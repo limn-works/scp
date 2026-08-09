@@ -1890,7 +1890,8 @@ async fn open_self_host_public_surface<S>(
 where
     S: scp_platform::EncryptedStorage + 'static,
 {
-    let tls_config = match build_self_host_tls_config(node.relay_url(), http_addr.ip(), plaintext) {
+    let tls_config = match build_self_host_tls_config(&node.relay_url(), http_addr.ip(), plaintext)
+    {
         Ok(c) => c,
         Err(e) => {
             release_self_host_mappings(upnp_mapper.clone(), natpmp_mapper.clone(), port).await;
@@ -3672,7 +3673,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::{
-        DidPublisher, NodeDidDocument, NodeDidPublisher, PublishedDidRecord, apply_tier_change,
+        DidPublisher, NodeDidDocument, NodeDidPublisher, NodeRelayUrl, PublishedDidRecord,
+        apply_tier_change,
     };
     use scp_did::DidDocument;
     use scp_identity::{DidMethod as _, ScpIdentity};
@@ -3786,8 +3788,9 @@ mod tests {
         //    producing a NEW (value, signature, seq). --
         let new_relay_url = "ws://203.0.113.42:8443/scp/v1";
         let node_document = NodeDidDocument::new(document);
-        let _url = apply_tier_change(
-            &relay_url,
+        let node_relay_url = NodeRelayUrl::new(relay_url);
+        apply_tier_change(
+            &node_relay_url,
             new_relay_url,
             "test tier change",
             &node_document,
@@ -3795,8 +3798,16 @@ mod tests {
             &identity,
             None,
         )
-        .await
-        .expect("the tier-change re-publish succeeds");
+        .await;
+        // `apply_tier_change` returns nothing: success is observable only where
+        // the node actually keeps its state. The relay-URL slot advancing is the
+        // signal the re-publish succeeded (it is written on the success arm
+        // only), which the record assertions below then corroborate.
+        assert_eq!(
+            node_relay_url.get(),
+            new_relay_url,
+            "a successful tier change advances the node's relay-URL slot"
+        );
 
         let second = records
             .get()

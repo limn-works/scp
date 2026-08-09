@@ -405,13 +405,22 @@ impl<S: Storage> ApplicationNode<S> {
         &self.storage
     }
 
-    /// Returns the relay URL published in the DID document.
+    /// Returns the relay URL the node is currently reachable at — the one it
+    /// publishes in its DID document and serves from `.well-known/scp`.
     ///
     /// For domain mode: `wss://<domain>/scp/v1` (spec section 18.5.2).
-    /// For no-domain mode: the relay URL is stored in the node state.
+    /// For no-domain mode: the address of the current reachability tier, which a
+    /// NAT tier change (§10.12.1) advances.
+    ///
+    /// Returned by value rather than as `&str` precisely because it can change:
+    /// this reads the node's live relay-URL slot per call, and a borrow cannot
+    /// escape that slot — a `&str` here could only be a copy that goes stale on
+    /// the next tier change, which is exactly the defect the slot removed. (No
+    /// intra-doc link: the slot type is crate-private, like the `NodeState` field
+    /// it lives on.)
     #[must_use]
-    pub fn relay_url(&self) -> &str {
-        &self.state.relay_url
+    pub fn relay_url(&self) -> String {
+        self.state.relay_url.get()
     }
 
     /// Returns a clonable handle to this node's outbound webhook dispatcher.
@@ -2196,6 +2205,79 @@ impl std::fmt::Debug for NodeDidDocument {
     }
 }
 
+/// The node's live "relay URL I am currently reachable at" slot (§10.12.1).
+///
+/// # Why a shared slot and not a `String` field
+///
+/// Same frozen-snapshot class as [`NodeDidDocument`], one reader over — and the
+/// most exposed instance of it. A NAT tier change re-points the node's relay
+/// endpoint ([`apply_tier_change`]); a `String` captured at build time keeps the
+/// pre-change address for the rest of the node's life. That address is served by
+/// `GET /.well-known/scp` — the node's **public, unauthenticated** discovery
+/// document (§18.3) — in both the top-level `relay` field and the
+/// `scp://context/…?relay=` invite URIs. A stale copy there does not merely
+/// mis-report state to an operator: it hands every peer that discovers this node
+/// an address the node has moved off, so joins and publishes fail against a dead
+/// endpoint with nothing in the document to indicate it is wrong.
+///
+/// The fix is the same structural one: a running node holds exactly ONE relay
+/// URL, here, and every reader ([`http::NodeState`], [`ApplicationNode::relay_url`],
+/// the tier re-evaluation loop itself) holds a clone of *this slot* rather than a
+/// copy of its contents. A stale read is unrepresentable rather than avoided.
+///
+/// # Not derived from [`NodeDidDocument`]
+///
+/// The two advance together but are not the same value. The document's
+/// `SCPRelay` service list is a `Vec` that a caller has to pick from, and it is
+/// only advanced for entries matching the *current* URL, whereas
+/// `.well-known/scp` needs exactly one authoritative string. Projecting one out
+/// of the other would replace a plain read with a pick-the-right-element rule
+/// and a "what if the list is empty" branch on the public discovery path.
+///
+/// # Only the update site writes it
+///
+/// [`set`](Self::set) is private to this module and its single caller is
+/// [`apply_tier_change`], which writes the slot in the same expression that
+/// resolves the new URL — and returns nothing, so no call site can hold the new
+/// URL, forward it, or forget to. There is no "remember to store the returned
+/// URL" step for a future path to miss.
+#[derive(Clone)]
+pub(crate) struct NodeRelayUrl(Arc<tokio::sync::watch::Sender<String>>);
+
+impl NodeRelayUrl {
+    /// A slot seeded with the relay URL the node was built with.
+    pub(crate) fn new(relay_url: String) -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(relay_url)))
+    }
+
+    /// Records the relay URL the node is now reachable at.
+    ///
+    /// Private on purpose — see the type docs. `send_replace` (not `send`) for
+    /// the same reason as [`NodeDidDocument::set`]: this slot has readers rather
+    /// than subscribers, so a write must not fail merely because no receiver is
+    /// currently parked on it.
+    fn set(&self, relay_url: String) {
+        self.0.send_replace(relay_url);
+    }
+
+    /// The relay URL the node is currently reachable at.
+    ///
+    /// Cloned out rather than borrowed: a `watch` borrow guard held across an
+    /// `.await` would block every writer, and the readers here (the
+    /// `.well-known/scp` handler, the tier task) are async.
+    pub(crate) fn get(&self) -> String {
+        self.0.borrow().clone()
+    }
+}
+
+impl std::fmt::Debug for NodeRelayUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("NodeRelayUrl")
+            .field(&*self.0.borrow())
+            .finish()
+    }
+}
+
 /// The node's live "signed BEP44 record I most recently published" slot
 /// (§3.10.5).
 ///
@@ -2645,25 +2727,32 @@ pub fn spawn_self_host_mapping_renewal(
     tokio::spawn(run_mapping_renewal_loop(mappers, port, cancel))
 }
 
-/// Handles a detected tier change: updates the node's DID document, re-publishes
-/// it through the node's publish seam, and emits the event only after the publish
-/// resolved. Returns the new URL on success.
+/// Handles a detected tier change: updates the node's DID document and relay
+/// URL, re-publishes the document through the node's publish seam, and emits the
+/// event only after the publish resolved.
 ///
-/// # This is the node's ONLY DID-document update site
+/// # This is the node's ONLY post-construction update site for BOTH slots
 ///
-/// The updated document is not returned. It is written straight into the node's
-/// [`NodeDidDocument`] slot — the single `DidDocument` a running node holds — in
-/// the same expression that produced it. Every reader (the dev-API identity
-/// endpoint, [`IdentityHandle::document`], this function's own next invocation)
-/// reads that slot, so none of them can be looking at the pre-tier-change
-/// document. Returning it for the caller to store is exactly the frozen-snapshot
+/// Nothing is returned. The updated document goes straight into the node's
+/// [`NodeDidDocument`] slot and the new address into its [`NodeRelayUrl`] slot —
+/// the single `DidDocument` and the single relay URL a running node holds — in
+/// the same expression that resolves each. Every reader (the dev-API identity
+/// endpoint, [`IdentityHandle::document`], the public `.well-known/scp` document,
+/// [`ApplicationNode::relay_url`], this function's own next invocation) reads
+/// those slots, so none of them can be looking at pre-tier-change state.
+/// Returning either value for the caller to store is exactly the frozen-snapshot
 /// defect: the caller's copy advances, every other copy does not.
 ///
-/// The write lands on the success arm only, so a failed re-publish leaves the
-/// node standing behind the document it actually published. A
-/// `DhtMode::Disabled` node publishes nothing (`Ok(None)`) and is still a
-/// success: its reachability genuinely changed, so its document must advance
-/// even though no record exists to carry it.
+/// `current_url` is read from the slot rather than passed in, so the endpoint
+/// this rewrites and the `previous_relay_url` it reports are by construction the
+/// address the node was actually standing behind — not a caller's idea of it.
+///
+/// The writes land on the success arm only, so a failed re-publish leaves the
+/// node standing behind the document and address it actually published; the next
+/// re-evaluation re-detects the change and retries. A `DhtMode::Disabled` node
+/// publishes nothing (`Ok(None)`) and is still a success: its reachability
+/// genuinely changed, so both slots must advance even though no record exists to
+/// carry the change.
 ///
 /// # Re-seeding the keep-alive is not this function's job either
 ///
@@ -2674,14 +2763,15 @@ pub fn spawn_self_host_mapping_renewal(
 /// whether or not this — or any future — call site remembers to pass it on. See
 /// [`PublishedDidRecord`].
 async fn apply_tier_change(
-    current_url: &str,
+    relay_url: &NodeRelayUrl,
     new_relay_url: &str,
     trigger_reason: &str,
     document: &NodeDidDocument,
     publisher: &dyn DidPublisher,
     identity: &ScpIdentity,
     event_tx: Option<&tokio::sync::mpsc::Sender<NatTierChange>>,
-) -> Option<String> {
+) {
+    let current_url = relay_url.get();
     let mut updated_doc = document.get();
     for svc in &mut updated_doc.service {
         if svc.service_type == "SCPRelay" && svc.service_endpoint == current_url {
@@ -2690,12 +2780,18 @@ async fn apply_tier_change(
     }
     match publisher.publish(identity, &updated_doc).await {
         Ok(signed) => {
-            // The publish and the document update are ONE step. Splitting them
-            // (returning the document and trusting the caller to store it) is the
-            // frozen-snapshot defect this slot exists to make unrepresentable.
-            // Written before the event fires, so an observer woken by
-            // `TierChanged` that immediately reads the document sees the new one.
+            // The publish, the document update and the address update are ONE
+            // step. Splitting any of them out (returning the value and trusting
+            // the caller to store it) is the frozen-snapshot defect these slots
+            // exist to make unrepresentable. Both writes are synchronous and
+            // adjacent — there is no `.await` between them — and they happen
+            // before the event fires, so an observer woken by `TierChanged` that
+            // immediately reads either slot sees the new value. No single served
+            // response reads both (`.well-known/scp` reads the address, the
+            // dev-API identity endpoint reads the document), so no reader can
+            // observe a mixed pair.
             document.set(updated_doc);
+            relay_url.set(new_relay_url.to_owned());
             if let Some(entry) = signed {
                 tracing::info!(
                     new_url = %new_relay_url, did = %identity.did, sequence = entry.sequence,
@@ -2721,17 +2817,15 @@ async fn apply_tier_change(
             if let Some(tx) = event_tx {
                 let _ = tx
                     .send(NatTierChange::TierChanged {
-                        previous_relay_url: current_url.to_owned(),
+                        previous_relay_url: current_url,
                         new_relay_url: new_relay_url.to_owned(),
                         reason: trigger_reason.to_owned(),
                     })
                     .await;
             }
-            Some(new_relay_url.to_owned())
         }
         Err(e) => {
             tracing::warn!(error = %e, "DID document republish failed after tier change");
-            None
         }
     }
 }
@@ -2746,11 +2840,14 @@ async fn apply_tier_change(
 /// result to the current tier. If the tier changed, it updates the DID
 /// document and republishes it, logging at INFO level.
 ///
-/// `document` is the node's shared [`NodeDidDocument`] slot, not a copy: this
-/// task is the node's only DID-document writer, and every reader of the node's
-/// document (the dev-API identity endpoint, [`IdentityHandle::document`]) holds a
-/// clone of that same slot. The task keeps no `DidDocument` of its own, so there
-/// is nothing here that can drift from what the rest of the node serves.
+/// `document` and `relay_url` are the node's shared [`NodeDidDocument`] and
+/// [`NodeRelayUrl`] slots, not copies: this task is the node's only writer for
+/// both, and every reader of either (the dev-API identity endpoint,
+/// [`IdentityHandle::document`], the public `.well-known/scp` document,
+/// [`ApplicationNode::relay_url`]) holds a clone of the same slot. The task keeps
+/// no `DidDocument` and no URL `String` of its own — not even the "current" one
+/// it compares against, which it reads back out of the slot — so there is
+/// nothing here that can drift from what the rest of the node serves.
 #[allow(clippy::too_many_arguments)]
 fn spawn_tier_reevaluation(
     nat_strategy: Arc<dyn NatStrategy>,
@@ -2759,7 +2856,7 @@ fn spawn_tier_reevaluation(
     identity: ScpIdentity,
     document: NodeDidDocument,
     relay_port: u16,
-    current_relay_url: String,
+    relay_url: NodeRelayUrl,
     event_tx: Option<tokio::sync::mpsc::Sender<NatTierChange>>,
     reevaluation_interval: Duration,
 ) -> TierReEvalHandle {
@@ -2776,7 +2873,6 @@ fn spawn_tier_reevaluation(
         // Held for the lifetime of the task future; dropped with it. The `move`
         // closure captures it even though it is never read.
         let _done_tx = done_tx;
-        let mut current_url = current_relay_url;
         loop {
             let trigger_reason = tokio::select! {
                 () = tokio::time::sleep(reevaluation_interval) => {
@@ -2812,6 +2908,13 @@ fn spawn_tier_reevaluation(
                 }
             };
             let new_relay_url = tier_to_relay_url(&new_tier);
+            // Read the address the node is CURRENTLY standing behind out of the
+            // slot rather than carrying it in a loop local. The local would be a
+            // second copy of a value the slot already owns — the frozen-snapshot
+            // shape — and it is unnecessary: this task is the slot's only
+            // writer, so the slot is always at least as fresh as any local could
+            // be.
+            let current_url = relay_url.get();
             if new_relay_url == current_url {
                 tracing::debug!(relay_url = %current_url, "tier re-evaluation: no change");
                 continue;
@@ -2821,11 +2924,12 @@ fn spawn_tier_reevaluation(
                 tier = ?new_tier, reason = trigger_reason,
                 "reachability tier changed, updating DID document (§10.12.1)"
             );
-            // The updated document goes straight into the shared slot; only the
-            // URL comes back, because only the URL is this loop's own state (it
-            // is what the next re-evaluation compares against).
-            if let Some(url) = apply_tier_change(
-                &current_url,
+            // Nothing comes back: the updated document and the new address go
+            // straight into the shared slots. On a failed re-publish the slots
+            // are left untouched, so the next re-evaluation re-detects the same
+            // change and retries — no retry bookkeeping to keep here.
+            apply_tier_change(
+                &relay_url,
                 &new_relay_url,
                 trigger_reason,
                 &document,
@@ -2833,10 +2937,7 @@ fn spawn_tier_reevaluation(
                 &identity,
                 event_tx.as_ref(),
             )
-            .await
-            {
-                current_url = url;
-            }
+            .await;
         }
     });
     TierReEvalHandle {
@@ -3460,7 +3561,12 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
 
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
-        relay_url,
+        // The node's single live relay URL (see `NodeRelayUrl`). Domain mode
+        // spawns NO tier re-evaluation, so nothing writes this slot after
+        // construction — it is still a slot so a future update site cannot leave
+        // a reader behind, and so the public `.well-known/scp` document reads the
+        // same live type in both modes.
+        relay_url: NodeRelayUrl::new(relay_url),
         broadcast_contexts: tokio::sync::RwLock::new(HashMap::new()),
         relay_addr: bound_addr,
         bridge_secret,
@@ -3699,6 +3805,13 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         "application node started (no-domain mode, §10.12.8)"
     );
 
+    // The node's single live relay URL. This SHADOWS the `String` deliberately:
+    // past this line there is no plain `String` copy of the node's address left
+    // in scope to hand out, so the tier task, `NodeState` and
+    // `ApplicationNode::relay_url` can only receive clones of the slot. See
+    // `NodeRelayUrl`.
+    let relay_url = NodeRelayUrl::new(relay_url);
+
     let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
     let bg_identity = identity.clone();
     // No tier to re-evaluate when the probe was skipped: the node is reached via
@@ -3719,10 +3832,18 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         ))
     };
 
-    // Bridge auth lookup — audience is relay URL in no-domain mode (spec 12.10.2).
+    // Bridge auth lookup — audience is the relay URL in no-domain mode (spec
+    // 12.10.2). Deliberately a SNAPSHOT, not a clone of the slot: the audience is
+    // this node's stable JWT-validation identity, not its reachability address.
+    // `load_from_storage` persists it once (`bridge/config/audience`) and never
+    // overwrites it, so it is already pinned across restarts — and making it
+    // follow a NAT tier change would silently invalidate every bridge credential
+    // an operator had already minted against the old value. The domain builder
+    // makes the same distinction visible: there the audience is
+    // `https://<domain>`, which is not the relay URL at all.
     let bridge_lookup = Arc::new(bridge_auth::StorageBridgeLookup::new(
         Arc::clone(&storage),
-        relay_url.clone(),
+        relay_url.get(),
     ));
     if let Err(e) = bridge_lookup.load_from_storage().await {
         tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
@@ -5939,7 +6060,7 @@ mod tests {
             identity,
             NodeDidDocument::new(document),
             32891,
-            "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            NodeRelayUrl::new("ws://198.51.100.7:32891/scp/v1".to_owned()),
             Some(event_tx),
             TEST_REEVALUATION_INTERVAL,
         );
@@ -6027,7 +6148,7 @@ mod tests {
             identity,
             NodeDidDocument::new(document),
             32891,
-            "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            NodeRelayUrl::new("ws://198.51.100.7:32891/scp/v1".to_owned()),
             Some(event_tx),
             // Use a long interval so the periodic timer does NOT fire first.
             Duration::from_hours(1),
@@ -6115,7 +6236,7 @@ mod tests {
             identity,
             NodeDidDocument::new(document),
             32891,
-            "ws://198.51.100.7:32891/scp/v1".to_owned(),
+            NodeRelayUrl::new("ws://198.51.100.7:32891/scp/v1".to_owned()),
             Some(event_tx),
             TEST_REEVALUATION_INTERVAL,
         );
@@ -6213,7 +6334,7 @@ mod tests {
             identity,
             NodeDidDocument::new(document),
             addr.port(),
-            format!("ws://{addr}/scp/v1"),
+            NodeRelayUrl::new(format!("ws://{addr}/scp/v1")),
             Some(event_tx),
             TEST_REEVALUATION_INTERVAL,
         );
@@ -6502,6 +6623,173 @@ mod tests {
             node.identity().document().relay_service_urls(),
             vec![TIER_CHANGE_NEW_URL.to_owned()],
         );
+
+        node.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // The node's relay URL is a LIVE slot, not a build-time snapshot
+    // (SCP-243 §10.12.1 — the frozen-snapshot class, and the most exposed
+    // instance of it: `.well-known/scp` is PUBLIC and UNAUTHENTICATED).
+    //
+    // `NodeState.relay_url` was a `String` captured at build time. A NAT tier
+    // change moved the node to a new address and never touched it, so the
+    // discovery document every peer reads kept advertising a DEAD relay
+    // endpoint — in the top-level `relay` field AND in every
+    // `scp://context/…?relay=` invite URI — for the rest of the node's life.
+    //
+    // These tests drive a REAL tier change on a REAL node and assert against the
+    // real `GET /.well-known/scp` RESPONSE BODY, not against the field.
+    // -----------------------------------------------------------------------
+
+    /// The context ID registered so the discovery document actually contains
+    /// `scp://context/…?relay=` URIs to check.
+    const WELL_KNOWN_TEST_CONTEXT: &str = "beefcafe";
+
+    /// The relay endpoints the node's PUBLIC `GET /.well-known/scp` document
+    /// (spec §18.3) actually advertises: `(top-level relay, one per context URI)`.
+    ///
+    /// Parsed out of the real handler's real JSON body — this is what an
+    /// unauthenticated peer discovering this node receives, not what a field
+    /// happens to hold.
+    async fn well_known_advertised_relays(state: &Arc<http::NodeState>) -> (String, Vec<String>) {
+        use axum::response::IntoResponse as _;
+
+        let response =
+            crate::well_known::well_known_handler(axum::extract::State(Arc::clone(state)))
+                .await
+                .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the .well-known/scp body is readable");
+        let doc: scp_core::well_known::WellKnownScp =
+            serde_json::from_slice(&body).expect("the .well-known/scp response is JSON");
+
+        let uri_relays = doc
+            .contexts
+            .unwrap_or_default()
+            .into_iter()
+            .map(|ctx| {
+                let uri = ctx
+                    .uri
+                    .expect("a broadcast context advertises an invite URI");
+                let query = uri
+                    .split_once('?')
+                    .expect("the invite URI carries a query string")
+                    .1;
+                let encoded = query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("relay="))
+                    .expect("the invite URI carries a relay= parameter");
+                percent_encoding::percent_decode_str(encoded)
+                    .decode_utf8()
+                    .expect("the relay= parameter is UTF-8")
+                    .into_owned()
+            })
+            .collect();
+
+        (doc.relay, uri_relays)
+    }
+
+    /// THE regression: after a NAT tier change the node's PUBLIC, UNAUTHENTICATED
+    /// discovery document must advertise the address the node is now reachable
+    /// at — in the top-level `relay` field and in the `scp://context/…?relay=`
+    /// invite URIs alike.
+    ///
+    /// Against the pre-fix code this fails: `NodeState.relay_url` was a `String`
+    /// captured at build time and never written again (`apply_tier_change`
+    /// returned the new URL for the tier loop to keep in a local), so
+    /// `.well-known/scp` handed every peer that discovered this node an endpoint
+    /// the node had moved off — with nothing in the document to indicate it was
+    /// stale.
+    #[tokio::test]
+    async fn tier_change_updates_the_relay_url_the_public_discovery_document_advertises() {
+        let (config, net_change_tx) = tier_change_config(DhtMode::Production);
+        let mut node = Node::start_for_testing(config)
+            .await
+            .expect("the no-domain node starts");
+        node.register_broadcast_context(WELL_KNOWN_TEST_CONTEXT.to_owned(), None)
+            .await
+            .expect("a broadcast context registers");
+
+        assert_eq!(
+            well_known_advertised_relays(&node.state).await,
+            (
+                TIER_CHANGE_OLD_URL.to_owned(),
+                vec![TIER_CHANGE_OLD_URL.to_owned()]
+            ),
+            "the discovery document starts on the build-time relay endpoint"
+        );
+        assert_eq!(node.relay_url(), TIER_CHANGE_OLD_URL);
+
+        drive_tier_change(&mut node, &net_change_tx).await;
+
+        assert_eq!(
+            well_known_advertised_relays(&node.state).await,
+            (
+                TIER_CHANGE_NEW_URL.to_owned(),
+                vec![TIER_CHANGE_NEW_URL.to_owned()]
+            ),
+            "the PUBLIC discovery document must advertise the address the node is \
+             NOW reachable at — both the top-level `relay` field and the invite \
+             URIs; a build-time copy here hands every peer a dead endpoint"
+        );
+        assert_eq!(
+            node.relay_url(),
+            TIER_CHANGE_NEW_URL,
+            "the public accessor reads the same live slot, so it cannot disagree \
+             with what the discovery document advertises"
+        );
+
+        node.shutdown();
+    }
+
+    /// The `DhtMode::Disabled` case: the node publishes NOTHING — its
+    /// `PublishedDidRecord` is `None` before and after — and the address it
+    /// advertises must STILL advance.
+    ///
+    /// `.well-known/scp` reports how to reach THIS node; it is served whether or
+    /// not the node is DHT-discoverable. Keying the advertised address off the
+    /// published record would leave a not-discoverable-by-design node directing
+    /// every peer at an endpoint it has moved off.
+    #[tokio::test]
+    async fn tier_change_updates_the_advertised_relay_url_on_a_disabled_node() {
+        let (config, net_change_tx) = tier_change_config(DhtMode::Disabled);
+        let mut node = Node::start_for_testing(config)
+            .await
+            .expect("a DhtMode::Disabled node starts without publishing");
+        node.register_broadcast_context(WELL_KNOWN_TEST_CONTEXT.to_owned(), None)
+            .await
+            .expect("a broadcast context registers");
+
+        assert!(
+            node.published_did_record().is_none(),
+            "DhtMode::Disabled publishes nothing — the honest absent state"
+        );
+        assert_eq!(
+            well_known_advertised_relays(&node.state).await,
+            (
+                TIER_CHANGE_OLD_URL.to_owned(),
+                vec![TIER_CHANGE_OLD_URL.to_owned()]
+            ),
+        );
+
+        drive_tier_change(&mut node, &net_change_tx).await;
+
+        assert!(
+            node.published_did_record().is_none(),
+            "the tier change must not make a non-publishing node publish"
+        );
+        assert_eq!(
+            well_known_advertised_relays(&node.state).await,
+            (
+                TIER_CHANGE_NEW_URL.to_owned(),
+                vec![TIER_CHANGE_NEW_URL.to_owned()]
+            ),
+            "the advertised address advances even though nothing was published — \
+             `.well-known/scp` reports how to reach this node, not what the DHT holds"
+        );
+        assert_eq!(node.relay_url(), TIER_CHANGE_NEW_URL);
 
         node.shutdown();
     }
