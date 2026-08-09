@@ -52,7 +52,7 @@
       "gate": "gate-capinject-0",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-platform/Cargo.toml",
         "crates/scp-platform/src/lib.rs",
@@ -112,7 +112,8 @@
         "adr": "ADR-062",
         "unit": "1",
         "slice": "Slice 0 (module structure)",
-        "scopeException": "atomic module move + feature split + twin deletion"
+        "scopeException": "atomic module move + feature split + twin deletion",
+        "verified_on_main": "Verified AC-by-AC against origin/main. AC[0]: crates/scp-platform/src/in_memory/{mod,storage,push}.rs exist and `grep -c 'InMemoryStorage|InMemoryPush' crates/scp-platform/src/testing/mod.rs` = 0. AC[1]: crates/scp-platform/Cargo.toml declares `in-memory-storage = []` and `in-memory-push = [\"dep:uuid\"]`, with `testing = [\"software_platform\", \"in-memory-storage\", \"in-memory-push\"]`. AC[2]: `grep -c 'testing as software' crates/scp-platform/src/lib.rs` = 0. AC[3]: crates/scp-platform/src/lib.rs gates `pub mod testing;` behind `#[cfg(feature = \"testing\")]`, so all three nullifier doubles are testing-only. AC[4]: `grep -c 'BridgeInMemoryStorage' crates/` = 0. AC[5]: `grep -c 'scp-platform/testing' crates/scp-ffi/common/Cargo.toml` = 0 and its `server` feature pulls `scp-platform/in-memory-storage`. AC[6]: the bridge storage arm resolves to `scp_platform::in_memory::InMemoryStorage` (crates/scp-ffi/common/src/{server,bridge_runtime}.rs) with no default/fallback path."
       }
     },
     {
@@ -121,7 +122,7 @@
       "gate": "gate-capinject-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-identity/src/dht.rs",
         "crates/scp-identity/src/config.rs",
@@ -215,7 +216,8 @@
         "unit": "1",
         "slice": "Slice 1 (DHT E1 + D-A default removal + D-B node DhtMode)",
         "closes": "PR keywords: closes #1518, re-satisfies #627, closes #1880",
-        "scopeException": "default-removal + type-gate + chokepoint retype + node DhtMode split are atomic"
+        "scopeException": "default-removal + type-gate + chokepoint retype + node DhtMode split are atomic",
+        "verified_on_main": "Verified AC-by-AC against origin/main. AC[0]: crates/scp-identity/src/dht.rs declares `pub struct DidDht<D: DhtClient, C: Clock = SystemClock>` — `grep -c 'DidDht<D: DhtClient = InMemoryDhtClient'` = 0, no `impl Default for DidDht<InMemoryDhtClient`, no `pub fn new()`. AC[3]: `pub enum FfiDhtClient` at crates/scp-ffi/common/src/dht.rs:25. AC[5]: `pub type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>` at crates/scp-ffi/common/src/server.rs:43 and `dht_client: OnceLock<Arc<crate::dht::FfiDhtClient>>` at crates/scp-ffi/common/src/bridge_instance.rs:355. AC[7]: `ClientDhtConfig::into_client` returns `Result<FfiDhtClient, DhtInitError>` (crates/scp-ffi/common/src/dht.rs:142). AC[8]: crates/scp-node/src/config.rs has `#[default] Disabled`, `#[cfg(feature = \"testing\")] Memory`, `Production`, and the NodeConfig default is `dht: DhtMode::Disabled`. AC[11]: `grep -c Pkarr .docs/standards/sdk-capability-matrix.json` = 5. AC[12]: crates/scp-ffi/common/tests/dht_capability_injection.rs carries the `#[ignore = \"requires live Mainline DHT network access\"]` roundtrip and `#[cfg(not(feature = \"testing\"))]` compile assertions. AC[1]/AC[4] absence is enforced mechanically by the G1 gate landed in SCP-CAPINJECT-006, not by a name grep."
       }
     },
     {
@@ -224,7 +226,7 @@
       "gate": "gate-capinject-6",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/Cargo.toml",
         "crates/scp-ffi/napi/Cargo.toml",
@@ -319,7 +321,8 @@
         "slice": "Slice 6 (severance + switch deletion + G1 subset-allowlist)",
         "folds": "#1733 (close as folded here)",
         "scopeException": "switch deletion + cfg-rename + edge-severance + phantom-retype + G1 are atomic",
-        "note": "pre-rotation NULLIFIER severed here (test-harness-only, fail-closed production create with a typed IdentityError); only the real BACKEND is out of scope (RFC #2130 / #1729). G1 allowlists ZERO nullifiers, no exceptions (PR #2132). Non-committing create = #1553."
+        "note": "pre-rotation NULLIFIER severed here (test-harness-only, fail-closed production create with a typed IdentityError); only the real BACKEND is out of scope (RFC #2130 / #1729). G1 allowlists ZERO nullifiers, no exceptions (PR #2132). Non-committing create = #1553.",
+        "verified_on_main": "Verified AC-by-AC against origin/main. AC[0]: `grep -c allow_in_memory_custody crates/ .github/` = 0. AC[1]: the shipped (no-`testing`) build carries `#[cfg(not(feature = \"testing\"))]` reject arms in crates/scp-ffi/src/identity.rs and crates/scp-ffi/napi/src/scp.rs. AC[4]: crates/scp-identity/src/lib.rs:164/182 defines the typed 'no production pre-rotation custody backend available' error. AC[6]/AC[7]/AC[8]: scripts/check-shipped-feature-graph.sh exists and is executable, its `PERMITTED_ALLOWLIST` contains ONLY `scp-platform/in-memory-push` and `scp-platform/in-memory-storage` (zero nullifiers), and its own fixture harness asserts the three behaviours — a novel unlisted feature is REJECTED, a trimmed allowlist is REJECTED, and a clean subset is ACCEPTED — plus a nullifier-leak positive control. The script is named in the CLAUDE.md enforcement-files list and wired into .github/workflows/ci.yml."
       }
     },
     {
@@ -328,7 +331,7 @@
       "gate": "gate-capinject-9",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/bridge/credentials.rs",
         "crates/scp-ffi/common/src/credentials.rs",
@@ -372,7 +375,8 @@
         "adr": "ADR-062",
         "unit": "3",
         "slice": "Slice 9 (E2 credentials)",
-        "scopeException": "seam + durable backend + Default removal are one selection-boundary change"
+        "scopeException": "seam + durable backend + Default removal are one selection-boundary change",
+        "verified_on_main": "Verified AC-by-AC against origin/main. AC[0]: `grep -c 'impl Default for InMemoryCredentialStore|impl Default for BridgeCredentialStore' crates/scp-runtime/src/bridge/credentials.rs` = 0. AC[1]: `pub enum FfiCredentialStore` at crates/scp-ffi/common/src/credentials.rs:45 with a `Durable(Arc<dyn DurableCredentialBackend>)` arm and an `InMemory` arm gated `#[cfg(feature = \"testing\")]`. AC[3]: `bridge_credential_survives_store_drop_and_reopen` (crates/scp-runtime/src/store/credentials.rs) opens a real on-disk SqliteStorage, writes the credential + root key, DROPS the store and its Arc, reopens at the same path/key, and asserts the ciphertext and root key are byte-identical — proving it is not RAM-only."
       }
     },
     {
@@ -381,7 +385,7 @@
       "gate": "gate-capinject-10",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-transport/src/native/storage.rs",
         "crates/scp-node/src/self_host.rs",
@@ -419,7 +423,8 @@
         "adr": "ADR-062",
         "unit": "3",
         "slice": "Slice 10 (E3 blob)",
-        "scopeException": "Default removal + explicit-selection wiring are one selection-boundary change"
+        "scopeException": "Default removal + explicit-selection wiring are one selection-boundary change",
+        "verified_on_main": "Verified AC-by-AC against origin/main. AC[0]: `grep -c 'impl Default for BlobStorageBackend' crates/scp-transport/src/native/storage.rs` = 0 and `grep -c 'BlobStorageBackend::default' crates/` = 0. AC[1]: the self-host path selects the backend explicitly (`BlobStorageBackend::sqlite(&blob_db)`, crates/scp-node/src/self_host.rs:2223) and passes it as a required argument at the construction boundary — no fallback path. AC[2]: `BlobStorageBackend::in_memory()` remains selectable by explicit choice only (crates/scp-node/src/config.rs, crates/scp-ffi/common/src/server.rs), documented in config.rs:303 as the 'durability-only arm, selected explicitly'. Merged as PR #2176."
       }
     },
     {
@@ -428,7 +433,7 @@
       "gate": "gate-capinject-11",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-identity/src/republish.rs"
       ],
@@ -474,7 +479,9 @@
         "unit": "3",
         "slice": "Slice 11 (E4 relay-publisher default sever — WRITE-path default-selection hygiene only)",
         "scopeException": "default-type-param removal + InMemoryRelayPublisher demotion are one atomic type-hygiene change (a half-applied removal leaves the DHT-only constructor impl under-parameterized and breaks the build)",
-        "note": "Relay resolution itself (real MultiRelayQuerier/RelayPublisher, DID-record frame §9.10.12, relay-side validation, republish-loop fix republish.rs:703, Disabled-node relay path) is issue #482 — a FEATURE, out of ADR-062 scope, storied under .docs/prds/relay-did-resolution.json. NoOpRelayQuerier is not a nullifier (fails CLOSED) and ships unchanged."
+        "note": "Relay resolution itself (real MultiRelayQuerier/RelayPublisher, DID-record frame §9.10.12, relay-side validation, republish-loop fix republish.rs:703, Disabled-node relay path) is issue #482 — a FEATURE, out of ADR-062 scope, storied under .docs/prds/relay-did-resolution.json. NoOpRelayQuerier is not a nullifier (fails CLOSED) and ships unchanged.",
+        "verified_on_main": "Verified AC-by-AC against origin/main. AC[0]: crates/scp-identity/src/republish.rs:415 declares `pub struct RepublishManager<D: DhtClient, R: RelayPublisher>` with NO `= InMemoryRelayPublisher` default. AC[1]: `pub struct InMemoryRelayPublisher` (:168), `impl InMemoryRelayPublisher` (:174) and `impl RelayPublisher for InMemoryRelayPublisher` (:200) are each immediately preceded by `#[cfg(any(test, feature = \"testing\"))]` (:166, :173, :199). AC[2]: `pub struct NoOpRelayQuerier` (crates/scp-identity/src/resolver.rs:283) carries no cfg gate. AC[3]: at the time of the merge, `grep -n 'RepublishManager::' crates/` outside crates/scp-identity/src/republish.rs returned 0.",
+        "superseded_acceptance_criteria": "Two criteria were satisfied when this slice merged and are NO LONGER TRUE, because SCP-RELAYRES-004 (issue #482, the feature this slice deliberately scoped out) subsequently built the relay WRITE path on top of the severed API. Both supersessions are correct and intended; neither is a regression of this slice's actual property (the default type parameter is still gone and InMemoryRelayPublisher is still test-harness-only). (1) AC[3]'s clause \"No production `RepublishManager` construction site exists to update (`grep -rn 'RepublishManager::' crates --include='*.rs'` outside crates/scp-identity/src/republish.rs returns 0)\" — a production construction site now exists at crates/scp-node/src/self_host.rs (`RepublishManager::with_relay_publisher_and_warning`), naming the real `TransportRelayPublisher` as its `R`. That site is exactly the real publisher this slice's severance required a caller to supply, so its arrival is the severance working as designed. (2) AC[2]'s clause \"this slice adds no `MultiRelayQuerier`/`RelayPublisher`/`TransportRelayQuerier`/DID-record-frame code ... `grep -rn 'publish_raw|query_raw|TransportRelayQuerier|DidRecordV1' crates/scp-identity/src/republish.rs` returns 0\" — republish.rs now references `DidRecordV1` (the relay-republish loop builds the §9.10.12 frame). The clause was scoped to what THIS SLICE adds; SCP-RELAYRES-004 added it, which is the correct owner. Re-run either grep against the merge commit for this slice, not against current HEAD."
       }
     }
   ]
