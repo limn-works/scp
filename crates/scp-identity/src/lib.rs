@@ -241,6 +241,16 @@ pub enum IdentityError {
     #[error("relay publish failed: {0}")]
     RelayPublishFailed(String),
 
+    /// A relay PUBLISH was attempted while NO relay is bound at all.
+    ///
+    /// Distinct from [`RelayPublishFailed`](Self::RelayPublishFailed): no relay
+    /// rejected the record, there was simply nowhere to send it. That is a
+    /// configuration state no retry can heal, so the republish loop reports it
+    /// on the transition and then rate-limits, instead of alarming every cycle
+    /// for the life of a node that has no relay client wired.
+    #[error("relay publish failed: no relay bound")]
+    NoRelayBound,
+
     /// A BEP44 record could not be wrapped into a `DidRecordV1` relay frame
     /// (§9.10.12) — the document bytes are empty or exceed the maximum frame
     /// `value` length.

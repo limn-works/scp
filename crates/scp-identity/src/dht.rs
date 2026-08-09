@@ -868,15 +868,28 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // Extract the public key from the DID.
         let public_key = extract_public_key(&identity.did)?;
 
+        // Persist the sequence BEFORE the network write (issue #327), not after.
+        // Write-ahead is the only ordering that keeps the caller's view and the
+        // network's from diverging in the direction that matters:
+        //
+        // - store-then-publish: a failed store returns `Err` with NOTHING
+        //   published, and a failed publish merely burns a sequence number
+        //   (monotone, so the next publish still supersedes).
+        // - publish-then-store (the predecessor): a failed store returned `Err`
+        //   with the record ALREADY live at `seq`. The publish seam files the
+        //   record only on `Ok`, so the republish arms kept re-asserting
+        //   `seq - 1`, which BEP44 nodes and validating relays both reject as
+        //   non-superseding — the CURRENT record stopped being kept alive and
+        //   expired at TTL. It also lost the durable record of `seq`, so a
+        //   restart could reuse it for different bytes.
+        if let Some(store) = &self.sequence_store {
+            store.store(&identity.did, seq).await?;
+        }
+
         // Publish to DHT.
         self.dht_client
             .publish(&public_key, &signature, value, seq)
             .await?;
-
-        // Persist the sequence number after successful publish (issue #327).
-        if let Some(store) = &self.sequence_store {
-            store.store(&identity.did, seq).await?;
-        }
 
         // Hand back the record this pass signed, so no caller has to re-derive
         // it from a network read-back (see `DidMethod::publish`).
@@ -6311,6 +6324,70 @@ mod tests {
 
         let stored = store.load(&identity.did).await.unwrap();
         assert_eq!(stored, Some(2));
+    }
+
+    /// A `SequenceStore` whose `store` always fails.
+    struct FailingSequenceStore;
+
+    impl SequenceStore for FailingSequenceStore {
+        fn load(
+            &self,
+            _did: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, IdentityError>> + Send + '_>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn store(
+            &self,
+            _did: &str,
+            _seq: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<(), IdentityError>> + Send + '_>> {
+            Box::pin(async {
+                Err(IdentityError::DhtPublishFailed(
+                    "sequence store is unwritable (test)".to_owned(),
+                ))
+            })
+        }
+    }
+
+    /// A failed sequence-store write must leave NOTHING on the network.
+    ///
+    /// Against the publish-then-store predecessor this fails: the record was
+    /// already live at `seq` when the store error propagated, so the caller saw
+    /// `Err` and filed nothing — leaving the republish arms asserting `seq - 1`,
+    /// which BEP44 nodes and validating relays both reject as non-superseding.
+    /// The current record then stopped being kept alive and expired at TTL. The
+    /// store write is now ahead of the network write, so the caller's view can
+    /// never be behind it.
+    #[tokio::test]
+    async fn a_failed_sequence_store_write_publishes_nothing() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht_client = Arc::new(InMemoryDhtClient::new());
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let sign_fn =
+            DidDht::<InMemoryDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
+        let dht = DidDht::with_client_signer_and_store(
+            Arc::clone(&dht_client),
+            Arc::new(DidCache::with_clock(clock)),
+            sign_fn,
+            Arc::new(FailingSequenceStore),
+        );
+
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
+
+        let result = dht.publish_document(&identity, &document).await;
+        assert!(result.is_err(), "an unwritable sequence store fails closed");
+
+        let public_key = extract_public_key(&identity.did).unwrap();
+        assert!(
+            dht_client.resolve(&public_key).await.unwrap().is_none(),
+            "nothing may be on the network that the caller was not handed: a \
+             record live at a sequence the caller never learned strands the \
+             republish arms one sequence behind, forever"
+        );
     }
 
     #[tokio::test]

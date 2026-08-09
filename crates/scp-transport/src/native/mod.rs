@@ -109,20 +109,25 @@ impl std::fmt::Debug for BoundRelays {
 }
 
 impl BoundRelays {
-    /// Creates an empty set.
-    pub(crate) fn new() -> Self {
-        Self {
-            relays: RwLock::new(HashMap::new()),
-        }
-    }
-
     /// Late-binds a live transport adapter for a relay URL.
     ///
     /// Idempotent: a subsequent bind for the same URL replaces the prior
     /// adapter (reconnects rebind rather than accumulate).
     pub(crate) fn bind(&self, relay_url: impl Into<String>, adapter: Arc<dyn TransportAdapter>) {
+        let relay_url = relay_url.into();
         if let Ok(mut relays) = self.relays.write() {
-            relays.insert(relay_url.into(), adapter);
+            relays.insert(relay_url, adapter);
+        } else {
+            // Fail-closed (see the locking discipline above) — but never
+            // silently: the publisher stays unbound for the rest of the
+            // process, so a dropped bind that produced no signal would look
+            // exactly like "no relay was ever configured".
+            tracing::error!(
+                relay_url = %relay_url,
+                "BoundRelays: the relay binding map is POISONED — this bind is \
+                 dropped and DID publishing/resolution stays unbound for the \
+                 life of the process"
+            );
         }
     }
 
