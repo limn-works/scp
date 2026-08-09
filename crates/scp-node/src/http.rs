@@ -62,8 +62,20 @@ pub struct BroadcastContext {
 pub struct NodeState {
     /// The operator's DID string.
     pub(crate) did: String,
-    /// The relay URL (e.g., `wss://example.com/scp/v1`).
-    pub(crate) relay_url: String,
+    /// The relay URL this node is currently reachable at (e.g.,
+    /// `wss://example.com/scp/v1`) — the node's live slot, NOT a build-time
+    /// copy.
+    ///
+    /// Served by the **public, unauthenticated** `.well-known/scp` discovery
+    /// document (spec section 18.3), both as the top-level `relay` field and
+    /// inside every `scp://context/…?relay=` invite URI. A NAT tier change
+    /// (§10.12.1) re-points the node's relay endpoint; holding a `String` by
+    /// value here advertised the pre-change address — one the node is no longer
+    /// reachable at — to every peer that discovered this node, for the rest of
+    /// the node's life. The slot is shared with the tier re-evaluation task, so
+    /// the discovery document cannot read a stale address.
+    /// See [`NodeRelayUrl`](crate::NodeRelayUrl).
+    pub(crate) relay_url: crate::NodeRelayUrl,
     /// Registered broadcast contexts, keyed by lowercase hex context ID.
     /// Modified via [`ApplicationNode::register_broadcast_context`].
     pub(crate) broadcast_contexts: RwLock<HashMap<String, BroadcastContext>>,
@@ -1174,7 +1186,7 @@ mod tests {
     fn test_state(cors_origins: Option<Vec<String>>) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:cors_test".to_owned(),
-            relay_url: "wss://localhost/scp/v1".to_owned(),
+            relay_url: crate::NodeRelayUrl::new("wss://localhost/scp/v1".to_owned()),
             broadcast_contexts: RwLock::new(HashMap::new()),
             relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
             bridge_secret: Zeroizing::new([0u8; 32]),
@@ -1370,7 +1382,7 @@ mod vhost_tests {
     ) -> Arc<NodeState> {
         Arc::new(NodeState {
             did: "did:dht:vhost_test".to_owned(),
-            relay_url: "wss://localhost/scp/v1".to_owned(),
+            relay_url: crate::NodeRelayUrl::new("wss://localhost/scp/v1".to_owned()),
             broadcast_contexts: RwLock::new(HashMap::new()),
             relay_addr: "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
             bridge_secret: Zeroizing::new([0u8; 32]),
