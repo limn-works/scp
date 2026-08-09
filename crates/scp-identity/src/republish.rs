@@ -86,6 +86,15 @@ const MAX_BACKOFF_SECS: u64 = 30 * 60;
 /// Number of consecutive failures before emitting a degraded warning.
 const DEGRADED_THRESHOLD: u32 = 6;
 
+/// How often an UNBOUND relay repeats its report once it has been made.
+///
+/// "No relay is bound" is a configuration state, not a fault: no retry heals it
+/// and no operator action is available while nothing binds a relay client. At
+/// the 30-minute backoff cap this is roughly one report every 12 hours instead
+/// of one every 30 minutes for the life of the node. The absence stays
+/// detectable — it just stops being a heartbeat.
+const UNBOUND_REPORT_EVERY: u32 = 24;
+
 /// Anti-segmentation warning logged when a publishing layer is disabled.
 const LAYER_DISABLED_WARNING: &str =
     "DID resolution layer disabled. This identity may not be resolvable by all peers.";
@@ -356,10 +365,13 @@ impl RepublishConfig {
         Self::default()
     }
 
-    /// Sets the callback invoked when a layer is disabled.
+    /// Sets an ADDITIONAL callback invoked when a layer is disabled.
     ///
-    /// The callback receives the warning message string. In production,
-    /// this would typically log via `tracing::warn!` or equivalent.
+    /// The callback receives the warning message string. It is never the only
+    /// notification: [`disable_dht`](Self::disable_dht) /
+    /// [`disable_relay`](Self::disable_relay) log the §3.10.6 warning
+    /// unconditionally. Wire this only to surface the event somewhere else too
+    /// (an SDK event stream, a health endpoint).
     #[must_use]
     pub fn with_layer_disabled_callback(mut self, callback: LayerDisabledCallback) -> Self {
         self.layer_disabled_callback = Some(callback);
@@ -370,35 +382,35 @@ impl RepublishConfig {
     ///
     /// **WARNING:** This violates the anti-segmentation invariant (§3.10.6).
     /// The identity may not be resolvable by peers that only check the DHT.
-    /// A warning is logged via the configured callback.
     pub fn disable_dht(&mut self) {
         self.dht_enabled = false;
-        if let Some(ref cb) = self.layer_disabled_callback {
-            cb(LAYER_DISABLED_WARNING);
-        }
+        self.warn_layer_disabled("dht");
     }
 
     /// Disables relay publishing.
     ///
     /// **WARNING:** This violates the anti-segmentation invariant (§3.10.6).
     /// The identity may not be resolvable by peers that only check SCP relays.
-    /// A warning is logged via the configured callback.
     pub fn disable_relay(&mut self) {
         self.relay_enabled = false;
+        self.warn_layer_disabled("relay");
+    }
+
+    /// Emits the §3.10.6 mandated layer-disabled warning.
+    ///
+    /// The `tracing::warn!` is UNCONDITIONAL: the spec makes the warning a
+    /// `MUST`, so it cannot depend on a caller having remembered to wire a
+    /// callback (`Default` has none). The optional callback is an additional
+    /// surface, not the mechanism.
+    fn warn_layer_disabled(&self, layer: &str) {
+        tracing::warn!(
+            layer,
+            warning = LAYER_DISABLED_WARNING,
+            "§3.10.6 DID resolution layer disabled"
+        );
         if let Some(ref cb) = self.layer_disabled_callback {
             cb(LAYER_DISABLED_WARNING);
         }
-    }
-
-    /// Whether the §3.10.6 layer-disabled warning callback is wired.
-    ///
-    /// §3.10.6 requires that disabling a resolution layer be accompanied by a
-    /// warning. A config built WITHOUT a callback can disable a layer silently,
-    /// so a caller that constructs configs on a production path can assert this
-    /// is `true` and make the mandate mechanical rather than a convention.
-    #[must_use]
-    pub const fn has_layer_disabled_callback(&self) -> bool {
-        self.layer_disabled_callback.is_some()
     }
 
     /// Returns whether DHT publishing is enabled.
@@ -812,10 +824,17 @@ impl<D: DhtClient + 'static, R: RelayPublisher + 'static> RepublishManager<D, R>
 
 /// Computes the backoff duration for a given attempt number (0-indexed).
 ///
-/// Sequence: 30s, 60s, 120s, 240s, 480s, 960s, 1800s (capped at 30m).
+/// Sequence: 30s, 60s, 120s, 240s, 480s, 960s, 1800s (capped at 30m), and
+/// monotone non-decreasing for EVERY `attempt` thereafter. `checked_shl`, not
+/// `wrapping_shl`: the latter masks the shift to `attempt & 63`, so attempt 64
+/// wrapped back to a 30-second backoff and re-ramped the whole ladder — a
+/// permanently-failing arm would emit a retry burst every ~30 hours, forever.
 fn backoff_secs(attempt: u32) -> u64 {
-    let backoff = INITIAL_BACKOFF_SECS.saturating_mul(1u64.wrapping_shl(attempt));
-    backoff.min(MAX_BACKOFF_SECS)
+    1u64.checked_shl(attempt)
+        .map_or(u64::MAX, |factor| {
+            INITIAL_BACKOFF_SECS.saturating_mul(factor)
+        })
+        .min(MAX_BACKOFF_SECS)
 }
 
 /// The DHT republish loop for a single identity.
@@ -948,15 +967,29 @@ async fn relay_republish_loop<R: RelayPublisher>(
             }
             Err(e) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                tracing::warn!(
-                    did = %did,
-                    error = %e,
-                    consecutive_failures,
-                    "relay republish failed on every bound relay — retrying with backoff"
-                );
+                // A CONFIGURED relay that is failing is actionable and can heal,
+                // so every attempt is reported. "No relay bound at all" cannot:
+                // reporting it every cycle would make a healthy node log
+                // DEGRADED forever for a condition its operator has no API to
+                // clear. Report its onset and its crossing into degraded, then
+                // repeat rarely. See [`UNBOUND_REPORT_EVERY`].
+                let report = !matches!(e, IdentityError::NoRelayBound)
+                    || consecutive_failures == 1
+                    || consecutive_failures == DEGRADED_THRESHOLD
+                    || consecutive_failures.is_multiple_of(UNBOUND_REPORT_EVERY);
+
+                if report {
+                    tracing::warn!(
+                        did = %did,
+                        error = %e,
+                        consecutive_failures,
+                        "relay republish reached no relay — retrying with backoff"
+                    );
+                }
 
                 // Emit degraded warning after threshold.
                 if consecutive_failures >= DEGRADED_THRESHOLD
+                    && report
                     && let Some(ref cb) = warning_cb
                 {
                     cb(RelayPublishDegraded {
@@ -1112,6 +1145,37 @@ mod tests {
         assert_eq!(backoff_secs(5), 960);
         assert_eq!(backoff_secs(6), MAX_BACKOFF_SECS);
         assert_eq!(backoff_secs(7), MAX_BACKOFF_SECS);
+    }
+
+    /// The backoff is monotone non-decreasing for EVERY attempt, including past
+    /// the 64th.
+    ///
+    /// Against the `wrapping_shl` predecessor this fails at attempt 64: the
+    /// shift was masked to `attempt & 63`, so the backoff collapsed from the
+    /// 30-minute cap back to 30s and re-ramped the whole ladder. A permanently
+    /// failing arm reaches attempt 64 in ~30 hours and then emits a retry burst
+    /// on that cycle, forever. Reachable in production ever since the arm stopped
+    /// being latched off while unbound.
+    #[test]
+    fn backoff_never_regresses_however_many_attempts_have_failed() {
+        let mut previous = 0;
+        for attempt in 0..=200u32 {
+            let backoff = backoff_secs(attempt);
+            assert!(
+                backoff >= previous,
+                "backoff regressed at attempt {attempt}: {previous} -> {backoff}"
+            );
+            assert!(backoff <= MAX_BACKOFF_SECS);
+            previous = backoff;
+        }
+        assert_eq!(backoff_secs(63), MAX_BACKOFF_SECS);
+        assert_eq!(
+            backoff_secs(64),
+            MAX_BACKOFF_SECS,
+            "the shift-wrap boundary"
+        );
+        assert_eq!(backoff_secs(65), MAX_BACKOFF_SECS);
+        assert_eq!(backoff_secs(u32::MAX), MAX_BACKOFF_SECS);
     }
 
     #[tokio::test]
@@ -1501,41 +1565,84 @@ mod tests {
         assert!(!config.is_relay_enabled());
     }
 
-    /// B3 / §3.10.6: disabling EITHER layer fires the layer-disabled callback
-    /// with the mandated warning text. This is the mechanism half of the
-    /// mandate; the self-host side asserts the production config wires a
-    /// callback into it (`has_layer_disabled_callback`).
+    /// B3 / §3.10.6: disabling EITHER layer emits the mandated warning on a
+    /// `Default` config — one that wired NO callback.
+    ///
+    /// The spec makes the warning a `MUST`, so it cannot be conditional on a
+    /// caller having remembered to wire a callback: this asserts the mechanical
+    /// guarantee by capturing the `tracing` output itself. The optional callback
+    /// is an additional surface, covered by
+    /// `disabling_a_layer_also_invokes_the_optional_callback`.
     #[test]
-    fn disabling_either_layer_fires_the_mandated_warning() {
-        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = Arc::clone(&seen);
-        let base = RepublishConfig::new().with_layer_disabled_callback(Arc::new(move |m: &str| {
-            sink.lock().unwrap().push(m.to_owned());
-        }));
-        assert!(base.has_layer_disabled_callback());
+    fn disabling_either_layer_always_logs_the_mandated_warning() {
+        let logs = capture_tracing(|| {
+            let mut relay_off = RepublishConfig::new();
+            relay_off.disable_relay();
+            let mut dht_off = RepublishConfig::new();
+            dht_off.disable_dht();
+        });
 
-        let mut relay_off = base.clone();
-        relay_off.disable_relay();
-        let mut dht_off = base;
-        dht_off.disable_dht();
-
-        let logged = seen.lock().unwrap().clone();
         assert_eq!(
-            logged.len(),
+            logs.matches(LAYER_DISABLED_WARNING).count(),
             2,
-            "each disable must warn — neither layer may be turned off silently"
+            "each disable must warn even with no callback wired — neither layer \
+             may be turned off silently. Captured: {logs}"
         );
         assert!(
-            logged.iter().all(|m| m == LAYER_DISABLED_WARNING),
-            "the §3.10.6 warning text is the one the spec mandates, got {logged:?}"
+            logs.contains("layer=\"relay\"") || logs.contains("layer=relay"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("layer=\"dht\"") || logs.contains("layer=dht"),
+            "{logs}"
         );
     }
 
-    /// The complement: a config with no callback reports so. Without this,
-    /// `has_layer_disabled_callback` could be a constant `true`.
+    /// The optional callback is invoked IN ADDITION to the unconditional log.
     #[test]
-    fn default_config_has_no_layer_disabled_callback() {
-        assert!(!RepublishConfig::new().has_layer_disabled_callback());
+    fn disabling_a_layer_also_invokes_the_optional_callback() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let mut config =
+            RepublishConfig::new().with_layer_disabled_callback(Arc::new(move |m: &str| {
+                sink.lock().unwrap().push(m.to_owned());
+            }));
+        config.disable_relay();
+
+        assert_eq!(seen.lock().unwrap().as_slice(), [LAYER_DISABLED_WARNING]);
+    }
+
+    /// Runs `body` with a scoped `tracing` subscriber and returns everything it
+    /// emitted, so a test can assert on a log line that no callback observes.
+    fn capture_tracing(body: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = SharedBuf(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     // --- Migration republisher tests ---
