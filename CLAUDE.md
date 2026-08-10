@@ -40,7 +40,7 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 - **No shortcuts.** No force unwraps, no placeholders, no "good enough."
 - **Provenance is paramount.** Every line traces to a documented decision. Chain: `.docs/` sources → `.docs/prds/` stories (or GitHub comments, feature-local artifacts). Before writing or changing code, read the full provenance chain — not summaries, not headers, the actual artifacts. Fresh agents must retrace full context quickly. Broken provenance is a bug.
 - **Always run CI locally before pushing.** Pushing lint, format, and test failures is a waste of CI minutes.
-- **Agent-first API design.** The SDK's primary author is an LLM. Optimize every public API for first-pass LLM authorability: one canonical pattern; flat named-field config objects over builders and typestate; enums over booleans for consequential choices; no silent security defaults; an identical shape across all language bindings. Typestate / phantom required-ordering a model can't track is a defect, not a safety feature — encode required choices as required fields. The measure: an agent writes correct code from the type signature plus one example, with no compile-retry loop. Enacted mechanically via `.docs/standards/construction.md` + a structural check (see ADR-052).
+- **Agent-first API design.** The SDK's primary author is an LLM. Optimize every public API for first-pass LLM authorability: one canonical pattern; flat named-field config objects over builders and typestate; enums over booleans for consequential choices; no silent security defaults; an identical shape across all language bindings. Typestate / phantom required-ordering a model can't track is a defect, not a safety feature — encode required choices as required fields. The measure: an agent writes correct code from the type signature plus one example, with no compile-retry loop. Enacted mechanically via `.docs/standards/construction.md` + a structural check (see ADR-052, the unified construction pattern).
 
 ## Tools
 
@@ -114,7 +114,7 @@ check-cross-layer.sh, check-protocol-deps.sh, check-no-shim-reexports.sh, check-
 check-no-bridge-globals.sh, check-no-fallback-registry.sh,
 check-handle-affinity.sh, check_ready_coverage.rs (per-instance handle
 affinity enforcement),
-check-saga-gating-granularity.sh (ADR-049 §3a per-participant-context-set
+check-saga-gating-granularity.sh (ADR-049 actor-per-context, §3a per-participant-context-set
 saga gating granularity), check-no-mutable-globals.sh,
 check-no-mutable-module-globals.py, check-no-ts-mutable-globals.sh,
 check-no-kotlin-mutable-globals.sh,
@@ -158,10 +158,11 @@ Weakening, removing, or exempting existing assertions requires human approval.
 - **"Each verb gets its own object, no zeugmas"** (Mike, 2026-07-29, verbatim). Rewrite "returns home wearing his blood and a self-defense story" as "returns home covered in his blood, and tells the police that she killed him in self-defense."
 - **"Resist metaphorical, poetic, or analogical language"** (Mike, 2026-07-29, verbatim). Replace each metaphor and each poetically compressed phrase with the literal claim it stands for. Write "kinship reveals appear in 7% of 1970s twist films and in 11% of 1980s twist films," not "the mode steps up and never falls back."
 - **Give every statistic an explicit denominator.** Write "23% of the twist films we catalogued from the 1920s," not "23% of twist films."
-- **Report what happened. Do not appraise it.** Delete "cleanly", "nicely", "elegant", "unfortunately", "interestingly", "I think", "it is worth noting", and "great question". When a judgment is the point of the sentence, name the criterion and cite the evidence: write "this reaches an in-memory backend on a production path, which §17.17 forbids," not "this feels wrong."
+- **Report what happened. Do not appraise it.** Delete "cleanly", "nicely", "elegant", "unfortunately", "interestingly", "I think", "it is worth noting", and "great question". When a judgment is the point of the sentence, name the criterion and cite the evidence: write "this reaches an in-memory backend on a production path, which §17.17 of the persistence spec forbids," not "this feels wrong."
+- **Never reference anything by an identifier alone.** Name the thing first, then give the identifier so the reader can find it. Write "ADR-062, capability injection", not "ADR-062". Write "§17.17 of the persistence spec, which classifies a capability as durability-only or as a nullifier", not "§17.17". Write "pull request #2293, the CLAUDE.md prose rules", not "#2293". Write "SCP-046, the streaming-saga seal state machine", not "SCP-046". A bare number tells a reader who has not memorized the ledger nothing, and it forces that reader to open the artifact before they can finish your sentence. This rule binds every kind of identifier: issue and pull-request numbers, ADR numbers, spec and section numbers, story IDs, commit hashes, branch names, and task IDs.
 - **Delete every modifier a reader cannot check.** Keep "129-line" and "two consecutive", because a reader can count them. Delete "robust", "comprehensive", "significant", "proper", "simply", "just", "very", and "actually". Delete any description that changes neither what the reader believes nor what the reader does next.
 - **Write the shortest sentence that still obeys every rule above.** Delete a word when deleting it takes no agent, no object, no denominator, and no connective out of the sentence. Delete preamble, restatements of the question, narration of your own process, hedges, and praise. Never shorten a sentence by deleting its subject, its object, or the word that states how its clauses relate. When you cannot shorten a sentence without deleting one of those three, leave the sentence long.
-- **Check every sentence before you send it.** Ask five questions: have I hidden a subordinate relation? Have I dropped a subject or an object? Does a passive verb hide who acted? Have I appraised the work instead of reporting it? Does this sentence admit two contradictory readings? If any answer is yes, rewrite the sentence.
+- **Check every sentence before you send it.** Ask six questions: have I hidden a subordinate relation? Have I dropped a subject or an object? Does a passive verb hide who acted? Have I appraised the work instead of reporting it? Have I referenced anything by a bare identifier? Does this sentence admit two contradictory readings? If any answer is yes, rewrite the sentence.
 - **Why this rule exists:** the poetically compressed register — "The asylum frame arrives", "Amy authors her own death and grades the coverage", "returns home wearing his blood and a self-defense story" — deletes the agent, deletes the object, and deletes the causal link, so contradictory readings coexist and the reader cannot determine which reading the writer meant.
 
 ### Toolchain
@@ -182,7 +183,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 - **Kotlin:** JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise. Run `eval "$(mise env)"` first.
 - **TypeScript:** `bun run check` runs `tsc --noEmit` for type checking. Biome handles both lint and format.
 - **PRD validation:** `python3.12 scripts/validate-prd.py` — run before committing PRD changes.
-- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands require `+nightly`. List targets: `cargo +nightly fuzz list --fuzz-dir fuzz`. See ADR-045 and `fuzz/README.md`.
+- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands require `+nightly`. List targets: `cargo +nightly fuzz list --fuzz-dir fuzz`. See ADR-045, the fuzzing infrastructure decision, and `fuzz/README.md`.
 
 ### Git
 
@@ -291,13 +292,13 @@ crates/              # Rust workspace — the protocol core
 │   ├── uniffi/      #   UniFFI (Swift, Kotlin)
 │   └── napi/        #   napi-rs (Node.js/Bun → TypeScript)
 ├── scp-identity/    # Native DID subsystem — DID-method, resolution/publication/lifecycle
-├── scp-dht/         # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 T1c-a)
+├── scp-dht/         # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 in-browser client, task T1c-a)
 ├── scp-clock/       # Clock port (wall-clock time) — wasm-safe capability leaf
 ├── scp-crypto/      # Ed25519 signature verification — wasm-safe capability leaf
 ├── scp-did/         # DID data model (DID, SigningKeyId, DidDocument, proofs, attestation) — wasm-safe
-├── scp-mls/         # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
-├── scp-client/      # Single-threaded in-browser participant driver over scp-mls (ADR-057)
-├── scp-client-wasm/ # wasm-bindgen browser surface over scp-client (ADR-057)
+├── scp-mls/         # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057 in-browser client)
+├── scp-client/      # Single-threaded in-browser participant driver over scp-mls (ADR-057 in-browser client)
+├── scp-client-wasm/ # wasm-bindgen browser surface over scp-client (ADR-057 in-browser client)
 ├── scp-transport/   # Relay, adapters, blob storage
 ├── scp-node/        # Application node binary (relay + HTTP + identity)
 ├── scp-platform/    # Platform abstractions (KeyCustody, Storage, DeviceAttestation)
@@ -308,7 +309,7 @@ crates/              # Rust workspace — the protocol core
 
 bindings/            # Language SDK wrappers — the developer-facing API
 ├── python/          # scp_sdk package (wraps PyO3 bridge)
-├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge; browser = in-browser SCP client over scp-client-wasm, keys on-device per ADR-057)
+├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge; browser = in-browser SCP client over scp-client-wasm, keys on-device per ADR-057, the in-browser client)
 ├── swift/           # SCP Swift package (wraps UniFFI bridge)
 └── kotlin/          # scp-kt (wraps UniFFI bridge) — Android extensions
 ```
