@@ -151,6 +151,15 @@ Weakening, removing, or exempting existing assertions requires human approval.
 - See `.docs/standards/sdk-common.md` §Stub and Placeholder Policy
 - **No dev/test-only stand-in may mask a missing production implementation (see the builder tenet).** A stub returns a documented, story-referenced gap on its own path; it does NOT reach for a test-only nullifier (in-memory custody/DHT/attestation, no-op verifier, placeholder value) to *appear* functional in production. Prod fails closed until the real backend lands. The prove-absence gate allowlists zero nullifiers — deferring a real backend to a tracked issue never authorizes shipping a stand-in for it.
 
+**Prose (MANDATORY — governs every sentence written for a human reader: chat responses, specs, ADRs, PRD stories, commit bodies, PR descriptions, code comments, review findings, README text, artifact copy):**
+- **Write concretely.** Give every transitive verb its explicit direct object. Name the owner behind every possessive. State what each clause does to the clause beside it.
+- **Never join two clauses with a bare comma when a logical relation connects them.** Write the relation out with `because`, `so`, `when`, `after`, `although`, or `which means`. A comma splice hides whether the second clause causes the first, follows it in time, or merely accompanies it, and the reader cannot recover which relation the writer intended.
+- **"Each verb gets its own object, no zeugmas"** (Mike, 2026-07-29, verbatim). Rewrite "returns home wearing his blood and a self-defense story" as "returns home covered in his blood, and tells the police that she killed him in self-defense."
+- **"Resist metaphorical, poetic, or analogical language"** (Mike, 2026-07-29, verbatim). Replace each metaphor and each poetically compressed phrase with the literal claim it stands for. Write "kinship reveals appear in 7% of 1970s twist films and in 11% of 1980s twist films," not "the mode steps up and never falls back."
+- **Give every statistic an explicit denominator.** Write "23% of the twist films we catalogued from the 1920s," not "23% of twist films."
+- **Interrogate every sentence before you ship it.** Ask three questions: have I hidden a subordinate relation? Have I dropped a subject or an object? Does this sentence admit two contradictory readings? If any answer is yes, rewrite the sentence.
+- **Why this rule exists:** the poetically compressed register — "The asylum frame arrives", "Amy authors her own death and grades the coverage", "returns home wearing his blood and a self-defense story" — deletes the agent, deletes the object, and deletes the causal link, so contradictory readings coexist and the reader cannot determine which reading the writer meant.
+
 ### Toolchain
 
 All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm or npx** — bun only for JS/TS. System `python3` is Xcode 3.9 — **do not use it**; use `python3.12`.
