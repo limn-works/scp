@@ -56,10 +56,10 @@ use crate::cover_traffic::{
 };
 use crate::error::TransportError;
 use crate::heartbeat::{HeartbeatConfig, HeartbeatMonitor};
-use crate::native::{relay_error_text, sanitize_relay_text};
 use crate::profile::TransportProfile;
 use crate::relay::connection::{SourcedRelayUrl, validate_relay_url};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
+use scp_relay_client::{relay_error_text, sanitize_relay_text};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
 /// [`TransportAdapter`] methods to ensure the trait is dyn-compatible.
