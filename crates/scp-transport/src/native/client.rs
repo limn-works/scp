@@ -39,7 +39,7 @@ use scp_core::envelope::OuterEnvelope;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::native::relay_error_text;
+use scp_relay_client::relay_error_text;
 
 use zeroize::Zeroizing;
 

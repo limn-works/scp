@@ -75,62 +75,6 @@ use std::sync::{Arc, RwLock};
 
 use crate::traits::TransportAdapter;
 
-/// Renders relay-supplied text safe to put in an operator log line or a
-/// `TransportError` message.
-///
-/// **This is the authoritative sanitizer for relay-supplied text; every site
-/// that folds a relay's own `RelayMessage::Err { msg }` into a Rust string goes
-/// through [`relay_error_text`], which calls this.**
-///
-/// A relay is untrusted (see the encryption-as-access-control tenet), so `msg`
-/// is an attacker-controlled string that lands in operator logs and — via
-/// `IdentityError::RelayQueryFailed` → `ResolutionError::NetworkUnavailable` —
-/// crosses the FFI boundary into every language SDK.
-///
-/// # Why a positive whitelist and not an escape-the-bad-ones denylist
-///
-/// The obvious spelling, `char::is_control()`, is Unicode general category `Cc`
-/// ONLY. It does not cover U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR —
-/// which a large fraction of log viewers and every ECMAScript-based log pipeline
-/// treat as line terminators, so a hostile relay could still forge a whole log
-/// line — nor U+202E RIGHT-TO-LEFT OVERRIDE, which re-renders the surrounding
-/// `relay_url = …` field as attacker-chosen text and thereby inverts the very
-/// finding the log exists to deliver (WHICH relay is suppressing this DID).
-/// Chasing those categories one at a time is an unbounded denylist. Permitting
-/// printable ASCII plus space and escaping everything else is closed by
-/// construction: no future Unicode addition can widen it.
-///
-/// Escaped rather than stripped so the original is still legible, and truncated
-/// so a hostile relay cannot flood the log — or an SDK error string — from one
-/// rejection.
-pub(crate) fn sanitize_relay_text(text: &str) -> String {
-    const MAX_LEN: usize = 512;
-    let mut out = String::with_capacity(text.len().min(MAX_LEN));
-    for c in text.chars() {
-        if out.len() >= MAX_LEN {
-            out.push('…');
-            break;
-        }
-        if c.is_ascii_graphic() || c == ' ' {
-            out.push(c);
-        } else {
-            out.extend(c.escape_default());
-        }
-    }
-    out
-}
-
-/// The one way relay-supplied error text becomes a Rust string.
-///
-/// `code` is a relay-supplied integer and needs no escaping; `msg` is
-/// attacker-controlled free text and goes through [`sanitize_relay_text`].
-/// Every `RelayMessage::Err` site in this module calls this rather than
-/// formatting `msg` directly, so the READ half and the WRITE half cannot
-/// diverge in how much they trust a relay.
-pub(crate) fn relay_error_text(code: u16, msg: &str) -> String {
-    format!("relay error {code}: {}", sanitize_relay_text(msg))
-}
-
 /// A late-bound `relay_url -> adapter` set.
 ///
 /// Both halves of Model B relay DID resolution — [`TransportRelayQuerier`]
@@ -157,10 +101,25 @@ pub(crate) struct BoundRelays {
 }
 
 impl std::fmt::Debug for BoundRelays {
+    /// Renders the poisoned state structurally and emits NOTHING to `tracing`.
+    ///
+    /// `Debug::fmt` must stay side-effect-free. `TransportRelayPublisher` and
+    /// `TransportRelayQuerier` both derive `Debug`, so `{:?}` on either is public
+    /// API, and it is routinely invoked from inside a tracing event's own field
+    /// formatting (`debug!(publisher = ?p)`) — emitting an event from there
+    /// re-enters the subscriber while it is formatting, which a downstream
+    /// subscriber holding a lock across `event()` would deadlock on. That is why
+    /// [`len`](BoundRelays::len) is the one reader that does not report: this is
+    /// its only caller, and "0 relays" and "poisoned" are distinguished here in
+    /// the output instead.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BoundRelays")
-            .field("bound_relays", &self.len())
-            .finish()
+        let mut out = f.debug_struct("BoundRelays");
+        if self.relays.is_poisoned() {
+            out.field("bound_relays", &"<POISONED>")
+        } else {
+            out.field("bound_relays", &self.len())
+        }
+        .finish()
     }
 }
 
@@ -227,15 +186,15 @@ impl BoundRelays {
         )
     }
 
-    /// Number of relays currently bound.
+    /// Number of relays currently bound; `0` if the map is poisoned.
+    ///
+    /// Deliberately silent, unlike the other readers: this is an observability
+    /// accessor, and its only caller is a `Debug` impl (which reports the
+    /// poisoned state structurally instead). The publish/resolve read paths —
+    /// [`get`](Self::get), [`snapshot`](Self::snapshot),
+    /// [`unbind`](Self::unbind) — are the ones that report.
     pub(crate) fn len(&self) -> usize {
-        self.relays.read().map_or_else(
-            |_| {
-                Self::report_poisoned("len");
-                0
-            },
-            |m| m.len(),
-        )
+        self.relays.read().map_or(0, |m| m.len())
     }
 
     /// Reports a poisoned binding map from a READ path.
