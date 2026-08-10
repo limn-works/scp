@@ -1,6 +1,7 @@
 # Backend Agent Memory (scoped)
 
 - [finding-cargo-deny-highest-version-only](finding_cargo_deny_highest_version_only.md) — cargo-deny flags only the HIGHEST version of a duplicated crate; a dep bump can green the gate while unsound copies still ship. Also: local cargo-deny 0.19 misses `unsound` advisories that CI's 0.20.2 catches
+- [project-2028-2029-welcome-ceiling-followups](project_2028_2029_welcome_ceiling_followups.md) — testing traps: scp-testing persistence.rs is `#![cfg(any())]`-dead; CI enables `*/testing` so production `cfg!(testing)` arms are untestable
 
 - [project-adr057-transport-jssocket](project_adr057_transport_jssocket.md) — ADR-057 JsSocket relay-transport slice; Step-2 finding: MLS SignatureKeyPair ED25519 private = 32-byte seed, recover via serde (private() is test-utils-gated); send_message()→() break analysis
 
