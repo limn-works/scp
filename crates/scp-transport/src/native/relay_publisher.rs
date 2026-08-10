@@ -40,7 +40,10 @@
 //! would hand an attacker who controls one relay of N permanent, silent
 //! suppression on that relay (§3.10.8): resolvers consulting it would never see
 //! the record while the publisher saw nothing wrong. Per-relay rejections are
-//! additionally logged at `warn` naming the relay URL.
+//! additionally logged at `warn` naming the relay URL, with the relay's own
+//! rejection text rendered inert first — see
+//! [`sanitize_relay_text`](crate::native::sanitize_relay_text) for why the
+//! permitted set is a whitelist rather than an escaped-control-character list.
 
 use std::sync::Arc;
 
@@ -49,32 +52,8 @@ use scp_identity::republish::{RelayPublishOutcome, RelayPublisher};
 use scp_protocol::envelope::did_record::DidRecordV1;
 use tracing::{debug, warn};
 
-use crate::native::BoundRelays;
+use crate::native::{BoundRelays, sanitize_relay_text};
 use crate::traits::{RoutingId, TransportAdapter};
-
-/// Renders relay-supplied text safe to put in a log line.
-///
-/// A rejection error wraps the relay's own `RelayMessage::Err { msg }` — an
-/// UNTRUSTED string from an untrusted party. Embedded newlines/CR would forge
-/// whole operator log lines; other control characters can corrupt a terminal.
-/// Escaped rather than stripped so the original is still legible, and truncated
-/// so a hostile relay cannot flood the log from one rejection.
-fn sanitize_relay_text(text: &str) -> String {
-    const MAX_LEN: usize = 512;
-    let mut out = String::with_capacity(text.len().min(MAX_LEN));
-    for c in text.chars() {
-        if out.len() >= MAX_LEN {
-            out.push('…');
-            break;
-        }
-        if c.is_control() {
-            out.push_str(&c.escape_default().to_string());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
 
 /// Production [`RelayPublisher`] that publishes DID-record frames over a live
 /// transport.
@@ -476,6 +455,58 @@ mod tests {
             "one rejection cannot flood the log, got {} chars",
             flood.chars().count()
         );
+    }
+
+    /// The line-forging characters that are NOT Unicode category `Cc`, so a
+    /// `char::is_control()` filter lets every one of them through.
+    ///
+    /// U+2028/U+2029 terminate a line in ECMAScript and in most log viewers, so
+    /// they forge exactly the log line the escaping exists to prevent. U+202E
+    /// re-renders the rest of the line right-to-left, inverting the `relay_url`
+    /// field that names WHICH relay is suppressing the DID (§3.10.8). U+200B and
+    /// U+FEFF are invisible and can hide text inside an otherwise honest line.
+    #[test]
+    fn non_cc_line_forging_characters_do_not_survive() {
+        for (label, hostile) in [
+            ("U+2028 LINE SEPARATOR", '\u{2028}'),
+            ("U+2029 PARAGRAPH SEPARATOR", '\u{2029}'),
+            ("U+202E RIGHT-TO-LEFT OVERRIDE", '\u{202E}'),
+            ("U+2066 LEFT-TO-RIGHT ISOLATE", '\u{2066}'),
+            ("U+200B ZERO WIDTH SPACE", '\u{200B}'),
+            ("U+FEFF BYTE ORDER MARK", '\u{FEFF}'),
+            ("U+0085 NEXT LINE", '\u{0085}'),
+        ] {
+            assert!(
+                !hostile.is_ascii_graphic() && hostile != ' ',
+                "{label} must be outside the permitted set by construction"
+            );
+            let sanitized = sanitize_relay_text(&format!("rejected{hostile}FORGED LINE"));
+            assert!(
+                !sanitized.contains(hostile),
+                "{label} survived sanitization: {sanitized:?}"
+            );
+            assert!(
+                sanitized.contains("FORGED LINE"),
+                "{label}: the text stays legible, just inert: {sanitized:?}"
+            );
+        }
+    }
+
+    /// The permitted set is a positive whitelist, so it is stated once and
+    /// checked directly: every printable ASCII character plus space passes
+    /// through untouched, and nothing else does.
+    #[test]
+    fn sanitizer_permits_exactly_printable_ascii_and_space() {
+        let printable: String = (0x20u8..=0x7Eu8).map(char::from).collect();
+        assert_eq!(
+            sanitize_relay_text(&printable),
+            printable,
+            "printable ASCII + space must pass through unchanged"
+        );
+        for c in ['\u{0}', '\u{1F}', '\u{7F}', '\u{9F}', 'é', '→', '🙂'] {
+            let out = sanitize_relay_text(&c.to_string());
+            assert_ne!(out, c.to_string(), "{c:?} must be escaped, got {out:?}");
+        }
     }
 
     // unbind removes a relay from the publish set.

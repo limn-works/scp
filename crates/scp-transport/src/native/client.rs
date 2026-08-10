@@ -39,6 +39,8 @@ use scp_core::envelope::OuterEnvelope;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::native::relay_error_text;
+
 use zeroize::Zeroizing;
 
 use crate::backoff::ReconnectBackoff;
@@ -769,8 +771,8 @@ impl NativeRelayClient {
             RelayMessage::Ok { .. } => Ok(rx),
             RelayMessage::Err { code, msg, .. } => {
                 self.subscriptions.remove(&rid);
-                Err(TransportError::SubscriptionFailed(format!(
-                    "relay error {code}: {msg}"
+                Err(TransportError::SubscriptionFailed(relay_error_text(
+                    code, &msg,
                 )))
             }
             _ => {
@@ -803,9 +805,9 @@ impl NativeRelayClient {
             .remove(&crate::traits::RoutingId::new(*routing_id));
 
         match response {
-            RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
-                "relay error {code}: {msg}"
-            ))),
+            RelayMessage::Err { code, msg, .. } => {
+                Err(TransportError::SendFailed(relay_error_text(code, &msg)))
+            }
             _ => Ok(()),
         }
     }
@@ -894,9 +896,9 @@ impl NativeRelayClient {
 
         match response {
             RelayMessage::Ok { .. } => Ok(()),
-            RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
-                "relay error {code}: {msg}"
-            ))),
+            RelayMessage::Err { code, msg, .. } => {
+                Err(TransportError::SendFailed(relay_error_text(code, &msg)))
+            }
             _ => Err(TransportError::ProtocolError(
                 "unexpected response to PUBLISH (raw)".to_string(),
             )),
@@ -1082,9 +1084,7 @@ impl NativeRelayClient {
                 term = &mut term_rx => {
                     match term {
                         Ok(RelayMessage::Err { code, msg, .. }) => {
-                            return Err(TransportError::SendFailed(format!(
-                                "relay error {code}: {msg}"
-                            )));
+                            return Err(TransportError::SendFailed(relay_error_text(code, &msg)));
                         }
                         // query_complete (or any other terminal response for this
                         // ref_id): drain blobs already delivered, then stop.
@@ -1283,7 +1283,8 @@ impl NativeRelayClient {
 
         match response {
             RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
-                "cover traffic relay error {code}: {msg}"
+                "cover traffic {}",
+                relay_error_text(code, &msg)
             ))),
             _ => Ok(()),
         }

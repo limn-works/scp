@@ -191,7 +191,7 @@ pub trait HealingPublisher: Send + Sync {
     /// answer to a question the record already answers. `DidRecordV1` can only
     /// be built through the validating [`DidRecordV1::try_new`], so both layers
     /// receive one already-well-formed unit (see
-    /// [`RelayPublisher`](crate::republish::RelayPublisher) for the same
+    /// [`RelayPublisher`] for the same
     /// discipline on the publish path).
     ///
     /// # Arguments
