@@ -25,3 +25,6 @@ artifact diverged) so future passes trace faster.
   `scp-client-wasm::WasmScpClient`; `resubscribe_all` was not (inter-layer gap). Also: type
   renames (Socket→RelaySink) leave stray doc refs; native reciprocal-announce is a legit
   recorded follow-up.
+- [MCP #1341 resources/subscribe vs ADR-015](mcp_1341_subscribe_adr015.md) — subscribe made
+  honest, but `tools.listChanged` still hard-coded, `resource:{type}` denies read on every
+  bridge, AC7/AC8 unmet, `sse_router` leaks its pump, stdio tests exercise a copy.
