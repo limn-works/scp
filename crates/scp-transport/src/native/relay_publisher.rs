@@ -41,9 +41,9 @@
 //! suppression on that relay (§3.10.8): resolvers consulting it would never see
 //! the record while the publisher saw nothing wrong. Per-relay rejections are
 //! additionally logged at `warn` naming the relay URL, with the relay's own
-//! rejection text rendered inert first — see
-//! [`sanitize_relay_text`](crate::native::sanitize_relay_text) for why the
-//! permitted set is a whitelist rather than an escaped-control-character list.
+//! rejection text rendered inert first — see `native::sanitize_relay_text` for
+//! why the permitted set is a whitelist rather than an
+//! escaped-control-character list.
 
 use std::sync::Arc;
 
@@ -52,7 +52,9 @@ use scp_identity::republish::{RelayPublishOutcome, RelayPublisher};
 use scp_protocol::envelope::did_record::DidRecordV1;
 use tracing::{debug, warn};
 
-use crate::native::{BoundRelays, sanitize_relay_text};
+use scp_relay_client::sanitize_relay_text;
+
+use crate::native::BoundRelays;
 use crate::traits::{RoutingId, TransportAdapter};
 
 /// Production [`RelayPublisher`] that publishes DID-record frames over a live
@@ -192,6 +194,8 @@ mod tests {
     struct RecordingPublishAdapter {
         published: Mutex<Vec<(RoutingId, u64, Vec<u8>)>>,
         should_fail: bool,
+        /// Rejection text the relay "sent". `None` uses a generic timeout.
+        failure_text: Option<String>,
     }
 
     impl RecordingPublishAdapter {
@@ -203,6 +207,17 @@ mod tests {
             Self {
                 published: Mutex::new(Vec::new()),
                 should_fail: true,
+                failure_text: None,
+            }
+        }
+
+        /// A relay that rejects with attacker-chosen text, so a test can assert
+        /// what reaches the log line and the surfaced error.
+        fn failing_with(text: &str) -> Self {
+            Self {
+                published: Mutex::new(Vec::new()),
+                should_fail: true,
+                failure_text: Some(text.to_owned()),
             }
         }
 
@@ -250,7 +265,11 @@ mod tests {
             blob: Vec<u8>,
         ) -> BoxFut<'_, Result<(), TransportError>> {
             if self.should_fail {
-                return Box::pin(async { Err(TransportError::Timeout) });
+                let err = self
+                    .failure_text
+                    .clone()
+                    .map_or(TransportError::Timeout, TransportError::SendFailed);
+                return Box::pin(async move { Err(err) });
             }
             self.published
                 .lock()
@@ -434,79 +453,38 @@ mod tests {
         );
     }
 
-    // A hostile relay's rejection text cannot forge operator log lines.
-    #[test]
-    fn relay_supplied_text_is_escaped_and_bounded() {
-        let forged = sanitize_relay_text(
-            "rejected\n2026-08-08T00:00:00Z  WARN scp: all relays healthy\r\u{7}",
-        );
-        assert!(
-            !forged.contains('\n') && !forged.contains('\r') && !forged.contains('\u{7}'),
-            "control characters must not survive into a log line: {forged}"
-        );
-        assert!(
-            forged.contains("all relays healthy"),
-            "the original text stays legible, just inert: {forged}"
+    // The generic sanitizer contract (whitelist completeness, the non-`Cc`
+    // line-forging characters, the length bound, backslash disambiguation) is
+    // owned and tested where the function lives — `scp_relay_client::untrusted_text`.
+    // What belongs HERE is that this publisher actually routes a relay's
+    // rejection text through it before that text reaches a log line or a
+    // `RelayPublishFailed` message.
+    #[tokio::test]
+    async fn publisher_sanitizes_relay_rejection_text_before_surfacing_it() {
+        let publisher = TransportRelayPublisher::new();
+        publisher.bind(
+            "wss://hostile.example.com/scp/v1",
+            Arc::new(RecordingPublishAdapter::failing_with(
+                "rejected\n2026-08-10T00:00:00Z  WARN scp: all relays healthy",
+            )),
         );
 
-        let flood = sanitize_relay_text(&"x".repeat(10_000));
+        let (vk, sk) = keypair(9);
+        let (record, _) = signed_record(&vk, &sk, 1);
+        let err = publisher
+            .publish(BLOB_TTL, &record)
+            .await
+            .expect_err("the only bound relay rejected, so this must fail closed");
+        let rendered = err.to_string();
+
         assert!(
-            flood.chars().count() <= 513,
-            "one rejection cannot flood the log, got {} chars",
-            flood.chars().count()
+            !rendered.contains('\n'),
+            "the relay's newline must not reach the error string: {rendered:?}"
         );
-    }
-
-    /// The line-forging characters that are NOT Unicode category `Cc`, so a
-    /// `char::is_control()` filter lets every one of them through.
-    ///
-    /// U+2028/U+2029 terminate a line in ECMAScript and in most log viewers, so
-    /// they forge exactly the log line the escaping exists to prevent. U+202E
-    /// re-renders the rest of the line right-to-left, inverting the `relay_url`
-    /// field that names WHICH relay is suppressing the DID (§3.10.8). U+200B and
-    /// U+FEFF are invisible and can hide text inside an otherwise honest line.
-    #[test]
-    fn non_cc_line_forging_characters_do_not_survive() {
-        for (label, hostile) in [
-            ("U+2028 LINE SEPARATOR", '\u{2028}'),
-            ("U+2029 PARAGRAPH SEPARATOR", '\u{2029}'),
-            ("U+202E RIGHT-TO-LEFT OVERRIDE", '\u{202E}'),
-            ("U+2066 LEFT-TO-RIGHT ISOLATE", '\u{2066}'),
-            ("U+200B ZERO WIDTH SPACE", '\u{200B}'),
-            ("U+FEFF BYTE ORDER MARK", '\u{FEFF}'),
-            ("U+0085 NEXT LINE", '\u{0085}'),
-        ] {
-            assert!(
-                !hostile.is_ascii_graphic() && hostile != ' ',
-                "{label} must be outside the permitted set by construction"
-            );
-            let sanitized = sanitize_relay_text(&format!("rejected{hostile}FORGED LINE"));
-            assert!(
-                !sanitized.contains(hostile),
-                "{label} survived sanitization: {sanitized:?}"
-            );
-            assert!(
-                sanitized.contains("FORGED LINE"),
-                "{label}: the text stays legible, just inert: {sanitized:?}"
-            );
-        }
-    }
-
-    /// The permitted set is a positive whitelist, so it is stated once and
-    /// checked directly: every printable ASCII character plus space passes
-    /// through untouched, and nothing else does.
-    #[test]
-    fn sanitizer_permits_exactly_printable_ascii_and_space() {
-        let printable: String = (0x20u8..=0x7Eu8).map(char::from).collect();
-        assert_eq!(
-            sanitize_relay_text(&printable),
-            printable,
-            "printable ASCII + space must pass through unchanged"
+        assert!(
+            rendered.contains("all relays healthy"),
+            "the text stays legible, just inert: {rendered:?}"
         );
-        for c in ['\u{0}', '\u{1F}', '\u{7F}', '\u{9F}', 'é', '→', '🙂'] {
-            let out = sanitize_relay_text(&c.to_string());
-            assert_ne!(out, c.to_string(), "{c:?} must be escaped, got {out:?}");
-        }
     }
 
     // unbind removes a relay from the publish set.
