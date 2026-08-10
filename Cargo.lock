@@ -5388,6 +5388,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "z-base-32",
  "zeroize",
 ]
