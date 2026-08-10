@@ -75,6 +75,62 @@ use std::sync::{Arc, RwLock};
 
 use crate::traits::TransportAdapter;
 
+/// Renders relay-supplied text safe to put in an operator log line or a
+/// `TransportError` message.
+///
+/// **This is the authoritative sanitizer for relay-supplied text; every site
+/// that folds a relay's own `RelayMessage::Err { msg }` into a Rust string goes
+/// through [`relay_error_text`], which calls this.**
+///
+/// A relay is untrusted (see the encryption-as-access-control tenet), so `msg`
+/// is an attacker-controlled string that lands in operator logs and — via
+/// `IdentityError::RelayQueryFailed` → `ResolutionError::NetworkUnavailable` —
+/// crosses the FFI boundary into every language SDK.
+///
+/// # Why a positive whitelist and not an escape-the-bad-ones denylist
+///
+/// The obvious spelling, `char::is_control()`, is Unicode general category `Cc`
+/// ONLY. It does not cover U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR —
+/// which a large fraction of log viewers and every ECMAScript-based log pipeline
+/// treat as line terminators, so a hostile relay could still forge a whole log
+/// line — nor U+202E RIGHT-TO-LEFT OVERRIDE, which re-renders the surrounding
+/// `relay_url = …` field as attacker-chosen text and thereby inverts the very
+/// finding the log exists to deliver (WHICH relay is suppressing this DID).
+/// Chasing those categories one at a time is an unbounded denylist. Permitting
+/// printable ASCII plus space and escaping everything else is closed by
+/// construction: no future Unicode addition can widen it.
+///
+/// Escaped rather than stripped so the original is still legible, and truncated
+/// so a hostile relay cannot flood the log — or an SDK error string — from one
+/// rejection.
+pub(crate) fn sanitize_relay_text(text: &str) -> String {
+    const MAX_LEN: usize = 512;
+    let mut out = String::with_capacity(text.len().min(MAX_LEN));
+    for c in text.chars() {
+        if out.len() >= MAX_LEN {
+            out.push('…');
+            break;
+        }
+        if c.is_ascii_graphic() || c == ' ' {
+            out.push(c);
+        } else {
+            out.extend(c.escape_default());
+        }
+    }
+    out
+}
+
+/// The one way relay-supplied error text becomes a Rust string.
+///
+/// `code` is a relay-supplied integer and needs no escaping; `msg` is
+/// attacker-controlled free text and goes through [`sanitize_relay_text`].
+/// Every `RelayMessage::Err` site in this module calls this rather than
+/// formatting `msg` directly, so the READ half and the WRITE half cannot
+/// diverge in how much they trust a relay.
+pub(crate) fn relay_error_text(code: u16, msg: &str) -> String {
+    format!("relay error {code}: {}", sanitize_relay_text(msg))
+}
+
 /// A late-bound `relay_url -> adapter` set.
 ///
 /// Both halves of Model B relay DID resolution — [`TransportRelayQuerier`]
@@ -134,21 +190,35 @@ impl BoundRelays {
     /// Removes the binding for a relay URL (e.g. on disconnect). Absent
     /// bindings are ignored.
     pub(crate) fn unbind(&self, relay_url: &str) {
-        if let Ok(mut relays) = self.relays.write() {
-            relays.remove(relay_url);
+        if self
+            .relays
+            .write()
+            .map(|mut m| m.remove(relay_url))
+            .is_err()
+        {
+            Self::report_poisoned("unbind");
         }
     }
 
     /// The adapter bound for `relay_url`, cloned out under a short lock.
     pub(crate) fn get(&self, relay_url: &str) -> Option<Arc<dyn TransportAdapter>> {
-        self.relays.read().ok()?.get(relay_url).cloned()
+        self.relays.read().map_or_else(
+            |_| {
+                Self::report_poisoned("get");
+                None
+            },
+            |m| m.get(relay_url).cloned(),
+        )
     }
 
     /// Every currently-bound `(relay_url, adapter)` pair, cloned out under a
     /// short lock so the guard never crosses an `.await`.
     pub(crate) fn snapshot(&self) -> Vec<(String, Arc<dyn TransportAdapter>)> {
         self.relays.read().map_or_else(
-            |_| Vec::new(),
+            |_| {
+                Self::report_poisoned("snapshot");
+                Vec::new()
+            },
             |m| {
                 m.iter()
                     .map(|(url, a)| (url.clone(), Arc::clone(a)))
@@ -159,6 +229,34 @@ impl BoundRelays {
 
     /// Number of relays currently bound.
     pub(crate) fn len(&self) -> usize {
-        self.relays.read().map_or(0, |m| m.len())
+        self.relays.read().map_or_else(
+            |_| {
+                Self::report_poisoned("len");
+                0
+            },
+            |m| m.len(),
+        )
+    }
+
+    /// Reports a poisoned binding map from a READ path.
+    ///
+    /// The read accessors degrade poison to "nothing bound", which is the right
+    /// fail-closed direction but the wrong *diagnosis*: a publisher whose map is
+    /// poisoned reports [`IdentityError::NoRelayBound`], and the republish loop
+    /// deliberately rate-limits that variant to roughly one report every 12
+    /// hours because it reads it as an unconfigured node no retry can heal. A
+    /// poisoned map on a node that HAS relays configured is a fault, not a
+    /// configuration state, so it must not inherit that quiet channel — the
+    /// operator would otherwise see "no relay bound" while the DID record
+    /// silently stops being republished and expires at TTL. `bind` already logs;
+    /// this makes the read half equally loud so the two states are never
+    /// confusable.
+    fn report_poisoned(accessor: &str) {
+        tracing::error!(
+            accessor,
+            "BoundRelays: the relay binding map is POISONED — reporting ZERO bound \
+             relays; DID publishing/resolution is dead for the life of the process. \
+             This is a FAULT, not an unconfigured node."
+        );
     }
 }

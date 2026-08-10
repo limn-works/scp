@@ -130,9 +130,18 @@ pub struct RelayPublishOutcome {
 
 impl RelayPublishOutcome {
     /// Every attempted relay accepted the record — the only fully healthy state.
+    ///
+    /// The `accepted > 0` conjunct is load-bearing, not redundant: `0 >= 0`
+    /// would make a `{ accepted: 0, attempted: 0 }` outcome vacuously "complete",
+    /// and [`relay_republish_loop`](crate::republish) treats a complete outcome by
+    /// resetting the failure counter and sleeping the FULL republish interval — so
+    /// a publisher that reached nothing would be reported as fully healthy for six
+    /// days. The `accepted >= 1` invariant on the field is a doc comment, and
+    /// [`RelayPublisher`] is a public trait any implementor can satisfy, so the
+    /// predicate enforces here what the type does not.
     #[must_use]
     pub const fn is_complete(&self) -> bool {
-        self.accepted >= self.attempted
+        self.accepted > 0 && self.accepted >= self.attempted
     }
 
     /// Relays that were attempted but did not accept.
@@ -1781,6 +1790,24 @@ mod tests {
         };
         assert!(!partial.is_complete());
         assert_eq!(partial.rejected(), 2);
+
+        // "Reached nothing" is never "fully healthy". `accepted >= attempted`
+        // alone is vacuously true here, and the loop's complete-arm resets the
+        // failure counter and sleeps the full 6-day interval — so a publisher
+        // that published to no one would report as healthy for six days. No
+        // production publisher constructs this today (an empty relay set is
+        // `NoRelayBound` and zero accepts is `RelayPublishFailed`), but
+        // `RelayPublisher` is a public trait and the invariant is only a doc
+        // comment on the field, so the predicate must not depend on it.
+        let reached_nothing = RelayPublishOutcome {
+            accepted: 0,
+            attempted: 0,
+        };
+        assert!(
+            !reached_nothing.is_complete(),
+            "a 0/0 outcome must never count as a complete publish"
+        );
+        assert_eq!(reached_nothing.rejected(), 0);
     }
 
     /// B4 / §3.10.8: an attacker controlling 1 of N relays must not get SILENT
