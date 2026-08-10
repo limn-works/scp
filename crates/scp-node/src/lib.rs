@@ -3316,33 +3316,35 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
 /// never the `find` target again. Inserting at the preferred position makes the
 /// premise the rewriter relies on true by construction instead of asserted.
 ///
-/// Additional relay entries keep their relative order after it; a NAT tier change
-/// does not move them. The service id is suffixed with a sequential index so
-/// multiple relays can coexist (`<did>#scp-relay-<n>`), renumbered here so the
-/// ids stay in document order.
+/// Additional relay entries keep their relative order after it, and their ids are
+/// left alone (see the comment on the insert). The node's own entry is suffixed
+/// with the next free sequential index so multiple relays can coexist
+/// (`<did>#scp-relay-<n>`).
 fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
     let insert_at = document
         .service
         .iter()
         .position(|s| s.service_type == "SCPRelay")
         .unwrap_or(document.service.len());
+    // The id is derived from the count of relay entries ALREADY present, not by
+    // renumbering the whole set. A caller-supplied document reaches this function
+    // verbatim through `IdentitySource::Explicit`, and its service ids are
+    // resolvable URIs that third parties may already reference; silently
+    // rewriting `did:x#my-primary-relay` to `did:x#scp-relay-2` would dangle
+    // them. The node names only the entry it owns.
+    let existing_relays = document
+        .service
+        .iter()
+        .filter(|s| s.service_type == "SCPRelay")
+        .count();
     document.service.insert(
         insert_at,
         scp_did::Service {
-            id: String::new(), // renumbered below, in document order
+            id: format!("{}#scp-relay-{}", document.id, existing_relays + 1),
             service_type: "SCPRelay".to_owned(),
             service_endpoint: relay_url.to_owned(),
         },
     );
-    let document_id = document.id.clone();
-    for (index, service) in document
-        .service
-        .iter_mut()
-        .filter(|s| s.service_type == "SCPRelay")
-        .enumerate()
-    {
-        service.id = format!("{document_id}#scp-relay-{}", index + 1);
-    }
 }
 
 /// Publishes a node's DID document, discriminating on the configured
@@ -6486,6 +6488,9 @@ mod tests {
             "so the tier loop's skip condition compares against the node's own \
              endpoint rather than the caller's"
         );
+        // The caller's service id is untouched. A DID service `id` is a
+        // resolvable URI a third party may already reference, so the node names
+        // only the entry it owns rather than renumbering the whole set.
         let ids: Vec<&str> = document
             .service
             .iter()
@@ -6495,10 +6500,15 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "did:dht:slottest#scp-relay-1",
-                "did:dht:slottest#scp-relay-2"
+                "did:dht:slottest#scp-relay-2",
+                "did:dht:slottest#scp-relay-1"
             ],
-            "ids stay sequential in document order after the insert"
+            "the node takes the next free index and leaves the caller's id alone"
+        );
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            ids.len(),
+            "service ids must stay unique within the document"
         );
     }
 
