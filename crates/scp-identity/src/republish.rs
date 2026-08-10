@@ -952,6 +952,38 @@ async fn relay_republish_loop<R: RelayPublisher>(
                 consecutive_failures = 0;
                 tokio::time::sleep(tokio::time::Duration::from_secs(republish_interval_secs)).await;
             }
+            // A zero-accept `Ok` is not a partial accept and must not be
+            // diagnosed as one. `is_complete()` correctly refuses to call it
+            // healthy, but the partial-accept arm below is built on the opposite
+            // premise — "the record IS live on at least one relay, so backing off
+            // would DoS the healthy ones" — and would log "reached only SOME bound
+            // relays" with `accepted=0 attempted=0 rejected=0`, a diagnosis that
+            // contradicts its own fields, then sleep the full 6-day cycle instead
+            // of retrying. No production publisher can produce this
+            // (`TransportRelayPublisher` returns `NoRelayBound` on an empty relay
+            // set and `RelayPublishFailed` on zero accepts), but `RelayPublisher`
+            // is a public trait and the `accepted >= 1` invariant is only prose,
+            // so a third-party implementation must land somewhere honest.
+            Ok(outcome) if outcome.accepted == 0 => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tracing::warn!(
+                    did = %did,
+                    attempted = outcome.attempted,
+                    consecutive_failures,
+                    "relay republish reported success while reaching NO relay — the \
+                     RelayPublisher implementation violates its `accepted >= 1` \
+                     contract; treating it as a failure and retrying with backoff"
+                );
+                if let Some(ref cb) = warning_cb {
+                    cb(RelayPublishDegraded {
+                        did: did.clone(),
+                        consecutive_failures,
+                        last_outcome: Some(outcome),
+                    });
+                }
+                let backoff = backoff_secs(consecutive_failures.saturating_sub(1));
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+            }
             Ok(outcome) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 tracing::warn!(
