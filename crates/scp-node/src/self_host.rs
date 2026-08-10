@@ -1547,7 +1547,7 @@ async fn start_self_did_republishing<D: DhtClient + 'static>(
 
     SelfDidRepublishing {
         manager,
-        reseed_task,
+        reseed_task: Some(reseed_task),
         stopped: false,
     }
 }
@@ -1558,9 +1558,13 @@ async fn start_self_did_republishing<D: DhtClient + 'static>(
 /// Held for the serve lifetime and torn down via [`stop`](Self::stop).
 struct SelfDidRepublishing<D: DhtClient + 'static> {
     manager: Arc<RepublishManager<D, TransportRelayPublisher>>,
-    /// The re-seed observer. Aborted BEFORE the manager is stopped — see
-    /// [`stop`](Self::stop).
-    reseed_task: tokio::task::JoinHandle<()>,
+    /// The re-seed observer. Aborted AND JOINED before the manager is stopped —
+    /// see [`stop`](Self::stop).
+    ///
+    /// `Option` so both teardown paths can take the handle by value: [`Drop`]
+    /// must move it into the task it spawns, because the join is the barrier and
+    /// a synchronous `drop` cannot perform it inline.
+    reseed_task: Option<tokio::task::JoinHandle<()>>,
     /// Set by [`stop`](Self::stop) so the [`Drop`] backstop stays out of the way
     /// on the deterministic teardown path.
     stopped: bool,
@@ -1580,14 +1584,13 @@ impl<D: DhtClient + 'static> SelfDidRepublishing<D> {
     /// DID document (a §10.12.1 address disclosure) past shutdown. Joining the
     /// aborted handle is the only barrier that rules that out.
     ///
-    /// The handle is awaited through `&mut` rather than by value because the type
-    /// carries a [`Drop`] backstop, and a type that implements `Drop` cannot be
-    /// moved out of field-by-field.
     async fn stop(mut self) {
-        self.reseed_task.abort();
-        // `Err(cancelled)` is the expected outcome; `Ok` means it finished
-        // first. Both mean the observer can no longer start an arm.
-        let _ = (&mut self.reseed_task).await;
+        if let Some(reseed) = self.reseed_task.take() {
+            reseed.abort();
+            // `Err(cancelled)` is the expected outcome; `Ok` means it finished
+            // first. Both mean the observer can no longer start an arm.
+            let _ = reseed.await;
+        }
         self.manager.stop_all().await;
         self.stopped = true;
     }
@@ -1606,19 +1609,34 @@ impl<D: DhtClient + 'static> Drop for SelfDidRepublishing<D> {
     /// record for the life of the process — the §10.12.1 address disclosure past
     /// shutdown that `stop` exists to prevent, reached by simply not calling it.
     ///
-    /// This cannot be the primary teardown: `Drop` is synchronous, so it can
-    /// abort the observer but must hand `stop_all` to the runtime. `stop` stays
-    /// the deterministic path (it JOINS the observer before draining the maps,
-    /// which this cannot); the flag keeps the two from doing the work twice.
-    /// Mirrors the existing `Drop` backstop on `TierReEvalHandle`.
+    /// `Drop` is synchronous, so it cannot perform the join inline — but it MUST
+    /// still perform it, and hand-waving that away would reintroduce the exact
+    /// race `stop` documents. Aborting here and spawning a bare `stop_all` would
+    /// let the observer finish `start_republishing` on another worker AFTER the
+    /// spawned `stop_all` had drained the maps, leaving two detached arms
+    /// republishing this node's address forever — the very outcome the backstop
+    /// exists to prevent. So the handle is MOVED into the spawned task and joined
+    /// there, before `stop_all`, preserving `stop`'s ordering asynchronously.
+    ///
+    /// `stop` remains the deterministic path (it completes before returning);
+    /// the flag keeps the two from doing the work twice. Mirrors the existing
+    /// `Drop` backstop on `TierReEvalHandle`.
     fn drop(&mut self) {
         if self.stopped {
             return;
         }
-        self.reseed_task.abort();
+        let Some(reseed) = self.reseed_task.take() else {
+            return;
+        };
+        reseed.abort();
         let manager = Arc::clone(&self.manager);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move { manager.stop_all().await });
+            handle.spawn(async move {
+                // The barrier: the observer can no longer be mid-`start_republishing`
+                // once this resolves, so `stop_all` cannot be outrun by a re-seed.
+                let _ = reseed.await;
+                manager.stop_all().await;
+            });
         } else {
             tracing::error!(
                 "self-DID republishing dropped without `stop()` and outside a Tokio \
@@ -3786,14 +3804,11 @@ mod tests {
         // The node retracts its published record. The observer runs on its own
         // task, so poll rather than assume it has been scheduled.
         slot.send_modify(|state| state.record = None);
-        for _ in 0..200u32 {
-            if republish.manager.active_count().await == 0
+        settle_until("the retracted record to stop both arms", async || {
+            republish.manager.active_count().await == 0
                 && republish.manager.active_relay_count().await == 0
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        })
+        .await;
 
         assert_eq!(
             republish.manager.active_count().await,
@@ -3904,17 +3919,39 @@ mod tests {
     /// The re-seed path crosses several tasks (publish → slot → observer →
     /// manager → arm), so a fixed number of yields would be a guess. Bounded, so
     /// a genuine failure to re-seed fails the test rather than hanging.
+    ///
+    /// # Why the budget is wall-clock and not an iteration count
+    ///
+    /// A plain `for _ in 0..N { yield_now().await }` is only a valid wait on a
+    /// CURRENT-THREAD runtime, where yielding necessarily hands the one worker to
+    /// the task being waited on. `stop_is_a_barrier_even_against_an_in_flight_reseed`
+    /// runs on `worker_threads = 2` deliberately, and there the awaited task may
+    /// be on the OTHER worker: the yield loop then spins through its whole budget
+    /// in microseconds without that worker having been scheduled at all. Under a
+    /// full-workspace test run (every core saturated) that is exactly what
+    /// happened, and the test failed with "timed out waiting for the initial DHT
+    /// arm to publish" while passing in isolation — a flake, not a regression.
+    ///
+    /// [`std::time::Instant`] is the REAL clock and is unaffected by
+    /// `#[tokio::test(start_paused = true)]`, so one deadline is correct for both
+    /// the paused current-thread tests and the multi-thread one. The generous
+    /// budget costs nothing on the happy path (the condition holds after a few
+    /// hops); it is only spent when the test is going to fail anyway.
     async fn settle_until<F>(label: &str, mut cond: F)
     where
         F: AsyncFnMut() -> bool,
     {
-        for _ in 0..2_000u32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
             if cond().await {
                 return;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {label}"
+            );
             tokio::task::yield_now().await;
         }
-        panic!("timed out waiting for {label}");
     }
 
     /// THE regression: a NAT tier change re-publishes the DID document with a NEW

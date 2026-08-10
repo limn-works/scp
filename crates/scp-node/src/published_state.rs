@@ -108,12 +108,17 @@ impl<T: Clone> LiveSlot<T> {
 /// Points the document's preferred `SCPRelay` endpoint at `new_url`, appending
 /// an entry when the document carries none.
 ///
-/// The **first** `SCPRelay` entry is the subject's preferred relay (§18.2.3) —
-/// the one both builders establish
-/// ([`add_relay_service`](scp_did::DidDocument::add_relay_service) /
-/// [`push_relay_service`](crate::push_relay_service)) and the only one this
-/// node's own reachability owns; any further entries are additional relays a
-/// tier change does not move. Keying on position rather than on the address the
+/// The **first** `SCPRelay` entry is the subject's preferred relay (§18.2.3) and
+/// the only one this node's own reachability owns; any further entries are
+/// additional relays a tier change does not move.
+///
+/// [`push_relay_service`](crate::push_relay_service) is what ESTABLISHES that
+/// position — it inserts the node's entry ahead of any the incoming document
+/// already carried. `scp_did::DidDocument::add_relay_service` APPENDS and is
+/// therefore not an establisher; it is used only by the domain builder, which
+/// spawns no tier re-evaluation, so no document built that way ever reaches this
+/// function. Do not wire a tier loop to that path without giving it the
+/// positional installer too. Keying on position rather than on the address the
 /// node currently advertises is what makes this idempotent and retry-stable: the
 /// two are allowed to differ while a publish is failing, so an
 /// address-keyed rewrite would match nothing on the retry and append a duplicate.
@@ -216,17 +221,42 @@ pub async fn apply_tier_change(
     // draining it.
     if previous_relay_url != new_relay_url
         && let Some(tx) = event_tx
-        && let Err(e) = tx.try_send(NatTierChange::TierChanged {
+    {
+        let event = NatTierChange::TierChanged {
             previous_relay_url,
             new_relay_url: new_relay_url.to_owned(),
             reason: trigger_reason.to_owned(),
-        })
-    {
-        tracing::warn!(
-            error = %e, new_url = %new_relay_url,
-            "tier-change event dropped: no consumer is draining the TierChanged \
-             stream. The node's address still advanced — only the notification \
-             was lost."
-        );
+        };
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // A consumer exists but has stopped draining. The newest event is
+                // the one that matters for a "where am I now" stream, so dropping
+                // it is the wrong end of the queue — but an `mpsc::Sender` cannot
+                // evict the oldest (`try_recv` is on the receiver), and the
+                // latest-value type that models this correctly,
+                // `tokio::sync::watch`, would change the public
+                // `ApplicationNode::tier_change_rx` signature. The gap is at least
+                // DETECTABLE rather than silent: every event carries
+                // `previous_relay_url`, so a consumer that resumes sees it not
+                // match the last `new_relay_url` it observed, and the
+                // authoritative surfaces (`.well-known/scp`, the DID document,
+                // `relay_url()`) never depended on this stream in the first place.
+                tracing::warn!(
+                    new_url = %new_relay_url,
+                    "tier-change queue full: a consumer has stopped draining, so \
+                     this event is dropped. The node's address still advanced — \
+                     only the notification was lost."
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // The consumer is gone for good. Not a fault: the receiver is
+                // optional and the authoritative surfaces already advanced.
+                tracing::debug!(
+                    new_url = %new_relay_url,
+                    "tier-change event dropped: the TierChanged receiver is closed"
+                );
+            }
+        }
     }
 }
