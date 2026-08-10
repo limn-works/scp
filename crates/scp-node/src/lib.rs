@@ -3268,21 +3268,56 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
 // Reach::Domain ACME-failure fallthrough in config.rs's build engine)
 // ---------------------------------------------------------------------------
 
-/// Appends an `SCPRelay` service entry to the DID document for `relay_url`.
+/// Installs the node's OWN `SCPRelay` service entry for `relay_url` at the
+/// preferred position — first among the document's `SCPRelay` entries (§18.2.3).
 ///
-/// The service id is suffixed with the next sequential index so multiple relays
-/// can coexist on one document (`<did>#scp-relay-<n>`).
+/// # Why it inserts rather than appends
+///
+/// [`repoint_relay_service`](crate::published_state) keys the tier-change rewrite
+/// on POSITION: the first `SCPRelay` entry is the subject's preferred relay and
+/// the only one this node's own reachability owns. Nothing used to *establish*
+/// that position — this function appended, and so does
+/// [`DidDocument::add_relay_service`](scp_did::DidDocument::add_relay_service).
+/// The node's entry therefore landed first only when the incoming document
+/// happened to carry no relay entry at all.
+///
+/// It does not always. `IdentitySource::Explicit` is public API and hands the
+/// caller's document through verbatim, so a caller supplying a document that
+/// already names a relay pushed the node's own entry to position 1. Then the
+/// first tier tick found `document_relay_url` (position 0 — the CALLER's relay)
+/// disagreeing with the address the node advertises, ran a tier change that had
+/// not happened, rewrote the caller's preferred relay to the node's address, and
+/// left the node's own entry at position 1 naming the pre-change URL forever —
+/// never the `find` target again. Inserting at the preferred position makes the
+/// premise the rewriter relies on true by construction instead of asserted.
+///
+/// Additional relay entries keep their relative order after it; a NAT tier change
+/// does not move them. The service id is suffixed with a sequential index so
+/// multiple relays can coexist (`<did>#scp-relay-<n>`), renumbered here so the
+/// ids stay in document order.
 fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
-    let relay_count = document
+    let insert_at = document
         .service
         .iter()
+        .position(|s| s.service_type == "SCPRelay")
+        .unwrap_or(document.service.len());
+    document.service.insert(
+        insert_at,
+        scp_did::Service {
+            id: String::new(), // renumbered below, in document order
+            service_type: "SCPRelay".to_owned(),
+            service_endpoint: relay_url.to_owned(),
+        },
+    );
+    let document_id = document.id.clone();
+    for (index, service) in document
+        .service
+        .iter_mut()
         .filter(|s| s.service_type == "SCPRelay")
-        .count();
-    document.service.push(scp_did::Service {
-        id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
-        service_type: "SCPRelay".to_owned(),
-        service_endpoint: relay_url.to_owned(),
-    });
+        .enumerate()
+    {
+        service.id = format!("{document_id}#scp-relay-{}", index + 1);
+    }
 }
 
 /// Publishes a node's DID document, discriminating on the configured
@@ -6395,6 +6430,51 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// The node's own entry lands FIRST even when the caller's document already
+    /// names a relay — the position premise `repoint_relay_service` keys on.
+    ///
+    /// `IdentitySource::Explicit` hands a caller-supplied document through
+    /// verbatim. While `push_relay_service` appended, the node's own entry landed
+    /// at position 1 behind the caller's, so `document_relay_url` (position 0)
+    /// reported the CALLER's relay while the slot reported the node's. The first
+    /// tier tick then saw them disagree, ran a tier change that had not happened,
+    /// rewrote the caller's preferred relay, and stranded the node's own entry at
+    /// position 1 naming a URL nothing would ever re-point again.
+    #[test]
+    fn the_nodes_own_relay_entry_is_installed_at_the_preferred_position() {
+        const CALLER_RELAY: &str = "wss://caller.example.com/scp/v1";
+        let mut document = slot_test_document(&[CALLER_RELAY]);
+
+        push_relay_service(&mut document, TIER_CHANGE_NEW_URL);
+
+        assert_eq!(
+            document.relay_service_urls(),
+            vec![TIER_CHANGE_NEW_URL.to_owned(), CALLER_RELAY.to_owned()],
+            "the node's own relay is the subject's preferred relay (§18.2.3) and \
+             must be first; the caller's additional relay keeps its order after it"
+        );
+        assert_eq!(
+            published_state::document_relay_url(&document).as_deref(),
+            Some(TIER_CHANGE_NEW_URL),
+            "so the tier loop's skip condition compares against the node's own \
+             endpoint rather than the caller's"
+        );
+        let ids: Vec<&str> = document
+            .service
+            .iter()
+            .filter(|s| s.service_type == "SCPRelay")
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "did:dht:slottest#scp-relay-1",
+                "did:dht:slottest#scp-relay-2"
+            ],
+            "ids stay sequential in document order after the insert"
+        );
     }
 
     /// A document with NO `SCPRelay` entry still ends up naming the address the
