@@ -1445,9 +1445,13 @@ fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
 ///   DID record resolvable on the DHT.
 /// - **Relay (6-day cycle).** Always enabled, including when no relay is bound
 ///   yet. [`TransportRelayPublisher::publish`] fails closed with a typed
-///   `RelayPublishFailed` while unbound, and the relay republish loop backs off
-///   30s → 30min — and the arm **self-heals** the instant a relay is bound, with
-///   no manager reconstruction and no re-drive.
+///   `IdentityError::NoRelayBound` while unbound (NOT the generic
+///   `RelayPublishFailed`, which means bound relays actively rejected — the
+///   distinction is the whole reason the variant exists: it selects the
+///   rate-limited reporting channel, since no retry heals an unconfigured node),
+///   and the relay republish loop backs off 30s → 30min — and the arm
+///   **self-heals** the instant a relay is bound, with no manager reconstruction
+///   and no re-drive.
 ///
 /// Sampling relay readiness once, at construction, to decide whether to enable
 /// the arm is what this function used to do, and it was unfixable by
@@ -1544,6 +1548,7 @@ async fn start_self_did_republishing<D: DhtClient + 'static>(
     SelfDidRepublishing {
         manager,
         reseed_task,
+        stopped: false,
     }
 }
 
@@ -1551,11 +1556,14 @@ async fn start_self_did_republishing<D: DhtClient + 'static>(
 /// observer that keeps it pointed at the node's CURRENT signed record.
 ///
 /// Held for the serve lifetime and torn down via [`stop`](Self::stop).
-struct SelfDidRepublishing<D: DhtClient> {
+struct SelfDidRepublishing<D: DhtClient + 'static> {
     manager: Arc<RepublishManager<D, TransportRelayPublisher>>,
     /// The re-seed observer. Aborted BEFORE the manager is stopped — see
     /// [`stop`](Self::stop).
     reseed_task: tokio::task::JoinHandle<()>,
+    /// Set by [`stop`](Self::stop) so the [`Drop`] backstop stays out of the way
+    /// on the deterministic teardown path.
+    stopped: bool,
 }
 
 impl<D: DhtClient + 'static> SelfDidRepublishing<D> {
@@ -1571,12 +1579,53 @@ impl<D: DhtClient + 'static> SelfDidRepublishing<D> {
     /// drained the maps, detaching two arms that keep republishing this node's
     /// DID document (a §10.12.1 address disclosure) past shutdown. Joining the
     /// aborted handle is the only barrier that rules that out.
-    async fn stop(self) {
+    ///
+    /// The handle is awaited through `&mut` rather than by value because the type
+    /// carries a [`Drop`] backstop, and a type that implements `Drop` cannot be
+    /// moved out of field-by-field.
+    async fn stop(mut self) {
         self.reseed_task.abort();
         // `Err(cancelled)` is the expected outcome; `Ok` means it finished
         // first. Both mean the observer can no longer start an arm.
-        let _ = self.reseed_task.await;
+        let _ = (&mut self.reseed_task).await;
         self.manager.stop_all().await;
+        self.stopped = true;
+    }
+}
+
+impl<D: DhtClient + 'static> Drop for SelfDidRepublishing<D> {
+    /// Backstop for every path that never reaches [`stop`](Self::stop).
+    ///
+    /// `stop` is called from exactly one line, after
+    /// `run_refresh_and_serve_until_shutdown` returns. If the `host_site` future
+    /// is DROPPED instead — a `tokio::select!` losing the race, a `JoinHandle`
+    /// abort on the spawning task, a panic unwinding past it — that line never
+    /// runs, and nothing else cleans up: `JoinHandle::drop` detaches rather than
+    /// aborts, `AbortHandle::drop` does not abort, and `RepublishManager` has no
+    /// `Drop` of its own. Both arms would then keep re-putting this node's DID
+    /// record for the life of the process — the §10.12.1 address disclosure past
+    /// shutdown that `stop` exists to prevent, reached by simply not calling it.
+    ///
+    /// This cannot be the primary teardown: `Drop` is synchronous, so it can
+    /// abort the observer but must hand `stop_all` to the runtime. `stop` stays
+    /// the deterministic path (it JOINS the observer before draining the maps,
+    /// which this cannot); the flag keeps the two from doing the work twice.
+    /// Mirrors the existing `Drop` backstop on `TierReEvalHandle`.
+    fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.reseed_task.abort();
+        let manager = Arc::clone(&self.manager);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { manager.stop_all().await });
+        } else {
+            tracing::error!(
+                "self-DID republishing dropped without `stop()` and outside a Tokio \
+                 runtime: the republish arms cannot be aborted and may keep \
+                 asserting this node's DID record (§10.12.1)"
+            );
+        }
     }
 }
 
@@ -1605,6 +1654,18 @@ async fn seed_republish_arms<D: DhtClient + 'static>(
     manager: &RepublishManager<D, TransportRelayPublisher>,
     entry: Option<RepublishEntry>,
 ) {
+    // Unconditional, and AHEAD of the dormancy branch: "point the arms at
+    // `entry`" has to include "point them at nothing". This used to sit after
+    // the early return, so `seed_republish_arms(manager, None)` left every
+    // running arm intact and asserting the record the node had just retracted —
+    // the function silently doing the opposite of what its own contract says.
+    // Reaching it requires the published record to go `Some -> None`, which no
+    // writer does today (`apply_tier_change` only ever assigns `Some`); that is
+    // a fact about the current single writer, not about this function, and it is
+    // exactly the kind of fact this module exists to stop relying on. On the
+    // startup seed the manager is empty, so this is a no-op.
+    manager.stop_all().await;
+
     let Some(entry) = entry else {
         // Nothing published (yet): no DHT record to keep alive and nothing to
         // publish to relays. Not an error — the `DhtMode::Disabled` default.
@@ -1623,7 +1684,6 @@ async fn seed_republish_arms<D: DhtClient + 'static>(
          relay (6d) (§3.10.6 anti-segmentation). The relay arm publishes on \
          every cycle and fails closed until a relay is bound."
     );
-    manager.stop_all().await;
     manager.start_republishing(entry).await;
 }
 
@@ -3686,6 +3746,65 @@ mod tests {
         assert!(
             adapter.recorded().is_empty(),
             "a dormant cycle publishes nothing to any layer"
+        );
+
+        republish.stop().await;
+    }
+
+    /// Retracting the published record STOPS the arms.
+    ///
+    /// `seed_republish_arms` is documented as "points both arms at `entry`,
+    /// replacing whatever they were asserting", but its dormancy branch used to
+    /// `return` ahead of `stop_all()`, so seeding with `None` left every running
+    /// arm alive and re-asserting a record the node no longer stands behind — the
+    /// function doing the exact opposite of its contract. The observer routes a
+    /// `Some -> None` slot transition straight into that branch.
+    ///
+    /// Driven through the real observer (`reseed_republish_arms`) rather than by
+    /// calling the helper directly, so the test pins the reachable behaviour.
+    #[tokio::test]
+    async fn retracting_the_published_record_stops_both_arms() {
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let publisher = Arc::new(TransportRelayPublisher::new());
+        let _adapter = bind_recording_relay(publisher.as_ref());
+
+        let (slot, records) = record_slot(Some(self_host_signed_record()));
+        let republish =
+            start_self_did_republishing(Arc::clone(&dht), Arc::clone(&publisher), records).await;
+
+        assert_eq!(
+            republish.manager.active_count().await,
+            1,
+            "precondition: the DHT keep-alive arm is running"
+        );
+        assert_eq!(
+            republish.manager.active_relay_count().await,
+            1,
+            "precondition: the relay arm is running"
+        );
+
+        // The node retracts its published record. The observer runs on its own
+        // task, so poll rather than assume it has been scheduled.
+        slot.send_modify(|state| state.record = None);
+        for _ in 0..200u32 {
+            if republish.manager.active_count().await == 0
+                && republish.manager.active_relay_count().await == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(
+            republish.manager.active_count().await,
+            0,
+            "a retracted record must stop the DHT keep-alive arm, not leave it \
+             asserting bytes the node has withdrawn"
+        );
+        assert_eq!(
+            republish.manager.active_relay_count().await,
+            0,
+            "a retracted record must stop the relay arm too"
         );
 
         republish.stop().await;

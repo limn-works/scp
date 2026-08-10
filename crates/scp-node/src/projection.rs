@@ -2796,7 +2796,7 @@ mod tests {
                 record: None,
                 document: scp_did::DidDocument {
                     context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
-                    id: "did:dht:test123".to_owned(),
+                    id: "did:dht:test".to_owned(),
                     verification_method: vec![],
                     authentication: vec![],
                     assertion_method: vec![],
