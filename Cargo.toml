@@ -153,7 +153,9 @@ await_holding_lock = "deny"
 # crate is a standalone non-member with its own `[profile.release]` and is
 # unaffected.
 #
-# `test` and `bench` inherit `dev`, so `cargo test`/`cargo nextest` are covered.
+# `test` inherits `dev`, so `cargo test`/`cargo nextest` are covered. `bench`
+# inherits `release`, NOT `dev` — as does `cargo test --release`. Both keep the
+# `[profile.release]` settings below, `debug-assertions = false` included.
 [profile.dev]
 debug = "line-tables-only"
 
