@@ -1,5 +1,10 @@
 # Backend Agent Memory (scoped)
 
+- [project-encrypted-storage-seal-17-5](project_encrypted_storage_seal_17_5.md) — §17.5 seal: in-memory FFI door sealed via EncryptingAdapter+Node::start; start_node_local + 4 manifest edges BLOCKED on a human SQLCipher-vs-adapter call; ADR-052 §AC-9 test was a phantom claim — now real (compile_fail,E0277 doctests, pin the code + pair a positive control; nextest skips doctests)
+
+- [project-liveslot-collapse-scp-node](project_liveslot_collapse_scp_node.md) — SUPERSEDES the frozen-snapshot memory: one LiveSlot<NodePublishedState> (9a7193702); position-keyed relay rewrite; address-vs-document gate split
+- [project-frozen-snapshot-live-slot-scp-node](project_frozen_snapshot_live_slot_scp_node.md) — OUTDATED (the three newtypes it names are deleted); kept only for the history of why the class existed
+
 - [project-adr057-transport-jssocket](project_adr057_transport_jssocket.md) — ADR-057 JsSocket relay-transport slice; Step-2 finding: MLS SignatureKeyPair ED25519 private = 32-byte seed, recover via serde (private() is test-utils-gated); send_message()→() break analysis
 
 - [project-eventlog-committer-assigned-timestamp](project_eventlog_committer_assigned_timestamp.md) — event-log convergence: committer-assigned leaf timestamps replace per-member now(); per-class sourcing rules + CommitMeta refactor + chokepoints; spec 2ecfa23fb, impl 88c856360
@@ -16,6 +21,8 @@
 - [project-adr-049-commit-4](project_adr_049_commit_4.md) — active work: ADR-049 actor-per-context, commit 4 (new traits + prod impls)
 - [project-adr-049-phase-2a8-governance](project_adr_049_phase_2a8_governance.md) — Phase 2A.8 governance multi-commit ladder: scaffold/strip/migrate-incrementally pattern for ~6K LOC modules
 - [project-adr-049-storage-foundation-step1](project_adr_049_storage_foundation_step1.md) — storage-foundation Step 1 (commit e8975ce05): mls_storage provider, build_actor_deps self-source, pub(in crate::context) test relocation, --no-verify mid-ladder, bridge worklist for Steps 2-4
+- [feedback-never-inline-git-stash](feedback_never_inline_git_stash.md) — NEVER put `git stash` in a Bash command (even as filler); it silently reverted 17 files. Use read-only `git show <rev>:<path>`
+- [project-relayres-004-selfhost-rewiring](project_relayres_004_selfhost_rewiring.md) — SCP-RELAYRES-004 B1-B7: DidMethod::publish returns the signed RepublishEntry (no more DHT read-back); residual tier-change re-seed gap unowned
 - [feedback-worktree-absolute-path](feedback_worktree_absolute_path.md) — always use worktree path for edits; bare /Users/alec/Developer/limn/scp/ is main
 - [feedback-no-git-checkout-paths](feedback_no_git_checkout_paths.md) — never `git stash` + `git checkout origin/X -- path/` to verify baseline; destroys uncommitted edits silently
 - [feedback-read-tool-stale-verify-with-awk](feedback_read_tool_stale_verify_with_awk.md) — Read tool can return stale content disagreeing with disk; verify load-bearing lines with awk/grep before editing
