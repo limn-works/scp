@@ -825,7 +825,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// The returned [`RepublishEntry`](crate::republish::RepublishEntry) is the
     /// `(public_key, seq, signature, value)` computed by THIS signing pass — see
-    /// [`DidMethod::publish`](crate::DidMethod::publish) for why it is an output
+    /// [`DidMethod::publish`] for why it is an output
     /// rather than something a caller reconstructs from a read-back.
     ///
     /// # Errors
