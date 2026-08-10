@@ -36,8 +36,14 @@ use crate::DidPublisher;
 /// Holding all three in one value behind one [`LiveSlot`] closes the whole class:
 /// a running node has exactly one of each, every reader holds a clone of the
 /// *slot* rather than of its contents, and a change lands as a single write.
-/// Neither a stale read nor a half-applied change is something a caller has to
-/// avoid — both are unrepresentable.
+///
+/// A **half-applied** change is genuinely unrepresentable: the three fields move
+/// under one `send_modify`, so no reader can observe a mixed pair. A **stale
+/// read** is not, and this module does not claim otherwise —
+/// [`get`](LiveSlot::get) clones the value out, so a caller that stores the
+/// clone in a field of its own has re-created the frozen snapshot by hand. What
+/// is enforced is narrower and is the part that rotted: the node holds exactly
+/// one of each value, and this module is its only writer.
 ///
 /// # The address and the document are gated differently, on purpose
 ///
@@ -50,8 +56,13 @@ use crate::DidPublisher;
 /// node serves is what it actually asserted. They still move under one write.
 #[derive(Clone, Debug)]
 pub struct NodePublishedState {
-    /// The DID document the node currently stands behind — the one it last
-    /// successfully published.
+    /// The DID document the node currently stands behind.
+    ///
+    /// This is the document of the last SUCCESSFUL publish *call* — which for a
+    /// [`DhtMode::Disabled`](crate::DhtMode) node published nothing at all
+    /// (`Ok(None)`, the honest non-disclosing success). So "the node serves this
+    /// document" must not be read as "this document is retrievable from the
+    /// network": only [`record`](Self::record) being `Some` says that.
     pub document: DidDocument,
     /// The relay URL the node is currently reachable at.
     pub relay_url: String,
@@ -189,15 +200,33 @@ pub async fn apply_tier_change(
     // Reports this node's reachability, so it fires exactly when the address
     // moved — including on a failed re-publish, whose retry tick finds the
     // address already advanced and must not re-announce it.
+    //
+    // `try_send`, never `send().await`. The receiver is a BOUNDED channel
+    // (`mpsc::channel(16)`) held on `ApplicationNode`, reachable only through
+    // `&mut` — which the serve path, holding the node as an `Arc`, structurally
+    // cannot obtain. A consumer is therefore optional in practice, and because
+    // the receiver stays alive the channel never closes, so `send().await` does
+    // not fail on a full queue: it PARKS. The 17th address change would then
+    // block this task forever inside `apply_tier_change`, which (a) stops tier
+    // re-evaluation entirely — freezing the advertised address and leaving
+    // `.well-known/scp` handing every peer a dead endpoint, the exact defect
+    // this module exists to close — and (b) hangs `shutdown()`, whose
+    // `stop_and_wait` joins on the task future being dropped. This stream is
+    // OBSERVABILITY; reachability must never be a hostage to whether anyone is
+    // draining it.
     if previous_relay_url != new_relay_url
         && let Some(tx) = event_tx
+        && let Err(e) = tx.try_send(NatTierChange::TierChanged {
+            previous_relay_url,
+            new_relay_url: new_relay_url.to_owned(),
+            reason: trigger_reason.to_owned(),
+        })
     {
-        let _ = tx
-            .send(NatTierChange::TierChanged {
-                previous_relay_url,
-                new_relay_url: new_relay_url.to_owned(),
-                reason: trigger_reason.to_owned(),
-            })
-            .await;
+        tracing::warn!(
+            error = %e, new_url = %new_relay_url,
+            "tier-change event dropped: no consumer is draining the TierChanged \
+             stream. The node's address still advanced — only the notification \
+             was lost."
+        );
     }
 }
