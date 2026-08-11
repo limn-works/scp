@@ -71,6 +71,13 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 - Be autonomous: infer from context, code, artifacts. Escalate only for genuine judgment calls.
 - Follow every reference. When a spec cites a section, read that section. When code references a story, read the story. When an ADR lists a rejected alternative, find out why its author rejected it. An agent who skims the sources writes code that matches the sources only on the surface.
 
+**Never resolve an open question yourself (MANDATORY):**
+- When you ask Alec a question, wait for Alec to answer it. Do not answer it yourself, and do not proceed on the answer you expected.
+- When Alec answers part of what you asked, the rest stays open. A partial answer decides nothing about the parts it did not cover, so name what is still open instead of filling it in.
+- Never act on an implicit or assumed resolution while a conversation is running. Alec not objecting is not agreement. Alec moving to the next topic is not agreement. Alec's answer implying something is not a decision about that something.
+- A question is settled when both parties have stated the same resolution: you state the resolution explicitly, and Alec confirms it. Until that happens the question stays open, and you say it is open rather than choosing an answer.
+- This rule governs open questions, not assigned work. It never licenses asking permission to do work Alec already assigned — the autonomy rules still hold. Execute what Alec asked for, and stop at the question Alec has not answered.
+
 **Artifact flow (INVARIANT):**
 - The flow is strictly one-way: **plans → specs → ADRs → stories → source code.**
 - Upstream artifacts govern downstream artifacts. Never the reverse. Code does not inform specs. Stories do not reshape or request ADRs. Implementation details do not change plans.
