@@ -4,7 +4,7 @@ The Prose rules in `CLAUDE.md` list nine ways a sentence fails. This file works 
 passage through all nine, because a rule read in the abstract does not change what an
 author writes, and a rewrite next to its original does.
 
-Alec flagged this passage. An agent wrote it while explaining why one row of a table
+A human flagged this passage. An agent wrote it while explaining why one row of a table
 should come out of a spec.
 
 ## The passage
