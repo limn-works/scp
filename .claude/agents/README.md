@@ -6,7 +6,7 @@ This project uses specialized agents for different architectural concerns. Each 
 
 An agent file must say, in one sentence, what the agent has to confirm before it reports a verdict. The rest of the file tells the agent where to look. An agent that has run every check in the file still has to confirm that one thing, and the file must say so.
 
-Mike Caulfield names the failure this file guards against in "I finally understand why LLMs suck at writing prompts" (https://mikecaulfield.substack.com/p/i-finally-understand-why-llms-suck): a model asked to write a prompt writes its intermediate extrapolation — the operational detail it invented to act on a vague request — in the same authoritative register as the contract, and the reader then applies the extrapolation as the definition. An agent handed a checklist and no criterion completes the checklist and reports success, which is exactly how `let _ = function_name;` came to satisfy a string-search test while calling nothing.
+An agent handed a checklist and no criterion completes the checklist and reports success. That is how `let _ = function_name;` came to satisfy a string-search test while calling nothing.
 
 When you write or edit an agent definition, satisfy both requirements:
 1. State the criterion in the file, in one sentence the agent can quote back. "INCOMPLETE if any acceptance criterion has no code behind it" is a criterion. "Check for stubs, check for `None`, check the matrix" is a recipe.
