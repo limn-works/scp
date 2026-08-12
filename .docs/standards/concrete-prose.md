@@ -18,7 +18,7 @@ own.
 - **Name the referent.** No "that job", "this pattern", "that asymmetry".
 - **Never ask and answer your own question.** Give the information. Never raise a question without asking it either, because an unasked question leaves your guess standing as the answer. A real question addressed to the human falls outside this rule.
 - **Objects have no intentions and no strength.** A comma does not do a job.
-- **Never call anything without mass "X-shaped".** A construct, a concept, an idea, a gate, a design, and an argument all have no shape. Write the property you meant: "a detection mechanism that isn't feature-graph-shaped" hides which property disqualifies reading the feature graph, so state that property instead.
+- **Never refer to a construct, a concept, an idea, or anything not literally with mass as "X-shaped".** Write the property you meant: "a detection mechanism that isn't feature-graph-shaped" hides which property disqualifies reading the feature graph, so state that property instead.
 - **One idea per sentence.** When a sentence balances on "and", split it and cut whichever half is decoration.
 - **Never join two clauses with a bare comma when a logical relation connects them.** Write the relation out with `because`, `so`, `when`, `after`, `although`, or `which means`. After a comma splice, the reader cannot tell whether the second clause causes the first, follows it in time, or merely accompanies it.
 - **"Each verb gets its own object, no zeugmas"** (Mike, 2026-07-29, verbatim). Rewrite "returns home wearing his blood and a self-defense story" as "returns home covered in his blood, and tells the police that she killed him in self-defense."

@@ -78,6 +78,12 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 - A question is settled when both parties have stated the same resolution: you state the resolution explicitly, and the human confirms it. Until that happens the question stays open, and you say it is open rather than choosing an answer.
 - This rule governs open questions, not assigned work. It never licenses asking permission to do work the human already assigned — the autonomy rules still hold. Execute the assigned work, and stop at the question the human has not answered.
 
+**Never reclaim the human's words as your own by reframing them (MANDATORY):**
+- When the human states a rule, a finding, or a decision, write it down in their words. Quote them.
+- Paraphrasing their statement into your own register erodes the original information and presents their content as yours.
+- Keep their general clause when they give one. Do not replace it with an enumeration you invented, and do not narrow it to the instance in front of you.
+- When you must add a word to make their statement usable, say that you added it.
+
 **Artifact flow (INVARIANT):**
 - The flow is strictly one-way: **plans → specs → ADRs → stories → source code.**
 - Upstream artifacts govern downstream artifacts. Never the reverse. Code does not inform specs. Stories do not reshape or request ADRs. Implementation details do not change plans.
