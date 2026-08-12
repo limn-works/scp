@@ -81,7 +81,7 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 **Never reclaim the human's words as your own by reframing them (MANDATORY):**
 - When the human states a rule, a finding, or a decision, record it with their meaning and their scope intact.
 - Quote them verbatim when they ask for a quote, not by default.
-- Paraphrasing their statement into your own register erodes the original information and presents their content as yours.
+- Paraphrasing their statement into your own register erodes the original information and presents your content as theirs, so your invention carries their authority.
 - Keep their general clause when they give one. Do not replace it with an enumeration you invented, and do not narrow it to the instance in front of you.
 - When you must add a word to make their statement usable, say that you added it.
 
