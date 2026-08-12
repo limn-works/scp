@@ -1,3 +1,8 @@
+---
+name: Concrete Prose
+description: Plain, literal writing — name the agent, give every verb its object, state causality, no metaphor or filler. Follows ISO 24495-1.
+---
+
 # Concrete prose
 
 These rules govern every sentence you write for a human reader: chat responses, specs,
