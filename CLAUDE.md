@@ -184,8 +184,8 @@ Caulfield asked a model to characterize the director Chris Columbus and got "war
   1. **Comparative definition** — "[abc], and it's [x] than a [y]".
   2. **Adjective reinforcement** — "sound and bounded".
   3. **Callout** — "[abc], and it's worth naming".
-  4. **Introductory patterns** — "Let me".
-  5. **Hedging** — "arguably".
+  4. **Introductory patterns**.
+  5. **Hedging**.
   6. **Decoration** — an em-dash aside that carries no new fact.
   7. **Compliance narration** — "[abc], and I'm not [x]ing [y]". Write "Two unanswered questions:", not "Two questions remain unanswered, and I am not deciding either."
 - **Check every sentence before you send it.** Ask seven questions: have I hidden a subordinate relation? Have I dropped a subject or an object? Does a passive verb hide who acted? Have I appraised the work instead of reporting it? Have I referenced anything by a bare identifier? Have I used any of the seven forbidden constructions? Does this sentence admit two contradictory readings? If any answer is yes, rewrite the sentence.
