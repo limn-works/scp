@@ -1,7 +1,7 @@
 # A bad passage, and its rewrite
 
 Read this before you write prose for this repository. It shows one passage that breaks
-`.docs/standards/output-style.md`, names every rule it breaks, and gives the rewrite.
+`.docs/standards/concrete-prose.md`, names every rule it breaks, and gives the rewrite.
 
 An agent wrote the passage in a review conversation. The agent was arguing that the
 maintainers should delete row 10 from a table in the addressability and deployment spec.

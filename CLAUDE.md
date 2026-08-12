@@ -167,7 +167,7 @@ Caulfield asked a model to characterize the director Chris Columbus and got "war
 - **Test every criterion you write by asking how many non-targets it admits.** When a criterion admits many things you did not mean, you wrote search candidates. Narrow the criterion, or demote the text to an indicator list under a criterion you then have to write.
 - **This failure produces a defect this repo already fights.** A denylist gate that chases one more spelling of a bypass is an indicator list presented as a criterion, which is why the "Guard against over-engineering" rule requires a positive whitelist closed by construction.
 
-**Prose (MANDATORY):** every sentence you write for a human reader follows `.docs/standards/output-style.md`. Read that file before you write prose. It governs chat responses, specs, ADRs, PRD stories, commit bodies, pull-request descriptions, code comments, review findings, README text, and artifact copy.
+**Prose (MANDATORY):** every sentence you write for a human reader follows `.docs/standards/concrete-prose.md`. Read that file before you write prose. It governs chat responses, specs, ADRs, PRD stories, commit bodies, pull-request descriptions, code comments, review findings, README text, and artifact copy.
 
 ### Toolchain
 
