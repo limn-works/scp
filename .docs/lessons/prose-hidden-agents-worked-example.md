@@ -1,11 +1,11 @@
-# Worked example: a passage that passed review and failed the reader
+# Worked example: prose that breaks the rules in CLAUDE.md
 
-The Prose rules in `CLAUDE.md` list nine ways a sentence fails. This file works one real
-passage through all nine, because a rule read in the abstract does not change what an
-author writes, and a rewrite next to its original does.
+Read this before you write prose for this repository. It shows one passage that breaks
+the Prose rules, names every rule it breaks, and gives the rewrite.
 
-A human flagged this passage. An agent wrote it while explaining why one row of a table
-should come out of a spec.
+An agent wrote the passage in a review conversation. The agent was arguing that the
+maintainers should delete row 10 from a table in the addressability and deployment spec.
+The human reading it could not tell what the argument was.
 
 ## The passage
 
@@ -53,10 +53,10 @@ document contradicts a MessagePack definition.
 
 ## The failure mode this example names
 
-The author appraised their own reasoning, then compressed the actual argument into
-metaphor. Those two moves travel together. An author who opens by rating their previous
-answer has turned attention toward the answer's quality and away from its content, and the
-compressed figure follows because the sentence is no longer carrying the argument.
+The author appraised their own reasoning, then replaced the argument with a metaphor. An
+author who opens by rating their own previous answer has stopped writing about the subject
+and started writing about the answer, so the next sentence carries a figure instead of the
+claim.
 
 Watch for the opening move. When a sentence starts by grading earlier work — "my reasoning
 was weaker", "the real argument is", "to be precise" — delete that sentence and start at
