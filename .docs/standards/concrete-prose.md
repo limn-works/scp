@@ -5,11 +5,6 @@ ADRs, PRD stories, commit bodies, pull-request descriptions, code comments, revi
 findings, README text, and artifact copy. `CLAUDE.md` points here and adds nothing of its
 own.
 
-This file duplicates the Claude Code output style at
-`~/.claude/output-styles/concrete-prose.md`, which applies the same rules to every session
-on this machine. The two copies must stay identical in rule text. When you change a rule
-here, change it there in the same commit, and the reverse.
-
 **The criterion:** a reader who does not already know the answer can reconstruct, from the sentence alone, who did what to what, and why. When a reader has to already know the answer in order to parse the sentence, the sentence has failed, however well it reads. Every rule below is a way that sentences fail this criterion. Satisfying all of them still does not satisfy the criterion, so check the criterion itself last. `.docs/lessons/bad-prose-and-its-rewrite.md` shows one passage that breaks these rules, names every rule it breaks, and gives the rewrite.
 
 - **Write concretely.** Give every transitive verb its explicit direct object. Name the owner behind every possessive. State how each clause relates to the clause beside it.
