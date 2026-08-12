@@ -4,7 +4,7 @@ This project uses specialized agents for different architectural concerns. Each 
 
 ## Every agent definition is a contract
 
-An agent definition states the criterion its verdict turns on: what the agent must establish before it reports a result. Everything else the file lists — review dimensions, greps, file paths, symptom catalogues — is evidence that helps the agent reach that criterion. Evidence never replaces the criterion.
+An agent file must say, in one sentence, what the agent has to confirm before it reports a verdict. The rest of the file tells the agent where to look. An agent that has run every check in the file still has to confirm that one thing, and the file must say so.
 
 Mike Caulfield names the failure this file guards against in "I finally understand why LLMs suck at writing prompts" (https://mikecaulfield.substack.com/p/i-finally-understand-why-llms-suck): a model asked to write a prompt writes its intermediate extrapolation — the operational detail it invented to act on a vague request — in the same authoritative register as the contract, and the reader then applies the extrapolation as the definition. An agent handed a checklist and no criterion completes the checklist and reports success, which is exactly how `let _ = function_name;` came to satisfy a string-search test while calling nothing.
 
