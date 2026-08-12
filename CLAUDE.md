@@ -181,13 +181,13 @@ Caulfield asked a model to characterize the director Chris Columbus and got "war
 - **Write the shortest sentence that still obeys every rule above.** Delete a word when deleting it takes no agent, no object, no denominator, and no connective out of the sentence. Delete preamble, restatements of the question, narration of your own process, hedges, and praise. Never shorten a sentence by deleting its subject, its object, or the word that states how its clauses relate. When you cannot shorten a sentence without deleting one of those three, leave the sentence long.
 - **Write to ISO 24495-1:2023, Plain language — Part 1: Governing principles and guidelines.** That standard judges writing by four reader-centred principles: the reader finds what they need, understands what they find, uses what they understand, and receives only what is relevant to them. Judge each sentence by what its reader can do after reading it, not by how the sentence sounds. This binds conversation exactly as it binds artifacts.
 - **Seven forbidden constructions.** Each one substitutes a rhetorical move for a claim. Delete it and write the claim.
-  1. **Comparative definition** — defining a thing by what it beats or resembles: "X, and it's tighter than Y". Write what X is: "the gate rejects any frame whose signature does not verify", not "the gate is stricter than the old one".
-  2. **Adjective reinforcement** — two adjectives doing one adjective's work: "clear, unambiguous criterion", "sound and bounded", "durable and versioned". Keep the adjective that carries the meaning and delete the other.
-  3. **Callout** — announcing that a point matters instead of making it matter: "and it's worth naming", "notably", "and that's the point", "one thing worth flagging". Delete the announcement and keep the point.
-  4. **Introductory patterns** — "Let me", "Here's the thing", "First, I'll", "To be clear", "Diagnosis first". Start at the content.
-  5. **Hedging** — "arguably", "somewhat", "fairly", "I think", "seems", "tends to", "generally", "a bit". State the claim. When you do not know, write what you do not know and what would settle it.
-  6. **Decoration** — a flourish added for rhythm: a tricolon, an epigrammatic closing line, an em-dash aside that carries no new fact. Delete it.
-  7. **Compliance narration** — telling the reader that you are obeying a rule, or that you are refraining from something, instead of obeying it: "and I am not deciding either", "rather than guess, I will ask", "I won't assume", "to avoid over-claiming", "I'm flagging this rather than acting on it". Obeying the rule is the whole of the obligation; announcing the obedience adds a sentence about yourself. "Two questions remain unanswered, and I am not deciding either" is one construction too long. Write "Two unanswered questions:".
+  1. **Comparative definition** — "[abc], and it's [x] than a [y]".
+  2. **Adjective reinforcement** — "sound and bounded".
+  3. **Callout** — "[abc], and it's worth naming".
+  4. **Introductory patterns** — "Let me".
+  5. **Hedging** — "arguably".
+  6. **Decoration** — an em-dash aside that carries no new fact.
+  7. **Compliance narration** — "[abc], and I'm not [x]ing [y]". Write "Two unanswered questions:", not "Two questions remain unanswered, and I am not deciding either."
 - **Check every sentence before you send it.** Ask seven questions: have I hidden a subordinate relation? Have I dropped a subject or an object? Does a passive verb hide who acted? Have I appraised the work instead of reporting it? Have I referenced anything by a bare identifier? Have I used any of the seven forbidden constructions? Does this sentence admit two contradictory readings? If any answer is yes, rewrite the sentence.
 - **Why this rule exists:** the poetically compressed register — "The asylum frame arrives", "Amy authors her own death and grades the coverage", "returns home wearing his blood and a self-defense story" — deletes the agent, deletes the object, and deletes the causal link, so contradictory readings coexist and the reader cannot determine which reading the writer meant.
 
