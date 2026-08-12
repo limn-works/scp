@@ -16,10 +16,6 @@ The human reading it could not tell what the argument was.
 > hash is defined over MessagePack while the document serves JSON. Cutting row 10 is what
 > makes the spec's own claim true. No §24.3.5 reasoning needed.
 
-Every sentence reads fluently. A reader who already knows the answer follows it. A reader
-who does not know the answer cannot reconstruct who did what to what, which is the
-criterion the passage has to meet.
-
 ## What fails, sentence by sentence
 
 | Text | Rule it breaks | What the reader loses |
