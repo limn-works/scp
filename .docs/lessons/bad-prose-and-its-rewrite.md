@@ -1,4 +1,4 @@
-# Worked example: prose that breaks the rules in CLAUDE.md
+# A bad passage, and its rewrite
 
 Read this before you write prose for this repository. It shows one passage that breaks
 the Prose rules, names every rule it breaks, and gives the rewrite.
