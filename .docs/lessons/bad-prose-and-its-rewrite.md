@@ -31,21 +31,20 @@ The human reading it could not tell what the argument was.
 
 ## The rewrite
 
-> I gave you two rationales for cutting row 10. Neither one holds, because each applies to
-> the envelope row and the attestation row just as well as it applies to row 10, so
-> neither tells you which single row to cut.
+> I gave you two rationales for deleting row 10. Both rationales apply equally to the
+> envelope row and to the attestation row. Neither rationale tells you to delete row 10
+> and keep the other two rows.
 >
-> Here is the argument that holds, and it needs nothing outside §18.11.13.2 of the
-> addressability and deployment spec. That section claims the verifier performs "no
-> decryption, no MessagePack, no AEAD, no key". Row 10 makes that claim false: row 10
-> defines the provenance hash over a MessagePack encoding, whereas the document the
-> verifier reads is JSON, so any verifier that honors row 10 must run MessagePack after
-> all. Once you cut row 10, §18.11.13.2's claim becomes true. The argument never reaches
-> §24.3.5, counterparty privacy in provenance.
+> A third argument does tell you to delete row 10. The addressability and deployment spec
+> says, in §18.11.13.2, that a verifier performs "no decryption, no MessagePack, no AEAD,
+> no key". Row 10 makes the spec's claim false. Row 10 defines the provenance hash over a
+> MessagePack encoding. A verifier reads a JSON document. A verifier that obeys row 10
+> therefore runs MessagePack. Delete row 10 and the spec's claim becomes true. I did not
+> use counterparty privacy in provenance, §24.3.5, anywhere above.
 
-The rewrite runs longer by a few words and answers three questions the original left open:
-which rows the failed rationales cover, who defines the provenance hash, and why a JSON
-document contradicts a MessagePack definition.
+Every sentence in the rewrite names its own subject. The rewrite answers three questions
+the original left open: which rows the two failed rationales cover, what defines the
+provenance hash, and why a JSON document contradicts a MessagePack definition.
 
 ## The failure mode this example names
 
