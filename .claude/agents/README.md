@@ -12,7 +12,7 @@ When you write or edit an agent definition, satisfy both requirements:
 1. State the criterion in the file, in one sentence the agent can quote back. "INCOMPLETE if any acceptance criterion has no code behind it" is a criterion. "Check for stubs, check for `None`, check the matrix" is a recipe.
 2. Mark the recipe as a recipe. Write "these dimensions are where gaps usually hide, not the definition of a gap," so an agent that exhausts the list still knows it has not yet met the criterion.
 
-Every agent definition also follows the prose rules in `CLAUDE.md`, which govern all prose in this repository.
+Every agent definition also follows `.docs/standards/output-style.md`, which governs all prose in this repository.
 
 ## Agents
 
