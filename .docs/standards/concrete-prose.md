@@ -11,6 +11,7 @@ own.
 - **Write every sentence in the active voice.** Put the actor in the subject position. Write "the gate rejects an unsigned frame," not "unsigned frames are rejected." A passive verb lets the writer omit the actor, and the rule above forbids that omission. When you do not know which component acted, write that you do not know it.
 - **Simple past for past events.** "marked", not "was marking".
 - **Name the referent.** No "that job", "this pattern", "that asymmetry".
+- **Never ask and answer your own question.** Give the information. Never raise a question without asking it either, because an unasked question leaves your guess standing as the answer. A real question addressed to the human falls outside this rule.
 - **Objects have no intentions and no strength.** A comma does not do a job.
 - **One idea per sentence.** When a sentence balances on "and", split it and cut whichever half is decoration.
 - **Never join two clauses with a bare comma when a logical relation connects them.** Write the relation out with `because`, `so`, `when`, `after`, `although`, or `which means`. After a comma splice, the reader cannot tell whether the second clause causes the first, follows it in time, or merely accompanies it.
@@ -23,9 +24,9 @@ own.
 - **Write the shortest sentence that still obeys every rule above.** Delete a word when deleting it takes no agent, no object, no denominator, and no connective out of the sentence. Delete preamble, restatements of the question, narration of your own process, hedges, and praise. Never shorten a sentence by deleting its subject, its object, or the word that states how its clauses relate. When you cannot shorten a sentence without deleting one of those three, leave the sentence long.
 - **Write to ISO 24495-1:2023, Plain language — Part 1: Governing principles and guidelines.** ISO 24495-1 sets four reader-centred principles: the reader finds what they need, understands what they find, uses what they understand, and receives only what is relevant to them. Judge each sentence by what its reader can do after reading it, not by how the sentence sounds. This binds conversation exactly as it binds artifacts.
 - **Ten forbidden constructions.** In each one, the writer puts a rhetorical move where a claim belongs. Delete it and write the claim.
-  1. **Comparative definition** — "[abc], and it's [x] than a [y]".
+  1. **Comparative definition** — defining the subject by likening it to another thing instead of saying what the subject is: "[abc], and it's [x] than a [y]"; "Rotation was a small question wearing a big coat".
   2. **Adjective reinforcement** — "sound and bounded".
-  3. **Callout** — "[abc], and it's worth naming".
+  3. **Callout** — announcing that a point matters instead of delivering it, whether the announcement trails the point or leads it: "[abc], and it's worth naming"; "And the caveat that's actually worth your attention:".
   4. **Introductory patterns**.
   5. **Hedging**.
   6. **Decoration** — an em-dash aside that carries no new fact.
