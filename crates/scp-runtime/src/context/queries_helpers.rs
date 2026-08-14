@@ -890,8 +890,11 @@ fn verify_remote_checkpoint_authenticity(
 /// # Errors
 ///
 /// - [`ContextError::MemberNotFound`] if the checkpoint sender is not a member.
-/// - [`ContextError::CryptoFailed`] if the public key cannot be resolved or the
-///   Ed25519 signature verification fails.
+/// - [`ContextError::CryptoFailed`] if the public key cannot be resolved, the
+///   Ed25519 signature verification fails, or the checkpoint is bound to a
+///   DIFFERENT `context_id` than the one being judged (the signature covers the
+///   checkpoint's own `context_id`, so authenticity alone does not bind it to
+///   this context).
 /// - [`ContextError::EventLogFailed`] if the LOCAL authoritative log is
 ///   unreachable (never initialised, or destroyed on actor shutdown /
 ///   create-rollback) or its replayed events break the hash chain — the
@@ -910,6 +913,22 @@ fn classify_remote_checkpoint(
 > {
     // Membership + Ed25519 signature gate (fail-closed before any compare).
     verify_remote_checkpoint_authenticity(sender_is_member, deps, context_id, remote)?;
+
+    // Context binding. The signature above covers the checkpoint's OWN
+    // `context_id`, so a validly-signed checkpoint naming a DIFFERENT context
+    // clears the authenticity gate — and would then be compared against THIS
+    // context's root, manufacturing a `Divergent` verdict (an equivocation
+    // accusation) out of two logs that were never meant to match. Callers
+    // currently bind `sender_did` to the MLS-authenticated envelope sender, but
+    // the gate whose verdict depends on this equality belongs HERE, in the
+    // judging function, not in one caller. Defense in depth, fail-closed.
+    if remote.context_id != context_id {
+        return Err(ContextError::CryptoFailed(format!(
+            "checkpoint from {} is bound to context {}, not {context_id}: \
+             refusing to judge it against this context's event log",
+            remote.sender_did, remote.context_id
+        )));
+    }
 
     let context_id_bytes = state::context_id_to_bytes(context_id);
     // ONE snapshot — both sides of the local commitment describe the same tree
@@ -2048,15 +2067,17 @@ mod remote_checkpoint_classification_tests {
             .expect("build_actor_deps")
     }
 
-    /// A GENUINELY SIGNED remote checkpoint — the authenticity gate must pass so
-    /// the test exercises the local-log read, not the signature check.
-    fn signed_remote(
+    /// A GENUINELY SIGNED remote checkpoint bound to `context_id` — the
+    /// authenticity gate must pass so the test exercises the code under test,
+    /// not the signature check.
+    fn signed_remote_for(
         signing_key: &ed25519_dalek::SigningKey,
+        context_id: &str,
         event_count: u64,
         merkle_root: [u8; 32],
     ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
         let unsigned = scp_event_log::checkpoint::UnsignedCheckpoint::over_commitment(
-            CTX_HEX,
+            context_id,
             &DID(SENDER.to_owned()),
             event_count,
             merkle_root,
@@ -2065,6 +2086,16 @@ mod remote_checkpoint_classification_tests {
         );
         let signature = ed25519_dalek::Signer::sign(signing_key, unsigned.canonical_hash());
         unsigned.into_signed(signature.to_bytes().to_vec())
+    }
+
+    /// A GENUINELY SIGNED remote checkpoint bound to [`CTX_HEX`], the context
+    /// under judgement.
+    fn signed_remote(
+        signing_key: &ed25519_dalek::SigningKey,
+        event_count: u64,
+        merkle_root: [u8; 32],
+    ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+        signed_remote_for(signing_key, CTX_HEX, event_count, merkle_root)
     }
 
     fn state_with_sender_as_member() -> PerContextState {
@@ -2219,5 +2250,64 @@ mod remote_checkpoint_classification_tests {
             comparison,
             scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
         ));
+    }
+
+    /// A checkpoint bound to a DIFFERENT context must be REFUSED, not judged.
+    ///
+    /// The Ed25519 signature covers the checkpoint's OWN `context_id`, so a
+    /// validly-signed foreign checkpoint clears the authenticity gate. Without
+    /// the binding check it would then be compared against THIS context's root
+    /// — two unrelated logs — and the mismatch arm would raise
+    /// `EquivocationDetected`: an accusation of dishonesty manufactured out of
+    /// a category error. Both arms below are asserted, because "refused" must
+    /// hold whether the foreign root happens to agree or disagree.
+    #[tokio::test]
+    async fn a_foreign_context_checkpoint_is_refused_not_judged() {
+        /// A different 64-hex context id, distinct from [`CTX_HEX`].
+        const FOREIGN_CTX_HEX: &str =
+            "0707070707070707070707070707070707070707070707070707070707070707";
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let provider = readable_provider(3).await;
+        let local_root = provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+        let deps = deps_over(Box::new(provider), signing_key.verifying_key()).await;
+
+        for (merkle_root, label) in [
+            (
+                local_root,
+                "agreeing root — without the gate this returns Ok(Consistent), \
+                 a verdict about a log that was never compared",
+            ),
+            (
+                [0xAB; 32],
+                "disagreeing root — without the gate this returns Divergent, \
+                 framing an honest peer",
+            ),
+        ] {
+            let foreign = signed_remote_for(&signing_key, FOREIGN_CTX_HEX, 3, merkle_root);
+            let err = classify_remote_checkpoint(true, &deps, CTX_HEX, &foreign)
+                .expect_err(&format!("{label}: a foreign checkpoint must be refused"));
+            assert!(
+                matches!(err, ContextError::CryptoFailed(_)),
+                "{label}: expected CryptoFailed, got: {err}"
+            );
+            assert!(
+                err.to_string().contains(FOREIGN_CTX_HEX),
+                "{label}: the refusal must name the context the checkpoint is \
+                 actually bound to, got: {err}"
+            );
+        }
+
+        // Control: the SAME shape, correctly bound to this context, is judged.
+        let native = signed_remote_for(&signing_key, CTX_HEX, 3, local_root);
+        let (comparison, _) = classify_remote_checkpoint(true, &deps, CTX_HEX, &native)
+            .expect("a correctly-bound checkpoint still yields a verdict");
+        assert!(
+            matches!(
+                comparison,
+                scp_event_log::checkpoint::CheckpointComparison::Consistent
+            ),
+            "the binding gate must not reject checkpoints bound to this context"
+        );
     }
 }

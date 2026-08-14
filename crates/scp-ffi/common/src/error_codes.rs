@@ -530,16 +530,30 @@ pub const CTX_2137: &str = "SCP-CTX-2137";
 /// authoritative log actually recorded).
 ///
 /// Distinct from a proof-generation failure over a log the bridge *could* read
-/// (empty log, out-of-range leaf index, absence claimed for a present event) —
-/// those are honest answers and carry [`CTX_2139`].
+/// (an absence claimed for a present event, an out-of-range leaf index, or an
+/// empty log for which no absence-proof shape exists) — those carry
+/// [`CTX_2139`], whose doc splits "the claim is false" from "no proof of this
+/// shape exists."
 pub const CTX_2138: &str = "SCP-CTX-2138";
 /// Event-log Merkle proof generation failed over a log the bridge COULD read.
 ///
-/// The honest-negative counterpart to [`CTX_2138`]: the authoritative log was
-/// reached, and the answer to the caller's claim is "no". Raised when
-/// `prove_inclusion` / `prove_absence` reject the claim — an empty log, a
-/// leaf index past the end of the tree, or an absence claimed for an event
-/// that IS present.
+/// The counterpart to [`CTX_2138`]: the authoritative log WAS reached, so this
+/// is never a refusal to look. It covers two distinct outcomes, and a caller
+/// must not collapse them:
+///
+/// 1. **The claim is demonstrably FALSE.** An absence claimed for an event that
+///    IS present, or an inclusion `leaf_index` past the end of the tree. Here
+///    the code carries a real negative answer about the log's contents.
+/// 2. **No proof of this shape exists in this construction.** Over an EMPTY but
+///    live log, an absence claim is in fact TRUE — nothing is present — but
+///    `prove_absence` has no bracketing neighbours to build a proof from, so it
+///    honestly declines rather than fabricating one. The code here means "no
+///    proof," NOT "disproof": it must never be read as evidence that the
+///    claimed event IS present.
+///
+/// An empty log is reported by the provider as `Ok(Some(vec![]))` and is a
+/// perfectly readable log — which is why it lands here and not on [`CTX_2138`],
+/// whose empty-vs-unknown distinction is the separate `Ok(None)` case.
 ///
 /// One code across all three bridges. Before this existed, `PyO3` raised the
 /// catch-all `CTX_2001` while NAPI and `UniFFI` reused `CTX_2025` — whose

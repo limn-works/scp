@@ -2542,10 +2542,14 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * instance is suspended or shut down, no supervisor is attached, or the
      * provider reports NO LOG for the context — `Ok(None)`, i.e. UNKNOWN,
      * which a destroyed log also reports). FAILS CLOSED: it never falls back
-     * to the UCAN-state tree. Proof-generation failures over a readable log
-     * (empty log, out-of-range index, absence claimed for a present event)
-     * return `SCP-CTX-2139` — the honest negative answer, distinct from
-     * "cannot answer." A malformed claim carries `SCP-VALID-7000` (caller
+     * to the UCAN-state tree. Proof-generation failures over a READABLE log
+     * return `SCP-CTX-2139`, which covers two distinct outcomes: the claim is
+     * demonstrably FALSE (absence claimed for an event that IS present, or a
+     * leaf index past the end of the tree), OR no proof of this shape exists
+     * in this construction (an EMPTY but live log, where an absence claim is
+     * actually TRUE but `prove_absence` has no bracketing neighbours to build
+     * a proof from). Never read the empty-log case as evidence the claimed
+     * event IS present. A malformed claim carries `SCP-VALID-7000` (caller
      * input validation): invalid JSON or a missing/invalid `type` is rejected
      * before the authoritative log is consulted, but a missing `leaf_index`, a
      * malformed `event_hash`, or an unsupported claim type is rejected only
@@ -5194,10 +5198,14 @@ open func eventLogQuery(handle: ContextHandle, filterJson: String?)async throws 
      * instance is suspended or shut down, no supervisor is attached, or the
      * provider reports NO LOG for the context — `Ok(None)`, i.e. UNKNOWN,
      * which a destroyed log also reports). FAILS CLOSED: it never falls back
-     * to the UCAN-state tree. Proof-generation failures over a readable log
-     * (empty log, out-of-range index, absence claimed for a present event)
-     * return `SCP-CTX-2139` — the honest negative answer, distinct from
-     * "cannot answer." A malformed claim carries `SCP-VALID-7000` (caller
+     * to the UCAN-state tree. Proof-generation failures over a READABLE log
+     * return `SCP-CTX-2139`, which covers two distinct outcomes: the claim is
+     * demonstrably FALSE (absence claimed for an event that IS present, or a
+     * leaf index past the end of the tree), OR no proof of this shape exists
+     * in this construction (an EMPTY but live log, where an absence claim is
+     * actually TRUE but `prove_absence` has no bracketing neighbours to build
+     * a proof from). Never read the empty-log case as evidence the claimed
+     * event IS present. A malformed claim carries `SCP-VALID-7000` (caller
      * input validation): invalid JSON or a missing/invalid `type` is rejected
      * before the authoritative log is consulted, but a missing `leaf_index`, a
      * malformed `event_hash`, or an unsupported claim type is rejected only

@@ -2194,9 +2194,13 @@ class SCP:
         - ``SCP-CTX-2138`` -- the authoritative log is unreachable or unknown
           (instance suspended or shut down, no supervisor, or no log for the
           context). FAILS CLOSED; never falls back to another tree.
-        - ``SCP-CTX-2139`` -- the claim was REJECTED over a readable log (empty
-          log, leaf index past the end, or absence claimed for an event that IS
-          present). The honest negative, distinct from "cannot answer."
+        - ``SCP-CTX-2139`` -- the authoritative log WAS read and no proof could
+          be issued. Two sub-cases: the claim is demonstrably FALSE (absence
+          claimed for an event that IS present, or a leaf index past the end of
+          the tree), OR no proof of this shape exists in this construction (an
+          EMPTY but live log, where an absence claim is actually TRUE but
+          ``prove_absence`` has no bracketing neighbours to build a proof from).
+          Never read the empty-log case as evidence the event IS present.
         - ``SCP-VALID-7000`` -- the claim itself is malformed (missing or
           mistyped fields, an ``event_hash`` that is not 32 hex-decoded bytes,
           an unsupported claim type); caller input validation. A missing or

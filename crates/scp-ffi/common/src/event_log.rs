@@ -167,6 +167,13 @@ pub fn filter_manager_entries<'a>(
 /// `direction` is the SIBLING's side, matching
 /// [`scp_event_log::proof::Direction`].
 ///
+/// `leaf_index` is reported for addressing, NOT proven: verification binds the
+/// LEAF HASH to the `root`, and establishes membership of that hash — not its
+/// position in the tree. The path directions do not encode the index
+/// unambiguously, because a promoted odd node contributes no direction bit at
+/// its level. Do not treat a verified proof as a commitment that the leaf sits
+/// at the reported `leaf_index`.
+///
 /// # Why the neighbour proofs are included
 ///
 /// An absence answer used to ship only each neighbour's `leaf_hash` +
