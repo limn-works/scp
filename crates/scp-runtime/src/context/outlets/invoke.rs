@@ -3407,12 +3407,24 @@ fn executor_error_to_terminal_payload(err: &OutletExecutorError) -> ChunkPayload
 ///   in [`invoke_outlet`], and `End` is emitted only on successful executor
 ///   completion), i.e. "still open and verifiable" per
 ///   [`SourceType::Persistent`](scp_protocol::provenance::SourceType::Persistent).
-/// - `counterparties` — empty: the End chunk is delivered IN-context to
-///   existing members; it exports no cross-context counterparty list. A
-///   cross-context hop re-derives counterparties under the source context's
+/// - `counterparties` — the source context's FULL member roster. This `End`
+///   chunk is delivered IN-context to existing members, and §7.7.1 rule 4
+///   ("Intra-context provenance") is unambiguous: within a context (no
+///   boundary crossing), counterparties are always `full` regardless of the
+///   `counterparty_policy` — the policy governs only what is exported across a
+///   boundary. The roster is captured from [`ContextRoleState::members`] at
+///   stream-open and threaded in as an owned, sorted `Vec<DID>` (the same
+///   pattern as `memory_scope`). Sorting makes the operator-signed
+///   `SCP-OUTLET-CHUNK-SIG-V1:` preimage over this provenance reproducible.
+///   Populating it honestly (rather than leaving it empty) means a consumer
+///   that re-evaluates this output after the source context closes derives
+///   `EphemeralKnownParties` — NOT the degraded `NoProvenance` an empty roster
+///   would force (§24.3.5). A cross-context hop later re-derives counterparties
+///   under the source context's
 ///   [`CounterpartyPolicy`](scp_protocol::provenance::CounterpartyPolicy) at
-///   `attach_provenance` time (§7.7.1) — this in-context terminal never
-///   over-claims membership.
+///   `attach_provenance` time (§7.7.1 rules 1-3) — the intra-context `full`
+///   roster here is the honest input that export policy narrows, never a
+///   membership over-claim across a boundary.
 /// - `discovery_method` — `OutOfBand`: no protocol-level cross-context
 ///   discovery path produced this output.
 /// - `age` — zero: the output is generated live by the executor for this
@@ -3425,11 +3437,12 @@ fn executor_error_to_terminal_payload(err: &OutletExecutorError) -> ChunkPayload
 fn stream_output_provenance(
     context_id: &str,
     memory_scope: scp_protocol::context::params::MemoryScope,
+    counterparties: Vec<DID>,
 ) -> scp_protocol::provenance::DataProvenance {
     scp_protocol::provenance::DataProvenance {
         source_context: context_id.to_owned(),
         source_type: scp_protocol::provenance::SourceType::Persistent,
-        counterparties: Vec::new(),
+        counterparties,
         purpose: None,
         discovery_method: scp_protocol::provenance::DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
@@ -3452,11 +3465,19 @@ fn stream_output_provenance(
 /// signing fails (JCS canonicalization of the payload, or a custody-side
 /// signer fault) — the caller then FAILS CLOSED (logs + stops the pump
 /// without emitting) rather than shipping a chunk bearing a forged all-zero
-/// signature. A `[0u8; 64]` sig is a false attestation the §5.4.5
-/// receiver-side verifier would reject anyway; emitting it would corrupt the
-/// wire and let a receiver bill chunks under a sig no operator ever produced.
-/// The sequence cursor is only advanced when a signed chunk is actually
-/// produced, so a signing failure never burns a sequence number.
+/// signature.
+///
+/// The protection this fail-closed path provides is **emit-side**, not a
+/// receiver backstop: the operator pump simply never puts a chunk bearing a
+/// `[0u8; 64]` sig on the wire. A downstream per-chunk check is NOT a reliable
+/// second line — the shipped SDK drain (SCP-OUT-045) does not verify per-chunk
+/// operator signatures, and the cross-context bridge deliberately ACCEPTS
+/// all-zero, bridge-authored fault-terminal chunks by design (§5.4.5). So an
+/// all-zero sig emitted here would be an indelible false attestation a member
+/// could bill chunks against under a signature no operator ever produced.
+/// Refusing to emit it at this boundary is the guarantee. The sequence cursor
+/// is only advanced when a signed chunk is actually produced, so a signing
+/// failure never burns a sequence number.
 async fn wrap_chunk(
     signing_ctx: &InnerPumpSigningContext,
     request_id: RequestId,
@@ -3467,15 +3488,33 @@ async fn wrap_chunk(
     let sig = signing_ctx
         .sign_inner_chunk(&request_id, seq, &payload)
         .await?;
-    // Advance ONLY after a successful sign — a failed sign leaves the cursor
-    // untouched so no gap appears in the emitted sequence.
-    *sequence = sequence.saturating_add(1);
-    Ok(OutletStreamChunk {
+    let chunk = OutletStreamChunk {
         request_id,
         sequence: seq,
         payload,
         sig,
-    })
+    };
+    // FIX 3 (symmetric just-signed self-verify): mirror the sibling dispatch
+    // pump (`dispatch.rs`, `sign_outer_chunk` call site). In debug builds
+    // re-verify the sig we just produced under the pinned operator verifying
+    // key, so a signing-vs-verifying preimage drift — or a signer that returns
+    // a bogus / all-zero signature on `Ok` — surfaces in tests before any
+    // member observes a bad chunk. Production builds compile this out.
+    debug_assert!(
+        verify_chunk_signature(
+            &chunk,
+            signing_ctx.operator_signer.verifying_key(),
+            &signing_ctx.context_id,
+            &signing_ctx.outlet_id,
+            &signing_ctx.caveats_binding,
+        ),
+        "invoke pump: just-signed chunk fails to verify under the pinned operator key — \
+         signing/verifying preimage drift",
+    );
+    // Advance ONLY after a successful sign — a failed sign leaves the cursor
+    // untouched so no gap appears in the emitted sequence.
+    *sequence = sequence.saturating_add(1);
+    Ok(chunk)
 }
 
 /// Identity-and-key bundle the inner pump uses to sign every chunk
@@ -3705,6 +3744,20 @@ where
     // creation-time parameter set (promotion mutates it in place), so this is
     // the authoritative scope at stream time.
     let memory_scope = context.params().memory_scope;
+    // FIX 1 (§7.7.1 rule 4): capture the hosting context's FULL member roster
+    // so the terminal `End` chunk's provenance carries the honest in-context
+    // counterparty list. The End chunk is delivered IN-context (no boundary
+    // crossing), and §7.7.1 rule 4 mandates `full` counterparties for
+    // intra-context provenance regardless of `counterparty_policy` (which
+    // governs only cross-boundary export). Leaving it empty degraded any
+    // post-close re-evaluation of this output to `NoProvenance` instead of the
+    // correct `EphemeralKnownParties` (§24.3.5). Sorted so the operator-signed
+    // `SCP-OUTLET-CHUNK-SIG-V1:` preimage over this provenance is reproducible.
+    let counterparties: Vec<DID> = {
+        let mut roster: Vec<DID> = role_state.members.iter().cloned().map(DID::from).collect();
+        roster.sort();
+        roster
+    };
     let signing_ctx = InnerPumpSigningContext {
         operator_signer,
         context_id: context_id_owned.clone(),
@@ -3733,6 +3786,7 @@ where
         effective_timeout,
         signing_ctx,
         memory_scope,
+        counterparties,
     };
     tokio::spawn(run_streaming_executor_task(task_inputs));
 
@@ -3784,6 +3838,14 @@ struct StreamingTaskInputs<E: ?Sized> {
     /// stamped into the terminal `End` chunk's provenance so it reflects the
     /// context's true scope rather than a hardcoded `Full` (Item 4).
     memory_scope: MemoryScope,
+    /// Source context's FULL member roster (sorted `Vec<DID>`), captured from
+    /// [`ContextRoleState::members`] at stream-open and stamped into the
+    /// terminal `End` chunk's provenance `counterparties`. §7.7.1 rule 4:
+    /// intra-context provenance counterparties are always `full` (the `End`
+    /// chunk is delivered in-context), so this is the honest roster, not an
+    /// empty list. Owned (mirrors `memory_scope`) because `role_state` is moved
+    /// into the executor future before the terminal is built.
+    counterparties: Vec<DID>,
 }
 
 /// Drives the streaming executor under panic guard + timeout, pumps
@@ -3824,6 +3886,7 @@ where
         effective_timeout,
         signing_ctx,
         memory_scope,
+        counterparties,
     } = inputs;
 
     let start = std::time::Instant::now();
@@ -3939,6 +4002,7 @@ where
         start,
         handler_panic_sink: handler_panic_sink.as_deref(),
         memory_scope,
+        counterparties,
     });
 
     let terminal_chunk =
@@ -3947,9 +4011,11 @@ where
             Err(e) => {
                 // Fail closed: the terminal chunk itself could not be signed.
                 // Emitting it with an all-zero sig would ship a forged
-                // attestation; the receiver's §5.4.5 verifier would reject it
-                // regardless. No terminal is delivered and the event is
-                // skipped.
+                // attestation. The guarantee is EMIT-SIDE — we never put the
+                // forged sig on the wire — NOT a receiver backstop (the SDK
+                // drain does not verify per-chunk sigs, and the bridge accepts
+                // all-zero fault terminals by design, §5.4.5). No terminal is
+                // delivered and the event is skipped.
                 tracing::error!(
                     request_id = %hex::encode(request_id),
                     outlet_id = %outlet_id_for_emit,
@@ -4370,6 +4436,11 @@ struct BuildTerminalChunkInputs<'a> {
     /// Hosting context's real retention policy, stamped into the successful
     /// `End` chunk's provenance (Item 4).
     memory_scope: MemoryScope,
+    /// Source context's FULL member roster (sorted), stamped into the
+    /// successful `End` chunk's provenance `counterparties` per §7.7.1 rule 4
+    /// (intra-context provenance is always `full`). Owned so the value
+    /// survives to terminal-emission time; consumed only in the `End` arm.
+    counterparties: Vec<DID>,
 }
 
 /// Builds the §5.4.5 terminal chunk for a streaming outlet invocation
@@ -4398,7 +4469,11 @@ fn build_terminal_chunk(inputs: BuildTerminalChunkInputs<'_>) -> ChunkPayload {
             let execution_time_ms = elapsed_ms(inputs.start);
             ChunkPayload::End {
                 aggregate: serde_json::Value::Null,
-                provenance: stream_output_provenance(inputs.context_id, inputs.memory_scope),
+                provenance: stream_output_provenance(
+                    inputs.context_id,
+                    inputs.memory_scope,
+                    inputs.counterparties,
+                ),
                 execution_time_ms,
             }
         }
@@ -7293,7 +7368,15 @@ mod tests {
             assert_eq!(end.chain_depth, 0);
             assert!(end.chain_path.is_none());
             assert!(end.payment_amount.is_none());
-            assert!(end.counterparties.is_empty());
+            // §7.7.1 rule 4 (FIX 1): intra-context provenance carries the FULL
+            // member roster, never an empty list. `test_role_state` seeds a
+            // single member (the creator), so the terminal `End` counterparties
+            // must be exactly that roster.
+            assert_eq!(
+                end.counterparties,
+                vec![DID::from(creator_did)],
+                "intra-context End provenance must carry the full member roster (§7.7.1 rule 4)"
+            );
 
             // Every chunk carries a real (non-forged) operator signature.
             for chunk in &chunks {
@@ -7396,6 +7479,152 @@ mod tests {
         assert!(
             chunks.is_empty(),
             "a total signer failure emits zero chunks (fail closed); got {chunks:?}"
+        );
+    }
+
+    /// A [`StreamSigner`] that signs the first `n` chunks successfully (under a
+    /// real key, so they verify) and then fails every subsequent `sign` with a
+    /// custody error. Used to reach the fail-closed branches that fire AFTER the
+    /// pump has already emitted signed `Data` chunks — specifically the terminal
+    /// (`End`) signing branch, which the always-failing [`FailingStreamSigner`]
+    /// (which fails the FIRST chunk) can never reach.
+    struct SucceedNThenFailStreamSigner {
+        inner: crate::context::outlets::signer::InProcessStreamSigner,
+        remaining: std::sync::atomic::AtomicUsize,
+    }
+    impl SucceedNThenFailStreamSigner {
+        fn new(n: usize) -> Self {
+            use ed25519_dalek::SigningKey;
+            Self {
+                inner: crate::context::outlets::signer::InProcessStreamSigner::new(
+                    SigningKey::from_bytes(&[0x5c; 32]),
+                ),
+                remaining: std::sync::atomic::AtomicUsize::new(n),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl StreamSigner for SucceedNThenFailStreamSigner {
+        async fn sign(&self, preimage: &[u8]) -> Result<[u8; 64], StreamSignerError> {
+            use std::sync::atomic::Ordering;
+            // Atomically consume one success from the budget; `fetch_update`
+            // returns `Ok` while the budget is positive and `Err` once it hits
+            // zero (never underflows).
+            let has_budget = self
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |r| {
+                    (r > 0).then(|| r - 1)
+                })
+                .is_ok();
+            if has_budget {
+                self.inner.sign(preimage).await
+            } else {
+                Err(StreamSignerError::Custody {
+                    category:
+                        crate::context::outlets::signer::StreamSignerCustodyCategory::BackendFault,
+                })
+            }
+        }
+        fn verifying_key(&self) -> &ed25519_dalek::VerifyingKey {
+            self.inner.verifying_key()
+        }
+    }
+
+    /// Item 1 / FIX 2 (fail-closed signing at the TERMINAL boundary): when the
+    /// operator signer succeeds for every `Data` chunk in the pump but then
+    /// fails to sign the framework's terminal `End` chunk, the stream MUST fail
+    /// closed — the already-signed `Data` chunks are delivered, but NO terminal
+    /// chunk is emitted (and certainly no forged all-zero-signature terminal).
+    ///
+    /// This exercises the terminal-chunk fail-closed branch in
+    /// [`run_streaming_executor_task`] (the `wrap_chunk` call for the terminal
+    /// payload), which the always-failing `FailingStreamSigner` cannot reach —
+    /// that signer fails the very first `Data` chunk, so the pump never gets to
+    /// the terminal. Here the executor emits exactly two `Data` chunks and the
+    /// signer's budget is exactly two, so both `Data` chunks sign and deliver
+    /// and only the terminal `End` sign fails.
+    #[tokio::test]
+    async fn streaming_terminal_signing_failure_fails_closed_no_terminal_chunk() {
+        struct TwoDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for TwoDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..2u32 {
+                    // Serialize each send against a drain so the pump signs and
+                    // delivers this chunk before the next is produced — keeps
+                    // the two `Data` sigs inside the budget deterministically.
+                    tx.send(ChunkPayload::Data {
+                        value: serde_json::json!({ "tick": i }),
+                    })
+                    .await
+                    .expect("pump receiver is alive for buffered Data sends");
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(TwoDataExecutor);
+        // Budget = 2: both `Data` chunks sign; the terminal `End` (the 3rd
+        // sign) fails.
+        let signer: std::sync::Arc<dyn StreamSigner> =
+            std::sync::Arc::new(SucceedNThenFailStreamSigner::new(2));
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            signer,
+            [0u8; 32],
+        )
+        .await
+        .expect("open succeeds; the terminal signing failure surfaces during the pump");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+
+        // No forged all-zero signature ever reaches the wire.
+        assert!(
+            chunks.iter().all(|c| c.sig != [0u8; 64]),
+            "no emitted chunk may carry the all-zero forged signature; got {chunks:?}"
+        );
+        // The two signed `Data` chunks are delivered ...
+        assert_eq!(
+            chunks.len(),
+            2,
+            "both pre-terminal Data chunks are signed and delivered; got {chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|c| matches!(c.payload, ChunkPayload::Data { .. })),
+            "only Data chunks are delivered; got {chunks:?}"
+        );
+        // ... but the terminal `End`/`Error` is NOT: the terminal sign failed,
+        // so the stream fails closed with no terminal chunk on the wire.
+        assert!(
+            !chunks.iter().any(|c| matches!(
+                c.payload,
+                ChunkPayload::End { .. } | ChunkPayload::Error { .. }
+            )),
+            "no terminal chunk may be emitted when terminal signing fails closed; got {chunks:?}"
         );
     }
 
