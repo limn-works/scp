@@ -816,8 +816,10 @@ func opEventLogAbsenceOverDivergentLocalTree(
     )
     let did = identity.did()
     // Diverge the bridge-local tree from the authoritative log via a real
-    // public bridge call (appends a ProvenanceAttached leaf NOT in the
-    // authoritative log).
+    // public bridge call. The source context is missing, so only the
+    // `ProvenanceReceived` target-side leaf lands on the bridge-local tree (a
+    // leaf NOT in the authoritative log); the source-side `ProvenanceAttached`
+    // append is dropped best-effort.
     _ = try scp.provenanceAttach(
         sourceContextId: "parity-prov-source",
         sourceType: "persistent",
@@ -902,6 +904,54 @@ func opEventLogVerifyMalformedClaim(
     }
 }
 
+// The direct cross-bridge regression guard for the `context_events` twin
+// (GitHub #1933). Reads the AUTHORITATIVE root + count from the verify path,
+// diverges the bridge-local tree via `provenanceAttach` (a `ProvenanceReceived`
+// leaf NOT in the authoritative log), then asserts the `mcpContextEvents`
+// summary STILL commits to the authoritative log. Raw `merkle_root` bytes are
+// not compared cross-bridge (the fresh `ContextCreated` leaf carries a
+// wall-clock timestamp); the SEMANTIC `root_matches_authoritative` invariant is.
+// Mirrors `seed_operations.py::_py_mcp_context_events_authoritative`.
+func opMcpContextEventsAuthoritative(
+    _ req: BridgeRequest
+) async throws -> [String: JSONValue] {
+    _ = req
+    let scp = try Scp.withStorage(config: .inMemory)
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(
+        identity: identity, params: buildContextParams()
+    )
+    let did = identity.did()
+    // AUTHORITATIVE root + count from the verify path — independent of the MCP
+    // summary surface under test.
+    let proof = try await scp.eventLogVerify(
+        handle: handle,
+        claimJson: "{\"type\":\"inclusion\",\"leaf_index\":0}"
+    )
+    let details = parseJsonObject(proof.detailsJson)
+    let authRoot = details["root"] as? String ?? ""
+    let authCount = (details["leaf_count"] as? NSNumber)?.int64Value ?? -1
+    // Diverge the bridge-local tree via a real public bridge call (appends a
+    // `ProvenanceReceived` leaf NOT in the authoritative log).
+    _ = try scp.provenanceAttach(
+        sourceContextId: "parity-prov-source",
+        sourceType: "persistent",
+        memoryScopeStr: "full",
+        members: [did],
+        targetContextId: handle.contextId(),
+        actorDid: did,
+        existingChainDepth: nil
+    )
+    let summary = parseJsonObject(try scp.mcpContextEvents(handle: handle))
+    let ceRoot = summary["merkle_root"] as? String
+    let ceCount = (summary["event_count"] as? NSNumber)?.int64Value
+    return [
+        "event_count": .integer(ceCount ?? -1),
+        "root_matches_authoritative": .bool(ceRoot != nil && ceRoot == authRoot),
+        "count_matches_authoritative": .bool(ceCount != nil && ceCount == authCount)
+    ]
+}
+
 /// Parses a JSON object string into `[String: Any]`; empty on failure.
 func parseJsonObject(_ json: String) -> [String: Any] {
     guard let data = json.data(using: .utf8),
@@ -947,6 +997,8 @@ func dispatch(_ req: BridgeRequest) async -> Any {
             result = try await opEventLogAbsenceOverDivergentLocalTree(req)
         case "event_log_verify_malformed_claim_rejected":
             result = try await opEventLogVerifyMalformedClaim(req)
+        case "mcp_context_events_authoritative":
+            result = try await opMcpContextEventsAuthoritative(req)
         case "unregistered_did_rejected":
             result = try await opUnregisteredDidRejected(req)
         default:

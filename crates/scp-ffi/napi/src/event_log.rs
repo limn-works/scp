@@ -65,7 +65,7 @@ pub struct NapiEvent {
 /// append order, and the sorted index the neighbours are drawn from is local
 /// state the root does not cover. Treat an `"absence"` answer as the log's own
 /// assertion plus checkable neighbour-inclusion, not as a self-contained
-/// negative proof.
+/// non-membership proof (a sorted/sparse tree is the real fix — see #2314).
 ///
 /// See ADR-011 (Event Log).
 #[napi(object)]
@@ -302,6 +302,17 @@ pub(crate) async fn event_log_verify_on(
             code: codes::VALID_7000.to_owned(),
         })?;
 
+    // DELIBERATE ordering (black-hat NIT, #1933): the invalid-JSON and
+    // missing/invalid-`type` checks run BEFORE the `check_ready`/authoritative-log
+    // gate below, on purpose — rejecting obviously-malformed claim shape is cheap,
+    // and a claim we cannot even parse or type cannot be answered against any log.
+    // The resulting self-oracle (a malformed-`type` claim on a not-ready instance
+    // returns VALID-7000 while a well-formed one returns CTX-2138) is benign: the
+    // caller crafted the malformed type and can already probe readiness with a
+    // well-formed claim, so the malformed path leaks strictly less. The remaining
+    // VALID-7000 sites (missing `leaf_index`, malformed `event_hash`, unsupported
+    // type) sit AFTER the gate, so an unreachable log surfaces CTX-2138 first for
+    // those — the documented precedence.
     let claim_type = claim
         .get("type")
         .and_then(|v| v.as_str())

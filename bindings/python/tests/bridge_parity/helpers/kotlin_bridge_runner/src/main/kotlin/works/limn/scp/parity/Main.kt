@@ -676,8 +676,10 @@ private suspend fun opEventLogAbsenceOverDivergentLocalTree(args: JsonObject): J
         val handle = scp.contextCreate(identity, buildContextParams())
         val did = identity.did()
         // Diverge the bridge-local tree from the authoritative log via a
-        // real public bridge call (appends a ProvenanceAttached leaf NOT in
-        // the authoritative log).
+        // real public bridge call. The source context is missing, so only the
+        // `ProvenanceReceived` target-side leaf lands on the bridge-local tree
+        // (a leaf NOT in the authoritative log); the source-side
+        // `ProvenanceAttached` append is dropped best-effort.
         scp.provenanceAttach(
             "parity-prov-source",
             "persistent",
@@ -754,6 +756,47 @@ private suspend fun opEventLogVerifyMalformedClaim(args: JsonObject): JsonObject
                     }
                 )
             }
+        }
+    }
+
+// The direct cross-bridge regression guard for the `context_events` twin
+// (GitHub #1933). Reads the AUTHORITATIVE root + count from the verify path,
+// diverges the bridge-local tree via `provenanceAttach` (a `ProvenanceReceived`
+// leaf NOT in the authoritative log), then asserts the `mcpContextEvents`
+// summary STILL commits to the authoritative log. Raw `merkle_root` bytes are
+// not compared cross-bridge (the fresh `ContextCreated` leaf carries a
+// wall-clock timestamp); the SEMANTIC `root_matches_authoritative` invariant is.
+// Mirrors `seed_operations.py::_py_mcp_context_events_authoritative`.
+@Suppress("UnusedParameter")
+private suspend fun opMcpContextEventsAuthoritative(args: JsonObject): JsonObject =
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams())
+        val did = identity.did()
+        // AUTHORITATIVE root + count from the verify path — independent of the
+        // MCP summary surface under test.
+        val proof = scp.eventLogVerify(handle, """{"type":"inclusion","leaf_index":0}""")
+        val details = JSON.parseToJsonElement(proof.detailsJson).jsonObject
+        val authRoot = details["root"]?.jsonPrimitive?.content ?: ""
+        val authCount = details["leaf_count"]?.jsonPrimitive?.longOrNull ?: -1L
+        // Diverge the bridge-local tree via a real public bridge call (appends
+        // a `ProvenanceReceived` leaf NOT in the authoritative log).
+        scp.provenanceAttach(
+            "parity-prov-source",
+            "persistent",
+            "full",
+            listOf(did),
+            handle.contextId(),
+            did,
+            null
+        )
+        val summary = JSON.parseToJsonElement(scp.mcpContextEvents(handle)).jsonObject
+        val ceRoot = summary["merkle_root"]?.jsonPrimitive?.content
+        val ceCount = summary["event_count"]?.jsonPrimitive?.longOrNull
+        buildJsonObject {
+            put("event_count", JsonPrimitive(ceCount ?: -1L))
+            put("root_matches_authoritative", JsonPrimitive(ceRoot == authRoot))
+            put("count_matches_authoritative", JsonPrimitive(ceCount == authCount))
         }
     }
 
@@ -841,6 +884,8 @@ private suspend fun dispatch(req: RawRequest): String {
                 opEventLogAbsenceOverDivergentLocalTree(req.args)
             "event_log_verify_malformed_claim_rejected" ->
                 opEventLogVerifyMalformedClaim(req.args)
+            "mcp_context_events_authoritative" ->
+                opMcpContextEventsAuthoritative(req.args)
             "unregistered_did_rejected" -> opUnregisteredDidRejected(req.args)
             else -> return errResponse(
                 req.id,

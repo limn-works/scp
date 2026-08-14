@@ -175,6 +175,11 @@ pub fn filter_manager_entries<'a>(
 /// producer had set. Shipping the full neighbour paths is what makes the
 /// neighbour-inclusion half of the claim independently checkable against the
 /// reported `root`.
+///
+/// This closes the neighbour-inclusion HALF only: the append-order root does
+/// NOT commit to sorted adjacency, so an absence answer is not a self-contained,
+/// off-box non-membership proof (a sorted/sparse tree is the real fix; see
+/// #2314).
 #[must_use]
 pub fn inclusion_proof_json(proof: &scp_event_log::proof::InclusionProof) -> serde_json::Value {
     let path: Vec<serde_json::Value> = proof
@@ -217,6 +222,49 @@ pub fn absence_neighbor_json(
             "inclusion_proof": inclusion_proof_json(&n.inclusion_proof),
         })
     })
+}
+
+/// Builds the MCP `context_events` metadata JSON over the AUTHORITATIVE event
+/// log (GitHub #1933).
+///
+/// The MCP `events` resource (`scp://{context_id}/events`, read through
+/// `ContextProvider::context_events`) and the `mcp_context_events` bridge
+/// method both publish the event-log summary through THIS single helper, so the
+/// `(event_count, merkle_root)` pair is byte-identical across all three bridges
+/// and identical to the commitment `event_log_verify` / `event_log_checkpoint`
+/// take over the SAME `Supervisor::authoritative_event_log` snapshot. The MCP
+/// tool previously computed its root over each bridge's own
+/// caller-influenceable bridge-local tree — the exact forgeable-root class
+/// #1933 severs on the verify / checkpoint / query paths, left live on the
+/// agent-facing MCP surface.
+///
+/// `log` is the authoritative-log fetch result. On success the summary is the
+/// real `(count, root)` of that snapshot. On failure it FAILS CLOSED to an
+/// honest absent state carrying [`crate::error_codes::CTX_2138`] — it does NOT
+/// fabricate a `[0u8; 32]` root or a `0` count, which a consumer could not
+/// distinguish from a genuinely-empty log. This mirrors the `SCP-CTX-2138`
+/// the verify / checkpoint paths raise when the authoritative log is
+/// unreachable; those paths raise a typed error, and this resource-shaped
+/// surface (which returns a JSON `Value`, never raising) carries the same code
+/// in an honest absent object instead.
+#[must_use]
+pub fn context_events_metadata_json<E: core::fmt::Display>(
+    context_id: &str,
+    log: Result<&scp_event_log::EventLog, E>,
+) -> serde_json::Value {
+    match log {
+        Ok(log) => serde_json::json!({
+            "event_count": scp_event_log::tree::event_count(log),
+            "merkle_root": hex::encode(scp_event_log::tree::root(log)),
+        }),
+        Err(detail) => serde_json::json!({
+            "error": format!(
+                "event log metadata cannot reach the authoritative log for \
+                 context '{context_id}': {detail}"
+            ),
+            "code": crate::error_codes::CTX_2138,
+        }),
+    }
 }
 
 #[cfg(test)]

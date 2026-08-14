@@ -903,7 +903,10 @@ export interface Event {
  * hash sorts strictly between them. It does NOT establish that the two
  * neighbours are *adjacent* in sorted order: the log's Merkle root commits to
  * append order, and the sorted index the neighbours are drawn from is local
- * state the root does not cover.
+ * state the root does not cover. So the neighbour-inclusion half is checkable
+ * off-box against the reported `root`, but adjacency is not — this is NOT a
+ * self-contained non-membership proof (a sorted/sparse tree is the real fix;
+ * see #2314).
  */
 export interface Proof {
   /** Proof type: `"inclusion"` or `"absence"`. */

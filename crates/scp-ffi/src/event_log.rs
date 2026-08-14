@@ -116,7 +116,7 @@ impl PyEvent {
 /// append order, and the sorted index the neighbours are drawn from is local
 /// state the root does not cover. Treat an `"absence"` answer as the log's own
 /// assertion plus checkable neighbour-inclusion, not as a self-contained
-/// negative proof.
+/// non-membership proof (a sorted/sparse tree is the real fix — see #2314).
 ///
 /// See ADR-011 (Merkle proofs) and ADR-013 §7 (bridge layer).
 #[pyclass(name = "Proof")]
@@ -495,6 +495,19 @@ fn event_log_verify_impl(
     // Parse the claim dict.
     let claim_json = py_dict_to_json(claim)?;
 
+    // DELIBERATE ordering (black-hat NIT, #1933): the missing/invalid-`type`
+    // check runs BEFORE the `check_ready`/authoritative-log gate below, on
+    // purpose. Rejecting obviously-malformed claim shape is cheap; the log gate
+    // rebuilds the authoritative log, so validating input first avoids that work
+    // for a claim we would reject anyway. This yields a benign self-oracle — a
+    // malformed-`type` claim on a not-ready instance returns VALID-7000 while a
+    // well-formed one returns CTX-2138 — but the caller CRAFTED the malformed
+    // type, so learns nothing new, and can already probe readiness with a
+    // well-formed claim (which returns CTX-2138). The malformed path therefore
+    // leaks strictly less, never more. The remaining VALID-7000 sites (missing
+    // `leaf_index`, malformed `event_hash`, unsupported type) sit in the match
+    // arms below, AFTER the gate — so an unreachable log surfaces CTX-2138 first
+    // for those; this split is the documented precedence.
     let claim_type = claim_json
         .get("type")
         .and_then(|v| v.as_str())

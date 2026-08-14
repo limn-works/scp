@@ -371,6 +371,12 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
           ok: true,
           result: await opEventLogVerifyMalformedClaim(req),
         };
+      case "mcp_context_events_authoritative":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opMcpContextEventsAuthoritative(req),
+        };
       case "unregistered_did_rejected":
         return {
           id: req.id,
@@ -846,8 +852,10 @@ async function opEventLogAbsenceOverDivergentLocalTree(
   const identity = await scp.identityCreate("in_memory");
   const handle = await scp.contextCreate(identity, JSON.stringify(params));
   // Diverge the bridge-local tree from the authoritative log via a real
-  // public bridge call (appends a ProvenanceAttached leaf NOT in the
-  // authoritative log).
+  // public bridge call. The source context is missing, so only the
+  // `ProvenanceReceived` target-side leaf lands on the bridge-local tree (a
+  // leaf NOT in the authoritative log); the source-side `ProvenanceAttached`
+  // append is dropped best-effort.
   scp.provenanceAttach(
     "parity-prov-source",
     "persistent",
@@ -923,6 +931,54 @@ async function opEventLogVerifyMalformedClaim(
   }
   return {
     error: { type: "none", code: "NONE", message: "no error raised" },
+  };
+}
+
+// The direct cross-bridge regression guard for the `context_events` twin
+// (GitHub #1933). Reads the AUTHORITATIVE root + count from the verify path,
+// diverges the bridge-local tree via `provenanceAttach` (a `ProvenanceReceived`
+// leaf NOT in the authoritative log), then asserts the `mcpContextEvents`
+// summary STILL commits to the authoritative log. Raw `merkle_root` bytes are
+// not compared cross-bridge (the fresh `ContextCreated` leaf carries a
+// wall-clock timestamp); the SEMANTIC `root_matches_authoritative` invariant is.
+// Mirrors `seed_operations.py::_py_mcp_context_events_authoritative`.
+async function opMcpContextEventsAuthoritative(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
+  const params = { name: "parity-elog-v", mode: "encrypted" };
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(identity, JSON.stringify(params));
+  // AUTHORITATIVE root + count from the verify path — independent of the MCP
+  // summary surface under test.
+  const proof = await scp.eventLogVerify(
+    handle,
+    JSON.stringify({ type: "inclusion", leaf_index: 0 }),
+  );
+  const details = JSON.parse(proof.detailsJson) as Record<string, unknown>;
+  const authRoot = String(details.root);
+  const authCount = Number(details.leaf_count);
+  // Diverge the bridge-local tree via a real public bridge call (appends a
+  // `ProvenanceReceived` leaf NOT in the authoritative log).
+  scp.provenanceAttach(
+    "parity-prov-source",
+    "persistent",
+    "full",
+    [identity.did],
+    handle.contextId,
+    identity.did,
+  );
+  const summary = JSON.parse(scp.mcpContextEvents(handle)) as Record<
+    string,
+    unknown
+  >;
+  const ceRoot = summary.merkle_root;
+  const ceCount = summary.event_count;
+  return {
+    event_count: typeof ceCount === "number" ? ceCount : -1,
+    root_matches_authoritative: ceRoot === authRoot,
+    count_matches_authoritative: ceCount === authCount,
   };
 }
 

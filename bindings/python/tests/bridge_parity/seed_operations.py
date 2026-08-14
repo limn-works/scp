@@ -1226,9 +1226,11 @@ OP_EVENT_LOG_ABSENCE_OF_LIFECYCLE_EVENT_REJECTED = OpSpec(
 # APART first:
 #
 #   1. create a context (authoritative log gets `ContextCreated` @ leaf 0);
-#   2. call the public `provenance_attach`, which appends a
-#      `ProvenanceAttached` leaf to the BRIDGE-LOCAL tree that is NOT in
-#      the authoritative log — the trees now diverge;
+#   2. call the public `provenance_attach` with a MISSING source context, so
+#      only the `ProvenanceReceived` leaf (the target-side append) lands on
+#      the BRIDGE-LOCAL tree — a leaf NOT in the authoritative log — while the
+#      source-side `ProvenanceAttached` append is dropped best-effort; the
+#      trees now diverge;
 #   3. read the AUTHORITATIVE `ContextCreated` leaf hash from
 #      `event_log_query` (which reads the authoritative log, INDEPENDENT
 #      of the verify path — so the hash is not derived from the surface
@@ -1362,6 +1364,113 @@ OP_EVENT_LOG_VERIFY_MALFORMED_CLAIM_REJECTED = OpSpec(
 
 
 # ---------------------------------------------------------------------------
+# op 16: mcp_context_events_authoritative
+#
+# The direct cross-bridge regression guard for the `context_events` twin
+# (GitHub #1933, BLACK-1933-1). The MCP `events` resource — and the
+# `mcp_context_events` bridge method that publishes the identical summary —
+# reports an event-log summary `{event_count, merkle_root}`. Before this fix
+# every bridge computed that root over its OWN caller-influenceable
+# bridge-local tree (PyO3/UniFFI) or returned an empty array (NAPI): the
+# exact forgeable-root class #1933 severs on verify/checkpoint/query, left
+# live on the agent-facing MCP surface, plus a THIRD cross-bridge
+# inconsistency. Ops 12/13/14 cover the verify path; NONE covers the MCP
+# summary surface, so the twin went unguarded.
+#
+# This op:
+#   1. creates a context (authoritative log gets `ContextCreated` @ leaf 0);
+#   2. reads the AUTHORITATIVE root + leaf count from `event_log_verify`
+#      inclusion@0 — an INDEPENDENT path, NOT the MCP surface under test;
+#   3. calls the public `provenance_attach`, which appends a
+#      `ProvenanceReceived` leaf to the BRIDGE-LOCAL tree that is NOT in the
+#      authoritative log — the two trees now diverge;
+#   4. reads the `mcp_context_events` summary and asserts its root + count
+#      STILL equal the authoritative ones (it did NOT move to the
+#      caller-shaped tree) — the direct regression guard for this twin.
+#
+# The raw `merkle_root` bytes are NOT compared cross-bridge: a fresh
+# `ContextCreated` leaf carries a wall-clock timestamp, so its hash (and the
+# root) legitimately differs per bridge — the same reason ops 4/12/13 pin
+# `event_count`/`leaf_count` but never the root value. Instead this op pins
+# the SEMANTIC invariant `root_matches_authoritative` (a within-bridge
+# comparison against the independent verify path) plus the authoritative
+# `event_count` (deterministically 1), both IDENTICAL across all three
+# bridges post-fix. Pre-fix the bridges DISAGREE — PyO3/UniFFI report the
+# 2-leaf divergent local tree (`event_count == 2`,
+# `root_matches_authoritative == False`), NAPI the empty array
+# (`event_count == -1`) — and the `expected_values` pins flip, catching both
+# a reverted routing fix AND joint drift.
+# ---------------------------------------------------------------------------
+
+
+# The committed post-fix invariant: after the bridge-local tree is diverged,
+# the MCP `events` summary STILL commits to the authoritative log.
+EXPECTED_CONTEXT_EVENTS_MATCHES_AUTHORITATIVE = True
+
+
+def _py_mcp_context_events_authoritative(ctx: OpContext) -> dict[str, Any]:
+    scp, identity = ctx.attached_scp()
+    handle = scp.context_create(identity.did, dict(_VERIFY_CONTEXT_PARAMS))
+    ctx_id = handle.context_id
+    # AUTHORITATIVE root + count from the verify path — independent of the
+    # MCP summary surface under test.
+    proof = scp.event_log_verify(ctx_id, {"type": "inclusion", "leaf_index": 0})
+    auth_root = str(proof.details["root"])
+    auth_count = int(proof.details["leaf_count"])
+    # Diverge the bridge-local tree via a real public bridge call (appends a
+    # `ProvenanceReceived` leaf NOT in the authoritative log).
+    scp.provenance_attach(
+        _DIVERGENCE_PROV_SOURCE,
+        "persistent",
+        "full",
+        [identity.did],
+        ctx_id,
+        identity.did,
+        None,
+    )
+    # The MCP `events` summary under test.
+    summary = json.loads(scp.mcp_context_events(ctx_id))
+    ce_root = summary.get("merkle_root")
+    ce_count = summary.get("event_count")
+    return {
+        "event_count": ce_count if isinstance(ce_count, int) else -1,
+        "root_matches_authoritative": ce_root == auth_root,
+        "count_matches_authoritative": ce_count == auth_count,
+    }
+
+
+OP_MCP_CONTEXT_EVENTS_AUTHORITATIVE = OpSpec(
+    name="mcp_context_events_authoritative",
+    py_call=_py_mcp_context_events_authoritative,
+    node_call={"op": "mcp_context_events_authoritative", "args": {}},
+    schema=OpSchema(
+        fields=(
+            FieldSpec("event_count", "exact"),
+            FieldSpec("root_matches_authoritative", "exact"),
+            FieldSpec("count_matches_authoritative", "exact"),
+        )
+    ),
+    # Pin the committed post-fix invariant. A bridge that regressed to the
+    # divergent local tree (or the empty array) fails both the parity equality
+    # and these literal pins — including under joint drift, where every bridge
+    # would report `count_matches_authoritative == False` together. The absolute
+    # `event_count` is intentionally NOT pinned (it equals the authoritative
+    # leaf count, which the cross-bridge `exact` comparison already holds
+    # identical without hard-coding its value).
+    expected_values=(
+        (
+            "root_matches_authoritative",
+            EXPECTED_CONTEXT_EVENTS_MATCHES_AUTHORITATIVE,
+        ),
+        (
+            "count_matches_authoritative",
+            EXPECTED_CONTEXT_EVENTS_MATCHES_AUTHORITATIVE,
+        ),
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
 # Why there is NO missing-signing-custody parity op here.
 #
 # The missing-signing-custody condition (a sign operation invoked for an
@@ -1401,4 +1510,5 @@ SEED_OPS: tuple[OpSpec, ...] = (
     OP_EVENT_LOG_ABSENCE_OF_LIFECYCLE_EVENT_REJECTED,
     OP_EVENT_LOG_ABSENCE_OVER_DIVERGENT_LOCAL_TREE_REJECTED,
     OP_EVENT_LOG_VERIFY_MALFORMED_CLAIM_REJECTED,
+    OP_MCP_CONTEXT_EVENTS_AUTHORITATIVE,
 )

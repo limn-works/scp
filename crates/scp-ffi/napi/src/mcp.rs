@@ -338,6 +338,38 @@ impl McpTransport for SseMcpTransport {
 struct McpNapiBridgeProvider {
     agent_did: String,
     context_ids: Vec<String>,
+    /// Weak reference to the bridge instance whose supervisor the `events`
+    /// resource reads. `Weak` (not `Arc`) so a live MCP server never keeps a
+    /// dropped bridge instance alive — mirrors the `PyO3` `FfiBridgeProvider`.
+    bi: std::sync::Weak<NapiBridgeInstance>,
+}
+
+impl McpNapiBridgeProvider {
+    /// Upgrades the stored [`Weak`] to a live [`Arc<NapiBridgeInstance>`].
+    fn upgrade_bi(&self) -> Result<Arc<NapiBridgeInstance>, String> {
+        self.bi.upgrade().ok_or_else(|| {
+            "bridge instance has been dropped — MCP provider cannot service request".to_owned()
+        })
+    }
+}
+
+/// Fetches the context's AUTHORITATIVE event log for the MCP `events` summary
+/// (GitHub #1933), mirroring the fail-closed gate `event_log_verify` uses.
+///
+/// `check_ready` rejects suspended AND shut-down instances, then the supervisor
+/// is resolved and the ONE authoritative snapshot replayed. Every failure maps
+/// to a `String` detail so the caller can render the honest absent object via
+/// [`scp_ffi_common::event_log::context_events_metadata_json`] — the summary
+/// never falls back to any bridge-local tree.
+fn authoritative_log_for_mcp_events(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<scp_event_log::EventLog, String> {
+    bi.core.check_ready().map_err(|e| e.to_string())?;
+    let supervisor = crate::runtime::supervisor(bi).map_err(|e| e.to_string())?;
+    supervisor
+        .authoritative_event_log(context_id)
+        .map_err(|e| e.to_string())
 }
 
 impl ContextProvider for McpNapiBridgeProvider {
@@ -393,8 +425,19 @@ impl ContextProvider for McpNapiBridgeProvider {
         Vec::new()
     }
 
-    fn context_events(&self, _context_id: &str) -> serde_json::Value {
-        serde_json::Value::Array(Vec::new())
+    fn context_events(&self, context_id: &str) -> serde_json::Value {
+        // #1933: bring NAPI to parity — the event-log summary the MCP `events`
+        // resource publishes commits to the AUTHORITATIVE log (the same
+        // `(event_count, merkle_root)` pair `event_log_verify` /
+        // `event_log_checkpoint` commit to), routed through the ONE shared
+        // helper so the bytes are identical across all three bridges. This arm
+        // previously returned an empty array — a third cross-bridge
+        // inconsistency. An unreachable log FAILS CLOSED to an honest absent
+        // object (SCP-CTX-2138), never a fabricated zero root or count.
+        let log = self
+            .upgrade_bi()
+            .and_then(|bi| authoritative_log_for_mcp_events(&bi, context_id));
+        scp_ffi_common::event_log::context_events_metadata_json(context_id, log.as_ref())
     }
 
     fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
@@ -475,10 +518,28 @@ async fn run_mcp_stdio_server(
 // Bridge functions
 // ---------------------------------------------------------------------------
 
+/// Per-bridge-instance implementation of `mcp_context_events` (GitHub #1933).
+///
+/// Returns the event-log summary the MCP `events` resource publishes for
+/// `handle`'s context — `{"event_count": N, "merkle_root": "<hex>"}` over the
+/// AUTHORITATIVE log — through the ONE shared
+/// [`scp_ffi_common::event_log::context_events_metadata_json`] helper, so the
+/// bytes match `ContextProvider::context_events` and the other two bridges.
+/// FAILS CLOSED to the honest absent object (SCP-CTX-2138) when the
+/// authoritative log is unreachable, never a fabricated zero root or count.
+pub(crate) fn mcp_context_events_on(
+    bi: &NapiBridgeInstance,
+    handle: &crate::context::NapiContextHandle,
+) -> String {
+    let context_id = handle.context_id();
+    let log = authoritative_log_for_mcp_events(bi, &context_id);
+    scp_ffi_common::event_log::context_events_metadata_json(&context_id, log.as_ref()).to_string()
+}
+
 /// Per-bridge-instance implementation of [`mcp_server_create`].
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_server_create_on(
-    bi: &NapiBridgeInstance,
+    bi: &Arc<NapiBridgeInstance>,
     config: NapiMcpServerConfig,
 ) -> napi::Result<NapiMcpServerHandle> {
     if config.transport != "stdio" && config.transport != "sse" {
@@ -503,6 +564,7 @@ pub(crate) async fn mcp_server_create_on(
     let provider = McpNapiBridgeProvider {
         agent_did: config.identity_did.clone(),
         context_ids: config.context_ids.clone(),
+        bi: Arc::downgrade(bi),
     };
     let server = scp_mcp::server::McpServer::new(provider);
     let server = Arc::new(Mutex::new(server));
@@ -511,6 +573,10 @@ pub(crate) async fn mcp_server_create_on(
 
     let server_clone = Arc::clone(&server);
     let transport_mode = config.transport.clone();
+    // Weak for the SSE arm's provider (constructed inside the spawned task) so
+    // its `events` resource reads the SAME authoritative log (#1933) without
+    // keeping a dropped bridge instance alive.
+    let sse_bi = Arc::downgrade(bi);
 
     let task_handle = crate::runtime().spawn(async move {
         match transport_mode.as_str() {
@@ -521,6 +587,7 @@ pub(crate) async fn mcp_server_create_on(
                 let provider = McpNapiBridgeProvider {
                     agent_did: config.identity_did,
                     context_ids: config.context_ids,
+                    bi: sse_bi,
                 };
                 let sse_server = scp_mcp::server::McpServer::new(provider);
                 let sse_config =

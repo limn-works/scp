@@ -2545,9 +2545,12 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * to the UCAN-state tree. Proof-generation failures over a readable log
      * (empty log, out-of-range index, absence claimed for a present event)
      * return `SCP-CTX-2139` — the honest negative answer, distinct from
-     * "cannot answer." A malformed claim (invalid JSON, missing/mistyped
-     * fields, unsupported type) is rejected with `SCP-VALID-7000` before any
-     * log is consulted.
+     * "cannot answer." A malformed claim carries `SCP-VALID-7000` (caller
+     * input validation): invalid JSON or a missing/invalid `type` is rejected
+     * before the authoritative log is consulted, but a missing `leaf_index`, a
+     * malformed `event_hash`, or an unsupported claim type is rejected only
+     * after the authoritative log is confirmed reachable — so an *unreachable*
+     * log surfaces `SCP-CTX-2138` first for those.
      */
     func eventLogVerify(handle: ContextHandle, claimJson: String) async throws  -> Proof
     
@@ -2897,6 +2900,33 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * lock is poisoned.
      */
     func mcpConfigureStdioAllowlist(additionalBinaries: [String]) throws 
+    
+    /**
+     * Returns the event-log summary the MCP `events` resource publishes for a
+     * context, as a JSON string.
+     *
+     * This is the exact metadata `ContextProvider::context_events` serves for
+     * `scp://{context_id}/events` — `{"event_count": N, "merkle_root": "<hex>"}`
+     * over the AUTHORITATIVE event log (`Supervisor::authoritative_event_log`),
+     * the SAME `(count, root)` [`Self::event_log_verify`] /
+     * [`Self::event_log_checkpoint`] commit to — routed through the ONE shared
+     * [`scp_ffi_common::event_log::context_events_metadata_json`] helper so the
+     * bytes are identical across all three bridges (GitHub #1933). It NEVER
+     * reads the caller-influenceable per-context UCAN-state `EventLog`.
+     *
+     * FAILS CLOSED: when the authoritative log is unreachable (instance
+     * suspended/shut down, no supervisor, or no log for the context) the
+     * returned object carries `{"error": ..., "code": "SCP-CTX-2138"}` with no
+     * `event_count` / `merkle_root` — an honest absent state, never a
+     * fabricated zero root or count.
+     *
+     * # Errors
+     *
+     * Returns [`ScpError`] only for a handle-affinity mismatch. Authoritative-log
+     * unreachability is NOT an error here — it is reported in-band as the
+     * fail-closed object, matching the resource surface.
+     */
+    func mcpContextEvents(handle: ContextHandle) throws  -> String
     
     /**
      * Disable THIS instance's stdio allowlist (unrestricted mode).
@@ -5166,9 +5196,12 @@ open func eventLogQuery(handle: ContextHandle, filterJson: String?)async throws 
      * to the UCAN-state tree. Proof-generation failures over a readable log
      * (empty log, out-of-range index, absence claimed for a present event)
      * return `SCP-CTX-2139` — the honest negative answer, distinct from
-     * "cannot answer." A malformed claim (invalid JSON, missing/mistyped
-     * fields, unsupported type) is rejected with `SCP-VALID-7000` before any
-     * log is consulted.
+     * "cannot answer." A malformed claim carries `SCP-VALID-7000` (caller
+     * input validation): invalid JSON or a missing/invalid `type` is rejected
+     * before the authoritative log is consulted, but a missing `leaf_index`, a
+     * malformed `event_hash`, or an unsupported claim type is rejected only
+     * after the authoritative log is confirmed reachable — so an *unreachable*
+     * log surfaces `SCP-CTX-2138` first for those.
      */
 open func eventLogVerify(handle: ContextHandle, claimJson: String)async throws  -> Proof  {
     return
@@ -5946,6 +5979,39 @@ open func mcpConfigureStdioAllowlist(additionalBinaries: [String])throws   {try 
         FfiConverterSequenceString.lower(additionalBinaries),$0
     )
 }
+}
+    
+    /**
+     * Returns the event-log summary the MCP `events` resource publishes for a
+     * context, as a JSON string.
+     *
+     * This is the exact metadata `ContextProvider::context_events` serves for
+     * `scp://{context_id}/events` — `{"event_count": N, "merkle_root": "<hex>"}`
+     * over the AUTHORITATIVE event log (`Supervisor::authoritative_event_log`),
+     * the SAME `(count, root)` [`Self::event_log_verify`] /
+     * [`Self::event_log_checkpoint`] commit to — routed through the ONE shared
+     * [`scp_ffi_common::event_log::context_events_metadata_json`] helper so the
+     * bytes are identical across all three bridges (GitHub #1933). It NEVER
+     * reads the caller-influenceable per-context UCAN-state `EventLog`.
+     *
+     * FAILS CLOSED: when the authoritative log is unreachable (instance
+     * suspended/shut down, no supervisor, or no log for the context) the
+     * returned object carries `{"error": ..., "code": "SCP-CTX-2138"}` with no
+     * `event_count` / `merkle_root` — an honest absent state, never a
+     * fabricated zero root or count.
+     *
+     * # Errors
+     *
+     * Returns [`ScpError`] only for a handle-affinity mismatch. Authoritative-log
+     * unreachability is NOT an error here — it is reported in-band as the
+     * fail-closed object, matching the resource surface.
+     */
+open func mcpContextEvents(handle: ContextHandle)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_mcp_context_events(self.uniffiClonePointer(),
+        FfiConverterTypeContextHandle_lower(handle),$0
+    )
+})
 }
     
     /**
@@ -11362,7 +11428,7 @@ public func FfiConverterTypeParticipationRecordView_lower(_ value: Participation
  * append order, and the sorted index the neighbours are drawn from is local
  * state the root does not cover. Treat an `"absence"` answer as the log's own
  * assertion plus checkable neighbour-inclusion, not as a self-contained
- * negative proof.
+ * non-membership proof (a sorted/sparse tree is the real fix — see #2314).
  *
  * See ADR-011 (Event Log).
  */
@@ -17926,7 +17992,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 27330) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_verify() != 52446) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_verify() != 35930) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_finalize_close() != 12188) {
@@ -18029,6 +18095,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_configure_stdio_allowlist() != 7937) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_context_events() != 7166) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_disable_stdio_allowlist() != 42656) {
