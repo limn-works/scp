@@ -1,21 +1,36 @@
-//! The node's single live published-state slot, and its single writer
-//! (§10.12.1, §3.10.5 — SCP-243 / SCP-RELAYRES-004).
+//! The node's single live published-state slot, its single writer, and the DID
+//! publish seam that feeds it (§10.12.1, §3.10.5 — SCP-243 / SCP-RELAYRES-004).
 //!
-//! A private module on purpose: `LiveSlot::modify` is visible only inside it,
-//! and the node's one post-construction writer, [`apply_tier_change`], lives here
-//! beside it. An out-of-band write from anywhere else in `scp-node` is a compile
-//! error rather than a convention a reviewer has to enforce. (The items below are
-//! `pub` *within* this private module, which is what confines them to the crate —
-//! `pub(crate)` here would be the redundant spelling of the same thing.)
+//! A private module on purpose. Two things are confined to it, and both matter:
+//!
+//! - `LiveSlot::modify` is visible only inside it, and the node's one
+//!   post-construction writer, [`apply_tier_change`], lives here beside it. An
+//!   out-of-band write from anywhere else in `scp-node` is a compile error rather
+//!   than a convention a reviewer has to enforce.
+//! - The DID publish seam — the [`DidPublisher`] trait, its production impl
+//!   `NodeDidPublisher`, the opaque [`NodePublisher`] handle, and
+//!   [`seed_from_startup_publish`] — lives here too. `DidPublisher::publish` takes
+//!   a [`PublishAuthorization`] whose only constructor is private to this module,
+//!   so the publish operation is uncallable from anywhere else. Publishing this
+//!   node's DID document is therefore reachable ONLY through
+//!   [`seed_from_startup_publish`] (startup) or [`apply_tier_change`] (tier
+//!   change), each of which seeds or advances the slot in the same step — so a
+//!   publish that does not (re-)seed the slot cannot be written (AC-6).
+//!
+//! (The items below are `pub` *within* this private module, which is what
+//! confines them to the crate — `pub(crate)` here would be the redundant spelling
+//! of the same thing.)
 
 use std::sync::Arc;
 
 use scp_did::DidDocument;
+use scp_identity::DidMethod;
 use scp_identity::ScpIdentity;
 use scp_identity::republish::RepublishEntry;
 use scp_transport::nat::NatTierChange;
 
-use crate::DidPublisher;
+use crate::DhtMode;
+use crate::NodeError;
 
 /// Everything a running node stands behind, advanced as ONE value.
 ///
@@ -142,6 +157,144 @@ pub fn document_relay_url(document: &DidDocument) -> Option<String> {
     document.relay_service_urls().into_iter().next()
 }
 
+// ---------------------------------------------------------------------------
+// The node's single DID-document publish seam (§3.10.5, SCP-RELAYRES-004 AC-6)
+// ---------------------------------------------------------------------------
+
+/// Proof that a [`DidPublisher::publish`] call is being made from INSIDE this
+/// module — the module that also owns the live slot and writes it in the same
+/// step as the publish.
+///
+/// Its single field is private to `published_state`, so a value can be minted
+/// ONLY here. `DidPublisher::publish` takes one by value, which makes the publish
+/// operation **uncallable anywhere else in the crate** — not by convention, but
+/// by construction, and even for a hypothetical future `DidPublisher` impl. The
+/// only two ways to publish this node's DID document are therefore
+/// [`seed_from_startup_publish`] (startup) and [`apply_tier_change`] (NAT tier
+/// change), each of which seeds or advances the live slot in the very same call.
+/// AC-6 — "the DID publish and the published-state write are one indivisible
+/// step" — is thus enforced by the type system, restoring and strengthening the
+/// guarantee the live-slot collapse had reduced to a call-site convention.
+pub struct PublishAuthorization(());
+
+/// The node's **single** DID-document publish operation.
+///
+/// Object-safe where the full [`DidMethod`] trait is not (it returns
+/// `impl Future`), so the tier re-evaluation background task (SCP-243) can hold
+/// it without a generic parameter. Every path that publishes this node's DID
+/// document — startup ([`seed_from_startup_publish`]) and tier change
+/// ([`apply_tier_change`]) alike — goes through this one method, so the configured
+/// [`DhtMode`] gate is honored by construction: a `DhtMode::Disabled` node
+/// discloses nothing on *any* publish.
+///
+/// The [`PublishAuthorization`] parameter is what confines the CALL to this
+/// module. The trait itself stays crate-visible so test doubles can implement it,
+/// but no caller outside `published_state` can mint the authorization to invoke
+/// it — so no site can publish without going through a seam that also (re-)seeds
+/// the slot.
+pub trait DidPublisher: Send + Sync {
+    /// Publishes a DID document per the node's configured `DhtMode`, returning the
+    /// signed record, or `Ok(None)` when the mode publishes nothing
+    /// (`DhtMode::Disabled`) — the honest absent state, never a synthesized
+    /// record.
+    fn publish<'a>(
+        &'a self,
+        _auth: PublishAuthorization,
+        identity: &'a ScpIdentity,
+        document: &'a DidDocument,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<RepublishEntry>, NodeError>> + Send + 'a,
+        >,
+    >;
+}
+
+/// The production [`DidPublisher`]: a [`DidMethod`] and the node's `DhtMode`
+/// bound together, so a publisher that publishes without honoring the mode is not
+/// constructible. Private to this module — the only way to obtain one is
+/// [`NodePublisher::new`].
+struct NodeDidPublisher<D: DidMethod> {
+    inner: Arc<D>,
+    dht_mode: DhtMode,
+}
+
+impl<D: DidMethod + 'static> DidPublisher for NodeDidPublisher<D> {
+    fn publish<'a>(
+        &'a self,
+        _auth: PublishAuthorization,
+        identity: &'a ScpIdentity,
+        document: &'a DidDocument,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<RepublishEntry>, NodeError>> + Send + 'a,
+        >,
+    > {
+        Box::pin(crate::publish_did_document_for_mode(
+            self.dht_mode,
+            self.inner.as_ref(),
+            identity,
+            document,
+        ))
+    }
+}
+
+/// The opaque handle to the node's publish seam.
+///
+/// Clone-able so the builder and the tier task can each hold one, but it exposes
+/// NO way to publish: its inner [`DidPublisher`] is private and that trait's
+/// `publish` needs a [`PublishAuthorization`] only this module can mint.
+/// Publishing is reachable solely through [`seed_from_startup_publish`] and
+/// [`apply_tier_change`], which is what keeps the publish and the slot write one
+/// indivisible step (AC-6).
+#[derive(Clone)]
+pub struct NodePublisher(Arc<dyn DidPublisher>);
+
+impl NodePublisher {
+    /// The production seam over a [`DidMethod`] in the configured [`DhtMode`].
+    pub fn new<D: DidMethod + 'static>(did_method: Arc<D>, dht_mode: DhtMode) -> Self {
+        Self(Arc::new(NodeDidPublisher {
+            inner: did_method,
+            dht_mode,
+        }))
+    }
+
+    /// Test-only: wrap an arbitrary [`DidPublisher`] double so unit tests can
+    /// drive the seam without a full signing `DidMethod`. Never compiled into a
+    /// production build.
+    #[cfg(test)]
+    pub(crate) fn from_dyn(publisher: Arc<dyn DidPublisher>) -> Self {
+        Self(publisher)
+    }
+}
+
+/// Publishes the node's DID document through the seam AND constructs the seeded
+/// live slot as ONE operation.
+///
+/// This is the ONLY way to perform the node's startup publish (`publish` is
+/// uncallable outside this module), and it always returns a slot already carrying
+/// the document and the record that publish produced. A caller therefore cannot
+/// obtain a startup-seeded [`LiveSlot`] whose contents disagree with what was
+/// actually published — the indivisibility AC-6 requires, enforced by the type
+/// rather than by each builder remembering to re-seed. `relay_url` is taken by
+/// reference because the caller still needs it (e.g. to log "node started")
+/// after the slot has taken its own owned copy.
+pub async fn seed_from_startup_publish(
+    publisher: &NodePublisher,
+    identity: &ScpIdentity,
+    document: DidDocument,
+    relay_url: &str,
+) -> Result<LiveSlot<NodePublishedState>, NodeError> {
+    let record = publisher
+        .0
+        .publish(PublishAuthorization(()), identity, &document)
+        .await?;
+    Ok(LiveSlot::new(NodePublishedState {
+        document,
+        relay_url: relay_url.to_owned(),
+        record,
+    }))
+}
+
 /// Handles a detected tier change: re-points the node's relay endpoint,
 /// re-publishes the document through the node's publish seam, and advances the
 /// node's state in ONE write.
@@ -159,7 +312,7 @@ pub async fn apply_tier_change(
     live_state: &LiveSlot<NodePublishedState>,
     new_relay_url: &str,
     trigger_reason: &str,
-    publisher: &dyn DidPublisher,
+    publisher: &NodePublisher,
     identity: &ScpIdentity,
     event_tx: Option<&tokio::sync::mpsc::Sender<NatTierChange>>,
 ) {
@@ -168,7 +321,11 @@ pub async fn apply_tier_change(
     let mut next_document = current.document;
     repoint_relay_service(&mut next_document, new_relay_url);
 
-    match publisher.publish(identity, &next_document).await {
+    match publisher
+        .0
+        .publish(PublishAuthorization(()), identity, &next_document)
+        .await
+    {
         Ok(signed) => {
             let sequence = signed.as_ref().map(|entry| entry.sequence);
             live_state.modify(|state| {

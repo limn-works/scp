@@ -42,7 +42,16 @@ use sha2::Digest;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-pub(crate) use published_state::{LiveSlot, NodePublishedState, apply_tier_change};
+pub(crate) use published_state::{
+    LiveSlot, NodePublishedState, NodePublisher, apply_tier_change, seed_from_startup_publish,
+};
+// The publish seam's trait and its call-authorization token are needed only by
+// test doubles (which implement `DidPublisher`) and the `NodePublisher::from_dyn`
+// test constructor. Production never names them — it goes through `NodePublisher`
+// and `seed_from_startup_publish` / `apply_tier_change` — so gate the re-export to
+// `cfg(test)` to keep the non-test build free of an unused import.
+#[cfg(test)]
+pub(crate) use published_state::{DidPublisher, PublishAuthorization};
 
 pub use http::BroadcastContext;
 pub use projection::{
@@ -2110,73 +2119,12 @@ impl TlsProvider for SelfSignedTlsProvider {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The node's DID-document publish seam (SCP-243, SCP-RELAYRES-004)
-// ---------------------------------------------------------------------------
-
-/// The node's **single** DID-document publish seam.
-///
-/// Object-safe (the full [`DidMethod`] trait is not — it returns `impl Future`),
-/// so the tier re-evaluation background task (SCP-243) can re-publish without
-/// carrying a generic parameter.
-///
-/// Every path that publishes this node's DID document — startup
-/// ([`build_domain_inner`] / [`build_no_domain_inner`]) and tier change
-/// ([`apply_tier_change`]) alike — goes through this one method, so the
-/// configured [`DhtMode`](crate::DhtMode) gate is honored by construction: a
-/// `DhtMode::Disabled` node discloses nothing on *any* publish, not just the
-/// startup one. The record it returns becomes part of the node's
-/// [`NodePublishedState`] at the same site that stores everything else the
-/// publish changed.
-pub(crate) trait DidPublisher: Send + Sync {
-    /// Publishes a DID document per the node's configured `DhtMode`.
-    ///
-    /// Returns the record that was signed, or `Ok(None)` when the configured mode
-    /// publishes nothing (`DhtMode::Disabled`) — the honest absent state, never a
-    /// synthesized record.
-    fn publish<'a>(
-        &'a self,
-        identity: &'a ScpIdentity,
-        document: &'a DidDocument,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<Option<scp_identity::republish::RepublishEntry>, NodeError>,
-                > + Send
-                + 'a,
-        >,
-    >;
-}
-
-/// The production [`DidPublisher`]: a [`DidMethod`] and the node's `DhtMode`
-/// bound together, so a publisher that publishes without honoring the mode is
-/// not constructible.
-struct NodeDidPublisher<D: DidMethod> {
-    inner: Arc<D>,
-    dht_mode: DhtMode,
-}
-
-impl<D: DidMethod + 'static> DidPublisher for NodeDidPublisher<D> {
-    fn publish<'a>(
-        &'a self,
-        identity: &'a ScpIdentity,
-        document: &'a DidDocument,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<Option<scp_identity::republish::RepublishEntry>, NodeError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(publish_did_document_for_mode(
-            self.dht_mode,
-            self.inner.as_ref(),
-            identity,
-            document,
-        ))
-    }
-}
+// The node's DID-document publish seam — the `DidPublisher` trait, its production
+// impl `NodeDidPublisher`, the opaque `NodePublisher` handle, and
+// `seed_from_startup_publish` — lives in the private `published_state` module,
+// beside the live slot it writes and `apply_tier_change`. Keeping the seam and
+// the slot in one module is what makes `publish` uncallable without also seeding
+// the slot (SCP-RELAYRES-004 AC-6). See `published_state`.
 
 // ---------------------------------------------------------------------------
 // Tier re-evaluation (§10.12.1, SCP-243)
@@ -2499,7 +2447,7 @@ pub fn spawn_self_host_mapping_renewal(
 fn spawn_tier_reevaluation(
     nat_strategy: Arc<dyn NatStrategy>,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    publisher: Arc<dyn DidPublisher>,
+    publisher: NodePublisher,
     identity: ScpIdentity,
     live_state: LiveSlot<NodePublishedState>,
     relay_port: u16,
@@ -2578,7 +2526,7 @@ fn spawn_tier_reevaluation(
                 &live_state,
                 &new_relay_url,
                 trigger_reason,
-                &*publisher,
+                &publisher,
                 &identity,
                 event_tx.as_ref(),
             )
@@ -3141,14 +3089,21 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // before. `Domain + Disabled` is never rejected: erroring on the fail-safe
     // direction would itself violate M2.
     //
-    // Published through the node's single publish seam (`NodeDidPublisher`) — the
-    // same one the no-domain builder and the tier-change task use.
-    let record = NodeDidPublisher {
-        inner: Arc::clone(&did_method),
-        dht_mode,
-    }
-    .publish(&identity, &document)
-    .await?;
+    // Published AND seeded through the node's single publish seam as ONE step:
+    // `seed_from_startup_publish` performs the publish and builds the live slot
+    // that carries the published document and record together, so a startup
+    // publish that does not seed the slot is not expressible (SCP-RELAYRES-004
+    // AC-6 — the seam's `publish` is uncallable outside `published_state`). The
+    // seam is the same one the no-domain builder and the tier-change task use, so
+    // the configured `DhtMode` gate is honored identically: `Disabled` publishes
+    // nothing (still a start), `Production` / test-only `Memory` publish FATALLY.
+    //
+    // Domain mode spawns NO tier re-evaluation (`tier_reeval: None`), so nothing
+    // writes the slot after construction — it is still a `LiveSlot` so both modes
+    // read the same live type and a future update site cannot leave a reader
+    // behind. See `LiveSlot`.
+    let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode);
+    let live_state = seed_from_startup_publish(&publisher, &identity, document, &relay_url).await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
@@ -3194,16 +3149,6 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     if let Err(e) = bridge_lookup.load_from_storage().await {
         tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
     }
-
-    // The node's single live published state. Domain mode spawns NO tier
-    // re-evaluation (`tier_reeval: None`), so nothing writes it after
-    // construction — it is still a slot so a future update site cannot leave a
-    // reader behind, and so both modes read the same live type. See `LiveSlot`.
-    let live_state = LiveSlot::new(NodePublishedState {
-        document,
-        relay_url,
-        record,
-    });
 
     let state = Arc::new(http::NodeState {
         did: identity.did.clone(),
@@ -3325,9 +3270,11 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
 /// Publishes a node's DID document, discriminating on the configured
 /// [`DhtMode`] so the two semantically-opposite outcomes are never conflated.
 ///
-/// The `DhtMode` gate itself. Its ONLY caller is [`NodeDidPublisher::publish`],
-/// so every publish this node performs — startup and NAT tier change alike —
-/// honors the mode. It is deliberately not called directly: a call site that
+/// The `DhtMode` gate itself. Its ONLY caller is the node's publish seam
+/// (`NodeDidPublisher::publish`, in `published_state`), so every publish this
+/// node performs — startup and NAT tier change alike — honors the mode. It is
+/// `pub(crate)` solely so that seam can reach it from its own module; it is
+/// deliberately not called directly anywhere else: a call site that
 /// reached the [`DidMethod`] around this gate would publish a
 /// `DhtMode::Disabled` node's address.
 ///
@@ -3365,7 +3312,7 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
 /// The record becomes part of the node's [`NodePublishedState`], from which the
 /// self-host republish cycle reads it directly, so the triple is never
 /// reconstructed by resolving the node's own record back off the network.
-async fn publish_did_document_for_mode<D: DidMethod + 'static>(
+pub(crate) async fn publish_did_document_for_mode<D: DidMethod + 'static>(
     dht_mode: DhtMode,
     did_method: &D,
     identity: &ScpIdentity,
@@ -3446,18 +3393,24 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
 
     push_relay_service(&mut document, &relay_url);
 
-    // 4. Publish the DID document through the node's SINGLE publish seam. The
-    //    seam applies the configured DhtMode gate — skipped for `Disabled`
-    //    (fail-safe, not discoverable by design), FATAL on failure for a
-    //    publishing node (`Production` / test-only `Memory`) so a genuine startup
-    //    publish failure fails the node closed rather than advertising a false
-    //    discoverability guarantee. The SAME publisher instance drives the
-    //    tier-change re-publish below.
-    let publisher: Arc<dyn DidPublisher> = Arc::new(NodeDidPublisher {
-        inner: Arc::clone(&did_method),
-        dht_mode,
-    });
-    let record = publisher.publish(&identity, &document).await?;
+    // 4. Publish the DID document through the node's SINGLE publish seam AND seed
+    //    the live slot in ONE step. `seed_from_startup_publish` performs the
+    //    publish and constructs the slot carrying the published document and
+    //    record together, so a startup publish that does not seed the slot is not
+    //    expressible (SCP-RELAYRES-004 AC-6 — the seam's `publish` is uncallable
+    //    outside `published_state`). The seam applies the configured DhtMode gate
+    //    — skipped for `Disabled` (fail-safe, not discoverable by design), FATAL
+    //    on failure for a publishing node (`Production` / test-only `Memory`) so a
+    //    genuine startup publish failure fails the node closed rather than
+    //    advertising a false discoverability guarantee. The SAME publisher handle
+    //    drives the tier-change re-publish below.
+    //
+    //    Consuming the plain `document` here is deliberate: past this line there
+    //    is no copy of it left in scope to hand out, so the tier task, `NodeState`
+    //    and the `IdentityHandle` can only receive clones of the slot. See
+    //    `LiveSlot`.
+    let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode);
+    let live_state = seed_from_startup_publish(&publisher, &identity, document, &relay_url).await?;
 
     tracing::info!(
         tier = ?tier,
@@ -3467,16 +3420,6 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         nat_probe_skipped = skip_nat_probe,
         "application node started (no-domain mode, §10.12.8)"
     );
-
-    // The node's single live published state. Consuming the plain `document` and
-    // `relay_url` here is deliberate: past this line there is no copy of either
-    // left in scope to hand out, so the tier task, `NodeState` and the
-    // `IdentityHandle` can only receive clones of the slot. See `LiveSlot`.
-    let live_state = LiveSlot::new(NodePublishedState {
-        document,
-        relay_url,
-        record,
-    });
 
     let (tier_event_tx, tier_event_rx) = tokio::sync::mpsc::channel(16);
     let bg_identity = identity.clone();
@@ -5638,6 +5581,7 @@ mod tests {
     impl DidPublisher for RecordingPublisher {
         fn publish<'a>(
             &'a self,
+            _auth: PublishAuthorization,
             _identity: &'a ScpIdentity,
             document: &'a DidDocument,
         ) -> std::pin::Pin<
@@ -5719,7 +5663,7 @@ mod tests {
         let handle = spawn_tier_reevaluation(
             Arc::clone(&strategy) as Arc<dyn NatStrategy>,
             None,
-            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             identity,
             LiveSlot::new(NodePublishedState {
                 document,
@@ -5810,7 +5754,7 @@ mod tests {
         let handle = spawn_tier_reevaluation(
             Arc::clone(&strategy) as Arc<dyn NatStrategy>,
             Some(detector as Arc<dyn NetworkChangeDetector>),
-            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             identity,
             LiveSlot::new(NodePublishedState {
                 document,
@@ -5901,7 +5845,7 @@ mod tests {
         let handle = spawn_tier_reevaluation(
             Arc::clone(&strategy) as Arc<dyn NatStrategy>,
             None,
-            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             identity,
             LiveSlot::new(NodePublishedState {
                 document,
@@ -6002,7 +5946,7 @@ mod tests {
         let handle = spawn_tier_reevaluation(
             strategy as Arc<dyn NatStrategy>,
             None,
-            Arc::clone(&publisher) as Arc<dyn DidPublisher>,
+            NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             identity,
             LiveSlot::new(NodePublishedState {
                 document,
@@ -6377,6 +6321,7 @@ mod tests {
     impl DidPublisher for ScriptedPublisher {
         fn publish<'a>(
             &'a self,
+            _auth: PublishAuthorization,
             _identity: &'a ScpIdentity,
             document: &'a DidDocument,
         ) -> std::pin::Pin<
@@ -6498,13 +6443,13 @@ mod tests {
             relay_url: TIER_CHANGE_OLD_URL.to_owned(),
             record: None,
         });
-        let publisher = ScriptedPublisher::new(false);
+        let publisher = Arc::new(ScriptedPublisher::new(false));
 
         apply_tier_change(
             &live_state,
             TIER_CHANGE_NEW_URL,
             "test",
-            &publisher,
+            &NodePublisher::from_dyn(Arc::clone(&publisher) as Arc<dyn DidPublisher>),
             &slot_test_identity(),
             None,
         )
@@ -6542,7 +6487,9 @@ mod tests {
             &live_state,
             TIER_CHANGE_NEW_URL,
             "test",
-            &ScriptedPublisher::new(false),
+            &NodePublisher::from_dyn(
+                Arc::new(ScriptedPublisher::new(false)) as Arc<dyn DidPublisher>
+            ),
             &slot_test_identity(),
             None,
         )
@@ -6573,7 +6520,9 @@ mod tests {
             &live_state,
             TIER_CHANGE_NEW_URL,
             "test",
-            &ScriptedPublisher::new(true),
+            &NodePublisher::from_dyn(
+                Arc::new(ScriptedPublisher::new(true)) as Arc<dyn DidPublisher>
+            ),
             &slot_test_identity(),
             Some(&event_tx),
         )
@@ -6603,12 +6552,13 @@ mod tests {
 
         // The retry succeeds and converges both, and does NOT re-announce an
         // address that did not move.
-        let publisher = ScriptedPublisher::new(false);
         apply_tier_change(
             &live_state,
             TIER_CHANGE_NEW_URL,
             "retry",
-            &publisher,
+            &NodePublisher::from_dyn(
+                Arc::new(ScriptedPublisher::new(false)) as Arc<dyn DidPublisher>
+            ),
             &slot_test_identity(),
             Some(&event_tx),
         )
