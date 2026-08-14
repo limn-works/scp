@@ -328,7 +328,7 @@ expect() { # <label> <expected: PASS|FAIL> <actual-rc>
 }
 
 assert_allowlist_has_no_nullifier() {
-  echo ">> fixture: allowlist carries ZERO nullifier features (AC7)"
+  echo ">> fixture: allowlist carries ZERO enumerated control-nullifier features — no NULLIFIER_CONTROL_FEATURES entry (custody/attestation/DHT/did:key/test-harness double) appears (AC7); disclosed allow_unencrypted_storage residue tracked in §Status / #2292"
   local nf
   for nf in "${NULLIFIER_CONTROL_FEATURES[@]}"; do
     if printf '%s\n' "$PERMITTED_ALLOWLIST" | grep -qxF "$nf"; then
