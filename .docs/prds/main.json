@@ -2117,28 +2117,33 @@
       "severity": "critical",
       "status": "done",
       "files": [
-        "crates/scp-core/event_log/checkpoint.rs"
+        "crates/scp-event-log/src/checkpoint.rs",
+        "crates/scp-runtime/src/context/queries_helpers.rs"
       ],
-      "description": "Implement consistency checkpoints (spec section 9.9.3) for detecting relay equivocation. Members periodically exchange signed Merkle roots. If two members have different roots for the same event count, the relay is equivocating (showing different histories to different members). Detection requires only two honest members. Checkpoints are generated every 50 events or every 10 minutes, whichever comes first, and sent as regular MLS application messages.",
+      "description": "Implement consistency checkpoints (spec section 9.9.3) for detecting relay equivocation. Members periodically exchange signed Merkle roots. If two members have different roots for the same event count, the relay is equivocating (showing different histories to different members). Detection requires only two honest members. Checkpoints are generated every 50 events or every 10 minutes, whichever comes first, and sent as regular MLS application messages. Scope boundary: this story covers checkpoint PRODUCTION (struct, generate_checkpoint, scheduling) in scp-event-log and the eventCount/merkleRoot verdict plus its authenticity gates in the runtime judge `queries_helpers::compare_remote_checkpoint`. It does NOT cover the third comparison field spec section 9.9.3 specifies, `epoch` (“Must match. Divergence indicates a missed MLS Commit (possible suppression)”) — see the explicit scope criterion below; that gap is tracked separately because implementing it changes protocol-observable verdicts.",
       "acceptanceCriteria": [
         "`ConsistencyCheckpoint` struct with fields: context_id (ContextId), sender_did (DID), event_count (u64), merkle_root ([u8; 32]), epoch (Option<u64> — current MLS epoch, None for Broadcast contexts), timestamp (u64), signature (Ed25519Signature)",
         "`generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signing_key: &KeyHandle) -> Result<ConsistencyCheckpoint, EventLogError>` creates and signs a checkpoint from the current log state",
-        "Comparison of a RECEIVED checkpoint against local state returns Consistent, Divergent { first_divergent_event: Option<u64> }, Behind { missing_events: u64 }, or Ahead { extra_events: u64 }. It lives in the runtime as `queries_helpers::compare_remote_checkpoint`, which verifies the sender's signature, checks the sender's membership, and binds context_id first. The originally-specified ungated `compare_checkpoint` free function in scp-event-log was REMOVED: carrying none of those three gates, it would classify an unsigned checkpoint from a non-member as Divergent, letting any unauthenticated sender forge an equivocation alert (see the CORRECTION under ADR-011 in .docs/adrs/phase-2.md)",
+        "Comparison of a RECEIVED checkpoint against local state returns Consistent, Divergent { first_divergent_event: Option<u64> }, Behind { missing_events: u64 }, or Ahead { extra_events: u64 }. The SOLE comparison path is the runtime judge `queries_helpers::compare_remote_checkpoint` in crates/scp-runtime/src/context/queries_helpers.rs. The originally-specified ungated `compare_checkpoint` free function in scp-event-log was REMOVED: with no signer, no roster, and no context binding in its signature it could not satisfy spec section 23.12 item 1 (“Clients MUST verify the signature on every received ConsistencyCheckpoint before accepting it for comparison”), and it would classify an unsigned checkpoint from a non-member as Divergent, letting any unauthenticated sender forge an equivocation alert. See the SUPERSEDED marker and correction under ADR-011 acceptance criterion 8 in .docs/adrs/phase-2.md and the Resolution clause in .docs/audits/adr-audit-phase-1-3.md",
+        "The judge REFUSES rather than judges when any authenticity gate fails, before the count/root arithmetic runs: a non-member sender returns ContextError::MemberNotFound; an unresolvable signing key or a signature that does not verify returns ContextError::CryptoFailed (spec section 23.12 items 1–2); a checkpoint bound to a different context_id than the one being judged returns ContextError::CryptoFailed. An unreachable LOCAL event log likewise returns ContextError::EventLogFailed rather than a fabricated verdict. On every refusal no ContextEvent::EquivocationDetected is emitted and no divergence is recorded",
+        "SCOPE — the judge compares eventCount and merkleRoot ONLY. Spec section 9.9.3 lists a third comparison field, `epoch` (“Must match. Divergence indicates a missed MLS Commit (possible suppression)”), and `classify_remote_checkpoint` reads no `remote.epoch` (grep for `remote.epoch` in crates/scp-runtime/src/context/queries_helpers.rs returns nothing). No criterion in this story asserts the epoch comparison and none may be read as claiming the full section 9.9.3 field set is implemented",
         "Checkpoints generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3)",
         "Checkpoints sent as regular MLS application messages",
         "Divergent Merkle roots for the same event count indicate equivocation — trigger alert and divergence resolution",
-        "Unit test: generate_checkpoint creates valid signed checkpoint",
-        "Unit test: count/root classification returns Consistent for matching roots",
-        "Unit test: count/root classification returns Divergent for mismatched roots at same event count",
-        "Unit test: count/root classification returns Behind when local has fewer events",
-        "Unit test: count/root classification returns Ahead when local has more events"
+        "No test-only reimplementation of the count/root classification exists in scp-event-log: grep for `classify_against_local` returns no definition. The unit-test criteria below are satisfied by the production judge, never by a fixture on no production path",
+        "Unit test: generate_checkpoint creates valid signed checkpoint — `scp_event_log::checkpoint::tests::generate_creates_valid_signed_checkpoint`",
+        "Unit test: the judge returns Consistent for equal event count + equal root — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::equal_count_and_equal_root_is_consistent`",
+        "Unit test: the judge returns Divergent for different roots at equal event count, and raises the EquivocationDetected alert — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::two_members_with_divergent_logs_at_equal_count_is_equivocation`",
+        "Unit test: the judge returns Behind when local has fewer events, and raises no alert — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::local_behind_the_remote_is_behind_not_equivocation`",
+        "Unit test: the judge returns Ahead when local has more events, and raises no alert — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::local_ahead_of_the_remote_is_ahead_not_equivocation`",
+        "Unit test: each authenticity gate refuses rather than judges, each with a positive control proving the refusal is that gate — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::a_non_member_checkpoint_is_refused_not_judged`, `...::a_forged_checkpoint_signature_is_refused_not_judged`, `...::a_foreign_context_checkpoint_is_refused_not_judged`, `...::an_unreachable_local_log_refuses_to_judge_a_peer`"
       ],
       "actionItems": [
-        "Create `crates/scp-core/event_log/checkpoint.rs` with ConsistencyCheckpoint struct, CheckpointComparison enum",
+        "Create `crates/scp-event-log/src/checkpoint.rs` with the ConsistencyCheckpoint struct and the CheckpointComparison enum",
         "Implement generate_checkpoint: capture current root, event_count, epoch, sign with Ed25519",
-        "Implement the count/root classification returning the appropriate CheckpointComparison variant; the gated received-checkpoint judge lives in the runtime",
+        "Implement the received-checkpoint judge in the runtime as `queries_helpers::compare_remote_checkpoint`: apply the membership, signature, and context_id gates first, then return the appropriate CheckpointComparison variant from a single event-log snapshot. Do NOT add an ungated free-function comparator in scp-event-log",
         "Implement checkpoint scheduling logic: track events since last checkpoint, track time since last checkpoint, trigger at 50 events or 10 minutes",
-        "Write unit tests for checkpoint generation, comparison, and equivocation detection"
+        "Write unit tests for checkpoint generation, for each CheckpointComparison variant against the production judge, and for each gate refusal"
       ],
       "blockedBy": [
         "SCP-006",
@@ -2148,6 +2153,14 @@
         {
           "file": ".docs/adrs/phase-2.md",
           "section": "## ADR-011: Verifiable Event Log (Merkle Tree)"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.9.3 Equivocation Detection — Relay Consistency Protocol"
+        },
+        {
+          "file": ".docs/specs/23-sync-and-offline-strategy.md",
+          "section": "## 23.12 Checkpoint Signature Verification"
         }
       ],
       "details": {
@@ -2155,7 +2168,7 @@
         "CheckpointComparison enum": "Returns: Consistent, Divergent { first_divergent_event: Option<u64> }, Behind { missing_events: u64 }, or Ahead { extra_events: u64 }.",
         "Scheduling": "Checkpoints are generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3). Checkpoints are sent as regular MLS application messages. Divergent Merkle roots for the same event count indicate equivocation — trigger alert and divergence resolution."
       },
-      "result": "ConsistencyCheckpoint struct, generate_checkpoint (async signing), CheckpointScheduler (50 events/10min). 13 tests. The ungated compare_checkpoint free function was later removed; the gated judge is runtime queries_helpers::compare_remote_checkpoint."
+      "result": "ConsistencyCheckpoint struct, generate_checkpoint (async signing), CheckpointScheduler (50 events/10min) in scp-event-log. The received-checkpoint verdict is the gated runtime judge queries_helpers::compare_remote_checkpoint; the ungated compare_checkpoint free function was removed (spec section 23.12 item 1). eventCount/merkleRoot only — the section 9.9.3 epoch comparison is not implemented and is tracked separately."
     },
     {
       "id": "SCP-033",
