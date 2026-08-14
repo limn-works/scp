@@ -907,7 +907,8 @@ export interface Event {
  * off-box against the reported `root`, but adjacency is not — this is NOT a
  * self-contained non-membership proof (a sorted/sparse Merkle tree whose root
  * commits to sorted order is the real fix; that is a change to the protocol's
- * Merkle construction, not to this binding).
+ * Merkle construction, not to this binding, and that construction change is
+ * tracked separately).
  */
 export interface Proof {
   /** Proof type: `"inclusion"` or `"absence"`. */
