@@ -544,6 +544,15 @@ pub trait DidMethod: Send + Sync {
     /// `did:dht` overrides it to recover its BEP44 sequence from the store and/or
     /// a DHT resolve. A resolve failure there is fail-closed (propagated): the
     /// caller must not publish at an unknown sequence.
+    ///
+    /// **Implementors:** any method with monotonic BEP44-style sequence
+    /// semantics MUST override this to bootstrap its counter to
+    /// `max(persisted, live)` before the first publish. Inheriting the no-op
+    /// default reintroduces the restart-within-TTL collision this method exists
+    /// to prevent: a fresh counter republishes at `seq = 1` beneath a live
+    /// `seq = N` record, and the network rejects the lower-seq write (fail-open —
+    /// the stale document stays authoritative). The default is correct ONLY for
+    /// methods with no monotonic-sequence semantics at all.
     fn initialize_sequence(
         &self,
         _did: &str,
