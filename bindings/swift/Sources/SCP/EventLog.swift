@@ -3,7 +3,9 @@ import Foundation
 // Event, Proof, and Checkpoint are defined by UniFFI in ScpBindings.swift.
 //
 // UniFFI Event fields: eventType, actorDid, timestamp, payloadJson (String), sequence
-// UniFFI Proof fields: verified (Bool), proofType (String), detailsJson (String)
+// UniFFI Proof fields: proofType (String), detailsJson (String) — there is no
+// `verified` flag; a returned Proof IS the positive answer, throwing IS the
+// negative one (see `proveInclusion` below).
 // UniFFI Checkpoint fields: contextId, senderDid, eventCount, merkleRoot (hex),
 //   epoch (optional), timestamp, signature (hex)
 //
@@ -123,8 +125,11 @@ public nonisolated struct EventLog: Sendable {
     ///
     /// - Parameter leafIndex: The index of the event to prove inclusion for.
     /// - Returns: A ``Proof`` carrying the Merkle path.
-    /// - Throws: ``ScpError/Context(msg:code:)`` if proof generation fails, or
-    ///   `SCP-CTX-2138` if the authoritative event log is unreachable.
+    /// - Throws: ``ScpError/Context(msg:code:)`` — `SCP-CTX-2138` if the
+    ///   authoritative event log is unreachable (FAILS CLOSED, never a proof
+    ///   over a fallback tree), or `SCP-CTX-2139` if proof generation is
+    ///   rejected over a readable log (empty log, out-of-range leaf index) —
+    ///   the honest negative answer, distinct from "cannot answer".
     public func proveInclusion(leafIndex: UInt64) async throws -> Proof {
         guard let contextHandle = handle.contextHandle else {
             throw ScpError.Context(

@@ -2490,6 +2490,26 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * # The answer comes from the AUTHORITATIVE log only
+     *
+     * Every event returned is a leaf of the supervisor's canonical event log —
+     * the same source [`Self::event_log_verify`] proves against and
+     * [`Self::event_log_checkpoint`] commits to. There is no UCAN-state
+     * fallback.
+     *
+     * This method used to try the manager, and on ANY failure or on an empty
+     * result fall through to the per-context UCAN-state `EventLog` —
+     * publishing THAT tree's root as `merkle_root` in a synthesized
+     * `LogSummary` event, under the same field name the authoritative answers
+     * use. Two consequences (GitHub #1933): a consumer pinning a verify proof
+     * against a queried root could accept a root a caller had shaped through
+     * `provenance_attach` / outlet calls; and the empty-result fall-through
+     * collapsed the empty-but-live vs unknown distinction, so query and verify
+     * returned contradictory answers about the same context.
+     *
+     * Now: an empty-but-live log returns an EMPTY list, and an unreachable or
+     * unknown log FAILS CLOSED with `SCP-CTX-2138`.
      */
     func eventLogQuery(handle: ContextHandle, filterJson: String?) async throws  -> [Event]
     
@@ -2524,7 +2544,10 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * which a destroyed log also reports). FAILS CLOSED: it never falls back
      * to the UCAN-state tree. Proof-generation failures over a readable log
      * (empty log, out-of-range index, absence claimed for a present event)
-     * keep `SCP-CTX-2025`.
+     * return `SCP-CTX-2139` — the honest negative answer, distinct from
+     * "cannot answer." A malformed claim (invalid JSON, missing/mistyped
+     * fields, unsupported type) is rejected with `SCP-VALID-7000` before any
+     * log is consulted.
      */
     func eventLogVerify(handle: ContextHandle, claimJson: String) async throws  -> Proof
     
@@ -5073,6 +5096,26 @@ open func eventLogCheckpointByDid(handle: ContextHandle, identity: Identity, did
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
+     *
+     * # The answer comes from the AUTHORITATIVE log only
+     *
+     * Every event returned is a leaf of the supervisor's canonical event log —
+     * the same source [`Self::event_log_verify`] proves against and
+     * [`Self::event_log_checkpoint`] commits to. There is no UCAN-state
+     * fallback.
+     *
+     * This method used to try the manager, and on ANY failure or on an empty
+     * result fall through to the per-context UCAN-state `EventLog` —
+     * publishing THAT tree's root as `merkle_root` in a synthesized
+     * `LogSummary` event, under the same field name the authoritative answers
+     * use. Two consequences (GitHub #1933): a consumer pinning a verify proof
+     * against a queried root could accept a root a caller had shaped through
+     * `provenance_attach` / outlet calls; and the empty-result fall-through
+     * collapsed the empty-but-live vs unknown distinction, so query and verify
+     * returned contradictory answers about the same context.
+     *
+     * Now: an empty-but-live log returns an EMPTY list, and an unreachable or
+     * unknown log FAILS CLOSED with `SCP-CTX-2138`.
      */
 open func eventLogQuery(handle: ContextHandle, filterJson: String?)async throws  -> [Event]  {
     return
@@ -5122,7 +5165,10 @@ open func eventLogQuery(handle: ContextHandle, filterJson: String?)async throws 
      * which a destroyed log also reports). FAILS CLOSED: it never falls back
      * to the UCAN-state tree. Proof-generation failures over a readable log
      * (empty log, out-of-range index, absence claimed for a present event)
-     * keep `SCP-CTX-2025`.
+     * return `SCP-CTX-2139` — the honest negative answer, distinct from
+     * "cannot answer." A malformed claim (invalid JSON, missing/mistyped
+     * fields, unsupported type) is rejected with `SCP-VALID-7000` before any
+     * log is consulted.
      */
 open func eventLogVerify(handle: ContextHandle, claimJson: String)async throws  -> Proof  {
     return
@@ -17877,10 +17923,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint_by_did() != 22488) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 26119) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 27330) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_verify() != 8728) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_verify() != 52446) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_finalize_close() != 12188) {
