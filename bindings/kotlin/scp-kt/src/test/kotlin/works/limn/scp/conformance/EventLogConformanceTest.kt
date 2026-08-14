@@ -18,12 +18,15 @@ import kotlin.test.assertTrue
 /**
  * Cross-platform conformance tests for event log operations.
  *
- * Covers: append, prove inclusion, verify proof, consistency checkpoint,
- * absence proof.
+ * Covers: query and consistency checkpoint.
  *
  * Event log tests verify that the Kotlin SDK correctly proxies event log
- * queries and proof verification through the bridge. The conformance
- * dispatcher maps operations to infra bridge calls.
+ * queries and checkpoints through the bridge. The conformance dispatcher
+ * maps operations to infra bridge calls. Merkle proof verification is NOT
+ * exercised here: the production Kotlin path is the UniFFI-generated
+ * `Scp.eventLogVerify` (returning a `Proof`), which this never-swapped
+ * `NativeBindings` scaffold does not reach — the ADR-046 cross-bridge
+ * parity harness pins it against the real bridge instead.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class EventLogConformanceTest {
@@ -103,52 +106,6 @@ class EventLogConformanceTest {
     }
 
     @Nested
-    inner class EventLogVerify {
-        @Test
-        fun `event_log_verify returns true for valid proof`() =
-            runTest(testDispatcher) {
-                stubBindings.eventLogVerifyResult = true
-                val result =
-                    dispatcher.dispatch(
-                        "event_log_verify",
-                        mapOf(
-                            "context_handle" to "1",
-                            "claim" to """{"type":"inclusion","leaf_index":0}""",
-                        ),
-                    )
-                assertEquals("true", result["is_valid"])
-            }
-
-        @Test
-        fun `event_log_verify returns false for invalid proof`() =
-            runTest(testDispatcher) {
-                stubBindings.eventLogVerifyResult = false
-                val result =
-                    dispatcher.dispatch(
-                        "event_log_verify",
-                        mapOf(
-                            "context_handle" to "1",
-                            "claim" to """{"type":"inclusion","leaf_index":0}""",
-                        ),
-                    )
-                assertEquals("false", result["is_valid"])
-            }
-
-        @Test
-        fun `event_log_verify propagates error`() =
-            runTest(testDispatcher) {
-                stubBindings.eventLogVerifyError =
-                    BridgeException("Proof verification failed", "SCP-CTX-2032")
-                val result =
-                    dispatcher.dispatch(
-                        "event_log_verify",
-                        mapOf("context_handle" to "1", "claim" to "{}"),
-                    )
-                assertEquals("SCP-CTX-2032", result["error"])
-            }
-    }
-
-    @Nested
     inner class EventLogCheckpoint {
         @Test
         fun `event_log_checkpoint returns signed checkpoint`() =
@@ -219,32 +176,6 @@ class EventLogConformanceTest {
                         operation = "event_log_query",
                         input = mapOf("context_handle" to "1"),
                         expected = mapOf("error" to "SCP-CTX-2030"),
-                    )
-                val result =
-                    dispatcher.dispatch(
-                        fixture.operation,
-                        fixture.input,
-                    )
-                val mismatches = compareResults(result, fixture.expected)
-                assertTrue(
-                    mismatches.isEmpty(),
-                    "Fixture ${fixture.testId}: $mismatches",
-                )
-            }
-
-        @Test
-        fun `event log verify fixture matches dispatcher result`() =
-            runTest(testDispatcher) {
-                stubBindings.eventLogVerifyError =
-                    BridgeException("Verification failed", "SCP-CTX-2032")
-                val fixture =
-                    ConformanceFixture(
-                        testId = "event-log-verify-001",
-                        category = "event_log",
-                        description = "Verify event log proof (stub returns error)",
-                        operation = "event_log_verify",
-                        input = mapOf("context_handle" to "1"),
-                        expected = mapOf("error" to "SCP-CTX-2032"),
                     )
                 val result =
                     dispatcher.dispatch(

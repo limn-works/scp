@@ -38,7 +38,7 @@ The single dispatcher gateway for all FFI calls. All SDK domain classes (Scp.kt,
 | `ContextBridge` | `create()`, `join()`, `leave()`, `close()`, `send()`, `subscribe()` |
 | `OutletBridge` | `register()`, `invoke()`, `verify()` |
 | `UcanBridge` | `validate()`, `mint()`, `revoke()`, `delegate()` |
-| `InfraBridge` | `eventLogQuery()`, `eventLogVerify()`, `transportConnect()`, `transportStatus()` |
+| `InfraBridge` | `eventLogQuery()`, `eventLogCheckpoint()`, `transportConnect()`, `transportStatus()` |
 | `NativeBindings` | Composite interface for UniFFI-generated functions (swap impl when NativeLib.kt is generated) |
 | `CancellationHandle` | Thread-safe cancellation propagation to Rust for long-running ops |
 | `BridgeException` | Carries structured SCP error codes from FFI layer |
@@ -69,7 +69,7 @@ Two-tier streaming architecture per ADR-028:
 
 ### detekt TooManyFunctions (threshold: 30)
 
-The `NativeBindings` interface has 19 methods (one per UniFFI function). It is split into 5 domain sub-interfaces (`IdentityBindings`, `ContextBindings`, `OutletBindings`, `UcanBindings`, `InfraBindings`) with `NativeBindings` as the composite. The test stub `StubNativeBindings` uses `@Suppress("TooManyFunctions")` since it must implement all 19. The file-level threshold is 30 (set in `detekt.yml` per `standards/kotlin.md`).
+The `NativeBindings` interface declares one method per bridged UniFFI function. It is split into 5 domain sub-interfaces (`IdentityBindings`, `ContextBindings`, `OutletBindings`, `UcanBindings`, `InfraBindings`) with `NativeBindings` as the composite. The test stub `StubNativeBindings` uses `@Suppress("TooManyFunctions")` since it must implement them all. The file-level threshold is 30 (set in `detekt.yml` per `standards/kotlin.md`).
 
 ### ktlint vs detekt line length conflict
 
@@ -137,7 +137,7 @@ Cross-platform conformance test suite (SCP-120) validating the Kotlin SDK API co
 |-----------|---------|
 | `ConformanceFixture` | `@Serializable` model matching JSON fixture format from scaffold |
 | `ConformanceFixtureLoader` | Loads shared fixtures from `tests/conformance/` (gracefully handles missing directory) |
-| `ConformanceDispatcher` | Maps 18 operation strings to SDK bridge calls, returns result dictionaries |
+| `ConformanceDispatcher` | Maps the supported operation strings to SDK bridge calls, returns result dictionaries (`event_log_verify` is NOT among them — verify is pinned against the real UniFFI bridge by the ADR-046 parity harness) |
 | `ConformanceStubBindings` | Configurable `NativeBindings` where every op returns stub result or throws `BridgeException` |
 
 ### Per-category test files (8 files, 95 tests)
@@ -150,7 +150,7 @@ Cross-platform conformance test suite (SCP-120) validating the Kotlin SDK API co
 | `OutletsConformanceTest` | register, invoke, verify test vectors |
 | `UcanConformanceTest` | validate, mint, revoke, delegate, nonce replay, ceiling enforcement |
 | `TransportConformanceTest` | connect, status |
-| `EventLogConformanceTest` | query, verify proof |
+| `EventLogConformanceTest` | query, checkpoint (Merkle-proof verify lives on the UniFFI production path `Scp.eventLogVerify` and is pinned by the ADR-046 cross-bridge parity harness, not this scaffold) |
 | `EncryptionConformanceTest` | encrypted send, sender key errors, decryption errors |
 | `GovernanceConformanceTest` | capability enforcement, ceiling governance, error code reachability |
 | `ConformanceRunnerTest` | fixture model, loader, result comparison, dispatcher infra |
@@ -160,7 +160,7 @@ Cross-platform conformance test suite (SCP-120) validating the Kotlin SDK API co
 - **No colons in backtick test names.** Kotlin compiler rejects `:` in backtick-quoted function names. Use `-` or `--` instead (e.g., `` `context lifecycle - create then leave` `` not `` `context lifecycle: create then leave` ``).
 - **Use `async` + `runCatching` for error Flow tests.** `launch` propagates exceptions to the parent scope and fails the test. `async { runCatching { flow.first() } }` captures the exception for assertion.
 - **Split across files for detekt.** The suite is split into 10 files to stay under the `TooManyFunctions` threshold (30 per file) in `detekt.yml`.
-- **`ConformanceStubBindings` uses `@Suppress("TooManyFunctions")`.** It must implement all 19 `NativeBindings` methods plus configurable fields and `reset()`.
+- **`ConformanceStubBindings` uses `@Suppress("TooManyFunctions")`.** It must implement all `NativeBindings` methods plus configurable fields and `reset()`.
 
 ## Build
 

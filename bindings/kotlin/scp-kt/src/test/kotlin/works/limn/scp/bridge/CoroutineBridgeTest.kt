@@ -332,14 +332,6 @@ class CoroutineBridgeTest {
             }
 
         @Test
-        fun `eventLogVerify dispatches on IO`() =
-            runTest(ioDispatcher) {
-                stubBindings.eventLogVerifyResult = true
-                val result = bridge.infra.eventLogVerify(1L, """{"type":"inclusion","leaf_index":0}""")
-                assertTrue(result)
-            }
-
-        @Test
         fun `eventLogCheckpoint dispatches on IO`() =
             runTest(ioDispatcher) {
                 val checkpointJson =
@@ -974,7 +966,6 @@ class StubNativeBindings : NativeBindings {
     var ucanMintResult = ""
     var ucanDelegateResult = ""
     var eventLogQueryResult = ""
-    var eventLogVerifyResult = false
     var eventLogCheckpointResult = ""
     var transportConnectResult = 0L
     var transportConnectBlocking = false
@@ -1440,11 +1431,6 @@ class StubNativeBindings : NativeBindings {
         contextHandle: Long,
         filterJson: String,
     ): String = eventLogQueryResult
-
-    override fun eventLogVerify(
-        contextHandle: Long,
-        claimJson: String,
-    ): Boolean = eventLogVerifyResult
 
     override fun eventLogCheckpoint(
         contextHandle: Long,

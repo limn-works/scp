@@ -327,7 +327,6 @@ private class TestNativeBindings : NativeBindings {
         capabilitiesJson: String,
     ): String = ""
     override fun eventLogQuery(contextHandle: Long, filterJson: String): String = ""
-    override fun eventLogVerify(contextHandle: Long, claimJson: String): Boolean = false
     @Suppress("MaxLineLength")
     override fun eventLogCheckpoint(contextHandle: Long, identityHandle: Long, epoch: Long): String =
         """{"context_id":"","sender_did":"","event_count":0,"merkle_root":"","epoch":0,"timestamp":0,"signature":""}"""

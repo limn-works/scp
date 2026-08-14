@@ -1085,7 +1085,32 @@ class SCP internal constructor(
             filterJson = filterJson,
         )
 
-    /** Forwards to [NativeScp.eventLogVerify] on [inner]. */
+    /**
+     * Forwards to [NativeScp.eventLogVerify] on [inner].
+     *
+     * Generates a Merkle proof for [claimJson] (`{"type":"inclusion",
+     * "leaf_index":N}` or `{"type":"absence","event_hash":"<hex>"}`)
+     * against the AUTHORITATIVE event log — the same log
+     * [eventLogQuery] reads and [eventLogCheckpoint] commits to, never
+     * a caller-influenceable fallback tree.
+     *
+     * A successful return IS the positive answer: the returned [Proof]
+     * carries the checkable proof material (`details_json`), and its
+     * proof/commitment pair comes from ONE log snapshot. There is no
+     * `verified` flag — throwing IS the negative answer:
+     *
+     * - `SCP-CTX-2138` — the authoritative log is unreachable or
+     *   unknown (instance suspended or shut down, no supervisor, or no
+     *   log for the context). FAILS CLOSED; never falls back to
+     *   another tree.
+     * - `SCP-CTX-2139` — the claim was REJECTED over a readable log
+     *   (empty log, leaf index past the end, or absence claimed for an
+     *   event that IS present). The honest negative, distinct from
+     *   "cannot answer."
+     * - `SCP-VALID-7000` — the claim itself is malformed (invalid
+     *   JSON, missing or mistyped fields, unsupported claim type);
+     *   rejected before any log is consulted.
+     */
     suspend fun eventLogVerify(
         handle: ContextHandle,
         claimJson: String,

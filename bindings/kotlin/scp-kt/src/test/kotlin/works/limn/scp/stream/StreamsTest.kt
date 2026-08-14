@@ -572,7 +572,6 @@ class StubEventContextBindings : EventContextBindings {
 
 class StubInfraBindings : works.limn.scp.bridge.InfraBindings {
     var eventLogQueryResults = mutableListOf<String>()
-    var eventLogVerifyResult = false
     var transportConnectResult = 0L
     var transportStatusResult = ""
     var queryCount = 0
@@ -586,11 +585,6 @@ class StubInfraBindings : works.limn.scp.bridge.InfraBindings {
         capturedFilters.add(filterJson)
         return if (eventLogQueryResults.isNotEmpty()) eventLogQueryResults.removeAt(0) else "[]"
     }
-
-    override fun eventLogVerify(
-        contextHandle: Long,
-        claimJson: String,
-    ): Boolean = eventLogVerifyResult
 
     override fun eventLogCheckpoint(
         contextHandle: Long,
