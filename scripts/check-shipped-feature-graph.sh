@@ -109,7 +109,7 @@ EOF
 #     --features server` — their production bridge configuration.
 #   - Binaries (scp-node / scp-relay): built with DEFAULT features, so the
 #     feature-arg string is EMPTY. This matches the Dockerfile
-#     `cargo build --release -p scp-node -p scp-relay` and the `cargo publish`
+#     `cargo build --release -p scp-relay -p scp-node` and the `cargo publish`
 #     shipping config. NEITHER binary has a `server` feature (scp-node has no
 #     `default` block wiring one; scp-relay has no `[features]` table at all),
 #     so passing `--features server` here would ERROR — they are correctly gated
@@ -117,7 +117,7 @@ EOF
 #
 # DRIFT CAVEAT: each entry's build-invocation string above MUST be kept in
 # lockstep with the actual shipped build config — the Dockerfile
-# `cargo build --release -p scp-node -p scp-relay` and the
+# `cargo build --release -p scp-relay -p scp-node` and the
 # `.github/workflows/release.yml` `cargo publish` steps. This gate checks the
 # feature config NAMED HERE, not whatever those workflows actually build; if the
 # two drift apart, coverage silently narrows (an artifact would be gated in a
