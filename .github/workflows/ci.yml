@@ -135,9 +135,8 @@ jobs:
   # durability-only + real-backend allowlist — so NO
   # in-memory nullifier (custody / attestation / pre-rotation / DHT / did:key)
   # feature can reach a production binary. Closed ⊆-whitelist; ZERO nullifier
-  # features is the gate's design mandate/target, with one disclosed deviation:
-  # the three scp-*/allow_unencrypted_storage entries are a known confidentiality-
-  # nullifier residue (ADR-062 §Status), tracked for removal in Track B / #2292.
+  # features is the gate's design mandate/target, with one disclosed
+  # allow_unencrypted_storage residue — see ADR-062 §Status / #2292.
   # The fixture harness (a/b/c + soundness + allowlist hygiene) runs
   # first and must pass before the real workspace gate. NEVER add a resolved
   # nullifier feature to the allowlist to make this pass — fix the dependency edge.
