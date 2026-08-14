@@ -1074,47 +1074,25 @@ pub async fn generate_checkpoint(
     generate_checkpoint_at(log, sender_did, epoch, timestamp, signer).await
 }
 
-/// Compares a received remote checkpoint against the local event log state.
-///
-/// The comparison logic:
-/// 1. If event counts differ, the result is [`CheckpointComparison::Behind`]
-///    or [`CheckpointComparison::Ahead`].
-/// 2. If event counts match but Merkle roots differ, the result is
-///    [`CheckpointComparison::Divergent`] -- this indicates equivocation.
-/// 3. If both match, the result is [`CheckpointComparison::Consistent`].
-///
-/// See ADR-011 acceptance criterion 8.
-#[must_use]
-pub fn compare_checkpoint(
-    local_log: &EventLog,
-    remote_checkpoint: &ConsistencyCheckpoint,
-) -> CheckpointComparison {
-    let local_count = tree::event_count(local_log);
-    let remote_count = remote_checkpoint.event_count;
-
-    if local_count < remote_count {
-        return CheckpointComparison::Behind {
-            missing_events: remote_count - local_count,
-        };
-    }
-
-    if local_count > remote_count {
-        return CheckpointComparison::Ahead {
-            extra_events: local_count - remote_count,
-        };
-    }
-
-    // Counts match -- compare Merkle roots.
-    let local_root = tree::root(local_log);
-    // Constant-time comparison to prevent timing side-channels.
-    if local_root.ct_eq(&remote_checkpoint.merkle_root).into() {
-        CheckpointComparison::Consistent
-    } else {
-        CheckpointComparison::Divergent {
-            first_divergent_event: None,
-        }
-    }
-}
+// ---------------------------------------------------------------------------
+// Checkpoint comparison
+// ---------------------------------------------------------------------------
+//
+// Comparison of a RECEIVED remote checkpoint against local state lives in the
+// runtime (`queries_helpers::compare_remote_checkpoint`), which has access to
+// the actor's live event-log provider and key resolver, and which gates the
+// comparison on the three things a received checkpoint's verdict depends on:
+// the sender's signature, the sender's membership in the context, and
+// `context_id` equality.
+//
+// The pure `compare_checkpoint` free function that lived here has been removed.
+// It had zero production callers and carried NONE of those three gates, nor any
+// precondition in its doc — so it would classify an UNSIGNED, UNVERIFIED,
+// wrong-context checkpoint from a NON-MEMBER as `Divergent`, i.e. as
+// equivocation. That shape lets a relay or any unauthenticated sender forge a
+// false equivocation alert, which is the defect recorded against ADR-011's
+// prescribed signature in `.docs/audits/adr-audit-phase-1-3.md`. Mirrors the
+// same removal of `compare_checkpoints` from `scp_protocol::sync`.
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -1347,6 +1325,42 @@ mod tests {
     // Test helpers (checkpoint-specific)
     // -------------------------------------------------------------------
 
+    /// Test-local count/root classification, inlined here when the ungated
+    /// `compare_checkpoint` free function was removed from this module.
+    ///
+    /// This is the raw §9.9.3 arithmetic ONLY. It is deliberately test-only and
+    /// deliberately NOT `pub`: a received checkpoint's verdict additionally
+    /// requires the sender's signature, the sender's membership, and
+    /// `context_id` equality, all of which are enforced by the runtime judge
+    /// (`queries_helpers::compare_remote_checkpoint`). The tests below exercise
+    /// the arithmetic over logs they construct themselves, so those gates are
+    /// satisfied by construction and are not what is under test here.
+    fn classify_against_local(
+        local_log: &EventLog,
+        remote_checkpoint: &ConsistencyCheckpoint,
+    ) -> CheckpointComparison {
+        let local_count = tree::event_count(local_log);
+        let remote_count = remote_checkpoint.event_count;
+
+        if local_count < remote_count {
+            return CheckpointComparison::Behind {
+                missing_events: remote_count - local_count,
+            };
+        }
+        if local_count > remote_count {
+            return CheckpointComparison::Ahead {
+                extra_events: local_count - remote_count,
+            };
+        }
+        if tree::root(local_log) == remote_checkpoint.merkle_root {
+            CheckpointComparison::Consistent
+        } else {
+            CheckpointComparison::Divergent {
+                first_divergent_event: None,
+            }
+        }
+    }
+
     /// Helper: build a log with `n` events and return the log, leaf hashes,
     /// and the DID used for signing.
     fn build_log(n: u64) -> (EventLog, Vec<[u8; 32]>, DID) {
@@ -1462,7 +1476,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // compare_checkpoint returns Consistent for matching roots
+    // classify_against_local returns Consistent for matching roots
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -1472,12 +1486,12 @@ mod tests {
 
         let checkpoint = generate_checkpoint(&log_a, &did, 5, &signer).await.unwrap();
 
-        let result = compare_checkpoint(&log_b, &checkpoint);
+        let result = classify_against_local(&log_b, &checkpoint);
         assert_eq!(result, CheckpointComparison::Consistent);
     }
 
     // -------------------------------------------------------------------
-    // compare_checkpoint returns Divergent for mismatched roots at same count
+    // classify_against_local returns Divergent for mismatched roots at same count
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -1540,7 +1554,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = compare_checkpoint(&log_b, &checkpoint);
+        let result = classify_against_local(&log_b, &checkpoint);
         assert_eq!(
             result,
             CheckpointComparison::Divergent {
@@ -1550,7 +1564,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // compare_checkpoint returns Behind when local has fewer events
+    // classify_against_local returns Behind when local has fewer events
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -1591,12 +1605,12 @@ mod tests {
             .await
             .unwrap();
 
-        let result = compare_checkpoint(&log_partial, &checkpoint);
+        let result = classify_against_local(&log_partial, &checkpoint);
         assert_eq!(result, CheckpointComparison::Behind { missing_events: 3 });
     }
 
     // -------------------------------------------------------------------
-    // compare_checkpoint returns Ahead when local has more events
+    // classify_against_local returns Ahead when local has more events
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -1637,12 +1651,12 @@ mod tests {
             .await
             .unwrap();
 
-        let result = compare_checkpoint(&log_full, &checkpoint);
+        let result = classify_against_local(&log_full, &checkpoint);
         assert_eq!(result, CheckpointComparison::Ahead { extra_events: 6 });
     }
 
     // -------------------------------------------------------------------
-    // compare_checkpoint returns Consistent for empty logs
+    // classify_against_local returns Consistent for empty logs
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -1654,7 +1668,7 @@ mod tests {
 
         let checkpoint = generate_checkpoint(&log_a, &did, 0, &signer).await.unwrap();
 
-        let result = compare_checkpoint(&log_b, &checkpoint);
+        let result = classify_against_local(&log_b, &checkpoint);
         assert_eq!(result, CheckpointComparison::Consistent);
     }
 
@@ -1876,7 +1890,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = compare_checkpoint(&log_b, &checkpoint_a);
+        let result = classify_against_local(&log_b, &checkpoint_a);
         match result {
             CheckpointComparison::Divergent { .. } => {}
             other => panic!("expected Divergent (equivocation), got {other:?}"),

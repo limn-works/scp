@@ -953,10 +953,22 @@ fn conf_021_weeks_offline_classification() {
 /// Layer: Sync | Tier: Full | Spec: §9.9
 #[test]
 fn conf_022_equivocation_detection() {
-    use scp_event_log::EventLog;
-    use scp_event_log::checkpoint::{
-        CheckpointComparison, ConsistencyCheckpoint, compare_checkpoint,
-    };
+    use scp_event_log::checkpoint::ConsistencyCheckpoint;
+    use scp_event_log::{EventLog, tree};
+
+    /// The §9.9.3 divergence predicate: equal event count, different Merkle
+    /// root. Inlined here when the ungated `compare_checkpoint` free function
+    /// was removed from scp-event-log — a RECEIVED checkpoint's verdict also
+    /// requires the sender's signature, the sender's membership, and
+    /// `context_id` equality, and those gates live in the runtime judge
+    /// (`queries_helpers::compare_remote_checkpoint`). This test pins the
+    /// arithmetic half only; its checkpoints are locally constructed and
+    /// deliberately carry a placeholder signature, so they could never clear
+    /// the gated path.
+    fn diverges_from(local_log: &EventLog, remote: &ConsistencyCheckpoint) -> bool {
+        tree::event_count(local_log) == remote.event_count
+            && tree::root(local_log) != remote.merkle_root
+    }
 
     println!("=== CONF-022: Equivocation Detection ===");
 
@@ -979,11 +991,10 @@ fn conf_022_equivocation_detection() {
         signature: vec![0u8; 64],
     };
 
-    print_step(2, "Detect equivocation via compare_checkpoint");
-    let comparison = compare_checkpoint(&local_log, &remote_checkpoint);
+    print_step(2, "Detect equivocation: equal event count, different root");
     assert!(
-        matches!(comparison, CheckpointComparison::Divergent { .. }),
-        "same event count + different roots must produce Divergent, got: {comparison:?}"
+        diverges_from(&local_log, &remote_checkpoint),
+        "same event count + different roots must be detected as divergent"
     );
 
     print_step(3, "Verify consistent checkpoints are not flagged");
@@ -998,10 +1009,17 @@ fn conf_022_equivocation_detection() {
         timestamp: 1_000_000,
         signature: vec![0u8; 64],
     };
-    let comparison = compare_checkpoint(&local_log, &consistent_checkpoint);
-    assert_eq!(comparison, CheckpointComparison::Consistent);
+    assert!(
+        !diverges_from(&local_log, &consistent_checkpoint),
+        "same event count + same root must NOT be flagged as divergent"
+    );
+    assert_eq!(
+        tree::root(&local_log),
+        consistent_checkpoint.merkle_root,
+        "the empty-log root must equal the checkpoint's reported root"
+    );
 
-    println!("  PASS: Equivocation detection verified via compare_checkpoint API");
+    println!("  PASS: Equivocation detection verified (§9.9.3 divergence predicate)");
 }
 
 // ===========================================================================

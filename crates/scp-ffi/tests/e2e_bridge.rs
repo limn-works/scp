@@ -502,8 +502,13 @@ fn ucan_mint_rejects_empty_context() {
 // Event log
 // ============================================================================
 
+/// A fresh context is NOT an empty log: `event_log_query` returns the
+/// authoritative creation stream. This test pins that stream's exact shape —
+/// `== 2` leaves, `ContextCreated` then the founder's `MemberJoined` — which is
+/// the control the sibling `event_log_query_ignores_bridge_local_leaves` relies
+/// on to prove the injected bridge-local leaf never appears.
 #[test]
-fn event_log_query_empty_returns_empty() {
+fn event_log_query_returns_authoritative_creation_stream() {
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         runtime::init_context_manager_for_test(scp.bridge_instance());
