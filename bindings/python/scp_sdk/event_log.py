@@ -64,58 +64,6 @@ _init_pyo3_log_bridge()
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers for bridge payload extraction
-# ---------------------------------------------------------------------------
-
-_EMPTY_ROOT_HASH = "0" * 64
-
-
-def _extract_root_hash(events: list[Any]) -> str:
-    """Extract the Merkle root hash from bridge query results.
-
-    The bridge ``event_log_query`` returns a single ``LogSummary`` event
-    whose ``payload`` dict contains a ``merkle_root`` key with the
-    hex-encoded Merkle root of the event log (RFC 6962 structure).
-
-    Returns the hex-encoded root hash, or the empty-tree sentinel
-    (64 zero characters) if the root cannot be extracted.
-    """
-    for event in events:
-        payload = getattr(event, "payload", None)
-        if payload is None:
-            continue
-
-        if isinstance(payload, dict):
-            root = payload.get("merkle_root")
-            if isinstance(root, str) and len(root) == 64:
-                return root
-
-    return _EMPTY_ROOT_HASH
-
-
-def _extract_event_count(events: list[Any]) -> int:
-    """Extract the total event count from bridge query results.
-
-    The bridge ``event_log_query`` returns a ``LogSummary`` event whose
-    ``payload`` dict contains an ``event_count`` key with the total
-    number of events in the log.
-
-    Returns the event count, or ``len(events)`` as a fallback.
-    """
-    for event in events:
-        payload = getattr(event, "payload", None)
-        if payload is None:
-            continue
-
-        if isinstance(payload, dict):
-            count = payload.get("event_count")
-            if isinstance(count, int):
-                return count
-
-    return len(events)
-
-
-# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 

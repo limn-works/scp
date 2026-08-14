@@ -1170,9 +1170,10 @@ impl ContextProvider for FfiBridgeProvider {
 
         match append_result {
             Ok((sequence, event_bytes, _leaf_hash)) => {
-                // Persist the event payload to storage (best-effort).
-                // This enables py_event_log_query to return real events
-                // instead of just a LogSummary (GitHub issue #303).
+                // Persist the event payload to storage (best-effort). This is
+                // durability only: `event_log_query` reads the supervisor's
+                // authoritative log and never consults `ProtocolRepository`,
+                // so this write does not feed the query surface.
                 //
                 // Uses the Storage trait directly because the global storage
                 // is Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolRepository

@@ -530,19 +530,36 @@ fn event_log_query_empty_returns_empty() {
     });
 }
 
+/// Negative guard: `event_log_query` must read the supervisor's authoritative
+/// log and NOTHING else. The bridge-local `FfiBridgeState::event_log` is a
+/// caller-shapable tree — a query that fell back to it (as the removed
+/// `LogSummary` fallback did) would publish attacker-influenced content and a
+/// non-authoritative Merkle root under the authoritative field names.
+///
+/// So: inject a leaf that exists ONLY in the bridge-local tree, then assert the
+/// query result contains the authoritative creation stream and does NOT contain
+/// the injected leaf. Repointing `event_log_query_impl` at `rt.event_log` makes
+/// this test fail.
 #[test]
-fn event_log_query_with_appended_event() {
+fn event_log_query_ignores_bridge_local_leaves() {
+    /// Actor DID used exclusively by the bridge-local injection below. It is
+    /// never written to the authoritative log, so seeing it in a query result
+    /// proves the query read the wrong tree.
+    const LOCAL_ONLY_DID: &str = "did:key:bridge-local-injection";
+
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         runtime::init_context_manager_for_test(scp.bridge_instance());
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
-        // Manually append an unsigned event to the log.
+        // Append a leaf to the BRIDGE-LOCAL tree only. `MessageSent` cannot
+        // occur in a fresh context's creation stream, so it is unambiguously
+        // attributable to this injection.
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
-                event_type: scp_event_log::EventType::ContextCreated,
-                actor_did: scp_did::DID("did:key:test".to_owned()),
+                event_type: scp_event_log::EventType::MessageSent,
+                actor_did: scp_did::DID(LOCAL_ONLY_DID.to_owned()),
                 timestamp: 1_700_000_000,
                 sequence: 0,
                 payload: scp_event_log::EventPayload { data: vec![] },
@@ -554,9 +571,36 @@ fn event_log_query_with_appended_event() {
         })
         .unwrap();
 
-        // Now query should return a LogSummary.
         let events = scp.event_log_query(py, &ctx_id, None).unwrap();
-        assert!(!events.is_empty());
+
+        // The authoritative creation stream IS returned...
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "ContextCreated" && e.actor_did == did),
+            "authoritative ContextCreated leaf must be present; got {:?}",
+            events
+                .iter()
+                .map(|e| (e.event_type.clone(), e.actor_did.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // ...and the bridge-local injection is NOT.
+        assert!(
+            !events.iter().any(|e| e.actor_did == LOCAL_ONLY_DID),
+            "bridge-local leaf leaked into event_log_query — the query is \
+             reading FfiBridgeState::event_log instead of the authoritative log"
+        );
+        assert!(
+            !events.iter().any(|e| e.event_type == "MessageSent"),
+            "bridge-local MessageSent leaf leaked into event_log_query"
+        );
+        assert_eq!(
+            events.len(),
+            2,
+            "authoritative creation stream is exactly ContextCreated + founder \
+             MemberJoined; a different count means a non-authoritative tree was read"
+        );
     });
 }
 

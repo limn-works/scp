@@ -621,7 +621,6 @@ fn validate_non_negative_epoch(epoch: f64) -> napi::Result<u64> {
 /// Used by absence proof verification to decode the `event_hash` field from
 /// the claim JSON. Rejects strings that are not exactly 64 hex characters
 /// (32 bytes).
-#[allow(dead_code)] // Will be used when event_log_verify is wired to scp-core.
 pub(crate) fn decode_hex_hash(hex: &str) -> Result<[u8; 32], String> {
     if hex.len() != 64 {
         return Err(format!(

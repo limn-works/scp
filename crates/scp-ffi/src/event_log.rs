@@ -734,9 +734,13 @@ fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
 impl crate::scp::PyScp {
     /// Queries the context event log.
     ///
-    /// Returns actual event data from the `ProtocolRepository` when available,
-    /// falling back to a `LogSummary` metadata event when storage is not
-    /// initialized or no event payloads have been persisted.
+    /// Reads the supervisor's authoritative per-context log exclusively. There
+    /// is no `ProtocolRepository` fallback and no synthesized `LogSummary`
+    /// metadata event: a log that is live but holds no matching events returns
+    /// an EMPTY list, and a log that is unreachable or unknown FAILS CLOSED.
+    /// Do not reintroduce a storage or bridge-local fallback — publishing a
+    /// non-authoritative Merkle root under the same field name is the exact
+    /// nullifier this path was built to remove.
     ///
     /// # Arguments
     ///
@@ -752,14 +756,17 @@ impl crate::scp::PyScp {
     ///
     /// # Returns
     ///
-    /// A list of [`PyEvent`] objects.
+    /// A list of [`PyEvent`] objects, empty when the log is live but holds no
+    /// matching events.
     ///
     /// # Errors
     ///
-    /// Raises `ContextError` if the context is not connected to the runtime
-    /// or if the query fails.
+    /// Raises `ContextError` with `SCP-CTX-2138` when the authoritative log is
+    /// unreachable or unknown (instance not ready, no supervisor, or no log
+    /// for this context), and `ContextError` if the filter is malformed or the
+    /// query otherwise fails.
     ///
-    /// See ADR-013 §7 and GitHub issue #303.
+    /// See ADR-013 §7.
     #[pyo3(name = "event_log_query", signature = (context_id, filter=None))]
     pub fn event_log_query(
         &self,

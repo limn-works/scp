@@ -127,9 +127,10 @@ public nonisolated struct EventLog: Sendable {
     /// - Returns: A ``Proof`` carrying the Merkle path.
     /// - Throws: ``ScpError/Context(msg:code:)`` — `SCP-CTX-2138` if the
     ///   authoritative event log is unreachable (FAILS CLOSED, never a proof
-    ///   over a fallback tree), or `SCP-CTX-2139` if proof generation is
-    ///   rejected over a readable log (empty log, out-of-range leaf index) —
-    ///   the honest negative answer, distinct from "cannot answer".
+    ///   over a fallback tree), or `SCP-CTX-2139` if the log WAS read and the
+    ///   inclusion claim is demonstrably FALSE (an empty log, or a leaf index
+    ///   past the end of the tree) — a real negative answer about the log's
+    ///   contents, distinct from "cannot answer".
     public func proveInclusion(leafIndex: UInt64) async throws -> Proof {
         guard let contextHandle = handle.contextHandle else {
             throw ScpError.Context(

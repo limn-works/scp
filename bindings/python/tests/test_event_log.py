@@ -4,7 +4,6 @@ Covers:
 - Event, Proof, Checkpoint, SignedCheckpoint dataclasses
 - :meth:`SCP.event_log_query` / :meth:`SCP.event_log_verify` /
   :meth:`SCP.event_log_checkpoint` dispatch
-- ``_extract_root_hash`` and ``_extract_event_count`` helpers
 
 Phase 4 PR 5 Agent B+C (#1549) deleted the :class:`EventLog` namespace
 class. Every operation lives on :class:`scp_sdk.SCP` — see
@@ -25,13 +24,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from scp_sdk.event_log import (
-    _EMPTY_ROOT_HASH,
     Checkpoint,
     Event,
     Proof,
     SignedCheckpoint,
-    _extract_event_count,
-    _extract_root_hash,
 )
 
 # -----------------------------------------------------------------------
@@ -42,7 +38,7 @@ SAMPLE_ROOT_HASH = "a1b2c3d4e5f6" + "0" * 52
 
 
 def _make_mock_event(
-    event_type: str = "LogSummary",
+    event_type: str = "MessageSent",
     actor_did: str = "",
     timestamp: float = 1_700_000_000.0,
     payload: Any = None,
@@ -54,19 +50,6 @@ def _make_mock_event(
         actor_did=actor_did,
         timestamp=timestamp,
         payload=payload,
-        sequence=sequence,
-    )
-
-
-def _make_log_summary_event(
-    event_count: int = 10,
-    merkle_root: str = SAMPLE_ROOT_HASH,
-    sequence: int = 9,
-) -> SimpleNamespace:
-    """Create a mock LogSummary event matching the bridge's format."""
-    return _make_mock_event(
-        event_type="LogSummary",
-        payload={"event_count": event_count, "merkle_root": merkle_root},
         sequence=sequence,
     )
 
@@ -211,96 +194,6 @@ class TestSignedCheckpointDataclass:
             signature="ff" * 64,
         )
         assert sc.epoch is None
-
-
-# -----------------------------------------------------------------------
-# _extract_root_hash helper tests
-# -----------------------------------------------------------------------
-
-
-class TestExtractRootHash:
-    """Tests for the _extract_root_hash helper function."""
-
-    def test_extracts_root_from_log_summary(self) -> None:
-        events = [_make_log_summary_event(merkle_root="ab" * 32)]
-        assert _extract_root_hash(events) == "ab" * 32
-
-    def test_returns_empty_sentinel_for_empty_events(self) -> None:
-        assert _extract_root_hash([]) == _EMPTY_ROOT_HASH
-
-    def test_returns_empty_sentinel_for_none_payload(self) -> None:
-        events = [_make_mock_event(payload=None)]
-        assert _extract_root_hash(events) == _EMPTY_ROOT_HASH
-
-    def test_returns_empty_sentinel_for_non_dict_payload(self) -> None:
-        events = [_make_mock_event(payload="not a dict")]
-        assert _extract_root_hash(events) == _EMPTY_ROOT_HASH
-
-    def test_returns_empty_sentinel_for_missing_merkle_root_key(self) -> None:
-        events = [_make_mock_event(payload={"event_count": 5})]
-        assert _extract_root_hash(events) == _EMPTY_ROOT_HASH
-
-    def test_returns_empty_sentinel_for_wrong_length_root(self) -> None:
-        events = [_make_mock_event(payload={"merkle_root": "tooshort"})]
-        assert _extract_root_hash(events) == _EMPTY_ROOT_HASH
-
-    def test_returns_empty_sentinel_for_non_string_root(self) -> None:
-        events = [_make_mock_event(payload={"merkle_root": 12345})]
-        assert _extract_root_hash(events) == _EMPTY_ROOT_HASH
-
-    def test_picks_first_valid_root_from_multiple_events(self) -> None:
-        first_root = "11" * 32
-        second_root = "22" * 32
-        events = [
-            _make_log_summary_event(merkle_root=first_root),
-            _make_log_summary_event(merkle_root=second_root),
-        ]
-        assert _extract_root_hash(events) == first_root
-
-    def test_skips_events_without_payload_attr(self) -> None:
-        no_payload = object()
-        valid = _make_log_summary_event(merkle_root="cc" * 32)
-        assert _extract_root_hash([no_payload, valid]) == "cc" * 32
-
-    def test_empty_root_hash_is_64_zeros(self) -> None:
-        assert _EMPTY_ROOT_HASH == "0" * 64
-        assert len(_EMPTY_ROOT_HASH) == 64
-
-
-# -----------------------------------------------------------------------
-# _extract_event_count helper tests
-# -----------------------------------------------------------------------
-
-
-class TestExtractEventCount:
-    """Tests for the _extract_event_count helper function."""
-
-    def test_extracts_count_from_log_summary(self) -> None:
-        events = [_make_log_summary_event(event_count=42)]
-        assert _extract_event_count(events) == 42
-
-    def test_returns_len_for_empty_events(self) -> None:
-        assert _extract_event_count([]) == 0
-
-    def test_returns_len_for_non_dict_payload(self) -> None:
-        events = [_make_mock_event(payload="string")]
-        assert _extract_event_count(events) == 1
-
-    def test_returns_len_for_missing_event_count_key(self) -> None:
-        events = [_make_mock_event(payload={"merkle_root": "ab" * 32})]
-        assert _extract_event_count(events) == 1
-
-    def test_returns_len_for_non_int_count(self) -> None:
-        events = [_make_mock_event(payload={"event_count": "not_int"})]
-        assert _extract_event_count(events) == 1
-
-    def test_handles_zero_event_count(self) -> None:
-        events = [_make_log_summary_event(event_count=0)]
-        assert _extract_event_count(events) == 0
-
-    def test_handles_large_event_count(self) -> None:
-        events = [_make_log_summary_event(event_count=1_000_000)]
-        assert _extract_event_count(events) == 1_000_000
 
 
 # -----------------------------------------------------------------------
