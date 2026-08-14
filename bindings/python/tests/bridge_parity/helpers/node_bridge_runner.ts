@@ -347,6 +347,18 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
           ok: true,
           result: await opEventLogQueryFiltered(req),
         };
+      case "event_log_verify_inclusion":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opEventLogVerifyInclusion(req),
+        };
+      case "event_log_absence_of_lifecycle_event_rejected":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opEventLogAbsenceRejected(req),
+        };
       case "unregistered_did_rejected":
         return {
           id: req.id,
@@ -735,6 +747,71 @@ async function opEventLogQueryFiltered(
   return {
     event_count: events.length,
     first_event_type: first ? String(first.eventType) : "",
+  };
+}
+
+async function opEventLogVerifyInclusion(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
+  const params = { name: "parity-elog-v", mode: "encrypted" };
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(identity, JSON.stringify(params));
+  // `ContextCreated` is leaf 0 of the AUTHORITATIVE log on every bridge.
+  const proof = await scp.eventLogVerify(
+    handle,
+    JSON.stringify({ type: "inclusion", leaf_index: 0 }),
+  );
+  const details = JSON.parse(proof.detailsJson) as Record<string, unknown>;
+  return {
+    proof_type: String(proof.proofType),
+    leaf_count: Number(details.leaf_count),
+    has_leaf_hash: "leaf_hash" in details,
+    has_path: "path" in details,
+    has_root: "root" in details,
+  };
+}
+
+async function opEventLogAbsenceRejected(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
+  const params = { name: "parity-elog-v", mode: "encrypted" };
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(identity, JSON.stringify(params));
+  // Extract the `ContextCreated` leaf hash from the bridge's own
+  // inclusion proof, so the absence claim provably names an event that
+  // IS in the authoritative log (GitHub #1933 AC 4).
+  const inclusion = await scp.eventLogVerify(
+    handle,
+    JSON.stringify({ type: "inclusion", leaf_index: 0 }),
+  );
+  const details = JSON.parse(inclusion.detailsJson) as Record<string, unknown>;
+  const leafHash = String(details.leaf_hash);
+  try {
+    await scp.eventLogVerify(
+      handle,
+      JSON.stringify({ type: "absence", event_hash: leafHash }),
+    );
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
+      return {
+        error: {
+          type: err.constructor.name,
+          code: codeMatch ? codeMatch[0] : "UNKNOWN",
+          message: err.message,
+        },
+      };
+    }
+    return {
+      error: { type: "unknown", code: "UNKNOWN", message: String(err) },
+    };
+  }
+  return {
+    error: { type: "none", code: "NONE", message: "no error raised" },
   };
 }
 

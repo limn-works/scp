@@ -585,6 +585,80 @@ private suspend fun opEventLogQueryFiltered(args: JsonObject): JsonObject =
         }
     }
 
+// Drives the PRODUCTION UniFFI verify path (`Scp.eventLogVerify` →
+// `Proof`) — NOT the never-swapped `NativeBindings` scaffold. Pins the
+// honest proof shape: a returned proof IS the positive answer (no
+// `verified` flag) and its details carry the checkable Merkle material
+// plus the one-snapshot `leaf_count`. Mirrors
+// `seed_operations.py::_py_event_log_verify_inclusion`.
+@Suppress("UnusedParameter")
+private suspend fun opEventLogVerifyInclusion(args: JsonObject): JsonObject =
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams())
+        // `ContextCreated` is leaf 0 of the AUTHORITATIVE log on every
+        // bridge.
+        val proof = scp.eventLogVerify(
+            handle,
+            """{"type":"inclusion","leaf_index":0}"""
+        )
+        val details = JSON.parseToJsonElement(proof.detailsJson).jsonObject
+        buildJsonObject {
+            put("proof_type", JsonPrimitive(proof.proofType))
+            put("leaf_count", JsonPrimitive(details["leaf_count"]?.jsonPrimitive?.longOrNull ?: -1L))
+            put("has_leaf_hash", JsonPrimitive(details.containsKey("leaf_hash")))
+            put("has_path", JsonPrimitive(details.containsKey("path")))
+            put("has_root", JsonPrimitive(details.containsKey("root")))
+        }
+    }
+
+// GitHub #1933 AC 4: an absence proof for a REAL lifecycle event must
+// FAIL with SCP-CTX-2139 identically on every bridge. Extracts the
+// `ContextCreated` leaf hash from this bridge's own inclusion proof so
+// the absence claim provably names an event that IS in the
+// authoritative log. Mirrors
+// `seed_operations.py::_py_event_log_absence_rejected`.
+@Suppress("UnusedParameter")
+private suspend fun opEventLogAbsenceRejected(args: JsonObject): JsonObject =
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams())
+        val inclusion = scp.eventLogVerify(
+            handle,
+            """{"type":"inclusion","leaf_index":0}"""
+        )
+        val details = JSON.parseToJsonElement(inclusion.detailsJson).jsonObject
+        val leafHash = details["leaf_hash"]?.jsonPrimitive?.content ?: ""
+        try {
+            scp.eventLogVerify(
+                handle,
+                """{"type":"absence","event_hash":"$leafHash"}"""
+            )
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive("none"))
+                        put("code", JsonPrimitive("NONE"))
+                        put("message", JsonPrimitive("no error raised"))
+                    }
+                )
+            }
+        } catch (e: Throwable) {
+            val message = e.message ?: e.toString()
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
+                        put("code", JsonPrimitive(extractScpCode(message)))
+                        put("message", JsonPrimitive(message))
+                    }
+                )
+            }
+        }
+    }
+
 // Fixed 32-byte nonce used when `signed_at_override` pins the SCPID
 // response. Must match
 // `bindings/python/tests/bridge_parity/seed_operations.py::PARITY_NONCE_HEX`.
@@ -662,6 +736,9 @@ private suspend fun dispatch(req: RawRequest): String {
             "ucan_evaluate_structured" -> opUcanEvaluateStructured(req.args)
             "transport_status" -> opTransportStatus(req.args)
             "event_log_query_filtered" -> opEventLogQueryFiltered(req.args)
+            "event_log_verify_inclusion" -> opEventLogVerifyInclusion(req.args)
+            "event_log_absence_of_lifecycle_event_rejected" ->
+                opEventLogAbsenceRejected(req.args)
             "unregistered_did_rejected" -> opUnregisteredDidRejected(req.args)
             else -> return errResponse(
                 req.id,

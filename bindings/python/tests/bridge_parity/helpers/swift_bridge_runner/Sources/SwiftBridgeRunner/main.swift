@@ -722,6 +722,88 @@ func opSignMessage(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     ]
 }
 
+// Drives the PRODUCTION UniFFI verify path (`Scp.eventLogVerify` →
+// `Proof`). Pins the honest proof shape: a returned proof IS the
+// positive answer (no `verified` flag) and its details carry the
+// checkable Merkle material plus the one-snapshot `leaf_count`.
+// Mirrors `seed_operations.py::_py_event_log_verify_inclusion`.
+func opEventLogVerifyInclusion(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    _ = req
+    let scp = try Scp.withStorage(config: .inMemory)
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(
+        identity: identity, params: buildContextParams()
+    )
+    // `ContextCreated` is leaf 0 of the AUTHORITATIVE log on every bridge.
+    let proof = try await scp.eventLogVerify(
+        handle: handle,
+        claimJson: "{\"type\":\"inclusion\",\"leaf_index\":0}"
+    )
+    let details = parseJsonObject(proof.detailsJson)
+    let leafCount = (details["leaf_count"] as? NSNumber)?.int64Value ?? -1
+    return [
+        "proof_type": .string(proof.proofType),
+        "leaf_count": .integer(leafCount),
+        "has_leaf_hash": .bool(details.keys.contains("leaf_hash")),
+        "has_path": .bool(details.keys.contains("path")),
+        "has_root": .bool(details.keys.contains("root"))
+    ]
+}
+
+// GitHub #1933 AC 4: an absence proof for a REAL lifecycle event must
+// FAIL with SCP-CTX-2139 identically on every bridge. Extracts the
+// `ContextCreated` leaf hash from this bridge's own inclusion proof so
+// the absence claim provably names an event that IS in the
+// authoritative log. Mirrors
+// `seed_operations.py::_py_event_log_absence_rejected`.
+func opEventLogAbsenceRejected(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    _ = req
+    let scp = try Scp.withStorage(config: .inMemory)
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(
+        identity: identity, params: buildContextParams()
+    )
+    let inclusion = try await scp.eventLogVerify(
+        handle: handle,
+        claimJson: "{\"type\":\"inclusion\",\"leaf_index\":0}"
+    )
+    let details = parseJsonObject(inclusion.detailsJson)
+    let leafHash = details["leaf_hash"] as? String ?? ""
+    do {
+        _ = try await scp.eventLogVerify(
+            handle: handle,
+            claimJson: "{\"type\":\"absence\",\"event_hash\":\"\(leafHash)\"}"
+        )
+        return [
+            "error": .object([
+                "type": .string("none"),
+                "code": .string("NONE"),
+                "message": .string("no error raised")
+            ])
+        ]
+    } catch {
+        let message = String(describing: error)
+        let code = extractScpCode(message)
+        let errType = String(describing: type(of: error))
+        return [
+            "error": .object([
+                "type": .string(errType),
+                "code": .string(code),
+                "message": .string(message)
+            ])
+        ]
+    }
+}
+
+/// Parses a JSON object string into `[String: Any]`; empty on failure.
+func parseJsonObject(_ json: String) -> [String: Any] {
+    guard let data = json.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return [:]
+    }
+    return obj
+}
+
 func dispatch(_ req: BridgeRequest) async -> Any {
     do {
         let result: [String: JSONValue]
@@ -750,6 +832,10 @@ func dispatch(_ req: BridgeRequest) async -> Any {
             result = try await opTransportStatus(req)
         case "event_log_query_filtered":
             result = try await opEventLogQueryFiltered(req)
+        case "event_log_verify_inclusion":
+            result = try await opEventLogVerifyInclusion(req)
+        case "event_log_absence_of_lifecycle_event_rejected":
+            result = try await opEventLogAbsenceRejected(req)
         case "unregistered_did_rejected":
             result = try await opUnregisteredDidRejected(req)
         default:
