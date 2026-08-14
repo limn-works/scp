@@ -932,122 +932,28 @@ pub fn verify_checkpoint_signature(
         .map_err(|e| format!("Ed25519 verification failed: {e}"))
 }
 
-/// Verifies consistency between two checkpoints.
-///
-/// Two checkpoints are consistent if they cover the same context and the
-/// older checkpoint's Merkle root can be recomputed from the newer
-/// checkpoint's event log (given the leaf hashes for the older range).
-///
-/// For efficiency, this function checks structural consistency:
-/// - Same context ID.
-/// - The older checkpoint's event count is <= the newer one's.
-/// - If event counts are equal, Merkle roots must match.
-///
-/// Full cryptographic verification (that the newer checkpoint's tree
-/// contains the older checkpoint's tree as a prefix) requires access to
-/// the leaf hashes, which is done by [`verify_cross_checkpoint_with_leaves`].
-#[must_use]
-pub fn cross_checkpoint_verify(
-    older: &ConsistencyCheckpoint,
-    newer: &ConsistencyCheckpoint,
-) -> CrossCheckpointResult {
-    if older.context_id != newer.context_id {
-        return CrossCheckpointResult::ContextMismatch;
-    }
-
-    if older.event_count > newer.event_count {
-        return CrossCheckpointResult::OrderViolation;
-    }
-
-    if older.event_count == newer.event_count {
-        // Constant-time comparison to prevent timing side-channels.
-        return if older.merkle_root.ct_eq(&newer.merkle_root).into() {
-            CrossCheckpointResult::Consistent
-        } else {
-            CrossCheckpointResult::Divergent
-        };
-    }
-
-    // older.event_count < newer.event_count -- structurally plausible but
-    // we cannot verify Merkle root prefix without leaf data.
-    CrossCheckpointResult::PlausiblyConsistent {
-        events_between: newer.event_count - older.event_count,
-    }
-}
-
-/// Verifies cross-checkpoint consistency using leaf hashes.
-///
-/// Given two checkpoints and the full leaf hashes for the newer checkpoint's
-/// range, verifies that the older checkpoint's Merkle root is the correct
-/// root for the first `older.event_count` leaves.
-///
-/// This is the full cryptographic verification of cross-checkpoint
-/// consistency.
-#[must_use]
-pub fn verify_cross_checkpoint_with_leaves(
-    older: &ConsistencyCheckpoint,
-    newer: &ConsistencyCheckpoint,
-    newer_leaves: &[[u8; 32]],
-) -> CrossCheckpointResult {
-    if older.context_id != newer.context_id {
-        return CrossCheckpointResult::ContextMismatch;
-    }
-
-    if older.event_count > newer.event_count {
-        return CrossCheckpointResult::OrderViolation;
-    }
-
-    // newer_leaves.len() bounded by event log size; fits in u64.
-    #[allow(clippy::cast_possible_truncation)]
-    let newer_count = newer_leaves.len() as u64;
-    if newer_count != newer.event_count {
-        return CrossCheckpointResult::Divergent;
-    }
-
-    if older.event_count == newer.event_count {
-        // Constant-time comparison to prevent timing side-channels.
-        return if older.merkle_root.ct_eq(&newer.merkle_root).into() {
-            CrossCheckpointResult::Consistent
-        } else {
-            CrossCheckpointResult::Divergent
-        };
-    }
-
-    // Verify that the first `older.event_count` leaves produce the older
-    // checkpoint's Merkle root.
-    #[allow(clippy::cast_possible_truncation)]
-    let older_leaves = &newer_leaves[..older.event_count as usize];
-    let computed_root = compute_root_from_leaves(older_leaves);
-
-    // Constant-time comparison to prevent timing side-channels.
-    if computed_root.ct_eq(&older.merkle_root).into() {
-        CrossCheckpointResult::Consistent
-    } else {
-        CrossCheckpointResult::Divergent
-    }
-}
-
-/// Result of cross-checkpoint consistency verification.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CrossCheckpointResult {
-    /// Both checkpoints are consistent (the older is a valid prefix of the
-    /// newer).
-    Consistent,
-    /// The checkpoints cover the same event range but have different Merkle
-    /// roots. This indicates equivocation or corruption.
-    Divergent,
-    /// The checkpoints belong to different contexts.
-    ContextMismatch,
-    /// The "older" checkpoint has more events than the "newer" one.
-    OrderViolation,
-    /// Structural consistency is plausible but not cryptographically verified.
-    /// Full verification requires leaf hashes (use
-    /// [`verify_cross_checkpoint_with_leaves`]).
-    PlausiblyConsistent {
-        /// Number of events between the two checkpoints.
-        events_between: u64,
-    },
-}
+// ---------------------------------------------------------------------------
+// Removed: the ungated cross-checkpoint comparators
+// ---------------------------------------------------------------------------
+//
+// `cross_checkpoint_verify`, `verify_cross_checkpoint_with_leaves`, and their
+// `CrossCheckpointResult` have been removed. They were the same ungated-verdict
+// class as the deleted `compare_checkpoint` below: each took two
+// `ConsistencyCheckpoint` values and returned `Divergent` — an accusation of
+// equivocation — with NO signature verification, NO membership check, and NO
+// binding to a caller-supplied context, and carried no precondition in their
+// docs saying a caller had to establish those first. They had zero production
+// callers and, unlike `compare_checkpoint`, no ADR/PRD/spec provenance
+// prescribing them.
+//
+// The two capabilities they gestured at both exist, soundly, elsewhere:
+// - Judging a RECEIVED checkpoint is `queries_helpers::compare_remote_checkpoint`
+//   in the runtime, which enforces all three gates (see the note below).
+// - Proving that an earlier tree state is a prefix of a later state of the SAME
+//   log is the RFC 6962 consistency proof: [`crate::proof::prove_consistency`] /
+//   [`crate::proof::verify_consistency`]. That is the mechanism for the
+//   prefix question `verify_cross_checkpoint_with_leaves` answered by
+//   recomputing a root from raw leaves handed in by the caller.
 
 // ---------------------------------------------------------------------------
 // Public operations (Phase 2 -- unchanged)
@@ -1212,27 +1118,6 @@ fn recompute_tree_from_leaves(leaves: &[[u8; 32]]) -> Vec<Vec<[u8; 32]>> {
     layers
 }
 
-/// Computes the Merkle root from a set of leaf hashes.
-///
-/// Returns `SHA-256("")` for an empty set (spec §25.8 Vector 15).
-fn compute_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
-    if leaves.is_empty() {
-        return crate::tree::empty_tree_root();
-    }
-    if leaves.len() == 1 {
-        return leaves[0];
-    }
-
-    let layers = recompute_tree_from_leaves(leaves);
-    if let Some(top) = layers.last()
-        && top.len() == 1
-    {
-        return top[0];
-    }
-
-    unreachable!("recompute_tree_from_leaves always produces a single root for non-empty input")
-}
-
 /// Computes `SHA-256(0x01 || left || right)` for an interior node.
 ///
 /// RFC 6962 Section 2.1 interior node hash function with domain separation.
@@ -1324,42 +1209,20 @@ mod tests {
     // -------------------------------------------------------------------
     // Test helpers (checkpoint-specific)
     // -------------------------------------------------------------------
-
-    /// Test-local count/root classification, inlined here when the ungated
-    /// `compare_checkpoint` free function was removed from this module.
-    ///
-    /// This is the raw §9.9.3 arithmetic ONLY. It is deliberately test-only and
-    /// deliberately NOT `pub`: a received checkpoint's verdict additionally
-    /// requires the sender's signature, the sender's membership, and
-    /// `context_id` equality, all of which are enforced by the runtime judge
-    /// (`queries_helpers::compare_remote_checkpoint`). The tests below exercise
-    /// the arithmetic over logs they construct themselves, so those gates are
-    /// satisfied by construction and are not what is under test here.
-    fn classify_against_local(
-        local_log: &EventLog,
-        remote_checkpoint: &ConsistencyCheckpoint,
-    ) -> CheckpointComparison {
-        let local_count = tree::event_count(local_log);
-        let remote_count = remote_checkpoint.event_count;
-
-        if local_count < remote_count {
-            return CheckpointComparison::Behind {
-                missing_events: remote_count - local_count,
-            };
-        }
-        if local_count > remote_count {
-            return CheckpointComparison::Ahead {
-                extra_events: local_count - remote_count,
-            };
-        }
-        if tree::root(local_log) == remote_checkpoint.merkle_root {
-            CheckpointComparison::Consistent
-        } else {
-            CheckpointComparison::Divergent {
-                first_divergent_event: None,
-            }
-        }
-    }
+    //
+    // NOTE: the count/root classification of a RECEIVED checkpoint is NOT
+    // tested here, and there is deliberately no test-local reimplementation of
+    // it in this module. A verdict about a received checkpoint depends on the
+    // sender's signature, the sender's membership, and `context_id` equality as
+    // much as it depends on the arithmetic, and the only thing that carries all
+    // four is the runtime judge, `queries_helpers::compare_remote_checkpoint`.
+    // Its tests live next to it, in
+    // `crates/scp-runtime/src/context/queries_helpers.rs`
+    // (`remote_checkpoint_classification_tests`), and cover every
+    // `CheckpointComparison` variant plus each gate. A test-only classifier
+    // here would have satisfied SCP-032's acceptance criteria from a fixture on
+    // no production path — which is exactly how the missing `Ahead` coverage
+    // went unnoticed.
 
     /// Helper: build a log with `n` events and return the log, leaf hashes,
     /// and the DID used for signing.
@@ -1387,33 +1250,6 @@ mod tests {
         }
 
         (log, leaf_hashes, did)
-    }
-
-    /// Helper: build two identical logs with `n` events each.
-    fn build_matching_logs(n: u64) -> (EventLog, EventLog, DID) {
-        let (verifying_key, signing_key) = test_keypair();
-        let did = did_from_pubkey(&verifying_key);
-        let mut log_a = EventLog::new("ctx-checkpoint-test".to_owned());
-        let mut log_b = EventLog::new("ctx-checkpoint-test".to_owned());
-        let mut prev_hash = GENESIS_PREV_HASH;
-
-        for i in 0..n {
-            let event = sign_event(
-                EventType::MessageSent,
-                &did,
-                1_000_000 + i,
-                i,
-                format!("message {i}").into_bytes(),
-                prev_hash,
-                &signing_key,
-            );
-            tree::append(&mut log_a, &event).unwrap();
-            tree::append(&mut log_b, &event).unwrap();
-            let leaf_hash = leaf_hash_from_event(&event);
-            prev_hash = leaf_hash;
-        }
-
-        (log_a, log_b, did)
     }
 
     // ===================================================================
@@ -1475,202 +1311,14 @@ mod tests {
         assert_eq!(checkpoint.merkle_root, expected_empty_root);
     }
 
-    // -------------------------------------------------------------------
-    // classify_against_local returns Consistent for matching roots
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn compare_returns_consistent_for_matching_roots() {
-        let (log_a, log_b, did) = build_matching_logs(10);
-        let signer = TestSigner::new();
-
-        let checkpoint = generate_checkpoint(&log_a, &did, 5, &signer).await.unwrap();
-
-        let result = classify_against_local(&log_b, &checkpoint);
-        assert_eq!(result, CheckpointComparison::Consistent);
-    }
-
-    // -------------------------------------------------------------------
-    // classify_against_local returns Divergent for mismatched roots at same count
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn compare_returns_divergent_for_mismatched_roots_same_count() {
-        let (verifying_key_a, signing_key_a) = test_keypair();
-        let did_a = did_from_pubkey(&verifying_key_a);
-
-        let (verifying_key_b, signing_key_b) = test_keypair();
-        let did_b = did_from_pubkey(&verifying_key_b);
-
-        let mut log_a = EventLog::new("ctx-checkpoint-test".to_owned());
-        let mut log_b = EventLog::new("ctx-checkpoint-test".to_owned());
-
-        let mut prev_hash_a = GENESIS_PREV_HASH;
-        let mut prev_hash_b = GENESIS_PREV_HASH;
-
-        for i in 0..5u64 {
-            let event_a = sign_event(
-                EventType::MessageSent,
-                &did_a,
-                1_000_000 + i,
-                i,
-                format!("msg-a-{i}").into_bytes(),
-                prev_hash_a,
-                &signing_key_a,
-            );
-            tree::append(&mut log_a, &event_a).unwrap();
-            let leaf_hash_a: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update([0x00]);
-                h.update(rmp_serde::to_vec(&event_a).unwrap());
-                h.finalize().into()
-            };
-            prev_hash_a = leaf_hash_a;
-
-            let event_b = sign_event(
-                EventType::MessageSent,
-                &did_b,
-                1_000_000 + i,
-                i,
-                format!("msg-b-{i}").into_bytes(),
-                prev_hash_b,
-                &signing_key_b,
-            );
-            tree::append(&mut log_b, &event_b).unwrap();
-            let leaf_hash_b: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update([0x00]);
-                h.update(rmp_serde::to_vec(&event_b).unwrap());
-                h.finalize().into()
-            };
-            prev_hash_b = leaf_hash_b;
-        }
-
-        assert_eq!(tree::event_count(&log_a), tree::event_count(&log_b));
-        assert_ne!(tree::root(&log_a), tree::root(&log_b));
-
-        let signer = TestSigner::new();
-        let checkpoint = generate_checkpoint(&log_a, &did_a, 1, &signer)
-            .await
-            .unwrap();
-
-        let result = classify_against_local(&log_b, &checkpoint);
-        assert_eq!(
-            result,
-            CheckpointComparison::Divergent {
-                first_divergent_event: None
-            }
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // classify_against_local returns Behind when local has fewer events
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn compare_returns_behind_when_local_has_fewer() {
-        let (verifying_key, signing_key) = test_keypair();
-        let did = did_from_pubkey(&verifying_key);
-
-        let mut log_full = EventLog::new("ctx-checkpoint-test".to_owned());
-        let mut log_partial = EventLog::new("ctx-checkpoint-test".to_owned());
-        let mut prev_hash = GENESIS_PREV_HASH;
-
-        for i in 0..10u64 {
-            let event = sign_event(
-                EventType::MessageSent,
-                &did,
-                1_000_000 + i,
-                i,
-                format!("message {i}").into_bytes(),
-                prev_hash,
-                &signing_key,
-            );
-            tree::append(&mut log_full, &event).unwrap();
-            if i < 7 {
-                tree::append(&mut log_partial, &event).unwrap();
-            }
-            let leaf_hash: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update([0x00]);
-                h.update(rmp_serde::to_vec(&event).unwrap());
-                h.finalize().into()
-            };
-            prev_hash = leaf_hash;
-        }
-
-        let signer = TestSigner::new();
-
-        let checkpoint = generate_checkpoint(&log_full, &did, 1, &signer)
-            .await
-            .unwrap();
-
-        let result = classify_against_local(&log_partial, &checkpoint);
-        assert_eq!(result, CheckpointComparison::Behind { missing_events: 3 });
-    }
-
-    // -------------------------------------------------------------------
-    // classify_against_local returns Ahead when local has more events
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn compare_returns_ahead_when_local_has_more() {
-        let (verifying_key, signing_key) = test_keypair();
-        let did = did_from_pubkey(&verifying_key);
-
-        let mut log_full = EventLog::new("ctx-checkpoint-test".to_owned());
-        let mut log_partial = EventLog::new("ctx-checkpoint-test".to_owned());
-        let mut prev_hash = GENESIS_PREV_HASH;
-
-        for i in 0..10u64 {
-            let event = sign_event(
-                EventType::MessageSent,
-                &did,
-                1_000_000 + i,
-                i,
-                format!("message {i}").into_bytes(),
-                prev_hash,
-                &signing_key,
-            );
-            tree::append(&mut log_full, &event).unwrap();
-            if i < 4 {
-                tree::append(&mut log_partial, &event).unwrap();
-            }
-            let leaf_hash: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update([0x00]);
-                h.update(rmp_serde::to_vec(&event).unwrap());
-                h.finalize().into()
-            };
-            prev_hash = leaf_hash;
-        }
-
-        let signer = TestSigner::new();
-
-        let checkpoint = generate_checkpoint(&log_partial, &did, 1, &signer)
-            .await
-            .unwrap();
-
-        let result = classify_against_local(&log_full, &checkpoint);
-        assert_eq!(result, CheckpointComparison::Ahead { extra_events: 6 });
-    }
-
-    // -------------------------------------------------------------------
-    // classify_against_local returns Consistent for empty logs
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn compare_returns_consistent_for_empty_logs() {
-        let log_a = EventLog::new("ctx-empty".to_owned());
-        let log_b = EventLog::new("ctx-empty".to_owned());
-        let signer = TestSigner::new();
-        let did: DID = "did:key:test".into();
-
-        let checkpoint = generate_checkpoint(&log_a, &did, 0, &signer).await.unwrap();
-
-        let result = classify_against_local(&log_b, &checkpoint);
-        assert_eq!(result, CheckpointComparison::Consistent);
-    }
+    // NOTE: the five `classify_against_local` tests that stood here
+    // (Consistent-for-matching-roots, Divergent-at-equal-count, Behind, Ahead,
+    // Consistent-for-empty-logs) have moved onto the production judge in
+    // `crates/scp-runtime/src/context/queries_helpers.rs`
+    // (`remote_checkpoint_classification_tests`), where they exercise
+    // `compare_remote_checkpoint` / `classify_remote_checkpoint` over a live
+    // event-log provider instead of a test-local reimplementation of the
+    // arithmetic. No assertion was weakened in the move.
 
     // -------------------------------------------------------------------
     // CheckpointScheduler: checkpoint due after event threshold
@@ -1830,72 +1478,12 @@ mod tests {
         assert_ne!(base, different_ts);
     }
 
-    #[tokio::test]
-    async fn divergent_roots_indicate_equivocation() {
-        let (vk_a, sk_a) = test_keypair();
-        let did_a = did_from_pubkey(&vk_a);
-        let (vk_b, sk_b) = test_keypair();
-        let did_b = did_from_pubkey(&vk_b);
-
-        let mut log_a = EventLog::new("ctx-equivocation".to_owned());
-        let mut log_b = EventLog::new("ctx-equivocation".to_owned());
-
-        let mut prev_a = GENESIS_PREV_HASH;
-        let mut prev_b = GENESIS_PREV_HASH;
-
-        for i in 0..5u64 {
-            let event_a = sign_event(
-                EventType::MessageSent,
-                &did_a,
-                1_000_000 + i,
-                i,
-                format!("alice-{i}").into_bytes(),
-                prev_a,
-                &sk_a,
-            );
-            tree::append(&mut log_a, &event_a).unwrap();
-            let h_a: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update([0x00]);
-                h.update(rmp_serde::to_vec(&event_a).unwrap());
-                h.finalize().into()
-            };
-            prev_a = h_a;
-
-            let event_b = sign_event(
-                EventType::MessageSent,
-                &did_b,
-                1_000_000 + i,
-                i,
-                format!("bob-{i}").into_bytes(),
-                prev_b,
-                &sk_b,
-            );
-            tree::append(&mut log_b, &event_b).unwrap();
-            let h_b: [u8; 32] = {
-                let mut h = Sha256::new();
-                h.update([0x00]);
-                h.update(rmp_serde::to_vec(&event_b).unwrap());
-                h.finalize().into()
-            };
-            prev_b = h_b;
-        }
-
-        assert_eq!(tree::event_count(&log_a), tree::event_count(&log_b));
-        assert_ne!(tree::root(&log_a), tree::root(&log_b));
-
-        let signer = TestSigner::new();
-
-        let checkpoint_a = generate_checkpoint(&log_a, &did_a, 1, &signer)
-            .await
-            .unwrap();
-
-        let result = classify_against_local(&log_b, &checkpoint_a);
-        match result {
-            CheckpointComparison::Divergent { .. } => {}
-            other => panic!("expected Divergent (equivocation), got {other:?}"),
-        }
-    }
+    // NOTE: `divergent_roots_indicate_equivocation` has moved onto the
+    // production judge as
+    // `queries_helpers::remote_checkpoint_classification_tests::two_members_with_divergent_logs_at_equal_count_is_equivocation`,
+    // which builds the same shape (two genuinely different logs at equal event
+    // count) and additionally asserts the `EquivocationDetected` alert the
+    // verdict is supposed to raise.
 
     // ===================================================================
     // Phase 6 tests — CheckpointPolicy
@@ -2351,164 +1939,13 @@ mod tests {
         assert_eq!(truncated.total_event_count(), 5);
     }
 
-    // ===================================================================
-    // Phase 6 tests — Cross-checkpoint verification
-    // ===================================================================
-
-    // -------------------------------------------------------------------
-    // 20. Cross-checkpoint verify detects consistent checkpoints
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn cross_checkpoint_consistent() {
-        let (log, _, did) = build_log(20);
-        let signer = TestSigner::new();
-
-        // Checkpoint at 10 events.
-        let mut log_10 = EventLog::new("ctx-checkpoint-test".to_owned());
-        let leaves = log.leaves();
-        for i in 0..10 {
-            log_10.push_leaf_raw(leaves[i]);
-        }
-        let cp_10 = generate_checkpoint_at(&log_10, &did, 1, 1_000_010, &signer)
-            .await
-            .unwrap();
-
-        // Checkpoint at 20 events.
-        let cp_20 = generate_checkpoint_at(&log, &did, 2, 1_000_020, &signer)
-            .await
-            .unwrap();
-
-        // Structural check: plausibly consistent.
-        let result = cross_checkpoint_verify(&cp_10, &cp_20);
-        assert_eq!(
-            result,
-            CrossCheckpointResult::PlausiblyConsistent { events_between: 10 },
-        );
-
-        // Full verification with leaves.
-        let all_leaves: Vec<[u8; 32]> = leaves.to_vec();
-        let result = verify_cross_checkpoint_with_leaves(&cp_10, &cp_20, &all_leaves);
-        assert_eq!(result, CrossCheckpointResult::Consistent);
-    }
-
-    // -------------------------------------------------------------------
-    // 21. Cross-checkpoint verify detects divergence
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn cross_checkpoint_divergent() {
-        let (log_a, _, did_a) = build_log(10);
-        let (log_b, _, _) = build_log(10);
-        let signer = TestSigner::new();
-
-        let cp_a = generate_checkpoint_at(&log_a, &did_a, 1, 1_000_010, &signer)
-            .await
-            .unwrap();
-
-        let cp_b = generate_checkpoint_at(&log_b, &did_a, 1, 1_000_010, &signer)
-            .await
-            .unwrap();
-
-        // Same event count, different roots.
-        let result = cross_checkpoint_verify(&cp_a, &cp_b);
-        assert_eq!(result, CrossCheckpointResult::Divergent);
-    }
-
-    // -------------------------------------------------------------------
-    // 22. Cross-checkpoint verify detects context mismatch
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn cross_checkpoint_context_mismatch() {
-        let signer = TestSigner::new();
-        let did: DID = "did:key:test".into();
-
-        let log_a = EventLog::new("ctx-a".to_owned());
-        let log_b = EventLog::new("ctx-b".to_owned());
-
-        let cp_a = generate_checkpoint_at(&log_a, &did, 0, 1_000_000, &signer)
-            .await
-            .unwrap();
-
-        let cp_b = generate_checkpoint_at(&log_b, &did, 0, 1_000_000, &signer)
-            .await
-            .unwrap();
-
-        let result = cross_checkpoint_verify(&cp_a, &cp_b);
-        assert_eq!(result, CrossCheckpointResult::ContextMismatch);
-    }
-
-    // -------------------------------------------------------------------
-    // 23. Cross-checkpoint verify detects order violation
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn cross_checkpoint_order_violation() {
-        let (log, _, did) = build_log(20);
-        let signer = TestSigner::new();
-
-        let mut log_10 = EventLog::new("ctx-checkpoint-test".to_owned());
-        let leaves = log.leaves();
-        for i in 0..10 {
-            log_10.push_leaf_raw(leaves[i]);
-        }
-
-        let cp_10 = generate_checkpoint_at(&log_10, &did, 1, 1_000_010, &signer)
-            .await
-            .unwrap();
-
-        let cp_20 = generate_checkpoint_at(&log, &did, 2, 1_000_020, &signer)
-            .await
-            .unwrap();
-
-        // Pass in wrong order.
-        let result = cross_checkpoint_verify(&cp_20, &cp_10);
-        assert_eq!(result, CrossCheckpointResult::OrderViolation);
-    }
-
-    // -------------------------------------------------------------------
-    // 24. Cross-checkpoint with leaves detects divergent histories
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn cross_checkpoint_with_leaves_detects_divergent() {
-        let (log_a, _, did) = build_log(10);
-        let (log_b, _, _) = build_log(20);
-        let signer = TestSigner::new();
-
-        // Checkpoint from log_a at 10.
-        let cp_a = generate_checkpoint_at(&log_a, &did, 1, 1_000_010, &signer)
-            .await
-            .unwrap();
-
-        // Checkpoint from log_b at 20 (different history).
-        let cp_b = generate_checkpoint_at(&log_b, &did, 2, 1_000_020, &signer)
-            .await
-            .unwrap();
-
-        // log_b leaves won't match log_a's checkpoint root.
-        let b_leaves: Vec<[u8; 32]> = log_b.leaves().to_vec();
-        let result = verify_cross_checkpoint_with_leaves(&cp_a, &cp_b, &b_leaves);
-        assert_eq!(result, CrossCheckpointResult::Divergent);
-    }
-
-    // -------------------------------------------------------------------
-    // 25. Cross-checkpoint same checkpoint is consistent
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn cross_checkpoint_same_is_consistent() {
-        let (log, _, did) = build_log(10);
-        let signer = TestSigner::new();
-
-        let cp = generate_checkpoint_at(&log, &did, 1, 1_000_010, &signer)
-            .await
-            .unwrap();
-
-        let result = cross_checkpoint_verify(&cp, &cp.clone());
-        assert_eq!(result, CrossCheckpointResult::Consistent);
-    }
+    // NOTE: Tests "20-25. Cross-checkpoint verification" have been removed
+    // along with `cross_checkpoint_verify` / `verify_cross_checkpoint_with_leaves`
+    // / `CrossCheckpointResult` — see the removal note above the "Public
+    // operations" section. The sound prefix-verification mechanism they
+    // approximated is the RFC 6962 consistency proof
+    // (`proof::prove_consistency` / `proof::verify_consistency`), which has its
+    // own tests in `proof.rs`.
 
     // NOTE: Test "26. Participation validation works with checkpointed logs (SCP-125 AC6)"
     // has been moved to scp-core integration tests because it depends on
@@ -2610,38 +2047,26 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 31. compute_root_from_leaves matches tree::root
+    // 31. recompute_tree_from_leaves agrees with the canonical tree::root
     // -------------------------------------------------------------------
+    //
+    // `recompute_tree_from_leaves` is the tree math `TruncatedEventLog` uses to
+    // rebuild pruned proof paths, so its top layer MUST be the same root the
+    // canonical incremental tree maintains. (This assertion previously ran
+    // through the private `compute_root_from_leaves` wrapper, which was deleted
+    // with `verify_cross_checkpoint_with_leaves`, its only caller; the wrapper's
+    // empty-set and single-leaf guards are properties of `tree::root` itself and
+    // are asserted in `tree.rs` — `root_consistent_after_multiple_appends`,
+    // `empty_tree_root_is_sha256_of_empty_string`, and
+    // `append_updates_tree_and_root_correctly`.)
 
     #[test]
-    fn compute_root_from_leaves_matches_tree_root() {
+    fn recompute_tree_from_leaves_matches_tree_root() {
         let (log, leaf_hashes, _) = build_log(10);
-        let root = compute_root_from_leaves(&leaf_hashes);
-        assert_eq!(root, tree::root(&log));
-    }
-
-    // -------------------------------------------------------------------
-    // 32. compute_root_from_leaves empty returns SHA-256("") per spec §25.8
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn compute_root_from_leaves_empty_returns_sha256_empty() {
-        let root = compute_root_from_leaves(&[]);
-        let expected: [u8; 32] = Sha256::digest(b"").into();
-        assert_eq!(root, expected);
-        // Must NOT be [0u8; 32].
-        assert_ne!(root, [0u8; 32]);
-    }
-
-    // -------------------------------------------------------------------
-    // 33. compute_root_from_leaves single leaf returns leaf
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn compute_root_from_leaves_single_returns_leaf() {
-        let leaf = [0xAB; 32];
-        let root = compute_root_from_leaves(&[leaf]);
-        assert_eq!(root, leaf);
+        let layers = recompute_tree_from_leaves(&leaf_hashes);
+        let top = layers.last().expect("non-empty leaf set produces layers");
+        assert_eq!(top.len(), 1, "the top layer must be a single root");
+        assert_eq!(top[0], tree::root(&log));
     }
 
     // -------------------------------------------------------------------
