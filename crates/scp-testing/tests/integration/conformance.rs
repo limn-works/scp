@@ -961,7 +961,8 @@ fn conf_022_equivocation_detection() {
     /// was removed from scp-event-log — a RECEIVED checkpoint's verdict also
     /// requires the sender's signature, the sender's membership, and
     /// `context_id` equality, and those gates live in the runtime judge
-    /// (`queries_helpers::compare_remote_checkpoint`). This test pins the
+    /// (`queries_helpers::compare_remote_checkpoint`) — §23.12 item 1 makes
+    /// signature verification before comparison a MUST. This test pins the
     /// arithmetic half only; its checkpoints are locally constructed and
     /// deliberately carry a placeholder signature, so they could never clear
     /// the gated path.
@@ -976,7 +977,9 @@ fn conf_022_equivocation_detection() {
         1,
         "Create local event log and a remote checkpoint with same event count but different root",
     );
-    // Empty local log has event_count=0 and merkle_root=[0;32].
+    // Empty local log: event_count = 0, and its Merkle root is the empty-tree
+    // root SHA-256("") (§25.8 Vector 15) — NOT [0u8; 32], which is
+    // GENESIS_PREV_HASH. Step 3 below pins that value explicitly.
     let local_log = EventLog::new("ctx-equivocation-test".to_owned());
 
     // Remote checkpoint claims 0 events but a non-zero root — equivocation.
@@ -1009,14 +1012,25 @@ fn conf_022_equivocation_detection() {
         timestamp: 1_000_000,
         signature: vec![0u8; 64],
     };
-    assert!(
-        !diverges_from(&local_log, &consistent_checkpoint),
-        "same event count + same root must NOT be flagged as divergent"
+    // `Consistent` is a CONJUNCTION — equal count AND equal root — so both
+    // halves are pinned explicitly. `!diverges_from(..)` alone would NOT pin
+    // count-equality: the predicate is also false whenever the counts differ,
+    // which is `Behind`/`Ahead`, not `Consistent`.
+    assert_eq!(
+        tree::event_count(&local_log),
+        consistent_checkpoint.event_count,
+        "consistency requires EQUAL event counts — a count mismatch is \
+         Behind/Ahead, not Consistent"
     );
     assert_eq!(
         tree::root(&local_log),
         consistent_checkpoint.merkle_root,
-        "the empty-log root must equal the checkpoint's reported root"
+        "consistency requires EQUAL Merkle roots — the empty-log root is \
+         SHA-256(\"\") (§25.8 Vector 15)"
+    );
+    assert!(
+        !diverges_from(&local_log, &consistent_checkpoint),
+        "same event count + same root must NOT be flagged as divergent"
     );
 
     println!("  PASS: Equivocation detection verified (§9.9.3 divergence predicate)");

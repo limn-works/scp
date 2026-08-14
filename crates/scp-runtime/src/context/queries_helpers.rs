@@ -1999,8 +1999,14 @@ mod remote_checkpoint_classification_tests {
         }
     }
 
-    /// Seeds a readable provider with `n` chained lifecycle events.
-    async fn readable_provider(n: u64) -> MerkleEventLogProvider {
+    /// Seeds a readable provider with `n` chained lifecycle events, stamping
+    /// leaf timestamps from `timestamp_base`.
+    ///
+    /// The base is a parameter so a test can build a SECOND, genuinely
+    /// different log at the SAME event count: differing leaf timestamps change
+    /// the leaf preimages and therefore the Merkle root, which is the shape of
+    /// two members served divergent histories (§9.9.3).
+    async fn readable_provider_from(n: u64, timestamp_base: u64) -> MerkleEventLogProvider {
         let provider = MerkleEventLogProvider::new();
         let id = ctx_bytes();
         provider.init_event_log(&id).await.unwrap();
@@ -2016,12 +2022,27 @@ mod remote_checkpoint_classification_tests {
                     event_type,
                     "did:example:actor",
                     scp_event_log::EventPayload::default(),
-                    1_700_000_000 + i,
+                    timestamp_base + i,
                 )
                 .await
                 .unwrap();
         }
         provider
+    }
+
+    /// Seeds a readable provider with `n` chained lifecycle events.
+    async fn readable_provider(n: u64) -> MerkleEventLogProvider {
+        readable_provider_from(n, 1_700_000_000).await
+    }
+
+    /// The Merkle root a log of `n` events under [`CTX_HEX`] settles on — used
+    /// to give a remote checkpoint a REAL root from a REAL log of that size,
+    /// rather than an invented byte pattern.
+    async fn root_of_log_with(n: u64) -> [u8; 32] {
+        readable_provider(n)
+            .await
+            .event_log_merkle_root(&ctx_bytes())
+            .unwrap()
     }
 
     /// Builds `ActorDeps` over `event_log`, with a key resolver that resolves
@@ -2098,12 +2119,16 @@ mod remote_checkpoint_classification_tests {
         signed_remote_for(signing_key, CTX_HEX, event_count, merkle_root)
     }
 
-    fn state_with_sender_as_member() -> PerContextState {
-        let mut state = PerContextState::new_for_test_encrypted(
+    fn state_without_sender_as_member() -> PerContextState {
+        PerContextState::new_for_test_encrypted(
             ctx_bytes(),
             1_700_000_000,
             DID("did:example:local".to_owned()),
-        );
+        )
+    }
+
+    fn state_with_sender_as_member() -> PerContextState {
+        let mut state = state_without_sender_as_member();
         state
             .membership
             .add_member(DID(SENDER.to_owned()), "member".to_owned(), Vec::new());
@@ -2309,5 +2334,278 @@ mod remote_checkpoint_classification_tests {
             ),
             "the binding gate must not reject checkpoints bound to this context"
         );
+    }
+
+    // =====================================================================
+    // The four §9.9.3 `CheckpointComparison` verdicts, over the production
+    // judge.
+    //
+    // These four assertions are SCP-032's count/root unit-test criteria. They
+    // previously ran against `classify_against_local`, a `#[cfg(test)]`
+    // reimplementation of the arithmetic in `scp-event-log/src/checkpoint.rs`
+    // that was on no production path and did not even mirror production (it
+    // compared roots with `==` where the judge uses `ct_eq`). A fixture
+    // satisfying a production acceptance criterion hid a real gap: `Ahead` had
+    // NO assertion anywhere in production test coverage.
+    // =====================================================================
+
+    /// Equal count + equal root ⇒ `Consistent`, at an empty, an odd, and an
+    /// even log size. No divergence root, so no equivocation alert.
+    #[tokio::test]
+    async fn equal_count_and_equal_root_is_consistent() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+
+        for n in [0u64, 5, 10] {
+            let provider = readable_provider(n).await;
+            let local_root = provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+            let deps = deps_over(Box::new(provider), signing_key.verifying_key()).await;
+
+            let agreeing = signed_remote(&signing_key, n, local_root);
+            let (comparison, divergence_root) =
+                classify_remote_checkpoint(true, &deps, CTX_HEX, &agreeing)
+                    .expect("a readable local log yields a verdict");
+            assert_eq!(
+                comparison,
+                scp_event_log::checkpoint::CheckpointComparison::Consistent,
+                "n = {n}: equal count + equal root is Consistent (§9.9.3)"
+            );
+            assert!(
+                divergence_root.is_none(),
+                "n = {n}: Consistent must carry no divergence root"
+            );
+        }
+    }
+
+    /// Two members whose logs genuinely diverge at the SAME event count ⇒
+    /// `Divergent`, and the `EquivocationDetected` alert the verdict exists to
+    /// raise is emitted.
+    ///
+    /// The remote root here is the REAL root of a REAL second log of the same
+    /// size (built with a different leaf-timestamp base), not an invented byte
+    /// pattern — the two-honest-members shape §9.9.3 describes.
+    #[tokio::test]
+    async fn two_members_with_divergent_logs_at_equal_count_is_equivocation() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+
+        let local_provider = readable_provider(5).await;
+        let local_root = local_provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+
+        // A second member's log: same context, same event count, different
+        // history.
+        let other_root = readable_provider_from(5, 1_800_000_000)
+            .await
+            .event_log_merkle_root(&ctx_bytes())
+            .unwrap();
+        assert_ne!(
+            local_root, other_root,
+            "the two logs must genuinely diverge for this to be the §9.9.3 test"
+        );
+
+        let deps = deps_over(Box::new(local_provider), signing_key.verifying_key()).await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        let remote = signed_remote(&signing_key, 5, other_root);
+        let comparison =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote)
+                .expect("a readable local log yields a verdict");
+        assert_eq!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Divergent {
+                first_divergent_event: None
+            },
+            "equal count + different root is Divergent (§9.9.3)"
+        );
+        assert_eq!(
+            cell.class_c_view()
+                .receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .len(),
+            1,
+            "a divergent verdict must raise EquivocationDetected"
+        );
+    }
+
+    /// Local has FEWER events than the remote ⇒ `Behind { missing_events }`.
+    /// Benign catch-up lag, so no alert and no divergence root.
+    #[tokio::test]
+    async fn local_behind_the_remote_is_behind_not_equivocation() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+
+        // Local: 7 events. Remote: a real 10-event log's count and root.
+        let remote_root = root_of_log_with(10).await;
+        let deps = deps_over(
+            Box::new(readable_provider(7).await),
+            signing_key.verifying_key(),
+        )
+        .await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        let remote = signed_remote(&signing_key, 10, remote_root);
+        let comparison =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote)
+                .expect("a readable local log yields a verdict");
+        assert_eq!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Behind { missing_events: 3 }
+        );
+        assert!(
+            cell.class_c_view()
+                .receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .is_empty(),
+            "catch-up lag is not equivocation — no alert may be raised"
+        );
+    }
+
+    /// Local has MORE events than the remote ⇒ `Ahead { extra_events }`.
+    ///
+    /// This is the variant that had NO production assertion at all: the
+    /// `Greater` arm of the judge was reachable only through a test-only
+    /// reimplementation in another crate.
+    #[tokio::test]
+    async fn local_ahead_of_the_remote_is_ahead_not_equivocation() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+
+        // Local: 10 events. Remote: a real 4-event log's count and root.
+        let remote_root = root_of_log_with(4).await;
+        let deps = deps_over(
+            Box::new(readable_provider(10).await),
+            signing_key.verifying_key(),
+        )
+        .await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        let remote = signed_remote(&signing_key, 4, remote_root);
+        let comparison =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote)
+                .expect("a readable local log yields a verdict");
+        assert_eq!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Ahead { extra_events: 6 }
+        );
+        assert!(
+            cell.class_c_view()
+                .receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .is_empty(),
+            "being ahead of a peer is not equivocation — no alert may be raised"
+        );
+    }
+
+    // =====================================================================
+    // The gates. A verdict about a received checkpoint is only as sound as
+    // the three things established before the arithmetic runs: the sender is
+    // a member, the signature verifies, and the checkpoint is bound to THIS
+    // context (the third is asserted by
+    // `a_foreign_context_checkpoint_is_refused_not_judged` above).
+    // =====================================================================
+
+    /// A checkpoint from a NON-MEMBER is refused, not judged — over a readable
+    /// log whose root genuinely disagrees, so without the gate the arithmetic
+    /// would have answered `Divergent` and accused a stranger.
+    #[tokio::test]
+    async fn a_non_member_checkpoint_is_refused_not_judged() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[14u8; 32]);
+        let provider = readable_provider(3).await;
+        let local_root = provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+        let deps = deps_over(Box::new(provider), signing_key.verifying_key()).await;
+
+        let disagreeing = signed_remote(&signing_key, 3, [0xAB; 32]);
+        assert_ne!(local_root, [0xAB; 32]);
+
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_without_sender_as_member());
+        let err = compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &disagreeing)
+            .expect_err("a non-member's checkpoint must be refused");
+        assert!(
+            matches!(err, ContextError::MemberNotFound(_)),
+            "expected MemberNotFound, got: {err}"
+        );
+
+        let mut view = cell.class_c_view();
+        assert!(
+            view.receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .is_empty(),
+            "a refused checkpoint must raise no EquivocationDetected"
+        );
+        assert!(
+            view.last_seen_remote_checkpoint_mut().is_empty(),
+            "a refused checkpoint must record no divergence"
+        );
+
+        // Control: the SAME checkpoint from a MEMBER is judged (and diverges),
+        // so the refusal above is the membership gate and not some other stop.
+        let mut member_cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+        let comparison = compare_remote_checkpoint(
+            &mut member_cell.class_c_view(),
+            &deps,
+            CTX_HEX,
+            &disagreeing,
+        )
+        .expect("a member's checkpoint is judged");
+        assert!(matches!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+        ));
+    }
+
+    /// A checkpoint whose signature does NOT verify against the sender's
+    /// resolved key is refused, not judged.
+    ///
+    /// This is the ADR-011 finding recorded at
+    /// `.docs/audits/adr-audit-phase-1-3.md` ("Consistency Checkpoint Does Not
+    /// Verify Remote Signature", HIGH) as a regression test: without the gate,
+    /// a relay or any unauthenticated sender could forge a divergent
+    /// checkpoint and make honest members accuse each other.
+    #[tokio::test]
+    async fn a_forged_checkpoint_signature_is_refused_not_judged() {
+        let honest_key = ed25519_dalek::SigningKey::from_bytes(&[15u8; 32]);
+        let forger_key = ed25519_dalek::SigningKey::from_bytes(&[16u8; 32]);
+        assert_ne!(honest_key.verifying_key(), forger_key.verifying_key());
+
+        let provider = readable_provider(3).await;
+        let local_root = provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+        // The resolver answers with the HONEST key for SENDER.
+        let deps = deps_over(Box::new(provider), honest_key.verifying_key()).await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        // Signed by the forger, but claiming to be from SENDER.
+        let forged = signed_remote(&forger_key, 3, [0xAB; 32]);
+        assert_ne!(local_root, [0xAB; 32]);
+        let err = compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &forged)
+            .expect_err("a checkpoint with an unverifiable signature must be refused");
+        assert!(
+            matches!(err, ContextError::CryptoFailed(_)),
+            "expected CryptoFailed, got: {err}"
+        );
+
+        let mut view = cell.class_c_view();
+        assert!(
+            view.receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .is_empty(),
+            "a forged checkpoint must not be able to raise EquivocationDetected"
+        );
+        assert!(
+            view.last_seen_remote_checkpoint_mut().is_empty(),
+            "a forged checkpoint must record no divergence"
+        );
+
+        // Control: the SAME divergent claim, genuinely signed by SENDER's key,
+        // IS judged — so the refusal above is the signature gate.
+        let genuine = signed_remote(&honest_key, 3, [0xAB; 32]);
+        let comparison =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &genuine)
+                .expect("a genuinely signed checkpoint is judged");
+        assert!(matches!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+        ));
     }
 }
