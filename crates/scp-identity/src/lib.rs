@@ -526,6 +526,31 @@ pub trait DidMethod: Send + Sync {
         document: &DidDocument,
     ) -> impl Future<Output = Result<republish::RepublishEntry, IdentityError>> + Send;
 
+    /// Bootstraps this method's monotonic publish sequence counter to the
+    /// highest value known across its persistent store and the live network
+    /// record, so the NEXT [`publish`](Self::publish) supersedes rather than
+    /// collides with an existing record.
+    ///
+    /// Must be called BEFORE the first publish of a process's lifetime (e.g. a
+    /// node's startup publish): a fresh counter starts at 0 and would otherwise
+    /// publish at `seq = 1`, which on a restart-within-TTL lands *beneath* a
+    /// live `seq = N` record — the real DHT rejects the lower-seq write while the
+    /// old (possibly superseded) document stays authoritative. See
+    /// `build_domain_inner` / `build_no_domain_inner` in `scp-node`, which call
+    /// this inside the builder ahead of the startup publish.
+    ///
+    /// The default is a no-op success: a DID method with no monotonic-sequence
+    /// semantics (nothing to bootstrap) legitimately has nothing to initialize.
+    /// `did:dht` overrides it to recover its BEP44 sequence from the store and/or
+    /// a DHT resolve. A resolve failure there is fail-closed (propagated): the
+    /// caller must not publish at an unknown sequence.
+    fn initialize_sequence(
+        &self,
+        _did: &str,
+    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        async { Ok(()) }
+    }
+
     /// Resolves a DID string to its DID document via the underlying infrastructure.
     ///
     /// For `did:dht`, this performs a Mainline DHT lookup. See ADR-003

@@ -868,7 +868,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // Extract the public key from the DID.
         let public_key = extract_public_key(&identity.did)?;
 
-        // Persist the sequence BEFORE the network write (issue #327), not after.
+        // Persist the sequence BEFORE the network write, not after.
         // Write-ahead is the only ordering that keeps the caller's view and the
         // network's from diverging in the direction that matters:
         //
@@ -2159,6 +2159,17 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
     ) -> impl Future<Output = Result<crate::republish::RepublishEntry, IdentityError>> + Send {
         // Delegate to the internal method that uses the stored signing function.
         self.publish_document(identity, document)
+    }
+
+    fn initialize_sequence(
+        &self,
+        did: &str,
+    ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        // Delegate to the inherent method of the SAME name. The explicit
+        // associated-function path selects the inherent `Self::initialize_sequence`
+        // (inherent items take priority over trait items in path resolution), so
+        // this is a delegation, not a self-recursive call into this trait method.
+        Self::initialize_sequence(self, did)
     }
 
     fn resolve(

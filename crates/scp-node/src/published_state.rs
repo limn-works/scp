@@ -221,7 +221,7 @@ struct NodeDidPublisher<D: DidMethod> {
 impl<D: DidMethod + 'static> DidPublisher for NodeDidPublisher<D> {
     fn publish<'a>(
         &'a self,
-        _auth: PublishAuthorization,
+        auth: PublishAuthorization,
         identity: &'a ScpIdentity,
         document: &'a DidDocument,
     ) -> std::pin::Pin<
@@ -229,7 +229,11 @@ impl<D: DidMethod + 'static> DidPublisher for NodeDidPublisher<D> {
             dyn std::future::Future<Output = Result<Option<RepublishEntry>, NodeError>> + Send + 'a,
         >,
     > {
+        // Forward the authorization: `publish_did_document_for_mode` (the real
+        // DHT/relay publish) also takes a `PublishAuthorization`, so it too is
+        // uncallable outside this seam module (AC-6).
         Box::pin(crate::publish_did_document_for_mode(
+            auth,
             self.dht_mode,
             self.inner.as_ref(),
             identity,

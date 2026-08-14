@@ -309,6 +309,20 @@ pub struct ApplicationNode<S: Storage> {
     /// `None` in domain mode with successful TLS (Tier 4 doesn't need NAT re-eval).
     tier_reeval: Option<TierReEvalHandle>,
     /// Channel for tier change events (§10.12.1, SCP-243).
+    ///
+    /// A bounded `mpsc` whose sender uses `try_send` (see `apply_tier_change`),
+    /// so it drops the NEWEST event on a full queue rather than the oldest —
+    /// technically the wrong end for a latest-value "where am I now" stream, for
+    /// which `tokio::sync::watch` would be the semantically-correct primitive.
+    /// It is kept as `mpsc` deliberately: no production consumer drains this
+    /// stream (the authoritative surfaces — `.well-known/scp`, the DID document,
+    /// `relay_url()` — never depend on it), so the drop-newest gap is
+    /// inconsequential, and the `try_send` is what keeps the tier task from
+    /// wedging on a full queue in the first place (see `apply_tier_change`). A
+    /// `watch` swap would wrap the variant-only `NatTierChange` in `Option` for
+    /// an initial value and rewrite the send block plus every test, buying
+    /// nothing while no consumer exists. Revisit the primitive if a real
+    /// draining consumer is ever added.
     tier_change_rx: Option<tokio::sync::mpsc::Receiver<NatTierChange>>,
     /// HTTP/3 configuration for the QUIC-based HTTP/3 endpoint (spec §10.15.1).
     /// `None` if HTTP/3 is not configured. Only available with the `http3` feature.
@@ -3102,6 +3116,11 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     // writes the slot after construction — it is still a `LiveSlot` so both modes
     // read the same live type and a future update site cannot leave a reader
     // behind. See `LiveSlot`.
+    //
+    // FIRST bootstrap the publish-sequence counter (Production / Memory) so a
+    // restart's startup publish supersedes the live record instead of colliding
+    // at `seq = 1` (SCP-RELAYRES-004). This MUST precede `seed_from_startup_publish`.
+    initialize_sequence_for_mode(dht_mode, did_method.as_ref(), &identity).await?;
     let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode);
     let live_state = seed_from_startup_publish(&publisher, &identity, document, &relay_url).await?;
 
@@ -3272,11 +3291,17 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
 ///
 /// The `DhtMode` gate itself. Its ONLY caller is the node's publish seam
 /// (`NodeDidPublisher::publish`, in `published_state`), so every publish this
-/// node performs — startup and NAT tier change alike — honors the mode. It is
-/// `pub(crate)` solely so that seam can reach it from its own module; it is
-/// deliberately not called directly anywhere else: a call site that
-/// reached the [`DidMethod`] around this gate would publish a
-/// `DhtMode::Disabled` node's address.
+/// node performs — startup and NAT tier change alike — honors the mode.
+///
+/// It takes a [`PublishAuthorization`] by value, whose sole constructor is
+/// private to `published_state`. So even though it is `pub(crate)`, it is
+/// **uncallable outside the publish seam by construction, not by convention**:
+/// a would-be in-crate caller that reached the [`DidMethod`] around this gate —
+/// publishing a `DhtMode::Disabled` node's address, or publishing WITHOUT
+/// seeding the live slot (the served≠published divergence AC-6 forbids) — cannot
+/// mint the token, so it does not compile. This completes AC-6's structural
+/// guarantee for the real DHT/relay publish itself, matching the guard on
+/// [`DidPublisher::publish`].
 ///
 /// The asymmetry is deliberate and honest:
 ///
@@ -3313,6 +3338,7 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
 /// self-host republish cycle reads it directly, so the triple is never
 /// reconstructed by resolving the node's own record back off the network.
 pub(crate) async fn publish_did_document_for_mode<D: DidMethod + 'static>(
+    _auth: published_state::PublishAuthorization,
     dht_mode: DhtMode,
     did_method: &D,
     identity: &ScpIdentity,
@@ -3342,6 +3368,49 @@ pub(crate) async fn publish_did_document_for_mode<D: DidMethod + 'static>(
             .publish(identity, document)
             .await
             .map(Some)
+            .map_err(NodeError::from),
+    }
+}
+
+/// Bootstraps the DID method's monotonic publish-sequence counter ahead of the
+/// node's STARTUP publish — for the modes that actually publish.
+///
+/// Mirrors [`publish_did_document_for_mode`]'s gate exactly, and must run BEFORE
+/// [`seed_from_startup_publish`] in the builders:
+///
+/// - [`DhtMode::Disabled`] publishes nothing, so there is no sequence to
+///   bootstrap — a no-op success (and it never touches the disabled DHT arm).
+/// - [`DhtMode::Production`] (and the test-only [`DhtMode::Memory`]) publish, so
+///   the counter MUST be raised to `max(persisted store, live DHT seq)` here.
+///   A fresh [`DidDht`](scp_identity::dht::DidDht) counter starts at
+///   `AtomicU64::new(0)`, so the first publish does `fetch_add(1)` → `seq = 1`.
+///   On a **restart within the record TTL** that `seq = 1` lands *beneath* the
+///   live `seq = N` record the previous run published: the real DHT rejects the
+///   lower-seq write (a fatal startup-publish failure) or, worse, the node pins
+///   itself at `seq = 1` and its DID document dies at the live record's TTL.
+///   Bootstrapping the counter here makes the startup publish emit `seq = N + 1`,
+///   correctly superseding the prior record (SCP-RELAYRES-004).
+///
+/// A failure is **FATAL**, exactly as a startup publish failure is:
+/// [`DidMethod::initialize_sequence`] is fail-closed on a DHT resolve error
+/// (proceeding at an unknown sequence would republish beneath the live record
+/// while the OLD — possibly superseded — document stays authoritative), so the
+/// node must not go on to publish.
+async fn initialize_sequence_for_mode<D: DidMethod + 'static>(
+    dht_mode: DhtMode,
+    did_method: &D,
+    identity: &ScpIdentity,
+) -> Result<(), NodeError> {
+    match dht_mode {
+        DhtMode::Disabled => Ok(()),
+        #[cfg(feature = "testing")]
+        DhtMode::Memory => did_method
+            .initialize_sequence(&identity.did)
+            .await
+            .map_err(NodeError::from),
+        DhtMode::Production => did_method
+            .initialize_sequence(&identity.did)
+            .await
             .map_err(NodeError::from),
     }
 }
@@ -3409,6 +3478,12 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     //    is no copy of it left in scope to hand out, so the tier task, `NodeState`
     //    and the `IdentityHandle` can only receive clones of the slot. See
     //    `LiveSlot`.
+    //
+    //    FIRST bootstrap the publish-sequence counter (Production / Memory) so the
+    //    startup publish supersedes any live record a prior run left within its
+    //    TTL, instead of colliding at `seq = 1` (SCP-RELAYRES-004). This MUST
+    //    precede `seed_from_startup_publish` — the publish is inside it.
+    initialize_sequence_for_mode(dht_mode, did_method.as_ref(), &identity).await?;
     let publisher = NodePublisher::new(Arc::clone(&did_method), dht_mode);
     let live_state = seed_from_startup_publish(&publisher, &identity, document, &relay_url).await?;
 
@@ -4580,6 +4655,112 @@ mod tests {
             record.sequence >= 1,
             "a published record carries the sequence its publish assigned"
         );
+    }
+
+    /// SCP-RELAYRES-004: a node RESTART within the record TTL must SUPERSEDE the
+    /// live `seq = N` record its prior run published, not collide beneath it at
+    /// `seq = 1`.
+    ///
+    /// The builder now bootstraps the publish-sequence counter
+    /// (`initialize_sequence_for_mode`) BEFORE the startup publish, so the
+    /// restart's `seed_from_startup_publish` emits `seq = N + 1`. Against the
+    /// pre-fix code — which bootstrapped the counter only AFTER `Node::start`
+    /// (or self-host build) had already published — this fails: a fresh
+    /// `AtomicU64::new(0)` published `seq = 1` beneath the live `seq = N`.
+    #[tokio::test]
+    async fn restart_startup_publish_supersedes_live_record_not_seq_1() {
+        use scp_platform::testing::InMemoryPreRotationCustody;
+
+        // The live record the prior run leaves behind sits at seq = N.
+        const N: u64 = 5;
+
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let cache = Arc::new(DidCache::new());
+        // ONE shared in-memory DHT client stands in for the live Mainline record
+        // that survives a restart within TTL: both the "prior run" and the
+        // "restart" DID methods publish into / resolve from it.
+        let shared_dht = Arc::new(InMemoryDhtClient::new());
+
+        // Create the node's identity ONCE; the restart reuses it verbatim via
+        // `IdentitySource::Explicit` (a restart keeps the same DID).
+        let prior_method = Arc::new(DidDht::with_client_and_signer(
+            Arc::clone(&shared_dht),
+            Arc::clone(&cache),
+            TestDidDht::make_sign_fn(Arc::clone(&custody)),
+        ));
+        let pre_rotation = InMemoryPreRotationCustody::new();
+        let (identity, document, _handle) = prior_method
+            .create(&*custody, &pre_rotation)
+            .await
+            .expect("identity creation succeeds");
+
+        // Simulate the prior run: drive the shared live record up to seq = N.
+        let mut last_seq = 0;
+        for _ in 0..N {
+            last_seq = prior_method
+                .publish(&identity, &document)
+                .await
+                .expect("prior-run publish succeeds")
+                .sequence;
+        }
+        assert_eq!(last_seq, N, "prior run left the live record at seq = N");
+
+        // RESTART: a FRESH DID method over the SAME shared DHT client — its
+        // sequence counter starts at `AtomicU64::new(0)`, exactly as a restarted
+        // process's would.
+        let restart_method = Arc::new(DidDht::with_client_and_signer(
+            Arc::clone(&shared_dht),
+            Arc::clone(&cache),
+            TestDidDht::make_sign_fn(Arc::clone(&custody)),
+        ));
+
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 9], 32893)),
+        };
+        let config: NodeConfig<InMemoryKeyCustody, TestDidDht, InMemoryStorage> = NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht: DhtMode::Memory,
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Explicit(Box::new(ExplicitIdentity {
+                    identity: identity.clone(),
+                    document: document.clone(),
+                    did_method: restart_method,
+                })),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        };
+
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("the restarted node starts");
+
+        let record = node
+            .published_did_record()
+            .expect("the restarted node carries the record it signed");
+
+        // The fix: the startup publish superseded the live record at seq = N + 1.
+        // Without `initialize_sequence` in the builder the fresh counter would
+        // have published seq = 1, colliding beneath the live seq = N record.
+        assert_eq!(
+            record.sequence,
+            N + 1,
+            "restart must supersede the live record at seq = N+1, not collide at seq = 1"
+        );
+        assert_eq!(
+            record.did(),
+            node.identity().did(),
+            "the record's key derives THIS (restarted) node's DID"
+        );
+        scp_dht::verify_bep44_signature(
+            &record.public_key,
+            &record.signature,
+            &record.document_bytes,
+            record.sequence,
+        )
+        .expect("the superseding record BEP44-verifies against the node's own key");
     }
 
     // -----------------------------------------------------------------------
