@@ -769,7 +769,7 @@ pub fn create_checkpoint_if_due_view(
 ///   The previous `unwrap_or([0u8; 32])` / `map_or(0, …)` defaults signed a
 ///   FABRICATED commitment: `[0u8; 32]` is not the empty-tree root (§25.8
 ///   Vector 15 is `SHA-256("")`), and an erroring root paired with a readable
-///   count produced an all-zero root beside a real event count. Both are the
+///   count produced an all-zero root beside a real event count. Both are
 ///   the established "provider `None` means UNKNOWN, never empty" rule,
 ///   violated on the one path whose output carries a signature.
 ///

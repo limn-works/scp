@@ -1153,15 +1153,15 @@ OP_EVENT_LOG_VERIFY_INCLUSION = OpSpec(
 # ---------------------------------------------------------------------------
 # op 13: event_log_absence_of_lifecycle_event_rejected
 #
-# The literal cross-bridge assertion of ADR-011 acceptance criterion 4: an
-# absence proof for a REAL lifecycle event must FAIL identically on every
+# An absence proof for a REAL lifecycle event must FAIL identically on every
 # bridge. Each bridge creates a context, extracts the `ContextCreated` leaf
 # hash from its own inclusion proof (so the absence claim provably names an
 # event that IS in the authoritative log), then claims that event is absent.
 # Every bridge must reject the claim with SCP-CTX-2139 — the committed
 # "claim is false over a readable log" code — never mint a verifying absence
-# proof (the repudiation primitive the issue closed) and never confuse the
-# honest negative with SCP-CTX-2138 ("cannot reach the log", fail-closed).
+# proof for an event that IS present (which would be a repudiation
+# primitive), and never confuse the honest negative with SCP-CTX-2138
+# ("cannot reach the log", fail-closed).
 # ---------------------------------------------------------------------------
 
 
