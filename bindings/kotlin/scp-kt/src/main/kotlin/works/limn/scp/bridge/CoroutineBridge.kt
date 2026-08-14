@@ -1130,43 +1130,26 @@ interface InfraBindings {
     /**
      * Queries the context event log with optional filters.
      *
-     * Returns events from the Merkle-backed event log, filtered by
-     * event type, actor DID, sequence range, and/or result limit. If no
-     * stored events match, returns a `LogSummary` event with the current
-     * Merkle root and event count.
+     * Returns events from the AUTHORITATIVE Merkle-backed event log —
+     * the same log verify proves against and checkpoint commits to —
+     * filtered by event type, actor DID, sequence range, and/or result
+     * limit. An empty-but-live log returns an empty list `[]`; there is
+     * no fallback tree and no synthesized summary event.
      *
      * @param contextHandle Opaque handle from context create or join.
      * @param filterJson JSON-encoded query filter with optional fields:
      *   `event_type` (string), `actor_did` (string), `after_sequence`
      *   (number), `before_sequence` (number), `limit` (number).
      * @return JSON-encoded list of event log entries.
-     * @throws BridgeException with `SCP-CTX-2023` if the context is not
-     *   found or the filter JSON is invalid.
+     * @throws BridgeException with `SCP-CTX-2138` if the authoritative
+     *   log is unreachable or unknown (FAILS CLOSED — never falls back
+     *   to another tree), or with `SCP-CTX-2023` if the filter JSON is
+     *   invalid.
      */
     fun eventLogQuery(
         contextHandle: Long,
         filterJson: String,
     ): String
-
-    /**
-     * Verifies a claim against the context event log using a Merkle proof.
-     *
-     * Generates and verifies an inclusion or absence proof for the given
-     * claim against the event log's Merkle tree.
-     *
-     * @param contextHandle Opaque handle from context create or join.
-     * @param claimJson JSON-encoded claim with `type` (`"inclusion"` or
-     *   `"absence"`), `leaf_index` (for inclusion proofs), or
-     *   `event_hash` (hex-encoded, for absence proofs).
-     * @return `true` if the Merkle proof is valid.
-     * @throws BridgeException with `SCP-CTX-2025` if the claim JSON is
-     *   invalid, or with `SCP-CTX-2026` if verification fails (empty
-     *   log, invalid index, etc.).
-     */
-    fun eventLogVerify(
-        contextHandle: Long,
-        claimJson: String,
-    ): Boolean
 
     /**
      * Generates a signed consistency checkpoint for equivocation detection.
@@ -1183,10 +1166,14 @@ interface InfraBindings {
      * @param epoch The MLS epoch to checkpoint at.
      * @return JSON-encoded checkpoint containing `context_id`,
      *   `sender_did`, `event_count`, `merkle_root`, `epoch`,
-     *   `signature`, and `timestamp`.
-     * @throws BridgeException with `SCP-IDENT-1017` if the identity
-     *   retains no signing custody (externally loaded), or with
-     *   `SCP-CTX-2027` if checkpoint generation fails.
+     *   `signature`, and `timestamp`. The commitment is derived from ONE
+     *   snapshot of the AUTHORITATIVE event log — the same log query
+     *   reads and verify proves against.
+     * @throws BridgeException with `SCP-CTX-2138` if the authoritative
+     *   log is unreachable or unknown (FAILS CLOSED — never commits to
+     *   another tree), with `SCP-IDENT-1017` if the identity retains no
+     *   signing custody (externally loaded), or with `SCP-CTX-2027` if
+     *   signing the checkpoint fails.
      */
     fun eventLogCheckpoint(
         contextHandle: Long,
@@ -2711,18 +2698,6 @@ class InfraBridge internal constructor(
         contextHandle: Long,
         filterJson: String,
     ): String = bridge.ffiCall { bindings.eventLogQuery(contextHandle, filterJson) }
-
-    /**
-     * Verify a claim against the context event log (Merkle proof).
-     *
-     * @param contextHandle Handle from context create or join.
-     * @param claimJson JSON-encoded claim to verify.
-     * @return true if the proof is valid.
-     */
-    suspend fun eventLogVerify(
-        contextHandle: Long,
-        claimJson: String,
-    ): Boolean = bridge.ffiCall { bindings.eventLogVerify(contextHandle, claimJson) }
 
     /**
      * Generate a signed consistency checkpoint for equivocation detection.

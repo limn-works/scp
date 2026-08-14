@@ -77,8 +77,6 @@ class ConformanceStubBindings : NativeBindings {
 
     var eventLogQueryResult: String = """[{"event":"joined"}]"""
     var eventLogQueryError: BridgeException? = null
-    var eventLogVerifyResult: Boolean = true
-    var eventLogVerifyError: BridgeException? = null
 
     var eventLogCheckpointResult: String =
         """{"context_id":"ctx-1","sender_did":"did:dht:stub",""" +
@@ -499,14 +497,6 @@ class ConformanceStubBindings : NativeBindings {
         return eventLogQueryResult
     }
 
-    override fun eventLogVerify(
-        contextHandle: Long,
-        claimJson: String,
-    ): Boolean {
-        eventLogVerifyError?.let { throw it }
-        return eventLogVerifyResult
-    }
-
     override fun eventLogCheckpoint(
         contextHandle: Long,
         identityHandle: Long,
@@ -579,8 +569,6 @@ class ConformanceStubBindings : NativeBindings {
         ucanDelegateError = null
         eventLogQueryResult = """[{"event":"joined"}]"""
         eventLogQueryError = null
-        eventLogVerifyResult = true
-        eventLogVerifyError = null
         eventLogCheckpointResult =
             """{"context_id":"ctx-1","sender_did":"did:dht:stub",""" +
             """"event_count":10,"merkle_root":"abcdef","epoch":5,""" +
