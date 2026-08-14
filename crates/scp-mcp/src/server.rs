@@ -375,8 +375,10 @@ impl std::fmt::Debug for ContextEventPump {
 /// that single construction site — not enforced by the type system — and
 /// cross-checked by a `debug_assert!` in [`Self::into_parts`]. The old transports
 /// re-checked this pairing at entry and failed closed on a mismatch; that runtime
-/// guard is gone because the bundle is only ever built at the one site that keeps
-/// field and variant in sync.
+/// guard is gone because, on production paths, the bundle is only ever built at
+/// the one site ([`McpServer::with_optional_event_source`]) that keeps field and
+/// variant in sync — the sole hand-constructions are `#[cfg(test)]`, which that
+/// `debug_assert!` covers.
 #[must_use = "hand this to a transport (run_stdio / run_sse) — dropping it leaves \
               a wired server's pump unspawned and resources.subscribe advertised \
               with nothing delivering notifications"]
