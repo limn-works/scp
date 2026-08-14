@@ -420,7 +420,12 @@ async fn sse_handler<P: ContextProvider + 'static>(
     //
     // Admission note: any process that can reach the bind address can claim
     // (or contend for) this single slot — with `SseConfig::auth_token` unset
-    // there is no authentication in front of it. Hardened deployments set
+    // there is no authentication in front of it. An unauthenticated local
+    // process can therefore deny the legitimate client outright by looping
+    // connect->disconnect to seize the slot on each release (or simply by
+    // holding it): a single-session availability denial. That is the accepted
+    // cost of the deliberate single-session design — the attacker gains denial,
+    // never another session's decrypted content. Hardened deployments set
     // `auth_token`, which the bearer middleware enforces before a request can
     // touch the slot.
     let Ok(permit) = Arc::clone(&state.session_slot).try_acquire_owned() else {
@@ -464,6 +469,15 @@ async fn sse_handler<P: ContextProvider + 'static>(
                 .data(data),
         )),
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+            // Deliberate tradeoff: a context co-member flooding events past
+            // `channel_capacity` can push this receiver into `Lagged`, forcing
+            // the victim's stream to terminate and reconnect-resync. That cost
+            // is bounded by the client's `retry_ms` reconnect interval,
+            // self-healing (the client re-reads current state on readmission),
+            // and non-escalating (no amplification, no accumulated state) — the
+            // correct "never fall silent" choice over the deleted silent-drop,
+            // which left the victim believing it was current while it had in
+            // fact missed events.
             tracing::warn!(
                 skipped,
                 "MCP SSE client lagged; terminating its stream to force a clean-session resync"
@@ -506,8 +520,18 @@ async fn sse_handler<P: ContextProvider + 'static>(
 ///
 /// Requires a live session (`GET /sse`): the response goes out on the SSE
 /// broadcast, so accepting a request with no session attached would drop the
-/// response unheard — and a response computed now could only ever be read by
-/// a *different*, later client.
+/// response unheard.
+///
+/// The response is computed *and* broadcast inside one `state.server` critical
+/// section. That lock is the one `sse_handler`'s `reset_session` and the next
+/// admission also take, so broadcasting under it orders the send strictly
+/// before any session reset or next-client subscribe — precisely to prevent
+/// cross-principal delivery. Were the broadcast performed after releasing the
+/// lock, an in-flight response computed for the current principal could be sent
+/// after the next client has been admitted and subscribed during a
+/// disconnect->reset->readmit window, delivering this principal's decrypted
+/// result (member lists, tool outputs, resource reads) to a *different*, later
+/// client.
 async fn message_handler<P: ContextProvider + 'static>(
     State(state): State<Arc<AppState<P>>>,
     body: String,
@@ -523,10 +547,24 @@ async fn message_handler<P: ContextProvider + 'static>(
         return StatusCode::BAD_REQUEST;
     }
 
-    let response = match parse_sse_incoming(trimmed) {
+    // Every response is computed AND broadcast inside a single `state.server`
+    // critical section. That lock is the one `sse_handler`'s `reset_session`
+    // and the next admission also take, so a send ordered under it lands before
+    // any reset/readmit — or not at all, dropped when no receiver exists yet.
+    // Broadcasting after releasing the lock, "for throughput", reopens the
+    // cross-principal window: an in-flight response computed for the current
+    // principal could otherwise be sent after the next client has been admitted
+    // and subscribed, delivering this principal's decrypted result to a
+    // different, later client. `broadcast` is synchronous, so holding the tokio
+    // mutex across it crosses no `.await`.
+    match parse_sse_incoming(trimmed) {
         Ok(SseIncoming::Request(req)) => {
             let mut server = state.server.lock().await;
-            server.handle_request(&req)
+            if let Some(resp) = server.handle_request(&req)
+                && let Ok(json) = serde_json::to_string(&resp)
+            {
+                state.notifier.broadcast(json);
+            }
         }
         Ok(SseIncoming::Notification(notif)) => {
             let synthetic_id = state.notifier.next_id();
@@ -536,17 +574,21 @@ async fn message_handler<P: ContextProvider + 'static>(
                 params: notif.params,
                 id: RequestId::Number(synthetic_id.cast_signed()),
             };
+            // Notifications produce no response; nothing to broadcast.
             let mut server = state.server.lock().await;
             server.handle_request(&synthetic);
-            None
         }
-        Err(err_response) => Some(*err_response),
-    };
-
-    if let Some(resp) = response
-        && let Ok(json) = serde_json::to_string(&resp)
-    {
-        state.notifier.broadcast(json);
+        Err(err_response) => {
+            // A parse error echoes only the caller's own malformed input, but
+            // it is still a server->client message on the shared broadcast.
+            // Order it under the server lock like every other response so the
+            // discipline is uniform: message_handler never broadcasts outside
+            // the lock that reset_session and the next admission serialize on.
+            let _server = state.server.lock().await;
+            if let Ok(json) = serde_json::to_string(&err_response) {
+                state.notifier.broadcast(json);
+            }
+        }
     }
 
     StatusCode::ACCEPTED
@@ -573,36 +615,42 @@ async fn pump_events<P: ContextProvider + 'static>(
                 // lagged client re-reads, exactly as the pump promises. Never
                 // fall silent.
                 tracing::warn!("MCP SSE event pump lagged, {skipped} events dropped");
-                let notifications = {
-                    let server = state.server.lock().await;
-                    server.lagged_resync_notifications()
-                };
-                for notification in &notifications {
+                // Compute AND broadcast the resync under the server lock, for
+                // the same cross-principal ordering reason as `message_handler`:
+                // a resync filtered to the current session's subscriptions must
+                // not be pushed to a later, different admission. The lock is the
+                // one reset_session and the next admission serialize on; `notify`
+                // is synchronous, so holding it across the broadcast crosses no
+                // `.await`.
+                let server = state.server.lock().await;
+                for notification in &server.lagged_resync_notifications() {
                     state.notifier.notify(notification);
                 }
+                // Release only after every resync notification is broadcast —
+                // the whole loop above runs under the lock, on purpose.
+                drop(server);
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => return,
         };
 
-        let notifications = {
-            // Contention trade-off, kept deliberately: computing notifications
-            // holds the session mutex across the provider re-authorization
-            // calls (`validate_resource_access`, `active_context_ids`), which
-            // on the UniFFI bridge are `block_in_place` actor round-trips — so
-            // a burst of events briefly serializes POST handlers behind the
-            // pump. Every restructure that releases the lock first must run
-            // authorization against a *snapshot* of the subscription registry,
-            // and a subscription retired concurrently (unsubscribe / session
-            // reset) could then still produce an emission after its
-            // retirement — the stale-delivery class this transport exists to
-            // kill. Correctness over throughput; the same reasoning covers
-            // the lagged-resync arm above.
-            let server = state.server.lock().await;
-            server.notifications_for_event(&context_id, &event)
-        };
-
-        for notification in &notifications {
+        // Contention trade-off, kept deliberately: the session mutex is held
+        // across BOTH the provider re-authorization calls
+        // (`validate_resource_access`, `active_context_ids`), which on the
+        // UniFFI bridge are `block_in_place` actor round-trips, AND the
+        // broadcast — so a burst of events briefly serializes POST handlers
+        // behind the pump. Holding the lock across the broadcast is required,
+        // not incidental: releasing it before emitting would (a) let
+        // authorization run against a *snapshot* of the subscription registry
+        // that a concurrent unsubscribe / session reset has already retired —
+        // the stale-delivery class this transport exists to kill — and (b)
+        // reopen the cross-principal window `message_handler` closes, where a
+        // notification filtered for the current session is delivered to a later
+        // admission. Correctness over throughput; the same reasoning covers the
+        // lagged-resync arm above. `notify` is synchronous, so no `.await` is
+        // crossed while the lock is held.
+        let server = state.server.lock().await;
+        for notification in &server.notifications_for_event(&context_id, &event) {
             state.notifier.notify(notification);
         }
     }
@@ -1705,6 +1753,71 @@ mod tests {
         assert!(
             !seen.contains("protocolVersion"),
             "client A's initialize response leaked to client B; stream was:\n{seen}"
+        );
+    }
+
+    // -- Response broadcast is ordered under the server lock ------------------
+
+    /// `message_handler` must broadcast its response *while holding the
+    /// `state.server` lock*, never after releasing it. That lock is the one
+    /// `sse_handler`'s `reset_session` and the next admission's re-subscribe
+    /// serialize on, so ordering the broadcast under it is what prevents a
+    /// response computed for the current principal from being delivered, during
+    /// a disconnect->reset->readmit window, to a later, different client (the
+    /// live-response cross-principal leak).
+    ///
+    /// The observable seam: hold the server lock (standing in for a reset /
+    /// concurrent admission that holds it), then drive a POST whose response is
+    /// produced by `message_handler` itself — a malformed body, the one message
+    /// that the pre-fix code broadcast *without ever taking the lock*. While the
+    /// lock is held, a correct handler cannot broadcast; a handler that
+    /// broadcasts lock-free (the bug) delivers immediately and this test fails.
+    ///
+    /// What it proves: no `message_handler` broadcast escapes the server-lock
+    /// critical section. What it does not attempt: a fully deterministic 3-way
+    /// reset race — the request-response arm shares the *same* single critical
+    /// section as this arm by construction (see `message_handler`), so the
+    /// ordering this locks down covers it too.
+    #[tokio::test]
+    async fn response_broadcast_is_serialized_under_the_server_lock() {
+        let state = test_state();
+        let mut rx = state.notifier.tx.subscribe();
+
+        // Stand in for the reset task / next admission holding the server lock.
+        let guard = state.server.lock().await;
+
+        // A POST arrives concurrently. Its response must be broadcast under the
+        // server lock; spawn the handler so it can park on the lock we hold.
+        let handler = tokio::spawn(message_handler(
+            State(Arc::clone(&state)),
+            "not valid json".to_owned(),
+        ));
+
+        // Give the handler time to run and block on the lock. A handler that
+        // broadcasts without the lock would already have delivered by now.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "message_handler broadcast a response while another party held the \
+             server lock — the cross-principal ordering that lock provides is \
+             defeated, so an in-flight response could reach a later client"
+        );
+
+        // Releasing the lock lets the handler acquire it and broadcast under it.
+        drop(guard);
+        let status = handler.await.unwrap().into_response().status();
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let (_id, payload) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the response must be delivered once the server lock is free")
+            .expect("broadcast channel must stay open");
+        assert!(
+            payload.contains("failed to parse"),
+            "expected the parse-error response once the lock freed; got:\n{payload}"
         );
     }
 
