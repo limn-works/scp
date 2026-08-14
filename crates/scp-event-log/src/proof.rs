@@ -138,6 +138,7 @@ pub struct LeafWithProof {
 /// log's own adjacency assertion plus checkable neighbour-inclusion. The real
 /// fix is a sorted/sparse Merkle tree whose root commits to sorted order; this
 /// log is append-order by construction and therefore cannot provide it.
+/// Changing that construction is tracked separately.
 ///
 /// **Privacy:** Reveals exactly two leaf hashes (the sorted neighbors).
 ///

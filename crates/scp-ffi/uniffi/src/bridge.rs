@@ -326,7 +326,7 @@ fn authoritative_log_unreachable(
     }
 }
 
-/// Fetches the context's AUTHORITATIVE event log for the MCP `events` summary
+/// Fetches the context's AUTHORITATIVE event log for the MCP `events` summary,
 /// mirroring the fail-closed gate `event_log_verify` uses.
 ///
 /// `check_ready` rejects suspended AND shut-down instances, then the supervisor
