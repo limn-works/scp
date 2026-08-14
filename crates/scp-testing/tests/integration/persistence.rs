@@ -92,9 +92,10 @@ fn make_store() -> ProtocolRepository<InMemoryStorage> {
 
 /// Generates the full persistence test suite for a given `Storage` implementation.
 ///
-/// Currently instantiated for `InMemoryStorage` only. When `SqliteStorage` and
-/// `FilesystemStorage` land, additional instantiations will be added here,
-/// producing identical test suites for each backend.
+/// Instantiated for `InMemoryStorage` unconditionally, and for `SqliteStorage`
+/// and `FilesystemStorage` under their respective `sqlite` / `filesystem`
+/// feature gates (see the instantiations below) — producing identical test
+/// suites for each backend.
 macro_rules! persistence_tests {
     ($mod_name:ident, $make_store:expr) => {
         mod $mod_name {
@@ -236,8 +237,9 @@ macro_rules! persistence_tests {
             // ---------------------------------------------------------------
 
             /// `delete_context` removes all persisted state (state, params,
-            /// memberships, roles). Verified via `list_keys` returning empty
-            /// for context prefix.
+            /// memberships, roles). Verified via the per-key `load_*` accessors
+            /// returning `None` and `list_active_contexts` no longer listing the
+            /// context.
             #[tokio::test]
             async fn close_cleanup_removes_all_context_state() {
                 let store = $make_store;
