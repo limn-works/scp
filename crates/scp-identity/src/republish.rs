@@ -77,6 +77,19 @@ pub const fn derive_republish_interval(ttl_secs: u64) -> u64 {
     result
 }
 
+/// Upper bound on a single publish ATTEMPT before it is abandoned as failed.
+///
+/// Belt-and-suspenders over each adapter's own timeout: the native DHT/relay
+/// transports cap a put at ~30s, but the QUIC/UDP/WebTransport/CoAP adapters do
+/// not all verify one, and a relay fan-out is sequential — a dead-but-accepting
+/// relay early in the set can stall the whole loop iteration, starving the
+/// degraded-warning path and the interval sleep behind it. Wrapping each publish
+/// in this bound guarantees the loop always makes progress: an over-budget
+/// attempt is treated as an ordinary failure and hits the normal backoff. It is
+/// generous relative to the ~30s adapter caps so a healthy publish (including a
+/// small relay fan-out) never trips it.
+const PUBLISH_ATTEMPT_TIMEOUT_SECS: u64 = 120;
+
 /// Initial backoff on failure: 30 seconds.
 const INITIAL_BACKOFF_SECS: u64 = 30;
 
@@ -848,6 +861,24 @@ fn backoff_secs(attempt: u32) -> u64 {
 
 /// The DHT republish loop for a single identity.
 ///
+/// Runs a single publish `fut` under [`PUBLISH_ATTEMPT_TIMEOUT_SECS`], mapping an
+/// over-budget attempt to `on_timeout()` so a hung adapter is treated as an
+/// ordinary publish failure rather than stalling the loop that awaits it.
+async fn with_publish_timeout<T, E>(
+    fut: impl std::future::Future<Output = Result<T, E>>,
+    on_timeout: impl FnOnce() -> E,
+) -> Result<T, E> {
+    match tokio::time::timeout(
+        tokio::time::Duration::from_secs(PUBLISH_ATTEMPT_TIMEOUT_SECS),
+        fut,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(on_timeout()),
+    }
+}
+
 /// Publishes immediately, then waits for the DHT republish interval (2 hours)
 /// before the next publish. On failure, retries with exponential backoff.
 async fn dht_republish_loop<D: DhtClient>(
@@ -859,15 +890,22 @@ async fn dht_republish_loop<D: DhtClient>(
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        // Attempt to publish.
-        let result = dht_client
-            .publish(
+        // Attempt to publish, bounded so a hung adapter cannot stall the loop
+        // (an over-budget attempt is an ordinary failure).
+        let result = with_publish_timeout(
+            dht_client.publish(
                 &entry.public_key,
                 &entry.signature,
                 &entry.document_bytes,
                 entry.sequence,
-            )
-            .await;
+            ),
+            || {
+                scp_dht::DhtError::DhtPublishFailed(
+                    "DHT publish attempt exceeded the per-attempt timeout".to_owned(),
+                )
+            },
+        )
+        .await;
 
         if result.is_ok() {
             consecutive_failures = 0;
@@ -947,7 +985,15 @@ async fn relay_republish_loop<R: RelayPublisher>(
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        match relay_publisher.publish(blob_ttl_secs, &record).await {
+        // Bound the fan-out (a dead relay early in the set must not stall the
+        // loop): an over-budget attempt is an ordinary failure (the `Err` arm).
+        match with_publish_timeout(relay_publisher.publish(blob_ttl_secs, &record), || {
+            IdentityError::RelayPublishFailed(
+                "relay publish fan-out exceeded the per-attempt timeout".to_owned(),
+            )
+        })
+        .await
+        {
             Ok(outcome) if outcome.is_complete() => {
                 consecutive_failures = 0;
                 tokio::time::sleep(tokio::time::Duration::from_secs(republish_interval_secs)).await;
@@ -1129,24 +1175,55 @@ impl<D: DhtClient + 'static> MigrationRepublisher<D> {
 }
 
 /// Background loop that periodically republishes a migration redirect.
+///
+/// Mirrors [`dht_republish_loop`]'s failure discipline: a failed (or timed-out)
+/// publish is warned and retried with exponential backoff rather than swallowed
+/// and left to the fixed interval — the redirect is what keeps the OLD DID
+/// resolving to the new one, so a silently-failing republish would let it lapse
+/// unnoticed.
 async fn migration_republish_loop<D: DhtClient>(
     dht_client: Arc<D>,
     entry: RepublishEntry,
     interval_secs: u64,
 ) {
+    let did = entry.did();
+    let mut consecutive_failures: u32 = 0;
+
     loop {
         // Attempt to publish the old DID document (which should already contain
-        // the alsoKnownAs redirect to the new DID).
-        let _ = dht_client
-            .publish(
+        // the alsoKnownAs redirect to the new DID), bounded so a hung adapter
+        // cannot stall the loop.
+        let result = with_publish_timeout(
+            dht_client.publish(
                 &entry.public_key,
                 &entry.signature,
                 &entry.document_bytes,
                 entry.sequence,
-            )
-            .await;
+            ),
+            || {
+                scp_dht::DhtError::DhtPublishFailed(
+                    "migration redirect publish attempt exceeded the per-attempt timeout"
+                        .to_owned(),
+                )
+            },
+        )
+        .await;
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+        if let Err(e) = result {
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            tracing::warn!(
+                did = %did,
+                error = %e,
+                consecutive_failures,
+                "migration redirect republish failed — the old DID's alsoKnownAs \
+                 redirect may lapse from the DHT; retrying with backoff"
+            );
+            let backoff = backoff_secs(consecutive_failures.saturating_sub(1));
+            tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+        } else {
+            consecutive_failures = 0;
+            tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+        }
     }
 }
 
