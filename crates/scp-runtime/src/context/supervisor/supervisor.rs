@@ -14694,7 +14694,7 @@ impl Supervisor {
     /// - [`ContextError::NotInitialized`] if no event-log provider is wired.
     /// - [`ContextError::EventLogFailed`] if the append fails (no log for the
     ///   context, serialization, persistence, or backstop rejection).
-    #[cfg(feature = "testing")]
+    #[cfg(any(test, feature = "testing"))]
     pub async fn test_append_event(
         &self,
         context_id: &str,
