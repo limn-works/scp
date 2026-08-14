@@ -20,7 +20,7 @@ use tokio::sync::broadcast;
 use crate::protocol::{
     JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId,
 };
-use crate::server::{ContextEventPump, ContextProvider, McpServer};
+use crate::server::{ContextProvider, McpServer, McpServerForTransport};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -32,24 +32,6 @@ pub enum StdioError {
     /// An I/O error occurred reading from stdin or writing to stdout.
     #[error("stdio I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    /// The server and pump handed to the transport are not a matched pair: a
-    /// server that advertises `resources.subscribe` arrived without its pump, or
-    /// an unwired server arrived with one. The two are produced together by
-    /// [`McpServer::with_event_source`](crate::server::McpServer::with_event_source);
-    /// this fails closed rather than serve an advertise-but-never-deliver lie
-    /// (wired, no pump) or run a delivery loop the server never advertised
-    /// (unwired, spare pump).
-    #[error(
-        "MCP stdio: server/pump mismatch (event_source_wired={wired}, pump_present={has_pump}); \
-         a wired server must be driven with its pump and an unwired server must not be given one"
-    )]
-    PumpServerMismatch {
-        /// Whether the server advertises `resources.subscribe`.
-        wired: bool,
-        /// Whether a pump was supplied.
-        has_pump: bool,
-    },
 }
 
 /// Aborts a spawned task when dropped.
@@ -164,7 +146,11 @@ impl StdioNotifier {
     }
 
     /// Writes a single line to stdout, flushing it.
-    async fn write_line(&self, json: &str) -> Result<(), std::io::Error> {
+    ///
+    /// Named `_raw` (not `write_line`) so the [`ClientChannel`] trait impl below
+    /// can delegate to it by name — non-recursion is structural, not a matter of
+    /// inherent-vs-trait method-resolution order.
+    async fn write_line_raw(&self, json: &str) -> Result<(), std::io::Error> {
         let mut stdout = self.stdout.lock().await;
         stdout.write_all(json.as_bytes()).await?;
         stdout.write_all(b"\n").await?;
@@ -174,8 +160,9 @@ impl StdioNotifier {
     /// Pushes a JSON-RPC notification to the client.
     ///
     /// Returns `false` if the notification could not be serialized or written
-    /// (e.g. the client closed stdout).
-    async fn notify(&self, notification: &JsonRpcNotification) -> bool {
+    /// (e.g. the client closed stdout). Named `_raw` for the same reason as
+    /// [`Self::write_line_raw`].
+    async fn notify_raw(&self, notification: &JsonRpcNotification) -> bool {
         let json = match serde_json::to_string(notification) {
             Ok(j) => j,
             Err(e) => {
@@ -183,7 +170,7 @@ impl StdioNotifier {
                 return false;
             }
         };
-        match self.write_line(&json).await {
+        match self.write_line_raw(&json).await {
             Ok(()) => true,
             Err(e) => {
                 tracing::warn!("MCP stdio notification write failed: {e}");
@@ -201,20 +188,18 @@ impl StdioNotifier {
 ///
 /// # Resource subscriptions
 ///
-/// `server` and `pump` are a **matched pair produced at construction**:
-/// [`McpServer::with_event_source`](crate::server::McpServer::with_event_source)
-/// (and the `with_optional_event_source` convenience) yield the wired server and
-/// its [`ContextEventPump`] from one call. A wired server advertises
-/// `resources.subscribe: true`; its pump turns each [`ContextEvent`] into
-/// `notifications/resources/updated` for the subscribed resources it
-/// invalidates. An unwired server ([`McpServer::new`](crate::server::McpServer::new))
-/// advertises `resources.subscribe: false`, rejects `resources/subscribe`, and
-/// has no pump (`None`).
+/// `server` is the single [`McpServerForTransport`] bundle
+/// [`McpServer::with_optional_event_source`](crate::server::McpServer::with_optional_event_source)
+/// produces: a wired server *and* its [`ContextEventPump`] as one value, or an
+/// unwired server alone. A wired server advertises `resources.subscribe: true`;
+/// its pump turns each [`ContextEvent`] into `notifications/resources/updated`
+/// for the subscribed resources it invalidates. An unwired server
+/// ([`McpServer::new`](crate::server::McpServer::new)) advertises
+/// `resources.subscribe: false`, rejects `resources/subscribe`, and has no pump.
 ///
-/// The transport takes the two as *separate* arguments, so it MUST drive both.
-/// It verifies the pairing at entry and fails closed with
-/// [`StdioError::PumpServerMismatch`] if a wired server arrives without its pump
-/// (an advertise-but-never-deliver lie) or an unwired server with one.
+/// The server's advertisement and its pump are one value, consumed atomically —
+/// a wired server cannot be transported without its pump, so there is no runtime
+/// pairing check to perform: the mismatch is unconstructable by type.
 ///
 /// The server is shared behind a mutex so the pump can consult the same
 /// subscription registry as the read loop; the lock is only ever held for the
@@ -226,29 +211,30 @@ impl StdioNotifier {
 ///
 /// # Errors
 ///
-/// Returns [`StdioError::Io`] if an I/O error occurs on stdin or stdout, or
-/// [`StdioError::PumpServerMismatch`] if `server` and `pump` are not a matched
-/// pair.
+/// Returns [`StdioError::Io`] if an I/O error occurs on stdin or stdout.
 pub async fn run_stdio<P: ContextProvider + 'static>(
-    server: &Arc<std::sync::Mutex<McpServer<P>>>,
-    pump: Option<ContextEventPump>,
+    server: McpServerForTransport<P>,
 ) -> Result<(), StdioError> {
     serve_stdio(
         server,
-        pump,
         BufReader::new(tokio::io::stdin()),
         StdioNotifier::new(),
     )
     .await
 }
 
-/// Spawns the event pump (if any) under an [`AbortOnDrop`] guard and runs the
-/// read loop over `reader`, writing responses and pump notifications to
-/// `channel`.
+/// Splits the [`McpServerForTransport`] bundle, spawns the event pump (if the
+/// server is wired) under an [`AbortOnDrop`] guard, and runs the read loop over
+/// `reader`, writing responses and pump notifications to `channel`.
 ///
 /// [`run_stdio`] binds `reader` to stdin and `channel` to stdout; tests bind
 /// them to in-memory doubles so the *shipped* abort-on-cancel path — pump guard
 /// and all — is the one under test rather than a copy.
+///
+/// Consuming the bundle is what makes "advertised ⟺ pump present" hold by
+/// construction: the pump travels *inside* the wired variant, so there is no
+/// separate pump argument that could be paired with the wrong server and no
+/// runtime pairing check to perform.
 ///
 /// The pump guard aborts the pump on **every** exit: the normal return after
 /// EOF *and* the cancellation-drop when a bridge's `tokio::select!` drops this
@@ -256,8 +242,7 @@ pub async fn run_stdio<P: ContextProvider + 'static>(
 /// the task, so without the guard a stopped server would leave the pump running,
 /// still writing notifications to stdout.
 async fn serve_stdio<P, R, C>(
-    server: &Arc<std::sync::Mutex<McpServer<P>>>,
-    pump: Option<ContextEventPump>,
+    bundle: McpServerForTransport<P>,
     reader: BufReader<R>,
     channel: C,
 ) -> Result<(), StdioError>
@@ -266,31 +251,20 @@ where
     R: tokio::io::AsyncRead + Unpin + Send,
     C: ClientChannel,
 {
-    // Fail closed on a server/pump pairing the constructor could not have
-    // produced: `event_source_wired` must hold exactly when a pump is present.
-    // A wired server with no pump would advertise resources.subscribe with
-    // nothing delivering; an unwired server with a spare pump would run a
-    // delivery loop it never advertised. This catches multi-server mixups the
-    // `#[must_use]` on `ContextEventPump` cannot — that only forces the pump to
-    // be consumed *somewhere*, not driven with *its own* server. A poisoned
-    // lock reads as unwired, which also fails closed when a pump is present.
-    let wired = server.lock().is_ok_and(|srv| srv.event_source_wired());
-    if wired != pump.is_some() {
-        return Err(StdioError::PumpServerMismatch {
-            wired,
-            has_pump: pump.is_some(),
-        });
-    }
+    // `Some(pump)` exactly when the server is wired — the bundle guarantees it,
+    // so no pairing check is needed here.
+    let (server, pump) = bundle.into_parts();
+    let server = Arc::new(std::sync::Mutex::new(server));
 
     let _pump_guard = pump.map(|pump| {
         AbortOnDrop(tokio::spawn(pump_events(
-            Arc::clone(server),
+            Arc::clone(&server),
             pump.into_receiver(),
             channel.clone(),
         )))
     });
 
-    read_loop_from(server, reader, &channel).await
+    read_loop_from(&server, reader, &channel).await
 }
 
 /// Forwards runtime context events to the client as MCP notifications.
@@ -372,13 +346,14 @@ trait ClientChannel: Clone + Send + Sync + 'static {
 
 impl ClientChannel for StdioNotifier {
     async fn write_line(&self, json: &str) -> std::io::Result<()> {
-        // `Self::` resolves to the inherent method (preferred over the trait
-        // method of the same name), so this delegates rather than recurses.
-        Self::write_line(self, json).await
+        // Delegates to the differently-named inherent method, so non-recursion
+        // is structural — it does not depend on inherent-vs-trait resolution
+        // order the way a same-named `Self::write_line` would.
+        self.write_line_raw(json).await
     }
 
     async fn notify(&self, notification: &JsonRpcNotification) -> bool {
-        Self::notify(self, notification).await
+        self.notify_raw(notification).await
     }
 }
 
@@ -486,6 +461,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::{METHOD_INITIALIZE, METHOD_INITIALIZED, METHOD_PING};
+    use crate::server::ContextEventPump;
 
     // -- parse_incoming -------------------------------------------------------
 
@@ -928,7 +904,9 @@ mod tests {
         use scp_core::context::membership::ContextEvent;
 
         let (event_tx, server, pump) = wired_subscribed_server("scp://ctx_a/events");
-        let server = Arc::new(std::sync::Mutex::new(server));
+        // The wired server and its pump travel to the transport as one bundle,
+        // exactly as `run_stdio` receives them from `with_optional_event_source`.
+        let bundle = McpServerForTransport::Wired(server, pump);
         let channel = VecSink::default();
 
         // A reader that never reaches EOF: stdin stays "open" so `serve_stdio`
@@ -940,10 +918,9 @@ mod tests {
         // Drive the SHIPPED serve loop on a task. Aborting the task drops the
         // `serve_stdio` future, the same drop the bridge `select!` performs.
         let serve = {
-            let server = Arc::clone(&server);
             let channel = channel.clone();
             tokio::spawn(async move {
-                let _ = serve_stdio(&server, Some(pump), BufReader::new(pending), channel).await;
+                let _ = serve_stdio(bundle, BufReader::new(pending), channel).await;
             })
         };
 
@@ -992,57 +969,5 @@ mod tests {
         );
 
         drop(keep_open);
-    }
-
-    /// A wired server handed to the transport without its pump is the exact
-    /// advertise-but-never-deliver lie the pairing guard must reject.
-    #[tokio::test]
-    async fn serve_stdio_rejects_a_wired_server_with_no_pump() {
-        let (_tx, server, _pump) = wired_subscribed_server("scp://ctx_a/events");
-        let server = Arc::new(std::sync::Mutex::new(server));
-        // Drop the pump deliberately to model the desync (in real code the
-        // `#[must_use]` would flag the drop; here we assert the transport also
-        // fails closed).
-        let err = serve_stdio(&server, None, BufReader::new(&b""[..]), VecSink::default())
-            .await
-            .expect_err("a wired server with no pump must be refused");
-        assert!(
-            matches!(
-                err,
-                StdioError::PumpServerMismatch {
-                    wired: true,
-                    has_pump: false
-                }
-            ),
-            "expected PumpServerMismatch, got {err:?}"
-        );
-    }
-
-    /// An unwired server handed a spare pump must also be refused — it would run
-    /// a delivery loop the server never advertised.
-    #[tokio::test]
-    async fn serve_stdio_rejects_an_unwired_server_with_a_pump() {
-        let (_tx, _wired, pump) = wired_subscribed_server("scp://ctx_a/events");
-        let unwired = Arc::new(std::sync::Mutex::new(McpServer::new(
-            MockProvider::default(),
-        )));
-        let err = serve_stdio(
-            &unwired,
-            Some(pump),
-            BufReader::new(&b""[..]),
-            VecSink::default(),
-        )
-        .await
-        .expect_err("an unwired server with a pump must be refused");
-        assert!(
-            matches!(
-                err,
-                StdioError::PumpServerMismatch {
-                    wired: false,
-                    has_pump: true
-                }
-            ),
-            "expected PumpServerMismatch, got {err:?}"
-        );
     }
 }

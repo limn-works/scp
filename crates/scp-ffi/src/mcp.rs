@@ -1429,22 +1429,24 @@ impl crate::scp::PyScp {
         }
 
         // One call decides both halves: the server that advertises
-        // `resources.subscribe` and the pump that honours it. There is no
-        // setter that could desynchronize them, and only one server is built
-        // per serve call — two servers over one event source would each
-        // advertise subscriptions while only one had the pump.
-        let (server, pump) = McpServer::with_optional_event_source(provider, context_events);
+        // `resources.subscribe` and the pump that honours it, folded into one
+        // `McpServerForTransport` value. There is no setter that could
+        // desynchronize them, and only one server is built per serve call — two
+        // servers over one event source would each advertise subscriptions while
+        // only one had the pump.
+        let server = McpServer::with_optional_event_source(provider, context_events);
 
         let task_handle = rt.spawn(async move {
             match transport_mode.as_str() {
                 "stdio" => {
-                    let server = Arc::new(Mutex::new(server));
                     // Run the MCP server over stdio via the shared
                     // `scp_mcp::stdio::run_stdio` loop. It owns stdout so the
                     // response writer and the resource-subscription event pump
                     // interleave as whole lines, and it parses JSON-RPC
                     // notifications correctly (a bare `JsonRpcRequest` decode
-                    // rejects them — they carry no `id`).
+                    // rejects them — they carry no `id`). The server and its pump
+                    // travel as the single `server` bundle, so the loop cannot be
+                    // handed one without the other.
                     //
                     // We also listen for the shutdown signal AND the bridge
                     // instance's cancel token so `emergency_cancel_tasks()`
@@ -1459,7 +1461,7 @@ impl crate::scp::PyScp {
                                 "MCP stdio server task exiting — bridge instance cancelled"
                             );
                         }
-                        result = scp_mcp::stdio::run_stdio(&server, pump) => {
+                        result = scp_mcp::stdio::run_stdio(server) => {
                             if let Err(e) = result {
                                 tracing::error!("MCP stdio server error: {e}");
                             }
@@ -1493,7 +1495,7 @@ impl crate::scp::PyScp {
                         sse_shutdown_trigger.shutdown();
                     });
 
-                    let result = scp_mcp::sse::run_sse(server, config, sse_shutdown, pump).await;
+                    let result = scp_mcp::sse::run_sse(server, config, sse_shutdown).await;
                     if let Err(e) = result {
                         tracing::error!("MCP SSE server error: {e}");
                     }

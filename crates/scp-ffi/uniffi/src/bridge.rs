@@ -5433,17 +5433,18 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
 /// Runs the MCP stdio transport for this bridge instance until shutdown.
 ///
-/// `context_events` is the supervisor's `ContextEvent` receiver. When `Some`,
-/// [`scp_mcp::stdio::run_stdio`] enables `resources/subscribe` on `server` and
-/// pumps each event into `notifications/resources/updated`. When `None` the
-/// server advertises `resources.subscribe: false` and rejects
-/// `resources/subscribe` with a typed error — the capability is honestly
-/// absent rather than accepted-and-never-delivered (#1341).
+/// `server` is the [`scp_mcp::server::McpServerForTransport`] bundle: when it is
+/// the wired variant, [`scp_mcp::stdio::run_stdio`] enables `resources/subscribe`
+/// and pumps each event into `notifications/resources/updated`; when it is the
+/// unwired variant, the server advertises `resources.subscribe: false` and
+/// rejects `resources/subscribe` with a typed error — the capability is honestly
+/// absent rather than accepted-and-never-delivered (#1341). The advertisement
+/// and its pump are one value, so the loop cannot be handed one without the
+/// other.
 async fn run_mcp_stdio_server_uniffi(
-    server: Arc<std::sync::Mutex<scp_mcp::server::McpServer<McpUniFfiBridgeProvider>>>,
+    server: scp_mcp::server::McpServerForTransport<McpUniFfiBridgeProvider>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     cancel_token: tokio_util::sync::CancellationToken,
-    pump: Option<scp_mcp::server::ContextEventPump>,
 ) {
     // Wire both `shutdown_rx` (mcp_server_stop) AND the bridge instance's
     // `cancel_token` (emergency_cancel_tasks from Drop) so either signal
@@ -5461,7 +5462,7 @@ async fn run_mcp_stdio_server_uniffi(
         () = cancel_token.cancelled() => {
             tracing::debug!("MCP stdio server task exiting — bridge instance cancelled");
         }
-        result = scp_mcp::stdio::run_stdio(&server, pump) => {
+        result = scp_mcp::stdio::run_stdio(server) => {
             if let Err(e) = result {
                 tracing::error!("MCP stdio server error: {e}");
             }
@@ -16208,23 +16209,18 @@ impl Scp {
         }
 
         // One call decides both halves: the server that advertises
-        // `resources.subscribe` and the pump that honours it. There is no
-        // setter that could desynchronize them, and only one server is built
-        // per serve call — two servers over one event source would each
-        // advertise subscriptions while only one had the pump.
-        let (server, pump) =
+        // `resources.subscribe` and the pump that honours it, folded into one
+        // `McpServerForTransport` bundle. There is no setter that could
+        // desynchronize them, and only one server is built per serve call — two
+        // servers over one event source would each advertise subscriptions while
+        // only one had the pump.
+        let server =
             scp_mcp::server::McpServer::with_optional_event_source(provider, context_events);
 
         let task_handle = runtime().spawn(async move {
             match transport_mode.as_str() {
                 "stdio" => {
-                    run_mcp_stdio_server_uniffi(
-                        Arc::new(std::sync::Mutex::new(server)),
-                        shutdown_rx,
-                        cancel_token,
-                        pump,
-                    )
-                    .await;
+                    run_mcp_stdio_server_uniffi(server, shutdown_rx, cancel_token).await;
                 }
                 "sse" => {
                     // `run_sse` takes ownership of the `McpServer` directly.
@@ -16245,8 +16241,7 @@ impl Scp {
                         }
                         sse_shutdown_trigger.shutdown();
                     });
-                    let result =
-                        scp_mcp::sse::run_sse(server, sse_config, sse_shutdown, pump).await;
+                    let result = scp_mcp::sse::run_sse(server, sse_config, sse_shutdown).await;
                     if let Err(e) = result {
                         tracing::error!("MCP SSE server error: {e}");
                     }
