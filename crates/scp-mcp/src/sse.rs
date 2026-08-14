@@ -186,9 +186,11 @@ pub(crate) struct McpNotifier {
     /// this one sender. Cross-session non-leakage therefore does *not* come
     /// from channel identity — it comes from two facts that hold together,
     /// both serialized on the `state.server` mutex:
-    /// 1. every server→client emission is computed *and* broadcast inside that
-    ///    mutex's critical section (see [`message_handler`] and [`pump_events`]),
-    ///    and
+    /// 1. every server→client emission's **broadcast is serialized inside** that
+    ///    mutex's critical section, and every principal-content-bearing emission
+    ///    is also *computed* under it (see [`message_handler`] and
+    ///    [`pump_events`]; the parse-error arm is the sole compute-before-lock
+    ///    case, and its echoed input carries no principal content), and
     /// 2. [`reset_session`](McpServer::reset_session) runs under the *same*
     ///    mutex at admission (see [`sse_handler`]).
     ///
