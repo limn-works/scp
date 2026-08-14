@@ -3049,10 +3049,11 @@ export class SCP {
    * - `SCP-CTX-2139` — the authoritative log WAS read and no proof could be
    *   issued. Two sub-cases: the claim is demonstrably FALSE (absence claimed
    *   for an event that IS present, or a leaf index past the end of the tree),
-   *   OR no proof of this shape exists in this construction (an EMPTY but live
-   *   log, where an absence claim is actually TRUE but `prove_absence` has no
-   *   bracketing neighbours to build a proof from). Never read the empty-log
-   *   case as evidence the event IS present.
+   *   OR no proof was issued (an EMPTY but live log, where an absence claim is
+   *   actually TRUE but `prove_absence` DECLINES to issue a proof — an
+   *   explicit `leaf_count == 0` guard, a deliberate choice and NOT a limit of
+   *   the construction). Never read the empty-log case as evidence the event IS
+   *   present.
    * - `SCP-VALID-7000` — the claim itself is malformed (invalid JSON, missing
    *   or mistyped fields, unsupported claim type); caller input validation. An
    *   unparseable claim or a missing/invalid `type` is caught before the log is

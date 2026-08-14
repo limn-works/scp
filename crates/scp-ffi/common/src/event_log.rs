@@ -169,10 +169,12 @@ pub fn filter_manager_entries<'a>(
 ///
 /// `leaf_index` is reported for addressing, NOT proven: verification binds the
 /// LEAF HASH to the `root`, and establishes membership of that hash — not its
-/// position in the tree. The path directions do not encode the index
-/// unambiguously, because a promoted odd node contributes no direction bit at
-/// its level. Do not treat a verified proof as a commitment that the leaf sits
-/// at the reported `leaf_index`.
+/// position in the tree. [`scp_event_log::proof::verify_inclusion`] never reads
+/// `leaf_index` at all — it recomputes the root from `leaf_hash` and `path`
+/// alone — so a proof carrying ANY `leaf_index` verifies. (Independently, where
+/// a level promotes an odd node the directions do not even determine the index;
+/// but that is a second reason, not the operative one.) Do not treat a verified
+/// proof as a commitment that the leaf sits at the reported `leaf_index`.
 ///
 /// # Why the neighbour proofs are included
 ///

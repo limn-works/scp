@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use scp_did::DID;
-use scp_event_log::checkpoint::{CheckpointComparison, compare_checkpoint, generate_checkpoint};
+use scp_event_log::checkpoint::generate_checkpoint;
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_platform::testing::InMemoryKeyCustody;
@@ -648,19 +648,31 @@ async fn phase2_end_to_end_integration() {
         "Alice and Bob Merkle roots must match"
     );
 
-    // Cross-compare: Alice's checkpoint against Bob's log.
-    let comparison = compare_checkpoint(&bob_log, &alice_checkpoint);
+    // Cross-compare: Alice's checkpoint against Bob's LIVE log state. The
+    // ungated `compare_checkpoint` free function was removed from
+    // scp-event-log (a received checkpoint's verdict belongs to the gated
+    // runtime judge), so this asserts the same §9.9.3 count+root agreement
+    // directly against the tree.
     assert_eq!(
-        comparison,
-        CheckpointComparison::Consistent,
+        tree::event_count(&bob_log),
+        alice_checkpoint.event_count,
+        "Bob's log should be at the same height as Alice's checkpoint"
+    );
+    assert_eq!(
+        tree::root(&bob_log),
+        alice_checkpoint.merkle_root,
         "Bob's log should be consistent with Alice's checkpoint"
     );
 
-    // Cross-compare: Bob's checkpoint against Alice's log.
-    let comparison = compare_checkpoint(&alice_log, &bob_checkpoint);
+    // Cross-compare: Bob's checkpoint against Alice's LIVE log state.
     assert_eq!(
-        comparison,
-        CheckpointComparison::Consistent,
+        tree::event_count(&alice_log),
+        bob_checkpoint.event_count,
+        "Alice's log should be at the same height as Bob's checkpoint"
+    );
+    assert_eq!(
+        tree::root(&alice_log),
+        bob_checkpoint.merkle_root,
         "Alice's log should be consistent with Bob's checkpoint"
     );
 

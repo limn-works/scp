@@ -1154,6 +1154,7 @@ pub struct ConsistencyCheckpoint {
 
    - **`generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signing_key: &KeyHandle, signing_key_id: &str) -> Result<ConsistencyCheckpoint, EventLogError>`**: Creates and signs a checkpoint from the current log state. The `signing_key_id` (ADR-039) identifies which verification method signed (accepts `"#active"` or `"#agent"`).
    - **`compare_checkpoint(local_log: &EventLog, remote_checkpoint: &ConsistencyCheckpoint) -> CheckpointComparison`**: Compares a received checkpoint against local state. Returns `Consistent`, `Divergent { first_divergent_event: Option<u64> }`, `Behind { missing_events: u64 }`, or `Ahead { extra_events: u64 }`.
+     - **CORRECTION — this signature was unsound and the free function has been removed.** As prescribed it takes no signer, no roster, and no context binding, so it classifies an *unsigned, unverified, wrong-context* checkpoint from a *non-member* as `Divergent` — letting a relay or any unauthenticated sender forge an equivocation alert. `.docs/audits/adr-audit-phase-1-3.md` records exactly this gap against this signature ("the ADR does not address it"). Comparison of a RECEIVED checkpoint now lives in the runtime as `queries_helpers::compare_remote_checkpoint`, which verifies the sender's signature, checks the sender's membership, and binds `context_id` before returning the same `CheckpointComparison`. The `CheckpointComparison` shape itself is unchanged. Do not reintroduce the ungated free function to satisfy this bullet.
    - Checkpoints are generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3).
    - Checkpoints are sent as regular MLS application messages.
    - Divergent Merkle roots for the same event count indicate equivocation — trigger alert and divergence resolution.
@@ -1167,7 +1168,7 @@ pub struct ConsistencyCheckpoint {
 | `mod.rs` | Module root, `EventLog` struct, `Event`, `EventType`, re-exports |
 | `tree.rs` | Merkle tree operations: `append`, `root`, `event_count`, internal node computation, tree maintenance |
 | `proof.rs` | `prove_inclusion`, `prove_absence`, `verify_inclusion`, `InclusionProof`, `AbsenceProof` types |
-| `checkpoint.rs` | `ConsistencyCheckpoint`, `generate_checkpoint`, `compare_checkpoint`, checkpoint scheduling logic |
+| `checkpoint.rs` | `ConsistencyCheckpoint`, `generate_checkpoint`, checkpoint scheduling logic (received-checkpoint comparison lives in the runtime — see the correction above) |
 
 **Estimated functions:** ~12-15 public functions, ~8-10 internal helpers.
 

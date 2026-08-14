@@ -279,9 +279,18 @@ fn authoritative_log_unreachable(
 /// Returns [`codes::CTX_2138`] when the authoritative log is unreachable (the
 /// instance is suspended or shut down, no supervisor is attached, or the
 /// provider reports NO LOG for the context). FAILS CLOSED: it never falls back
-/// to the UCAN-state tree. Proof-generation failures over a readable log (empty
-/// log, out-of-range index, absence claimed for a present event) keep
-/// [`codes::CTX_2139`].
+/// to the UCAN-state tree.
+///
+/// Returns [`codes::CTX_2139`] when the authoritative log WAS read but no proof
+/// was issued. That code covers two distinct outcomes and a caller must not
+/// collapse them:
+///
+/// 1. **The claim is demonstrably FALSE** — an absence claimed for an event
+///    that IS present, or an inclusion index past the end of the tree.
+/// 2. **No proof was issued, and the claim may well be TRUE** — over an EMPTY
+///    but live log an absence claim IS true, and `prove_absence` DECLINES to
+///    issue a proof for it (an explicit `leaf_count == 0` guard — a deliberate
+///    choice, not a limit of the construction). "No proof," NOT "disproof".
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 #[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.

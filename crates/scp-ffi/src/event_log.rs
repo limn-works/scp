@@ -477,10 +477,18 @@ fn malformed_claim(message: impl Into<String>) -> ScpPyError {
 ///
 /// Raises `ContextError` with `SCP-CTX-2138` when the authoritative log is
 /// unreachable (instance not ready, no supervisor, or no log for the context —
-/// FAIL CLOSED, never a "verified" proof over a fallback tree), and
-/// `ContextError` when proof generation legitimately fails over a readable log
-/// (empty log, out-of-range leaf index, or an absence claim for an event that
-/// IS present).
+/// FAIL CLOSED, never a "verified" proof over a fallback tree).
+///
+/// Raises `ContextError` with `SCP-CTX-2139` when the authoritative log WAS
+/// read but no proof was issued. That code covers two distinct outcomes and a
+/// caller must not collapse them:
+///
+/// 1. **The claim is demonstrably FALSE** — an absence claimed for an event
+///    that IS present, or an inclusion `leaf_index` past the end of the tree.
+/// 2. **No proof was issued, and the claim may well be TRUE** — over an EMPTY
+///    but live log an absence claim IS true, and `prove_absence` DECLINES to
+///    issue a proof for it (an explicit `leaf_count == 0` guard — a deliberate
+///    choice, not a limit of the construction). "No proof," NOT "disproof".
 ///
 /// See ADR-013 §7 and ADR-011.
 #[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
@@ -763,8 +771,15 @@ impl crate::scp::PyScp {
     ///
     /// Raises `ContextError` with `SCP-CTX-2138` when the authoritative log is
     /// unreachable or unknown (instance not ready, no supervisor, or no log
-    /// for this context), and `ContextError` if the filter is malformed or the
-    /// query otherwise fails.
+    /// for this context), and `ContextError` if a retrieved entry's leaf hash
+    /// cannot be computed.
+    ///
+    /// Malformed input does NOT reach either of those: a `context_id` that
+    /// fails validation, and an `after_timestamp` / `before_timestamp` that is
+    /// negative or non-finite, raise `ValidationError` (the latter with
+    /// `SCP-VALID-7040`); a wrong-typed filter field raises `TypeError` from
+    /// the extraction itself. All of these are rejected BEFORE the
+    /// authoritative-log gate runs.
     ///
     /// See ADR-013 §7.
     #[pyo3(name = "event_log_query", signature = (context_id, filter=None))]
@@ -801,8 +816,27 @@ impl crate::scp::PyScp {
     ///
     /// # Errors
     ///
-    /// Raises `ContextError` if the context is not connected to the runtime
-    /// or if the verification fails (empty log, invalid index, etc.).
+    /// Raises `ContextError` with `SCP-CTX-2138` when the authoritative log is
+    /// unreachable (instance not ready, no supervisor, or no log for this
+    /// context). FAILS CLOSED — never a proof over a bridge-local fallback
+    /// tree.
+    ///
+    /// Raises `ContextError` with `SCP-CTX-2139` when the authoritative log
+    /// WAS read but no proof was issued. Do NOT read that code as "the claim
+    /// was disproved" — it covers two outcomes that mean opposite things:
+    ///
+    /// 1. **The claim is demonstrably FALSE** — an absence claimed for an
+    ///    event that IS present, or an inclusion `leaf_index` past the end of
+    ///    the tree.
+    /// 2. **No proof was issued, and the claim may well be TRUE** — over an
+    ///    EMPTY but live log an absence claim IS true, and `prove_absence`
+    ///    DECLINES to issue a proof for it (an explicit `leaf_count == 0`
+    ///    guard — a deliberate choice, not a limit of the construction).
+    ///
+    /// Malformed claim input (missing or invalid `type`, missing `leaf_index`,
+    /// an `event_hash` that is not 32 hex-decoded bytes, an unsupported claim
+    /// type) raises `ValidationError` with `SCP-VALID-7000`, never
+    /// `ContextError`.
     ///
     /// See ADR-013 §7.
     #[pyo3(name = "event_log_verify")]

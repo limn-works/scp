@@ -2545,10 +2545,11 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * to the UCAN-state tree. Proof-generation failures over a READABLE log
      * return `SCP-CTX-2139`, which covers two distinct outcomes: the claim is
      * demonstrably FALSE (absence claimed for an event that IS present, or a
-     * leaf index past the end of the tree), OR no proof of this shape exists
-     * in this construction (an EMPTY but live log, where an absence claim is
-     * actually TRUE but `prove_absence` has no bracketing neighbours to build
-     * a proof from). Never read the empty-log case as evidence the claimed
+     * leaf index past the end of the tree), OR no proof was issued (an EMPTY
+     * but live log, where an absence claim is actually TRUE but
+     * `prove_absence` DECLINES to issue a proof — an explicit
+     * `leaf_count == 0` guard, a deliberate choice and NOT a limit of the
+     * construction). Never read the empty-log case as evidence the claimed
      * event IS present. A malformed claim carries `SCP-VALID-7000` (caller
      * input validation): invalid JSON or a missing/invalid `type` is rejected
      * before the authoritative log is consulted, but a missing `leaf_index`, a
@@ -5201,10 +5202,11 @@ open func eventLogQuery(handle: ContextHandle, filterJson: String?)async throws 
      * to the UCAN-state tree. Proof-generation failures over a READABLE log
      * return `SCP-CTX-2139`, which covers two distinct outcomes: the claim is
      * demonstrably FALSE (absence claimed for an event that IS present, or a
-     * leaf index past the end of the tree), OR no proof of this shape exists
-     * in this construction (an EMPTY but live log, where an absence claim is
-     * actually TRUE but `prove_absence` has no bracketing neighbours to build
-     * a proof from). Never read the empty-log case as evidence the claimed
+     * leaf index past the end of the tree), OR no proof was issued (an EMPTY
+     * but live log, where an absence claim is actually TRUE but
+     * `prove_absence` DECLINES to issue a proof — an explicit
+     * `leaf_count == 0` guard, a deliberate choice and NOT a limit of the
+     * construction). Never read the empty-log case as evidence the claimed
      * event IS present. A malformed claim carries `SCP-VALID-7000` (caller
      * input validation): invalid JSON or a missing/invalid `type` is rejected
      * before the authoritative log is consulted, but a missing `leaf_index`, a

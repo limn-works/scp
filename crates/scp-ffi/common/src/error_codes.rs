@@ -531,9 +531,9 @@ pub const CTX_2137: &str = "SCP-CTX-2137";
 ///
 /// Distinct from a proof-generation failure over a log the bridge *could* read
 /// (an absence claimed for a present event, an out-of-range leaf index, or an
-/// empty log for which no absence-proof shape exists) — those carry
-/// [`CTX_2139`], whose doc splits "the claim is false" from "no proof of this
-/// shape exists."
+/// empty log for which `prove_absence` declines to issue a proof) — those carry
+/// [`CTX_2139`], whose doc splits "the claim is false" from "no proof was
+/// issued."
 pub const CTX_2138: &str = "SCP-CTX-2138";
 /// Event-log Merkle proof generation failed over a log the bridge COULD read.
 ///
@@ -544,12 +544,22 @@ pub const CTX_2138: &str = "SCP-CTX-2138";
 /// 1. **The claim is demonstrably FALSE.** An absence claimed for an event that
 ///    IS present, or an inclusion `leaf_index` past the end of the tree. Here
 ///    the code carries a real negative answer about the log's contents.
-/// 2. **No proof of this shape exists in this construction.** Over an EMPTY but
-///    live log, an absence claim is in fact TRUE — nothing is present — but
-///    `prove_absence` has no bracketing neighbours to build a proof from, so it
-///    honestly declines rather than fabricating one. The code here means "no
-///    proof," NOT "disproof": it must never be read as evidence that the
-///    claimed event IS present.
+/// 2. **No proof was issued.** Over an EMPTY but live log, an absence claim is
+///    in fact TRUE — nothing is present — but `prove_absence` DECLINES to issue
+///    a proof for it, via an explicit `leaf_count == 0` guard. The code here
+///    means "no proof," NOT "disproof": it must never be read as evidence that
+///    the claimed event IS present.
+///
+///    That decline is a deliberate choice, NOT a limit of the construction —
+///    do not read this as "an empty log is unprovable." `AbsenceProof` admits
+///    `lower: None, upper: None`, and `leaf_count == 0` paired with
+///    `root == SHA-256("")` is in fact the one fully self-contained,
+///    off-box-checkable non-membership proof this append-order log can produce:
+///    a verifier recomputes the empty-tree root and needs no adjacency
+///    assumption. Every OTHER absence answer leans on bracketing neighbours
+///    whose sorted adjacency the append-order root does not commit to. If the
+///    guard is ever lifted, the empty-log case is the strongest absence answer
+///    here, not the weakest.
 ///
 /// An empty log is reported by the provider as `Ok(Some(vec![]))` and is a
 /// perfectly readable log — which is why it lands here and not on [`CTX_2138`],
