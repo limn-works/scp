@@ -893,11 +893,21 @@ fn restore_supervisor(
 /// End-to-end: a governance `ApproveSpend` executed before a simulated restart
 /// leaves its Class-S `executed_proposals` replay marker durably persisted in
 /// the [`ContextSnapshot`]; after the context is rehydrated into a fresh
-/// `Supervisor` from that same persistence backend, the marker is still present
-/// in the live actor and a SECOND governance action accumulates a new marker
-/// alongside the restored one — proving the replay-protection set (ADR-049 §9
-/// Class-S) survives a restart. See the module-level ADR-049 note for why this
-/// replaces the old "replay rejected as already-executed" assertion.
+/// `Supervisor` from that same persistence backend, the test asserts BOTH:
+///
+/// * **Accumulation** — the pre-restart marker is still present in the live
+///   actor and a SECOND governance action accumulates a new marker alongside
+///   the restored one, proving the replay-protection set (ADR-049 §9 Class-S)
+///   survives a restart.
+/// * **Replay rejection** — the pre-restart proposal, re-submitted verbatim on
+///   the restored supervisor, recomputes the identical `proposal_id` and is
+///   rejected with "already been executed" by the rehydrated marker. The
+///   durable marker is the load-bearing gate: a regression that dropped it (or
+///   stopped consulting it) would let the replay auto-execute a second time and
+///   return `Ok`, failing the assertion.
+///
+/// See the module-level ADR-049 note for how the verbatim re-submit reaches the
+/// `executed_proposals` guard and is rejected there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn executed_proposals_survive_restart_and_accumulate() {
