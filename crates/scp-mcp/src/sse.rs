@@ -241,9 +241,22 @@ impl McpNotifier {
 
     /// Broadcasts a JSON payload to all connected SSE clients and records it
     /// in the replay buffer. Returns the assigned event ID.
+    //
+    // The lint wants the guard dropped before `tx.send` — precisely the gap
+    // this critical section exists to close (see the comment inside).
+    #[allow(clippy::significant_drop_tightening)]
     async fn broadcast(&self, data: String) -> u64 {
+        // One critical section: id assignment, the replay-buffer push and the
+        // live send all happen under the replay-buffer write guard. Split
+        // apart, two concurrent broadcasts could interleave — publishing out
+        // of id order — and a client disconnecting between a lower id's
+        // `fetch_add` and its buffer push would advance `Last-Event-ID` past
+        // an id that was not yet buffered, losing that event from both the
+        // live stream and the replay path forever. Nothing below the guard
+        // acquisition `.await`s: `push` and `send` are synchronous.
+        let mut buffer = self.replay_buffer.write().await;
         let id = self.next_event_id.fetch_add(1, Ordering::Relaxed);
-        self.replay_buffer.write().await.push(id, data.clone());
+        buffer.push(id, data.clone());
         let _ = self.tx.send((id, data));
         id
     }
@@ -293,8 +306,10 @@ pub(crate) struct AppState<P: ContextProvider> {
     ///
     /// Rather than pretend to multiplex, the endpoint is structurally
     /// single-session: the second concurrent `GET /sse` is refused with
-    /// `409 Conflict`. The permit is released when the first client's stream is
-    /// dropped, at which point the session state is reset for the next client.
+    /// `409 Conflict`. When the first client's stream is dropped, the session
+    /// state is reset and only *then* is the permit released (the reset task
+    /// carries the permit — see [`SessionGuard`]), so the next client is never
+    /// admitted while a stale reset is still pending.
     session_slot: Arc<tokio::sync::Semaphore>,
 }
 
@@ -471,6 +486,15 @@ async fn sse_handler<P: ContextProvider + 'static>(
             .into_response();
     };
 
+    // Every session begins from a clean slate by sequencing, not scheduling
+    // luck. The previous guard's `Drop` can only *spawn* its reset (`Drop` is
+    // synchronous), and although that spawned task holds the session permit
+    // until the reset completes (see `SessionGuard`), resetting here makes
+    // admission itself the guarantee: a freshly admitted client can never
+    // inherit another session's handshake or subscriptions, nor lose its own
+    // to a stale reset that was scheduled but had not yet run.
+    state.server.lock().await.reset_session();
+
     let last_event_id = parse_last_event_id(&headers);
 
     let endpoint_event = Event::default()
@@ -478,32 +502,46 @@ async fn sse_handler<P: ContextProvider + 'static>(
         .data("/message")
         .retry(Duration::from_millis(state.retry_ms));
 
-    let replay_events: Vec<Result<Event, Infallible>> = if let Some(last_id) = last_event_id {
+    // Subscribe to the live broadcast BEFORE snapshotting the replay buffer.
+    // In the reverse order, an event broadcast between the two operations
+    // lands in neither the snapshot nor the live receiver, and the client's
+    // `Last-Event-ID` advances past it forever — a silent gap. Subscribing
+    // first turns that race into a harmless duplicate (present in both the
+    // snapshot and the live stream), which the id filter below suppresses.
+    let rx = state.notifier.tx.subscribe();
+
+    let replayed: Vec<ReplayEntry> = if let Some(last_id) = last_event_id {
         tracing::debug!(last_id, "SSE client reconnecting");
         let buf = state.notifier.replay_buffer.read().await;
         buf.events_after(last_id)
-            .into_iter()
-            .map(|entry| {
-                Ok(Event::default()
-                    .event("message")
-                    .id(entry.id.to_string())
-                    .data(entry.data))
-            })
-            .collect()
     } else {
         Vec::new()
     };
+    // Ids are assigned in ascending order and `events_after` preserves buffer
+    // order, so the last replayed entry carries the highest replayed id. Live
+    // events at or below it were already delivered via the replay and are
+    // suppressed from the live stream.
+    let last_replayed_id = replayed.last().map(|entry| entry.id);
+    let replay_events: Vec<Result<Event, Infallible>> = replayed
+        .into_iter()
+        .map(|entry| {
+            Ok(Event::default()
+                .event("message")
+                .id(entry.id.to_string())
+                .data(entry.data))
+        })
+        .collect();
 
-    let rx = state.notifier.tx.subscribe();
-    let message_stream = BroadcastStream::new(rx).filter_map(|result| {
+    let message_stream = BroadcastStream::new(rx).filter_map(move |result| {
         result
+            .ok()
+            .filter(|(id, _)| last_replayed_id.is_none_or(|max| *id > max))
             .map(|(id, data)| {
                 Ok(Event::default()
                     .event("message")
                     .id(id.to_string())
                     .data(data))
             })
-            .ok()
     });
 
     let initial = tokio_stream::once(Ok(endpoint_event));
@@ -517,7 +555,7 @@ async fn sse_handler<P: ContextProvider + 'static>(
     // inherit the previous session's registry.
     let guard = SessionGuard {
         state: Arc::clone(&state),
-        _permit: permit,
+        permit: Some(permit),
     };
     let stream = stream.map(move |event| {
         let _keep_alive = &guard;
@@ -621,6 +659,18 @@ async fn pump_events<P: ContextProvider + 'static>(
         };
 
         let notifications = {
+            // Contention trade-off, kept deliberately: computing notifications
+            // holds the session mutex across the provider re-authorization
+            // calls (`validate_resource_access`, `active_context_ids`), which
+            // on the UniFFI bridge are `block_in_place` actor round-trips — so
+            // a burst of events briefly serializes POST handlers behind the
+            // pump. Every restructure that releases the lock first must run
+            // authorization against a *snapshot* of the subscription registry,
+            // and a subscription retired concurrently (unsubscribe / session
+            // reset) could then still produce an emission after its
+            // retirement — the stale-delivery class this transport exists to
+            // kill. Correctness over throughput; the same reasoning covers
+            // the lagged-resync arm above.
             let server = state.server.lock().await;
             server.notifications_for_event(&context_id, &event)
         };
@@ -638,28 +688,38 @@ async fn pump_events<P: ContextProvider + 'static>(
 /// Resets the MCP session when the SSE client disconnects.
 ///
 /// Held alive by the SSE response stream; dropped when the client goes away.
-/// Dropping it releases the single-session permit (the `_permit` field) so the
-/// next client can connect, and resets the server's per-session state so that
-/// client cannot inherit the previous one's handshake or subscriptions.
+/// Dropping it schedules the session reset (handshake state + resource
+/// subscriptions) and moves the single-session permit into that reset task, so
+/// the slot is released only *after* `reset_session()` completes — the next
+/// client cannot be admitted while the reset is still pending, and therefore
+/// cannot have its own freshly registered state wiped by it.
 struct SessionGuard<P: ContextProvider + 'static> {
     state: Arc<AppState<P>>,
-    /// The single-session permit. Released on drop, in field order *after*
-    /// the reset is scheduled below.
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    /// The single-session permit. Moved into the spawned reset task on drop —
+    /// released only after `reset_session()` has run. `Option` solely so
+    /// `Drop` (which gets `&mut self`) can move it out; it is `Some` for the
+    /// guard's entire lifetime.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl<P: ContextProvider + 'static> Drop for SessionGuard<P> {
     fn drop(&mut self) {
+        let permit = self.permit.take();
         // `Drop` is synchronous and the reset needs the async server mutex, so
-        // hand the work to the runtime. Outside a runtime (e.g. a test that
-        // drops the stream after the runtime ends) there is nothing to clean
-        // up, so skipping is correct rather than a lost update.
+        // hand the work — carrying the permit — to the runtime: the session
+        // slot frees only once the reset has completed. Outside a runtime
+        // (e.g. a test that drops the stream after the runtime ends) there is
+        // no task to run; releasing the permit here is still correct because
+        // admission itself resets the session first (see `sse_handler`), so a
+        // later client can never inherit this session's state.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            drop(permit);
             return;
         };
         let state = Arc::clone(&self.state);
         handle.spawn(async move {
             state.server.lock().await.reset_session();
+            drop(permit);
         });
     }
 }
@@ -1604,5 +1664,209 @@ mod tests {
         // Second call produces a different ID
         let id2 = state.notifier.next_event_id.fetch_add(1, Ordering::SeqCst);
         assert_ne!(id1, id2);
+    }
+
+    // -- Session reset sequencing ---------------------------------------------
+
+    /// A session admitted immediately after the previous guard's drop must not
+    /// lose its handshake or subscriptions to that guard's asynchronously
+    /// spawned `reset_session`.
+    ///
+    /// Guards against the admission race where `SessionGuard::drop` freed the
+    /// permit synchronously (in field order) while only *spawning* the reset:
+    /// the next client could be admitted, initialize, and subscribe before the
+    /// spawned reset ran — which then silently wiped the new session's state.
+    /// Two mechanisms close it: admission resets the session first thing, and
+    /// the dropped guard's permit now rides its reset task, freeing the slot
+    /// only after `reset_session()` completes.
+    #[tokio::test]
+    async fn session_admitted_after_previous_drop_keeps_its_subscription() {
+        let (_event_tx, event_rx) = broadcast::channel::<ContextEventEnvelope>(16);
+        // Wired server: `resources/subscribe` must be accepted for the second
+        // session's registration to exist at all.
+        let (server, _pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
+        let state = Arc::new(AppState {
+            server: Mutex::new(server),
+            notifier: McpNotifier::new(&test_config()),
+            retry_ms: DEFAULT_RETRY_MS,
+            session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+
+        // First client attaches through the real handler, then disconnects,
+        // dropping its stream and with it the `SessionGuard`.
+        let first = sse_handler(State(Arc::clone(&state)), HeaderMap::new()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        drop(first);
+
+        // Admission may briefly 409 while the dropped guard's reset task still
+        // holds the permit; the slot must free once the reset completes.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let second = loop {
+            let resp = sse_handler(State(Arc::clone(&state)), HeaderMap::new()).await;
+            if resp.status() == StatusCode::OK {
+                break resp;
+            }
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session slot never freed after the previous guard dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // The second session immediately handshakes and subscribes through the
+        // real POST path — exactly the window the old race wiped.
+        for body in [
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": METHOD_INITIALIZE,
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test" }
+                },
+                "id": 1
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": crate::protocol::METHOD_RESOURCES_SUBSCRIBE,
+                "params": { "uri": "scp://ctx_a/events" },
+                "id": 2
+            }),
+        ] {
+            let status = message_handler(State(Arc::clone(&state)), body.to_string())
+                .await
+                .into_response()
+                .status();
+            assert_eq!(status, StatusCode::ACCEPTED);
+        }
+        assert_eq!(state.server.lock().await.subscription_count(), 1);
+
+        // Give any stale scheduled reset every chance to run; the second
+        // session's registration must survive it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            state.server.lock().await.subscription_count(),
+            1,
+            "a stale session reset wiped the newly admitted session's subscription"
+        );
+        drop(second);
+    }
+
+    // -- Replay/live ordering -------------------------------------------------
+
+    /// The handler must subscribe to the live broadcast BEFORE snapshotting the
+    /// replay buffer, and suppress the duplicates that ordering can produce.
+    ///
+    /// Deterministic interleaving: the test holds the replay buffer's write
+    /// lock so the handler parks at its snapshot read — provably *after*
+    /// subscribing, observed via `receiver_count` rising to 1 — then publishes
+    /// an event into both the buffer and the live channel (the racy window),
+    /// releases the lock, and asserts the client sees the event exactly once.
+    /// Under the old snapshot-first ordering the handler would park *before*
+    /// subscribing, `receiver_count` would never rise, and an event broadcast
+    /// in that window reached neither the snapshot nor the live stream — a
+    /// silent, permanent gap.
+    #[tokio::test]
+    async fn replay_snapshot_follows_live_subscribe_and_suppresses_duplicates() {
+        let state = Arc::new(AppState {
+            server: Mutex::new(McpServer::new(MockProvider::default())),
+            notifier: McpNotifier::new(&test_config()),
+            retry_ms: DEFAULT_RETRY_MS,
+            session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+
+        // Park the handler at its replay snapshot.
+        let mut buffer = state.notifier.replay_buffer.write().await;
+
+        // Reconnecting client: `Last-Event-ID: 0` requests a full replay.
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "0".parse().unwrap());
+        let handler = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { sse_handler(State(state), headers).await }
+        });
+
+        // The handler must have subscribed before it blocks on the snapshot.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.notifier.tx.receiver_count() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "handler never subscribed while the snapshot was blocked — \
+                 snapshot-before-subscribe ordering regressed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // An event lands in BOTH the replay buffer and the live channel while
+        // the handler sits between subscribe and snapshot — the racy window.
+        // (Manual push + send rather than `broadcast()`: the test itself holds
+        // the write guard `broadcast()` would need.)
+        buffer.push(1, "racy-event".to_owned());
+        let _ = state.notifier.tx.send((1, "racy-event".to_owned()));
+        drop(buffer);
+
+        let response = handler.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Read the SSE body: the event must appear exactly once — replayed,
+        // with the live duplicate suppressed by id.
+        let mut body = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        let read_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        // Collect frames until the stream ends, errors, or the window closes.
+        while let Ok(Some(Ok(bytes))) = tokio::time::timeout_at(read_deadline, body.next()).await {
+            seen.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        assert_eq!(
+            seen.matches("racy-event").count(),
+            1,
+            "the racy event must be delivered exactly once (replayed, live \
+             duplicate suppressed); SSE stream was:\n{seen}"
+        );
+    }
+
+    // -- Cancel-abort teardown ------------------------------------------------
+
+    /// The SSE twin of the stdio pump-abort test: aborting the task running
+    /// `run_sse` (the drop a bridge's shutdown `select!` performs) must abort
+    /// the event pump, not detach it. The pump holds the only receiver on the
+    /// event channel, so its death is observable as `receiver_count` falling
+    /// to zero; a detached pump would hold that receiver forever.
+    #[tokio::test]
+    async fn aborting_run_sse_tears_down_the_pump() {
+        let (event_tx, event_rx) = broadcast::channel::<ContextEventEnvelope>(16);
+        let (server, pump) = McpServer::with_event_source(MockProvider::default(), event_rx);
+        let bundle = McpServerForTransport::Wired(server, pump);
+        let config = SseConfig::new("127.0.0.1:0".parse().unwrap());
+
+        let task = tokio::spawn(run_sse(bundle, config, ShutdownHandle::new()));
+
+        // Let the server bind and spawn its pump; the pump task now owns the
+        // channel's only receiver.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "run_sse exited before it was aborted");
+        assert_eq!(event_tx.receiver_count(), 1);
+
+        // Abort the server task — the cancellation-drop path. Awaiting the
+        // aborted task guarantees the `run_sse` future was dropped, so its
+        // `AbortOnDrop` pump guard has run.
+        task.abort();
+        let _ = task.await;
+
+        // Task abortion completes asynchronously; poll until the pump's
+        // receiver is gone.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while event_tx.receiver_count() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pump outlived run_sse — it was detached, not aborted"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(event_tx.receiver_count(), 0);
     }
 }

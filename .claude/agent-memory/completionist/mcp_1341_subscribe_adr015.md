@@ -35,12 +35,18 @@ and do nothing while `initialize` advertised `subscribe: true` (NAPI returned
   runs) is exercised directly through the `ClientChannel` seam — no duplicated
   `process_lines` copy. A cancellation test proves stop-while-stdin-open aborts
   the pump.
-- **Transport pairing fails closed.** `run_stdio`/`run_sse` reject a wired server
-  with no pump (or an unwired server with a spare pump) via `PumpServerMismatch`.
+- **Transport pairing is unconstructable-by-type, not runtime-checked.**
+  `McpServer::with_optional_event_source` returns one `McpServerForTransport`
+  bundle (`Wired(server, pump)` / `Unwired(server)`) and `run_stdio`/`run_sse`
+  take that bundle as a single atomic argument — a wired server without its pump
+  cannot be built, so the former runtime `PumpServerMismatch` check is DELETED,
+  not merely unused. Do not cite it.
 - **Lagged receiver over-notifies, never silent.** On `broadcast Lagged`, both
-  pumps emit `resources/list_changed` + `resources/updated` per still-authorized
-  subscription (`McpServer::lagged_resync_notifications`, re-authorized per URI so
-  it is not an activity oracle).
+  pumps emit `resources/list_changed` + `tools/list_changed` + one
+  `resources/updated` per still-authorized subscription
+  (`McpServer::lagged_resync_notifications`, re-authorized per URI so it is not
+  an activity oracle; the two list-changed signals are content-free and thus
+  deliberately not per-event auth-gated).
 
 ## Still genuinely OPEN (ADR-015 acceptance criteria, not regressions)
 - **AC7 — dynamic tool list on join/leave.** `active_context_ids()` is a static
