@@ -1035,4 +1035,50 @@ mod tests {
         let b_state = mcp_get_stdio_allowlist_on(&b).expect("snapshot b");
         assert!(!b_state.allowed.contains(&"custom-a".to_owned()));
     }
+
+    /// #1933 fail-closed parity: NAPI's `context_events` arm must fail closed
+    /// to the honest absent object (SCP-CTX-2138) — never a fabricated zero
+    /// root/count — when the authoritative event log is unreachable. Here the
+    /// bridge instance is dropped so the provider's `Weak` can no longer
+    /// upgrade, forcing the fail-closed path. Mirrors the `PyO3`
+    /// `ffi_bridge_provider_returns_safe_defaults_when_bridge_dropped` and the
+    /// `UniFFI` `mcp_uniffi_provider_returns_safe_defaults_when_bridge_dropped`
+    /// siblings gained in this delta.
+    #[test]
+    fn context_events_returns_absent_object_when_bridge_dropped_napi() {
+        // Construct the provider against a short-lived Arc, then drop the Arc
+        // so the provider's `Weak` can no longer upgrade.
+        let provider = {
+            let bi = Arc::new(NapiBridgeInstance::new_napi());
+            let p = McpNapiBridgeProvider {
+                agent_did: "did:dht:z6MkDropped".to_owned(),
+                context_ids: vec!["ctx-dropped".to_owned()],
+                bi: Arc::downgrade(&bi),
+            };
+            drop(bi);
+            p
+        };
+
+        // The stored `Weak` can no longer upgrade to a live bridge instance.
+        assert!(
+            provider.upgrade_bi().is_err(),
+            "upgrade_bi must fail after the bridge instance is dropped"
+        );
+
+        // context_events FAILS CLOSED to the honest absent object (#1933): a
+        // dropped bridge cannot reach the authoritative log, so the summary
+        // carries SCP-CTX-2138 and NO `event_count` / `merkle_root` key —
+        // never a fabricated zero root/count a consumer could mistake for a
+        // genuinely-empty log.
+        let events = provider.context_events("ctx-dropped");
+        assert_eq!(
+            events.get("code").and_then(serde_json::Value::as_str),
+            Some(scp_ffi_common::error_codes::CTX_2138),
+            "context_events must fail closed with SCP-CTX-2138 when the bridge is dropped"
+        );
+        assert!(
+            events.get("event_count").is_none() && events.get("merkle_root").is_none(),
+            "the fail-closed summary must not fabricate a zero root or count"
+        );
+    }
 }

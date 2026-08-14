@@ -3,8 +3,10 @@
 //! Provides three core operations:
 //!
 //! - [`prove_inclusion`] -- Generate a Merkle path from a leaf to the root.
-//! - [`prove_absence`] -- Prove that a hash is NOT in the log using sorted
-//!   leaf neighbors.
+//! - [`prove_absence`] -- Build an absence answer by scanning the full local
+//!   log: ship the sorted-neighbour inclusion proofs that bracket the query
+//!   hash. The neighbour inclusion is checkable off-box, but the append-order
+//!   root does not commit to their sorted adjacency (see [`AbsenceProof`]).
 //! - [`verify_inclusion`] -- Verify an inclusion proof without access to the
 //!   log (pure function).
 //!
@@ -116,13 +118,26 @@ pub struct LeafWithProof {
     pub inclusion_proof: InclusionProof,
 }
 
-/// An absence proof: proves that a given hash is NOT in the log.
+/// An absence answer for a query hash, built by inspecting the full local log.
 ///
-/// Uses the sorted leaf hash approach: finds the two adjacent leaf hashes
-/// that bracket the query hash in sorted order, and provides inclusion
-/// proofs for both. A verifier confirms that both neighbors are in the tree,
-/// that they are truly adjacent in sorted order, and that the query hash
-/// falls between them.
+/// Uses the sorted leaf hash approach: [`prove_absence`] scans the log's leaf
+/// hashes in sorted order, finds the two that bracket the query hash, and ships
+/// each neighbour's full [`InclusionProof`]. The two inclusion proofs are
+/// checkable off-box against the reported [`root`](Self::root) — a recipient can
+/// confirm both neighbours are in the tree and that the query hash sorts strictly
+/// between them.
+///
+/// What the inclusion proofs do NOT establish is that the two neighbours are
+/// *adjacent* in sorted order. Adjacency is asserted only by [`prove_absence`]
+/// having walked the full local sorted index; the append-order Merkle root does
+/// not commit to sorted order, so no off-box verifier can confirm it, and there
+/// is deliberately no `verify_absence` in this crate (only [`verify_inclusion`]
+/// and [`verify_consistency`]). A recipient checking only the two inclusion
+/// proofs cannot rule out a hidden leaf sorting between the neighbours. This is
+/// therefore NOT a self-contained, off-box non-membership proof — it is the
+/// log's own adjacency assertion plus checkable neighbour-inclusion. The real
+/// fix is a sorted/sparse Merkle tree whose root commits to sorted order; see
+/// #2314.
 ///
 /// **Privacy:** Reveals exactly two leaf hashes (the sorted neighbors).
 ///
@@ -245,11 +260,14 @@ pub fn prove_inclusion(log: &EventLog, leaf_index: u64) -> Result<InclusionProof
     })
 }
 
-/// Generates an absence proof for `event_hash`, proving it is NOT in the log.
+/// Builds an [`AbsenceProof`] for `event_hash` by scanning the full local log.
 ///
-/// Uses the sorted leaf hash approach: finds the two adjacent leaf hashes
-/// that bracket `event_hash` in sorted order and generates inclusion proofs
-/// for both.
+/// Uses the sorted leaf hash approach: finds the two leaf hashes that bracket
+/// `event_hash` in the local sorted index — adjacent there by construction — and
+/// generates inclusion proofs for both. The neighbour inclusion is checkable
+/// off-box against the root, but the append-order root does not commit to their
+/// sorted adjacency, so the result is not a self-contained off-box
+/// non-membership proof; see [`AbsenceProof`] for the full caveat.
 ///
 /// # Errors
 ///
