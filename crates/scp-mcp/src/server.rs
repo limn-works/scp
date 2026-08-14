@@ -320,12 +320,16 @@ pub struct McpServer<P: ContextProvider> {
 /// The receiving half of a wired [`ContextEvent`] source, produced by
 /// [`McpServer::with_event_source`] together with the server it feeds.
 ///
-/// It exists so the "capability advertised" and "capability deliverable" states
-/// are one value rather than two that a caller could set independently: there
-/// is no way to obtain a server with `resources.subscribe: true` without also
-/// obtaining the pump, and no way to obtain the pump without a server that
-/// advertises it. A transport takes this by value and drives it; dropping it
-/// unspawned is a bug the `#[must_use]` catches at compile time.
+/// **Pairing holds at construction.** This one call is the only way to obtain a
+/// server that advertises `resources.subscribe: true`, and it always hands back
+/// the pump alongside it — there is no setter that could produce the flag
+/// without the pump, or the pump without the flag. The two values are still
+/// passed *separately* to a transport ([`run_stdio`](crate::stdio::run_stdio) /
+/// [`run_sse`](crate::sse::run_sse)), so the transport does not get the pairing
+/// for free: it MUST drive both, and it re-checks the pairing at entry, failing
+/// closed if a wired server arrives without its pump (or an unwired server with
+/// one). Dropping the pump unspawned is additionally a bug the `#[must_use]`
+/// catches at compile time.
 #[must_use = "hand this to a transport (run_stdio / run_sse) — dropping it leaves \
               resources.subscribe advertised with nothing delivering notifications"]
 pub struct ContextEventPump {
@@ -1151,6 +1155,60 @@ impl<P: ContextProvider> McpServer<P> {
             // lifecycle transitions that add or remove a served context — so
             // the client's cached `resources/list` is stale here too.
             out.push(Self::resources_list_changed_notification());
+        }
+
+        out
+    }
+
+    /// Builds the notifications a client needs after the pump's broadcast
+    /// receiver reported [`RecvError::Lagged`](tokio::sync::broadcast::error::RecvError::Lagged).
+    ///
+    /// The dropped events are gone — nothing can reconstruct which resources
+    /// they touched — so instead of falling silent (which would strand the
+    /// client on stale state with no signal to re-read), the pump *over-notifies*:
+    /// one `notifications/resources/list_changed` (the served resource set may
+    /// have changed) plus one `notifications/resources/updated` per still-authorized
+    /// subscription. A lagged client then re-reads exactly the resources it cares
+    /// about.
+    ///
+    /// Each subscribed URI is re-authorized through the same participation +
+    /// [`ContextProvider::validate_resource_access`] check
+    /// [`Self::notifications_for_event`] applies, so a subscription whose grant
+    /// was revoked during the lag delivers nothing: the lag path cannot become
+    /// the activity oracle the subscribe gate prevents. Delivery is best-effort
+    /// but never silent.
+    #[must_use]
+    pub fn lagged_resync_notifications(&self) -> Vec<JsonRpcNotification> {
+        // A server with no event source advertised none of the pump-backed
+        // capabilities and can hold no subscriptions, so there is nothing to
+        // resync. (The pump only exists on a wired server; this guard keeps the
+        // "advertised ⟺ emittable" invariant total.)
+        if !self.event_source_wired {
+            return Vec::new();
+        }
+
+        let mut out = vec![Self::resources_list_changed_notification()];
+
+        for uri in &self.subscriptions {
+            let Ok((context_id, kind)) = parse_resource_uri(uri) else {
+                continue;
+            };
+            let serves_context = self
+                .provider
+                .active_context_ids()
+                .iter()
+                .any(|c| c == &context_id);
+            if !serves_context {
+                continue;
+            }
+            if self
+                .provider
+                .validate_resource_access(&context_id, kind)
+                .is_err()
+            {
+                continue;
+            }
+            out.push(Self::resource_updated_notification(uri));
         }
 
         out
@@ -2283,6 +2341,72 @@ mod tests {
             "the registration is filtered, not forgotten — suspension is \
              reversible and MCP has no server-initiated unsubscribe"
         );
+    }
+
+    /// On a broadcast lag the pump must NOT fall silent: it over-notifies so a
+    /// lagged client re-reads. `lagged_resync_notifications` returns one
+    /// `resources/list_changed` plus one `resources/updated` per still-authorized
+    /// subscription.
+    #[test]
+    fn lagged_resync_over_notifies_every_authorized_subscription() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/events");
+        subscribe(&mut server, "scp://ctx_a/members");
+
+        let notifs = server.lagged_resync_notifications();
+
+        assert!(
+            notifs
+                .iter()
+                .any(|n| n.method == protocol::METHOD_RESOURCES_LIST_CHANGED),
+            "a lagged client must be told its resource list may be stale"
+        );
+        let updated: Vec<&str> = notifs
+            .iter()
+            .filter(|n| n.method == protocol::METHOD_RESOURCES_UPDATED)
+            .filter_map(|n| n.params.as_ref()?.get("uri")?.as_str())
+            .collect();
+        assert!(updated.contains(&"scp://ctx_a/events"));
+        assert!(updated.contains(&"scp://ctx_a/members"));
+        assert_eq!(updated.len(), 2, "one updated per subscription, no more");
+    }
+
+    /// The lag path re-authorizes each subscription, so a subscription whose
+    /// grant was revoked during the lag delivers nothing — it must not become
+    /// the activity oracle the subscribe gate prevents.
+    #[test]
+    fn lagged_resync_filters_a_revoked_subscription() {
+        let mut revoked = MockProvider::default();
+        revoked
+            .denied_resources
+            .push(("ctx_a".to_owned(), ResourceKind::Members));
+        let mut server = subscribing_server(revoked);
+        // Register both directly (subscribe() would reject the denied one).
+        server.subscriptions.insert("scp://ctx_a/events".to_owned());
+        server
+            .subscriptions
+            .insert("scp://ctx_a/members".to_owned());
+
+        let notifs = server.lagged_resync_notifications();
+        let updated: Vec<&str> = notifs
+            .iter()
+            .filter(|n| n.method == protocol::METHOD_RESOURCES_UPDATED)
+            .filter_map(|n| n.params.as_ref()?.get("uri")?.as_str())
+            .collect();
+
+        assert_eq!(
+            updated,
+            vec!["scp://ctx_a/events"],
+            "the revoked members subscription must not resync"
+        );
+    }
+
+    /// An unwired server has no pump and can hold no subscriptions, so a lag it
+    /// could never observe produces nothing.
+    #[test]
+    fn unwired_server_lagged_resync_is_empty() {
+        let server = initialized_server(MockProvider::default());
+        assert!(server.lagged_resync_notifications().is_empty());
     }
 
     /// `resources/list` must not advertise a URI that `resources/read` denies.

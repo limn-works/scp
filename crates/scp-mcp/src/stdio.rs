@@ -32,6 +32,43 @@ pub enum StdioError {
     /// An I/O error occurred reading from stdin or writing to stdout.
     #[error("stdio I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The server and pump handed to the transport are not a matched pair: a
+    /// server that advertises `resources.subscribe` arrived without its pump, or
+    /// an unwired server arrived with one. The two are produced together by
+    /// [`McpServer::with_event_source`](crate::server::McpServer::with_event_source);
+    /// this fails closed rather than serve an advertise-but-never-deliver lie
+    /// (wired, no pump) or run a delivery loop the server never advertised
+    /// (unwired, spare pump).
+    #[error(
+        "MCP stdio: server/pump mismatch (event_source_wired={wired}, pump_present={has_pump}); \
+         a wired server must be driven with its pump and an unwired server must not be given one"
+    )]
+    PumpServerMismatch {
+        /// Whether the server advertises `resources.subscribe`.
+        wired: bool,
+        /// Whether a pump was supplied.
+        has_pump: bool,
+    },
+}
+
+/// Aborts a spawned task when dropped.
+///
+/// The event pump is spawned as a detached [`tokio::task`]; a bare
+/// [`JoinHandle`](tokio::task::JoinHandle) dropped without `abort()` *detaches*
+/// the task rather than stopping it. Holding the handle in this guard makes the
+/// abort run on **every** exit from [`serve_stdio`] — the normal return after
+/// EOF *and* the case where a `tokio::select!` in a bridge drops the
+/// `run_stdio` future mid-await when `mcp_server_stop` fires. Without it, the
+/// pump would outlive the stopped server and keep writing JSON-RPC
+/// notifications to stdout. [`run_sse`](crate::sse::run_sse) uses it for the
+/// same reason.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,17 +201,20 @@ impl StdioNotifier {
 ///
 /// # Resource subscriptions
 ///
-/// `pump` is the [`ContextEventPump`] that
+/// `server` and `pump` are a **matched pair produced at construction**:
 /// [`McpServer::with_event_source`](crate::server::McpServer::with_event_source)
-/// returned alongside `server`. Passing it runs a delivery loop that turns each
-/// [`ContextEvent`] into `notifications/resources/updated` for the subscribed
-/// resources it invalidates.
+/// (and the `with_optional_event_source` convenience) yield the wired server and
+/// its [`ContextEventPump`] from one call. A wired server advertises
+/// `resources.subscribe: true`; its pump turns each [`ContextEvent`] into
+/// `notifications/resources/updated` for the subscribed resources it
+/// invalidates. An unwired server ([`McpServer::new`](crate::server::McpServer::new))
+/// advertises `resources.subscribe: false`, rejects `resources/subscribe`, and
+/// has no pump (`None`).
 ///
-/// `None` is only constructible for a server built with
-/// [`McpServer::new`](crate::server::McpServer::new), which advertises
-/// `resources.subscribe: false` and rejects `resources/subscribe` with a typed
-/// error — the capability cannot be advertised without the machinery to honour
-/// it, because the same call produces both.
+/// The transport takes the two as *separate* arguments, so it MUST drive both.
+/// It verifies the pairing at entry and fails closed with
+/// [`StdioError::PumpServerMismatch`] if a wired server arrives without its pump
+/// (an advertise-but-never-deliver lie) or an unwired server with one.
 ///
 /// The server is shared behind a mutex so the pump can consult the same
 /// subscription registry as the read loop; the lock is only ever held for the
@@ -186,43 +226,105 @@ impl StdioNotifier {
 ///
 /// # Errors
 ///
-/// Returns [`StdioError`] if an I/O error occurs on stdin or stdout.
+/// Returns [`StdioError::Io`] if an I/O error occurs on stdin or stdout, or
+/// [`StdioError::PumpServerMismatch`] if `server` and `pump` are not a matched
+/// pair.
 pub async fn run_stdio<P: ContextProvider + 'static>(
     server: &Arc<std::sync::Mutex<McpServer<P>>>,
     pump: Option<ContextEventPump>,
 ) -> Result<(), StdioError> {
-    let notifier = StdioNotifier::new();
+    serve_stdio(
+        server,
+        pump,
+        BufReader::new(tokio::io::stdin()),
+        StdioNotifier::new(),
+    )
+    .await
+}
 
-    let pump_task = pump.map(|pump| {
-        tokio::spawn(pump_events(
+/// Spawns the event pump (if any) under an [`AbortOnDrop`] guard and runs the
+/// read loop over `reader`, writing responses and pump notifications to
+/// `channel`.
+///
+/// [`run_stdio`] binds `reader` to stdin and `channel` to stdout; tests bind
+/// them to in-memory doubles so the *shipped* abort-on-cancel path — pump guard
+/// and all — is the one under test rather than a copy.
+///
+/// The pump guard aborts the pump on **every** exit: the normal return after
+/// EOF *and* the cancellation-drop when a bridge's `tokio::select!` drops this
+/// future as `mcp_server_stop` fires. Dropping a bare `JoinHandle` only detaches
+/// the task, so without the guard a stopped server would leave the pump running,
+/// still writing notifications to stdout.
+async fn serve_stdio<P, R, C>(
+    server: &Arc<std::sync::Mutex<McpServer<P>>>,
+    pump: Option<ContextEventPump>,
+    reader: BufReader<R>,
+    channel: C,
+) -> Result<(), StdioError>
+where
+    P: ContextProvider + 'static,
+    R: tokio::io::AsyncRead + Unpin + Send,
+    C: ClientChannel,
+{
+    // Fail closed on a server/pump pairing the constructor could not have
+    // produced: `event_source_wired` must hold exactly when a pump is present.
+    // A wired server with no pump would advertise resources.subscribe with
+    // nothing delivering; an unwired server with a spare pump would run a
+    // delivery loop it never advertised. This catches multi-server mixups the
+    // `#[must_use]` on `ContextEventPump` cannot — that only forces the pump to
+    // be consumed *somewhere*, not driven with *its own* server. A poisoned
+    // lock reads as unwired, which also fails closed when a pump is present.
+    let wired = server.lock().is_ok_and(|srv| srv.event_source_wired());
+    if wired != pump.is_some() {
+        return Err(StdioError::PumpServerMismatch {
+            wired,
+            has_pump: pump.is_some(),
+        });
+    }
+
+    let _pump_guard = pump.map(|pump| {
+        AbortOnDrop(tokio::spawn(pump_events(
             Arc::clone(server),
             pump.into_receiver(),
-            notifier.clone(),
-        ))
+            channel.clone(),
+        )))
     });
 
-    let result = read_loop(server, &notifier).await;
-
-    if let Some(handle) = pump_task {
-        handle.abort();
-    }
-    result
+    read_loop_from(server, reader, &channel).await
 }
 
 /// Forwards runtime context events to the client as MCP notifications.
-async fn pump_events<P: ContextProvider>(
+async fn pump_events<P, C>(
     server: Arc<std::sync::Mutex<McpServer<P>>>,
     mut events: broadcast::Receiver<ContextEventEnvelope>,
-    notifier: StdioNotifier,
-) {
+    channel: C,
+) where
+    P: ContextProvider,
+    C: ClientChannel,
+{
     loop {
         let ContextEventEnvelope { context_id, event } = match events.recv().await {
             Ok(v) => v,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                // The client may have missed a change. Over-notify rather
-                // than leave it stale: nothing here can reconstruct which
-                // resources the dropped events touched, so callers re-read.
+                // The dropped events are gone; nothing can reconstruct which
+                // resources they touched. Over-notify — one
+                // resources/list_changed plus one resources/updated per
+                // still-authorized subscription — so a lagged client re-reads,
+                // exactly as the pump promises. Never fall silent.
                 tracing::warn!("MCP stdio event pump lagged, {skipped} events dropped");
+                let notifications = match server.lock() {
+                    Ok(srv) => srv.lagged_resync_notifications(),
+                    Err(e) => {
+                        tracing::error!("MCP server mutex poisoned in event pump: {e}");
+                        return;
+                    }
+                };
+                for notification in &notifications {
+                    if !channel.notify(notification).await {
+                        // stdout is gone; the session is over.
+                        return;
+                    }
+                }
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => return,
@@ -237,7 +339,7 @@ async fn pump_events<P: ContextProvider>(
         };
 
         for notification in &notifications {
-            if !notifier.notify(notification).await {
+            if !channel.notify(notification).await {
                 // stdout is gone; the session is over.
                 return;
             }
@@ -245,48 +347,57 @@ async fn pump_events<P: ContextProvider>(
     }
 }
 
-/// Where the read loop writes its JSON-RPC responses.
+/// The server→client push surface for a stdio session: JSON-RPC response lines
+/// from the read loop and notifications from the event pump share it so they
+/// interleave as whole lines on one stdout.
 ///
-/// Exists so [`read_loop_from`] — the loop that actually ships — can be driven
-/// over an in-memory buffer in tests instead of being reimplemented there.
-trait LineSink {
+/// Abstracted so [`serve_stdio`] — the loop that actually ships, pump guard and
+/// all — can be driven over in-memory doubles in tests rather than
+/// reimplemented there. `Clone + Send + Sync + 'static` is required because the
+/// spawned pump task owns its own handle to the channel.
+trait ClientChannel: Clone + Send + Sync + 'static {
     /// Writes one complete line, terminator included.
     fn write_line(
         &self,
         json: &str,
     ) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
+
+    /// Pushes a JSON-RPC notification, returning `false` if it could not be
+    /// written (e.g. the client closed stdout).
+    fn notify(
+        &self,
+        notification: &JsonRpcNotification,
+    ) -> impl std::future::Future<Output = bool> + Send;
 }
 
-impl LineSink for StdioNotifier {
+impl ClientChannel for StdioNotifier {
     async fn write_line(&self, json: &str) -> std::io::Result<()> {
+        // `Self::` resolves to the inherent method (preferred over the trait
+        // method of the same name), so this delegates rather than recurses.
         Self::write_line(self, json).await
+    }
+
+    async fn notify(&self, notification: &JsonRpcNotification) -> bool {
+        Self::notify(self, notification).await
     }
 }
 
-/// Reads and dispatches client messages from stdin until EOF.
-async fn read_loop<P: ContextProvider>(
-    server: &Arc<std::sync::Mutex<McpServer<P>>>,
-    notifier: &StdioNotifier,
-) -> Result<(), StdioError> {
-    read_loop_from(server, BufReader::new(tokio::io::stdin()), notifier).await
-}
-
 /// The transport read loop, parameterized over its input and its response
-/// sink.
+/// channel.
 ///
-/// [`read_loop`] binds it to stdin/stdout; tests bind it to in-memory buffers.
+/// [`serve_stdio`] binds it to stdin/stdout; tests bind it to in-memory doubles.
 /// Keeping one body means the JSON-RPC notification handling, the
 /// [`MAX_LINE_BYTES`] truncation guard and the dispatch path that ship are the
 /// ones under test — a test-local reimplementation would verify a copy.
-async fn read_loop_from<P, R, S>(
+async fn read_loop_from<P, R, C>(
     server: &Arc<std::sync::Mutex<McpServer<P>>>,
     mut reader: BufReader<R>,
-    sink: &S,
+    channel: &C,
 ) -> Result<(), StdioError>
 where
     P: ContextProvider,
     R: tokio::io::AsyncRead + Unpin + Send,
-    S: LineSink + Sync,
+    C: ClientChannel,
 {
     let mut line = String::new();
 
@@ -339,7 +450,7 @@ where
                     continue;
                 }
             };
-            sink.write_line(&json).await?;
+            channel.write_line(&json).await?;
         }
     }
 
@@ -371,6 +482,8 @@ fn dispatch<P: ContextProvider>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::protocol::{METHOD_INITIALIZE, METHOD_INITIALIZED, METHOD_PING};
 
@@ -718,20 +831,24 @@ mod tests {
         server: &Arc<std::sync::Mutex<McpServer<P>>>,
         input: &[u8],
     ) -> Vec<u8> {
-        let sink = VecSink::default();
-        read_loop_from(server, BufReader::new(input), &sink)
+        let channel = VecSink::default();
+        read_loop_from(server, BufReader::new(input), &channel)
             .await
             .expect("read loop must not error on in-memory input");
-        sink.lines.lock().await.clone()
+        channel.lines.lock().await.clone()
     }
 
-    /// In-memory [`LineSink`] capturing everything the loop writes.
-    #[derive(Default)]
+    /// In-memory [`ClientChannel`] capturing response lines from the read loop
+    /// and notifications from the event pump. `Clone` (via inner `Arc`s) lets
+    /// the spawned pump own its own handle while a test observes the shared
+    /// buffers.
+    #[derive(Clone, Default)]
     struct VecSink {
-        lines: tokio::sync::Mutex<Vec<u8>>,
+        lines: Arc<tokio::sync::Mutex<Vec<u8>>>,
+        notifications: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
-    impl LineSink for VecSink {
+    impl ClientChannel for VecSink {
         async fn write_line(&self, json: &str) -> std::io::Result<()> {
             {
                 let mut buf = self.lines.lock().await;
@@ -740,6 +857,20 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn notify(&self, notification: &JsonRpcNotification) -> bool {
+            if let Ok(json) = serde_json::to_string(notification) {
+                self.notifications.lock().await.push(json);
+            }
+            true
+        }
+    }
+
+    impl VecSink {
+        /// The serialized notifications the pump has pushed so far.
+        async fn notifications(&self) -> Vec<String> {
+            self.notifications.lock().await.clone()
+        }
     }
 
     /// Wraps a mock-backed server for the in-memory loop.
@@ -747,5 +878,171 @@ mod tests {
         Arc::new(std::sync::Mutex::new(McpServer::new(
             MockProvider::default(),
         )))
+    }
+
+    /// Builds a *wired* server (advertising `resources.subscribe`) that has
+    /// completed `initialize` and subscribed to `uri`, returning the event
+    /// sender, the server, and the pump the transport must drive.
+    fn wired_subscribed_server(
+        uri: &str,
+    ) -> (
+        broadcast::Sender<ContextEventEnvelope>,
+        McpServer<MockProvider>,
+        ContextEventPump,
+    ) {
+        let (tx, rx) = broadcast::channel(16);
+        let (mut server, pump) = McpServer::with_event_source(MockProvider::default(), rx);
+
+        let init = JsonRpcRequest {
+            jsonrpc: crate::protocol::JSONRPC_VERSION.to_owned(),
+            method: METHOD_INITIALIZE.to_owned(),
+            params: Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test" }
+            })),
+            id: RequestId::Number(1),
+        };
+        assert!(server.handle_request(&init).unwrap().error.is_none());
+
+        let sub = JsonRpcRequest {
+            jsonrpc: crate::protocol::JSONRPC_VERSION.to_owned(),
+            method: crate::protocol::METHOD_RESOURCES_SUBSCRIBE.to_owned(),
+            params: Some(serde_json::json!({ "uri": uri })),
+            id: RequestId::Number(2),
+        };
+        assert!(server.handle_request(&sub).unwrap().error.is_none());
+
+        (tx, server, pump)
+    }
+
+    /// The HIGH-severity fix: stopping the server while stdin is still open must
+    /// **abort** the event pump, not detach it. All three bridges wrap
+    /// `run_stdio` in a `tokio::select!` that drops the future when
+    /// `mcp_server_stop` fires; dropping a bare pump `JoinHandle` detaches the
+    /// task, which kept running and kept writing `notifications/...` to stdout
+    /// after the server stopped. The `AbortOnDrop` guard in `serve_stdio` closes
+    /// that leak, and this test drives the shipped `serve_stdio` to prove it.
+    #[tokio::test]
+    async fn stopping_stdio_while_stdin_is_open_aborts_the_pump() {
+        use scp_core::context::membership::ContextEvent;
+
+        let (event_tx, server, pump) = wired_subscribed_server("scp://ctx_a/events");
+        let server = Arc::new(std::sync::Mutex::new(server));
+        let channel = VecSink::default();
+
+        // A reader that never reaches EOF: stdin stays "open" so `serve_stdio`
+        // only ends when its future is dropped — exactly what a bridge's
+        // shutdown `select!` branch does. `keep_open` stays alive so the read
+        // half pends forever instead of seeing EOF.
+        let (keep_open, pending) = tokio::io::duplex(64);
+
+        // Drive the SHIPPED serve loop on a task. Aborting the task drops the
+        // `serve_stdio` future, the same drop the bridge `select!` performs.
+        let serve = {
+            let server = Arc::clone(&server);
+            let channel = channel.clone();
+            tokio::spawn(async move {
+                let _ = serve_stdio(&server, Some(pump), BufReader::new(pending), channel).await;
+            })
+        };
+
+        // Positive control: the live pump delivers a first event.
+        event_tx
+            .send(ContextEventEnvelope::new(
+                "ctx_a".to_owned(),
+                ContextEvent::ContentKeysRotated { reason: None },
+            ))
+            .expect("event send");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let seen = channel
+                .notifications()
+                .await
+                .iter()
+                .any(|n| n.contains(crate::protocol::METHOD_RESOURCES_UPDATED));
+            if seen {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the live pump never delivered the first event"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Stop the server mid-stream. Awaiting the aborted task guarantees the
+        // `serve_stdio` future was dropped, so its `AbortOnDrop` guard has run.
+        serve.abort();
+        let _ = serve.await;
+        tokio::task::yield_now().await;
+
+        // The pump must now be dead: a fresh event produces nothing more.
+        let before = channel.notifications().await.len();
+        let _ = event_tx.send(ContextEventEnvelope::new(
+            "ctx_a".to_owned(),
+            ContextEvent::ContentKeysRotated { reason: None },
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let after = channel.notifications().await.len();
+        assert_eq!(
+            before, after,
+            "the pump kept delivering after the server stopped — it was detached, not aborted"
+        );
+
+        drop(keep_open);
+    }
+
+    /// A wired server handed to the transport without its pump is the exact
+    /// advertise-but-never-deliver lie the pairing guard must reject.
+    #[tokio::test]
+    async fn serve_stdio_rejects_a_wired_server_with_no_pump() {
+        let (_tx, server, _pump) = wired_subscribed_server("scp://ctx_a/events");
+        let server = Arc::new(std::sync::Mutex::new(server));
+        // Drop the pump deliberately to model the desync (in real code the
+        // `#[must_use]` would flag the drop; here we assert the transport also
+        // fails closed).
+        let err = serve_stdio(&server, None, BufReader::new(&b""[..]), VecSink::default())
+            .await
+            .expect_err("a wired server with no pump must be refused");
+        assert!(
+            matches!(
+                err,
+                StdioError::PumpServerMismatch {
+                    wired: true,
+                    has_pump: false
+                }
+            ),
+            "expected PumpServerMismatch, got {err:?}"
+        );
+    }
+
+    /// An unwired server handed a spare pump must also be refused — it would run
+    /// a delivery loop the server never advertised.
+    #[tokio::test]
+    async fn serve_stdio_rejects_an_unwired_server_with_a_pump() {
+        let (_tx, _wired, pump) = wired_subscribed_server("scp://ctx_a/events");
+        let unwired = Arc::new(std::sync::Mutex::new(McpServer::new(
+            MockProvider::default(),
+        )));
+        let err = serve_stdio(
+            &unwired,
+            Some(pump),
+            BufReader::new(&b""[..]),
+            VecSink::default(),
+        )
+        .await
+        .expect_err("an unwired server with a pump must be refused");
+        assert!(
+            matches!(
+                err,
+                StdioError::PumpServerMismatch {
+                    wired: false,
+                    has_pump: true
+                }
+            ),
+            "expected PumpServerMismatch, got {err:?}"
+        );
     }
 }
