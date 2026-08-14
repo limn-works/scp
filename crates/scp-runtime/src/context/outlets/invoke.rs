@@ -3407,24 +3407,24 @@ fn executor_error_to_terminal_payload(err: &OutletExecutorError) -> ChunkPayload
 ///   in [`invoke_outlet`], and `End` is emitted only on successful executor
 ///   completion), i.e. "still open and verifiable" per
 ///   [`SourceType::Persistent`](scp_protocol::provenance::SourceType::Persistent).
-/// - `counterparties` — the source context's FULL member roster. This `End`
-///   chunk is delivered IN-context to existing members, and §7.7.1 rule 4
-///   ("Intra-context provenance") is unambiguous: within a context (no
-///   boundary crossing), counterparties are always `full` regardless of the
-///   `counterparty_policy` — the policy governs only what is exported across a
-///   boundary. The roster is captured from [`ContextRoleState::members`] at
-///   stream-open and threaded in as an owned, sorted `Vec<DID>` (the same
-///   pattern as `memory_scope`). Sorting makes the operator-signed
-///   `SCP-OUTLET-CHUNK-SIG-V1:` preimage over this provenance reproducible.
-///   Populating it honestly (rather than leaving it empty) means a consumer
-///   that re-evaluates this output after the source context closes derives
-///   `EphemeralKnownParties` — NOT the degraded `NoProvenance` an empty roster
-///   would force (§24.3.5). A cross-context hop later re-derives counterparties
-///   under the source context's
-///   [`CounterpartyPolicy`](scp_protocol::provenance::CounterpartyPolicy) at
-///   `attach_provenance` time (§7.7.1 rules 1-3) — the intra-context `full`
-///   roster here is the honest input that export policy narrows, never a
-///   membership over-claim across a boundary.
+/// - `counterparties` — empty (cross-context-safe redacted default). The
+///   operator-signed terminal `End` chunk is forwarded VERBATIM across the
+///   cross-context streaming bridge (`run_cross_context_bridge` calls
+///   `forward_frame` on the signed chunk and never re-signs it) to an A-side
+///   invoker that is NOT a member of this host context. The streaming path has
+///   no `apply_counterparty_policy` / narrowing step, so whatever roster this
+///   provenance carries would leak to that non-member unchanged — and because
+///   the chunk is operator-signed, it CANNOT be narrowed downstream without
+///   invalidating the signature. Carrying the full intra-context roster here
+///   would therefore leak this context's membership across a context boundary,
+///   violating §7.7.1 rule 3 (cross-context default `Redacted`) and §9.10
+///   metadata privacy. The chunk must instead carry the cross-context-safe
+///   empty/redacted counterparties. Populating the §7.7.1-rule-4 full
+///   intra-context roster (for in-context-only re-evaluation) requires
+///   mode-aware, cross-context-safe construction that distinguishes the
+///   verbatim-forwarded terminal from an in-context-only delivery; that
+///   distinction does not yet exist on the streaming path, so the honest
+///   redacted default holds until it does.
 /// - `discovery_method` — `OutOfBand`: no protocol-level cross-context
 ///   discovery path produced this output.
 /// - `age` — zero: the output is generated live by the executor for this
@@ -3437,12 +3437,11 @@ fn executor_error_to_terminal_payload(err: &OutletExecutorError) -> ChunkPayload
 fn stream_output_provenance(
     context_id: &str,
     memory_scope: scp_protocol::context::params::MemoryScope,
-    counterparties: Vec<DID>,
 ) -> scp_protocol::provenance::DataProvenance {
     scp_protocol::provenance::DataProvenance {
         source_context: context_id.to_owned(),
         source_type: scp_protocol::provenance::SourceType::Persistent,
-        counterparties,
+        counterparties: Vec::new(),
         purpose: None,
         discovery_method: scp_protocol::provenance::DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
@@ -3744,20 +3743,6 @@ where
     // creation-time parameter set (promotion mutates it in place), so this is
     // the authoritative scope at stream time.
     let memory_scope = context.params().memory_scope;
-    // FIX 1 (§7.7.1 rule 4): capture the hosting context's FULL member roster
-    // so the terminal `End` chunk's provenance carries the honest in-context
-    // counterparty list. The End chunk is delivered IN-context (no boundary
-    // crossing), and §7.7.1 rule 4 mandates `full` counterparties for
-    // intra-context provenance regardless of `counterparty_policy` (which
-    // governs only cross-boundary export). Leaving it empty degraded any
-    // post-close re-evaluation of this output to `NoProvenance` instead of the
-    // correct `EphemeralKnownParties` (§24.3.5). Sorted so the operator-signed
-    // `SCP-OUTLET-CHUNK-SIG-V1:` preimage over this provenance is reproducible.
-    let counterparties: Vec<DID> = {
-        let mut roster: Vec<DID> = role_state.members.iter().cloned().map(DID::from).collect();
-        roster.sort();
-        roster
-    };
     let signing_ctx = InnerPumpSigningContext {
         operator_signer,
         context_id: context_id_owned.clone(),
@@ -3786,7 +3771,6 @@ where
         effective_timeout,
         signing_ctx,
         memory_scope,
-        counterparties,
     };
     tokio::spawn(run_streaming_executor_task(task_inputs));
 
@@ -3838,14 +3822,6 @@ struct StreamingTaskInputs<E: ?Sized> {
     /// stamped into the terminal `End` chunk's provenance so it reflects the
     /// context's true scope rather than a hardcoded `Full` (Item 4).
     memory_scope: MemoryScope,
-    /// Source context's FULL member roster (sorted `Vec<DID>`), captured from
-    /// [`ContextRoleState::members`] at stream-open and stamped into the
-    /// terminal `End` chunk's provenance `counterparties`. §7.7.1 rule 4:
-    /// intra-context provenance counterparties are always `full` (the `End`
-    /// chunk is delivered in-context), so this is the honest roster, not an
-    /// empty list. Owned (mirrors `memory_scope`) because `role_state` is moved
-    /// into the executor future before the terminal is built.
-    counterparties: Vec<DID>,
 }
 
 /// Drives the streaming executor under panic guard + timeout, pumps
@@ -3886,7 +3862,6 @@ where
         effective_timeout,
         signing_ctx,
         memory_scope,
-        counterparties,
     } = inputs;
 
     let start = std::time::Instant::now();
@@ -4002,7 +3977,6 @@ where
         start,
         handler_panic_sink: handler_panic_sink.as_deref(),
         memory_scope,
-        counterparties,
     });
 
     let terminal_chunk =
@@ -4436,11 +4410,6 @@ struct BuildTerminalChunkInputs<'a> {
     /// Hosting context's real retention policy, stamped into the successful
     /// `End` chunk's provenance (Item 4).
     memory_scope: MemoryScope,
-    /// Source context's FULL member roster (sorted), stamped into the
-    /// successful `End` chunk's provenance `counterparties` per §7.7.1 rule 4
-    /// (intra-context provenance is always `full`). Owned so the value
-    /// survives to terminal-emission time; consumed only in the `End` arm.
-    counterparties: Vec<DID>,
 }
 
 /// Builds the §5.4.5 terminal chunk for a streaming outlet invocation
@@ -4469,11 +4438,7 @@ fn build_terminal_chunk(inputs: BuildTerminalChunkInputs<'_>) -> ChunkPayload {
             let execution_time_ms = elapsed_ms(inputs.start);
             ChunkPayload::End {
                 aggregate: serde_json::Value::Null,
-                provenance: stream_output_provenance(
-                    inputs.context_id,
-                    inputs.memory_scope,
-                    inputs.counterparties,
-                ),
+                provenance: stream_output_provenance(inputs.context_id, inputs.memory_scope),
                 execution_time_ms,
             }
         }
@@ -7368,14 +7333,14 @@ mod tests {
             assert_eq!(end.chain_depth, 0);
             assert!(end.chain_path.is_none());
             assert!(end.payment_amount.is_none());
-            // §7.7.1 rule 4 (FIX 1): intra-context provenance carries the FULL
-            // member roster, never an empty list. `test_role_state` seeds a
-            // single member (the creator), so the terminal `End` counterparties
-            // must be exactly that roster.
-            assert_eq!(
-                end.counterparties,
-                vec![DID::from(creator_did)],
-                "intra-context End provenance must carry the full member roster (§7.7.1 rule 4)"
+            // The operator-signed terminal `End` chunk is forwarded verbatim
+            // across the cross-context streaming bridge to a non-member invoker
+            // and cannot be narrowed after signing, so its `counterparties` MUST
+            // be empty (cross-context-safe redacted default; §7.7.1 rule 3,
+            // §9.10) — never the host context's member roster.
+            assert!(
+                end.counterparties.is_empty(),
+                "End provenance counterparties must be empty (cross-context-safe redacted default) — the signed terminal is forwarded verbatim to a non-member and cannot be narrowed downstream"
             );
 
             // Every chunk carries a real (non-forged) operator signature.
