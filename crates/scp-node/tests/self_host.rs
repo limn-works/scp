@@ -1066,7 +1066,7 @@ async fn nat_traversal_disabled_dht_node_starts_without_publishing() {
     // production `dispatch_hosted_site_by_dht_mode` selects EXACTLY this method
     // for `DhtMode::Disabled`.
     let cache = Arc::new(DidCache::new());
-    let (did_method, _seq_init) = scp_node::self_host::build_disabled_did_method(cache);
+    let did_method = scp_node::self_host::build_disabled_did_method(cache);
 
     // `NatTraversal` (skip_nat = false) is a PUBLISHING reach, yet `dht:
     // DhtMode::Disabled` means the node must NOT publish — the reachable-but-

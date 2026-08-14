@@ -377,8 +377,6 @@ async fn run_full_node_ephemeral() {
         sequence_store,
     ));
 
-    let seq_init_method = Arc::clone(&did_method);
-    let seq_init = scp_node::self_host::make_seq_init(seq_init_method);
     // Wrap InMemoryStorage in EncryptingAdapter to satisfy the
     // EncryptedStorage bound. Ephemeral mode data is lost on restart
     // anyway, so a random key is fine.
@@ -392,7 +390,6 @@ async fn run_full_node_ephemeral() {
         domain,
         http_addr,
         custody,
-        seq_init,
         did_method,
         encrypted_storage,
         // Ephemeral contract: in-memory blob, no persistence, env ignored.
@@ -518,7 +515,7 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 "using InMemoryDhtClient — DID documents will NOT be published to the network \
                  (test-harness-only; DhtMode::Disabled is the shipped no-publish value)"
             );
-            let (did_method, seq_init) = scp_node::self_host::build_memory_did_method(
+            let did_method = scp_node::self_host::build_memory_did_method(
                 Arc::clone(&custody),
                 cache,
                 sequence_store,
@@ -529,7 +526,6 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 domain,
                 http_addr,
                 custody,
-                seq_init,
                 did_method,
                 Arc::clone(&node_storage_arc),
                 // Persistent mode: operator-configured durable blob backend
@@ -544,13 +540,13 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
             // DHT HTTP gateways come from the same env var the self-host path
             // reads; the library helper threads them into the pkarr client.
             let dht_gateways = dht_gateways_from_env();
-            let (did_method, seq_init) = match scp_node::self_host::build_production_did_method(
+            let did_method = match scp_node::self_host::build_production_did_method(
                 Arc::clone(&custody),
                 cache,
                 sequence_store,
                 &dht_gateways,
             ) {
-                Ok(pair) => pair,
+                Ok(method) => method,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to build production DID method");
                     std::process::exit(1);
@@ -562,7 +558,6 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 domain,
                 http_addr,
                 custody,
-                seq_init,
                 did_method,
                 Arc::clone(&node_storage_arc),
                 // Persistent mode: operator-configured durable blob backend
@@ -896,10 +891,11 @@ fn dht_gateways_from_env() -> Vec<String> {
 /// Shared implementation for `run_full_node`, parameterized over DID method
 /// and storage type.
 ///
-/// The `seq_init` callback is invoked with the node's DID string after
-/// `build()` completes, before any publish operation. It calls
-/// `DidDht::initialize_sequence` to recover the BEP44 sequence number from
-/// the persistent store and/or DHT.
+/// The BEP44 publish-sequence counter is bootstrapped INSIDE the node builder
+/// (`build_domain_inner` / `build_no_domain_inner`), ahead of the startup
+/// publish, via [`scp_identity::DidMethod::initialize_sequence`] — so `Node::start`
+/// already publishes at the correct next sequence and no post-build step is
+/// needed here (SCP-RELAYRES-004).
 async fn run_node_with<
     K: scp_platform::KeyCustody + 'static,
     D: scp_identity::DidMethod + 'static,
@@ -908,7 +904,6 @@ async fn run_node_with<
     domain: String,
     http_addr: SocketAddr,
     custody: Arc<K>,
-    seq_init: scp_node::self_host::SeqInitFn,
     did_method: Arc<D>,
     storage: S,
     // The relay's blob backend, selected by each caller at ITS OWN boundary
@@ -1013,12 +1008,9 @@ async fn run_node_with<
         }
     };
 
-    // Initialize BEP44 sequence number from persistent store and/or DHT
-    // BEFORE any publish operation.
-    let did = node.identity().did().to_owned();
-    if let Err(e) = seq_init(did).await {
-        tracing::error!(error = %e, "failed to initialize BEP44 sequence — publishing may fail");
-    }
+    // The BEP44 sequence counter was bootstrapped inside the builder ahead of
+    // the startup publish (SCP-RELAYRES-004), so `Node::start` above already
+    // published at the correct next sequence — no post-build seq step here.
 
     tracing::info!(
         did = %node.identity().did(),
