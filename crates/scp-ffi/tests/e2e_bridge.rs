@@ -582,7 +582,7 @@ fn event_log_query_with_filter() {
 ///
 /// The projection tests below need a leaf of a SPECIFIC type
 /// (`GovernanceActionExecuted` with a `target_did`, `RoleAssigned` with a
-/// `subject_did`). Since #1933 `event_log_query` reads the authoritative log
+/// `subject_did`). Because `event_log_query` reads the authoritative log
 /// exclusively, and a full governance round-trip is not drivable from this
 /// harness (the governance key resolver only resolves DID-document-published
 /// identities; in-memory test identities are never published), so the event is
@@ -614,8 +614,7 @@ fn event_log_query_projects_governance_target_did() {
     // The query must project a `GovernanceActionExecuted` leaf's `target_did`
     // into `payload` via the shared `project_payload` decoder, agreeing
     // byte-for-byte with the other three bridges. Driven over the
-    // AUTHORITATIVE log — since #1933 there is no bridge-local fallback to
-    // project from.
+    // AUTHORITATIVE log — there is no bridge-local fallback to project from.
     Python::with_gil(|py| {
         let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
         let bi = scp.bridge_instance();
@@ -712,8 +711,8 @@ fn event_log_query_projects_role_assigned_subject_did() {
     });
 }
 
-/// #1933 — an UNKNOWN authoritative log must FAIL CLOSED, not fall through to
-/// the bridge-local tree and publish its root as `merkle_root` in a synthesized
+/// An UNKNOWN authoritative log must FAIL CLOSED, not fall through to the
+/// bridge-local tree and publish its root as `merkle_root` in a synthesized
 /// `LogSummary` event.
 #[test]
 fn event_log_query_fails_closed_when_the_authoritative_log_is_unknown() {
@@ -746,7 +745,6 @@ fn event_log_query_fails_closed_when_the_authoritative_log_is_unknown() {
 
 // ---------------------------------------------------------------------------
 // event_log_verify — proofs are generated against the AUTHORITATIVE log only
-// (F3 / GitHub #1933)
 // ---------------------------------------------------------------------------
 
 /// The AUTHORITATIVE event log — the same source `event_log_query` reads,
@@ -849,10 +847,10 @@ fn event_log_verify_inclusion_proof_after_append() {
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
-        // Append an unsigned event so the BRIDGE-LOCAL log is non-empty. Since
-        // #1933 this tree is irrelevant to verification — the proof below is
-        // generated against the authoritative supervisor log, which already
-        // holds the context's `ContextCreated` leaf.
+        // Append an unsigned event so the BRIDGE-LOCAL log is non-empty. This
+        // tree is irrelevant to verification — the proof below is generated
+        // against the authoritative supervisor log, which already holds the
+        // context's `ContextCreated` leaf.
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
@@ -890,7 +888,7 @@ fn event_log_verify_inclusion_proof_after_append() {
     });
 }
 
-/// F3 / GitHub #1933 — the forgeable false-negative absence proof.
+/// The forgeable false-negative absence proof.
 ///
 /// An ABSENCE claim for an event that IS in the authoritative log must be
 /// rejected. Pre-fix the proof ran over the bridge-local tree, which does not
@@ -946,11 +944,11 @@ fn event_log_verify_absence_of_an_authoritative_event_is_rejected() {
     });
 }
 
-/// (b) #1933 — a caller-injected BRIDGE-LOCAL leaf must never be provable as
-/// included. Pre-fix the synced tree was a UNION of the authoritative leaves
-/// and any bridge-local suffix, so `provenance_attach` + an inclusion claim at
-/// the next index produced `verified: true` for a caller-chosen leaf sitting at
-/// an authoritative-looking index.
+/// A caller-injected BRIDGE-LOCAL leaf must never be provable as included.
+/// Pre-fix the synced tree was a UNION of the authoritative leaves and any
+/// bridge-local suffix, so `provenance_attach` + an inclusion claim at the next
+/// index produced `verified: true` for a caller-chosen leaf sitting at an
+/// authoritative-looking index.
 #[test]
 fn event_log_verify_cannot_prove_a_caller_injected_local_leaf() {
     Python::with_gil(|py| {
@@ -1015,10 +1013,10 @@ fn event_log_verify_cannot_prove_a_caller_injected_local_leaf() {
     });
 }
 
-/// (c) #1933 — the proof's `root` must be the AUTHORITATIVE Merkle root, and
-/// the details must carry the authoritative `leaf_count`, so a relying party
-/// can pin the proof against the log's own commitment. Pre-fix the root was
-/// that of the union tree and matched nothing.
+/// The proof's `root` must be the AUTHORITATIVE Merkle root, and the details
+/// must carry the authoritative `leaf_count`, so a relying party can pin the
+/// proof against the log's own commitment. Pre-fix the root was that of the
+/// union tree and matched nothing.
 #[test]
 fn event_log_verify_details_carry_the_authoritative_root_and_leaf_count() {
     Python::with_gil(|py| {
@@ -1106,11 +1104,11 @@ fn event_log_verify_details_carry_the_authoritative_root_and_leaf_count() {
     });
 }
 
-/// (d) #1933 — verification is READ-ONLY. Pre-fix the "rebuild on divergence"
-/// branch discarded the bridge-local log's leaves AND its stored events,
-/// destroying real bridge-local records (UCAN revocations, outlet invocations,
-/// provenance) and resetting the sequence counter that `mcp.rs` derives its
-/// storage key from.
+/// Verification is READ-ONLY. Pre-fix the "rebuild on divergence" branch
+/// discarded the bridge-local log's leaves AND its stored events, destroying
+/// real bridge-local records (UCAN revocations, outlet invocations, provenance)
+/// and resetting the sequence counter that `mcp.rs` derives its storage key
+/// from.
 #[test]
 fn event_log_verify_never_mutates_the_bridge_local_log() {
     Python::with_gil(|py| {
@@ -1162,9 +1160,9 @@ fn event_log_verify_never_mutates_the_bridge_local_log() {
     });
 }
 
-/// (a) #1933 — the provider reporting NO LOG (`Ok(None)`) means UNKNOWN, never
-/// "empty". Pre-fix the sync silently no-op'd on `None` and the proof fell
-/// through to the bridge-local tree, so an absence claim "verified".
+/// The provider reporting NO LOG (`Ok(None)`) means UNKNOWN, never "empty".
+/// Pre-fix the sync silently no-op'd on `None` and the proof fell through to
+/// the bridge-local tree, so an absence claim "verified".
 #[test]
 fn event_log_verify_fails_closed_when_the_authoritative_log_is_unknown() {
     Python::with_gil(|py| {
@@ -1210,9 +1208,9 @@ fn event_log_verify_fails_closed_when_the_authoritative_log_is_unknown() {
     });
 }
 
-/// (e) #1933 — a SHUT-DOWN instance must be rejected, not merely a suspended
-/// one. `supervisor()` only errors on suspend and just warns after shutdown,
-/// so gating on it alone left the shutdown path open; `check_ready()` rejects
+/// A SHUT-DOWN instance must be rejected, not merely a suspended one.
+/// `supervisor()` only errors on suspend and just warns after shutdown, so
+/// gating on it alone left the shutdown path open; `check_ready()` rejects
 /// both.
 #[test]
 fn event_log_verify_fails_closed_after_shutdown() {
@@ -1335,10 +1333,10 @@ fn event_log_checkpoint_by_did_generates_signed_checkpoint() {
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
-        // Append an unsigned event to the BRIDGE-LOCAL tree. Since the #1933
-        // follow-up this tree is irrelevant to checkpointing — the commitment
-        // below is taken over the authoritative supervisor log, which already
-        // holds the context's `ContextCreated` leaf.
+        // Append an unsigned event to the BRIDGE-LOCAL tree. This tree is
+        // irrelevant to checkpointing — the commitment below is taken over the
+        // authoritative supervisor log, which already holds the context's
+        // `ContextCreated` leaf.
         runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
@@ -1369,7 +1367,7 @@ fn event_log_checkpoint_by_did_generates_signed_checkpoint() {
 
 // ---------------------------------------------------------------------------
 // event_log_checkpoint — the SIGNED commitment covers the AUTHORITATIVE log
-// only (GitHub #1933 follow-up)
+// only
 //
 // A `ConsistencyCheckpoint` is signed, non-repudiable evidence: a peer that
 // sees the same `event_count` with a different `merkle_root` raises

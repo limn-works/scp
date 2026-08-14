@@ -110,10 +110,10 @@ const KT_COROUTINE_BRIDGE: &str = include_str!(
     "../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt"
 );
 // `Scp.kt` is the PRODUCTION Kotlin wrapper surface: it wraps the
-// UniFFI-generated `NativeScp` (one `suspend fun` per bridged UniFFI
-// function). Operations that live ONLY here — e.g. `eventLogVerify`,
-// whose never-swapped `NativeBindings` scaffold slice was deleted
-// (#1933) — are invisible to a scan of `CoroutineBridge.kt` alone.
+// UniFFI-generated `NativeScp` (one `suspend fun` per bridged UniFFI function).
+// Operations that live ONLY here — e.g. `eventLogVerify`, whose never-swapped
+// `NativeBindings` scaffold slice was deleted — are invisible to a scan of
+// `CoroutineBridge.kt` alone.
 const KT_SCP: &str =
     include_str!("../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt");
 

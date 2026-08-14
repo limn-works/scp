@@ -353,8 +353,8 @@ impl McpNapiBridgeProvider {
     }
 }
 
-/// Fetches the context's AUTHORITATIVE event log for the MCP `events` summary
-/// (GitHub #1933), mirroring the fail-closed gate `event_log_verify` uses.
+/// Fetches the context's AUTHORITATIVE event log for the MCP `events` summary,
+/// mirroring the fail-closed gate `event_log_verify` uses.
 ///
 /// `check_ready` rejects suspended AND shut-down instances, then the supervisor
 /// is resolved and the ONE authoritative snapshot replayed. Every failure maps
@@ -426,14 +426,14 @@ impl ContextProvider for McpNapiBridgeProvider {
     }
 
     fn context_events(&self, context_id: &str) -> serde_json::Value {
-        // #1933: bring NAPI to parity — the event-log summary the MCP `events`
-        // resource publishes commits to the AUTHORITATIVE log (the same
-        // `(event_count, merkle_root)` pair `event_log_verify` /
-        // `event_log_checkpoint` commit to), routed through the ONE shared
-        // helper so the bytes are identical across all three bridges. This arm
-        // previously returned an empty array — a third cross-bridge
-        // inconsistency. An unreachable log FAILS CLOSED to an honest absent
-        // object (SCP-CTX-2138), never a fabricated zero root or count.
+        // The event-log summary the MCP `events` resource publishes commits to
+        // the AUTHORITATIVE log (the same `(event_count, merkle_root)` pair
+        // `event_log_verify` / `event_log_checkpoint` commit to), routed
+        // through the ONE shared helper so the bytes are identical across all
+        // three bridges. This arm previously returned an empty array — a third
+        // cross-bridge inconsistency. An unreachable log FAILS CLOSED to an
+        // honest absent object (SCP-CTX-2138), never a fabricated zero root or
+        // count.
         let log = self
             .upgrade_bi()
             .and_then(|bi| authoritative_log_for_mcp_events(&bi, context_id));
@@ -518,7 +518,7 @@ async fn run_mcp_stdio_server(
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of `mcp_context_events` (GitHub #1933).
+/// Per-bridge-instance implementation of `mcp_context_events`.
 ///
 /// Returns the event-log summary the MCP `events` resource publishes for
 /// `handle`'s context — `{"event_count": N, "merkle_root": "<hex>"}` over the
@@ -574,8 +574,8 @@ pub(crate) async fn mcp_server_create_on(
     let server_clone = Arc::clone(&server);
     let transport_mode = config.transport.clone();
     // Weak for the SSE arm's provider (constructed inside the spawned task) so
-    // its `events` resource reads the SAME authoritative log (#1933) without
-    // keeping a dropped bridge instance alive.
+    // its `events` resource reads the SAME authoritative log without keeping a
+    // dropped bridge instance alive.
     let sse_bi = Arc::downgrade(bi);
 
     let task_handle = crate::runtime().spawn(async move {
@@ -1036,11 +1036,11 @@ mod tests {
         assert!(!b_state.allowed.contains(&"custom-a".to_owned()));
     }
 
-    /// #1933 fail-closed parity: NAPI's `context_events` arm must fail closed
-    /// to the honest absent object (SCP-CTX-2138) — never a fabricated zero
-    /// root/count — when the authoritative event log is unreachable. Here the
-    /// bridge instance is dropped so the provider's `Weak` can no longer
-    /// upgrade, forcing the fail-closed path. Mirrors the `PyO3`
+    /// Fail-closed parity: NAPI's `context_events` arm must fail closed to the
+    /// honest absent object (SCP-CTX-2138) — never a fabricated zero root/count
+    /// — when the authoritative event log is unreachable. Here the bridge
+    /// instance is dropped so the provider's `Weak` can no longer upgrade,
+    /// forcing the fail-closed path. Mirrors the `PyO3`
     /// `ffi_bridge_provider_returns_safe_defaults_when_bridge_dropped` and the
     /// `UniFFI` `mcp_uniffi_provider_returns_safe_defaults_when_bridge_dropped`
     /// siblings gained in this delta.
@@ -1065,10 +1065,10 @@ mod tests {
             "upgrade_bi must fail after the bridge instance is dropped"
         );
 
-        // context_events FAILS CLOSED to the honest absent object (#1933): a
-        // dropped bridge cannot reach the authoritative log, so the summary
-        // carries SCP-CTX-2138 and NO `event_count` / `merkle_root` key —
-        // never a fabricated zero root/count a consumer could mistake for a
+        // context_events FAILS CLOSED to the honest absent object: a dropped
+        // bridge cannot reach the authoritative log, so the summary carries
+        // SCP-CTX-2138 and NO `event_count` / `merkle_root` key — never a
+        // fabricated zero root/count a consumer could mistake for a
         // genuinely-empty log.
         let events = provider.context_events("ctx-dropped");
         assert_eq!(

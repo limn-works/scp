@@ -11489,7 +11489,7 @@ impl Supervisor {
     /// Synchronous for the same reason as [`Self::event_log_entries`]: the FFI
     /// event-log probes that call it cannot `.await`.
     ///
-    /// # Security (GitHub #1933)
+    /// # Security
     ///
     /// FAILS CLOSED when the provider reports no log for the context. `None`
     /// means UNKNOWN — never initialised, or destroyed by `destroy_event_log`
@@ -11534,7 +11534,7 @@ impl Supervisor {
     /// `epoch` is `Some(mls_epoch)` for MLS-encrypted contexts and `None` for
     /// Broadcast contexts, which do not use MLS.
     ///
-    /// # Security (GitHub #1933 follow-up)
+    /// # Security
     ///
     /// A checkpoint is signed, non-repudiable evidence: a peer that sees the
     /// same `event_count` with a different `merkle_root` raises
@@ -14679,10 +14679,10 @@ impl Supervisor {
     /// runtime's own lifecycle/governance paths make; it is a seam for
     /// *reaching* the authoritative log from a test, not a substitute for it.
     /// Bridge tests need it because the FFI event-log surfaces read the
-    /// authoritative log exclusively (GitHub #1933), while a leaf of a specific
-    /// type — a `GovernanceActionExecuted` carrying a `target_did`, say — is
-    /// otherwise only produced by a full governance round-trip that the bridge
-    /// test harness cannot drive (the governance key resolver only resolves
+    /// authoritative log exclusively, while a leaf of a specific type — a
+    /// `GovernanceActionExecuted` carrying a `target_did`, say — is otherwise
+    /// only produced by a full governance round-trip that the bridge test
+    /// harness cannot drive (the governance key resolver only resolves
     /// DID-document-published identities, and in-memory test identities are
     /// never published).
     ///

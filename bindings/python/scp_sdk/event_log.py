@@ -178,8 +178,9 @@ class Proof:
     append order, and the sorted index the neighbours are drawn from is local
     state the root does not cover. So the neighbour-inclusion half is checkable
     off-box against the reported ``root``, but adjacency is not — this is NOT a
-    self-contained non-membership proof (a sorted/sparse tree is the real fix;
-    see #2314).
+    self-contained non-membership proof (a sorted/sparse Merkle tree whose
+    root commits to sorted order is the real fix; that is a change to the
+    protocol's Merkle construction, not to this binding).
     """
 
     #: The proof type: ``"inclusion"`` or ``"absence"``.

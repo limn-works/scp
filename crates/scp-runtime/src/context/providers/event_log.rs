@@ -1778,7 +1778,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Proof seam — the single authoritative snapshot (GitHub #1933)
+    // Proof seam — the single authoritative snapshot
     //
     // `rebuild_event_log_for_proof` is the ONE call every Merkle answer is
     // derived from. These tests pin its two security-critical properties: the
@@ -1891,9 +1891,9 @@ mod tests {
         );
     }
 
-    /// #1933 — `None` from the provider means UNKNOWN, not empty. A DESTROYED
-    /// log (actor shutdown, create-rollback) must not yield a snapshot at all,
-    /// so no "verified" absence proof can be built for an event it previously
+    /// `None` from the provider means UNKNOWN, not empty. A DESTROYED log
+    /// (actor shutdown, create-rollback) must not yield a snapshot at all, so
+    /// no "verified" absence proof can be built for an event it previously
     /// recorded.
     #[tokio::test]
     async fn destroyed_log_fails_closed_instead_of_snapshotting_empty() {

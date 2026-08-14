@@ -686,14 +686,15 @@ export async function evaluateTrust(
   // Layer 2: query behavioral record from the event log.
   //
   // NOT wrapped in a catch. This used to swallow ANY `[SCP-CTX-NNNN]` from
-  // `eventLogQuery` into `behavioralRecord: null`, on the theory that a context
-  // error there meant "the subject has no event-log history yet". That is no
-  // longer a state the bridge signals with an error: since GitHub #1933 an
+  // `eventLogQuery` into `behavioralRecord: null`, on the theory that a
+  // context error there meant "the subject has no event-log history yet".
+  // That is no longer a state the bridge signals with an error: an
   // empty-but-live authoritative log returns an EMPTY LIST, and the only
-  // context error the query raises is `SCP-CTX-2138` — the authoritative log is
-  // UNREACHABLE or UNKNOWN. Swallowing that would turn a fail-closed refusal
-  // into a confident "this subject has no behavioural history", i.e. a trust
-  // evaluation built on absence that was never established. It propagates.
+  // context error the query raises is `SCP-CTX-2138` — the authoritative
+  // log is UNREACHABLE or UNKNOWN. Swallowing that would turn a fail-closed
+  // refusal into a confident "this subject has no behavioural history",
+  // i.e. a trust evaluation built on absence that was never established. It
+  // propagates.
   let behavioralRecord: BehavioralRecord | null = null;
   {
     // `scp.eventLogQuery` returns the raw NAPI event objects, which carry an
