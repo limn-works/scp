@@ -823,8 +823,10 @@ fn reverify_inclusion_json(details: &Bound<'_, pyo3::types::PyAny>) -> bool {
 }
 
 /// Injects a caller-influenced leaf into the BRIDGE-LOCAL tree through a real
-/// public bridge call (`provenance_attach` appends a `ProvenanceAttached` leaf
-/// whose payload is the caller-derived provenance hash).
+/// public bridge call. The source context (`ctx-source-injected`) is missing,
+/// so only the target-side `ProvenanceReceived` leaf — whose payload is the
+/// caller-derived provenance hash — lands on `ctx_id`'s bridge-local tree; the
+/// source-side `ProvenanceAttached` append is dropped best-effort.
 fn inject_local_leaf(scp: &_scp_core::scp::PyScp, py: Python<'_>, ctx_id: &str, actor_did: &str) {
     scp.provenance_attach(
         py,

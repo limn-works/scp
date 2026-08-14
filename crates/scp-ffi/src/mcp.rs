@@ -653,6 +653,62 @@ impl FfiBridgeProvider {
     }
 }
 
+/// Fetches the context's AUTHORITATIVE event log for the MCP `events` summary
+/// (GitHub #1933), mirroring the fail-closed gate `event_log_verify` uses.
+///
+/// `check_ready` rejects suspended AND shut-down instances, then the supervisor
+/// is resolved and the ONE authoritative snapshot replayed. Every failure maps
+/// to a `String` detail so the caller can render the honest absent object via
+/// [`scp_ffi_common::event_log::context_events_metadata_json`] — the summary
+/// never falls back to the bridge-local tree.
+fn authoritative_log_for_mcp_events(
+    bi: &crate::runtime::PyBridgeInstance,
+    context_id: &str,
+) -> Result<scp_event_log::EventLog, String> {
+    bi.core.check_ready().map_err(|e| e.to_string())?;
+    let supervisor = crate::runtime::supervisor(bi).map_err(|e| e.to_string())?;
+    supervisor
+        .authoritative_event_log(context_id)
+        .map_err(|e| e.to_string())
+}
+
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Returns the event-log summary the MCP `events` resource publishes for a
+    /// context, as a JSON string.
+    ///
+    /// This is the exact metadata `ContextProvider::context_events` serves for
+    /// `scp://{context_id}/events` — `{"event_count": N, "merkle_root": "<hex>"}`
+    /// over the AUTHORITATIVE event log (`Supervisor::authoritative_event_log`),
+    /// the SAME `(count, root)` `event_log_verify` / `event_log_checkpoint`
+    /// commit to — routed through the ONE shared
+    /// [`scp_ffi_common::event_log::context_events_metadata_json`] helper so the
+    /// bytes are identical across all three bridges (GitHub #1933). It NEVER
+    /// reads the caller-influenceable bridge-local `FfiBridgeState::event_log`.
+    ///
+    /// FAILS CLOSED: when the authoritative log is unreachable (instance
+    /// suspended/shut down, no supervisor, or no log for the context) the
+    /// returned object carries `{"error": ..., "code": "SCP-CTX-2138"}` with no
+    /// `event_count` / `merkle_root` — an honest absent state, never a
+    /// fabricated zero root or count.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if `context_id` is malformed. Authoritative-log
+    /// unreachability is NOT an error here — it is reported in-band as the
+    /// fail-closed object, matching the resource surface.
+    #[pyo3(name = "mcp_context_events")]
+    pub fn mcp_context_events(&self, context_id: &str) -> PyResult<String> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        let log = authoritative_log_for_mcp_events(bi, context_id);
+        Ok(
+            scp_ffi_common::event_log::context_events_metadata_json(context_id, log.as_ref())
+                .to_string(),
+        )
+    }
+}
+
 impl ContextProvider for FfiBridgeProvider {
     fn active_context_ids(&self) -> Vec<String> {
         self.context_ids.clone()
@@ -1177,21 +1233,19 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn context_events(&self, context_id: &str) -> serde_json::Value {
-        // The EventLog stores Merkle tree hashes, not event payloads.
-        // Return the event count and Merkle root as metadata.
-        // Falls back to zero-count JSON if the bridge has been dropped.
-        let Ok(bi) = self.upgrade_bi() else {
-            return serde_json::json!({ "event_count": 0 });
-        };
-        crate::runtime::with_context(&bi, context_id, |rt| {
-            let leaf_count = rt.event_log.leaves().len();
-            let root = scp_event_log::tree::root(&rt.event_log);
-            Ok(serde_json::json!({
-                "event_count": leaf_count,
-                "merkle_root": crate::types::encode_hex(&root),
-            }))
-        })
-        .unwrap_or_else(|_| serde_json::json!({ "event_count": 0 }))
+        // #1933: the event-log summary the MCP `events` resource publishes MUST
+        // commit to the AUTHORITATIVE log — the same `(event_count, merkle_root)`
+        // pair `event_log_verify` / `event_log_checkpoint` commit to — NOT the
+        // caller-influenceable bridge-local tree this used to read. Both this
+        // resource path and the `mcp_context_events` bridge method route through
+        // the ONE shared helper over the ONE authoritative snapshot, so the root
+        // is byte-identical to what the verify/checkpoint paths sign. An
+        // unreachable log FAILS CLOSED to an honest absent object (SCP-CTX-2138),
+        // never a fabricated zero root or count.
+        let log = self
+            .upgrade_bi()
+            .and_then(|bi| authoritative_log_for_mcp_events(&bi, context_id));
+        scp_ffi_common::event_log::context_events_metadata_json(context_id, log.as_ref())
     }
 
     fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
@@ -3830,12 +3884,20 @@ mod tests {
         // context_members: returns empty.
         assert!(provider.context_members("ctx-dropped").is_empty());
 
-        // context_events: returns zero-count JSON fallback.
+        // context_events: FAILS CLOSED to the honest absent object (#1933) —
+        // NOT a fabricated zero root/count that a consumer could mistake for a
+        // genuinely-empty log. A dropped bridge cannot reach the authoritative
+        // log, so the summary carries SCP-CTX-2138 and no `event_count` /
+        // `merkle_root` key.
         let events = provider.context_events("ctx-dropped");
         assert_eq!(
-            events,
-            serde_json::json!({ "event_count": 0 }),
-            "context_events must emit the zero-count fallback"
+            events.get("code").and_then(serde_json::Value::as_str),
+            Some(scp_ffi_common::error_codes::CTX_2138),
+            "context_events must fail closed with SCP-CTX-2138 when the bridge is dropped"
+        );
+        assert!(
+            events.get("event_count").is_none() && events.get("merkle_root").is_none(),
+            "the fail-closed summary must not fabricate a zero root or count"
         );
 
         // validate_capability: returns Err.

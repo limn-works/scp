@@ -2456,6 +2456,19 @@
       ]
     },
     {
+      "canonical": "mcp_context_events",
+      "category": "mcp",
+      "pyo3": [
+        "mcp_context_events"
+      ],
+      "uniffi": [
+        "mcp_context_events"
+      ],
+      "napi": [
+        "mcp_context_events"
+      ]
+    },
+    {
       "canonical": "outlet_interface_expose",
       "category": "outlets",
       "pyo3": [

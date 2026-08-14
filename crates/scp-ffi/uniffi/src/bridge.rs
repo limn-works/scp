@@ -326,6 +326,25 @@ fn authoritative_log_unreachable(
     }
 }
 
+/// Fetches the context's AUTHORITATIVE event log for the MCP `events` summary
+/// (GitHub #1933), mirroring the fail-closed gate `event_log_verify` uses.
+///
+/// `check_ready` rejects suspended AND shut-down instances, then the supervisor
+/// is resolved and the ONE authoritative snapshot replayed. Every failure maps
+/// to a `String` detail so the caller can render the honest absent object via
+/// [`scp_ffi_common::event_log::context_events_metadata_json`] — the summary
+/// never falls back to the per-context UCAN-state tree.
+fn authoritative_log_for_mcp_events(
+    bi: &crate::runtime::UniffiBridgeInstance,
+    context_id: &str,
+) -> Result<scp_event_log::EventLog, String> {
+    bi.core.check_ready().map_err(|e| e.to_string())?;
+    let supervisor = bi.context_manager_or_error().map_err(|e| e.to_string())?;
+    supervisor
+        .authoritative_event_log(context_id)
+        .map_err(|e| e.to_string())
+}
+
 /// Builds the unsigned §9.9.3 checkpoint over the AUTHORITATIVE event log.
 ///
 /// Shared by both `UniFFI` checkpoint entry points so they cannot drift on WHICH
@@ -2528,7 +2547,7 @@ pub struct Event {
 /// append order, and the sorted index the neighbours are drawn from is local
 /// state the root does not cover. Treat an `"absence"` answer as the log's own
 /// assertion plus checkable neighbour-inclusion, not as a self-contained
-/// negative proof.
+/// non-membership proof (a sorted/sparse tree is the real fix — see #2314).
 ///
 /// See ADR-011 (Event Log).
 #[derive(Debug, Clone, uniffi::Record)]
@@ -5452,26 +5471,19 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn context_events(&self, context_id: &str) -> serde_json::Value {
-        // The EventLog stores Merkle tree hashes, not event payloads.
-        // Return the event count and Merkle root as metadata (matching PyO3).
-        // Falls back to zero-count JSON if the bridge has been dropped
-        // (#1549 round-2).
-        let Ok(bi) = self.upgrade_bi() else {
-            return serde_json::json!({ "event_count": 0 });
-        };
-        if let Some(handle) = context_handle_registry(&bi).get(context_id) {
-            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
-        }
-
-        bi.with_ucan_state(context_id, |ucan_state| {
-            let leaf_count = ucan_state.event_log.leaves().len();
-            let root = scp_event_log::tree::root(&ucan_state.event_log);
-            serde_json::json!({
-                "event_count": leaf_count,
-                "merkle_root": hex::encode(root),
-            })
-        })
-        .unwrap_or_else(|| serde_json::json!({ "event_count": 0 }))
+        // #1933: the event-log summary the MCP `events` resource publishes MUST
+        // commit to the AUTHORITATIVE log — the same `(event_count, merkle_root)`
+        // pair `event_log_verify` / `event_log_checkpoint` commit to — NOT the
+        // caller-influenceable per-context UCAN-state tree this used to read.
+        // Both this resource path and the `mcp_context_events` bridge method
+        // route through the ONE shared helper over the ONE authoritative
+        // snapshot, so the root is byte-identical to what verify/checkpoint sign.
+        // An unreachable log FAILS CLOSED to an honest absent object
+        // (SCP-CTX-2138), never a fabricated zero root or count.
+        let log = self
+            .upgrade_bi()
+            .and_then(|bi| authoritative_log_for_mcp_events(&bi, context_id));
+        scp_ffi_common::event_log::context_events_metadata_json(context_id, log.as_ref())
     }
 
     fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
@@ -15115,9 +15127,12 @@ impl Scp {
     /// to the UCAN-state tree. Proof-generation failures over a readable log
     /// (empty log, out-of-range index, absence claimed for a present event)
     /// return `SCP-CTX-2139` — the honest negative answer, distinct from
-    /// "cannot answer." A malformed claim (invalid JSON, missing/mistyped
-    /// fields, unsupported type) is rejected with `SCP-VALID-7000` before any
-    /// log is consulted.
+    /// "cannot answer." A malformed claim carries `SCP-VALID-7000` (caller
+    /// input validation): invalid JSON or a missing/invalid `type` is rejected
+    /// before the authoritative log is consulted, but a missing `leaf_index`, a
+    /// malformed `event_hash`, or an unsupported claim type is rejected only
+    /// after the authoritative log is confirmed reachable — so an *unreachable*
+    /// log surfaces `SCP-CTX-2138` first for those.
     pub async fn event_log_verify(
         &self,
         handle: Arc<ContextHandle>,
@@ -15137,6 +15152,20 @@ impl Scp {
                         code: codes::VALID_7000.to_owned(),
                     })?;
 
+                // DELIBERATE ordering (black-hat NIT, #1933): the invalid-JSON
+                // and missing/invalid-`type` checks run BEFORE the
+                // `check_ready`/authoritative-log gate below, on purpose —
+                // rejecting obviously-malformed claim shape is cheap, and a
+                // claim we cannot even parse or type cannot be answered against
+                // any log. The resulting self-oracle (a malformed-`type` claim
+                // on a not-ready instance returns VALID-7000 while a well-formed
+                // one returns CTX-2138) is benign: the caller crafted the
+                // malformed type and can already probe readiness with a
+                // well-formed claim, so the malformed path leaks strictly less.
+                // The remaining VALID-7000 sites (missing `leaf_index`,
+                // malformed `event_hash`, unsupported type) sit AFTER the gate,
+                // so an unreachable log surfaces CTX-2138 first for those — the
+                // documented precedence.
                 let claim_type = claim.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
                     ScpError::Context {
                         msg: "claim must include 'type' field ('inclusion' or 'absence')"
@@ -15260,6 +15289,42 @@ impl Scp {
                 msg: format!("tokio task join error during event log verification: {e}"),
                 code: codes::CTX_2026.to_owned(),
             })?
+    }
+
+    /// Returns the event-log summary the MCP `events` resource publishes for a
+    /// context, as a JSON string.
+    ///
+    /// This is the exact metadata `ContextProvider::context_events` serves for
+    /// `scp://{context_id}/events` — `{"event_count": N, "merkle_root": "<hex>"}`
+    /// over the AUTHORITATIVE event log (`Supervisor::authoritative_event_log`),
+    /// the SAME `(count, root)` [`Self::event_log_verify`] /
+    /// [`Self::event_log_checkpoint`] commit to — routed through the ONE shared
+    /// [`scp_ffi_common::event_log::context_events_metadata_json`] helper so the
+    /// bytes are identical across all three bridges (GitHub #1933). It NEVER
+    /// reads the caller-influenceable per-context UCAN-state `EventLog`.
+    ///
+    /// FAILS CLOSED: when the authoritative log is unreachable (instance
+    /// suspended/shut down, no supervisor, or no log for the context) the
+    /// returned object carries `{"error": ..., "code": "SCP-CTX-2138"}` with no
+    /// `event_count` / `merkle_root` — an honest absent state, never a
+    /// fabricated zero root or count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScpError`] only for a handle-affinity mismatch. Authoritative-log
+    /// unreachability is NOT an error here — it is reported in-band as the
+    /// fail-closed object, matching the resource surface.
+    pub fn mcp_context_events(&self, handle: Arc<ContextHandle>) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let context_id = handle.context_id.clone();
+        let log = authoritative_log_for_mcp_events(&self.inner, &context_id);
+        Ok(
+            scp_ffi_common::event_log::context_events_metadata_json(&context_id, log.as_ref())
+                .to_string(),
+        )
     }
 
     /// Per-instance equivalent of the free-function `event_log_checkpoint`.
@@ -23254,10 +23319,23 @@ mod tests {
         // context_members: returns empty.
         assert!(provider.context_members("ctx-dropped").is_empty());
 
-        // context_events: returns zero-count JSON fallback.
+        // context_events: FAILS CLOSED to the honest absent object (#1933) —
+        // NOT a fabricated zero root/count that a consumer could mistake for a
+        // genuinely-empty log. A dropped bridge cannot reach the authoritative
+        // log, so the summary carries SCP-CTX-2138 and no `event_count` /
+        // `merkle_root` key.
+        let dropped_events = provider.context_events("ctx-dropped");
         assert_eq!(
-            provider.context_events("ctx-dropped"),
-            serde_json::json!({ "event_count": 0 })
+            dropped_events
+                .get("code")
+                .and_then(serde_json::Value::as_str),
+            Some(codes::CTX_2138),
+            "context_events must fail closed with SCP-CTX-2138 when the bridge is dropped"
+        );
+        assert!(
+            dropped_events.get("event_count").is_none()
+                && dropped_events.get("merkle_root").is_none(),
+            "the fail-closed summary must not fabricate a zero root or count"
         );
 
         // validate_capability with no UCAN: returns the UCAN-required error

@@ -3552,6 +3552,23 @@ impl Scp {
         crate::event_log::event_log_checkpoint_by_did_on(&self.inner, handle, did, epoch)
     }
 
+    /// Returns the event-log summary the MCP `events` resource publishes for a
+    /// context, as a JSON string.
+    ///
+    /// This is the exact metadata `ContextProvider::context_events` serves for
+    /// `scp://{context_id}/events` — `{"event_count": N, "merkle_root": "<hex>"}`
+    /// over the AUTHORITATIVE event log, the SAME `(count, root)`
+    /// `eventLogVerify` / `eventLogCheckpoint` commit to — routed through the ONE
+    /// shared `context_events_metadata_json` helper so the bytes are identical
+    /// across all three bridges (GitHub #1933). Never reads a bridge-local tree.
+    /// FAILS CLOSED to `{"error": ..., "code": "SCP-CTX-2138"}` (no
+    /// `event_count` / `merkle_root`) when the authoritative log is unreachable.
+    #[napi(js_name = "mcpContextEvents")]
+    pub fn mcp_context_events(&self, handle: &NapiContextHandle) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
+        Ok(crate::mcp::mcp_context_events_on(&self.inner, handle))
+    }
+
     // -------------------------------------------------------------------
     // Transport
     // -------------------------------------------------------------------
