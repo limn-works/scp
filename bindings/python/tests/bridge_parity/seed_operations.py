@@ -1215,6 +1215,153 @@ OP_EVENT_LOG_ABSENCE_OF_LIFECYCLE_EVENT_REJECTED = OpSpec(
 
 
 # ---------------------------------------------------------------------------
+# op 14: event_log_absence_over_divergent_local_tree_rejected
+#
+# Reproduces the F3 divergence precondition (GitHub #1933) through the
+# PUBLIC runner surface — the property the pristine-context ops 12/13
+# CANNOT catch. Ops 12/13 run on a context whose bridge-local
+# (UCAN-state) tree still equals the authoritative log, so a bridge that
+# regressed to proving over the caller-influenceable local tree would
+# still answer identically and pass parity. This op forces the two trees
+# APART first:
+#
+#   1. create a context (authoritative log gets `ContextCreated` @ leaf 0);
+#   2. call the public `provenance_attach`, which appends a
+#      `ProvenanceAttached` leaf to the BRIDGE-LOCAL tree that is NOT in
+#      the authoritative log — the trees now diverge;
+#   3. read the AUTHORITATIVE `ContextCreated` leaf hash from
+#      `event_log_query` (which reads the authoritative log, INDEPENDENT
+#      of the verify path — so the hash is not derived from the surface
+#      under test, unlike op 13's inclusion-proof hash);
+#   4. claim that authoritative hash is ABSENT.
+#
+# A correct bridge proves over the authoritative log, where the hash IS
+# present, and REJECTS with SCP-CTX-2139 on every bridge. A bridge that
+# regressed to the divergent local tree — where the authoritative hash is
+# absent — would MINT a verifying absence proof (no error), which this op
+# catches as a parity + `expected_values` failure. This is the mechanical
+# guard that a reverted F3 fix, or a verify that proves over the local
+# tree, can no longer slip past parity.
+# ---------------------------------------------------------------------------
+
+
+# Made-up source context id: `provenance_attach` is best-effort on a
+# missing source (it only appends the bridge-local target leaf), so this
+# needs no real second context — matching the PyO3/NAPI/UniFFI
+# `inject_local_leaf` test helpers.
+_DIVERGENCE_PROV_SOURCE = "parity-prov-source"
+
+
+def _py_event_log_absence_over_divergent_local_tree_rejected(ctx: OpContext) -> dict[str, Any]:
+    scp, identity = ctx.attached_scp()
+    handle = scp.context_create(identity.did, dict(_VERIFY_CONTEXT_PARAMS))
+    ctx_id = handle.context_id
+    # Diverge the bridge-local tree from the authoritative log via a real
+    # public bridge call.
+    scp.provenance_attach(
+        _DIVERGENCE_PROV_SOURCE,
+        "persistent",
+        "full",
+        [identity.did],
+        ctx_id,
+        identity.did,
+        None,
+    )
+    # The AUTHORITATIVE ContextCreated leaf hash, read from the query path
+    # (authoritative), NOT the verify path under test.
+    events = scp.event_log_query(ctx_id, {"event_type": "ContextCreated"})
+    auth_hash = str(events[0].payload["hash"])
+    try:
+        scp.event_log_verify(ctx_id, {"type": "absence", "event_hash": auth_hash})
+    except Exception as err:  # we want the error shape — test surface
+        code = getattr(err, "code", None) or _extract_code(str(err))
+        return {
+            "error": {
+                "type": type(err).__name__,
+                "code": code or "UNKNOWN",
+                "message": str(err),
+            }
+        }
+    return {"error": {"type": "none", "code": "NONE", "message": "no error raised"}}
+
+
+OP_EVENT_LOG_ABSENCE_OVER_DIVERGENT_LOCAL_TREE_REJECTED = OpSpec(
+    name="event_log_absence_over_divergent_local_tree_rejected",
+    py_call=_py_event_log_absence_over_divergent_local_tree_rejected,
+    node_call={"op": "event_log_absence_over_divergent_local_tree_rejected", "args": {}},
+    schema=OpSchema(
+        fields=(
+            FieldSpec("error.type", "ignore"),
+            FieldSpec("error.code", "exact"),
+            FieldSpec("error.message", "ignore"),
+        )
+    ),
+    # Pin the committed honest-negative code. If a bridge regresses to the
+    # divergent local tree it will SUCCEED (error.code == "NONE") and both
+    # the parity equality and this literal pin fail.
+    expected_values=(("error.code", EXPECTED_ABSENCE_REJECTED_CODE),),
+)
+
+
+# ---------------------------------------------------------------------------
+# op 15: event_log_verify_malformed_claim_rejected
+#
+# The mechanical cross-bridge guard for Fix 1 (GitHub #1933): malformed
+# CLAIM input carries SCP-VALID-7000 on EVERY bridge — it is caller input
+# validation, distinct from the honest-negative SCP-CTX-2139 and the
+# fail-closed SCP-CTX-2138. The PyO3 reference bridge previously emitted
+# the generic SCP-VALID-7001 here while NAPI/UniFFI emitted SCP-VALID-7000,
+# and no parity op fed a malformed claim, so the drift went undetected.
+# This op feeds a malformed inclusion claim (missing `leaf_index`) over a
+# readable log and pins `error.code == SCP-VALID-7000` across all bridges.
+# ---------------------------------------------------------------------------
+
+
+# The committed cross-bridge code for "the claim itself is malformed" —
+# caller input validation, distinct from CTX-2138/CTX-2139. Pinned so a
+# single bridge drifting (or all drifting together) cannot pass silently.
+EXPECTED_MALFORMED_CLAIM_CODE = "SCP-VALID-7000"
+
+
+def _py_event_log_verify_malformed_claim(ctx: OpContext) -> dict[str, Any]:
+    scp, identity = ctx.attached_scp()
+    handle = scp.context_create(identity.did, dict(_VERIFY_CONTEXT_PARAMS))
+    try:
+        # `type` is present and valid, so this reaches the inclusion arm
+        # over a readable log; the MISSING `leaf_index` is the malformed
+        # input the arm rejects with VALID-7000.
+        scp.event_log_verify(handle.context_id, {"type": "inclusion"})
+    except Exception as err:  # we want the error shape — test surface
+        code = getattr(err, "code", None) or _extract_code(str(err))
+        return {
+            "error": {
+                "type": type(err).__name__,
+                "code": code or "UNKNOWN",
+                "message": str(err),
+            }
+        }
+    return {"error": {"type": "none", "code": "NONE", "message": "no error raised"}}
+
+
+OP_EVENT_LOG_VERIFY_MALFORMED_CLAIM_REJECTED = OpSpec(
+    name="event_log_verify_malformed_claim_rejected",
+    py_call=_py_event_log_verify_malformed_claim,
+    node_call={"op": "event_log_verify_malformed_claim_rejected", "args": {}},
+    schema=OpSchema(
+        fields=(
+            FieldSpec("error.type", "ignore"),
+            FieldSpec("error.code", "exact"),
+            FieldSpec("error.message", "ignore"),
+        )
+    ),
+    # Pin the committed malformed-claim code. A bridge drifting to
+    # VALID-7001 (the pre-fix PyO3 behavior) fails both the parity
+    # equality and this literal pin.
+    expected_values=(("error.code", EXPECTED_MALFORMED_CLAIM_CODE),),
+)
+
+
+# ---------------------------------------------------------------------------
 # Why there is NO missing-signing-custody parity op here.
 #
 # The missing-signing-custody condition (a sign operation invoked for an
@@ -1252,4 +1399,6 @@ SEED_OPS: tuple[OpSpec, ...] = (
     OP_UNREGISTERED_DID_REJECTED,
     OP_EVENT_LOG_VERIFY_INCLUSION,
     OP_EVENT_LOG_ABSENCE_OF_LIFECYCLE_EVENT_REJECTED,
+    OP_EVENT_LOG_ABSENCE_OVER_DIVERGENT_LOCAL_TREE_REJECTED,
+    OP_EVENT_LOG_VERIFY_MALFORMED_CLAIM_REJECTED,
 )

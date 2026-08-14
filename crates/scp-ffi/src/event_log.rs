@@ -16,7 +16,8 @@
 //!
 //! - [`PyEvent`] -- A protocol event (type, actor, timestamp, payload,
 //!   sequence).
-//! - [`PyProof`] -- A verification proof (verified, proof type, details).
+//! - [`PyProof`] -- A Merkle verification proof (proof type, details). There is
+//!   no `verified` field; `event_log_verify` raising IS the negative answer.
 //! - [`PyCheckpoint`] -- A signed consistency checkpoint (context ID, sender
 //!   DID, event count, Merkle root, epoch, timestamp, signature).
 //!
@@ -413,6 +414,25 @@ fn authoritative_log_unreachable(
     }
 }
 
+/// Builds the malformed-claim-input validation error `event_log_verify` raises.
+///
+/// Malformed CLAIM input (missing `type`, missing `leaf_index`, an `event_hash`
+/// that is not 32 hex-decoded bytes, an unsupported claim type) is caller input
+/// validation, and the cross-bridge contract pins it to `VALID_7000` on EVERY
+/// bridge — see [`codes::CTX_2139`]'s doc, and the napi (`napi/src/event_log.rs`)
+/// and `UniFFI` (`uniffi/src/bridge.rs`) `event_log_verify` arms, which already
+/// raise `VALID_7000` at the byte-identical conditions.
+///
+/// This path must NOT use the generic [`ScpPyError::validation`] helper, whose
+/// `VALID_7001` would silently diverge the reference bridge from the contract
+/// it establishes (GitHub #1933).
+fn malformed_claim(message: impl Into<String>) -> ScpPyError {
+    ScpPyError::ValidationError {
+        message: message.into(),
+        code: codes::VALID_7000.to_owned(),
+    }
+}
+
 /// Verifies a claim against the context event log.
 ///
 /// Generates and verifies a Merkle proof for the given claim. Supports
@@ -449,7 +469,8 @@ fn authoritative_log_unreachable(
 ///
 /// # Returns
 ///
-/// A [`PyProof`] with the verification result, proof type, and details.
+/// A [`PyProof`] carrying the proof type and Merkle details. There is no
+/// `verified` field — `event_log_verify` raising IS the negative answer.
 ///
 /// # Errors
 ///
@@ -478,7 +499,7 @@ fn event_log_verify_impl(
         .get("type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            ScpPyError::validation("claim must include 'type' field ('inclusion' or 'absence')")
+            malformed_claim("claim must include 'type' field ('inclusion' or 'absence')")
         })?;
 
     // #1933 fail-closed gate. `check_ready` rejects BOTH suspended and
@@ -505,7 +526,7 @@ fn event_log_verify_impl(
                 .get("leaf_index")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| {
-                    ScpPyError::validation("inclusion claim must include 'leaf_index' (integer)")
+                    malformed_claim("inclusion claim must include 'leaf_index' (integer)")
                 })?;
 
             let proof = scp_event_log::proof::prove_inclusion(&log, leaf_index).map_err(|e| {
@@ -531,12 +552,12 @@ fn event_log_verify_impl(
                 .get("event_hash")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    ScpPyError::validation("absence claim must include 'event_hash' (hex string)")
+                    malformed_claim("absence claim must include 'event_hash' (hex string)")
                 })?;
 
             // Decode the hex event hash.
             let event_hash = decode_hex_hash(event_hash_hex)
-                .map_err(|e| ScpPyError::validation(format!("invalid event_hash: {e}")))?;
+                .map_err(|e| malformed_claim(format!("invalid event_hash: {e}")))?;
 
             let proof = scp_event_log::proof::prove_absence(&log, &event_hash).map_err(|e| {
                 ScpPyError::ContextError {
@@ -565,7 +586,7 @@ fn event_log_verify_impl(
                 details,
             })
         }
-        other => Err(ScpPyError::validation(format!(
+        other => Err(malformed_claim(format!(
             "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
         ))
         .into()),
@@ -754,7 +775,8 @@ impl crate::scp::PyScp {
     ///
     /// # Returns
     ///
-    /// A [`PyProof`] with the verification result, proof type, and details.
+    /// A [`PyProof`] carrying the proof type and Merkle details. There is no
+    /// `verified` field — `event_log_verify` raising IS the negative answer.
     ///
     /// # Errors
     ///
