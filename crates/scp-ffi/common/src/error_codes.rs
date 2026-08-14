@@ -344,7 +344,14 @@ pub const CTX_2022: &str = "SCP-CTX-2022";
 pub const CTX_2023: &str = "SCP-CTX-2023";
 /// Context governance action error.
 pub const CTX_2024: &str = "SCP-CTX-2024";
-/// Context broadcast unsubscribe error.
+/// Retired — kept registered so the number is never reassigned.
+///
+/// Despite its position in the broadcast block, this code was never raised by
+/// any broadcast-unsubscribe path. Its only historical use was the
+/// NAPI/`UniFFI` `event_log_verify` claim-parse and proof-failure paths,
+/// which now raise `VALID_7000` (malformed claim input) and [`CTX_2139`]
+/// (proof rejected over a readable log) instead. No production path emits
+/// this code today.
 pub const CTX_2025: &str = "SCP-CTX-2025";
 /// Context broadcast admission error.
 pub const CTX_2026: &str = "SCP-CTX-2026";

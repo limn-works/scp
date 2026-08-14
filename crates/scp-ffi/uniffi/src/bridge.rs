@@ -15114,7 +15114,10 @@ impl Scp {
     /// which a destroyed log also reports). FAILS CLOSED: it never falls back
     /// to the UCAN-state tree. Proof-generation failures over a readable log
     /// (empty log, out-of-range index, absence claimed for a present event)
-    /// keep `SCP-CTX-2025`.
+    /// return `SCP-CTX-2139` — the honest negative answer, distinct from
+    /// "cannot answer." A malformed claim (invalid JSON, missing/mistyped
+    /// fields, unsupported type) is rejected with `SCP-VALID-7000` before any
+    /// log is consulted.
     pub async fn event_log_verify(
         &self,
         handle: Arc<ContextHandle>,
