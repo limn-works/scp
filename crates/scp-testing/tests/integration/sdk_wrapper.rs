@@ -109,6 +109,13 @@ const KT_SYNC: &str =
 const KT_COROUTINE_BRIDGE: &str = include_str!(
     "../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt"
 );
+// `Scp.kt` is the PRODUCTION Kotlin wrapper surface: it wraps the
+// UniFFI-generated `NativeScp` (one `suspend fun` per bridged UniFFI
+// function). Operations that live ONLY here — e.g. `eventLogVerify`,
+// whose never-swapped `NativeBindings` scaffold slice was deleted
+// (#1933) — are invisible to a scan of `CoroutineBridge.kt` alone.
+const KT_SCP: &str =
+    include_str!("../../../../bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt");
 
 // ---------------------------------------------------------------------------
 // Operation definitions — the expected wrapper surface
@@ -190,6 +197,7 @@ fn kt_all() -> String {
         KT_PROVENANCE,
         KT_SYNC,
         KT_COROUTINE_BRIDGE,
+        KT_SCP,
     ]
     .join("\n")
 }
@@ -1452,6 +1460,7 @@ fn all_sdk_source_files_are_non_empty() {
         ("Kotlin Provenance.kt", KT_PROVENANCE),
         ("Kotlin Sync.kt", KT_SYNC),
         ("Kotlin CoroutineBridge.kt", KT_COROUTINE_BRIDGE),
+        ("Kotlin Scp.kt", KT_SCP),
     ];
 
     for (label, content) in files {
