@@ -519,7 +519,11 @@ pub const CTX_2137: &str = "SCP-CTX-2137";
 /// - the provider reports **no log** for the context — `Ok(None)`, which means
 ///   UNKNOWN, never "empty". A context whose log was destroyed on actor
 ///   shutdown or create-rollback reports `None`, and an empty-but-live log
-///   reports `Ok(Some(vec![]))`.
+///   reports `Ok(Some(vec![]))`;
+/// - the persisted log is **corrupt or undecodable** — a broken Merkle
+///   hash-chain, or a record that fails to deserialize. Reading fails, so no
+///   proof can be honestly generated over it; this is a fail-closed "cannot
+///   answer", not a false claim about the log's contents.
 ///
 /// The bridge MUST NOT fall back to any bridge-local tree in these cases:
 /// proving absence against a non-authoritative or unknown log is a forgeable

@@ -359,6 +359,18 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
           ok: true,
           result: await opEventLogAbsenceRejected(req),
         };
+      case "event_log_absence_over_divergent_local_tree_rejected":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opEventLogAbsenceOverDivergentLocalTree(req),
+        };
+      case "event_log_verify_malformed_claim_rejected":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opEventLogVerifyMalformedClaim(req),
+        };
       case "unregistered_did_rejected":
         return {
           id: req.id,
@@ -795,6 +807,105 @@ async function opEventLogAbsenceRejected(
       handle,
       JSON.stringify({ type: "absence", event_hash: leafHash }),
     );
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
+      return {
+        error: {
+          type: err.constructor.name,
+          code: codeMatch ? codeMatch[0] : "UNKNOWN",
+          message: err.message,
+        },
+      };
+    }
+    return {
+      error: { type: "unknown", code: "UNKNOWN", message: String(err) },
+    };
+  }
+  return {
+    error: { type: "none", code: "NONE", message: "no error raised" },
+  };
+}
+
+// Reproduces the F3 divergence precondition (GitHub #1933) through the
+// PUBLIC surface — the mechanical guard ops 12/13 CANNOT provide because
+// they run on a pristine context whose bridge-local tree still equals the
+// authoritative log. Diverges the trees via `provenanceAttach`, reads the
+// AUTHORITATIVE ContextCreated hash from the query path (independent of the
+// verify path under test), then claims it absent. A correct bridge proves
+// over the authoritative log where the hash IS present and rejects with
+// SCP-CTX-2139; a bridge regressed to the divergent local tree would mint a
+// verifying absence proof. Mirrors
+// `seed_operations.py::_py_event_log_absence_over_divergent_local_tree_rejected`.
+async function opEventLogAbsenceOverDivergentLocalTree(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
+  const params = { name: "parity-elog-v", mode: "encrypted" };
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(identity, JSON.stringify(params));
+  // Diverge the bridge-local tree from the authoritative log via a real
+  // public bridge call (appends a ProvenanceAttached leaf NOT in the
+  // authoritative log).
+  scp.provenanceAttach(
+    "parity-prov-source",
+    "persistent",
+    "full",
+    [identity.did],
+    handle.contextId,
+    identity.did,
+  );
+  // AUTHORITATIVE ContextCreated leaf hash, read from the query path —
+  // independent of the verify path under test.
+  const events = await scp.eventLogQuery(
+    handle,
+    JSON.stringify({ event_type: "ContextCreated" }),
+  );
+  const first = events[0];
+  const payload = JSON.parse(String(first.payloadJson)) as Record<string, unknown>;
+  const authHash = String(payload.hash);
+  try {
+    await scp.eventLogVerify(
+      handle,
+      JSON.stringify({ type: "absence", event_hash: authHash }),
+    );
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
+      return {
+        error: {
+          type: err.constructor.name,
+          code: codeMatch ? codeMatch[0] : "UNKNOWN",
+          message: err.message,
+        },
+      };
+    }
+    return {
+      error: { type: "unknown", code: "UNKNOWN", message: String(err) },
+    };
+  }
+  return {
+    error: { type: "none", code: "NONE", message: "no error raised" },
+  };
+}
+
+// The mechanical cross-bridge guard for Fix 1 (GitHub #1933): a malformed
+// claim carries SCP-VALID-7000 on every bridge. Feeds a malformed inclusion
+// claim (missing `leaf_index`) over a readable log and reports the code.
+// Mirrors `seed_operations.py::_py_event_log_verify_malformed_claim`.
+async function opEventLogVerifyMalformedClaim(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  requireNapi(req.bridgeMode);
+  const params = { name: "parity-elog-v", mode: "encrypted" };
+  const scp = await newNapiScp();
+  const identity = await scp.identityCreate("in_memory");
+  const handle = await scp.contextCreate(identity, JSON.stringify(params));
+  try {
+    // `type` present and valid, `leaf_index` MISSING — malformed input the
+    // inclusion arm rejects with VALID-7000 over a readable log.
+    await scp.eventLogVerify(handle, JSON.stringify({ type: "inclusion" }));
   } catch (err: unknown) {
     if (err instanceof Error) {
       const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);

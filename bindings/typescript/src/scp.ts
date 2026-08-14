@@ -3032,6 +3032,30 @@ export class SCP {
     }
   }
 
+  /**
+   * Generates a Merkle proof for `claimJson` (`{"type":"inclusion",
+   * "leaf_index":N}` or `{"type":"absence","event_hash":"<hex>"}`) against the
+   * AUTHORITATIVE event log — the same log {@link eventLogQuery} reads and
+   * {@link eventLogCheckpoint} commits to, never a caller-influenceable
+   * fallback tree.
+   *
+   * A resolved promise IS the positive answer: the returned proof carries the
+   * checkable proof material (`details_json`). There is no `verified` flag —
+   * rejecting IS the negative answer:
+   *
+   * - `SCP-CTX-2138` — the authoritative log is unreachable or unknown
+   *   (instance suspended or shut down, no supervisor, or no log for the
+   *   context). FAILS CLOSED; never falls back to another tree.
+   * - `SCP-CTX-2139` — the claim was REJECTED over a readable log (empty log,
+   *   leaf index past the end, or absence claimed for an event that IS
+   *   present). The honest negative, distinct from "cannot answer."
+   * - `SCP-VALID-7000` — the claim itself is malformed (invalid JSON, missing
+   *   or mistyped fields, unsupported claim type); caller input validation. An
+   *   unparseable claim or a missing/invalid `type` is caught before the log is
+   *   read; the remaining malformed cases are checked after the authoritative
+   *   log is confirmed reachable, so an *unreachable* log surfaces
+   *   `SCP-CTX-2138` first.
+   */
   async eventLogVerify(handle: unknown, claimJson: string): Promise<unknown> {
     try {
       return await (this.#native.eventLogVerify as (h: unknown, c: string) => Promise<unknown>)(

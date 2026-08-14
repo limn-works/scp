@@ -1109,7 +1109,11 @@ class SCP internal constructor(
      *   "cannot answer."
      * - `SCP-VALID-7000` — the claim itself is malformed (invalid
      *   JSON, missing or mistyped fields, unsupported claim type);
-     *   rejected before any log is consulted.
+     *   caller input validation. An unparseable claim or a
+     *   missing/invalid `type` is caught before the log is read; the
+     *   remaining malformed cases are checked after the authoritative
+     *   log is confirmed reachable, so an *unreachable* log surfaces
+     *   `SCP-CTX-2138` first.
      */
     suspend fun eventLogVerify(
         handle: ContextHandle,

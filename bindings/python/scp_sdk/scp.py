@@ -2180,6 +2180,30 @@ class SCP:
     async def event_log_verify(self, context_id: str, claim: dict[str, Any]) -> Any:
         """Delegate to ``_scp_core.SCP.event_log_verify``.
 
+        Generates a Merkle proof for ``claim`` (``{"type": "inclusion",
+        "leaf_index": N}`` or ``{"type": "absence", "event_hash": "<hex>"}``)
+        against the AUTHORITATIVE event log -- the same log
+        :meth:`event_log_query` reads and :meth:`event_log_checkpoint` commits
+        to, never a caller-influenceable fallback tree.
+
+        A successful return IS the positive answer: the returned
+        :class:`~scp_sdk.event_log.Proof` carries the checkable proof material
+        (``details``). There is no ``verified`` field -- raising IS the negative
+        answer:
+
+        - ``SCP-CTX-2138`` -- the authoritative log is unreachable or unknown
+          (instance suspended or shut down, no supervisor, or no log for the
+          context). FAILS CLOSED; never falls back to another tree.
+        - ``SCP-CTX-2139`` -- the claim was REJECTED over a readable log (empty
+          log, leaf index past the end, or absence claimed for an event that IS
+          present). The honest negative, distinct from "cannot answer."
+        - ``SCP-VALID-7000`` -- the claim itself is malformed (missing or
+          mistyped fields, an ``event_hash`` that is not 32 hex-decoded bytes,
+          an unsupported claim type); caller input validation. A missing or
+          invalid ``type`` is caught before the log is read; the remaining
+          malformed cases are checked after the authoritative log is confirmed
+          reachable, so an *unreachable* log surfaces ``SCP-CTX-2138`` first.
+
         Returns a :class:`~scp_sdk.event_log.Proof` dataclass.
         """
         from scp_sdk.event_log import Proof

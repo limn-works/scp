@@ -933,6 +933,14 @@ fn event_log_verify_absence_of_an_authoritative_event_is_rejected() {
             err.to_string().contains("present in the log"),
             "expected an absence-proof-for-present-event rejection, got: {err}"
         );
+        // An honest negative over a READABLE authoritative log carries CTX-2139,
+        // NOT the fail-closed CTX-2138 (unreachable log) — pinning the code
+        // guards against a message reword and matches the taxonomy the
+        // cross-bridge parity op pins.
+        assert!(
+            err.to_string().contains("SCP-CTX-2139"),
+            "absence-for-present is an honest negative and must carry SCP-CTX-2139, got: {err}"
+        );
     });
 }
 

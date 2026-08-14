@@ -659,6 +659,104 @@ private suspend fun opEventLogAbsenceRejected(args: JsonObject): JsonObject =
         }
     }
 
+// Reproduces the F3 divergence precondition (GitHub #1933) through the
+// PUBLIC surface — the mechanical guard ops 12/13 CANNOT provide because
+// they run on a pristine context whose bridge-local tree still equals the
+// authoritative log. Diverges the trees via `provenanceAttach`, reads the
+// AUTHORITATIVE ContextCreated hash from the query path (independent of the
+// verify path under test), then claims it absent. A correct bridge proves
+// over the authoritative log where the hash IS present and rejects with
+// SCP-CTX-2139; a bridge regressed to the divergent local tree would mint a
+// verifying absence proof. Mirrors
+// `seed_operations.py::_py_event_log_absence_over_divergent_local_tree_rejected`.
+@Suppress("UnusedParameter")
+private suspend fun opEventLogAbsenceOverDivergentLocalTree(args: JsonObject): JsonObject =
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams())
+        val did = identity.did()
+        // Diverge the bridge-local tree from the authoritative log via a
+        // real public bridge call (appends a ProvenanceAttached leaf NOT in
+        // the authoritative log).
+        scp.provenanceAttach(
+            "parity-prov-source",
+            "persistent",
+            "full",
+            listOf(did),
+            handle.contextId(),
+            did,
+            null
+        )
+        // AUTHORITATIVE ContextCreated leaf hash from the query path —
+        // independent of the verify path under test.
+        val events = scp.eventLogQuery(handle, """{"event_type":"ContextCreated"}""")
+        val payload = JSON.parseToJsonElement(events.first().payloadJson).jsonObject
+        val authHash = payload["hash"]?.jsonPrimitive?.content ?: ""
+        try {
+            scp.eventLogVerify(handle, """{"type":"absence","event_hash":"$authHash"}""")
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive("none"))
+                        put("code", JsonPrimitive("NONE"))
+                        put("message", JsonPrimitive("no error raised"))
+                    }
+                )
+            }
+        } catch (e: Throwable) {
+            val message = e.message ?: e.toString()
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
+                        put("code", JsonPrimitive(extractScpCode(message)))
+                        put("message", JsonPrimitive(message))
+                    }
+                )
+            }
+        }
+    }
+
+// The mechanical cross-bridge guard for Fix 1 (GitHub #1933): a malformed
+// claim carries SCP-VALID-7000 on every bridge. Feeds a malformed inclusion
+// claim (missing `leaf_index`) over a readable log and reports the code.
+// Mirrors `seed_operations.py::_py_event_log_verify_malformed_claim`.
+@Suppress("UnusedParameter")
+private suspend fun opEventLogVerifyMalformedClaim(args: JsonObject): JsonObject =
+    uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams())
+        try {
+            // `type` present and valid, `leaf_index` MISSING — malformed
+            // input the inclusion arm rejects with VALID-7000.
+            scp.eventLogVerify(handle, """{"type":"inclusion"}""")
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive("none"))
+                        put("code", JsonPrimitive("NONE"))
+                        put("message", JsonPrimitive("no error raised"))
+                    }
+                )
+            }
+        } catch (e: Throwable) {
+            val message = e.message ?: e.toString()
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
+                        put("code", JsonPrimitive(extractScpCode(message)))
+                        put("message", JsonPrimitive(message))
+                    }
+                )
+            }
+        }
+    }
+
 // Fixed 32-byte nonce used when `signed_at_override` pins the SCPID
 // response. Must match
 // `bindings/python/tests/bridge_parity/seed_operations.py::PARITY_NONCE_HEX`.
@@ -739,6 +837,10 @@ private suspend fun dispatch(req: RawRequest): String {
             "event_log_verify_inclusion" -> opEventLogVerifyInclusion(req.args)
             "event_log_absence_of_lifecycle_event_rejected" ->
                 opEventLogAbsenceRejected(req.args)
+            "event_log_absence_over_divergent_local_tree_rejected" ->
+                opEventLogAbsenceOverDivergentLocalTree(req.args)
+            "event_log_verify_malformed_claim_rejected" ->
+                opEventLogVerifyMalformedClaim(req.args)
             "unregistered_did_rejected" -> opUnregisteredDidRejected(req.args)
             else -> return errResponse(
                 req.id,

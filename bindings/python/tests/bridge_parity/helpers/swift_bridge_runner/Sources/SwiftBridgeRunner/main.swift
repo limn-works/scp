@@ -795,6 +795,113 @@ func opEventLogAbsenceRejected(_ req: BridgeRequest) async throws -> [String: JS
     }
 }
 
+// Reproduces the F3 divergence precondition (GitHub #1933) through the
+// PUBLIC surface — the mechanical guard ops 12/13 CANNOT provide because
+// they run on a pristine context whose bridge-local tree still equals the
+// authoritative log. Diverges the trees via `provenanceAttach`, reads the
+// AUTHORITATIVE ContextCreated hash from the query path (independent of the
+// verify path under test), then claims it absent. A correct bridge proves
+// over the authoritative log where the hash IS present and rejects with
+// SCP-CTX-2139; a bridge regressed to the divergent local tree would mint a
+// verifying absence proof. Mirrors
+// `seed_operations.py::_py_event_log_absence_over_divergent_local_tree_rejected`.
+func opEventLogAbsenceOverDivergentLocalTree(
+    _ req: BridgeRequest
+) async throws -> [String: JSONValue] {
+    _ = req
+    let scp = try Scp.withStorage(config: .inMemory)
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(
+        identity: identity, params: buildContextParams()
+    )
+    let did = identity.did()
+    // Diverge the bridge-local tree from the authoritative log via a real
+    // public bridge call (appends a ProvenanceAttached leaf NOT in the
+    // authoritative log).
+    _ = try scp.provenanceAttach(
+        sourceContextId: "parity-prov-source",
+        sourceType: "persistent",
+        memoryScopeStr: "full",
+        members: [did],
+        targetContextId: handle.contextId(),
+        actorDid: did,
+        existingChainDepth: nil
+    )
+    // AUTHORITATIVE ContextCreated leaf hash from the query path —
+    // independent of the verify path under test.
+    let events = try await scp.eventLogQuery(
+        handle: handle,
+        filterJson: "{\"event_type\":\"ContextCreated\"}"
+    )
+    let payload = parseJsonObject(events.first?.payloadJson ?? "")
+    let authHash = payload["hash"] as? String ?? ""
+    do {
+        _ = try await scp.eventLogVerify(
+            handle: handle,
+            claimJson: "{\"type\":\"absence\",\"event_hash\":\"\(authHash)\"}"
+        )
+        return [
+            "error": .object([
+                "type": .string("none"),
+                "code": .string("NONE"),
+                "message": .string("no error raised")
+            ])
+        ]
+    } catch {
+        let message = String(describing: error)
+        let code = extractScpCode(message)
+        let errType = String(describing: type(of: error))
+        return [
+            "error": .object([
+                "type": .string(errType),
+                "code": .string(code),
+                "message": .string(message)
+            ])
+        ]
+    }
+}
+
+// The mechanical cross-bridge guard for Fix 1 (GitHub #1933): a malformed
+// claim carries SCP-VALID-7000 on every bridge. Feeds a malformed inclusion
+// claim (missing `leaf_index`) over a readable log and reports the code.
+// Mirrors `seed_operations.py::_py_event_log_verify_malformed_claim`.
+func opEventLogVerifyMalformedClaim(
+    _ req: BridgeRequest
+) async throws -> [String: JSONValue] {
+    _ = req
+    let scp = try Scp.withStorage(config: .inMemory)
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(
+        identity: identity, params: buildContextParams()
+    )
+    do {
+        // `type` present and valid, `leaf_index` MISSING — malformed input
+        // the inclusion arm rejects with VALID-7000 over a readable log.
+        _ = try await scp.eventLogVerify(
+            handle: handle,
+            claimJson: "{\"type\":\"inclusion\"}"
+        )
+        return [
+            "error": .object([
+                "type": .string("none"),
+                "code": .string("NONE"),
+                "message": .string("no error raised")
+            ])
+        ]
+    } catch {
+        let message = String(describing: error)
+        let code = extractScpCode(message)
+        let errType = String(describing: type(of: error))
+        return [
+            "error": .object([
+                "type": .string(errType),
+                "code": .string(code),
+                "message": .string(message)
+            ])
+        ]
+    }
+}
+
 /// Parses a JSON object string into `[String: Any]`; empty on failure.
 func parseJsonObject(_ json: String) -> [String: Any] {
     guard let data = json.data(using: .utf8),
@@ -836,6 +943,10 @@ func dispatch(_ req: BridgeRequest) async -> Any {
             result = try await opEventLogVerifyInclusion(req)
         case "event_log_absence_of_lifecycle_event_rejected":
             result = try await opEventLogAbsenceRejected(req)
+        case "event_log_absence_over_divergent_local_tree_rejected":
+            result = try await opEventLogAbsenceOverDivergentLocalTree(req)
+        case "event_log_verify_malformed_claim_rejected":
+            result = try await opEventLogVerifyMalformedClaim(req)
         case "unregistered_did_rejected":
             result = try await opUnregisteredDidRejected(req)
         default:
