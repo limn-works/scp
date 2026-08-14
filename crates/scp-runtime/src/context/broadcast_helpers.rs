@@ -11,9 +11,8 @@
 //! This module hosts broadcast-domain helpers that operate on actor-owned
 //! [`PerContextState`](crate::context::actor::state::PerContextState) and
 //! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
-//! The legacy `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::broadcast_helpers_legacy`] until Phase 2A finalization
-//! removes the shim fallback.
+//! The pre-migration `&Supervisor` lock-and-call bodies have been removed
+//! (Phase 2A finalization); this module is the sole home for these helpers.
 //!
 //! Publish helpers are actor-shaped here for parity with the domain surface,
 //! but the actor mailbox still rejects publish commands: `KeyCustody` uses
@@ -22,7 +21,7 @@
 
 use std::hash::BuildHasher;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::broadcast::{
     BlockResult, BroadcastAdmission, BroadcastContext, KeyRequestDecision, SubscriptionResult,
@@ -56,7 +55,7 @@ use crate::context::state::{context_id_to_bytes, require_active, strip_event_pay
 ///   context or the subscriber is already registered.
 /// - [`ContextError::PermissionDenied`] if the context is gated and no valid
 ///   `messagesRead` UCAN is supplied.
-pub fn subscribe_broadcast<D, N, R, P, S>(
+pub async fn subscribe_broadcast<D, N, R, P, S>(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -79,22 +78,56 @@ where
         .params()
         .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
+    // Governance-ban admission gate (spec §5.14.4 / §5.14.8, #2088), fail-closed
+    // BEFORE any roster mutation or `MemberJoined` leaf.
+    //
+    // AUTHORITATIVE check: the durable `banned_subscribers` record on the
+    // broadcast context. A governance ban (`execute_revoke{Read}` →
+    // `governance_ban_subscriber`) removes the DID from the roster AND records it
+    // here; this record is INDEPENDENT of the subscriber registry and of
+    // `read_exclusion_list`, and is cleared ONLY by an authority via
+    // `RestoreAccess` — so it survives the banned subject's OWN self-leave and a
+    // subsequent admin `RemoveMember` (both of which clear `read_exclusion_list`
+    // for §5.6.1/§5.9 hygiene). This closes the replay-after-leave laundering the
+    // review found: a banned DID that self-leaves to clear its exclusion still
+    // cannot re-subscribe by replaying a retained `messages:read` UCAN. (The
+    // protocol `subscribe` also enforces this by construction; this is the early,
+    // uniform-reason gate.)
+    //
+    // DEFENSE-IN-DEPTH: `read_exclusion_list` still catches a STILL-PRESENT
+    // read-revoked member (§5.9 keeps them a member; they are excluded from CEK
+    // wrapping but not yet in `banned_subscribers` if never a broadcast
+    // subscriber). Both return the uniform
+    // [`SUBSCRIBE_DENY_REASON`](scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON)
+    // so the rejection does not disclose ban status.
+    if cell
+        .broadcast_context
+        .as_ref()
+        .is_some_and(|bc| bc.is_banned(subscriber_did.as_ref()))
+    {
+        return Err(ContextError::PermissionDenied(
+            scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON.to_owned(),
+        ));
+    }
+    if cell.access.read_exclusion_list.contains(subscriber_did) {
+        return Err(ContextError::PermissionDenied(
+            scp_protocol::context::broadcast::SUBSCRIBE_DENY_REASON.to_owned(),
+        ));
+    }
+
     // All in-state mutations below are Class-C (broadcast subscriber roster
     // ADD, broadcast metadata, receive buffer, checkpoint counter) with the
     // best-effort persist below — routed through the non-persisting Class-C
     // view (ADR-049 §9). Member ADD is a structural Class-C op (the restricted
     // `MembershipClassCMut` exposes it; member REMOVAL is the downward-auth
     // Class-S op it withholds — see `unsubscribe_broadcast`).
-    let (result, snapshot) = {
+    let result = {
         let mut view = cell.class_c_view();
-        let bc = view
-            .broadcast_context_mut()
-            .as_mut()
+        let mut bc = view
+            .broadcast_class_c_mut()
             .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-        let result = bc.subscribe(subscriber_did, ucan, timestamp, validation_ctx)?;
-        let snapshot = bc.to_snapshot();
-        (result, snapshot)
+        bc.subscribe(subscriber_did, ucan, timestamp, validation_ctx)?
     };
 
     {
@@ -112,17 +145,29 @@ where
         deps.event_tx.as_ref(),
     );
 
-    persist_broadcast_snapshot(deps, context_id, &snapshot);
-    persist_state_best_effort(cell, deps, context_id);
+    // Broadcast roster state now rides the Class-S `ContextSnapshot`; the
+    // whole-snapshot best-effort persist below covers it. Subscribe/unsubscribe
+    // are roster ADD/REMOVE with no key secrecy, best-effort by design (§9 carve).
+    persist_state_best_effort(cell, deps, context_id).await;
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberJoined,
-        subscriber_did.as_ref(),
-        // Committer-assigned: the subscriber's signed subscribe-request
-        // timestamp, copied by every member (§7.3.1, §9.9.3).
-        timestamp,
-    )?;
+    // Subject-bearing leaf (ADR-011 amendment): carry the subscriber
+    // (`subscriber_did`, which on a self-subscribe already equals `actor_did`)
+    // and the "subscriber" role, so the leaf shape is uniform with member
+    // joins and the SDK reads `subject_did` consistently. The participation
+    // record (§7.3.2) attributes the join interval to this subject.
+    //
+    // Committer-assigned: the subscriber's signed subscribe-request timestamp,
+    // copied by every member (§7.3.1, §9.9.3).
+    deps.event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberJoined,
+            subscriber_did.as_ref(),
+            subscriber_did.as_ref(),
+            "subscriber",
+            timestamp,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)
@@ -139,7 +184,7 @@ where
 /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
 /// - [`ContextError::MembershipFailed`] if the actor is not a broadcast
 ///   context.
-pub fn unsubscribe_broadcast(
+pub async fn unsubscribe_broadcast(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -150,16 +195,13 @@ pub fn unsubscribe_broadcast(
 
     require_active(&cell.handle)?;
 
-    let (result, snapshot) = {
+    let result = {
         let mut view = cell.class_c_view();
-        let bc = view
-            .broadcast_context_mut()
-            .as_mut()
+        let mut bc = view
+            .broadcast_class_c_mut()
             .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
-        let result = bc.unsubscribe(subscriber_did, rotate_keys)?;
-        let snapshot = bc.to_snapshot();
-        (result, snapshot)
+        bc.unsubscribe(subscriber_did, rotate_keys)?
     };
 
     // SECURITY CARVE-OUT (ADR-049 §9): a broadcast UNSUBSCRIBE removes a
@@ -185,19 +227,77 @@ pub fn unsubscribe_broadcast(
         deps.event_tx.as_ref(),
     );
 
-    persist_broadcast_snapshot(deps, context_id, &snapshot);
-    persist_state_best_effort(cell, deps, context_id);
+    // Broadcast roster state now rides the Class-S `ContextSnapshot`; the
+    // whole-snapshot best-effort persist below covers it. Subscribe/unsubscribe
+    // are roster ADD/REMOVE with no key secrecy, best-effort by design (§9 carve).
+    persist_state_best_effort(cell, deps, context_id).await;
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberLeft,
-        subscriber_did.as_ref(),
-        // Committer-assigned: the unsubscribing author's clock — the source of
-        // the `created_at` on its outgoing leave message, copied by every
-        // member (§7.3.1, §9.9.3).
-        deps.clock.now_secs(),
-    )?;
+    // Subject-bearing leaf (ADR-011 amendment): carry the unsubscribing
+    // subscriber (`subscriber_did`, which already equals `actor_did` on this
+    // self-unsubscribe path) and the "subscriber" role, so the leaf shape is
+    // uniform with member leaves and the SDK reads `subject_did` consistently.
+    //
+    // Committer-assigned: the unsubscribing author's clock — the source of the
+    // `created_at` on its outgoing leave message, copied by every member
+    // (§7.3.1, §9.9.3).
+    let unsub_ts = deps.clock.now_secs();
+    deps.event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberLeft,
+            subscriber_did.as_ref(),
+            subscriber_did.as_ref(),
+            "subscriber",
+            unsub_ts,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
+
+    // ADR-007 §5: when `rotate_keys` was requested, each author's sender-key
+    // epoch was advanced as a consequence of the unsubscription. Emit one
+    // `KeyEpochAdvance` leaf per rotated author so the event log reflects the
+    // new epoch state. Best-effort: a failure here does not roll back the
+    // unsubscription. `rotate_sender_key_for_block` (reused internally by
+    // `unsubscribe`) always increments by exactly 1, so `old_epoch =
+    // new_epoch.saturating_sub(1)` is exact.
+    for rotation in &result.key_rotations {
+        let old_epoch = rotation.new_epoch.saturating_sub(1);
+        match scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::KeyEpochAdvancePayload {
+                old_epoch,
+                new_epoch: rotation.new_epoch,
+            },
+        ) {
+            Ok(payload) => {
+                if let Err(e) = deps
+                    .event_log
+                    .append_context_event_with_payload(
+                        &context_id_bytes,
+                        scp_event_log::EventType::KeyEpochAdvance,
+                        rotation.author_did.as_str(),
+                        payload,
+                        unsub_ts,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        author_did = %rotation.author_did,
+                        error = %e,
+                        "KeyEpochAdvance event-log append failed on unsubscribe (best-effort)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %context_id,
+                    author_did = %rotation.author_did,
+                    error = %e,
+                    "KeyEpochAdvance payload encode failed on unsubscribe (best-effort)"
+                );
+            }
+        }
+    }
 
     Ok(result)
 }
@@ -288,9 +388,8 @@ pub fn reserve_broadcast_publish(
     // Class-C (the handler reports `mutated`; the run loop coalesce-persists)
     // — routed through the non-persisting Class-C view (ADR-049 §9).
     let mut view = cell.class_c_view();
-    let bc = view
-        .broadcast_context_mut()
-        .as_mut()
+    let mut bc = view
+        .broadcast_class_c_mut()
         .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
     // Reserve the broadcast sequence atomically. A concurrent publish on
@@ -352,7 +451,7 @@ pub fn reserve_broadcast_publish(
 ///   context.
 /// - [`ContextError::CryptoFailed`] on a signature-length mismatch, an
 ///   epoch change between phases, or a seal failure.
-pub fn apply_broadcast_publish(
+pub async fn apply_broadcast_publish(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -360,7 +459,7 @@ pub fn apply_broadcast_publish(
     signature: &[u8],
     payload: &[u8],
 ) -> Result<BroadcastEnvelope, ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
+    let routing_id = broadcast_publish_routing_id(context_id);
 
     // Resolve the reservation first so a stale/duplicate apply is a
     // clean typed error and never touches sequence state. Class-C
@@ -383,21 +482,40 @@ pub fn apply_broadcast_publish(
         cell,
         deps,
         context_id,
-        &context_id_bytes,
+        &routing_id,
         &pending,
         signature,
         payload,
     )
+    .await
+}
+
+/// Relay routing id under which a sealed broadcast envelope is published.
+///
+/// Broadcast routing is `SHA-256(context_id)` (no domain separator) per spec
+/// §5.14.6 — the identical value the read side computes
+/// (`scp_node::projection::compute_routing_id`,
+/// `BroadcastRoutingId`/`ProjectedContext::routing_id`). It is deliberately
+/// **NOT** `context_id_to_bytes` (the ADR-056 keying chokepoint, which DECODES
+/// a real 64-hex id to its digest): for a real context id those two values
+/// diverge (`SHA-256(hex(digest)) != digest`), so routing a publish through the
+/// keying digest would store the blob at a relay slot no subscriber or
+/// projection ever reads — the deploy then commits zero assets
+/// (`scp-node` `host_site` `CommitCountMismatch { committed: 0, expected: N }`).
+/// Routing through the canonical broadcast-routing primitive keeps publish and
+/// projection addressing the SAME slot by construction.
+fn broadcast_publish_routing_id(context_id: &str) -> [u8; 32] {
+    scp_protocol::context::broadcast_routing_id(context_id)
 }
 
 /// Inner apply body. Separated so the caller-facing
 /// [`apply_broadcast_publish`] can guarantee the reserved sequence is
 /// released on every error path.
-fn apply_guarded(
+async fn apply_guarded(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
+    routing_id: &[u8; 32],
     pending: &PendingBroadcastPublish,
     signature: &[u8],
     payload: &[u8],
@@ -435,7 +553,8 @@ fn apply_guarded(
     let envelope_bytes = rmp_serde::to_vec_named(&envelope)
         .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?;
     deps.transport
-        .send_message(context_id_bytes, &envelope_bytes)?;
+        .send_message(routing_id, &envelope_bytes)
+        .await?;
 
     // `MessageSent` is no longer a durable Merkle leaf — per ADR-051 §6 / the
     // phase-2.md ADR-011 amendment exclusion taxonomy §2 it is a per-author,
@@ -469,9 +588,8 @@ fn seal_reserved(
     // Broadcast metadata seal is Class-C (coalesced persist) — non-persisting
     // Class-C view (ADR-049 §9).
     let mut view = cell.class_c_view();
-    let bc = view
-        .broadcast_context_mut()
-        .as_mut()
+    let mut bc = view
+        .broadcast_class_c_mut()
         .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
     // Detect a key rotation between reserve and apply — sealing under a
@@ -503,7 +621,7 @@ fn seal_reserved(
 /// applied. No-op if the context is no longer a broadcast context.
 fn release_reserved(cell: &mut ClassSCell, pending: &PendingBroadcastPublish) {
     // Broadcast metadata rollback is Class-C (coalesced persist) — view.
-    if let Some(bc) = cell.class_c_view().broadcast_context_mut().as_mut() {
+    if let Some(mut bc) = cell.class_c_view().broadcast_class_c_mut() {
         bc.rollback_reserved_publish(pending.author_did.as_ref(), pending.reserved_sequence);
     }
 }
@@ -527,7 +645,7 @@ pub fn release_broadcast_reservation(
     else {
         return;
     };
-    if let Some(bc) = cell.class_c_view().broadcast_context_mut().as_mut() {
+    if let Some(mut bc) = cell.class_c_view().broadcast_class_c_mut() {
         bc.rollback_reserved_publish(pending.author_did.as_ref(), pending.reserved_sequence);
     }
 }
@@ -544,7 +662,7 @@ pub fn release_broadcast_reservation(
 /// - [`ContextError::MembershipFailed`] if the actor is not a broadcast
 ///   context.
 /// - [`ContextError::MemberNotFound`] if the author is not registered.
-pub fn block_broadcast_subscriber(
+pub async fn block_broadcast_subscriber(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -555,20 +673,29 @@ pub fn block_broadcast_subscriber(
 
     require_active(&cell.handle)?;
 
-    // Class-C broadcast metadata + receive buffer + checkpoint counter
-    // (best-effort/coalesced persist) — non-persisting Class-C view (ADR-049 §9).
-    let (result, snapshot) = {
-        let mut view = cell.class_c_view();
-        let bc = view
-            .broadcast_context_mut()
-            .as_mut()
-            .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+    // Fail-closed (ADR-049 §9, §5.14.8 block-before-serve). The block ADVANCES
+    // the author key epoch and ADDS the subscriber to the author's block list — a
+    // downward-authorization revocation. It MUST be durable BEFORE the block is
+    // acked: an actor crash in the coalesce window after a best-effort ack would
+    // roll the epoch advance + block-list insert back and silently RE-GRANT the
+    // revoked subscriber post-block key access (encryption-as-access-control
+    // violation). Route the mutation through the fail-closed KEEP combinator: on a
+    // persist failure the in-memory block is RETAINED (un-blocking is the unsafe
+    // direction) and the error propagates so the caller never observes a
+    // non-durable block — BEFORE any MemberBlocked event-log append or ack. The
+    // broadcast state now rides the Class-S `ContextSnapshot`, so this persist is
+    // atomic with `read_exclusion_list` in one row.
+    let result = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
+            let bc =
+                view.rest_mut().broadcast_context.as_mut().ok_or_else(|| {
+                    ContextError::MembershipFailed("not a broadcast context".into())
+                })?;
+            bc.block_subscriber(author_did, subscriber_did)
+        })
+        .await?;
 
-        let result = bc.block_subscriber(author_did, subscriber_did)?;
-        let snapshot = bc.to_snapshot();
-        (result, snapshot)
-    };
-
+    // Durable — now emit the MemberBlocked receive-buffer event + Merkle leaf.
     emit_event(
         cell.class_c_view().receive_buffer_mut(),
         ContextEvent::MemberBlocked {
@@ -579,17 +706,55 @@ pub fn block_broadcast_subscriber(
         deps.event_tx.as_ref(),
     );
 
-    persist_broadcast_snapshot(deps, context_id, &snapshot);
+    let block_ts = deps.clock.now_secs();
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberBlocked,
+            author_did.as_ref(),
+            // Committer-assigned: the blocking author's clock — the source of the
+            // `created_at` on its outgoing block message, copied by every member
+            // (§7.3.1, §9.9.3).
+            block_ts,
+        )
+        .await?;
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberBlocked,
-        author_did.as_ref(),
-        // Committer-assigned: the blocking author's clock — the source of the
-        // `created_at` on its outgoing block message, copied by every member
-        // (§7.3.1, §9.9.3).
-        deps.clock.now_secs(),
-    )?;
+    // ADR-007 §5: blocking a subscriber rotates the author's sender-key epoch.
+    // Append the KeyEpochAdvance leaf immediately after MemberBlocked so the
+    // two leaves are always co-located in the Merkle log. rotate_sender_key_for_block
+    // always increments by exactly 1, so old = new.saturating_sub(1) is exact.
+    let old_epoch = result.new_epoch.saturating_sub(1);
+    match scp_event_log::payload::encode_payload(&scp_event_log::payload::KeyEpochAdvancePayload {
+        old_epoch,
+        new_epoch: result.new_epoch,
+    }) {
+        Ok(payload) => {
+            if let Err(e) = deps
+                .event_log
+                .append_context_event_with_payload(
+                    &context_id_bytes,
+                    scp_event_log::EventType::KeyEpochAdvance,
+                    author_did.as_ref(),
+                    payload,
+                    block_ts,
+                )
+                .await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "KeyEpochAdvance event-log append failed (best-effort)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "KeyEpochAdvance payload encode failed (best-effort)"
+            );
+        }
+    }
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(result)
@@ -608,7 +773,7 @@ pub fn block_broadcast_subscriber(
 ///   context.
 /// - [`ContextError::MemberNotFound`] if the author is not registered.
 /// - [`ContextError::InvalidState`] if the subscriber is not blocked.
-pub fn unblock_broadcast_subscriber(
+pub async fn unblock_broadcast_subscriber(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -621,16 +786,19 @@ pub fn unblock_broadcast_subscriber(
 
     // Class-C broadcast metadata + receive buffer + checkpoint counter
     // (best-effort/coalesced persist) — non-persisting Class-C view (ADR-049 §9).
-    let snapshot = {
+    // Unblock is an UPWARD authorization change (block-list REMOVE, re-grants
+    // access) and does NOT rotate keys (§9.16.8), so best-effort persistence is
+    // correct: a coalesce-window rollback re-instates the block (the safe
+    // direction), never a spurious grant. Deliberately NOT tightened to
+    // fail-closed — see the block-before-serve asymmetry (§5.14.8).
+    {
         let mut view = cell.class_c_view();
-        let bc = view
-            .broadcast_context_mut()
-            .as_mut()
+        let mut bc = view
+            .broadcast_class_c_mut()
             .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
 
         let _result = bc.unblock_subscriber(author_did, subscriber_did)?;
-        bc.to_snapshot()
-    };
+    }
 
     emit_event(
         cell.class_c_view().receive_buffer_mut(),
@@ -642,17 +810,21 @@ pub fn unblock_broadcast_subscriber(
         deps.event_tx.as_ref(),
     );
 
-    persist_broadcast_snapshot(deps, context_id, &snapshot);
+    // Broadcast roster/block state rides the Class-S `ContextSnapshot`; the
+    // whole-snapshot best-effort persist covers the block-list REMOVE.
+    persist_state_best_effort(cell, deps, context_id).await;
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberUnblocked,
-        author_did.as_ref(),
-        // Committer-assigned: the unblocking author's clock — the source of the
-        // `created_at` on its outgoing unblock message, copied by every member
-        // (§7.3.1, §9.9.3).
-        deps.clock.now_secs(),
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberUnblocked,
+            author_did.as_ref(),
+            // Committer-assigned: the unblocking author's clock — the source of the
+            // `created_at` on its outgoing unblock message, copied by every member
+            // (§7.3.1, §9.9.3).
+            deps.clock.now_secs(),
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(())
@@ -686,6 +858,36 @@ pub fn handle_broadcast_key_request(
         .broadcast_context
         .as_ref()
         .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
+
+    // Durable-ban serve-path gate (§5.14.8, #2088 / BLACK-303), fail-closed before
+    // any grant. AUTHORITATIVE: the durable `banned_subscribers` record — the same
+    // authority-only-clearable signal the subscribe-admission gate uses. This
+    // catches a banned DID whom NEITHER other signal covers: a banned AUTHOR (the
+    // context creator is always an author) is never on any block list (a
+    // non-subscriber ban writes no block-list entry) and, once they self-leave,
+    // is no longer in `read_exclusion_list`. `BroadcastContext::handle_key_request`
+    // enforces this by construction for all callers; this early check keeps the
+    // runtime serve path symmetric with subscribe. Uses the uniform reason
+    // (non-leakage).
+    if bc.is_banned(requester_did.as_ref()) {
+        return Ok(KeyRequestDecision::Deny {
+            reason: scp_protocol::context::broadcast::KEY_REQUEST_DENY_REASON.to_owned(),
+        });
+    }
+
+    // Serve-path exclusion consult (defense-in-depth, §5.14.8 block-before-serve)
+    // for a STILL-PRESENT read-revoked member: `read_exclusion_list` is written
+    // fail-closed on `RevokeAccess{Read}` and consulted here before the per-author
+    // block-list check. Unlike the durable ban above, this entry is CLEARED when
+    // the subject self-leaves, so it is a defense-in-depth complement — NOT the
+    // authoritative durable signal. Uses the SAME uniform deny reason (non-leakage).
+    // Disjoint shared borrow of `cell.access` (a different field than
+    // `broadcast_context`), so `bc` stays valid for the delegation below.
+    if cell.access.read_exclusion_list.contains(requester_did) {
+        return Ok(KeyRequestDecision::Deny {
+            reason: scp_protocol::context::broadcast::KEY_REQUEST_DENY_REASON.to_owned(),
+        });
+    }
 
     Ok(bc.handle_key_request(author_did, requester_did, wrapping_pubkey))
 }
@@ -748,28 +950,31 @@ fn emit_event(
     }
 }
 
-fn persist_broadcast_snapshot(
-    deps: &ActorDeps,
-    context_id: &str,
-    snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-) {
-    if let Err(e) = deps.persistence.persist_broadcast(context_id, snapshot) {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist broadcast snapshot"
-        );
-    }
-}
-
 /// Best-effort persist of the current actor state. Mirrors
 /// the legacy context-snapshot persistence path, but reads fields from actor
 /// state rather than the old lock-shaped state.
-fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
+fn persist_state_best_effort<'d, 'c>(
+    state: &PerContextState,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
+) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
     let mut snapshot = build_snapshot_from_state(state);
 
     let ctx_id_bytes = context_id_to_bytes(context_id);
-    match deps.crypto.export_crypto_state(&ctx_id_bytes) {
+    // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
+    // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
+    // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
+    // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
+    // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
+    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
+    // sequence is read from `state.send_tracker` inside the twin.
+    let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
+    match state.export_crypto_state(
+        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
+        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
+        wrapping_public_key,
+        &*wrapping_secret_key,
+    ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {
             snapshot.needs_reconnect = true;
@@ -784,98 +989,92 @@ fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_
         }
     }
 
-    if let Err(e) = deps.persistence.persist_context(context_id, &snapshot) {
-        crate::metrics::record_persistence_failure();
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist context snapshot"
-        );
+    async move {
+        if let Err(e) = deps
+            .persistence
+            .persist_context(context_id, &snapshot)
+            .await
+        {
+            crate::metrics::record_persistence_failure();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist context snapshot"
+            );
+        }
     }
 }
 
 fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::ContextSnapshot {
-    use crate::context::state::VelocityTrackerSnapshot;
-    use scp_protocol::context::ContextState;
+    // Single source of truth (ADR-049 §9): delegate to the canonical builder so
+    // the broadcast Class-S fold and the field-round-trip tripwire cover every
+    // persist path. This copy was value-identical to the canonical one.
+    crate::context::messaging_helpers::build_snapshot_from_state(state)
+}
 
-    let context_state_value = state
-        .handle
-        .try_read_state()
-        .unwrap_or(ContextState::Active);
-    let ttl_remaining_secs = state.ttl.timer.remaining_secs();
-    let grace_entries = state.epoch.grace_store.to_grace_entries();
+#[cfg(test)]
+mod broadcast_routing_tests {
+    use super::broadcast_publish_routing_id;
+    use crate::context::state::context_id_to_bytes;
 
-    crate::context::state::ContextSnapshot {
-        context_id: state.handle.context_id().to_owned(),
-        creation_timestamp_secs: state.creation_timestamp_secs,
-        state: context_state_value,
-        context_params: state.handle.params().clone(),
-        membership: state.membership.clone(),
-        role_state: state.role_state.clone(),
-        event_log_merkle_root: [0u8; 32],
-        executed_proposals: state
-            .governance
-            .class_s
-            .executed_proposals
-            .keys()
-            .copied()
-            .collect(),
-        ttl_remaining_secs,
-        registered_tools: state.governance.registered_tools.clone(),
-        read_exclusion_list: state.access.read_exclusion_list.clone(),
-        tool_interfaces: state.governance.tool_interfaces.clone(),
-        threshold_signers: state.governance.class_s.threshold_signers.clone(),
-        threshold_value: state.governance.class_s.threshold_value,
-        pruning_policy: state.governance.pruning_policy.clone(),
-        governance_model_config: Some(state.governance.engine.model_config()),
-        economic_policy: state.governance.economic_policy.clone(),
-        budget_tracker: state.governance.budget_tracker.clone(),
-        approved_proposals: state.governance.approved_proposals.clone(),
-        next_proposal_seq: state.governance.next_proposal_seq,
-        governance_freeze: state.governance.freeze,
-        pending_ceiling_modification: state.governance.pending_ceiling_modification.clone(),
-        pending_economic_policy_change: state.governance.pending_economic_policy_change.clone(),
-        mls_epoch: state.epoch.mls_epoch,
-        epoch_coordination_records: state.epoch.coordinator.records().to_vec(),
-        grace_entries,
-        needs_reconnect: state.epoch.needs_reconnect,
-        mls_crypto_state: Vec::new(),
-        migration_state: state.migration_state.clone(),
-        access_key_store: state.access.access_key_store.clone(),
-        consequence_rules: state.governance.consequence_rules.clone(),
-        participation_cache: state.governance.participation_cache.clone(),
-        velocity_tracker: Some(state.governance.velocity_tracker.window_secs()),
-        velocity_tracker_state: Some(VelocityTrackerSnapshot {
-            window_secs: state.governance.velocity_tracker.window_secs(),
-            entries: state.governance.velocity_tracker.snapshot_entries(),
-        }),
-        cooldown_until: state.governance.cooldown_until.clone(),
-        proposal_timestamps: state.governance.proposal_timestamps.clone(),
-        message_pricing: state.governance.message_pricing.clone(),
-        hard_rate_limit_config: Some(state.governance.hard_rate_limit.config().clone()),
-        hard_rate_limit_state: state.governance.hard_rate_limit.snapshot_entries(),
-        spending_nonce_tracker_state: state
-            .governance
-            .class_s
-            .spending_nonce_tracker
-            .snapshot_entries(),
-        revoked_spending_ucan_cids: state.governance.revoked_spending_ucan_cids.clone(),
-        pending_commits: state.pending_commits.clone(),
-        commit_fault: state.commit_fault.clone(),
-        checkpoint_events_since: state.checkpoint_events_since,
-        checkpoint_last_time_secs: state.checkpoint_last_time_secs,
-        generation: state.generation,
-        routing: state.routing.clone(),
-        // ADR-049 §9 Class S (line 144): persist the staged saga slot
-        // through its sanctioned mirror via the shared helper.
-        saga_pending: crate::context::messaging_helpers::saga_pending_snapshot(state),
-        xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
-            state,
-        ),
-        xctx_committed_invocations:
-            crate::context::messaging_helpers::xctx_committed_invocations_snapshot(state),
-        xctx_caller_reservations:
-            crate::context::messaging_helpers::xctx_caller_reservations_snapshot(state),
-        xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(state),
+    /// Regression guard (ADR-056 / spec §5.14.6): the broadcast publish path
+    /// MUST address the relay under the broadcast ROUTING id
+    /// (`SHA-256(context_id)`), NOT the canonical context-identity digest that
+    /// `context_id_to_bytes` decodes for a real 64-hex id. Before this guard,
+    /// `apply_broadcast_publish` routed the `send_message` slot through
+    /// `context_id_to_bytes`. On `main` that incidentally equalled
+    /// `SHA-256(id)`; ADR-056 broke the equality, so publish stored a blob at a
+    /// slot the projection (`compute_routing_id` = `SHA-256(id)`) never reads —
+    /// the self-host deploy then committed zero assets (`host_site`
+    /// `CommitCountMismatch`). This test pins the routing primitive so a future
+    /// edit that swaps it back to the keying digest fails fast, without a full
+    /// HTTP/relay round-trip.
+    #[test]
+    fn broadcast_publish_routes_under_sha256_routing_id_not_keying_digest() {
+        // A canonical id: lowercase-hex of a known 32-byte digest — exactly the
+        // shape `generate_context_id` emits (`hex(32 random bytes)`).
+        let digest: [u8; 32] = [
+            0x05, 0xf9, 0x1c, 0x9f, 0x77, 0x21, 0x9f, 0xd7, 0x6e, 0xee, 0x2b, 0x7e, 0x07, 0x16,
+            0x24, 0xf9, 0x1d, 0xf4, 0xc2, 0x11, 0x50, 0x71, 0xb4, 0xa6, 0x5b, 0x6b, 0xd8, 0x03,
+            0x5c, 0xf4, 0x6b, 0xbe,
+        ];
+        let id = hex::encode(digest);
+        assert_eq!(id.len(), 64, "fixture id must be a real 64-hex context id");
+
+        // The keying chokepoint DECODES a real 64-hex id to its digest. For
+        // such an id that decoded digest IS the id's own bytes — and is NOT
+        // `SHA-256(id)`. This precondition is what makes the two slots diverge.
+        assert_eq!(
+            context_id_to_bytes(&id),
+            digest,
+            "a real 64-hex id resolves to its decoded digest (ADR-056 keying)"
+        );
+        let sha256_of_id = scp_protocol::context::context_id_bytes(&id);
+        assert_ne!(
+            sha256_of_id, digest,
+            "test precondition: SHA-256(hex(digest)) must differ from the digest, \
+             else publish-slot vs read-slot could not diverge"
+        );
+
+        // The publish path's routing slot MUST be the SHA-256 broadcast routing
+        // id, matching the projection read side …
+        let routing = broadcast_publish_routing_id(&id);
+        assert_eq!(
+            routing,
+            scp_protocol::context::broadcast_routing_id(&id),
+            "broadcast publish must route under the canonical broadcast routing id"
+        );
+        assert_eq!(
+            routing, sha256_of_id,
+            "broadcast routing id is SHA-256(context_id) per §5.14.6"
+        );
+
+        // … and MUST NOT be the ADR-056 keying digest (the bug this fixes).
+        assert_ne!(
+            routing,
+            context_id_to_bytes(&id),
+            "broadcast publish MUST NOT route under the keying digest — that stores \
+             the blob at a slot no subscriber/projection reads (host_site CommitCountMismatch)"
+        );
     }
 }

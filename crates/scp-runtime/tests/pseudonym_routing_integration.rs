@@ -5,7 +5,7 @@
     clippy::large_futures,
     // Test-only recording transport: `send_message` is a synchronous trait
     // method, so a plain `std::sync::Mutex` (never held across `.await`) is the
-    // right tool. The runtime's actor path bans it (ADR-049); test fixtures are
+    // right outlet. The runtime's actor path bans it (ADR-049); test fixtures are
     // explicitly exempt. See crates/scp-runtime/clippy.toml.
     clippy::disallowed_types
 )]
@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::KeyResolver;
@@ -40,7 +40,7 @@ use scp_protocol::context::params::{
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 const ALICE: &str = "did:dht:z6MkAlice";
 const BOB: &str = "did:dht:z6MkBob";
@@ -71,21 +71,26 @@ impl RecordingTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for RecordingTransport {
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn send_message(&self, id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
         self.routing_ids.lock().expect("lock").push(*id);
         Ok(())
     }
@@ -94,11 +99,12 @@ impl ContextTransportProvider for RecordingTransport {
 #[derive(Default)]
 struct MockEventLog;
 
+#[async_trait::async_trait]
 impl ContextEventLogProvider for MockEventLog {
-    fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(
+    async fn append_event(
         &self,
         _id: &[u8; 32],
         _event: scp_event_log::EventType,
@@ -108,7 +114,7 @@ impl ContextEventLogProvider for MockEventLog {
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 }
@@ -122,7 +128,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|did, _kid: scp_did::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -134,17 +140,20 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 
 fn ceiling() -> Vec<Capability> {
     vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("role:assign"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
     ]
 }
 
 fn manager_with_transport(transport: Arc<RecordingTransport>) -> std::sync::Arc<Supervisor> {
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(ALICE.to_owned())),
+        Arc::new(NodeMlsFactory::new(
+            ALICE.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(TransportShim(transport)),
         Box::new(MockEventLog),
         mock_key_resolver(),
@@ -155,22 +164,23 @@ fn manager_with_transport(transport: Arc<RecordingTransport>) -> std::sync::Arc<
 /// inspect captured routing IDs after the supervisor sends.
 struct TransportShim(Arc<RecordingTransport>);
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for TransportShim {
     fn is_connected(&self) -> bool {
         self.0.is_connected()
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         id: &[u8; 32],
         params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
-        self.0.publish_context(id, params)
+        self.0.publish_context(id, params).await
     }
-    fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.delete_published(id)
+    async fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.delete_published(id).await
     }
-    fn send_message(&self, id: &[u8; 32], payload: &[u8]) -> Result<(), ContextError> {
-        self.0.send_message(id, payload)
+    async fn send_message(&self, id: &[u8; 32], payload: &[u8]) -> Result<(), ContextError> {
+        self.0.send_message(id, payload).await
     }
 }
 

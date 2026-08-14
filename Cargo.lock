@@ -1258,9 +1258,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2074,11 +2074,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.0",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -5077,12 +5079,113 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "scp-client"
+version = "0.1.0-beta.2"
+dependencies = [
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.2",
+ "openmls",
+ "rmp-serde",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
+ "scp-event-log",
+ "scp-mls",
+ "scp-protocol",
+ "scp-relay-client",
+ "scp-relay-mock",
+ "serde",
+ "thiserror 2.0.18",
+ "tls_codec",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "scp-client-wasm"
+version = "0.1.0-beta.2"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.2",
+ "js-sys",
+ "openmls",
+ "rmp-serde",
+ "scp-client",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
+ "scp-event-log",
+ "scp-mls",
+ "scp-protocol",
+ "scp-relay-client",
+ "scp-relay-mock",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "tls_codec",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+ "web-sys",
+ "zeroize",
+]
+
+[[package]]
+name = "scp-clock"
+version = "0.1.0-beta.2"
+
+[[package]]
 name = "scp-core"
 version = "0.1.0-beta.2"
 dependencies = [
+ "scp-mls",
  "scp-protocol",
  "scp-runtime",
  "serde_json",
+]
+
+[[package]]
+name = "scp-crypto"
+version = "0.1.0-beta.2"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "hkdf",
+ "hmac",
+ "rand 0.8.5",
+ "sha2 0.10.9",
+ "zeroize",
+]
+
+[[package]]
+name = "scp-dht"
+version = "0.1.0-beta.2"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+ "mainline",
+ "reqwest",
+ "scp-dht",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "z-base-32",
+]
+
+[[package]]
+name = "scp-did"
+version = "0.1.0-beta.2"
+dependencies = [
+ "base64",
+ "bs58",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "rand 0.8.5",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 2.0.18",
+ "z-base-32",
 ]
 
 [[package]]
@@ -5094,7 +5197,9 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "rmp-serde",
- "scp-primitives",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5118,7 +5223,10 @@ dependencies = [
  "pyo3",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-clock",
  "scp-core",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-ffi-common",
  "scp-identity",
@@ -5126,7 +5234,6 @@ dependencies = [
  "scp-media",
  "scp-node",
  "scp-platform",
- "scp-primitives",
  "scp-testing",
  "scp-transport",
  "serde_json",
@@ -5151,13 +5258,15 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "rand_core 0.6.4",
+ "scp-clock",
  "scp-core",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-identity",
  "scp-mcp",
  "scp-node",
  "scp-platform",
- "scp-primitives",
  "scp-protocol",
  "scp-transport",
  "serde_json",
@@ -5186,7 +5295,10 @@ dependencies = [
  "napi-derive",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-clock",
  "scp-core",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-ffi-common",
  "scp-ffi-napi-test-stubs",
@@ -5195,7 +5307,6 @@ dependencies = [
  "scp-media",
  "scp-node",
  "scp-platform",
- "scp-primitives",
  "scp-testing",
  "scp-transport",
  "serde_json",
@@ -5229,7 +5340,10 @@ dependencies = [
  "hex",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-clock",
  "scp-core",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-ffi-common",
  "scp-identity",
@@ -5237,7 +5351,6 @@ dependencies = [
  "scp-media",
  "scp-node",
  "scp-platform",
- "scp-primitives",
  "scp-transport",
  "serde_json",
  "sha2 0.10.9",
@@ -5255,49 +5368,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scp-ffi-wasm"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "base64",
- "ed25519-dalek 2.2.0",
- "getrandom 0.2.17",
- "getrandom 0.3.4",
- "hex",
- "hmac",
- "js-sys",
- "jsonschema",
- "openmls",
- "openmls_basic_credential",
- "openmls_rust_crypto 0.5.1",
- "openmls_traits 0.5.0",
- "proptest",
- "rand 0.8.5",
- "rand_core 0.6.4",
- "rmp-serde",
- "scp-event-log",
- "scp-ffi-common",
- "scp-identity",
- "scp-protocol",
- "serde",
- "serde_bytes",
- "serde_json",
- "serde_json_canonicalizer",
- "sha2 0.10.9",
- "subtle",
- "thiserror 2.0.18",
- "tls_codec",
- "unicode-normalization",
- "uuid",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-sys",
- "z-base-32",
- "zeroize",
-]
-
-[[package]]
 name = "scp-identity"
 version = "0.1.0-beta.2"
 dependencies = [
@@ -5305,11 +5375,11 @@ dependencies = [
  "bs58",
  "ed25519-dalek 2.2.0",
  "hex",
- "mainline",
  "rand 0.8.5",
- "reqwest",
+ "scp-clock",
+ "scp-dht",
+ "scp-did",
  "scp-platform",
- "scp-primitives",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5326,8 +5396,8 @@ name = "scp-mcp"
 version = "0.1.0-beta.2"
 dependencies = [
  "axum",
+ "scp-clock",
  "scp-core",
- "scp-primitives",
  "serde",
  "serde_json",
  "subtle",
@@ -5344,12 +5414,45 @@ name = "scp-media"
 version = "0.1.0-beta.2"
 dependencies = [
  "openmls_traits 0.5.0",
+ "scp-clock",
  "scp-core",
+ "scp-did",
  "scp-identity",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
+name = "scp-mls"
+version = "0.1.0-beta.2"
+dependencies = [
+ "bs58",
+ "ed25519-dalek 2.2.0",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.2",
+ "openmls",
+ "openmls_basic_credential",
+ "openmls_memory_storage 0.5.0",
+ "openmls_rust_crypto 0.5.1",
+ "openmls_traits 0.5.0",
+ "proptest",
+ "rand 0.8.5",
+ "rmp-serde",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
+ "scp-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tls_codec",
+ "tracing",
+ "uuid",
+ "x25519-dalek 2.0.1",
  "zeroize",
 ]
 
@@ -5378,10 +5481,14 @@ dependencies = [
  "rmp-serde",
  "rustls",
  "rustls-pemfile",
+ "scp-clock",
  "scp-core",
+ "scp-crypto",
+ "scp-dht",
+ "scp-did",
  "scp-identity",
  "scp-platform",
- "scp-primitives",
+ "scp-relay-client",
  "scp-transport",
  "serde",
  "serde_json",
@@ -5411,11 +5518,11 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "fs2",
  "hex",
- "hkdf",
  "hmac",
  "rand 0.8.5",
  "rmp-serde",
  "rusqlite",
+ "scp-crypto",
  "scp-testing",
  "serde",
  "sha2 0.10.9",
@@ -5426,19 +5533,6 @@ dependencies = [
  "uuid",
  "x25519-dalek 2.0.1",
  "zeroize",
-]
-
-[[package]]
-name = "scp-primitives"
-version = "0.1.0-beta.2"
-dependencies = [
- "ed25519-dalek 2.2.0",
- "hex",
- "rand 0.8.5",
- "rmp-serde",
- "serde",
- "serde_json",
- "z-base-32",
 ]
 
 [[package]]
@@ -5454,6 +5548,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hkdf",
+ "hmac",
  "hpke-rs",
  "hpke-rs-rust-crypto",
  "jsonschema",
@@ -5464,8 +5559,10 @@ dependencies = [
  "rand 0.8.5",
  "rmp-serde",
  "rmpv",
+ "scp-clock",
+ "scp-crypto",
+ "scp-did",
  "scp-event-log",
- "scp-primitives",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5491,6 +5588,27 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "scp-relay-client"
+version = "0.1.0-beta.2"
+dependencies = [
+ "rmp-serde",
+ "rmpv",
+ "scp-protocol",
+ "serde",
+ "serde_bytes",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "scp-relay-mock"
+version = "0.1.0-beta.2"
+dependencies = [
+ "scp-client",
+ "scp-protocol",
+ "scp-relay-client",
 ]
 
 [[package]]
@@ -5522,12 +5640,17 @@ dependencies = [
  "rand 0.8.5",
  "rmp-serde",
  "rmpv",
+ "scp-clock",
+ "scp-crypto",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-identity",
  "scp-media",
+ "scp-mls",
  "scp-platform",
- "scp-primitives",
  "scp-protocol",
+ "scp-testing",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -5549,6 +5672,7 @@ dependencies = [
 name = "scp-testing"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64",
  "bytes",
@@ -5564,13 +5688,18 @@ dependencies = [
  "proc-macro2",
  "rand 0.8.5",
  "rmp-serde",
+ "scp-clock",
  "scp-core",
+ "scp-dht",
+ "scp-did",
  "scp-event-log",
  "scp-ffi-common",
  "scp-identity",
  "scp-node",
  "scp-platform",
- "scp-primitives",
+ "scp-protocol",
+ "scp-relay-client",
+ "scp-runtime",
  "scp-transport",
  "serde",
  "serde_json",
@@ -5622,10 +5751,11 @@ dependencies = [
  "rmpv",
  "rusqlite",
  "rustls",
+ "scp-clock",
  "scp-core",
  "scp-identity",
  "scp-platform",
- "scp-primitives",
+ "scp-relay-client",
  "scp-testing",
  "serde",
  "serde_bytes",
@@ -5738,6 +5868,17 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
 ]
 
 [[package]]

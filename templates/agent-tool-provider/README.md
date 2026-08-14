@@ -24,10 +24,10 @@ python agent.py --mcp --sse           # MCP server over SSE
 The agent demonstrates the complete tool lifecycle within SCP:
 
 1. **Identity creation** -- creates a `did:dht` identity with in-memory key custody.
-2. **Context creation** -- opens an encrypted context with `ToolRegister` and `ToolInvokeAll` capabilities in the ceiling.
+2. **Context creation** -- opens an encrypted context with `OutletRegister` and `OutletCallAll` capabilities in the ceiling.
 3. **Tool registration** -- registers two tools (`calculator`, `search`) with JSON Schema input/output definitions and test vectors.
 4. **Handler attachment** -- attaches Python callables to each tool via `register_tool_handler()`. When a tool is invoked, the handler receives validated JSON input and returns JSON output.
-5. **UCAN minting** -- mints a UCAN token with `tool_invoke:*` capability scoped to the context. Every tool invocation requires a valid UCAN.
+5. **UCAN minting** -- mints a UCAN token with `outlet_call:*` capability scoped to the context. Every outlet invocation requires a valid UCAN.
 6. **Invocation** -- calls `ctx.invoke(tool_name, input, ucan_token)` which validates the UCAN, checks the input against the tool's JSON Schema, executes the handler, and returns the result.
 7. **MCP bridging** (optional) -- starts an MCP server that exposes all context tools to MCP-compatible models (Claude, GPT, etc.) over stdio or SSE transport.
 
@@ -100,7 +100,7 @@ from scp_sdk.ucan import mint as ucan_mint
 # Mint a token authorizing tool invocation.
 token = await ucan_mint(
     audience=identity.did,
-    capabilities=["tool_invoke:my_tool"],  # or "tool_invoke:*" for all
+    capabilities=["outlet_call:my_tool"],  # or "outlet_call:*" for all
     context=ctx.context_id,
 )
 
@@ -177,7 +177,7 @@ async with await serve_mcp(
 
 ### Capability Filtering
 
-The MCP server only exposes tools that the agent's role permits. If the agent lacks `ToolInvokeAll`, only tools matching specific `ToolInvoke(tool_id)` capabilities are listed.
+The MCP server only exposes tools that the agent's role permits. If the agent lacks `OutletCallAll`, only tools matching specific `OutletCall(outlet_id)` capabilities are listed.
 
 ### Provenance
 
@@ -209,7 +209,7 @@ async with await McpClient.connect(
 1. Define a `ToolDefinition` with JSON Schema for input and output.
 2. Write a handler function `(dict) -> dict`.
 3. Register the handler with `register_tool_handler(ctx, tool_name, handler)`.
-4. Mint a UCAN token with `tool_invoke:<tool_name>` capability.
+4. Mint a UCAN token with `outlet_call:<tool_name>` capability.
 5. Invoke via `ctx.invoke()` or expose via MCP with `serve_mcp()`.
 
 Test vectors are optional but recommended -- they document expected behavior and can be used for verification during registration.

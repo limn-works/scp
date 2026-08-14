@@ -1,5 +1,5 @@
 /**
- * MCP integration: expose SCP tools via an MCP JSON-RPC server, then
+ * MCP integration: expose SCP outlets via an MCP JSON-RPC server, then
  * connect as an MCP client to a remote server.
  *
  * Post-Phase-4 (ADR-048): all bridge operations route through an
@@ -11,27 +11,28 @@
  * Run: bun run examples/mcp-integration.ts
  */
 
-import { SCP, defineToolDefinition } from "../src/index";
+import { SCP, defineOutletDefinition } from "../src/index";
 
 async function main(): Promise<void> {
   const scp = new SCP({ storage: { type: "in_memory" } });
   try {
     const identity = await scp.identityCreate("in_memory");
 
-    // Create a context with tool capabilities.
+    // Create a context with outlet capabilities.
     const ctx = await scp.contextCreate(
       identity,
       JSON.stringify({
-        ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
+        ceiling: ["messages:read", "messages:write", "outlet:call:*", "outlet:register"],
         memoryScope: "ephemeral",
         governance: "single_admin",
       }),
     );
 
-    // Register a tool in the context.
-    const tool = defineToolDefinition({
+    // Register an outlet in the context.
+    const outlet = defineOutletDefinition({
       name: "summarize",
       description: "Summarize text content",
+      kind: "action",
       inputSchema: {
         type: "object",
         properties: { text: { type: "string" } },
@@ -43,22 +44,22 @@ async function main(): Promise<void> {
       },
       operator: identity.did,
     });
-    await scp.toolRegister(ctx._rawHandle, tool);
+    await scp.outletRegister(ctx._rawHandle, outlet);
 
-    // Start an MCP server exposing context tools on stdio.
+    // Start an MCP server exposing context outlets on stdio.
     const server = await scp.mcpServerCreate({
       identityDid: identity.did,
       contextIds: [ctx.contextId],
       transport: "stdio",
     });
-    console.log("MCP server running, exposing tools");
+    console.log("MCP server running, exposing outlets");
 
     try {
       // Or connect as an MCP client to a remote server.
       const client = await scp.mcpClientConnectSse("http://localhost:8080/mcp");
       try {
-        const tools = await scp.mcpClientListTools(client);
-        console.log(`Remote server offers ${tools.length} tool(s)`);
+        const outlets = await scp.mcpClientListTools(client);
+        console.log(`Remote server offers ${outlets.length} outlet(s)`);
 
         const result = await scp.mcpClientInvoke(
           client,

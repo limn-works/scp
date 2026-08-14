@@ -51,6 +51,23 @@ pub use key_protocol_verify::{
     verify_block_notification, verify_epoch_advance, verify_sender_key_request,
 };
 
+/// Maximum allowed epoch advance in a single sender key distribution or
+/// message receive (§9.16.1 "Epoch poisoning defense").
+///
+/// Recipients reject a sender-key epoch that exceeds the highest legitimately
+/// observed epoch for that sender by more than this bound. Without it, an
+/// attacker could craft a single message or key distribution with
+/// `epoch = u64::MAX`, which — once recorded in the per-sender high-water /
+/// replay tracker — permanently locks out every subsequent legitimate epoch
+/// from that sender (self-DoS / persistent per-receiver poisoning).
+///
+/// The value is shared by every consumer so the ceiling cannot diverge across
+/// implementations:
+/// - the `scp-runtime` MLS crypto provider (`seal` / `open` receive ceiling) and
+/// - [`SenderKeyStore::merge_incoming_epochs`] snapshot-import overshoot guard
+///   (callers pass this as `max_advance_per_sender`).
+pub const MAX_EPOCH_ADVANCE: u64 = 1000;
+
 // ---------------------------------------------------------------------------
 // SenderKey
 // ---------------------------------------------------------------------------

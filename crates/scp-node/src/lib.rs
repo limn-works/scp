@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use scp_core::store::{CURRENT_STORE_VERSION, ProtocolRepository, StoredValue};
-use scp_identity::document::DidDocument;
+use scp_did::DidDocument;
 use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_transport::nat::{NatTierChange, NetworkChangeDetector};
@@ -1482,16 +1482,21 @@ impl<S: Storage> ApplicationNode<S> {
 
 /// Dev/demo convenience constructor for [`ApplicationNode`].
 ///
-/// Requires the `allow_unencrypted_storage` feature flag (or `#[cfg(test)]`).
-/// **Not for production use.**
-#[cfg(any(test, feature = "allow_unencrypted_storage"))]
-impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
+/// Requires the `testing` feature flag (or `#[cfg(test)]`). **Not for production
+/// use.** It wires the `InMemoryDhtClient` (a §17.17.3 resolve nullifier) and
+/// publishes its DID document at startup, so it is a test-harness node only —
+/// hence the `testing` gate, which keeps the nullifier out of shipped artifacts
+/// (ADR-062 §Decision 1). Production callers use [`Node::start`] with a real
+/// Pkarr client, or [`DhtMode::Disabled`](crate::DhtMode::Disabled) via
+/// `host_site` for a non-publishing node.
+#[cfg(any(test, feature = "testing"))]
+impl ApplicationNode<scp_platform::in_memory::InMemoryStorage> {
     /// Creates an `ApplicationNode` with sensible development defaults.
     ///
     /// Auto-wires:
     /// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
-    /// - [`InMemoryStorage`](scp_platform::testing::InMemoryStorage)
-    /// - [`InMemoryDhtClient`](scp_identity::InMemoryDhtClient) (no real DHT network)
+    /// - [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage)
+    /// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT network)
     /// - [`SelfSignedTlsProvider`] (self-signed TLS certificate for `localhost`)
     /// - Relay bound to `127.0.0.1:<port>`
     /// - Domain set to `localhost`
@@ -1502,7 +1507,7 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```ignore
     /// # async fn example() -> Result<(), scp_node::NodeError> {
     /// let node = scp_node::ApplicationNode::dev(4000).await?;
     /// println!("Relay at {}", node.relay().bound_addr());
@@ -1516,11 +1521,12 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
     /// Returns [`NodeError`] if relay binding, identity generation, or TLS
     /// provisioning fails.
     pub async fn dev(port: u16) -> Result<Self, NodeError> {
+        use scp_clock::SystemClock;
+        use scp_dht::InMemoryDhtClient;
         use scp_identity::DidCache;
-        use scp_identity::InMemoryDhtClient;
-        use scp_identity::cache::SystemClock;
         use scp_identity::dht::DidDht;
-        use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+        use scp_platform::in_memory::InMemoryStorage;
+        use scp_platform::testing::InMemoryKeyCustody;
 
         type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
@@ -1550,6 +1556,9 @@ impl ApplicationNode<scp_platform::testing::InMemoryStorage> {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                // Durability-only blob arm, selected explicitly — `dev()` is a
+                // documented dev/prototyping affordance (SCP-CAPINJECT-010).
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -2537,6 +2546,10 @@ fn spawn_tier_reevaluation(
 
 /// Resolves the identity from an [`IdentitySource`], returning the identity,
 /// document, and DID method.
+///
+/// On a shipped build the `Generate` arm fails closed with no `.await`; the
+/// `async` signature is kept for the `testing` build and callers' `.await`.
+#[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
 async fn resolve_identity<K: KeyCustody, D: DidMethod>(
     source: IdentitySource<K, D>,
 ) -> Result<(ScpIdentity, DidDocument, Arc<D>), NodeError> {
@@ -2545,29 +2558,35 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             custody,
             did_method,
         } => {
-            // KNOWN LIMITATION: this path drops the `PreRotationKeyHandle`
-            // because `ApplicationNode<K, D, S, Dom, Id>`'s generic
-            // parameter list does not yet carry a `P: PreRotationCustody`
-            // slot. As a consequence, identities produced by this code
-            // path CANNOT be migrated later — the migrate flow needs both
-            // the handle and the custody instance to call
-            // `dht::migrate_identity`. The current shipped backend is
-            // `InMemoryPreRotationCustody` which is process-local
-            // anyway, so the migration capability would be lost on
-            // process restart even if we persisted the handle. Widening
-            // the builder to accept a real `PreRotationCustody` is
-            // tracked alongside the production custody backends.
-            let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
-            let (identity, document, _pre_rotation_handle) =
-                did_method.create(&*custody, &pre_rotation_custody).await?;
-            tracing::warn!(
-                did = %identity.did,
-                "identity created without a persistent PreRotationCustody — migration \
-                 (Layer-2 DID rotation) will be impossible until the builder API is \
-                 widened to accept a real backend. Recovery from `#0` compromise via \
-                 spec §9.7.4.1 is unreachable for this identity."
-            );
-            Ok((identity, document, did_method))
+            // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3), which
+            // requires a `PreRotationCustody` backend. The only implementation
+            // is the test-harness `InMemoryPreRotationCustody` nullifier.
+            #[cfg(feature = "testing")]
+            {
+                // KNOWN LIMITATION (testing builds): this path drops the
+                // `PreRotationKeyHandle` because `ApplicationNode`'s generic
+                // parameter list does not yet carry a `P: PreRotationCustody`
+                // slot, so identities produced here cannot be migrated later.
+                let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+                let (identity, document, _pre_rotation_handle) =
+                    did_method.create(&*custody, &pre_rotation_custody).await?;
+                tracing::warn!(
+                    did = %identity.did,
+                    "identity created without a persistent PreRotationCustody — migration \
+                     (Layer-2 DID rotation) will be impossible until the builder API is \
+                     widened to accept a real backend. Recovery from `#0` compromise via \
+                     spec §9.7.4.1 is unreachable for this identity."
+                );
+                Ok((identity, document, did_method))
+            }
+            #[cfg(not(feature = "testing"))]
+            {
+                // FAIL CLOSED (ADR-062 §Decision 6): no real PreRotationCustody
+                // backend exists yet (RFC #2130 / #1729). Never mint the in-memory
+                // nullifier on a shipped build — return a typed error instead.
+                let _ = (custody, did_method);
+                Err(NodeError::Identity(IdentityError::NoPreRotationBackend))
+            }
         }
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
         // `Node::start` normalizes `Persisted` to a `Generate` source with
@@ -2744,46 +2763,62 @@ pub(crate) async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: 
             } else {
                 // 3. Generate a new identity and persist it.
                 //
-                // Same KNOWN LIMITATION as `resolve_identity` above: the
-                // `PreRotationKeyHandle` is dropped because the builder
-                // does not yet carry a `P: PreRotationCustody` generic
-                // slot. Identities produced via this persistent path
-                // cannot migrate. With `InMemoryPreRotationCustody` as
-                // the only shipped backend, the handle would be
-                // process-local anyway and lost on restart.
-                let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
-                let (identity, document, _pre_rotation_handle) =
-                    did_method.create(&*custody, &pre_rotation_custody).await?;
-                tracing::warn!(
-                    did = %identity.did,
-                    "persisted identity created without a persistent PreRotationCustody — \
-                     migration (Layer-2 DID rotation) will be impossible after process \
-                     restart. Recovery from `#0` compromise via spec §9.7.4.1 is unreachable \
-                     for this identity until the builder API is widened to accept a real \
-                     backend."
-                );
-                let persisted = PersistedIdentity {
-                    identity: identity.clone(),
-                    document: document.clone(),
-                };
-                let envelope = StoredValue {
-                    version: CURRENT_STORE_VERSION,
-                    data: &persisted,
-                };
-                let bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
-                    NodeError::Storage(format!("failed to serialize identity for persistence: {e}"))
-                })?;
-                storage
-                    .store(IDENTITY_STORAGE_KEY, &bytes)
-                    .await
-                    .map_err(|e| {
-                        NodeError::Storage(format!("failed to persist identity to storage: {e}"))
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3),
+                // which requires a `PreRotationCustody` backend. The only
+                // implementation is the test-harness `InMemoryPreRotationCustody`.
+                #[cfg(feature = "testing")]
+                {
+                    // KNOWN LIMITATION (testing builds): the `PreRotationKeyHandle`
+                    // is dropped because the builder does not yet carry a
+                    // `P: PreRotationCustody` generic slot, so identities produced
+                    // via this persistent path cannot migrate.
+                    let pre_rotation_custody =
+                        scp_platform::testing::InMemoryPreRotationCustody::new();
+                    let (identity, document, _pre_rotation_handle) =
+                        did_method.create(&*custody, &pre_rotation_custody).await?;
+                    tracing::warn!(
+                        did = %identity.did,
+                        "persisted identity created without a persistent PreRotationCustody — \
+                         migration (Layer-2 DID rotation) will be impossible after process \
+                         restart. Recovery from `#0` compromise via spec §9.7.4.1 is unreachable \
+                         for this identity until the builder API is widened to accept a real \
+                         backend."
+                    );
+                    let persisted = PersistedIdentity {
+                        identity: identity.clone(),
+                        document: document.clone(),
+                    };
+                    let envelope = StoredValue {
+                        version: CURRENT_STORE_VERSION,
+                        data: &persisted,
+                    };
+                    let bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+                        NodeError::Storage(format!(
+                            "failed to serialize identity for persistence: {e}"
+                        ))
                     })?;
-                tracing::info!(
-                    did = %identity.did,
-                    "created and persisted new identity to storage"
-                );
-                Ok((identity, document, did_method))
+                    storage
+                        .store(IDENTITY_STORAGE_KEY, &bytes)
+                        .await
+                        .map_err(|e| {
+                            NodeError::Storage(format!(
+                                "failed to persist identity to storage: {e}"
+                            ))
+                        })?;
+                    tracing::info!(
+                        did = %identity.did,
+                        "created and persisted new identity to storage"
+                    );
+                    Ok((identity, document, did_method))
+                }
+                #[cfg(not(feature = "testing"))]
+                {
+                    // FAIL CLOSED (ADR-062 §Decision 6): no real PreRotationCustody
+                    // backend exists yet (RFC #2130 / #1729). Never mint the
+                    // in-memory nullifier on a shipped build — return a typed error.
+                    let _ = (&custody, &did_method, storage);
+                    Err(NodeError::Identity(IdentityError::NoPreRotationBackend))
+                }
             }
         }
         // Explicit identities are never persisted — caller already manages them.
@@ -3017,6 +3052,7 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
+    dht_mode: DhtMode,
     storage: Arc<ProtocolRepository<S>>,
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
@@ -3037,8 +3073,21 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
     #[cfg(feature = "http3")] http3_config: Option<scp_transport::http3::Http3Config>,
 ) -> Result<ApplicationNode<S>, NodeError> {
     let relay_url = format!("wss://{domain}/scp/v1");
-    document.add_relay_service(&relay_url)?;
-    did_method.publish(&identity, &document).await?;
+    // `add_relay_service` now returns the wasm-safe `DidError`
+    // (ADR-057); route it through `IdentityError` so it lands in the
+    // existing `NodeError::Identity` variant, preserving prior behavior.
+    document
+        .add_relay_service(&relay_url)
+        .map_err(IdentityError::from)?;
+    // Publish the domain→DID binding per the configured `DhtMode` (NOT
+    // unconditionally). `DhtMode::Disabled` — the fail-safe default, and a
+    // LEGITIMATE more-private `Domain + Disabled` config per construction.md M2
+    // (:63/:194): reachable via the domain, address NOT DHT-published, shared
+    // out-of-band — SKIPS the publish, so the node still starts. `Production`
+    // (and the test-only `Memory`) publish FATALLY, exactly as this path did
+    // before. `Domain + Disabled` is never rejected: erroring on the fail-safe
+    // direction would itself violate M2.
+    publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
 
     // Build the rustls ServerConfig from the provisioned certificate.
     // Uses the reloadable config so that ACME renewal can hot-swap certs
@@ -3158,11 +3207,72 @@ fn push_relay_service(document: &mut DidDocument, relay_url: &str) {
         .iter()
         .filter(|s| s.service_type == "SCPRelay")
         .count();
-    document.service.push(scp_identity::document::Service {
+    document.service.push(scp_did::Service {
         id: format!("{}#scp-relay-{}", document.id, relay_count + 1),
         service_type: "SCPRelay".to_owned(),
         service_endpoint: relay_url.to_owned(),
     });
+}
+
+/// Publishes a node's DID document on the no-domain build path, discriminating
+/// on the configured [`DhtMode`] so the two semantically-opposite outcomes are
+/// never conflated.
+///
+/// The asymmetry is deliberate and honest:
+///
+/// - [`DhtMode::Disabled`]: the DID document is **not published at all** — the
+///   publish call is skipped entirely. The node is intentionally not
+///   DHT-discoverable (fail-safe by design; no address disclosed), which is a
+///   *success*, not a degradation. A single `info` is emitted; no warning/error
+///   path is taken, reserving those for genuine degradation. The `host_site`
+///   non-publishing node and any local/dev node rely on exactly this.
+/// - [`DhtMode::Production`] (and the test-harness-only [`DhtMode::Memory`]):
+///   the DID document is published, and a publish failure is **fatal** — it
+///   propagates so [`build_no_domain_inner`] fails and `Node::start` fails
+///   closed. A stable node's tier does not change, so a genuine startup publish
+///   failure (network / timeout / rate-limit) is not something a later periodic
+///   republish will heal into correctness; swallowing it would report a healthy
+///   start while the DID is NOT on the DHT — a false discoverability guarantee,
+///   strictly worse than an honest failure.
+///
+/// This brings the no-domain publishing reaches (`NatTraversal` / `Tunnel`, and
+/// the `Reach::Domain` TLS-provisioning fall-through) into line with the
+/// `Reach::Domain` path, which already treats publish as fatal.
+///
+/// Note the `DhtMode::Disabled` skip is independent of the concrete `D`: even if
+/// `D`'s client would error on publish (e.g.
+/// [`DisabledDhtClient`](scp_dht::DisabledDhtClient), ADR-062 §Decision 1), no
+/// publish is attempted, so a `Disabled` node always starts.
+async fn publish_did_document_for_mode<D: DidMethod + 'static>(
+    dht_mode: DhtMode,
+    did_method: &D,
+    identity: &ScpIdentity,
+    document: &DidDocument,
+) -> Result<(), NodeError> {
+    match dht_mode {
+        DhtMode::Disabled => {
+            tracing::info!(
+                did = %identity.did,
+                "DhtMode::Disabled — node is intentionally not DHT-published \
+                 (not discoverable by design; no address disclosed)"
+            );
+            Ok(())
+        }
+        // Production publishes to the global Mainline DHT; Memory (test-harness-
+        // only) publishes to its in-memory client. Both treat a publish failure
+        // as FATAL so the node fails closed instead of advertising a false
+        // discoverability guarantee. Gated `feature = "testing"` ONLY (ADR-062 A5)
+        // to match the `DhtMode::Memory` variant's single activation path.
+        #[cfg(feature = "testing")]
+        DhtMode::Memory => did_method
+            .publish(identity, document)
+            .await
+            .map_err(NodeError::from),
+        DhtMode::Production => did_method
+            .publish(identity, document)
+            .await
+            .map_err(NodeError::from),
+    }
 }
 
 // Node builder internal: all parameters are required for server construction.
@@ -3171,6 +3281,7 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
     identity: ScpIdentity,
     mut document: DidDocument,
     did_method: Arc<D>,
+    dht_mode: DhtMode,
     storage: Arc<ProtocolRepository<S>>,
     shutdown_handle: ShutdownHandle,
     bound_addr: SocketAddr,
@@ -3210,8 +3321,12 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
 
     push_relay_service(&mut document, &relay_url);
 
-    // 4. Publish DID document.
-    did_method.publish(&identity, &document).await?;
+    // 4. Publish the DID document per the configured DhtMode: skipped for
+    //    `Disabled` (fail-safe, not discoverable by design), FATAL on failure for
+    //    a publishing node (`Production` / test-only `Memory`) so a genuine
+    //    startup publish failure fails the node closed rather than advertising a
+    //    false discoverability guarantee.
+    publish_did_document_for_mode(dht_mode, did_method.as_ref(), &identity, &document).await?;
 
     tracing::info!(
         tier = ?tier,
@@ -3544,11 +3659,12 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use scp_clock::SystemClock;
+    use scp_dht::InMemoryDhtClient;
     use scp_identity::DidCache;
-    use scp_identity::cache::SystemClock;
     use scp_identity::dht::DidDht;
-    use scp_identity::dht_client::InMemoryDhtClient;
-    use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+    use scp_platform::in_memory::InMemoryStorage;
+    use scp_platform::testing::InMemoryKeyCustody;
 
     /// The concrete `DidDht` type used in tests (with in-memory DHT and system clock).
     type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
@@ -3559,6 +3675,63 @@ mod tests {
         let cache = Arc::new(DidCache::new());
         let sign_fn = TestDidDht::make_sign_fn(Arc::clone(custody));
         DidDht::with_client_and_signer(dht_client, cache, sign_fn)
+    }
+
+    /// ADR-062 §Decision 6 / SCP-CAPINJECT-006: on a shipped (no-`testing`) build
+    /// the production `Node` / self-host identity-generation path has no
+    /// pre-rotation custody backend, so it FAILS CLOSED with
+    /// [`IdentityError::NoPreRotationBackend`] (surfaced as SCP-IDENT-1059) rather
+    /// than minting the in-memory `InMemoryPreRotationCustody` nullifier.
+    ///
+    /// Gated `#[cfg(not(feature = "testing"))]`: the fail-closed behavior only
+    /// holds when the nullifier is severed. `resolve_identity`'s `Generate` arm
+    /// mints under `feature = "testing"`; with the feature off (this crate's
+    /// standalone `cargo test -p scp-node` build) it returns the typed error. The
+    /// test constructs its `Generate` inputs via the dev-dependency in-memory
+    /// custody/DHT (available under `test` cfg) — but the fail-closed arm is
+    /// selected by the FEATURE, not `test` cfg, so the assertion is real.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test]
+    async fn pre_rotation_severance_generate_fails_closed() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        let source = IdentitySource::Generate {
+            custody,
+            did_method,
+        };
+        // The Ok type contains `Arc<DidDht<..>>` which is not `Debug`, so match
+        // explicitly rather than `expect_err`.
+        match resolve_identity(source).await {
+            Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
+            Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
+            Ok(_) => panic!(
+                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                 pre-rotation nullifier was minted on a shipped-config create path!"
+            ),
+        }
+    }
+
+    /// Companion to the above for the persisting create path
+    /// (`resolve_identity_persistent`'s generate branch): it likewise funnels
+    /// through the pre-rotation commitment and fails closed on a shipped build.
+    #[cfg(not(feature = "testing"))]
+    #[tokio::test]
+    async fn pre_rotation_severance_persistent_fails_closed() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let did_method = Arc::new(make_test_dht(&custody));
+        let source = IdentitySource::Generate {
+            custody,
+            did_method,
+        };
+        let storage = InMemoryStorage::new();
+        match resolve_identity_persistent(source, true, &storage).await {
+            Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
+            Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
+            Ok(_) => panic!(
+                "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
+                 pre-rotation nullifier was minted on a shipped-config persist create path!"
+            ),
+        }
     }
 
     /// Mock TLS provider that succeeds with a self-signed certificate.
@@ -3624,6 +3797,7 @@ mod tests {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         }
     }
@@ -3689,6 +3863,7 @@ mod tests {
                     },
                 )),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -3783,6 +3958,7 @@ mod tests {
                     did_method: counting_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -3936,6 +4112,7 @@ mod tests {
                     did_method: check_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -4007,6 +4184,7 @@ mod tests {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         }
     }
@@ -4091,6 +4269,254 @@ mod tests {
         assert_eq!(node.relay_url(), "ws://203.0.113.42:8443/scp/v1");
     }
 
+    // -----------------------------------------------------------------------
+    // No-domain publish asymmetry: `DhtMode::Production` fails closed on a
+    // genuine publish failure; `DhtMode::Disabled` starts without publishing.
+    // (P3 fail-closed fix — a Production node must never report a healthy start
+    // while its DID is NOT on the DHT.)
+    // -----------------------------------------------------------------------
+
+    /// A `DidMethod` spy whose `publish` **always fails** — simulating a genuine
+    /// Pkarr network / timeout / rate-limit error — and records whether publish
+    /// was attempted at all. `create` / `verify` / `resolve` / `rotate` delegate
+    /// to an inner `TestDidDht` so identity creation still succeeds.
+    struct FailingPublishDidMethod {
+        inner: TestDidDht,
+        publish_attempts: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl DidMethod for FailingPublishDidMethod {
+        fn create(
+            &self,
+            key_custody: &impl KeyCustody,
+            pre_rotation_custody: &impl scp_platform::PreRotationCustody,
+        ) -> impl std::future::Future<
+            Output = Result<
+                (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                IdentityError,
+            >,
+        > + Send {
+            self.inner.create(key_custody, pre_rotation_custody)
+        }
+
+        fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
+            self.inner.verify(did_string, public_key)
+        }
+
+        fn publish(
+            &self,
+            _identity: &ScpIdentity,
+            _document: &DidDocument,
+        ) -> impl std::future::Future<Output = Result<(), IdentityError>> + Send {
+            self.publish_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Err(IdentityError::DhtPublishFailed(
+                "simulated Pkarr publish failure (network/timeout/rate-limit)".to_owned(),
+            )))
+        }
+
+        fn resolve(
+            &self,
+            did_string: &str,
+        ) -> impl std::future::Future<Output = Result<DidDocument, IdentityError>> + Send {
+            self.inner.resolve(did_string)
+        }
+
+        fn rotate(
+            &self,
+            identity: &ScpIdentity,
+            key_custody: &impl KeyCustody,
+        ) -> impl std::future::Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
+        {
+            self.inner.rotate(identity, key_custody)
+        }
+    }
+
+    /// Builds a no-domain (`Reach::NatTraversal`) config whose DID method's
+    /// `publish` always fails, with an explicit `DhtMode`. Returns the config and
+    /// the shared publish-attempt counter so tests can assert whether publish was
+    /// attempted.
+    fn failing_publish_no_domain_config(
+        dht: DhtMode,
+    ) -> (
+        NodeConfig<InMemoryKeyCustody, FailingPublishDidMethod, InMemoryStorage>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let publish_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let did_method = Arc::new(FailingPublishDidMethod {
+            inner: make_test_dht(&custody),
+            publish_attempts: Arc::clone(&publish_attempts),
+        });
+        // A resolvable NAT tier so the build reaches the publish step (the NAT
+        // probe succeeds; only the DHT publish fails).
+        let tier = ReachabilityTier::Stun {
+            external_addr: SocketAddr::from(([198, 51, 100, 7], 32891)),
+        };
+        let config = NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht,
+            nat: NatSlot::Custom(Arc::new(MockNatStrategy { tier })),
+            ..NodeConfig::defaults(
+                Reach::NatTraversal,
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        };
+        (config, publish_attempts)
+    }
+
+    #[tokio::test]
+    async fn no_domain_production_publish_failure_fails_closed() {
+        // A `DhtMode::Production` no-domain node whose DID publish genuinely
+        // FAILS must NOT report a healthy start — it fails closed so it never
+        // advertises a false discoverability guarantee.
+        let (config, publish_attempts) = failing_publish_no_domain_config(DhtMode::Production);
+
+        let err = Node::start_for_testing(config)
+            .await
+            .err()
+            .expect("Production no-domain start must fail closed when DID publish fails");
+
+        assert!(
+            matches!(err, NodeError::Identity(IdentityError::DhtPublishFailed(_))),
+            "expected a fatal NodeError::Identity(DhtPublishFailed), got: {err:?}"
+        );
+        assert_eq!(
+            publish_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Production must attempt the DID publish exactly once (and fail closed on error)"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_domain_disabled_starts_without_publishing() {
+        // A `DhtMode::Disabled` node must start cleanly WITHOUT attempting to
+        // publish — even when the underlying DID method's publish would error.
+        let (config, publish_attempts) = failing_publish_no_domain_config(DhtMode::Disabled);
+
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("a Disabled node must start cleanly even when publish would error");
+
+        assert_eq!(
+            publish_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Disabled must NOT attempt to publish the DID document (not discoverable by design)"
+        );
+        // The node is genuinely up (relay bound) — just not DHT-published.
+        assert!(
+            node.domain().is_none(),
+            "no-domain mode should have None domain"
+        );
+        assert_ne!(
+            node.relay().bound_addr().port(),
+            0,
+            "relay should be bound to a real port"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Domain-success publish honors DhtMode (R2-2). `build_domain_inner` (the
+    // TLS-provisioning-SUCCESS `Reach::Domain` path) previously published
+    // unconditionally + fatally, ignoring `config.dht`; now it routes through
+    // `publish_did_document_for_mode`, so `DhtMode::Disabled` — a legitimate
+    // more-private `Domain + Disabled` config (construction.md M2 :63/:194) —
+    // starts the node WITHOUT publishing, and `Production` still publishes
+    // fatally. `Domain + Disabled` is NEVER rejected.
+    // -----------------------------------------------------------------------
+
+    /// Builds a `Reach::Domain` config (with a succeeding self-signed TLS
+    /// provider so the build reaches `build_domain_inner`) whose DID method's
+    /// `publish` always fails, with an explicit `DhtMode`. Returns the config and
+    /// the shared publish-attempt counter.
+    fn failing_publish_domain_config(
+        dht: DhtMode,
+    ) -> (
+        NodeConfig<InMemoryKeyCustody, FailingPublishDidMethod, InMemoryStorage>,
+        Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let publish_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let did_method = Arc::new(FailingPublishDidMethod {
+            inner: make_test_dht(&custody),
+            publish_attempts: Arc::clone(&publish_attempts),
+        });
+        let config = NodeConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            dht,
+            tls: TlsMode::Custom(Arc::new(SucceedingTlsProvider {
+                domain: "test.example.com".to_owned(),
+            })),
+            ..NodeConfig::defaults(
+                Reach::Domain {
+                    domain: "test.example.com".to_owned(),
+                },
+                IdentitySource::Generate {
+                    custody,
+                    did_method,
+                },
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
+        };
+        (config, publish_attempts)
+    }
+
+    #[tokio::test]
+    async fn domain_disabled_starts_without_publishing() {
+        // A `Domain + DhtMode::Disabled` node (TLS provisioned) must start
+        // cleanly WITHOUT attempting to publish — even when the DID method's
+        // publish would error. This is the legitimate more-private config
+        // (reachable via the domain, address NOT DHT-published); M2 forbids
+        // rejecting it.
+        let (config, publish_attempts) = failing_publish_domain_config(DhtMode::Disabled);
+
+        let node = Node::start_for_testing(config)
+            .await
+            .expect("a Domain + Disabled node must start cleanly (publish is SKIPPED, not fatal)");
+
+        assert_eq!(
+            publish_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Domain + Disabled must NOT attempt to publish the DID document"
+        );
+        // The node is genuinely up in domain mode (TLS active, relay bound).
+        assert_eq!(node.domain(), Some("test.example.com"));
+        assert_ne!(
+            node.relay().bound_addr().port(),
+            0,
+            "relay should be bound to a real port"
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_production_publish_failure_fails_closed() {
+        // A `Domain + DhtMode::Production` node whose DID publish genuinely FAILS
+        // must fail closed — the domain-success path publishes fatally, never
+        // reporting a healthy start while the DID is NOT on the DHT.
+        let (config, publish_attempts) = failing_publish_domain_config(DhtMode::Production);
+
+        let err = Node::start_for_testing(config)
+            .await
+            .err()
+            .expect("Domain + Production start must fail closed when DID publish fails");
+
+        assert!(
+            matches!(err, NodeError::Identity(IdentityError::DhtPublishFailed(_))),
+            "expected a fatal NodeError::Identity(DhtPublishFailed), got: {err:?}"
+        );
+        assert_eq!(
+            publish_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Production must attempt the DID publish exactly once (and fail closed on error)"
+        );
+    }
+
     #[tokio::test]
     async fn no_domain_does_not_serve_well_known() {
         // AC: .well-known/scp is NOT served in no-domain mode.
@@ -4171,6 +4597,7 @@ mod tests {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -4235,6 +4662,7 @@ mod tests {
                     did_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await;
@@ -4325,6 +4753,7 @@ mod tests {
                     did_method: counting_method,
                 },
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -5039,7 +5468,7 @@ mod tests {
             authentication: vec![],
             assertion_method: vec![],
             also_known_as: vec![],
-            service: vec![scp_identity::document::Service {
+            service: vec![scp_did::Service {
                 id: "did:dht:test123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
@@ -5127,7 +5556,7 @@ mod tests {
             authentication: vec![],
             assertion_method: vec![],
             also_known_as: vec![],
-            service: vec![scp_identity::document::Service {
+            service: vec![scp_did::Service {
                 id: "did:dht:testnet123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
@@ -5215,7 +5644,7 @@ mod tests {
             authentication: vec![],
             assertion_method: vec![],
             also_known_as: vec![],
-            service: vec![scp_identity::document::Service {
+            service: vec![scp_did::Service {
                 id: "did:dht:unchanged123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: "ws://198.51.100.7:32891/scp/v1".to_owned(),
@@ -5313,7 +5742,7 @@ mod tests {
             authentication: vec![],
             assertion_method: vec![],
             also_known_as: vec![],
-            service: vec![scp_identity::document::Service {
+            service: vec![scp_did::Service {
                 id: "did:dht:resilient123#scp-relay-1".to_owned(),
                 service_type: "SCPRelay".to_owned(),
                 service_endpoint: format!("ws://{addr}/scp/v1"),
@@ -5419,6 +5848,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -5473,6 +5903,7 @@ mod tests {
                     did_method: Arc::clone(&did_method),
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -5521,6 +5952,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await;
@@ -5694,6 +6126,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await;
@@ -5735,6 +6168,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -5773,6 +6207,7 @@ mod tests {
                     did_method: Arc::clone(&did_method),
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -5793,6 +6228,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await

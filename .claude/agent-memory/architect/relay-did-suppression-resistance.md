@@ -1,0 +1,16 @@
+---
+name: relay-did-suppression-resistance
+description: Clean-room verdict — relay DID-resolution layer CANNOT be suppression-resistant without relay-side validation; §3.10.8 spec claim is wrong for the flood case
+metadata:
+  type: project
+---
+
+Independent clean-room design (2026-08-02, security-first lens) of SCP relay-based DID resolution. Corroborates [[adr062-relay-public-record-framing]] (framing net-new) and [[relay-resolution-late-binding]]. Adds the load-bearing impossibility result.
+
+**Core result — client-only cannot deliver anti-suppression against a flood.** routing_id=SHA-256("scp:did:"||did) is public; anyone can PUBLISH; relay stores MULTIPLE blobs/routing_id; QUERY returns a BOUNDED window (max 1000). The honest record is one element of an attacker-unbounded multiset behind a bounded reader window. *Presence-in-window is controlled by the storer (relay), not the reader (client).* Attacker floods > window junk (or relay reorders) → honest doc unreachable. Client sig-filtering only works if the valid blob is INSIDE the returned window — which the attacker/relay controls by volume/order. Therefore relay-side validation is NECESSARY for relay-layer suppression-resistance. Client verification remains necessary for authenticity but is insufficient for anti-suppression.
+
+**Why:** the DHT (Layer 1, already built) is suppression-resistant precisely because BEP44 nodes validate on write + keep ONE highest-seq slot/key. To match, the relay must do the same for DID records: verify BEP44 sig + routing_id binding + strictly-higher seq on PUBLISH, keep a single slot. Then flooding is inert (junk fails verify, lower-seq won't displace, higher-seq needs the private key), reordering is structurally eliminated (≤1 record to return), and storage DoS improves (O(1)/routing_id, CAS on seq).
+
+**Not a dumb-pipe violation.** Tenet governs ENCRYPTED context content. DID docs are PUBLIC self-certifying; relay gains no forge/rollback/decrypt power (client re-verifies; private key still required to change slot). Precedent IN-TREE: SCP-247 BRIDGE_REGISTER already has the relay derive DID from pubkey + verify Ed25519 sig + check SHA-256("scp:did:"||did)==routing_id (`native/protocol.rs:259-292`). Mainline DHT nodes validate BEP44 puts — standard practice.
+
+**How to apply — SPEC BUG (artifact-flow: fix spec before code).** §3.10.2 ("no special relay behavior, DID doc is just another blob") and §3.10.8 ("Relay suppresses document … multi-relay … as it does for context blobs") are WRONG for the flood/reorder case: multi-relay defeats OMISSION, not flood-eviction-within-window. §3.10.2 opaque-blob + limit:1 is the DOA choice (oldest-first+limit:1 → attacker pre-registers junk → relay-layer resolution fails). Correct design = typed DidRecordV1 frame (magic+did+seq+value+sig, BEP44 preimage byte-identical to DHT per §3.10.5) as the blob payload (rides existing PUBLISH/QUERY, no new wire op) + relay validation path + single highest-seq slot. Freshness/rollback stays TOFU-bounded at first contact (irreducible, same as DHT; #1855 persisted floor closes cold-start beyond process lifetime). Verdict: no-special-relay-behavior goal is incompatible with suppression-resistance goal; security-first ⇒ suppression-resistance wins.

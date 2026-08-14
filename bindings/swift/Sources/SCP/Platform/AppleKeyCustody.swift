@@ -896,7 +896,7 @@ public extension AppleKeyCustody {
     ///   ``PlatformError/custodyError(_:)`` for HMAC or keygen failures.
     ///
     /// See ADR-025 Key custody, spec §9.10.4.1, and
-    /// `derive_pseudonym_keypair` in `scp-platform/src/pseudonym.rs` for the
+    /// `derive_pseudonym_keypair` in `scp-crypto/src/pseudonym.rs` for the
     /// canonical Rust reference implementation.
     @concurrent
     func deriveRotatablePseudonym(

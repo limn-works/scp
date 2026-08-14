@@ -1,14 +1,41 @@
 //! Context creation shared types and errors.
 //!
 //! Pure sync data types and associated errors. The crypto provider itself
-//! (`MlsCryptoProvider`) and the async builder implementation
+//! (`NodeMlsFactory`) and the async builder implementation
 //! (`create_context`, `CreateContextPhases`) live in
 //! `scp-runtime::context::builder` and `scp-runtime::crypto::mls::provider`.
 //! After ADR-049 commit 12c.9e, the `ContextCryptoProvider` trait was
-//! deleted — callers name the concrete `MlsCryptoProvider` directly.
+//! deleted — callers name the concrete `NodeMlsFactory` directly.
 
 use super::ContextError;
 use crate::envelope::inner::InnerEnvelope;
+
+// ---------------------------------------------------------------------------
+// ReceiveFloor — receive-side anti-replay high-water mark
+// ---------------------------------------------------------------------------
+
+/// The receive-side anti-replay floor for a single sender.
+///
+/// The `(sender_key_epoch, sequence)` high-water mark that
+/// `NodeMlsFactory::open` (in `scp-runtime`) advanced the anti-replay tracker
+/// to (spec §23.17.3).
+///
+/// A named-field newtype rather than a bare `(u64, u64)` tuple so the two
+/// scalars can never be transposed at a call site — `epoch` is always the
+/// epoch-major component. `Ord`/`PartialOrd` are derived, and because `epoch`
+/// is declared BEFORE `sequence`, the derived comparison is LEXICOGRAPHIC and
+/// epoch-major — byte-for-byte the ordering the previous `(u64, u64)` tuple
+/// had, so the replay-detection compare (`next <= current`) is unchanged.
+///
+/// `Copy` (two `u64` scalars, no key material — see [`OpenedEnvelope`] and the
+/// supervisor floor registry, both of which move it by value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReceiveFloor {
+    /// The sender-key epoch component — the MAJOR ordering key.
+    pub epoch: u64,
+    /// The intra-epoch sequence number — the MINOR ordering key.
+    pub sequence: u64,
+}
 
 // ---------------------------------------------------------------------------
 // OpenedEnvelope — result of successfully opening a received envelope
@@ -16,7 +43,7 @@ use crate::envelope::inner::InnerEnvelope;
 
 /// Result of successfully opening and verifying a received envelope.
 ///
-/// Returned by `MlsCryptoProvider::open` (in `scp-runtime`) for application messages.
+/// Returned by `NodeMlsFactory::open` (in `scp-runtime`) for application messages.
 /// Contains the deserialized inner envelope (with all integrity checks
 /// passed) and the sender's DID extracted from MLS credentials.
 #[derive(Debug, Clone)]
@@ -25,9 +52,21 @@ pub struct OpenedEnvelope {
     pub inner: InnerEnvelope,
     /// The sender's DID extracted from MLS credentials.
     pub sender_did: String,
+    /// The receive-side [`ReceiveFloor`] (`sender_key_epoch`, `sequence`) this
+    /// envelope advanced the anti-replay tracker to inside
+    /// `NodeMlsFactory::open` (spec §23.17.3).
+    ///
+    /// ADR-049 PR-4: surfaced SOLELY so the supervisor floor-registry follower
+    /// mirror-forward (`decrypt_and_dispatch`) can track the just-advanced
+    /// receive floor in O(1), without an O(senders) `export_recv_sequence_floors`
+    /// re-read (Decision-14 budget). It is the value `open()` ALREADY computed
+    /// and stored; exposing it does NOT change `open()`'s enforcement or advance
+    /// behavior, and NOTHING reads this field for enforcement — only the
+    /// follower mirror-forward consumes it.
+    pub receive_floor: ReceiveFloor,
 }
 
-/// Discriminated result of `MlsCryptoProvider::open` (in `scp-runtime`).
+/// Discriminated result of `NodeMlsFactory::open` (in `scp-runtime`).
 ///
 /// After MLS decryption, the plaintext may be an application message,
 /// an MLS control message, or a management message (e.g., sender key
@@ -51,16 +90,16 @@ pub enum OpenResult {
 /// 4-byte magic prefix for management messages inside MLS application payloads.
 ///
 /// ASCII `SCPM` (Shared Context Protocol Management). Prepended by
-/// `MlsCryptoProvider::mls_encrypt_management` (in `scp-runtime`) and detected by
-/// `MlsCryptoProvider::open` (in `scp-runtime`) to distinguish management traffic
+/// `NodeMlsFactory::mls_encrypt_management` (in `scp-runtime`) and detected by
+/// `NodeMlsFactory::open` (in `scp-runtime`) to distinguish management traffic
 /// from application messages.
 pub const MANAGEMENT_MSG_MAGIC: [u8; 4] = [0x53, 0x43, 0x50, 0x4D];
 
 /// Maximum management payload size in bytes (64 KiB).
 ///
 /// Management payloads MUST NOT exceed this limit (§9.16.1). Enforced on
-/// both send side (`MlsCryptoProvider::mls_encrypt_management` (in `scp-runtime`)) and
-/// receive side (`MlsCryptoProvider::open` (in `scp-runtime`)).
+/// both send side (`NodeMlsFactory::mls_encrypt_management` (in `scp-runtime`)) and
+/// receive side (`NodeMlsFactory::open` (in `scp-runtime`)).
 pub const MAX_MANAGEMENT_PAYLOAD_SIZE: usize = 65_536;
 
 /// Attempts to strip the [`MANAGEMENT_MSG_MAGIC`] prefix from an MLS
@@ -73,7 +112,7 @@ pub const MAX_MANAGEMENT_PAYLOAD_SIZE: usize = 65_536;
 /// outer-envelope processing, sender-key decryption, or any post-dispatch
 /// application code — is permitted to strip, test, or depend on the
 /// magic prefix. Crypto-provider implementations of
-/// `MlsCryptoProvider::open` (in `scp-runtime`) MUST use this helper rather than
+/// `NodeMlsFactory::open` (in `scp-runtime`) MUST use this helper rather than
 /// re-implementing the check inline, so the single-responsibility
 /// invariant for management-message framing stays enforceable.
 ///
@@ -177,6 +216,61 @@ mod mgmt_prefix_tests {
                 return Ok(());
             }
             prop_assert_eq!(try_strip_management_prefix(&bytes), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod receive_floor_tests {
+    use super::ReceiveFloor;
+
+    /// The derived `Ord` must be LEXICOGRAPHIC and epoch-major — identical to
+    /// the `(epoch, sequence)` tuple ordering the newtype replaced, so replay
+    /// detection (`next <= current`) is byte-for-byte unchanged.
+    #[test]
+    fn ordering_is_lexicographic_epoch_major() {
+        let a = ReceiveFloor {
+            epoch: 0,
+            sequence: 3,
+        };
+        let b = ReceiveFloor {
+            epoch: 0,
+            sequence: 4,
+        };
+        let c = ReceiveFloor {
+            epoch: 1,
+            sequence: 0,
+        };
+
+        // Same epoch: higher sequence is greater.
+        assert!(a < b);
+        // Higher epoch dominates even a much larger sequence: (1,0) > (0,99).
+        assert!(
+            c > ReceiveFloor {
+                epoch: 0,
+                sequence: 99,
+            }
+        );
+        // Cross-epoch: (0,4) < (1,0).
+        assert!(b < c);
+        // Equality is field-wise.
+        assert_eq!(
+            a,
+            ReceiveFloor {
+                epoch: 0,
+                sequence: 3,
+            }
+        );
+
+        // Matches the raw `(epoch, sequence)` tuple ordering for every pair.
+        for x in [a, b, c] {
+            for y in [a, b, c] {
+                assert_eq!(
+                    x.cmp(&y),
+                    (x.epoch, x.sequence).cmp(&(y.epoch, y.sequence)),
+                    "ReceiveFloor::cmp must equal the (epoch, sequence) tuple cmp"
+                );
+            }
         }
     }
 }

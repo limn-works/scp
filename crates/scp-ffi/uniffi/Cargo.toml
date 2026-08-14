@@ -17,18 +17,33 @@ path = "src/bin/uniffi-bindgen.rs"
 
 [features]
 default = ["server"]
-# Enables the `"in_memory"` custody path in `identity_create`, which uses
-# `InMemoryKeyCustody` from `scp-platform/testing`. This stores private key
-# material in unprotected heap memory — suitable for testing, CLI, and desktop
-# contexts but NOT for production mobile builds (iOS/Android). Mobile CI MUST
-# NOT enable this feature. See GitHub issue #88 and ADR-006.
-allow_in_memory_custody = ["scp-platform/testing"]
 # Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
 server = ["scp-ffi-common/server", "dep:scp-node"]
-# Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
-# be enabled in production mobile builds; the parity harness (ADR-046)
-# enables it.
-testing = ["scp-core/testing"]
+# Single test-harness feature (ADR-062 §Decision 6): folds in every in-memory
+# nullifier double. `scp-platform/testing` compiles `InMemoryKeyCustody`/
+# `InMemoryDeviceAttestation`/`InMemoryPreRotationCustody` (the §17.17.2 security
+# nullifiers, formerly behind the deleted custody switch) and
+# enables the `"in_memory"` custody path in `identity_create`; `scp-dht/testing`
+# makes the `InMemoryDhtClient` resolve nullifier nameable; `scp-ffi-common/testing`
+# makes the shared `FfiDhtClient::InMemory` arm nameable; `scp-core/testing`
+# (→ `scp-runtime/testing`) makes test-only actor affordances (e.g.
+# `Supervisor::test_insert_member`) available. MUST NOT be enabled in production
+# mobile builds (iOS/Android) — G1 proves `scp-platform/testing`/`scp-dht/testing`
+# never reach a shipped artifact. `cargo test -p scp-ffi-uniffi --features testing`.
+testing = [
+    "scp-core/testing",
+    "scp-dht/testing",
+    "scp-ffi-common/testing",
+    "scp-platform/testing",
+]
+# §5.4.5 streaming-outlet live-flow test seam (SCP-OUT-037, C8b). Enables
+# `Supervisor::test_grant_member_capability` — an AUTHORITY-ESCALATION primitive
+# deliberately NOT folded into `testing` (which leaks into every bridge test
+# build and would compile the custody-escape-hatch into a released Swift/Kotlin
+# SDK). Mirrors scp-ffi / scp-ffi-napi's
+# `outlet-capability-test-grant`; enabled ONLY by the outlet-stream live-poll
+# test, and the seam has ZERO FFI/SDK exports.
+outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
 uniffi = { version = "0.29", features = ["tokio", "cli"] }
@@ -38,8 +53,10 @@ tokio-util = { workspace = true }
 thiserror = { workspace = true }
 scp-core = { path = "../../scp-core" }
 scp-media = { path = "../../scp-media" }
-scp-primitives = { path = "../../scp-primitives" }
+scp-clock = { path = "../../scp-clock" }
+scp-did = { path = "../../scp-did" }
 scp-identity = { path = "../../scp-identity", features = ["production-dht"] }
+scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common", features = ["custody"] }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
@@ -50,10 +67,13 @@ rmp-serde = { workspace = true }
 # `software_platform` provides crypto primitives (Ed25519, X25519);
 # `encrypting` provides `EncryptingAdapter` for event log persistence (#484).
 # The `testing` feature is NOT enabled unconditionally because it exposes
-# `InMemoryKeyCustody` in production mobile builds. Instead, the bridge uses
-# `scp-ffi-common::bridge_runtime::BridgeInMemoryStorage` for the event log
-# backing store (#1447). The `allow_in_memory_custody` feature above adds
-# `scp-platform/testing` for dev/test/desktop builds only.
+# the `InMemoryKeyCustody` nullifier in production mobile builds. Instead, the
+# event-log backing store uses the durability-only
+# `scp_platform::in_memory::InMemoryStorage` adapter (ADR-062 §0), pulled via
+# `scp-ffi-common`'s `scp-platform/in-memory-storage` edge and wrapped by
+# `EncryptingAdapter` in `build_event_log_provider` (#1447 / #484). The
+# `testing` crate-feature above adds `scp-platform/testing` for
+# dev/test/desktop builds only (ADR-062 §Decision 6).
 scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting", "filesystem", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
@@ -71,6 +91,16 @@ z-base-32 = { workspace = true }
 [dev-dependencies]
 # Tests need InMemoryKeyCustody — enable the `testing` feature for dev-deps.
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
+# Test seams (`install_seedable_resolver`) construct
+# `FfiDhtClient::InMemory(..)`, whose arm is gated behind
+# `scp-ffi-common/testing`; enable it for this crate's test build. The normal
+# dep (below) carries `custody`; the test build unifies to `custody` + `testing`.
+scp-ffi-common = { path = "../common", features = ["testing", "custody"] }
+# Tests / test seams construct `FfiDhtClient::InMemory(InMemoryDhtClient::new())`,
+# which is gated behind `scp-dht/testing`; activate it for this crate's test
+# build (ADR-062 §Decision 1). `scp-dht/testing` never appears in a non-testing
+# feature list.
+scp-dht = { path = "../../scp-dht", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json = { workspace = true }
 tempfile = "3"
@@ -82,7 +112,15 @@ syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 [[test]]
 name = "e2e_bridge"
 path = "tests/e2e_bridge.rs"
-required-features = ["allow_in_memory_custody"]
+required-features = ["testing"]
+
+# SCP-OUT-039 (§5.4.5) — replays the 7 outlet-streaming conformance vectors
+# through the UniFFI bridge's public pure-wrapper exports. Needs
+# `testing` for `Scp::new_in_memory_for_test`.
+[[test]]
+name = "outlet_stream_vectors_real"
+path = "tests/outlet_stream_vectors_real.rs"
+required-features = ["testing"]
 
 [build-dependencies]
 uniffi = { version = "0.29", features = ["build", "tokio"] }

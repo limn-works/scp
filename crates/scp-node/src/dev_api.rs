@@ -615,7 +615,7 @@ mod tests {
             dev_token: Some(token.to_owned()),
             dev_bind_addr: Some("127.0.0.1:9100".parse::<SocketAddr>().unwrap()),
             projected_contexts: RwLock::new(HashMap::new()),
-            blob_storage: Arc::new(BlobStorageBackend::default()),
+            blob_storage: Arc::new(BlobStorageBackend::in_memory()),
             relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
@@ -629,7 +629,7 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_identity::document::DidDocument {
+            did_document: scp_did::DidDocument {
                 context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
                 id: "did:dht:test123".to_owned(),
                 verification_method: vec![],

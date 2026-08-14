@@ -29,15 +29,15 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 
+use scp_clock::Clock;
 use scp_platform::traits::{KeyCustody, KeyHandle};
-use scp_primitives::Clock;
 
 use std::collections::HashSet;
 
+use scp_did::SigningKeyId;
 use scp_protocol::crypto::ucan::capability::{CapabilityUri, verify_ceiling_compliance};
 use scp_protocol::crypto::ucan::nonce::generate_nonce;
 use scp_protocol::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
-use scp_protocol::identity::SigningKeyId;
 
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
@@ -94,6 +94,215 @@ fn verify_attestation_ceiling_compliance(
         })
         .collect::<Result<Vec<_>, _>>()?;
     verify_ceiling_compliance(&cap_uris, ceiling)
+}
+
+/// Infers the [`OutletKind`](scp_protocol::context::outlets::OutletKind) of a delegation from the stem family of its
+/// delegated capability URIs, mirroring the root-mint inference in
+/// [`scp_protocol::trust::caveats::InvocationCaveats::try_new_for_root`].
+///
+/// Used by [`build_delegated_caveats`] to materialize an explicit
+/// `origin_kind` on the FIRST non-root delegation, where the parent (root)
+/// token may legitimately carry `origin_kind = None` (§7.3.8 rule 3): the
+/// root's single-kind stem set is unambiguous, and the first delegation
+/// pins the inferred value into the child's signed caveats so every
+/// downstream hop sees an explicit, equality-checked value.
+///
+/// - `outlet_query:*` / `outlet_query:{id}` ⇒ [`OutletKind::Query`](scp_protocol::context::outlets::OutletKind::Query).
+/// - `outlet_call:*` / `outlet_call:{id}` ⇒ [`OutletKind::Action`](scp_protocol::context::outlets::OutletKind::Action).
+/// - Non-outlet stems contribute nothing (returns `None` when no outlet
+///   stems are present — there is no outlet kind to materialize).
+///
+/// # Errors
+///
+/// Returns [`UcanError::AttenuationViolation`] when the delegated set is
+/// mixed-kind (carries BOTH `outlet_query:*` and `outlet_call:*` stems):
+/// such a set has no single unambiguous `origin_kind` and is rejected at
+/// mint, matching
+/// [`scp_protocol::trust::caveats::CaveatMintError::OriginKindMixedStemRoot`].
+/// Returns [`UcanError::AttenuationViolation`] when any attestation URI is
+/// unparseable (fail-closed).
+fn infer_origin_kind_from_capabilities(
+    attenuated_capabilities: &[Attenuation],
+) -> Result<Option<scp_protocol::context::outlets::OutletKind>, UcanError> {
+    use scp_protocol::context::outlets::OutletKind;
+
+    let mut has_query = false;
+    let mut has_action = false;
+    for att in attenuated_capabilities {
+        let uri: CapabilityUri = att.with.parse().map_err(|e: UcanError| {
+            UcanError::AttenuationViolation(format!(
+                "invalid capability URI '{}' while inferring origin_kind: {e}",
+                att.with
+            ))
+        })?;
+        match uri.resource() {
+            "outlet_query" => has_query = true,
+            "outlet_call" => has_action = true,
+            _ => {}
+        }
+    }
+
+    match (has_query, has_action) {
+        (true, true) => Err(UcanError::AttenuationViolation(
+            "origin-kind-mixed-stem: delegated set carries both outlet_query and \
+             outlet_call stems; origin_kind is ambiguous"
+                .to_owned(),
+        )),
+        (true, false) => Ok(Some(OutletKind::Query)),
+        (false, true) => Ok(Some(OutletKind::Action)),
+        (false, false) => Ok(None),
+    }
+}
+
+/// Builds the delegated child's `nb` (invocation caveats) — the §7.3.8
+/// rule-4 `origin_kind` materialization half of the canonical model.
+///
+/// SCOPE (PR-3): this port materializes ONLY the `origin_kind` field plus the
+/// per-field narrow against whatever `nb` the parent carries. The value-caveat
+/// fields (`max_calls` / `amount_max_*` / `rate_window` / adapter / target /
+/// schema / time-box) and their delegation-param plumbing + runtime counter
+/// enforcement are a DEFERRED slice — `DelegateParams` carries no caveat
+/// params, so there is nothing to overlay. When a parent ever carries a real
+/// caveat field, the narrow below still faithfully inherits it (the child is
+/// built from `parent_effective`), so this stays correct if a parent gains
+/// caveats in a later slice.
+///
+/// Construction:
+///
+/// - **Non-outlet child** — invocation caveats are outlet-scoped (§7.3.8), so a
+///   delegated set with NO outlet stem carries no `nb`. Returns `None` (the
+///   validator's per-edge outlet gate treats such a child symmetrically).
+/// - **Outlet child** — the child inherits the parent's effective caveat set
+///   verbatim and materializes an explicit `origin_kind`: inherited from the
+///   parent when present, otherwise inferred from the delegated capability
+///   stems (the first delegation off an unconstrained single-family root pins
+///   the kind). The materialized child is then run through
+///   [`InvocationCaveats::try_new`](scp_protocol::trust::caveats::InvocationCaveats::try_new) (mint limits) and narrowed against the
+///   parent (`parent.narrow(child)` — rejects widening / field removal /
+///   `origin_kind` change; `empty().narrow(child)` when the parent is a
+///   caveat-free root, which still enforces rule-4's explicit-`origin_kind`
+///   requirement).
+///
+/// # Errors
+///
+/// Returns [`UcanError::MalformedToken`] when the materialized child fails
+/// [`scp_protocol::trust::caveats::InvocationCaveats::try_new`]. Returns
+/// [`UcanError::AttenuationViolation`] when the parent rejects the child via
+/// [`scp_protocol::trust::caveats::InvocationCaveats::narrow`], or when
+/// `origin_kind` inference fails (mixed-stem set / unparseable URI).
+fn build_delegated_caveats(
+    params: &DelegateParams<'_>,
+) -> Result<Option<scp_protocol::trust::caveats::InvocationCaveats>, UcanError> {
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    let parent_nb = params.parent_token.payload.nb.as_ref();
+
+    // §7.3.8 outlet-scoping: invocation caveats bind outlet *invocation* and are
+    // meaningless on a non-outlet capability. A delegated set with NO outlet
+    // stem carries NO `nb`. Do not fold an ancestor's outlet-scoped caveats onto
+    // a legitimately-narrowed non-outlet child. Uses the SHARED stem classifier
+    // so mint and validator never diverge (symmetric mirror of
+    // `verify_edge_attenuation`'s outlet-edge gate). Fail-closed on unparseable.
+    let child_is_outlet_edge = scp_protocol::crypto::ucan::capability::att_set_has_outlet_stem(
+        params.attenuated_capabilities,
+    )
+    .map_err(|e| {
+        UcanError::AttenuationViolation(format!("outlet-scope classification failed: {e}"))
+    })?;
+    if !child_is_outlet_edge {
+        return Ok(None);
+    }
+
+    // The parent's effective set: a root with no nb contributes no field bounds
+    // (empty). A non-root parent (or a root minted WITH caveats in a future
+    // slice) already carries its complete validated set.
+    let parent_effective = parent_nb.map_or_else(InvocationCaveats::empty, Clone::clone);
+
+    // Infer the origin_kind implied by the delegated capability stems. Errors on
+    // a mixed-stem set (ambiguous kind).
+    let inferred_origin_kind = infer_origin_kind_from_capabilities(params.attenuated_capabilities)?;
+
+    // Materialize an explicit origin_kind: inherit the parent's value when
+    // present; otherwise — the parent is a root with origin_kind = None
+    // (permitted by §7.3.8 rule 3) — use the inferred stem kind. This is the
+    // point at which the chain's origin_kind becomes a signed, explicit,
+    // equality-checked value for every hop below the root (rule 4).
+    let inherited_origin_kind = parent_effective.origin_kind.or(inferred_origin_kind);
+
+    // The child's effective set is the parent's effective set (no caller-
+    // supplied caveat overlay in PR-3) with the materialized origin_kind. This
+    // guarantees an outlet child is never silently `origin_kind = None`.
+    let materialized = InvocationCaveats {
+        origin_kind: inherited_origin_kind,
+        ..parent_effective
+    };
+
+    // Final gates: mint limits, then per-field attenuation against the parent.
+    // narrow() rejects any widening / field removal / origin_kind change and
+    // rejects a still-absent origin_kind (OriginKindUnspecified).
+    let validated = InvocationCaveats::try_new(materialized)
+        .map_err(|e| UcanError::MalformedToken(format!("caveat-mint-limit-exceeded: {e}")))?;
+    if let Some(parent_caveats) = parent_nb {
+        parent_caveats.narrow(&validated).map_err(|e| {
+            UcanError::AttenuationViolation(format!("caveat narrow violation: {e}"))
+        })?;
+    } else {
+        // Root parent (no nb): no parent bound to narrow against, but a non-root
+        // child still MUST carry an explicit origin_kind. narrow() against an
+        // empty parent enforces exactly this (OriginKindUnspecified when
+        // child.origin_kind is None) without imposing any field bound the root
+        // never had.
+        InvocationCaveats::empty().narrow(&validated).map_err(|e| {
+            UcanError::AttenuationViolation(format!("caveat narrow violation: {e}"))
+        })?;
+    }
+    Ok(Some(validated))
+}
+
+/// Builds the ROOT token's `nb` (invocation caveats) per §7.3.8 outlet-scoping
+/// and the root stem/`origin_kind` agreement gate.
+///
+/// SCOPE (PR-3): no caveat params exist on `MintParams`, so this never emits a
+/// populated caveat set — it exists to run the UNCONDITIONAL root stem/kind
+/// agreement gate ([`InvocationCaveats::try_new_for_root`](scp_protocol::trust::caveats::InvocationCaveats::try_new_for_root)) so a mixed-family
+/// outlet root can never be signed, then returns `None` (a single-family outlet
+/// root legitimately carries `nb = None`; the first delegation materializes the
+/// kind). Value-caveat routing on the root is a DEFERRED slice.
+///
+/// # Errors
+///
+/// Returns [`UcanError::MalformedToken`] when `try_new_for_root` rejects the
+/// stem set (mixed-family outlet root).
+fn build_root_caveats(
+    parsed_stems: &[scp_protocol::context::roles::Capability],
+) -> Result<Option<scp_protocol::trust::caveats::InvocationCaveats>, UcanError> {
+    use scp_protocol::context::roles::Capability;
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    let root_has_outlet_stem = parsed_stems.iter().any(|cap| {
+        matches!(
+            cap,
+            Capability::OutletQuery(_)
+                | Capability::OutletQueryAll
+                | Capability::OutletCall(_)
+                | Capability::OutletCallAll
+        )
+    });
+
+    // Non-outlet root: invocation caveats are outlet-scoped (§7.3.8), and there
+    // is no stem family to mix, so the gate does not apply.
+    if !root_has_outlet_stem {
+        return Ok(None);
+    }
+
+    // Outlet root: ALWAYS run the root stem/kind agreement gate. try_new_for_root
+    // performs the UNCONDITIONAL mixed-family rejection (§7.3.8) plus the mint-
+    // limit check over `empty()`. A single-family root then carries `nb = None`
+    // (the validated `empty()` is not a real caveat set — it existed only to run
+    // the mixed-family gate).
+    InvocationCaveats::try_new_for_root(InvocationCaveats::empty(), parsed_stems)
+        .map_err(|e| UcanError::MalformedToken(format!("caveat-mint-limit-exceeded: {e}")))?;
+    Ok(None)
 }
 
 /// Builds the `fct` (facts) section, merging `scp_key_scope` when present.
@@ -166,7 +375,7 @@ pub struct MintParams<'a> {
     /// The context ID this token is scoped to.
     pub context_id: &'a str,
     /// Capabilities to grant, as `{resource}:{action}` strings (e.g.,
-    /// `"messages:write"`, `"tool_invoke:assistant"`).
+    /// `"messages:write"`, `"outlet_call:assistant"`).
     pub capabilities: &'a [String],
     /// Token lifetime in seconds from now. Must not exceed 24 hours (86400s).
     pub lifetime_secs: u64,
@@ -207,7 +416,7 @@ pub struct MintParams<'a> {
     /// rejected with [`UcanError::CapabilityOutsideCeiling`].
     ///
     /// The ceiling contains `{resource}:{action}` strings (e.g.,
-    /// `"messages:read"`, `"tool_invoke:assistant"`).
+    /// `"messages:read"`, `"outlet_call:assistant"`).
     ///
     /// `None` means no ceiling enforcement (backward-compatible default).
     pub ceiling: Option<HashSet<String>>,
@@ -254,14 +463,28 @@ pub async fn mint_ucan(
     }
 
     // Convert capability strings to UCAN resource/action pairs. This bridges
-    // the canonical user-facing colon format (e.g. "tool:invoke:*") to the
-    // UCAN underscore format (e.g. resource="tool_invoke", action="*") by
+    // the canonical user-facing colon format (e.g. "outlet:call:*") to the
+    // UCAN underscore format (e.g. resource="outlet_call", action="*") by
     // parsing through the Capability enum. See #1293.
-    let parsed_caps: Vec<(String, String)> = params
+    let parsed_stems: Vec<scp_protocol::context::roles::Capability> = params
         .capabilities
         .iter()
         .map(|cap| {
-            let capability = scp_protocol::context::roles::Capability::new(cap);
+            // `Capability::new` returns `None` for names that fail the strict
+            // §5.4.2.1 parser (e.g. hard-rejected `outlet:invoke:*` /
+            // `outlet_call:foo`, or malformed outlet stems). Reject rather than
+            // silently degrade — SCP-OUT-014 parser-differential guard.
+            scp_protocol::context::roles::Capability::new(cap).ok_or_else(|| {
+                UcanError::MalformedToken(format!(
+                    "invalid capability name {cap:?} (fails §5.4.2.1 parser)"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, UcanError>>()?;
+
+    let parsed_caps: Vec<(String, String)> = parsed_stems
+        .iter()
+        .map(|capability| {
             let (resource, action) = capability.ucan_resource_action();
             (resource.into_owned(), action.into_owned())
         })
@@ -318,6 +541,11 @@ pub async fn mint_ucan(
     // is present (ADR-039 acceptance criterion 6).
     let fct = build_facts_with_key_scope(params.facts.as_ref(), params.key_scope.as_ref())?;
 
+    // §7.3.8 root stem/origin_kind agreement gate (rejects a mixed-family
+    // outlet root). A single-family outlet root legitimately carries `nb =
+    // None` — the first delegation materializes the inferred origin_kind.
+    let nb = build_root_caveats(&parsed_stems)?;
+
     let payload = UcanPayload {
         iss: params.issuer_did.to_owned(),
         aud: params.audience_did.to_owned(),
@@ -327,6 +555,7 @@ pub async fn mint_ucan(
         att,
         prf: params.proofs.clone(),
         fct,
+        nb,
     };
 
     // Encode header and payload as base64url JSON.
@@ -572,6 +801,14 @@ pub async fn delegate_ucan(
     // is present (ADR-039).
     let fct = build_facts_with_key_scope(params.facts.as_ref(), params.key_scope.as_ref())?;
 
+    // §7.3.8 rule-4: materialize an explicit `origin_kind` on a delegated
+    // OUTLET child (inherited from the parent, or inferred from the delegated
+    // stem family when the parent is a caveat-free root), narrowed against the
+    // parent's `nb`. A non-outlet delegation carries no `nb`. Without this, a
+    // delegated outlet token would carry `nb = None` and the shipped validator
+    // would reject it (`OriginKindUnspecified`) — the defect this fixes.
+    let nb = build_delegated_caveats(params)?;
+
     let payload = UcanPayload {
         iss: params.delegator_did.to_owned(),
         aud: params.delegatee_did.to_owned(),
@@ -581,6 +818,7 @@ pub async fn delegate_ucan(
         att: params.attenuated_capabilities.to_vec(),
         prf: proofs,
         fct,
+        nb,
     };
 
     // Encode header and payload as base64url JSON.
@@ -649,7 +887,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -701,7 +939,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -745,7 +983,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         let nonce = &token.payload.nnc;
@@ -785,10 +1023,10 @@ mod tests {
             ceiling: None,
         };
 
-        let token1 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token1 = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
-        let token2 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token2 = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -818,7 +1056,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(matches!(err, UcanError::ExpiryTooFar(_)));
@@ -845,7 +1083,7 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            mint_ucan(&params, &custody, &scp_clock::SystemClock)
                 .await
                 .is_ok()
         );
@@ -857,7 +1095,7 @@ mod tests {
         let caps = vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ];
 
         let params = MintParams {
@@ -875,7 +1113,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -889,7 +1127,7 @@ mod tests {
         assert_eq!(token.payload.att[1].can, "write");
         assert_eq!(
             token.payload.att[2].with,
-            "scp:ctx:ctx-multi/tool_invoke:assistant"
+            "scp:ctx:ctx-multi/outlet_call:assistant"
         );
         assert_eq!(token.payload.att[2].can, "assistant");
     }
@@ -914,7 +1152,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -946,7 +1184,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -986,7 +1224,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         let cid = compute_cid(&token);
@@ -1017,7 +1255,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         let cid1 = compute_cid(&token);
@@ -1046,10 +1284,10 @@ mod tests {
             ceiling: None,
         };
 
-        let token1 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token1 = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
-        let token2 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token2 = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1082,7 +1320,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         let cid = compute_cid(&token);
@@ -1125,7 +1363,7 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        mint_ucan(&params, custody, &scp_primitives::SystemClock)
+        mint_ucan(&params, custody, &scp_clock::SystemClock)
             .await
             .unwrap()
     }
@@ -1167,7 +1405,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1225,7 +1463,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1270,7 +1508,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1301,7 +1539,7 @@ mod tests {
         let caps = vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ];
         let root_token = mint_root_token(
             &alice_custody,
@@ -1329,7 +1567,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert_eq!(delegated.payload.att.len(), 3);
@@ -1343,7 +1581,7 @@ mod tests {
         let caps = vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ];
         let root_token = mint_root_token(
             &alice_custody,
@@ -1374,7 +1612,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert_eq!(delegated.payload.att.len(), 1);
@@ -1415,7 +1653,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert_eq!(
@@ -1458,10 +1696,10 @@ mod tests {
             ceiling: None,
         };
 
-        let d1 = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let d1 = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
-        let d2 = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let d2 = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -1522,13 +1760,10 @@ mod tests {
             ceiling: None,
         };
 
-        let bob_to_carol = delegate_ucan(
-            &bob_delegate_params,
-            &bob_custody,
-            &scp_primitives::SystemClock,
-        )
-        .await
-        .unwrap();
+        let bob_to_carol =
+            delegate_ucan(&bob_delegate_params, &bob_custody, &scp_clock::SystemClock)
+                .await
+                .unwrap();
         let bob_to_carol_cid = compute_cid(&bob_to_carol);
 
         // Bob's delegated token should have root CID in proof chain.
@@ -1557,7 +1792,7 @@ mod tests {
         let carol_to_dave = delegate_ucan(
             &carol_delegate_params,
             &carol_custody,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -1609,7 +1844,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &eve_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &eve_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1654,7 +1889,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1679,14 +1914,14 @@ mod tests {
         )
         .await;
 
-        // Bob tries to delegate including tool_invoke:assistant (not in parent).
+        // Bob tries to delegate including outlet_call:assistant (not in parent).
         let attenuated = vec![
             Attenuation {
                 with: "scp:ctx:ctx-1/messages:read".to_owned(),
                 can: "read".to_owned(),
             },
             Attenuation {
-                with: "scp:ctx:ctx-1/tool_invoke:assistant".to_owned(),
+                with: "scp:ctx:ctx-1/outlet_call:assistant".to_owned(),
                 can: "assistant".to_owned(),
             },
         ];
@@ -1704,7 +1939,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1748,7 +1983,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1791,7 +2026,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1834,7 +2069,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -1875,7 +2110,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert!(delegated.payload.att.is_empty());
@@ -1908,7 +2143,7 @@ mod tests {
             signing_key_id: None,
             ceiling: None,
         };
-        let mut root_token = mint_ucan(&params, &alice_custody, &scp_primitives::SystemClock)
+        let mut root_token = mint_ucan(&params, &alice_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         // Overwrite att to use the explicitly wildcard form.
@@ -1933,7 +2168,7 @@ mod tests {
             ceiling: None,
         };
 
-        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert_eq!(
@@ -1966,7 +2201,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2012,7 +2247,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2056,7 +2291,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2100,7 +2335,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2140,7 +2375,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2180,7 +2415,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2219,7 +2454,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2268,7 +2503,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2306,7 +2541,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2343,7 +2578,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2373,7 +2608,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         let fct = token.payload.fct.as_ref().expect("fct must be present");
@@ -2403,7 +2638,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2432,7 +2667,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
         assert_eq!(token.payload.iss, token.payload.aud);
@@ -2458,7 +2693,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2490,7 +2725,7 @@ mod tests {
                 ceiling: None,
             },
             &custody,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -2509,7 +2744,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap_err();
@@ -2541,7 +2776,7 @@ mod tests {
                 ceiling: None,
             },
             &custody,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -2560,7 +2795,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap_err();
@@ -2592,7 +2827,7 @@ mod tests {
                 ceiling: None,
             },
             &custody,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -2611,7 +2846,7 @@ mod tests {
                 ceiling: None,
             },
             &custody_b,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap_err();
@@ -2645,7 +2880,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2677,7 +2912,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2712,7 +2947,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2752,7 +2987,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -2770,7 +3005,7 @@ mod tests {
     #[tokio::test]
     async fn mint_ucan_rejects_capability_outside_ceiling() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool_invoke:assistant".to_owned()];
+        let caps = vec!["outlet_call:assistant".to_owned()];
         let ceiling: HashSet<String> = ["messages:read".to_owned(), "messages:write".to_owned()]
             .into_iter()
             .collect();
@@ -2790,7 +3025,7 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2802,11 +3037,11 @@ mod tests {
     #[tokio::test]
     async fn mint_ucan_succeeds_within_ceiling() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool_invoke:assistant".to_owned()];
+        let caps = vec!["outlet_call:assistant".to_owned()];
         let ceiling: HashSet<String> = [
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ]
         .into_iter()
         .collect();
@@ -2827,7 +3062,7 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            mint_ucan(&params, &custody, &scp_clock::SystemClock)
                 .await
                 .is_ok(),
             "minting with capabilities within the ceiling must succeed"
@@ -2838,10 +3073,10 @@ mod tests {
     async fn mint_ucan_no_ceiling_applies_default_ceiling() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
         // These capabilities are within the default ceiling:
-        // tool_invoke:assistant is covered by ToolInvokeAll (tool_invoke:*),
+        // outlet_call:assistant is covered by OutletCallAll (outlet_call:*),
         // messages:write is exact match.
         let caps = vec![
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
             "messages:write".to_owned(),
         ];
 
@@ -2861,7 +3096,7 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            mint_ucan(&params, &custody, &scp_clock::SystemClock)
                 .await
                 .is_ok(),
             "minting with ceiling: None must succeed for capabilities within the default ceiling"
@@ -2874,7 +3109,7 @@ mod tests {
     async fn mint_ucan_no_ceiling_rejects_capability_outside_default() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
         // "custom:exotic" is NOT in the default ceiling (which contains only
-        // standard SCP capabilities like messages:*, tool_invoke:*, etc.).
+        // standard SCP capabilities like messages:*, outlet_call:*, etc.).
         let caps = vec!["custom:exotic".to_owned()];
 
         let params = MintParams {
@@ -2892,7 +3127,7 @@ mod tests {
             ceiling: None,
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2910,10 +3145,10 @@ mod tests {
         let (alice_custody, alice_key, alice_did) = setup_custody().await;
         let (bob_custody, bob_key, bob_did) = setup_custody().await;
 
-        // Root token grants messages:read + tool_invoke:assistant.
+        // Root token grants messages:read + outlet_call:assistant.
         let caps = vec![
             "messages:read".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ];
         let root_token = mint_root_token(
             &alice_custody,
@@ -2925,11 +3160,11 @@ mod tests {
         )
         .await;
 
-        // Ceiling only allows messages:read — tool_invoke:assistant is outside.
+        // Ceiling only allows messages:read — outlet_call:assistant is outside.
         let ceiling: HashSet<String> = std::iter::once("messages:read".to_owned()).collect();
 
         let attenuated = vec![Attenuation {
-            with: "scp:ctx:ctx-1/tool_invoke:assistant".to_owned(),
+            with: "scp:ctx:ctx-1/outlet_call:assistant".to_owned(),
             can: "assistant".to_owned(),
         }];
 
@@ -2946,7 +3181,7 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+        let err = delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
@@ -2996,7 +3231,7 @@ mod tests {
         };
 
         assert!(
-            delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
+            delegate_ucan(&delegate_params, &bob_custody, &scp_clock::SystemClock)
                 .await
                 .is_ok(),
             "delegation narrowing within ceiling must succeed"
@@ -3008,11 +3243,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_produces_underscore_resource() {
-        // Minting with the colon-format name "tool:invoke:*" must produce
-        // a UCAN URI with resource "tool_invoke", not "tool".
+    async fn mint_ucan_outlet_invoke_produces_underscore_resource() {
+        // Minting with the colon-format name "outlet:call:*" must produce
+        // a UCAN URI with resource "outlet_call", not "outlet".
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool:invoke:*".to_owned()];
+        let caps = vec!["outlet:call:*".to_owned()];
 
         let params = MintParams {
             issuer_did: &issuer_did,
@@ -3029,22 +3264,22 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
         // The attestation URI must use underscore format.
         assert_eq!(
-            token.payload.att[0].with, "scp:ctx:ctx-1293/tool_invoke:*",
-            "tool:invoke:* must produce tool_invoke:* in UCAN URI"
+            token.payload.att[0].with, "scp:ctx:ctx-1293/outlet_call:*",
+            "outlet:call:* must produce outlet_call:* in UCAN URI"
         );
         assert_eq!(token.payload.att[0].can, "*");
     }
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_specific_produces_underscore_resource() {
+    async fn mint_ucan_outlet_invoke_specific_produces_underscore_resource() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool:invoke:calculator".to_owned()];
+        let caps = vec!["outlet:call:calculator".to_owned()];
 
         let params = MintParams {
             issuer_did: &issuer_did,
@@ -3061,13 +3296,13 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
         assert_eq!(
-            token.payload.att[0].with, "scp:ctx:ctx-1293/tool_invoke:calculator",
-            "tool:invoke:calculator must produce tool_invoke:calculator in UCAN URI"
+            token.payload.att[0].with, "scp:ctx:ctx-1293/outlet_call:calculator",
+            "outlet:call:calculator must produce outlet_call:calculator in UCAN URI"
         );
         assert_eq!(token.payload.att[0].can, "calculator");
     }
@@ -3096,7 +3331,7 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -3128,7 +3363,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -3140,13 +3375,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_passes_ceiling_check() {
-        // A ceiling with UCAN-format entries must accept tool:invoke:* capabilities.
+    async fn mint_ucan_outlet_invoke_passes_ceiling_check() {
+        // A ceiling with UCAN-format entries must accept outlet:call:* capabilities.
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool:invoke:*".to_owned()];
+        let caps = vec!["outlet:call:*".to_owned()];
 
         let mut ceiling = HashSet::new();
-        ceiling.insert("tool_invoke:*".to_owned());
+        ceiling.insert("outlet_call:*".to_owned());
 
         let params = MintParams {
             issuer_did: &issuer_did,
@@ -3164,17 +3399,17 @@ mod tests {
         };
 
         assert!(
-            mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+            mint_ucan(&params, &custody, &scp_clock::SystemClock)
                 .await
                 .is_ok(),
-            "tool:invoke:* must pass ceiling check with tool_invoke:* in ceiling"
+            "outlet:call:* must pass ceiling check with outlet_call:* in ceiling"
         );
     }
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_rejected_when_not_in_ceiling() {
+    async fn mint_ucan_outlet_invoke_rejected_when_not_in_ceiling() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool:invoke:*".to_owned()];
+        let caps = vec!["outlet:call:*".to_owned()];
 
         let mut ceiling = HashSet::new();
         ceiling.insert("messages:write".to_owned());
@@ -3194,12 +3429,12 @@ mod tests {
             ceiling: Some(ceiling),
         };
 
-        let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(
             matches!(err, UcanError::CapabilityOutsideCeiling(_)),
-            "tool:invoke:* must be rejected when not in ceiling: {err:?}"
+            "outlet:call:* must be rejected when not in ceiling: {err:?}"
         );
     }
 }

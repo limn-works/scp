@@ -58,9 +58,13 @@
 #          store);
 #     (P2) the `saga_participant_context_set` extractor (computes the set a
 #          saga reserves);
-#     (P3) the overlap-reject: a `.contains(` membership check returning a
-#          `SagaBusy`/`ActorBusy` error, occurring INSIDE
-#          `fn try_reserve_context_set` (not merely somewhere in the file);
+#     (P3) the overlap-reject: a `.contains(` membership check AND a typed
+#          `SagaBusy`/`ActorBusy` error AND a real early-return `return Err(`,
+#          all in CODE (not comments) INSIDE `fn try_reserve_context_set` (not
+#          merely somewhere in the file). `//`-comment tails are stripped before
+#          matching, so a gutted reject whose busy tokens survive only in an
+#          explanatory comment (with the real reject replaced by a discarded
+#          binding like `let _ = contended;`) does NOT satisfy P3;
 #     (P4) `try_reserve_context_set` is CALLED in `fn start_saga` (the gate is
 #          on the start path, not dead code);
 #     (P5) `saga_participant_context_set` does NOT emit a `"standing-"`-prefixed
@@ -71,9 +75,11 @@
 #
 # FFI ORDERING clause — if any `start_*_saga` export exists anywhere under
 #   `crates/scp-ffi/`, the NEGATIVE assertion MUST pass (no instance-wide saga
-#   guard may coexist with a shipped FFI saga surface). Today there are no such
-#   exports, so this clause is a vacuous pass that ARMS the prerequisite: the
-#   moment an FFI saga export lands, the negative assertion is load-bearing.
+#   guard may coexist with a shipped FFI saga surface). The §6.2.4 cross-context
+#   tool saga (`tool_invoke_cross_context_saga`, which drives
+#   `Supervisor::start_cross_context_tool_invocation_saga`) is now exported across
+#   all three FFI bridges, so this clause is currently LOAD-BEARING — not a
+#   vacuous pass.
 #
 # ---------------------------------------------------------------------------
 # HOW TO FIX A FAILURE
@@ -227,17 +233,28 @@ fn_body() {
 # ---------------------------------------------------------------------------
 # has_overlap_reject_in_reserve <file> — 0 if the overlap-reject lives INSIDE
 # `fn try_reserve_context_set`: a `.contains(` membership check AND a typed
-# `SagaBusy`/`ActorBusy` rejection, all within that function's body (P3). This
-# is stricter than "somewhere in the file": it pins the reject to the
-# reservation critical section. Returns 0 (present) or 1 (absent).
+# `SagaBusy`/`ActorBusy` rejection AND a real early-return `return Err(`, all
+# within that function's body, all in CODE (P3). This is stricter than
+# "somewhere in the file": it pins the reject to the reservation critical
+# section. Before matching the tokens, `//`-comment tails are STRIPPED from the
+# body so a gutted reject whose busy tokens survive only in an explanatory
+# comment (e.g. `let _ = contended; // would be SagaBusy/ActorBusy`) does NOT
+# count — the tokens must appear in live code. The additional `return Err(`
+# requirement ensures a real early-return reject, not a discarded binding.
+# Returns 0 (present) or 1 (absent).
 # ---------------------------------------------------------------------------
 has_overlap_reject_in_reserve() {
-    local file="$1" body
+    local file="$1" body code
     body="$(fn_body "$file" 'try_reserve_context_set')"
     [[ -n "$body" ]] || return 1
-    printf '%s' "$body" | grep -Fq -- '.contains(' || return 1
-    printf '%s' "$body" | grep -Fq -- 'SagaBusy' || return 1
-    printf '%s' "$body" | grep -Fq -- 'ActorBusy' || return 1
+    # Strip //-comment tails so tokens that appear ONLY in comments do not count
+    # (a gutted reject with explanatory-comment-only tokens must NOT pass).
+    code="$(printf '%s' "$body" | sed 's://.*$::')"
+    printf '%s' "$code" | grep -Fq -- '.contains(' || return 1
+    printf '%s' "$code" | grep -Fq -- 'SagaBusy' || return 1
+    printf '%s' "$code" | grep -Fq -- 'ActorBusy' || return 1
+    # The reject must be a real early-return, not a discarded binding.
+    printf '%s' "$code" | grep -Eq -- 'return[[:space:]]+Err\(' || return 1
     return 0
 }
 
@@ -397,7 +414,8 @@ run_check() {
             "$C_RED" "$C_RESET" >&2
         printf '`fn try_reserve_context_set`. The reservation critical section must\n' >&2
         printf 'reject an OVERLAPPING set with a typed SagaBusy/ActorBusy error via a\n' >&2
-        printf '`.contains(` membership check. Restore the overlap rejection there.\n' >&2
+        printf '`.contains(` membership check AND a real early-return `return Err(` — all\n' >&2
+        printf 'in live CODE, not just comments. Restore the overlap rejection there.\n' >&2
         fail=1
     fi
     if ! start_saga_calls_reserve "$sup"; then
@@ -411,9 +429,9 @@ run_check() {
         printf '\n%sFAILED (positive P5)%s: `fn saga_participant_context_set` emits a\n' \
             "$C_RED" "$C_RESET" >&2
         printf '`"standing-"`-prefixed literal (or calls `generate_standing_context_id`)\n' >&2
-        printf 'into the reserved set. The standing-pair saga must reserve the CANONICAL\n' >&2
+        printf 'into the reserved set. Standing-pair creation must reserve the CANONICAL\n' >&2
         printf 'raw-digest hex (`derive_standing_context_digest`), not the prefixed\n' >&2
-        printf 'display id, or it cannot overlap a cross-context/broadcast saga over the\n' >&2
+        printf 'display id, or it cannot overlap the cross-context tool saga (§6.2.4) over the\n' >&2
         printf 'same standing context (spec §5.15.8). Reserve the raw digest.\n' >&2
         fail=1
     fi
@@ -445,6 +463,11 @@ run_check() {
 #       Mutex instance-wide wedge).
 #   (f) FAILS on a `saga_x: AtomicI64` (the NEG signed-atomic bypass: a SIGNED
 #       atomic instance-wide wedge — same wedge as AtomicU64, just signed).
+#   (g) FAILS on a supervisor whose `try_reserve_context_set` reject is GUTTED to
+#       a discarded binding (`let _ = contended;`) with the busy tokens
+#       (`SagaBusy`/`ActorBusy`) and the membership reasoning surviving ONLY in a
+#       `//` comment (the P3 comment-only / no-real-`return Err` bypass). The
+#       comment-strip + `return Err(` requirement must catch this.
 # ---------------------------------------------------------------------------
 self_test() {
     local fixt rc=0
@@ -599,6 +622,49 @@ self_test() {
             "$C_RED" "$C_RESET" >&2
         printf 'slipped past the negative scan. The NEG type list named only the\n' >&2
         printf 'UNSIGNED atomics — cover AtomicI8|I16|I32|I64|Isize too.\n' >&2
+        rc=1
+    fi
+
+    # ---- fixture (g): P3 comment-only / gutted-reject bypass -> FAIL.
+    # Identical to emit_good_supervisor EXCEPT `try_reserve_context_set`'s real
+    # reject is GUTTED: the `return Err(...)` is replaced by a discarded binding
+    # (`let _ = contended;`) and the busy tokens (SagaBusy/ActorBusy) survive
+    # ONLY in a `//` comment. The comment-strip + `return Err(` requirement in
+    # has_overlap_reject_in_reserve must reject this (P3). No FFI saga export
+    # here: the failure must come from P3, not the negative/FFI-ordering clause.
+    local sup_g="$fixt/sup_g.rs"
+    {
+        printf 'struct Supervisor {\n'
+        printf '    reserved_saga_contexts: std::sync::Mutex<HashSet<String>>,\n'
+        printf '    spawn_generation: std::sync::atomic::AtomicU64,\n'
+        printf '}\n'
+        printf 'fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {\n'
+        printf '    vec![hex::encode(derive_standing_context_digest(a, b))]\n'
+        printf '}\n'
+        printf 'fn try_reserve_context_set(&self, set: &[String]) -> Result<R, E> {\n'
+        printf '    if set.iter().find(|id| reserved.contains(*id)).is_some() {\n'
+        printf '        // overlap -> would be ContextError::ActorBusy / SagaBusy\n'
+        printf '        let _ = contended;\n'
+        printf '    }\n'
+        printf '    Ok(reservation)\n'
+        printf '}\n'
+        printf 'pub async fn start_saga(&self, input: SagaInput) -> Result<O, E> {\n'
+        printf '    let set = saga_participant_context_set(&input);\n'
+        printf '    let _r = self.try_reserve_context_set(&set)?;\n'
+        printf '    Ok(out)\n'
+        printf '}\n'
+    } > "$sup_g"
+    local ffi_g="$fixt/ffi_g"
+    mkdir -p "$ffi_g"
+    printf 'pub fn unrelated() {}\n' > "$ffi_g/exports.rs"
+
+    if run_check "$sup_g" "$ffi_g" "self-test(g)" "$tests_ok" >/dev/null 2>&1; then
+        printf '%sSELF-TEST FAILED (g)%s: a comment-only / gutted overlap-reject (no real\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '`return Err` with the busy tokens in code — the reject replaced by a\n' >&2
+        printf 'discarded binding and SagaBusy/ActorBusy surviving only in a `//` comment)\n' >&2
+        printf 'was wrongly accepted. The P3 comment-strip + `return Err(` requirement is\n' >&2
+        printf 'dead — restore the comment-tail stripping and the early-return check.\n' >&2
         rc=1
     fi
 

@@ -364,7 +364,7 @@ Spec 12 (Platform Bridge Connectors) is by far the most substantial of these fou
 ### [13-004] Extension Point Registration Mechanism Not Specified
 - **Category**: Underspecified algorithms
 - **Location**: 13
-- **What's missing**: "The attestation type system, tool schema format, and capability declaration contract are designed to be extensible without protocol version bumps." But no extension point registry exists. No namespacing for extensions. No mechanism to register new attestation types without collision. No specification of how an agent discovers that an extension is in use.
+- **What's missing**: "The attestation type system, outlet schema format, and capability declaration contract are designed to be extensible without protocol version bumps." But no extension point registry exists. No namespacing for extensions. No mechanism to register new attestation types without collision. No specification of how an agent discovers that an extension is in use.
 - **Why it matters**: Without a registry or namespacing, two independent extensions could use the same attestation type name with different semantics, causing silent data corruption.
 - **Severity**: HIGH
 

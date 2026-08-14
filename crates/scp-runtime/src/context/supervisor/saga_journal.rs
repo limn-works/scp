@@ -5,7 +5,7 @@
 //! # Trait
 //!
 //! [`SagaJournal`] is the supervisor's durable coordinator record for
-//! cross-actor sagas (the sole saga is cross-context tool invoke,
+//! cross-actor sagas (the sole saga is cross-context outlet invoke,
 //! §6.2.4). It exposes three operations per
 //! spec §17.16.1:
 //!
@@ -843,7 +843,7 @@ fn current_timestamp_ms() -> u64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     fn test_journal() -> ProtocolRepositorySagaJournal<InMemoryStorage> {
         ProtocolRepositorySagaJournal::new(Arc::new(InMemoryStorage::new()))

@@ -1,0 +1,23 @@
+---
+name: review-wasm-governance-mls-eviction-c3f7fe48b
+description: WASM governance RemoveMember MLS-eviction security audit at branch HEAD c3f7fe48b — CLEAN, zero findings
+metadata:
+  type: project
+---
+
+# WASM governance MLS-eviction — HEAD c3f7fe48b (fix/wasm-governance-mls-eviction) — CLEAN
+
+Fresh independent audit 2026-06-23. Branch HEAD c3f7fe48b ("docs(wasm): clarify self-removal test + WASM-backend relay obligation"). Merge-base 0a87e4ac2. This is the SAME branch line previously reviewed CLEAN at 97c351df9 / b98c5b1a9 / f761c7d2b; c3f7fe48b adds the docs-only commit on top (TS scp.ts/wasm.ts + context.rs doc-comments clarifying caller relay obligation; native NAPI auto-broadcasts, WASM caller MUST relay commit or MLS forks). Diff = 7 files, +1688/-11. ZERO findings (injection/auth/secrets/leakage all clean).
+
+**Why clean (verified against native reference, not just comments):**
+- Fail-closed ordering byte-matches native `execute_remove_member` (governance_helpers.rs:1231): existence check (members.contains, NO removal) → MLS evict FIRST (`governance_remove_from_group`, only fallible step, ?→CRYPTO_4011) → infallible remove_sender_key + rotate_sender_key → THEN strip members/F5/broadcast/leaf. Genuine MLS err (GroupDestroyed / commit-serialize-on-found-leaf) leaves member FULLY present (proven by test remove_member_keeps_governance_state_when_mls_eviction_fails). WASM SAFER than native: native sender-key/rotate are fallible (fail_close_remove_member arms); WASM's are infallible → no partial-crypto window.
+- Self-removal parity: WASM mirrors BOTH native mechanisms — self-DID short-circuit (native provider.rs:1041 `member_did==self.local_did`) via `own_did()` derived from own leaf credential (no stored field, correct for creator leaf0 AND Welcome-joined non-zero leaf), AND own-leaf skip in scan (native provider.rs:1060 `member.index==own_index continue`). Either funnels self → empty-commit no-op; dispatch STILL strips + appends leaf (matches native). Duplicate-DID tree: short-circuit returns BEFORE scan → neither leaf evicted (native parity), proven by remove_member_by_did_self_did_does_not_evict_duplicate_leaf + governance_remove_self_did_no_op_in_dup_did_tree.
+- Missing-leaf no-op: `remove_member_by_did` Ok(None)→Ok(Vec::new()) empty commit (matches native RemoveMemberOutput::default), dispatch proceeds. GroupDestroyed propagates as genuine err (fail-closed). leaf_index_for_did byte-parity with native scan.
+- Sender-key drop+zeroize+rotate: SenderKey derives Zeroize+ZeroizeOnDrop (scp-protocol sender_keys/mod.rs:66). remove→drop zeroizes; rotate→eager .zeroize() in-place THEN reassign. Correct.
+- Commit-hex: returned `commit` field = TLS-serialized MLS Commit (HPKE-sealed path secrets = public material by design). encode_hex only. No key leak. Self/no-leaf/broadcast paths return empty "".
+- Executor attribution NOT caller-controlled: context.rs context_execute_governance resolves proposer via mgr.proposal_proposer_did(), passes as both initiator+executor; action+timestamp resolved from TRACKED proposal (pending/resolved), never caller-supplied (closes action-substitution facet). proposal_id_hex strict-validated. MemberLeft leaf actor_did=executor (proposer), empty payload (removed DID buffer-only), convergent created_at, precedes GovernanceActionExecuted — byte-parity proven by cross-impl KAT (native half cross_impl_remove_member_leaf_is_empty_and_precedes_executed in wasm_conformance.rs).
+- F5 cleanup COMPLETE for WASM state model: WASM PerContextState has NO separate assignments/member_capabilities/access_key_store/peer_registry per-DID maps (native does). WASM models per-DID authz state ONLY as suspended_capabilities + read_exclusion_list — both .remove(did)'d. members stripped. No other per-DID-keyed map left behind (sessions=session-id keyed; nonces/proposals/revoked not per-member).
+
+**OBSERVATION (non-finding, pre-existing):** `append_log_event` (manager.rs:489) SWALLOWS the append error (web_sys console.error only, no propagation). The MemberLeft durable leaf is appended AFTER strip+evict; a silent append failure → member gone+evicted but missing Merkle leaf → tree::root divergence (convergence/availability, NOT auth bypass — member still cryptographically locked out). Pre-existing behavior of every governance leaf append (incl GovernanceActionExecuted), comment notes "should never fail" since seq/prev_hash computed from current state. Not a regression of this change.
+
+**VERIFICATION:** wasm32 cargo check clean. 12 remove_member tests + evicted_member_cannot_decrypt_after_removal_and_rotation (3-party security proof: Bob evicted can't decrypt post-eviction even WITH rotated sender key handed to him; Carol still can) + own_did×3 + dup-DID×2 all PASS.

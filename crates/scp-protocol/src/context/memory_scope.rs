@@ -14,7 +14,7 @@
 //! The `KeyDestructionOrchestrator` (which actually invokes the crypto
 //! provider to destroy keys) lives in
 //! `scp_runtime::context::key_destruction` after ADR-049 commit 12c.9e —
-//! it operates on the concrete `MlsCryptoProvider` and so cannot live in
+//! it operates on the concrete `NodeMlsFactory` and so cannot live in
 //! `scp-protocol` (forward dep).
 //!
 //! # Key Destruction
@@ -292,7 +292,7 @@ impl PublishableKeyDestructionAttestation {
 ///
 /// Per spec §5.11: "Durable metadata persists: who participated, when, the
 /// declared purpose, participation contributions (participation counts,
-/// tool invocations), and discovery provenance."
+/// outlet invocations), and discovery provenance."
 ///
 /// Content and messages are NOT included — they are destroyed with the keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,7 +502,7 @@ mod tests {
 
     // Note: `KeyDestructionOrchestrator` tests moved to
     // `scp_runtime::context::key_destruction` in ADR-049 commit 12c.9e —
-    // the orchestrator now operates on the concrete `MlsCryptoProvider`
+    // the orchestrator now operates on the concrete `NodeMlsFactory`
     // which lives in scp-runtime (forward dep of scp-protocol).
 
     // -----------------------------------------------------------------------

@@ -29,11 +29,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::ed25519::verify_ed25519_signature;
 use crate::identity::attestation::AttestationClass;
+use scp_clock::Clock;
+use scp_crypto::verify_ed25519_signature;
+use scp_did::DID;
 use scp_event_log::Ed25519Signature;
-use scp_primitives::Clock;
-use scp_primitives::DID;
 
 use super::{AttestationType, TrustError};
 
@@ -59,6 +59,16 @@ pub struct Attestation {
     /// DID of the attestation subject.
     pub subject: DID,
     /// Type-specific claim data.
+    ///
+    /// Serialized into the signed preimage as RFC 8785 (JCS) canonical JSON
+    /// (§9.5.2). **I-JSON numeric constraint (RFC 7493):** numeric values in
+    /// the claim MUST be within the IEEE-754 double exactly-representable
+    /// integer range (|n| ≤ 2^53); larger identifiers (e.g. 64-bit snowflake
+    /// IDs, u64 counters) MUST be string-encoded by the caller. RFC 8785
+    /// serializes numbers as ES6 doubles, so integers beyond 2^53 are not
+    /// injective: distinct values in the same rounding class canonicalize to
+    /// identical bytes, and a signature over one such claim validly covers
+    /// every other claim in that class.
     pub claim: serde_json::Value,
     /// Optional evidence supporting the attestation.
     pub evidence: Option<AttestationEvidence>,
@@ -68,6 +78,21 @@ pub struct Attestation {
     pub expires_at: Option<u64>,
     /// Optional renewal interval. Attestations past this interval but not
     /// expired are considered stale (degraded, not revoked).
+    ///
+    /// # ADVISORY / UNAUTHENTICATED
+    ///
+    /// This field is **NOT** part of the signed attestation preimage
+    /// ([`canonical_attestation_bytes`] excludes it, per §9.5.2), so the
+    /// issuer's signature does **not** cover it. It is advisory metadata only.
+    /// A holder or relay can change it in transit without invalidating the
+    /// signature, so a verifier MUST NOT treat it as an authenticated input to
+    /// any authenticity or freshness *security* decision. Freshness derived
+    /// from it (see `renewal.rs`) is a soft/degraded-status signal, not an
+    /// authenticity guarantee. Authenticated staleness bounds come only from
+    /// the signed `issued_at` / `expires_at` fields. (Design: attestations are
+    /// renewable "without re-sign" — see `renewal.rs` — so this exclusion is
+    /// intentional; the security consequence is documented here rather than
+    /// closed by signing it, which would be a wire-format/model change.)
     pub renewal_interval: Option<Duration>,
     /// Timestamp (seconds) of the last renewal, if renewable (spec 7.4.1).
     ///
@@ -75,6 +100,15 @@ pub struct Attestation {
     /// `issued_at`. A renewable attestation that has never been renewed
     /// should set this to `None`, causing freshness to be measured from
     /// `issued_at`.
+    ///
+    /// # ADVISORY / UNAUTHENTICATED
+    ///
+    /// Like [`Self::renewal_interval`], this field is **NOT** in the signed
+    /// preimage ([`canonical_attestation_bytes`] excludes it) and is therefore
+    /// unauthenticated. A holder/relay can bump it to make a stale attestation
+    /// read as freshly renewed, and no verifier can detect the change from the
+    /// signature. A verifier MUST NOT trust it for an authenticity or freshness
+    /// *security* decision; treat renewal-derived freshness as advisory only.
     pub renewed_at: Option<u64>,
     /// Current revocation status.
     pub revocation_status: RevocationStatus,
@@ -90,7 +124,7 @@ pub struct Attestation {
 /// Evidence supporting an attestation claim.
 ///
 /// The structure of evidence depends on the attestation type. For example,
-/// a `ToolIntegrity` attestation might include a hash of the tool binary,
+/// a `OutletIntegrity` attestation might include a hash of the outlet binary,
 /// while an `IdentityLink` attestation might include a signed challenge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationEvidence {
@@ -594,12 +628,32 @@ pub struct AttestorInfo {
 /// Used by [`verify_attestation`] to obtain the issuer's public key for
 /// signature verification. Implementations may resolve via DHT, cache, or
 /// test fixtures.
+///
+/// # Totality invariant (REQUIRED)
+///
+/// An `Err` from [`Self::resolve_public_key`] MUST mean a **terminal** outcome:
+/// the key genuinely cannot exist for that DID, or the DID is malformed —
+/// i.e., verification against it can never succeed and never will. An `Err`
+/// MUST NOT signal a **transient** condition (network timeout, cache miss,
+/// resolver temporarily unavailable). Callers on the trust read path (e.g.
+/// `trust::aggregate`) treat `Err` as "verification genuinely failed" and
+/// **discard** the attestation; a transient error surfaced as `Err` would
+/// silently erase a live attestation from the trust computation — a fail-open
+/// availability bug for trust evidence.
+///
+/// A resolver that cannot honor this invariant (a networked/fallible DHT or
+/// cache-backed resolver) MUST NOT be wired into the aggregate read path
+/// without first splitting terminal from transient errors there. The
+/// production [`IdentityDidPublicKeyResolver`] satisfies the invariant by
+/// construction: it is a pure, deterministic DID-string parse with no I/O.
 pub trait DidPublicKeyResolver {
     /// Resolves a DID string to its Ed25519 public key bytes (32 bytes).
     ///
     /// # Errors
     ///
-    /// Returns [`TrustError`] if the DID cannot be resolved.
+    /// Returns [`TrustError`] if the DID cannot be resolved. Per the trait's
+    /// totality invariant, an `Err` MUST be terminal (key cannot exist /
+    /// malformed DID), never a retryable transient failure.
     fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError>;
 }
 
@@ -629,10 +683,10 @@ pub struct IdentityDidPublicKeyResolver;
 
 impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
     fn resolve_public_key(&self, did: &str) -> Result<Vec<u8>, TrustError> {
-        // Delegates to the canonical implementation in scp-primitives which
+        // Delegates to the canonical implementation in scp-did which
         // supports did:dht:z (production) and did:key:{hex} (testing only,
         // gated behind #[cfg(test)] / feature = "testing"). See issue #128.
-        let key = scp_primitives::extract_public_key_from_did(did).map_err(|e| {
+        let key = scp_did::extract_public_key_from_did(did).map_err(|e| {
             TrustError::AttestationSignatureInvalid {
                 attestation_id: String::new(),
                 reason: format!("failed to extract public key from DID {did}: {e}"),
@@ -1074,13 +1128,59 @@ pub fn check_threshold_attestation(
 /// intermediary cannot flip Active↔Revoked without invalidating the
 /// signature.
 ///
+/// # Authenticated field set (and what is intentionally excluded)
+///
+/// The signed preimage covers exactly: `id`, `attestation_type`, `issuer`,
+/// `subject`, `claim`, `evidence`, `issued_at`, `expires_at`,
+/// `revocation_status` (§9.5.2). The renewal fields
+/// [`Attestation::renewal_interval`] and [`Attestation::renewed_at`] are
+/// **deliberately excluded** so an attestation can be renewed without
+/// re-signing (`renewal.rs`). Consequently those two fields are
+/// **UNAUTHENTICATED / ADVISORY**: they are not covered by the issuer
+/// signature, a holder/relay can alter them undetectably, and neither this
+/// function nor any verifier treats them as an authenticated input to an
+/// authenticity or freshness *security* decision. Only the fields listed above
+/// are authenticated.
+///
+/// # Canonicalization scheme — per §9.5.2
+///
+/// The §9.5.2 Attestation table assigns a serialization per field:
+///
+/// - `claim` — **compact JSON** (no whitespace, equivalent to Python
+///   `json.dumps(separators=(',', ':'))`), produced via [`crate::jcs::to_vec`]
+///   (RFC 8785 JCS). JCS emits exactly that compact form and additionally
+///   sorts object keys, which makes the preimage deterministic across
+///   implementations. This matches how the same §9.5.2 "compact JSON" phrase
+///   is implemented for `GovernanceProposal` `action_bytes`
+///   (`compute_proposal_id`) and `SignedVote` `vote_type`
+///   (`compute_vote_hash`).
+/// - `evidence` and `revocation_status` — `rmp_serde::to_vec_named`
+///   (`MessagePack`, named keys), as the §9.5.2 note explicitly sanctions for
+///   these two fields.
+///
+/// Note: `IdentityLinkAttestation::canonical_signing_bytes` is governed by a
+/// different spec row (§3 identity, domain
+/// `SCP-IDENTITY-LINK-ATTESTATION-V1:`) which mandates `MessagePack` for its
+/// `claim` as well — its scheme is independent of this function.
+///
+/// # I-JSON numeric constraint on `claim` (RFC 7493, per §9.5.2)
+///
+/// RFC 8785 serializes JSON numbers as ES6 IEEE-754 doubles, so claim
+/// integers outside |n| ≤ 2^53 are **not injective**: distinct values in the
+/// same f64 rounding class (e.g. `9007199254740993` and `9007199254740992`)
+/// canonicalize to identical bytes, producing identical preimages — a
+/// signature over one validly covers the other, and the substitution is
+/// undetectable. Callers MUST keep claim numeric values within |n| ≤ 2^53 and
+/// string-encode larger identifiers (snowflake IDs, u64 counters). This
+/// function does not reject out-of-range integers — the coercion is inherent
+/// to RFC 8785 and is pinned by test.
+///
 /// # Errors
 ///
-/// Returns [`TrustError::InvalidEventData`] if evidence or revocation
-/// status serialization fails.
-pub(crate) fn canonical_attestation_bytes(
-    attestation: &Attestation,
-) -> Result<Vec<u8>, TrustError> {
+/// Returns [`TrustError::CanonicalizationFailed`] if evidence, claim, or
+/// revocation-status serialization fails, or if the canonical hash cannot be
+/// constructed.
+pub fn canonical_attestation_bytes(attestation: &Attestation) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash};
 
     // Serialize evidence as MessagePack bytes (named/sorted keys) if present.
@@ -1088,8 +1188,7 @@ pub(crate) fn canonical_attestation_bytes(
         .evidence
         .as_ref()
         .map(|e| {
-            rmp_serde::to_vec_named(e).map_err(|err| TrustError::InvalidEventData {
-                sequence: 0,
+            rmp_serde::to_vec_named(e).map_err(|err| TrustError::CanonicalizationFailed {
                 reason: format!("evidence serialization failed: {err}"),
             })
         })
@@ -1098,8 +1197,7 @@ pub(crate) fn canonical_attestation_bytes(
     // Serialize revocation_status as MessagePack bytes (named/sorted keys).
     let revocation_bytes =
         rmp_serde::to_vec_named(&attestation.revocation_status).map_err(|err| {
-            TrustError::InvalidEventData {
-                sequence: 0,
+            TrustError::CanonicalizationFailed {
                 reason: format!("revocation_status serialization failed: {err}"),
             }
         })?;
@@ -1107,14 +1205,14 @@ pub(crate) fn canonical_attestation_bytes(
     // Field order per §9.5.2: id, attestation_type, issuer, subject, claim,
     // evidence, issued_at, expires_at, revocation_status.
     //
-    // Serialize claim as MessagePack (named/sorted keys) for deterministic
-    // ordering. Using `serde_json::Value::to_string()` would produce JSON
-    // with non-deterministic key ordering. This matches
-    // `IdentityLinkAttestation::canonical_signing_bytes` which also uses
-    // `rmp_serde::to_vec_named`.
-    let claim_bytes = rmp_serde::to_vec_named(&attestation.claim).map_err(|err| {
-        TrustError::InvalidEventData {
-            sequence: 0,
+    // Serialize claim as compact JSON per the §9.5.2 Attestation table
+    // (row 5: "compact JSON", equivalent to Python
+    // `json.dumps(separators=(',', ':'))`). RFC 8785 JCS produces exactly
+    // that compact form with deterministic (sorted) key ordering — the same
+    // implementation of the same spec phrase as `compute_proposal_id`
+    // (`action_bytes`) and `compute_vote_hash` (`vote_type`).
+    let claim_bytes = crate::jcs::to_vec(&attestation.claim).map_err(|err| {
+        TrustError::CanonicalizationFailed {
             reason: format!("claim serialization failed: {err}"),
         }
     })?;
@@ -1136,8 +1234,7 @@ pub(crate) fn canonical_attestation_bytes(
             CanonicalField::VarBytes(&revocation_bytes),
         ],
     )
-    .map_err(|e| TrustError::InvalidEventData {
-        sequence: 0,
+    .map_err(|e| TrustError::CanonicalizationFailed {
         reason: format!("canonical hash failed: {e}"),
     })?
     .to_vec())
@@ -1146,14 +1243,14 @@ pub(crate) fn canonical_attestation_bytes(
 /// Validates that evidence is present and appropriate for the attestation type.
 ///
 /// Some attestation types require evidence:
-/// - `ToolIntegrity` requires evidence (hash of the tool).
+/// - `OutletIntegrity` requires evidence (hash of the outlet).
 /// - `ParticipationWitness` requires evidence (log reference).
 ///
 /// Other types accept optional evidence without strict requirements.
 fn validate_evidence(attestation: &Attestation) -> Result<(), TrustError> {
     let requires_evidence = matches!(
         attestation.attestation_type,
-        AttestationType::ToolIntegrity | AttestationType::ParticipationWitness
+        AttestationType::OutletIntegrity | AttestationType::ParticipationWitness
     );
 
     if requires_evidence && attestation.evidence.is_none() {
@@ -1272,7 +1369,7 @@ mod tests {
 
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use scp_primitives::TestClock;
+    use scp_clock::TestClock;
 
     /// A test resolver that maps DIDs to public key bytes.
     struct TestResolver {
@@ -1558,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_attestation_requires_evidence_for_tool_integrity() {
+    fn verify_attestation_requires_evidence_for_outlet_integrity() {
         let (signing_key, pubkey_bytes) = test_keypair();
         let mut resolver = TestResolver::new();
         resolver.add_key("did:key:issuer", pubkey_bytes);
@@ -1566,7 +1663,7 @@ mod tests {
 
         let attestation = make_signed_attestation(
             &signing_key,
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             "did:key:issuer",
             "did:key:subject",
             900,
@@ -1584,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_attestation_accepts_tool_integrity_with_evidence() {
+    fn verify_attestation_accepts_outlet_integrity_with_evidence() {
         let (signing_key, pubkey_bytes) = test_keypair();
         let mut resolver = TestResolver::new();
         resolver.add_key("did:key:issuer", pubkey_bytes);
@@ -1597,7 +1694,7 @@ mod tests {
 
         let attestation = make_signed_attestation(
             &signing_key,
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             "did:key:issuer",
             "did:key:subject",
             900,
@@ -2002,7 +2099,7 @@ mod tests {
     #[test]
     fn threshold_ignores_wrong_attestation_type() {
         let required_type = AttestationType::Endorsement;
-        let wrong_type = AttestationType::ToolIntegrity;
+        let wrong_type = AttestationType::OutletIntegrity;
 
         let attestors = vec![
             make_attestor(
@@ -2153,6 +2250,152 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // §9.5.2 claim serialization scheme: compact JSON (RFC 8785 JCS)
+    // -------------------------------------------------------------------
+
+    /// Pins the §9.5.2 Attestation row-5 scheme: the signed preimage embeds
+    /// the `claim` as length-prefixed **compact JSON** (no whitespace, sorted
+    /// keys per RFC 8785 JCS) — not `MessagePack`.
+    #[test]
+    fn canonical_attestation_claim_is_length_prefixed_compact_json() {
+        use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
+        use sha2::{Digest, Sha256};
+
+        let make = |claim: serde_json::Value| Attestation {
+            id: "att-claim-scheme".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subj".into(),
+            claim,
+            evidence: None,
+            issued_at: 1000,
+            expires_at: None,
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+        };
+
+        let att = make(serde_json::json!({"z": 2, "a": 1}));
+        let canonical = canonical_attestation_bytes(&att).unwrap();
+
+        // Expected claim bytes: compact JSON, keys sorted by Unicode code
+        // point (RFC 8785). Equivalent to Python
+        // json.dumps(separators=(',', ':')) for pre-sorted keys.
+        let claim_json: &[u8] = br#"{"a":1,"z":2}"#;
+
+        // Reconstruct the full §9.5.2 preimage with the compact-JSON claim
+        // embedded as a length-prefixed field, and assert the production
+        // digest commits to exactly these bytes.
+        let revocation_bytes = rmp_serde::to_vec_named(&att.revocation_status).unwrap();
+        let preimage = canonical_hash_bytes(
+            b"SCP-ATTESTATION-V1:",
+            &[
+                CanonicalField::VarBytes(att.id.as_bytes()),
+                CanonicalField::U16(super::super::attestation_type_tag(&att.attestation_type)),
+                CanonicalField::VarBytes(att.issuer.as_bytes()),
+                CanonicalField::VarBytes(att.subject.as_bytes()),
+                CanonicalField::VarBytes(claim_json),
+                CanonicalField::Absent,
+                CanonicalField::U64(att.issued_at),
+                CanonicalField::Absent,
+                CanonicalField::VarBytes(&revocation_bytes),
+            ],
+        )
+        .unwrap();
+
+        // The preimage embeds the length-prefixed compact-JSON claim bytes.
+        let mut expected_claim_field = Vec::new();
+        #[allow(clippy::cast_possible_truncation)]
+        expected_claim_field.extend_from_slice(&(claim_json.len() as u32).to_be_bytes());
+        expected_claim_field.extend_from_slice(claim_json);
+        assert!(
+            preimage
+                .windows(expected_claim_field.len())
+                .any(|window| window == expected_claim_field.as_slice()),
+            "preimage must embed the length-prefixed compact-JSON claim {:?}",
+            String::from_utf8_lossy(claim_json)
+        );
+
+        let expected_digest: [u8; 32] = Sha256::digest(&preimage).into();
+        assert_eq!(
+            canonical,
+            expected_digest.to_vec(),
+            "canonical_attestation_bytes must be the SHA-256 of the §9.5.2 \
+             preimage with the claim as compact JSON"
+        );
+
+        // Key-insertion order must not affect the preimage: JCS sorts object
+        // keys, so a semantically identical claim constructed in a different
+        // order yields byte-identical canonical bytes.
+        let att_reordered = make(serde_json::json!({"a": 1, "z": 2}));
+        let canonical_reordered = canonical_attestation_bytes(&att_reordered).unwrap();
+        assert_eq!(
+            canonical, canonical_reordered,
+            "claim key order must not change the canonical bytes (JCS sorts keys)"
+        );
+    }
+
+    /// Pins the documented RFC 8785 f64 rounding class for claim integers
+    /// beyond 2^53 (§9.5.2 I-JSON constraint, RFC 7493).
+    ///
+    /// RFC 8785 serializes JSON numbers as ES6 IEEE-754 doubles, so distinct
+    /// claim integers in the same f64 rounding class canonicalize to
+    /// IDENTICAL bytes — a signature over one validly covers the other. This
+    /// is inherent to RFC 8785 (not a defect in this implementation, and not
+    /// something to "fix" here): it is why §9.5.2 requires claim numeric
+    /// values to stay within |n| ≤ 2^53 and large identifiers (snowflake IDs,
+    /// u64 counters) to be string-encoded. The test makes the hazard visible
+    /// and pins the current behavior; the string-encoded forms of the same
+    /// values remain distinct.
+    #[test]
+    fn canonical_attestation_claim_integers_beyond_2_53_collide_per_rfc8785() {
+        let make = |claim: serde_json::Value| Attestation {
+            id: "att-claim-numeric".to_owned(),
+            attestation_type: AttestationType::Endorsement,
+            issuer: "did:key:issuer".into(),
+            subject: "did:key:subj".into(),
+            claim,
+            evidence: None,
+            issued_at: 1000,
+            expires_at: None,
+            renewal_interval: None,
+            renewed_at: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+        };
+
+        // 2^53 = 9007199254740992 is exactly representable as an f64;
+        // 2^53 + 1 = 9007199254740993 is NOT, and rounds to 2^53 under
+        // RFC 8785 / ES6 number serialization.
+        let att_exact = make(serde_json::json!({"id": 9_007_199_254_740_992_u64}));
+        let att_plus_one = make(serde_json::json!({"id": 9_007_199_254_740_993_u64}));
+
+        let canonical_exact = canonical_attestation_bytes(&att_exact).unwrap();
+        let canonical_plus_one = canonical_attestation_bytes(&att_plus_one).unwrap();
+
+        // Documented rounding-class collision: distinct claims differing only
+        // beyond f64 precision produce IDENTICAL canonical bytes, so one
+        // signature covers both. This is why §9.5.2 mandates string-encoding
+        // for identifiers beyond 2^53.
+        assert_eq!(
+            canonical_exact, canonical_plus_one,
+            "claim integers in the same f64 rounding class must canonicalize \
+             identically per RFC 8785 (documented §9.5.2 hazard)"
+        );
+
+        // The mandated mitigation preserves injectivity: string-encoded forms
+        // of the same two values yield distinct canonical bytes.
+        let att_exact_str = make(serde_json::json!({"id": "9007199254740992"}));
+        let att_plus_one_str = make(serde_json::json!({"id": "9007199254740993"}));
+        assert_ne!(
+            canonical_attestation_bytes(&att_exact_str).unwrap(),
+            canonical_attestation_bytes(&att_plus_one_str).unwrap(),
+            "string-encoded identifiers must remain distinct in the preimage"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // IdentityDidPublicKeyResolver tests
     // -----------------------------------------------------------------------
@@ -2243,6 +2486,118 @@ mod tests {
             "revocation_status must be in the signed scope: Active and Revoked \
              must produce different canonical bytes"
         );
+    }
+
+    #[test]
+    fn renewal_fields_are_unauthenticated_outside_signed_scope() {
+        // Pins the documented ADVISORY/UNAUTHENTICATED contract (#1999): the
+        // `renewal_interval` / `renewed_at` fields are NOT in the signed
+        // attestation preimage, so mutating them changes neither the canonical
+        // bytes nor the validity of the issuer signature. A verifier therefore
+        // cannot detect (and MUST NOT trust) a holder/relay bumping them.
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        // Sign with no renewal metadata.
+        let signed = make_signed_attestation_with_revocation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None, // renewal_interval
+            None, // evidence
+            RevocationStatus::Active,
+        );
+        assert!(signed.renewal_interval.is_none());
+        assert!(signed.renewed_at.is_none());
+
+        let baseline_bytes = canonical_attestation_bytes(&signed).unwrap();
+        assert!(
+            verify_attestation(&signed, &resolver, &clock).is_ok(),
+            "baseline attestation must verify"
+        );
+
+        // Adversarially mutate BOTH renewal fields (as a holder/relay would to
+        // fake freshness), keeping the original signature untouched.
+        let mut tampered = signed;
+        tampered.renewal_interval = Some(Duration::from_hours(8760));
+        tampered.renewed_at = Some(999_999);
+
+        // 1. Canonical bytes are byte-identical — the fields are outside the
+        //    authenticated set.
+        let tampered_bytes = canonical_attestation_bytes(&tampered).unwrap();
+        assert_eq!(
+            baseline_bytes, tampered_bytes,
+            "renewal_interval/renewed_at must NOT affect canonical_attestation_bytes"
+        );
+
+        // 2. The original signature still verifies over the tampered struct —
+        //    proving the mutation is undetectable via the signature.
+        assert!(
+            verify_attestation(&tampered, &resolver, &clock).is_ok(),
+            "mutating unauthenticated renewal fields must not invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn identity_resolver_is_total_for_accepted_did_forms() {
+        // #2000: the aggregate read path (`trust::aggregate`) drops any cached
+        // attestation whose re-verification Errs, which is sound ONLY if the
+        // injected resolver is TOTAL — every Err is terminal (key cannot exist
+        // / malformed DID), never a transient/infra fault. The production
+        // `IdentityDidPublicKeyResolver` is a pure DID-string parse with no I/O,
+        // so it is total by construction. This test pins that:
+        //   (a) every well-formed accepted DID form resolves `Ok`, and
+        //   (b) malformed / unsupported inputs `Err` terminally AND
+        //       deterministically (same input always yields the same outcome),
+        //       which is the observable proxy for "no transient error path".
+        use scp_did::did_dht_from_public_key;
+
+        let resolver = IdentityDidPublicKeyResolver;
+        let key = [7u8; 32];
+
+        // (a) Accepted forms → Ok, round-tripping to the embedded key.
+        let did_dht = did_dht_from_public_key(&key);
+        assert_eq!(
+            resolver.resolve_public_key(did_dht.as_ref()).unwrap(),
+            key.to_vec(),
+            "valid did:dht:z must resolve to its embedded key",
+        );
+        let did_key = format!("did:key:{}", hex::encode(key));
+        assert_eq!(
+            resolver.resolve_public_key(&did_key).unwrap(),
+            key.to_vec(),
+            "valid did:key:{{hex}} (testing form) must resolve",
+        );
+
+        // (b) Malformed / unsupported inputs → terminal, deterministic Err.
+        // A total, pure resolver never returns Err for a resolvable key and
+        // never flips Ok↔Err for the same input across calls (which a
+        // networked/cache resolver could). Determinism here stands in for
+        // "no transient failure".
+        let terminal_cases = [
+            "",                    // empty
+            "not-a-did",           // no scheme
+            "did:web:example.com", // unsupported method
+            "did:dht:z!@#$%^&*",   // invalid z-base-32
+            "did:dht:zyyy",        // decodes but wrong length
+            "did:key:zzzz",        // invalid hex
+            "did:key:00",          // hex but wrong length
+        ];
+        for input in terminal_cases {
+            let first = resolver.resolve_public_key(input);
+            let second = resolver.resolve_public_key(input);
+            assert!(first.is_err(), "expected terminal Err for {input:?}");
+            assert_eq!(
+                first.is_ok(),
+                second.is_ok(),
+                "resolver must be deterministic (no transient behavior) for {input:?}",
+            );
+        }
     }
 
     // --- ThresholdRequirement NaN / Infinity guard tests ---

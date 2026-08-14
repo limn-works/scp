@@ -1,8 +1,10 @@
 /**
  * @limn-works/scp-ts — Shared Context Protocol TypeScript SDK.
  *
- * Dual-target architecture: browser (WASM) and Bun/Node (napi-rs native
- * addon). The correct backend is selected automatically at runtime.
+ * Runs on Bun/Node.js via the napi-rs native addon. Browser clients run the
+ * full protocol in-tab, keys on-device, via the sibling `@limn-works/scp-ts-wasm`
+ * package (the in-browser SCP client over `scp-client-wasm`, ADR-057 — which
+ * amends ADR-055's earlier remote-thin-client browser model).
  *
  * ## Quick start
  *
@@ -33,7 +35,7 @@
  * (`Identity`, `Context`, `Relay`, `Node`) to pure handle types. The
  * module-level free-function shims and class-level instance/static
  * method fan-out were deleted. Pure helpers that do not touch bridge
- * state (e.g. {@link defineToolDefinition}, {@link parseAddress})
+ * state (e.g. {@link defineOutletDefinition}, {@link parseAddress})
  * remain as free functions.
  *
  * @packageDocumentation
@@ -66,16 +68,38 @@ export type {
 export { Context } from "./context";
 
 // ---------------------------------------------------------------------------
-// Tools
+// Outlets
 // ---------------------------------------------------------------------------
 
-export { defineToolDefinition } from "./tools";
+export type {
+  Aggregate,
+  InvokeOptions,
+  StreamingSagaNative,
+  StreamingSagaOptions,
+} from "./outlets";
+export {
+  Credit,
+  defineOutletDefinition,
+  InvocationHandle,
+  OutletStreamChunk,
+  Outlets,
+  StreamingSagaHandle,
+} from "./outlets";
 
 // ---------------------------------------------------------------------------
 // Trust — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type { AggregatedTrustInput, AggregationInput } from "./trust";
+export type {
+  AggregatedTrustInput,
+  AggregationInput,
+  Attestation,
+  BehavioralRecord,
+  ChallengeResult,
+  Endorsement,
+  TrustEvaluation,
+} from "./trust";
+export { evaluateTrust } from "./trust";
 
 // ---------------------------------------------------------------------------
 // Event Log — types only (entry points moved to SCP)
@@ -111,16 +135,25 @@ export type { AggregatedTrustInput, AggregationInput } from "./trust";
 export type { McpClient, McpServer, NativeMcpClientHandle, NativeMcpServerHandle } from "./mcp";
 
 // ---------------------------------------------------------------------------
-// Bridge Connector — types only (entry points moved to SCP)
+// Bridge Connector — types + bridge-provenance trust tier
 // ---------------------------------------------------------------------------
+//
+// Stateful entry points (`bridgeCreateShadow`, credentials) live on SCP.
+// `evaluateTrust` (exported here as `bridgeEvaluateTrust` to disambiguate
+// from the four-layer `evaluateTrust` in `./trust`, mirroring the Python
+// SDK's `bridge_evaluate_trust` re-export name) is the pure bridge-provenance
+// trust-tier classifier (spec §12).
 
 export type {
   BridgeCredential,
   BridgeMode,
   BridgeRegistration,
+  BridgeTrustLevel,
+  BridgeTrustOptions,
   ShadowIdentity,
   ShadowStatus,
 } from "./bridge";
+export { bridgeRegister, evaluateTrust as bridgeEvaluateTrust } from "./bridge";
 
 // ---------------------------------------------------------------------------
 // Discovery — types + pure helpers (entry points for stateful ops moved to SCP)
@@ -166,10 +199,16 @@ export type {
 export type { DiscoveryMethod, ProvenanceRecord } from "./provenance";
 
 // ---------------------------------------------------------------------------
-// Economy — types only (entry points moved to SCP)
+// Economy — types + display helper (stateful entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type { ObservableMetrics, PaidActionType } from "./economy";
+export type {
+  ObservableMetrics,
+  PaidActionType,
+  PaymentReceiptVerificationEntry,
+  PaymentReceiptVerificationResult,
+} from "./economy";
+export { formatAmount } from "./economy";
 
 // ---------------------------------------------------------------------------
 // Sync — types only (entry points moved to SCP)
@@ -196,6 +235,7 @@ export { Node, Relay } from "./server";
 export type {
   ContextReconnectResult,
   KeyCustodyProvider,
+  KeyPackageReservation,
   ReconnectReport,
   ScpOptions,
   StorageConfig,
@@ -210,20 +250,25 @@ export {
   AttestationError,
   ContextError,
   CryptoError,
-  EconomicPolicyUnsupportedOnWasm,
   EconomyError,
   GovernanceError,
   IdentityError,
+  InvalidGrant,
   McpError,
   mapBridgeError,
-  PermissionError,
+  mapSagaError,
+  OutletError,
+  ProtocolError,
+  SagaAbortedError,
+  SagaBusyError,
+  SagaNeedsRepairError,
   ScpError,
   StorageError,
-  ToolError,
+  StreamAlreadyClosed,
+  StreamGap,
   TransportError,
   UcanPermissionError,
   ValidationError,
-  WasmCannotValidateSpendingUcan,
 } from "./errors";
 
 // ---------------------------------------------------------------------------
@@ -234,10 +279,21 @@ export type {
   AddressResolution,
   AssetEntry,
   AttestationSummary,
+  AttestationType,
+  AttestorInfo,
   BatchPublishResult,
-  BehavioralRecord,
   BroadcastAdmissionPolicy,
+  CachedAttestation,
+  CachedAttestationDuration,
+  CachedAttestationEnvelope,
+  CachedAttestationEvidence,
   Capability,
+  CapabilityRequirement,
+  CapabilityValidation,
+  ChallengeRequest,
+  ChallengeResponse,
+  ChallengeVerification,
+  ChallengeVerificationMethod,
   Checkpoint,
   ContextParams,
   CrossContextInvocationResult,
@@ -245,11 +301,20 @@ export type {
   Event,
   EventClaim,
   EventFilter,
+  EventLogEntry,
+  EventLogEntryPayload,
   GovernanceActionResult,
+  InviteMemberOutcome,
   McpClientConfig,
   McpServerConfig,
   MemberRole,
   Message,
+  OutletCost,
+  OutletDefinition,
+  OutletKind,
+  OutletSessionInvokeResult,
+  OutletSessionResult,
+  OutletVerificationResult,
   ParticipationFact,
   ParticipationProfile,
   ParticipationThreshold,
@@ -259,29 +324,28 @@ export type {
   RequireParticipation,
   ResolutionLayer,
   ResolutionPath,
+  SagaResult,
+  SealedInvitation,
   SiteConfig,
   TestVector,
-  ToolCost,
-  ToolDefinition,
-  ToolSessionInvokeResult,
-  ToolSessionResult,
-  ToolVerificationResult,
+  ThresholdRequirement,
   TransportConfig,
   TransportStatus,
-  TrustEvaluation,
   TrustLevel,
   UcanToken,
+  VerificationLevel,
   VerificationMethod,
 } from "./types";
 
-export { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "./types";
-
-// ---------------------------------------------------------------------------
-// Storage
-// ---------------------------------------------------------------------------
-
-export type { StorageInterface, VfsType } from "./storage/index";
-export { InMemorySqliteStorage, prefixSuccessor, WasmSqliteStorage } from "./storage/index";
+export {
+  allValid,
+  Capabilities,
+  outletCall,
+  outletQuery,
+  validateAdmission,
+  validateBroadcastKeyHex,
+  validateSiteConfig,
+} from "./types";
 
 // ---------------------------------------------------------------------------
 // Internal — bridge target detection (read-only, for diagnostics)

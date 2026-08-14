@@ -78,6 +78,57 @@ pyo3::create_exception!(
     "Input validation failed (malformed data, schema mismatch, constraint violation)."
 );
 
+// Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a) terminal errors.
+//
+// These three exceptions surface the typed
+// `Supervisor::start_cross_context_outlet_invocation_saga` terminal space
+// (`SagaError`) WITHOUT the caller having to parse a message string: each
+// carries the structured terminal datum the §6.2.4 / ADR-049 §3a contract
+// makes load-bearing as a positional Python exception argument (read from
+// `e.args`, never re-parsed from the message text):
+//
+// - `SagaAbortedError(message, code, retry_after_ms)` — a Prepare-phase abort
+//   (§6.2.4) that may be a permanent rejection OR a retryable transient (rate
+//   limit / participant actor unavailable), distinguished by the `SCP-SAGA-*`
+//   code. `retry_after_ms` is the rate-limit back-off hint:
+//   an `int` of milliseconds when the tripped limiter can compute one, or
+//   `None` (NEVER `0`) when no precise back-off instant exists — `0` would
+//   read as "retry immediately" and re-trip the same hard limit. An unavailable
+//   participant actor or a plain (non-rate-limit) rejection also carries `None`.
+// - `SagaNeedsRepairError(message, code, saga_id)` — Commit-retry exhausted;
+//   the saga may have partially committed (a divergence). `saga_id` is the
+//   durable operator-repair handle.
+// - `SagaBusyError(message, code, contended_context)` — the participant
+//   context set overlapped an in-flight saga (§5.15.4). `contended_context`
+//   names the shared context id.
+//
+// `code` is the canonical `SCP-SAGA-13xxx` string and is ALSO embedded in
+// `message` (`"[SCP-SAGA-13xxx] …"`) so a flattened log line still
+// disambiguates by `grep`.
+pyo3::create_exception!(
+    scp_sdk,
+    SagaAbortedError,
+    ScpError,
+    "A cross-context outlet-invocation saga aborted at a Prepare phase (§6.2.4). \
+     args = (message, code, retry_after_ms): retry_after_ms is an int of \
+     milliseconds or None (never 0)."
+);
+pyo3::create_exception!(
+    scp_sdk,
+    SagaNeedsRepairError,
+    ScpError,
+    "A cross-context outlet-invocation saga exhausted its Commit retries and may \
+     have diverged (ADR-049 §3a). args = (message, code, saga_id): saga_id is \
+     the durable operator-repair handle."
+);
+pyo3::create_exception!(
+    scp_sdk,
+    SagaBusyError,
+    ScpError,
+    "A cross-context outlet-invocation saga's participant context set overlapped \
+     an in-flight saga (§5.15.4). args = (message, code, contended_context)."
+);
+
 // ---------------------------------------------------------------------------
 // ScpPyError enum
 // ---------------------------------------------------------------------------
@@ -137,6 +188,46 @@ pub enum ScpPyError {
         /// Stable error code (e.g. `SCP-VALID-7001`).
         code: String,
     },
+    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase.
+    ///
+    /// Maps to the Python `SagaAbortedError`. This terminal may be a permanent
+    /// rejection OR a retryable transient (rate limit / participant actor
+    /// unavailable), distinguished by the `SCP-SAGA-*` code. Carries the
+    /// rate-limit back-off hint STRUCTURALLY (`retry_after_ms`): `Some(ms)` is
+    /// the limiter's computed cooldown; `None` (NEVER `0`) means no precise
+    /// back-off instant (a token-bucket hard limit, an unavailable participant
+    /// actor, or a permanent rejection).
+    SagaAborted {
+        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        message: String,
+        /// The canonical `SCP-SAGA-13xxx` code.
+        code: String,
+        /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
+        retry_after_ms: Option<u64>,
+    },
+    /// A §6.2.4 saga exhausted its Commit retries and may have diverged.
+    ///
+    /// Maps to the Python `SagaNeedsRepairError`. Carries the durable
+    /// `saga_id` operator-repair handle.
+    SagaNeedsRepair {
+        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        message: String,
+        /// The canonical `SCP-SAGA-13065` code.
+        code: String,
+        /// The durable saga identifier — the operator-repair handle.
+        saga_id: String,
+    },
+    /// A §6.2.4 saga's participant context set overlapped an in-flight saga.
+    ///
+    /// Maps to the Python `SagaBusyError`. Carries the contended context id.
+    SagaBusy {
+        /// Human-readable detail (carries the `[SCP-SAGA-…]` prefix).
+        message: String,
+        /// The canonical `SCP-SAGA-13066` code.
+        code: String,
+        /// The shared context id that forced serialization.
+        contended_context: String,
+    },
 }
 
 impl std::fmt::Display for ScpPyError {
@@ -159,6 +250,19 @@ impl std::fmt::Display for ScpPyError {
             }
             Self::ValidationError { message, code } => {
                 write!(f, "[{code}] validation error: {message}")
+            }
+            // Saga terminals embed the canonical SCP-SAGA-13xxx code so a
+            // flattened log line still `grep`-disambiguates; the structured
+            // datum (retry_after_ms / saga_id / contended_context) rides the
+            // exception args, not the message text.
+            Self::SagaAborted { message, code, .. } => {
+                write!(f, "[{code}] saga aborted: {message}")
+            }
+            Self::SagaNeedsRepair { message, code, .. } => {
+                write!(f, "[{code}] saga needs repair: {message}")
+            }
+            Self::SagaBusy { message, code, .. } => {
+                write!(f, "[{code}] saga busy: {message}")
             }
         }
     }
@@ -252,6 +356,27 @@ impl From<ScpPyError> for PyErr {
             ScpPyError::TransportError { .. } => TransportError::new_err(formatted),
             ScpPyError::UcanError { .. } => UcanError::new_err(formatted),
             ScpPyError::ValidationError { .. } => ValidationError::new_err(formatted),
+            // Saga terminals carry their structured datum as positional
+            // exception args so a Python caller reads `retry_after_ms` /
+            // `saga_id` / `contended_context` directly from `e.args[2]` —
+            // never by re-parsing the message text. `formatted` (carrying the
+            // `[SCP-SAGA-…]` prefix) is `args[0]`; the canonical code is
+            // `args[1]`. `retry_after_ms` maps `None` → Python `None`
+            // (NEVER `0`), preserving the §6.2.4 back-off semantics across
+            // the FFI boundary.
+            ScpPyError::SagaAborted {
+                code,
+                retry_after_ms,
+                ..
+            } => SagaAbortedError::new_err((formatted, code, retry_after_ms)),
+            ScpPyError::SagaNeedsRepair { code, saga_id, .. } => {
+                SagaNeedsRepairError::new_err((formatted, code, saga_id))
+            }
+            ScpPyError::SagaBusy {
+                code,
+                contended_context,
+                ..
+            } => SagaBusyError::new_err((formatted, code, contended_context)),
         }
     }
 }
@@ -312,10 +437,10 @@ impl From<scp_identity::IdentityError> for ScpPyError {
 
 /// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
 ///
-/// `ContextManager::invoke_tool_with_economy` and several other paths
+/// `ContextManager::invoke_outlet_with_economy` and several other paths
 /// surface category-specific error codes inside `PermissionDenied(String)`
 /// (e.g. `"SCP-ECON-12010: budget exceeded for ..."`,
-/// `"SCP-TOOL-6080: context not active: ..."`). Without this parser the
+/// `"SCP-OUTLET-6080: context not active: ..."`). Without this parser the
 /// bridge would bucket every such error under the generic `SCP-CTX-2001`
 /// envelope and Python callers would have to string-match the message
 /// body. This helper preserves the existing typed-envelope contract by
@@ -417,15 +542,15 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                 code: codes::CTX_2136.to_owned(),
             },
             // `PermissionDenied(String)` is the catch-all the runtime
-            // uses for tool-economy and tool-invocation failures
-            // (economy 12xxx, tool-invocation 6xxx). Recover the embedded
+            // uses for outlet-economy and outlet-invocation failures
+            // (economy 12xxx, outlet-invocation 6xxx). Recover the embedded
             // code prefix so callers can detect specific failures
-            // (budget exceeded, spending UCAN missing, tool not active,
+            // (budget exceeded, spending UCAN missing, outlet not active,
             // etc.) without string-matching the message body.
             CE::PermissionDenied(msg) => {
                 let code = extract_scp_code(msg).unwrap_or_else(|| codes::PERM_3001.to_owned());
                 // Permission/UCAN-class codes raise UcanError; everything
-                // else (tool, economy, context) raises ContextError so
+                // else (outlet, economy, context) raises ContextError so
                 // existing call sites that catch ContextError keep
                 // working.
                 if code.starts_with("SCP-PERM-") {
@@ -440,6 +565,17 @@ impl From<scp_core::context::ContextError> for ScpPyError {
                     }
                 }
             }
+            // §5.9: a `RestoreAccess` requested capabilities that were not
+            // actually suspended for the member (and the member is not
+            // read-excluded with read requested). Dedicated SCP-CTX-2137 instead
+            // of the CTX_2001 catch-all so a caller can detect a no-op restore
+            // (the member already held the requested access). The other
+            // bridges surface the same code for byte-identical
+            // cross-bridge parity.
+            CE::NothingToRestore(_) => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2137.to_owned(),
+            },
             _ => Self::ContextError {
                 message: format!("{e} — verify context state, membership, and permissions"),
                 code: codes::CTX_2001.to_owned(),
@@ -503,35 +639,35 @@ impl From<scp_core::context::promotion::PromotionError> for ScpPyError {
     }
 }
 
-// Tool errors → ScpPyError (tools category, matching napi/uniffi bridges)
+// Outlet errors → ScpPyError (outlets category, matching napi/uniffi bridges)
 
-impl From<scp_core::context::tools::ToolError> for ScpPyError {
-    fn from(e: scp_core::context::tools::ToolError) -> Self {
+impl From<scp_core::context::outlets::OutletError> for ScpPyError {
+    fn from(e: scp_core::context::outlets::OutletError) -> Self {
         Self::ContextError {
             message: format!(
-                "tool operation failed: {e} — check tool registration, permissions, and input schema"
+                "outlet operation failed: {e} — check outlet registration, permissions, and input schema"
             ),
-            code: codes::TOOL_6001.to_owned(),
+            code: codes::OUTLET_6001.to_owned(),
         }
     }
 }
 
-impl From<scp_core::context::tools::invoke::InvocationError> for ScpPyError {
-    fn from(e: scp_core::context::tools::invoke::InvocationError) -> Self {
+impl From<scp_core::context::outlets::invoke::InvocationError> for ScpPyError {
+    fn from(e: scp_core::context::outlets::invoke::InvocationError) -> Self {
         Self::ContextError {
             message: format!(
-                "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
+                "outlet invocation failed: {e} — verify outlet ID, input, and caller permissions"
             ),
-            code: codes::TOOL_6002.to_owned(),
+            code: codes::OUTLET_6002.to_owned(),
         }
     }
 }
 
-impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpPyError {
-    fn from(e: scp_core::context::tools::schema::SchemaValidationError) -> Self {
+impl From<scp_core::context::outlets::schema::SchemaValidationError> for ScpPyError {
+    fn from(e: scp_core::context::outlets::schema::SchemaValidationError) -> Self {
         Self::ValidationError {
             message: format!(
-                "schema validation failed: {e} — check input against the tool's JSON Schema"
+                "schema validation failed: {e} — check input against the outlet's JSON Schema"
             ),
             code: codes::VALID_7001.to_owned(),
         }
@@ -567,7 +703,7 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpPyError {
 impl From<scp_core::crypto::ucan::UcanError> for ScpPyError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
         // Canonical UCAN→error-code mapping lives in `scp_ffi_common::ucan_errors`
-        // so all four bridges (PyO3/NAPI/UniFFI/WASM) stay in lockstep.
+        // so all three FFI bridges (PyO3/NAPI/UniFFI) stay in lockstep.
         // The cross-bridge parity harness (`OP_UCAN_VALIDATE_MALFORMED`)
         // pins this code; changing it here requires updating the shared
         // mapping and the harness golden-code in the same PR.
@@ -764,6 +900,12 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("TransportError", m.py().get_type::<TransportError>())?;
     m.add("UcanError", m.py().get_type::<UcanError>())?;
     m.add("ValidationError", m.py().get_type::<ValidationError>())?;
+    m.add("SagaAbortedError", m.py().get_type::<SagaAbortedError>())?;
+    m.add(
+        "SagaNeedsRepairError",
+        m.py().get_type::<SagaNeedsRepairError>(),
+    )?;
+    m.add("SagaBusyError", m.py().get_type::<SagaBusyError>())?;
     Ok(())
 }
 
@@ -905,5 +1047,101 @@ mod tests {
         let err: ScpPyError =
             scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2136);
+    }
+
+    /// §5.9: a `RestoreAccess` with nothing to restore must surface the
+    /// dedicated SCP-CTX-2137 code, distinct from the catch-all SCP-CTX-2001.
+    /// The same code is surfaced by the other bridges for cross-bridge parity.
+    #[test]
+    fn nothing_to_restore_surfaces_ctx_2137() {
+        let err: ScpPyError = scp_core::context::ContextError::NothingToRestore(
+            "no suspended capabilities to restore for did:dht:zsubject".to_owned(),
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2137);
+    }
+
+    // ------------------------------------------------------------------
+    // Saga terminal → Python exception: the structured datum MUST ride the
+    // exception args so a Python caller reads it directly (never by parsing
+    // the message text). args = (message, code, structured_field).
+    // ------------------------------------------------------------------
+
+    /// `SagaAborted` → `SagaAbortedError` carrying `retry_after_ms` as `args[2]`
+    /// (a Python `int` when `Some`).
+    #[test]
+    fn saga_aborted_maps_to_exception_with_retry_after_ms_arg() {
+        Python::with_gil(|py| {
+            pyo3::prepare_freethreaded_python();
+            let err: PyErr = ScpPyError::SagaAborted {
+                message: "rate limited".to_owned(),
+                code: "SCP-SAGA-13026".to_owned(),
+                retry_after_ms: Some(2500),
+            }
+            .into();
+            assert!(err.is_instance_of::<SagaAbortedError>(py));
+            let args = err.value(py).getattr("args").unwrap();
+            let code: String = args.get_item(1).unwrap().extract().unwrap();
+            assert_eq!(code, "SCP-SAGA-13026");
+            let retry: u64 = args.get_item(2).unwrap().extract().unwrap();
+            assert_eq!(retry, 2500);
+        });
+    }
+
+    /// `SagaAborted` with `retry_after_ms = None` → `args[2]` is Python `None`,
+    /// NEVER `0`.
+    #[test]
+    fn saga_aborted_none_retry_is_python_none_not_zero() {
+        Python::with_gil(|py| {
+            pyo3::prepare_freethreaded_python();
+            let err: PyErr = ScpPyError::SagaAborted {
+                message: "no back-off".to_owned(),
+                code: "SCP-SAGA-13026".to_owned(),
+                retry_after_ms: None,
+            }
+            .into();
+            let args = err.value(py).getattr("args").unwrap();
+            let retry = args.get_item(2).unwrap();
+            assert!(
+                retry.is_none(),
+                "retry_after_ms None must surface as Python None, not 0"
+            );
+        });
+    }
+
+    /// `SagaNeedsRepair` → `SagaNeedsRepairError` carrying `saga_id` as `args[2]`.
+    #[test]
+    fn saga_needs_repair_maps_to_exception_with_saga_id_arg() {
+        Python::with_gil(|py| {
+            pyo3::prepare_freethreaded_python();
+            let err: PyErr = ScpPyError::SagaNeedsRepair {
+                message: "diverged".to_owned(),
+                code: codes::SAGA_13065.to_owned(),
+                saga_id: "saga-xyz".to_owned(),
+            }
+            .into();
+            assert!(err.is_instance_of::<SagaNeedsRepairError>(py));
+            let args = err.value(py).getattr("args").unwrap();
+            let saga_id: String = args.get_item(2).unwrap().extract().unwrap();
+            assert_eq!(saga_id, "saga-xyz");
+        });
+    }
+
+    /// `SagaBusy` → `SagaBusyError` carrying `contended_context` as `args[2]`.
+    #[test]
+    fn saga_busy_maps_to_exception_with_contended_context_arg() {
+        Python::with_gil(|py| {
+            pyo3::prepare_freethreaded_python();
+            let err: PyErr = ScpPyError::SagaBusy {
+                message: "busy".to_owned(),
+                code: codes::SAGA_13066.to_owned(),
+                contended_context: "ctx-shared".to_owned(),
+            }
+            .into();
+            assert!(err.is_instance_of::<SagaBusyError>(py));
+            let args = err.value(py).getattr("args").unwrap();
+            let contended: String = args.get_item(2).unwrap().extract().unwrap();
+            assert_eq!(contended, "ctx-shared");
+        });
     }
 }

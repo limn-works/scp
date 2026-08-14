@@ -10,7 +10,7 @@
 //! nodes are SHA-256 hashes of their children's concatenated hashes.
 //!
 //! This crate is the standalone extraction of the event log subsystem from
-//! `scp-core`. It depends on `scp-primitives` for the [`DID`] newtype and
+//! `scp-core`. It depends on `scp-did` for the [`DID`] newtype and
 //! defines an [`EventLogSigner`] trait to abstract signing, removing the
 //! direct dependency on `scp-platform`'s `KeyCustody`/`KeyHandle`.
 //!
@@ -32,14 +32,12 @@
 //! - [`tree::event_count`] -- Get the number of events in the log.
 
 pub mod checkpoint;
-pub mod crypto;
 pub mod metrics;
 pub mod payload;
 pub mod proof;
 pub mod pruning;
 pub mod system_actors;
 pub mod tiered_storage;
-pub mod time;
 pub mod tree;
 
 #[cfg(any(test, feature = "testing"))]
@@ -50,8 +48,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-// Re-export DID from scp-primitives -- single type across the workspace.
-pub use scp_primitives::DID;
+use scp_did::DID;
 
 /// A context identifier string.
 ///
@@ -95,12 +92,12 @@ pub trait EventLogSigner: Send + Sync {
 ///
 /// Every protocol action that mutates context state is represented as one of
 /// these variants. See ADR-011 for the base enumeration and ADR-031 for
-/// the 8 governance-specific event types. The native↔WASM event-log
+/// the 8 governance-specific event types. The event-log typed-event
 /// unification amendment (ADR-011, `.docs/adrs/phase-2.md`) added the 40
 /// governance-action-coverage, lifecycle/migration, content-access, economic,
 /// consequence-enforcement, commit-broadcast-reconciliation, compromise-recovery,
 /// and app-sandbox-binding variants; the cross-context-saga event model
-/// (ADR-011 Amendment §6 for `CrossContextToolInvoked`; spec §6.2.4 for
+/// (ADR-011 Amendment §6 for `CrossContextOutletInvoked`; spec §6.2.4 for
 /// `CrossContextDivergenceMarker`) added the 2 `CrossContext*` variants. This is a CLOSED set with no catch-all
 /// variant: every protocol action that produces a verifiable Merkle-log entry
 /// is one of these variants.
@@ -128,16 +125,16 @@ pub enum EventType {
     TokenRevoked,
     /// A message was sent within the context.
     MessageSent,
-    /// A tool was registered in the context.
-    ToolRegistered,
-    /// A tool registration was updated.
-    ToolUpdated,
-    /// A tool was invoked.
-    ToolInvoked,
-    /// A tool invocation result was verified.
-    ToolVerified,
-    /// A tool interface was established.
-    ToolInterfaceEstablished,
+    /// A outlet was registered in the context.
+    OutletRegistered,
+    /// A outlet registration was updated.
+    OutletUpdated,
+    /// A outlet was invoked.
+    OutletInvoked,
+    /// A outlet invocation result was verified.
+    OutletVerified,
+    /// A outlet interface was established.
+    OutletInterfaceEstablished,
     /// A governance action was executed (legacy variant, see also
     /// `GovernanceActionExecuted`).
     GovernanceAction,
@@ -173,29 +170,29 @@ pub enum EventType {
     // -------------------------------------------------------------------
     /// A governance proposal was created (ADR-031 §8).
     ///
-    /// Durable leaf payload: EMPTY. Both native (`append_context_event`,
-    /// `EventPayload::default()`) and WASM append this leaf with no payload so
-    /// the leaf preimage is byte-identical across platforms (§9.9.3
-    /// native↔WASM parity). The associated data (`proposal_id`,
+    /// Durable leaf payload: EMPTY. Every honest member appends this leaf with
+    /// no payload (`EventPayload::default()`) so the leaf preimage is
+    /// byte-identical across implementations (§9.9.3
+    /// convergence). The associated data (`proposal_id`,
     /// `proposer_did`, `action`, `voting_deadline`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceProposalCreated,
     /// A vote was cast on a governance proposal (ADR-031 §8).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`proposal_id`, `voter_did`, `vote`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceVoteCast,
     /// A vote was withdrawn from a governance proposal (ADR-031 §8).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`proposal_id`, `voter_did`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceVoteWithdrawn,
     /// A governance proposal was resolved (approved, rejected, expired)
     /// (ADR-031 §8).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`proposal_id`, `status`, `executor_did`,
     /// `resulting_epoch`) rides only on the buffer-only `ContextEvent`, never
     /// in the canonical Merkle leaf.
@@ -203,19 +200,19 @@ pub enum EventType {
     /// A governance conflict was detected (two proposals landed at the
     /// same event log sequence) (ADR-031 §7).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`proposal_a`, `proposal_b`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceConflictDetected,
     /// A governance conflict was resolved (ADR-031 §7).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`winner_id`, `resolution`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceConflictResolved,
     /// A deadlock recovery was performed (ADR-031 §10).
     ///
-    /// Durable leaf payload: EMPTY (native↔WASM parity, §9.9.3). The
+    /// Durable leaf payload: EMPTY (cross-implementation parity, §9.9.3). The
     /// associated data (`justification`, `changes`) rides only on the
     /// buffer-only `ContextEvent`, never in the canonical Merkle leaf.
     GovernanceDeadlockRecovery,
@@ -231,15 +228,15 @@ pub enum EventType {
     // -------------------------------------------------------------------
     /// Provenance metadata was attached to data leaving a source context.
     ///
-    /// Payload: SHA-256 hash of JSON-serialized provenance record (32 bytes).
+    /// Payload: SHA-256 hash of positional-MessagePack-serialized provenance record (32 bytes, §24.3.3).
     ProvenanceAttached,
     /// Provenance metadata was received in a target context.
     ///
-    /// Payload: SHA-256 hash of JSON-serialized provenance record (32 bytes).
+    /// Payload: SHA-256 hash of positional-MessagePack-serialized provenance record (32 bytes, §24.3.3).
     ProvenanceReceived,
 
     // -------------------------------------------------------------------
-    // Governance-action-coverage event types (native↔WASM unification;
+    // Governance-action-coverage event types (typed-event unification;
     // ADR-011 Amendment in `.docs/adrs/phase-2.md`). Each traces to a
     // GovernanceAction (ADR-031 §2) or a §19 / §5.11A / §9.9
     // protocol action. Parameters live in [`EventPayload`], never in the
@@ -287,9 +284,9 @@ pub enum EventType {
     /// A context migration started (`ProposeContextMigration` §5.11A grace
     /// start).
     ContextMigrationStarted,
-    /// A tool was removed (`RemoveTool`; pairs with
-    /// [`EventType::ToolRegistered`]).
-    ToolRemoved,
+    /// A outlet was removed (`RemoveOutlet`; pairs with
+    /// [`EventType::OutletRegistered`]).
+    OutletRemoved,
     /// The pruning policy was modified (`ModifyPruningPolicy` ADR-030 §6).
     PruningPolicyModified,
     /// An MLS commit was broadcast (commit broadcast record §9.9
@@ -410,29 +407,29 @@ pub enum EventType {
     AppUnbound,
 
     // -------------------------------------------------------------------
-    // Cross-context tool-call saga event types (ADR-011 Amendment §6
+    // Cross-context outlet-call saga event types (ADR-011 Amendment §6
     // carve-out; `.docs/adrs/phase-2.md`). UNLIKE the intra-context,
-    // per-author `ToolInvoked` emission (excluded as non-convergent under
-    // the §2 per-author exclusion), the cross-context tool-call saga records
+    // per-author `OutletInvoked` emission (excluded as non-convergent under
+    // the §2 per-author exclusion), the cross-context outlet-call saga records
     // these WITHIN the saga's MLS-Commit phase: they are commit-ordered,
     // convergent, durable leaves — every honest member processing the same
     // saga commit produces the byte-identical leaf (committer-assigned
-    // timestamp drawn from B's signed `CrossContextToolReceipt`). The
+    // timestamp drawn from B's signed `CrossContextOutletReceipt`). The
     // committed-side event id is itself a signed receipt field, so the
     // record is canonical by design. See spec §6.2.4 "Dual event-log
     // recording".
     // -------------------------------------------------------------------
-    /// A cross-context tool call was recorded on the CALLER side (spec
+    /// A cross-context outlet call was recorded on the CALLER side (spec
     /// §6.2.4 "Dual event-log recording"; ADR-011 Amendment §6 carve-out).
     ///
     /// A convergent, commit-ordered durable leaf — NOT a per-author-excluded
     /// event. Emitted by the caller-side actor at Commit-A referencing the
     /// target context id and the same `nonce` as the target's
-    /// [`EventType::ToolInvoked`] record, so an auditor joins the two into one
+    /// [`EventType::OutletInvoked`] record, so an auditor joins the two into one
     /// provenance edge. The committer-assigned leaf timestamp is the target's
     /// signed-receipt `timestamp_ms` (B's staged Prepare-B instant), so two
     /// honest members reconstruct the identical leaf.
-    CrossContextToolInvoked,
+    CrossContextOutletInvoked,
     /// A one-sided cross-context saga commit was made durably auditable (spec
     /// §6.2.4 "Dual event-log recording"; ADR-011 Amendment §6 carve-out).
     ///
@@ -442,7 +439,7 @@ pub enum EventType {
     /// committed-side event id (a signed `CrossContextDivergenceMarker`
     /// payload). The committer-assigned leaf timestamp is the target's staged
     /// `recorded_timestamp_ms` (the same convergent instant the committed-side
-    /// [`EventType::ToolInvoked`] leaf carries), so the marker leaf is
+    /// [`EventType::OutletInvoked`] leaf carries), so the marker leaf is
     /// byte-identical across honest members.
     CrossContextDivergenceMarker,
 }
@@ -555,6 +552,23 @@ pub enum EventLogError {
     /// The signing operation failed during checkpoint generation.
     #[error("signing failed: {0}")]
     SigningFailed(String),
+
+    /// An `OutletInvokedEvent` whose recorded `chunks_billed` does not match
+    /// the value derivable from the manifest root, the sealed chunk sequence,
+    /// and the cancel-ack sequence is a wire-layer rejection — the event is
+    /// refused at log-insert time, not accepted-and-flagged (§5.4.5).
+    #[error(
+        "OutletInvokedEvent.chunks_billed mismatch (§5.4.5): recorded={recorded}, \
+         reference={reference}"
+    )]
+    ChunksBilledMismatch {
+        /// Recorded value carried by the rejected event.
+        recorded: u32,
+        /// Reference count derived from the chunk manifest +
+        /// cancel-ack sequence by
+        /// `scp_runtime::context::outlets::stream::compute_chunks_billed_ref`.
+        reference: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -736,11 +750,11 @@ mod tests {
             EventType::RoleAssigned,
             EventType::TokenRevoked,
             EventType::MessageSent,
-            EventType::ToolRegistered,
-            EventType::ToolUpdated,
-            EventType::ToolInvoked,
-            EventType::ToolVerified,
-            EventType::ToolInterfaceEstablished,
+            EventType::OutletRegistered,
+            EventType::OutletUpdated,
+            EventType::OutletInvoked,
+            EventType::OutletVerified,
+            EventType::OutletInterfaceEstablished,
             EventType::GovernanceAction,
             EventType::ConsistencyCheckpoint,
             EventType::AbsenceProofRequested,
@@ -782,7 +796,7 @@ mod tests {
             EventType::HardRateLimitModified,
             EventType::EconomicPolicyLocked,
             EventType::ContextMigrationStarted,
-            EventType::ToolRemoved,
+            EventType::OutletRemoved,
             EventType::PruningPolicyModified,
             EventType::CommitBroadcasted,
             EventType::CommitBroadcastPending,
@@ -802,7 +816,7 @@ mod tests {
             EventType::RecoveryEpochAdvanced,
             EventType::AppBound,
             EventType::AppUnbound,
-            EventType::CrossContextToolInvoked,
+            EventType::CrossContextOutletInvoked,
             EventType::CrossContextDivergenceMarker,
         ]
     }

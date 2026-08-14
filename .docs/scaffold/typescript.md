@@ -2,7 +2,7 @@
 
 > Source of truth: .docs/specs/, .docs/sketch.md, .docs/adrs/. This file is downstream of those documents.
 
-Build blueprint for the SCP TypeScript SDK: package structure, dual-target architecture, build configuration, and type definitions. See `.docs/standards/typescript.md` for coding standards (Biome config, style rules, testing, CI).
+Build blueprint for the SCP TypeScript SDK: package structure, the napi-rs in-process bridge, build configuration, and type definitions. See `.docs/standards/typescript.md` for coding standards (Biome config, style rules, testing, CI).
 
 ## Package Layout
 
@@ -26,8 +26,7 @@ bindings/typescript/
     mcp.ts                    # serveMcp(), McpClient
     internal/
       native.ts              # napi-rs native addon binding (Bun/Node)
-      wasm.ts                 # wasm-bindgen WASM binding (browser)
-      bridge.ts               # Unified bridge — selects native or WASM at runtime
+      bridge.ts               # Bridge module exposing the napi-rs backend
   tests/
     identity.test.ts
     context.test.ts
@@ -44,20 +43,20 @@ bindings/typescript/
     index.d.ts                # Type declarations
 ```
 
-## Dual Target Architecture
+## In-Process Architecture
 
-The TypeScript SDK supports two runtime environments via different FFI bridges:
+The TypeScript SDK runs the protocol engine **in-process on every tier**, via a per-tier FFI mechanism, delivered as two npm packages (ADR-057 and its 2026-07-15 amendment):
 
-| Target | FFI bridge | Runtime | Use case |
-|--------|-----------|---------|----------|
-| **Browser** | wasm-bindgen (WASM) | Any browser | Web apps, browser extensions |
-| **Bun/Node** | napi-rs (native addon) | Bun, Node.js | Server-side agents, CLI tools, MCP servers |
+| Target | FFI mechanism | Runtime | Package | Use case |
+|--------|--------------|---------|---------|----------|
+| **Bun/Node** | napi-rs (native addon) | Bun, Node.js | `@limn-works/scp-ts` | Server-side agents, CLI tools, MCP servers (full capability) |
+| **Browser/edge** | wasm-bindgen (`scp-client-wasm`) | Browser, Deno, Workers, edge | `@limn-works/scp-ts-wasm` | In-tab SCP participant, keys on-device (participant subset) |
 
-### Bridge selection
+Browser/edge clients **do** run the protocol in-process. Per **ADR-057** (which amends ADR-055's browser-deployment conclusion), a browser client runs the full participant protocol **in-tab** over `scp-client-wasm` — MLS group state, seal/open, and event-log leaves execute locally, with the DID signing key and MLS group secrets held **on-device**; the server is untrusted and never holds key material or plaintext. This is **not** a remote thin client: there is a real in-browser protocol engine. The wasm tier is a capability **subset** — governance, economy, saga coordination, media, DHT, and broadcast hosting stay node-side behind the `scp-runtime` scope fence — so tier selection is an explicit install choice (`@limn-works/scp-ts-wasm`), with no transparent native→wasm fallback. The `@limn-works/scp-ts` package is the NAPI-backed native tier. (ADR-055's removal of the WASM **bridge** stands; ADR-057 revises only its "browser = remote thin client, no in-browser execution" conclusion.)
 
-Bridge selection logic determines runtime at import time. Implementation must avoid top-level await for CJS compatibility.
+### Bridge module
 
-The public API is identical regardless of bridge. Application code never imports from `internal/`.
+The public API is identical for application code; application code never imports from `internal/`.
 
 ### napi-rs binding (Bun/Node)
 
@@ -68,17 +67,7 @@ crates/scp-ffi/napi/
   package.json              # napi-rs build output metadata
 ```
 
-Produces a `.node` native addon loaded at runtime. Zero WASM overhead, direct memory access.
-
-### wasm-bindgen binding (browser)
-
-```
-crates/scp-ffi/wasm/
-  Cargo.toml
-  src/lib.rs                # #[wasm_bindgen] annotated functions + structs
-```
-
-Built via `wasm-pack build --target bundler`. Produces `.wasm` + JS glue code. Async operations use `wasm-bindgen-futures` to bridge Rust futures to JS Promises.
+Produces a `.node` native addon loaded at runtime, with direct memory access.
 
 ## package.json
 
@@ -215,8 +204,10 @@ interface Message {
 
 ## npm Publishing
 
-Published as `@limn-works/scp-ts` on npm. Package includes:
-- ESM + CJS bundles (via tsup)
-- Type declarations (`.d.ts`)
-- Pre-built native addon for Bun/Node (platform-specific optionalDependencies)
-- WASM bundle for browser (included in main package)
+Published as **two** npm packages (ADR-057 two-package delivery; the `package.json` above is the native base package):
+
+- **`@limn-works/scp-ts`** (native base) — shared core + NAPI-backed full-capability `ScpClient`. Includes:
+  - ESM + CJS bundles (via tsup)
+  - Type declarations (`.d.ts`)
+  - Pre-built native addon for Bun/Node (platform-specific optionalDependencies)
+- **`@limn-works/scp-ts-wasm`** (browser/edge tier) — shared core + wasm-backed participant-subset `ScpClient` + opt-in `WebCryptoCustody` / `IndexedDbStorage` adapters. Includes ESM + CJS bundles, type declarations, and the `scp-client-wasm` wasm module bundled in (no `node:` specifiers — bundle isolation is a CI invariant). Each package bundles its own copy of the shared core; there is no third `-core` package.

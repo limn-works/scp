@@ -19,16 +19,19 @@
 
 use std::sync::Arc;
 
-use scp_identity::cache::SystemClock;
+use scp_clock::SystemClock;
+use scp_dht::InMemoryDhtClient;
+use scp_did::DidDocument;
+use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
-use scp_identity::dht_client::InMemoryDhtClient;
-use scp_identity::{DidDocument, ScpIdentity};
 use scp_node::tls;
 use scp_node::{
     DhtMode, IdentitySource, NatSlot, NatStrategy, NodeConfig, NodeError, Reach, ReachabilityTier,
     TlsProvider,
 };
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
+use scp_transport::native::storage::BlobStorageBackend;
 
 /// The concrete `DidDht` type used in tests (in-memory DHT, system clock).
 pub type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
@@ -141,6 +144,8 @@ pub fn test_node_config() -> NodeConfig<InMemoryKeyCustody, TestDidDht, InMemory
                 did_method,
             },
             InMemoryStorage::new(),
+            // Durability-only blob arm, selected explicitly (SCP-CAPINJECT-010).
+            BlobStorageBackend::in_memory(),
         )
     }
 }
@@ -168,6 +173,8 @@ pub fn test_no_domain_node_config(
                 did_method,
             },
             InMemoryStorage::new(),
+            // Durability-only blob arm, selected explicitly (SCP-CAPINJECT-010).
+            BlobStorageBackend::in_memory(),
         )
     }
 }

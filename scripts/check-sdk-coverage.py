@@ -64,6 +64,11 @@ MATRIX_PATH = REPO_ROOT / ".docs" / "standards" / "sdk-capability-matrix.json"
 SDK_PATHS: dict[str, Path] = {
     "python": REPO_ROOT / "bindings" / "python" / "scp_sdk",
     "typescript": REPO_ROOT / "bindings" / "typescript" / "src",
+    # The wasm-mechanism tier (@limn-works/scp-ts-wasm, ADR-057 Slice 3): a
+    # capability SUBSET of `typescript`. It is an OPTIONAL matrix column —
+    # verified where a cell claims it, never forced onto every op — so the
+    # in-browser participant subset is mechanically legible (planning-session-09).
+    "typescript-wasm": REPO_ROOT / "bindings" / "typescript-wasm" / "src",
     "kotlin": (
         REPO_ROOT
         / "bindings"
@@ -83,6 +88,7 @@ SDK_PATHS: dict[str, Path] = {
 SDK_EXTENSIONS: dict[str, str] = {
     "python": "*.py",
     "typescript": "*.ts",
+    "typescript-wasm": "*.ts",
     "kotlin": "*.kt",
     "swift": "*.swift",
 }
@@ -125,6 +131,23 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     },
     ("Identity", "verify_attestation"): {
         "kotlin": ["verifyLinkAttestation"],
+    },
+    # Outlets streaming control plane (SCP-OUT-038): the grant/cancel methods
+    # live on the InvocationHandle returned by the single public invoke() verb,
+    # so their SDK symbols are the bare method names (grant_credit / cancel),
+    # not a domain-prefixed free function. All four SDKs are wired: Python
+    # (C11a reference) plus the TS/Swift/Kotlin mirrors (C11b).
+    ("Outlets", "stream_grant_credit"): {
+        "python": ["grant_credit", "InvocationHandle.grant_credit"],
+        "typescript": ["grantCredit"],
+        "kotlin": ["grantCredit"],
+        "swift": ["grantCredit"],
+    },
+    ("Outlets", "stream_cancel"): {
+        "python": ["cancel", "InvocationHandle.cancel"],
+        "typescript": ["cancel"],
+        "kotlin": ["cancel"],
+        "swift": ["cancel"],
     },
     # Context validation helpers
     ("Context", "metadata_record_serialize"): {
@@ -350,7 +373,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     # Discovery -- discover is `discoverContexts` in TS, `discover` in Kotlin,
     # and `contextDiscover` in Swift (generated UniFFI binding)
     ("Discovery", "discover"): {
-        "python": ["discover_contexts"],
+        "python": ["discover", "discover_contexts"],
         "typescript": ["discoverContexts"],
         "kotlin": ["discover", "contextDiscover"],
         "swift": ["contextDiscover"],
@@ -394,6 +417,18 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("UCAN", "delegate"): {
         "typescript": ["delegateUcan"],
     },
+    # UCAN.evaluate -- the structured read-only diagnostic (ADR-059, §7.2.4).
+    # All four bindings expose an idiomatic wrapper over the typed
+    # CapabilityValidationRecord and consume it inside their evaluate_trust /
+    # evaluateTrust trust-signal wrapper (Python SCP.ucan_evaluate, TypeScript
+    # SCP.ucanEvaluate, Kotlin SCP.ucanEvaluate (Scp.kt), Swift SCP.ucanEvaluate
+    # (Trust.swift)).
+    ("UCAN", "evaluate"): {
+        "python": ["ucan_evaluate", "evaluate_trust"],
+        "typescript": ["ucanEvaluate", "evaluateTrust"],
+        "kotlin": ["ucanEvaluate", "evaluateTrust"],
+        "swift": ["ucanEvaluate", "evaluateTrust"],
+    },
     # MCP
     ("MCP", "serve"): {
         "python": ["serve_mcp", "McpServer"],
@@ -436,6 +471,31 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "python": ["reconnect"],
         "typescript": ["reconnect"],
         "kotlin": ["reconnect"],
+    },
+    # Context -- ADR-049 Phase 2J joiner handshake.
+    #
+    # reserve_key_package NEEDS an explicit mapping: its auto-generated
+    # domain-prefixed candidate is context_reserve_key_package, which does not
+    # match the real SDK symbols (reserve_key_package / reserveKeyPackage).
+    #
+    # join_from_welcome needs NO entry: the auto-generated domain_snake for
+    # ("Context", "join_from_welcome") is already context_join_from_welcome
+    # (single prefix), so it matches the real symbols with no alias required.
+    ("Context", "reserve_key_package"): {
+        "python": ["reserve_key_package"],
+        "typescript": ["reserveKeyPackage"],
+        "kotlin": ["reserveKeyPackage"],
+        "swift": ["reserveKeyPackage"],
+    },
+    # invite_member (ADR-049 Phase 2J / FFI-02 Option A) NEEDS an explicit
+    # mapping: its auto-generated domain-prefixed candidate is
+    # context_invite_member, which does not match the real SDK symbols
+    # (invite_member / inviteMember). Peer of reserve_key_package above.
+    ("Context", "invite_member"): {
+        "python": ["invite_member"],
+        "typescript": ["inviteMember"],
+        "kotlin": ["inviteMember"],
+        "swift": ["inviteMember"],
     },
     ("Context", "set_economic_policy"): {
         "python": ["set_economic_policy"],
@@ -527,71 +587,96 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["broadcastOpenKey"],
         "swift": ["broadcastOpenKey"],
     },
-    # Tools -- Kotlin/Swift use bare method names without domain prefix
-    ("Tools", "register"): {
-        "python": ["tool_register"],
-        "typescript": ["toolRegister"],
-        "kotlin": ["register"],
-        "swift": ["register"],
+    # Outlets -- all SDKs use the outlet-prefixed method name for the renamed
+    # outlet domain (outlet_register / outletRegister / ...).
+    ("Outlets", "register"): {
+        "python": ["outlet_register"],
+        "typescript": ["outletRegister"],
+        "kotlin": ["outletRegister"],
+        "swift": ["outletRegister"],
     },
-    ("Tools", "invoke"): {
-        "python": ["tool_invoke"],
-        "typescript": ["toolInvoke"],
-        "kotlin": ["invoke"],
-        "swift": ["invoke"],
+    ("Outlets", "invoke"): {
+        "python": ["outlet_invoke"],
+        "typescript": ["outletInvoke"],
+        "kotlin": ["outletInvoke"],
+        "swift": ["outletInvoke"],
     },
-    ("Tools", "verify"): {
-        "python": ["tool_verify"],
-        "typescript": ["toolVerify"],
-        "kotlin": ["verify"],
-        "swift": ["verify"],
+    ("Outlets", "verify"): {
+        "python": ["outlet_verify"],
+        "typescript": ["outletVerify"],
+        "kotlin": ["outletVerify"],
+        "swift": ["outletVerify"],
     },
-    ("Tools", "invoke_cross_context"): {
-        "python": ["tool_invoke_cross_context"],
-        "typescript": ["toolInvokeCrossContext"],
-        "kotlin": ["invokeCrossContext"],
-        "swift": ["toolInvokeCrossContext"],
+    ("Outlets", "invoke_cross_context"): {
+        "python": ["outlet_invoke_cross_context"],
+        "typescript": ["outletInvokeCrossContext"],
+        "kotlin": ["outletInvokeCrossContext"],
+        "swift": ["outletInvokeCrossContext"],
     },
-    ("Tools", "session_create"): {
-        "python": ["tool_session_create"],
-        "typescript": ["toolSessionCreate"],
-        "kotlin": ["sessionCreate"],
-        "swift": ["toolSessionCreate"],
+    ("Outlets", "invoke_cross_context_saga"): {
+        "python": ["outlet_invoke_cross_context_saga"],
+        "typescript": ["outletInvokeCrossContextSaga"],
+        "kotlin": ["outletInvokeCrossContextSaga"],
+        "swift": ["outletInvokeCrossContextSaga"],
     },
-    ("Tools", "session_invoke"): {
-        "python": ["tool_session_invoke"],
-        "typescript": ["toolSessionInvoke"],
-        "kotlin": ["sessionInvoke"],
-        "swift": ["toolSessionInvoke"],
+    # Streaming cross-context saga (SCP-OUT-047): the open verb wraps the
+    # bridge outlet_streaming_saga_open behind a StreamingSagaHandle. Swift
+    # exposes it as a Context extension method (invokeOutletCrossContextStreamingSaga).
+    ("Outlets", "invoke_cross_context_streaming_saga"): {
+        "python": ["outlet_invoke_cross_context_streaming_saga"],
+        "typescript": ["outletInvokeCrossContextStreamingSaga"],
+        "kotlin": ["outletInvokeCrossContextStreamingSaga"],
+        "swift": ["invokeOutletCrossContextStreamingSaga"],
     },
-    ("Tools", "session_close"): {
-        "python": ["tool_session_close"],
-        "typescript": ["toolSessionClose"],
-        "kotlin": ["sessionClose"],
-        "swift": ["toolSessionClose"],
+    # Streaming cross-context saga FFI-reconnect key-bearing recovery driver
+    # (SCP-OUT-047): all four SDKs expose the bare recover verb name.
+    ("Outlets", "recover_streaming_saga_truncated_close"): {
+        "python": ["recover_streaming_saga_truncated_close"],
+        "typescript": ["recoverStreamingSagaTruncatedClose"],
+        "kotlin": ["recoverStreamingSagaTruncatedClose"],
+        "swift": ["recoverStreamingSagaTruncatedClose"],
     },
-    ("Tools", "interface_expose"): {
-        "python": ["tool_interface_expose"],
-        "typescript": ["toolInterfaceExpose"],
-        "kotlin": ["interfaceExpose"],
-        "swift": ["exposeToolInterface"],
+    ("Outlets", "session_create"): {
+        "python": ["outlet_session_create"],
+        "typescript": ["outletSessionCreate"],
+        "kotlin": ["outletSessionCreate"],
+        "swift": ["outletSessionCreate"],
     },
-    ("Tools", "interface_accept"): {
-        "python": ["tool_interface_accept"],
-        "typescript": ["toolInterfaceAccept"],
-        "kotlin": ["interfaceAccept"],
-        "swift": ["acceptToolInterface"],
+    ("Outlets", "session_invoke"): {
+        "python": ["outlet_session_invoke"],
+        "typescript": ["outletSessionInvoke"],
+        "kotlin": ["outletSessionInvoke"],
+        "swift": ["outletSessionInvoke"],
     },
-    ("Tools", "interface_revoke"): {
-        "python": ["tool_interface_revoke"],
-        "typescript": ["toolInterfaceRevoke"],
-        "kotlin": ["interfaceRevoke"],
-        "swift": ["revokeToolInterface"],
+    ("Outlets", "session_close"): {
+        "python": ["outlet_session_close"],
+        "typescript": ["outletSessionClose"],
+        "kotlin": ["outletSessionClose"],
+        "swift": ["outletSessionClose"],
+    },
+    ("Outlets", "interface_expose"): {
+        "python": ["outlet_interface_expose"],
+        "typescript": ["outletInterfaceExpose"],
+        "kotlin": ["outletInterfaceExpose"],
+        "swift": ["outletInterfaceExpose"],
+    },
+    ("Outlets", "interface_accept"): {
+        "python": ["outlet_interface_accept"],
+        "typescript": ["outletInterfaceAccept"],
+        "kotlin": ["outletInterfaceAccept"],
+        "swift": ["outletInterfaceAccept"],
+    },
+    ("Outlets", "interface_revoke"): {
+        "python": ["outlet_interface_revoke"],
+        "typescript": ["outletInterfaceRevoke"],
+        "kotlin": ["outletInterfaceRevoke"],
+        "swift": ["outletInterfaceRevoke"],
     },
     # Trust -- bare names in all SDKs
     ("Trust", "evaluate_trust"): {
         "python": ["evaluate_trust"],
         "typescript": ["evaluateTrust"],
+        "kotlin": ["evaluateTrust"],
         "swift": ["evaluateTrust"],
     },
     ("Trust", "aggregate_trust_input"): {
@@ -605,6 +690,36 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["verifyParticipationRequirements"],
         "kotlin": ["verifyParticipationRequirements"],
         "swift": ["verifyParticipationRequirements"],
+    },
+    ("Trust", "check_capability_requirements"): {
+        "python": ["check_capability_requirements"],
+        "typescript": ["checkCapabilityRequirements"],
+        "kotlin": ["checkCapabilityRequirements"],
+        "swift": ["checkCapabilityRequirements"],
+    },
+    ("Trust", "participation_record"): {
+        "python": ["participation_record"],
+        "typescript": ["participationRecord"],
+        "kotlin": ["participationRecord"],
+        "swift": ["participationRecord"],
+    },
+    ("Trust", "trust_create_challenge"): {
+        "python": ["trust_create_challenge"],
+        "typescript": ["trustCreateChallenge"],
+        "kotlin": ["trustCreateChallenge"],
+        "swift": ["trustCreateChallenge"],
+    },
+    ("Trust", "trust_verify_attestation"): {
+        "python": ["trust_verify_attestation"],
+        "typescript": ["trustVerifyAttestation"],
+        "kotlin": ["trustVerifyAttestation"],
+        "swift": ["trustVerifyAttestation"],
+    },
+    ("Trust", "trust_verify_response"): {
+        "python": ["trust_verify_response"],
+        "typescript": ["trustVerifyResponse"],
+        "kotlin": ["trustVerifyResponse"],
+        "swift": ["trustVerifyResponse"],
     },
     # Discovery -- bare/different names across SDKs
     ("Discovery", "parse_address"): {
@@ -728,6 +843,11 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     ("Economy", "evaluate_formula"): {
         "python": ["evaluate_formula"],
     },
+    # Python uses the bare verify_payment_receipts function (no domain prefix);
+    # the auto-generated domain_snake form would be 'economy_verify_payment_receipts'.
+    ("Economy", "verify_payment_receipts"): {
+        "python": ["verify_payment_receipts"],
+    },
     # Sync -- Python uses bare get_policy (no domain prefix)
     # (TypeScript getSyncPolicy is already in the entry above)
     # Provenance -- Kotlin uses bare evaluateQuality
@@ -802,8 +922,7 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["resume"],
     },
     # Bridge -- Python uses bare 'register' and 'evaluate_trust'.
-    # TypeScript does not expose bridge_register as a named public SDK function
-    # (matrix: typescript=false); the entry below covers only the SDKs that do.
+    # TypeScript's bridgeRegister is matched by the domain_camel auto-candidate.
     ("Bridge", "register"): {
         "python": ["register"],
     },
@@ -945,6 +1064,18 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "swift": ["instanceId"],
         "kotlin": ["instanceId"],
     },
+    # Bridge credential storage backend is bridge-INTERNAL: the durable
+    # `FfiCredentialStore` is selected from the SAME storage config the SDK
+    # already chooses (ADR-062 §Decision 5, SCP-CAPINJECT-009). There is no
+    # dedicated SDK wrapper method — selecting storage (SCP / withStorage /
+    # withSqlite) selects the durable credential backend by construction, so the
+    # matrix cell aliases to the existing storage-selection symbols.
+    ("Bridge", "credential_backend_durable"): {
+        "python": ["SCP"],
+        "typescript": ["SCP"],
+        "swift": ["withStorage", "SCP"],
+        "kotlin": ["withStorage", "withSqlite", "SCP"],
+    },
     ("Lifecycle", "scp_with_storage_in_memory"): {
         "python": ["SCP"],
         "typescript": ["SCP"],
@@ -968,6 +1099,65 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["transportAddRelay", "configureRelayTransport"],
         "swift": ["addRelay"],
         "kotlin": ["addRelay"],
+    },
+    # BrowserParticipant (ADR-057 Slice 3): the in-browser wasm participant
+    # subset. Its `typescript-wasm` symbols are ScpBrowserClient methods/getters
+    # and free functions in bindings/typescript-wasm/src (extracted as bare
+    # names). The four core tiers are `false`+exempt on this domain (this is the
+    # in-tab participant DRIVER surface; the node tiers run the full
+    # ContextManager over NAPI, not this surface — see the matrix exemptions).
+    ("BrowserParticipant", "create_context"): {"typescript-wasm": ["createContext"]},
+    ("BrowserParticipant", "generate_key_package_for_join"): {
+        "typescript-wasm": ["generateKeyPackageForJoin"]
+    },
+    ("BrowserParticipant", "add_member"): {"typescript-wasm": ["addMember"]},
+    ("BrowserParticipant", "join_context_encrypted"): {
+        "typescript-wasm": ["joinContextEncrypted"]
+    },
+    ("BrowserParticipant", "send_message"): {"typescript-wasm": ["sendMessage"]},
+    ("BrowserParticipant", "handle_relay_frame"): {
+        "typescript-wasm": ["handleRelayFrame"]
+    },
+    ("BrowserParticipant", "resubscribe_all"): {"typescript-wasm": ["resubscribeAll"]},
+    ("BrowserParticipant", "receive_message"): {"typescript-wasm": ["receiveMessage"]},
+    ("BrowserParticipant", "drain_events"): {"typescript-wasm": ["drainEvents"]},
+    ("BrowserParticipant", "close_context"): {"typescript-wasm": ["closeContext"]},
+    ("BrowserParticipant", "rotate_sender_key"): {
+        "typescript-wasm": ["rotateSenderKey"]
+    },
+    ("BrowserParticipant", "context_ids"): {"typescript-wasm": ["contextIds"]},
+    ("BrowserParticipant", "context_status"): {"typescript-wasm": ["contextStatus"]},
+    ("BrowserParticipant", "member_dids"): {"typescript-wasm": ["memberDids"]},
+    ("BrowserParticipant", "event_log_root"): {"typescript-wasm": ["eventLogRoot"]},
+    ("BrowserParticipant", "event_log_leaf_count"): {
+        "typescript-wasm": ["eventLogLeafCount"]
+    },
+    ("BrowserParticipant", "event_log_leaf_hashes"): {
+        "typescript-wasm": ["eventLogLeafHashes"]
+    },
+    ("BrowserParticipant", "mls_epoch"): {"typescript-wasm": ["mlsEpoch"]},
+    ("BrowserParticipant", "did"): {"typescript-wasm": ["did"]},
+    ("BrowserParticipant", "init"): {"typescript-wasm": ["initScp"]},
+    ("BrowserParticipant", "version"): {"typescript-wasm": ["scpVersion"]},
+    ("BrowserParticipant", "outlet_stream_compute_caveats_binding"): {
+        "typescript-wasm": ["outletStreamComputeCaveatsBinding"]
+    },
+    ("BrowserParticipant", "outlet_stream_verify_chunk_signature"): {
+        "typescript-wasm": ["outletStreamVerifyChunkSignature"]
+    },
+    # SCP-OUT-048: invoker credit signing predicate + the #1980-forward WebCrypto
+    # preimage seam. The scp-client-wasm free functions land in unit A; their
+    # @limn-works/scp-ts-wasm wrappers + the BrowserParticipant matrix rows
+    # (typescript-wasm: true) co-land in unit B, when these aliases resolve to the
+    # verified bindings/typescript-wasm symbols. Browser-initiated CANCEL is
+    # node-delegated (ADR-057; §5.4.5 runtime-derived next_seq — outlet.json
+    # CRITICAL #3), deferred to a future cross-context-cancel slice, so there is no
+    # cancel signing/preimage predicate here.
+    ("BrowserParticipant", "outlet_stream_sign_credit"): {
+        "typescript-wasm": ["outletStreamSignCredit"]
+    },
+    ("BrowserParticipant", "outlet_stream_compute_credit_preimage"): {
+        "typescript-wasm": ["outletStreamComputeCreditPreimage"]
     },
 }
 
@@ -1010,6 +1200,8 @@ def _get_parser(sdk: str) -> Parser:
         lang_map = {
             "python": Language(tspython.language()),
             "typescript": Language(tstypescript.language_typescript()),
+            # The wasm tier is TypeScript — same grammar, different source tree.
+            "typescript-wasm": Language(tstypescript.language_typescript()),
             "kotlin": Language(tskotlin.language()),
             "swift": Language(tsswift.language()),
         }
@@ -1037,11 +1229,16 @@ def _extract_python_methods_from_block(
 
     Handles both plain function_definition and decorated_definition
     (e.g., @classmethod, @staticmethod, @property) inside the block.
+
+    Only public (non-underscore-prefixed) names are added.  Private and
+    dunder methods (``_foo``, ``__bar``, ``__init__``, etc.) are excluded
+    so they cannot be referenced by ALIASES entries — parity with the
+    TypeScript extractor which requires an explicit ``export`` keyword.
     """
     for member in block_node.children:
         if member.type == "function_definition":
             name = _get_func_name_from_definition(member)
-            if name:
+            if name and not name.startswith("_"):
                 symbols.add(f"{class_name}.{name}")
                 symbols.add(name)
 
@@ -1050,19 +1247,23 @@ def _extract_python_methods_from_block(
             for inner in member.children:
                 if inner.type == "function_definition":
                     name = _get_func_name_from_definition(inner)
-                    if name:
+                    if name and not name.startswith("_"):
                         symbols.add(f"{class_name}.{name}")
                         symbols.add(name)
 
 
 def _extract_python_class(class_node: Node, symbols: set[str]) -> None:
-    """Extract class name and all its methods from a class_definition node."""
+    """Extract class name and all its methods from a class_definition node.
+
+    Private classes (names starting with ``_``) are skipped entirely — their
+    name and all their methods are excluded from the symbol set.
+    """
     class_name = None
     for child in class_node.children:
         if child.type == "identifier":
             class_name = _node_text(child) or None
             break
-    if not class_name:
+    if not class_name or class_name.startswith("_"):
         return
 
     symbols.add(class_name)
@@ -1072,20 +1273,27 @@ def _extract_python_class(class_node: Node, symbols: set[str]) -> None:
 
 
 def _extract_python_symbols(root_node: Node) -> set[str]:
-    """Extract function and class.method names from a Python AST.
+    """Extract public function and class.method names from a Python AST.
+
+    Only **public** symbols are collected — names starting with ``_``
+    (private/dunder) are excluded.  This brings parity with the TypeScript
+    extractor which requires an explicit ``export`` keyword: ALIASES entries
+    that reference a private helper would otherwise pass the gate while the
+    underlying symbol is implementation-internal and not callable as public API.
 
     Collects:
-      - Top-level function names (including decorated, e.g., @decorated)
-      - Class names
-      - Method names as both "ClassName.method_name" and bare "method_name"
-      - Decorated methods (@classmethod, @staticmethod, @property)
+      - Top-level public function names (``def foo``, not ``def _foo``)
+      - Public class names (not ``_PrivateClass``)
+      - Public method names as both "ClassName.method_name" and bare
+        "method_name" (``def method``, not ``def _method``)
+      - Decorated public methods (@classmethod, @staticmethod, @property)
     """
     symbols: set[str] = set()
 
     for child in root_node.children:
         if child.type == "function_definition":
             name = _get_func_name_from_definition(child)
-            if name:
+            if name and not name.startswith("_"):
                 symbols.add(name)
 
         elif child.type == "class_definition":
@@ -1096,7 +1304,7 @@ def _extract_python_symbols(root_node: Node) -> set[str]:
             for inner in child.children:
                 if inner.type == "function_definition":
                     name = _get_func_name_from_definition(inner)
-                    if name:
+                    if name and not name.startswith("_"):
                         symbols.add(name)
                 elif inner.type == "class_definition":
                     _extract_python_class(inner, symbols)
@@ -1411,6 +1619,8 @@ def _extract_swift_symbols(root_node: Node) -> set[str]:
 _EXTRACTORS: dict[str, Callable[[Node], set[str]]] = {
     "python": _extract_python_symbols,
     "typescript": _extract_typescript_symbols,
+    # Same language, same extractor — a different source tree (the wasm tier).
+    "typescript-wasm": _extract_typescript_symbols,
     "kotlin": _extract_kotlin_symbols,
     "swift": _extract_swift_symbols,
 }
@@ -1490,6 +1700,15 @@ def _check_operation_in_sdk(
     domain_snake = f"{domain_lower}_{op_name}"
     domain_camel = _to_camel(domain_snake)
 
+    # NOTE: The candidate list includes bare op_name/camelCase/PascalCase.
+    # These are necessary because Swift/Kotlin SDKs use bare method names
+    # (e.g. Swift: `addAgentKey`, Kotlin: `isMember`) rather than
+    # domain-prefixed forms. The tradeoff is that a fabricated op whose name
+    # collides with an unrelated SDK symbol will pass the gate — this is the
+    # name-existence vs name-resolution limitation documented in
+    # .docs/lessons/ast-gate-checks-definition-not-name-resolution.md.
+    # Cross-SDK name irregularities and all ops where domain-scoped matching
+    # is insufficient must use explicit ALIASES entries above.
     candidates = [
         # Domain-prefixed
         domain_snake,  # messaging_send_message
@@ -1533,9 +1752,12 @@ def main() -> int:
         )
         return 1
 
-    # Pre-extract all SDK symbols via tree-sitter
+    # Pre-extract all SDK symbols via tree-sitter. `typescript-wasm` is an
+    # OPTIONAL tier (the ADR-057 in-browser participant subset): it is iterated
+    # so any cell that claims it is statically verified, but it is deliberately
+    # NOT in `expected_sdks` below, so ops that do not name it are unaffected.
     sdk_symbols: dict[str, set[str]] = {}
-    for sdk in ("python", "typescript", "kotlin", "swift"):
+    for sdk in ("python", "typescript", "typescript-wasm", "kotlin", "swift"):
         sdk_symbols[sdk] = _collect_sdk_symbols(sdk)
         if not sdk_symbols[sdk]:
             print(f"  WARNING: No symbols extracted for {sdk} SDK at {SDK_PATHS[sdk]}")
@@ -1547,8 +1769,15 @@ def main() -> int:
     coverage_exempted = 0
     all_exempted_ops = 0
 
-    sdks = ("python", "typescript", "kotlin", "swift")
-    expected_sdks = frozenset(sdks)
+    # `sdks` is the iteration set (every cell present in an op is validated).
+    # `expected_sdks` is the REQUIRED set — the four core tiers that must appear
+    # on every op. `typescript-wasm` is iterated but NOT required: it is an
+    # optional subset tier, present only on the in-browser participant ops
+    # (ADR-057 Slice 3 / planning-session-09). Keeping it out of `expected_sdks`
+    # means adding it never forces a mostly-`false` column onto the other 21
+    # domains — additive coverage, no weakening of the four-tier requirement.
+    sdks = ("python", "typescript", "typescript-wasm", "kotlin", "swift")
+    expected_sdks = frozenset({"python", "typescript", "kotlin", "swift"})
 
     for domain_entry in matrix.get("capabilities", []):
         if not isinstance(domain_entry, dict):

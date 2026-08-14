@@ -1,6 +1,6 @@
-// MCP integration: expose SCP tools via MCP and consume external MCP servers.
+// MCP integration: expose SCP outlets via MCP and consume external MCP servers.
 //
-// Demonstrates tool registration against an explicit `SCP` instance
+// Demonstrates outlet registration against an explicit `SCP` instance
 // (ADR-048). MCP server/client methods are available as `SCP` instance
 // methods once the bridge is wired.
 
@@ -17,7 +17,7 @@ struct McpIntegration {
 
         let params = ContextParams(
             mode: .encrypted,
-            ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
+            ceiling: ["messages:read", "messages:write", "outlet:call:*", "outlet:register"],
             ceilingPolicy: .immutable,
             governance: .singleAdmin,
             memoryScope: .ephemeral,
@@ -31,7 +31,7 @@ struct McpIntegration {
         )
         let handle = try await scp.contextCreate(identity: identity, params: params)
 
-        let tool = ToolDefinition(
+        let outlet = OutletDefinition(
             name: "summarize",
             description: "Summarize text content",
             inputSchemaJson: #"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#,
@@ -41,7 +41,7 @@ struct McpIntegration {
             implementationHash: nil,
             cost: nil
         )
-        _ = try await scp.toolRegister(handle: handle, definition: tool)
+        _ = try await scp.outletRegister(handle: handle, definition: outlet)
 
         // MCP server/client methods on SCP:
         //
@@ -58,7 +58,7 @@ struct McpIntegration {
         //       scp: scp,
         //       config: .sse(url: "http://localhost:8080/mcp")
         //   )
-        //   let tools = try await client.listTools()
+        //   let outlets = try await client.listTools()
         //
         print("(MCP server/client available via scp.mcpServerCreate / McpClient.connect)")
 

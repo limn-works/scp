@@ -77,13 +77,13 @@ async function main(): Promise<void> {
         ceiling: [
           "messages:read",
           "messages:write",
-          "tool:invoke:*",
+          "outlet:call:*",
           "member:invite",
           "member:remove",
           "role:assign",
         ],
         roles: {
-          agent: ["messages:write", "messages:read", "tool:invoke:*"],
+          agent: ["messages:write", "messages:read", "outlet:call:*"],
         },
         memoryScope: "ephemeral",
         governance: "single_admin",

@@ -4,13 +4,18 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist",
-    "start": "bun run build && open index.html"
+    "dev": "vite",
+    "start": "vite",
+    "build": "vite build",
+    "check": "tsc --noEmit",
+    "lint": "biome check src/"
   },
   "dependencies": {
-    "@limn-works/scp-ts": "0.1.0"
+    "@limn-works/scp-ts-wasm": "file:../../bindings/typescript-wasm"
   },
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "@biomejs/biome": "2.5.5",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
   }
 }

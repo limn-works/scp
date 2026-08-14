@@ -5,6 +5,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 
 scp_testing::storage_conformance!(InMemoryStorage::new());

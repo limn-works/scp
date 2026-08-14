@@ -1,0 +1,39 @@
+---
+name: adr055-c3c-participation-trust-sdk
+description: C3c participation/structured-trust SDK rebuild (branch c3c-ts) — ALIGNED at HEAD fcd7ee1d7 (1 NON-BLOCKING residual); ADR renumbered 055->057, WASM-scrub + threat-model + founder MemberJoined landed
+metadata:
+  type: project
+---
+
+# RE-REVIEW @ `fcd7ee1d7` (2026-06-29, +9 commits past a19aa5352) — ALIGNED, 1 NON-BLOCKING residual
+
+Delta since a19aa5352 (all aligned): e78d8a3b5 WASM/four-bridge scrub of ADR-057/SCP-302/SCP-303/matrix; 6803b5c89 threat-model notes; dfb12baff+fcd7ee1d7 founder MemberJoined leaf; f49ef862a verify-on-ingest for challenge results/external revocation; 8544bf9c5+0f793e0a1 presenting_agent_did made required.
+- **WASM-free + three-bridge: PASS.** ADR-057 (phase-2.md:1974) "all four"→"all three FFI bridges" + grounds bridge enum in ADR-055 (phase-4) for WASM removal; "NAPI/WASM serde"→"NAPI"; "four bridge exports"→"three". SCP-302 dropped wasm.ts/wasm/src/ucan.rs from files + rewrote ACs/actionItems native+wasm→NAPI-only/three-bridge. SCP-303 dropped "WASM native-only" outOfScope. matrix dropped WASM-native-only note. git grep: 0 wasm in ADR-057 file/spec07/lesson; all repo ADR-055 refs = merged WASM-removal (leave alone); ADR numbering consistent (this work=ADR-057 everywhere, no stray 055). validate-prd PASS (369).
+- **Spec07 §7.2.4 (new) gate-vs-diagnostic** + 6-bool table + challenge OPTIONAL-for-diagnostic/MANDATORY-for-gate + "never an authorization decision" — matches ADR-057. **§7.3.1/§7.3.2: attestations NOT context-log events; no AttestationPublished EventType (grep: only TrustError::AttestationRevoked, correct); subject_did(role/membership) vs target_did(governance/access) distinction codified; anchoring TIGHTENED "committer-local until ADR-051"; attestation_count credential-layer/verifier-relative/NOT-Merkle.** §7.4.1 Sybil note ACCURATE (authenticity≠Sybil-resistance; self-issuance; claim-count not score; threshold/independence+DeviceAttestation). Threat docstrings (scp.py/trust.py/scp.ts) match spec verbatim.
+- **Founder MemberJoined: PASS.** builder.rs::create_context Step 8 appends subject-bearing MemberJoined (actor==subject==creator, role admin, SAME creation_timestamp_secs=convergent not now(), same rollback receipt, fires once/founding — import/restore replay existing stream). Test asserts duration spans creation→latest >0 + subject_did projects creator.
+- **NON-BLOCKING FINDING:** SCP-302 actionItems[2] (main.json:10368) still says wrapBridgeErrors Proxy "over **both bridge factories**" — stale; parallel acceptanceCriteria#3 was correctly updated to "**the native bridge factory**" (singular). wasm.ts factory deleted → only native factory remains. Fix: "both bridge factories"→"the native bridge factory". Residual-WASM-ref class the e78d8a3b5 scrub targeted; AC is right, only the actionItem missed.
+
+LESSON: a "scrub X from artifacts" commit that updates acceptanceCriteria must also re-grep the PARALLEL actionItems array — PRD stories carry the same claim twice (AC + actionItem) and the actionItem is the classic miss (validate-prd doesn't cross-check AC vs actionItem consistency).
+
+---
+
+# (prior) C3c participation + structured-trust SDK rebuild (branch `c3c-ts`) — ALIGNED (re-review @ `a19aa5352`)
+
+**STATUS FLIP: prior NEEDS-DISCUSSION (ADR# collision) is RESOLVED.** Re-reviewed `git diff origin/main...HEAD` on branch `c3c-ts` (worktree agent-a1400c1b005b502a3, rebased on current origin/main, WASM-bridge gone). 0 blocking, 0 material. Both prior findings closed; two new real security hardenings landed.
+
+**Prior BLOCKER (ADR-055 number collision) → FIXED.** Commit `51d9ba98f` renumbered this branch's ADR to **ADR-057** ("Structured Capability/Trust Validation Across the FFI; SDKs Consume Typed Results, Not Prose", phase-2.md:1961). Verified by grep: every ADR-055 ref repo-wide (docs + crates + bindings + scripts) is the merged WASM-removal ADR-055 (phase-4.md:1468) — NONE refer to this work. Every ADR-057 ref (spec §7.2.4, lesson, PRD SCP-302/303, src/test comments, sdk-capability-matrix, check-sdk-coverage.py) is this work. Clean.
+
+**Prior LOW (5 stale "attestation event in the log" doc-comments) → FIXED.** trust/mod.rs AttestationReference now "NOT an event-log entry: there is no attestation event type… `event_sequence` Always 0"; participation.rs:48/104/196/588/706 all negating form. (mod.rs:296/305 "sequence number of the event in the log" CORRECTLY remain — they're GovernanceActionSummary/RoleTransition, genuine convergent facts, not attestation.)
+
+**Three locked decisions — ALL HONORED (re-verified):**
+1. Attestations credential-layer, never context-log/Merkle, verifier-relative, NOW verified-on-ingest. NO `AttestationPublished`/`AttestationRevoked` EventType variant (grep=0 def; only negating ADR text). `attestation_count` built from caller-supplied accessible attestations filtered to subject+non-revoked, `event_sequence`=0. **NEW HARDENING (commit `ba2e3cc90`, was a HIGH):** FFI ingest (`populate_and_aggregate` + new `verified_attestations` helper in common/trust_store.rs) now routes every caller attestation through `AttestationCache::verify_and_cache` (Ed25519 sig vs resolver-resolved issuer key + expiry/revocation BEFORE caching, trusted clock stamps verified_at, caller's ignored) — closes forged-fresh `attestation_count` inflation + durable poisoning of later evaluate_trust. Same cache/resolver/clock wiring as aggregate_trust_input so participation count == aggregation by construction.
+2. `subject_did` on convergent leaves. payload.rs: RoleAssignedPayload.subject_did, MembershipChangePayload.subject_did, GovernanceActionExecutedPayload carries BOTH subject_did AND target_did (role/membership facts key subject_did; governance/access key target_did — spec §7.3.2 codifies the distinction). Projection wires them; round-trip tests present.
+3. Computed ONCE in Rust core, both SDKs consume. Supervisor::participation_record → compute_participation_record. Python `_participation_record_from`→`instance.participation_record`; TS `participationRecord`→`#native.participationRecord`. Neither re-aggregates (comments at trust.py:749, scp.ts:2383); grep shows no event_log_query/client-classification in evaluate_trust/evaluateTrust.
+
+**§7.3.2 anchoring claim TIGHTENED (as required):** "Today the runtime emits these leaves committer-side only (receive-side replication is dormant), so a non-committer's locally-derived record is committer-local rather than independently Merkle-verifiable until ADR-051." `attestation_count` explicitly "NOT Merkle-anchored". §7.2.4 (new) defines gate-vs-diagnostic + optional-challenge intrinsic mode, fail-closed.
+
+**SECOND NEW HARDENING (commit `07b10818a`, alignment-positive):** ucan_validate gate in all 3 bridges no longer self-defaults absent `presenting_agent_did` to token `aud` (was a `aud==aud` tautology = trust inflation); now fail-closed validation error, matching the diagnostic gate.
+
+**Gates:** validate-prd PASS (369 stories — SCP-302 cites ADR-057+§7.2.4, SCP-303 cites §7.3.2/§7.3.2.1/ADR-011/ADR-051, all real headings, ACs machine-verifiable/grep-able). check-sdk-coverage PASS (225 ops, 0 errors). bridge-aliases.json + ffi-export-allowlist.json + check-sdk-coverage.py edits are ADD-only (new participation_record/UCAN.evaluate alias mappings = coverage expansion; __repr__ dunder exemption legit).
+
+LESSON (carried): a spec-scrub of "X is not an event" must re-grep CODE doc-comments — a struct whose SEMANTICS the change alters (AttestationReference: event_sequence now always 0) drifts to actively-wrong. This round confirms the fix landed. ALSO: a forward-looking ingest path that accepts caller-supplied "already-verified" records MUST re-verify on ingest (don't trust caller verified_at/ttl) — else a forgery is both counted and durably persisted; the tell of a good fix is a trusted-clock re-stamp + drop-on-fail + shared verification wiring with the read path.

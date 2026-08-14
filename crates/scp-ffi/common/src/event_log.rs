@@ -41,6 +41,40 @@ pub fn event_type_label(event_type: &scp_event_log::EventType) -> String {
     format!("{event_type:?}")
 }
 
+/// Injects a typed event payload's bridge-facing projection fields into a JSON object.
+///
+/// The fields are `target_did` (governance / access-revocation events) and
+/// `subject_did` (role / membership events), decoded via the single shared
+/// [`scp_event_log::payload::project_payload`].
+///
+/// Each key is inserted ONLY when the projection yields a value, so every bridge
+/// surfaces byte-identical event payloads from one decoder rather than
+/// re-implementing the field selection per call site. `value` must be a
+/// `serde_json::Value::Object` (e.g. the `{"hash": ...}` map the event-log query
+/// paths build); a non-object value is left untouched.
+pub fn inject_projection(
+    value: &mut serde_json::Value,
+    event_type: &scp_event_log::EventType,
+    payload: &scp_event_log::EventPayload,
+) {
+    let projection = scp_event_log::payload::project_payload(event_type, payload);
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(target_did) = projection.target_did {
+        map.insert(
+            "target_did".to_owned(),
+            serde_json::Value::String(target_did),
+        );
+    }
+    if let Some(subject_did) = projection.subject_did {
+        map.insert(
+            "subject_did".to_owned(),
+            serde_json::Value::String(subject_did),
+        );
+    }
+}
+
 /// The five canonical filter clauses applied to manager event-log entries.
 ///
 /// Borrowed fields so callers can pass string slices from their own
@@ -118,7 +152,7 @@ mod tests {
     fn entry(event_type: scp_event_log::EventType, actor: &str) -> Event {
         Event {
             event_type,
-            actor_did: scp_event_log::DID(actor.to_owned()),
+            actor_did: scp_did::DID(actor.to_owned()),
             timestamp: 0,
             sequence: 0,
             payload: scp_event_log::EventPayload::default(),

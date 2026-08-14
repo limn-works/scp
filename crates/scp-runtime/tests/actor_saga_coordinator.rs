@@ -8,13 +8,13 @@
 //!
 //! # Executor-less misuse guardrail
 //!
-//! Driving a `CrossContextToolInvocation` [`SagaInput`] through the generic
+//! Driving a `CrossContextOutletInvocation` [`SagaInput`] through the generic
 //! `start_saga` (no supervisor-side executor / signing key) is a misuse —
 //! the Prepare-A dispatch aborts with `ContextError::InvalidState`
 //! (SCP-SAGA-13051). The FSM transitions through
 //! `Initiated → PreparingA → Aborting → Aborted` and returns the typed
 //! error. This is the observable behaviour the tests assert; the production
-//! entry point is `start_cross_context_tool_invocation_saga`.
+//! entry point is `start_cross_context_outlet_invocation_saga`.
 //!
 //! The committing-retry-exhaustion and crash-recovery arms exercise the
 //! coordinator's retry loop and journal-replay logic against this abort
@@ -31,8 +31,8 @@
 
 use std::sync::Arc;
 
-use scp_identity::DID;
-use scp_platform::testing::InMemoryStorage;
+use scp_did::DID;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_protocol::context::ContextError;
 use scp_runtime::context::supervisor::{
     JournalEntry, JournalError, ProtocolRepositorySagaJournal, RestoredContexts, SagaId, SagaInput,
@@ -44,15 +44,16 @@ use scp_runtime::context::supervisor::{
 // ---------------------------------------------------------------------------
 
 struct NoopPersistence;
+#[async_trait::async_trait]
 impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         _: &str,
         _: &scp_runtime::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
-    fn load_context(
+    async fn load_context(
         &self,
         _: &str,
     ) -> Result<
@@ -61,26 +62,13 @@ impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
     > {
         Ok(None)
     }
-    fn persist_broadcast(
+    async fn delete_context(
         &self,
         _: &str,
-        _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
-    fn load_broadcast(
-        &self,
-        _: &str,
-    ) -> Result<
-        Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        Ok(None)
-    }
-    fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Vec::new())
@@ -169,7 +157,7 @@ async fn saga_prepare_a_invalid_state_aborts_and_returns_error() {
         .unwrap_err();
     assert!(
         matches!(err, ContextError::InvalidState(_)),
-        "expected InvalidState for the executor-less CrossContextToolInvocation misuse, got {err:?}"
+        "expected InvalidState for the executor-less CrossContextOutletInvocation misuse, got {err:?}"
     );
 }
 

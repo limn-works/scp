@@ -17,7 +17,7 @@ The following Ed25519 keypair is used across all test vectors for consistency. I
 
 **Ed25519 Public Key (32 bytes):**
 ```
-0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa3f4a18446b0b8d183f8e3
+0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
 ```
 
 This is the RFC 8032 Section 7.1 Test Vector 1 keypair. Implementations that cannot reproduce this public key from the seed have a broken Ed25519 implementation and MUST NOT proceed with SCP interoperability testing.
@@ -360,7 +360,7 @@ Note: The vectors above use abstract `data` leaves to pin the RFC 6962 tree cons
 
 ### Vector 32: Typed-Leaf KAT (closed `EventType` taxonomy)
 
-Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + native↔WASM unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextToolInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
+Each leaf is `SHA-256(0x00 || rmp_serde(Event))` over a canonical `scp_event_log::Event` whose `event_type` is one of the closed 77-variant `EventType` taxonomy (ADR-011 AC1 + typed-event unification Amendment + the cross-context-saga event model — Amendment §6 added `CrossContextOutletInvoked` (tag 76) and spec §6.2.4 added `CrossContextDivergenceMarker` (tag 77)). The events are signed with a fixed Ed25519 key (RFC 8032 deterministic signatures), so the full-event MessagePack bytes — and therefore the leaf hashes — are reproducible across runs and implementations. Structured payloads are encoded with positional `rmp_serde::to_vec` of the per-variant payload struct (`scp_event_log::payload`); the two opaque payloads carry the documented `key=value;…` bytes shown.
 
 ```
 Signing key seed (32 bytes): 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
@@ -372,7 +372,7 @@ Events (append order; each prev_hash = previous leaf hash, genesis = [0u8;32]):
 
   seq 0  AppBound                 ts 1700000000
          payload = rmp(AppBoundPayload{ app_did:"did:key:app", app_name:"Scheduler",
-                       app_version:"1.0.0", capabilities:["tool:invoke:*"] })
+                       app_version:"1.0.0", capabilities:["outlet:call:*"] })
          leaf = 0xe0c0691d264ca38d086375a0274afb630e9bbb906f2e12e0112adf4d1b4fcd38
 
   seq 1  SpendApproved            ts 1700000001
@@ -403,8 +403,17 @@ Events (append order; each prev_hash = previous leaf hash, genesis = [0u8;32]):
          payload = b"operation=join;attempts=3"
          leaf = 0x87e3cde25168f4af4328f010369313e28fde305dbc6f706be3392fdf7b8e7f3c
 
-RFC 6962 tree::root over the 7 leaves:
-  0x39e50b879956255f4fd28b2c6f03995e759919e07166c232dd61ed321b54d40d
+  seq 7  RoleAssigned             ts 1700000007
+         payload = rmp(RoleAssignedPayload{ subject_did:"did:key:carol", role:"admin" })
+         leaf = 0x9455cca66b6528ff7061d27b70ddab795ffff1e790fc1f797f22e21687e5f449
+
+  seq 8  MemberJoined             ts 1700000008
+         payload = rmp(MembershipChangePayload{ subject_did:"did:key:dave",
+                       role_name:"member" })
+         leaf = 0x28860f95688e8b0604db7349fd79deed13d3b9a10198a9623ea288a6eeea58f2
+
+RFC 6962 tree::root over the 9 leaves:
+  0x0c6f6a09ecdda29319880ca609060ec15aa8055ee9fbc85099e5f6e8b1ba4117
 ```
 
 ### Vector 33: Checkpoint Root KAT (§23.16.1)
@@ -413,11 +422,40 @@ A `ConsistencyCheckpoint` generated over the Vector 32 log MUST carry `merkle_ro
 
 ```
 checkpoint.merkle_root == tree::root (Vector 32)
-  = 0x39e50b879956255f4fd28b2c6f03995e759919e07166c232dd61ed321b54d40d
-checkpoint.event_count == 7
+  = 0x0c6f6a09ecdda29319880ca609060ec15aa8055ee9fbc85099e5f6e8b1ba4117
+checkpoint.event_count == 9
 ```
 
 Reference implementation and assertions: `crates/scp-event-log/tests/test_vectors.rs` (`vector_32_typed_leaf_and_checkpoint_kat`, `vector_33_checkpoint_root_equals_tree_root_kat`). Regenerate with `cargo test -p scp-event-log --test test_vectors -- --nocapture`.
+
+### Vector 35: `DataProvenance` -> `provenance_hash` KAT (§24.3.3)
+
+Pins the canonical provenance-hash encoding — `SHA-256(rmp_serde::to_vec(DataProvenance))`, positional MessagePack in struct-declaration field order (§24.3.3). This is the single encoding used by the signed BroadcastEnvelope `provenance_hash` (§5.14.5), the inner-envelope provenance hash, and the FFI event-log `ProvenanceAttached` / `ProvenanceReceived` payloads — so this hash is identical whether computed on a signed path or recorded in an event log. `payment_amount` (an `Amount`) encodes as a **native MessagePack integer** (`uint`) here: ADR-060's decimal-string wire form applies only to human-readable encodings (JSON); binary MessagePack keeps the native `u64`, so this KAT is byte-identical to its pre-ADR-060 value.
+
+```
+DataProvenance (all fields populated; field order per §24.2.1):
+  source_context:     "ctx-kat-provenance"
+  source_type:        Persistent
+  counterparties:     ["did:key:alice", "did:key:bob"]
+  purpose:            Some("kat")
+  discovery_method:   SharedContext("ctx-shared")
+  age:                300 s
+  memory_scope:       Full
+  chain_depth:        1
+  chain_path:         Some(["ctx-hop-1"])
+  payment_amount:     Some(Amount(1000))   # wire: native MessagePack uint 1000 (ADR-060 binary path)
+  payment_adapter:    Some("stripe")
+  payment_receipt_id: Some([0x11; 32])
+
+provenance_hash = SHA-256(rmp_serde::to_vec(DataProvenance))
+  = 0x12ea6cf53e3e2fe1c851214d6c9b1acf1338e835bcb91271c8bcdf04e553ce68
+
+Absent-provenance sentinel (ADR-002):
+  provenance_hash = SHA-256(0x00)
+  = 0x6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d
+```
+
+Reference implementation and assertions: `crates/scp-protocol/src/crypto/sender_keys/broadcast.rs` (`vector_35_data_provenance_hash_kat`). Regenerate with `cargo test -p scp-protocol vector_35_data_provenance_hash_kat -- --nocapture`.
 
 ## 25.9 Key Continuity Fingerprint Vectors (§9.11)
 
@@ -427,7 +465,7 @@ Domain: `"SCP-KEY-CONTINUITY-V1:"`
 
 ```
 Input:
-  root_key (#0):    0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa3f4a18446b0b8d183f8e3 (32 bytes)
+  root_key (#0):    0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a (32 bytes)
   active_key (#active): 0x3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c (32 bytes)
   agent_key (#agent):   0xfc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025 (32 bytes)
 
@@ -619,32 +657,32 @@ Result: did:pseudo:a1545542cd8834cc0599f07e5c730dee3005c01097dde63abf906110f1a8e
 
 The pseudonym is deterministic: the same (key, context, DID) triple always produces the same pseudonym. Different keys or contexts produce unrelated pseudonyms for the same DID.
 
-## 25.15 Tool Interface Offer ID Vectors (§6.2.0.1)
+## 25.15 Outlet Interface Offer ID Vectors (§6.2.0.1)
 
 Domain: `"SCP-OFFER-ID-V1:"`
 
-### Vector 28: Tool Interface Offer ID
+### Vector 28: Outlet Interface Offer ID
 
-`compute_offer_id` derives a deterministic 32-byte offer ID from the source context, tool ID, target context, and timestamp.
+`compute_offer_id` derives a deterministic 32-byte offer ID from the source context, outlet ID, target context, and timestamp.
 
 ```
 Input:
   source_context:  "source-ctx-01"
-  tool_id:         "tool-abc123"
+  outlet_id:         "outlet-abc123"
   target_context:  "target-ctx-02"
   timestamp:       1700000000
 
 Canonical hash input:
   "SCP-OFFER-ID-V1:"                            (16 bytes, no length prefix)
   || BE32(13) || "source-ctx-01"                 (4 + 13 = 17 bytes)
-  || BE32(11) || "tool-abc123"                   (4 + 11 = 15 bytes)
+  || BE32(13) || "outlet-abc123"                 (4 + 13 = 17 bytes)
   || BE32(13) || "target-ctx-02"                 (4 + 13 = 17 bytes)
   || BE64(1700000000)                            (8 bytes)
 
-Total: 16 + 17 + 15 + 17 + 8 = 73 bytes
+Total: 16 + 17 + 17 + 17 + 8 = 75 bytes
 
 Expected SHA-256:
-  0xb9f0cd497bede455c99c995c16eb2a0a2bc013a94cdd744dfd5ddbcd73791d53
+  0xea9ce09b497405e8c160c8d0d57067c726092866f6d1ec541e8e6081a5328733
 ```
 
 ## 25.16 Attestation ID Vectors (§3.5.2)
@@ -698,11 +736,11 @@ To verify an implementation against these test vectors:
 The Rust reference implementation can generate exact expected outputs for all vectors. Run the test vector generation tool:
 
 ```bash
-cargo test -p scp-core --test test_vectors -- --nocapture
+cargo test -p scp-runtime --test test_vectors -- --nocapture
 cargo test -p scp-event-log --test test_vectors -- --nocapture
 ```
 
-The test vector generation test is defined in `crates/scp-core/tests/test_vectors.rs` and `crates/scp-event-log/tests/test_vectors.rs`. These tests print hex-encoded intermediate and final values for each vector defined above.
+The test vector generation test is defined in `crates/scp-runtime/tests/test_vectors.rs` and `crates/scp-event-log/tests/test_vectors.rs`. These tests print hex-encoded intermediate and final values for each vector defined above.
 
 Independent implementations SHOULD run these tests against the Rust implementation to obtain the expected outputs, then embed those outputs in their own test suites.
 
@@ -767,4 +805,232 @@ Expected v2 pseudonym public key (epoch = 1):
   0xedd47319719e2350d1db9488e0189f2405267d7dc243489cfd9aa6f3ac3fc639
 ```
 
-These vectors are mechanically enforced by the Rust known-answer test `derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-platform/src/pseudonym.rs`.
+These vectors are mechanically enforced by the Rust known-answer test `derive_pseudonym_keypair_known_answer_vectors` in `crates/scp-crypto/src/pseudonym.rs` (the wasm-safe home of the derivation, ADR-057 Option A), and cross-checked for native/`wasm32` byte-parity by `pseudonym_derivation_matches_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_derivation_cross_target_kat.rs`.
+
+### Vector 36: `PseudonymAnnouncement` wire format + classifier decisions (§9.10.4)
+
+These vectors pin the on-the-wire **pseudonym announcement** — the `MessagePack` payload a member broadcasts on the shared bootstrap channel to teach peers their per-context routing ID — and the pure §9.10.4 accept/reject classifier that both the native orchestrator and the in-browser client run over an inbound announcement. Because the announcement type and the classifier live in the wasm-safe `scp-protocol::context::pseudonym` module (ADR-057 T-1), native and `wasm32` MUST produce byte-identical wire bytes and identical accept/reject decisions.
+
+**Wire format.** `PseudonymAnnouncement` is serialized with `rmp_serde::to_vec_named` — a name-keyed `MessagePack` map with three fields, in declaration order: `tag` (string), `member_did` (string), `pseudonym` (32-byte `serde_bytes` binary). No `usize`, no float, no map-iteration order, so a fixed value re-encodes deterministically and target-independently.
+
+```
+Input:
+  tag:        "\0scp:pseudonym-announce:v1"   (PSEUDONYM_ANNOUNCEMENT_TAG, 26 bytes, NUL-prefixed)
+  member_did: "did:dht:z6MkPseudonymKatFixtureMemberAAAAAAAAAAAAAA"  (51 bytes)
+  pseudonym:  0x42 × 32
+
+MessagePack layout:
+  0x83                                   fixmap, 3 entries
+  0xa3 "tag"                             key
+  0xba <26 bytes>  "\0scp:pseudonym-announce:v1"   str8 value (NUL-prefixed magic tag)
+  0xaa "member_did"                      key
+  0xd9 0x33 <51 bytes> "did:dht:z6Mk…AA"  str8 value
+  0xa9 "pseudonym"                        key
+  0xc4 0x20 <32 bytes> 0x42×32            bin8 value (serde_bytes)
+
+Expected bytes (hex, single continuous string):
+  83a3746167ba007363703a70736575646f6e796d2d616e6e6f756e63653a7631aa6d656d6265725f646964d9336469643a6468743a7a364d6b50736575646f6e796d4b6174466978747572654d656d6265724141414141414141414141414141a970736575646f6e796dc4204242424242424242424242424242424242424242424242424242424242424242
+```
+
+**Classifier decisions.** `classify_pseudonym_announcement(plaintext, sender_did, context_id, registry)` returns a `PseudonymAnnouncementDecision` over the four-step §9.10.4 validation. The reject `reason` strings are stable `&'static str`s and are part of this vector — a change to any is wire-observable:
+
+| Case | `sender_did` | payload / registry | Decision | `reason` |
+|------|--------------|--------------------|----------|----------|
+| ordinary app data | member | `b"hello world"` / `Some({})` | `NotAnnouncement` | — |
+| legitimate announce | member | golden announce (member, `0x42×32`) / `Some({})` | `Accept { member, 0x42×32 }` | — |
+| sender mismatch | member | announce claims `other` / `Some({})` | `Rejected` (carries `claimed_did = other`) | `pseudonym announcement member_did does not match sender` |
+| reserved value | member | announce with `[0;32]` **or** `context_routing_id(ctx)` **or** `broadcast_routing_id(ctx)` / `Some({})` | `Rejected` | `pseudonym announcement uses a reserved routing ID` |
+| broadcast context | member | golden announce / `None` | `Rejected` | `pseudonym announcement received on broadcast context` |
+| cross-DID collision | member | golden announce / `Some({other → 0x42×32})` | `Rejected` | `pseudonym announcement collides with another member's routing ID` |
+
+where `member = "did:dht:z6MkPseudonymKatFixtureMemberAAAAAAAAAAAAAA"`, `other = "did:dht:z6MkPseudonymKatFixtureOtherBBBBBBBBBBBBBBB"`, and `ctx = "ctx-adr057-pseudonym-kat"`.
+
+This vector is mechanically enforced on BOTH native and `wasm32` by `pseudonym_wire_and_classifier_match_golden_vectors` in `crates/scp-client-wasm/tests/pseudonym_cross_target_kat.rs` (native `#[test]` + `#[wasm_bindgen_test]`, run under `wasm-pack test --node`): `native == golden` and `wasm == golden` together prove `native == wasm` (ADR-057 T-1 / Prerequisite 5). The pure predicate + classifier unit tests also live in `crates/scp-protocol/src/context/pseudonym.rs`.
+
+## 25.20 Trust Attestation Signing Vectors (§7.4.1, §9.5.2)
+
+Domain: `"SCP-ATTESTATION-V1:"`
+
+### Vector 34: Trust Attestation Signature
+
+The signing payload for the common attestation envelope (`trust::Attestation`, §7.4.1) uses the canonical hash construction from §9.5.1 with domain separator `"SCP-ATTESTATION-V1:"` and the §9.5.2 Attestation field order. The `claim` field is serialized as RFC 8785 (JCS) canonical JSON — sorted keys, no whitespace — so a claim constructed with any key insertion order yields identical bytes. Per the §9.5.2 I-JSON constraint, claim numeric values MUST be within |n| ≤ 2^53 (this vector's claim uses `42`). `evidence` and `revocation_status` are serialized as MessagePack (`rmp_serde::to_vec_named`). The renewal fields (`renewal_interval`, `renewed_at`) are excluded from the signed preimage (§9.5.2) and do not appear below.
+
+Note: this is the *signature* construction for the generic trust attestation envelope. It is distinct from the IdentityLinkAttestation signature (§25.13, domain `"SCP-IDENTITY-LINK-ATTESTATION-V1:"`, MessagePack claim) and from the attestation *ID* computation (§25.16, domain `"SCP-ATTESTATION-ID-V1:"`).
+
+```
+Input:
+  id:                "att-trust-001"
+  attestation_type:  Endorsement  (type tag 4 per attestation_type_tag())
+  issuer:            "did:dht:z6MkIssuer"
+  subject:           "did:dht:z6MkSubject"
+  claim:             {"level": "gold", "score": 42}
+                       JCS: {"level":"gold","score":42}  (27 bytes)
+  evidence:          absent (use absent sentinel)
+  issued_at:         1700000000
+  expires_at:        absent (no expiry — use absent sentinel)
+  revocation_status: RevocationStatus::Active
+                       msgpack: 0xa6 "Active"  (7 bytes)
+
+Canonical hash input:
+  "SCP-ATTESTATION-V1:"                          (19 bytes, no length prefix)
+  || BE32(13) || "att-trust-001"                  (4 + 13 = 17 bytes — id)
+  || BE16(4)                                      (2 bytes — attestation_type tag)
+  || BE32(18) || "did:dht:z6MkIssuer"            (4 + 18 = 22 bytes — issuer)
+  || BE32(19) || "did:dht:z6MkSubject"           (4 + 19 = 23 bytes — subject)
+  || BE32(27) || {"level":"gold","score":42}      (4 + 27 = 31 bytes — claim as JCS)
+  || SHA-256(0x00)                                 (32 bytes, raw — no length prefix — absent evidence sentinel)
+  || BE64(1700000000)                              (8 bytes — issued_at)
+  || SHA-256(0x00)                                 (32 bytes, raw — no length prefix — absent expires_at sentinel)
+  || BE32(7)  || msgpack(Active)                  (4 + 7 = 11 bytes — revocation_status as MessagePack)
+
+Total: 19 + 17 + 2 + 22 + 23 + 31 + 32 + 8 + 32 + 11 = 197 bytes
+
+Expected SHA-256 (= canonical_attestation_bytes output):
+  0x6d07c76821a2ae4dd830ca117aa9fd8e30232cca72459a4d129432f56d87a08c
+```
+
+The Ed25519 signature is computed over the 32-byte canonical hash. Sign with the reference key (§25.2) and verify per §25.17 step 5; Ed25519 is deterministic, so the reference implementation reproduces the same signature bytes on every run.
+
+This vector is mechanically enforced by `vector_34_trust_attestation_signature` in `crates/scp-runtime/tests/test_vectors.rs`, which pins the expected hash, reconstructs the preimage byte-for-byte, and verifies the signed attestation through the production `verify_attestation` path.
+
+## 25.21 Outlet Streaming Conformance Vectors (§5.4.5)
+
+Progressive-output (streaming) outlet invocation (§5.4.5, ADR-061) is exercised by a shared set of 7 scenario vectors that pin the observable behaviour of a stream end-to-end: the ordered chunk transcript, the credit-grant timing, the cancellation billing boundary, and the terminal status recorded in the `OutletInvokedEvent` (`StreamTerminalStatus`, §5.4.5 "Event log shape"). Unlike the cryptographic known-answer vectors above, these are **behavioural** vectors — they carry payload *descriptors*, not literal signed wire bytes. Every chunk signature (`OutletStreamChunk.sig`) and every `caveats_binding` is **recomputed** by the harness at replay time under the §25.2 reference operator key (RFC 8032 §7.1 Test Vector 1, seed `0x9d61…7f60`), because the operator signature preimage (`SCP-OUTLET-CHUNK-SIG-V1:`, §5.4.5) binds the per-stream `request_id`, `sequence`, and `caveats_binding`, none of which are fixed until the stream is opened.
+
+The canonical vector file is `tests/conformance/vectors/outlet_stream_vectors.json` (top-level `{version, vectors:[7]}`). The four language SDKs consume the **same** JSON so the drain-side chunk decoding, credit granting, cancellation, and terminal-status mapping match the Rust core byte-for-byte across bindings.
+
+### Scenario matrix
+
+| Vector | Outlet kind | Scenario | `expected_end_status` | `expected_error_code` |
+|--------|-------------|----------|-----------------------|-----------------------|
+| `non_streaming` | action | Degenerate two-chunk stream (`Data` then `End`); the §5.4.5 "Non-streaming invocation" case | `Ok` | — |
+| `multi_chunk` | query | Ten `Data` chunks with one interleaved non-billable `Progress` chunk (§5.4.5 `ChunkPayload::Progress`), followed by `End`; ordered multi-chunk transcript (§5.4.5 ordering). The `Progress` chunk is forwarded, consumes a sequence slot (the monotonicity cursor advances across it), and is NOT billed | `Ok` | — |
+| `cancellation` | query | Signed `OutletCancel` mid-stream; cancel-ack terminal pins the billing boundary (§5.4.5 "Cancellation and billing boundary") | `Cancelled` | — |
+| `error_terminal` | action | Executor emits `Data(seq0)` then a terminal `Error{terminal:true}` at seq1 (§5.4.5 billing: a billable `Data` chunk PRECEDES the terminal here, so escrow is settled for that one delivered chunk — this vector is NOT the "terminal `Error` before any `Data`" full-refund case) | `Error` | `SCP-OUTLET-6130` |
+| `error_recoverable` | query | Non-terminal `Error{terminal:false}` is informational; the stream continues and closes `Ok` (§5.4.5 `ChunkPayload::Error` semantics) | `Ok` | — |
+| `sequence_gap` | query | Receiver observes a missing `sequence` (0,1,3 — 2 dropped) and MUST cancel (§5.4.5 "Ordering and gaps") | `Cancelled` | `SCP-OUTLET-6131` |
+| `credit_stall` | query | Credit window of 1, no grant → the executor stalls past `stream_credit_stall_secs` → framework credit-stall terminal (§5.4.5 "Credit-based backpressure"). NOTE: this vector exercises the credit-**stall** terminal (`SCP-OUTLET-6133` / `execution.credit-stall`) ONLY. The distinct cumulative-ceiling `execution.credit-exhausted` terminal (`SCP-OUTLET-6131`, window driven to its `max_calls` cap) is a SEPARATE condition NOT covered by this 7-vector set (future coverage follow-up) — do not read `credit_stall` as covering it | `Error` | `SCP-OUTLET-6133` |
+
+All rows cite §5.4.5. Sequences are strictly monotonic from `0`; the producer pump renumbers emitted chunks under its own outer cursor, so the runtime-driven replays assert monotonic-from-zero rather than the vector's literal sequence field (which is authoritative only for the receiver-side gap check).
+
+### Two error-code traps (do not conflate)
+
+- **`credit_stall` → `SCP-OUTLET-6133` / `execution.credit-stall`**, NOT `6131`. The round-4 cancel-ack-vs-credit-stall split gave the credit-stall terminal its own dedicated code (`CODE_EXECUTION_CREDIT_STALL`, `crates/scp-protocol/src/context/outlets/error_codes.rs`). A window that reaches zero and is not replenished within `stream_credit_stall_secs` is `CreditStall` (`TerminateReason::CreditStall`), distinct from the cumulative-ceiling `execution.credit-exhausted` (6131). The vector was renamed to `credit_stall` (its earlier name used "exhaustion") so the name matches the terminal it actually drives — an "exhaustion" name misread the retry-policy / error class; the distinct `execution.credit-exhausted` (6131) terminal is not exercised by this set.
+- **`sequence_gap` → `SCP-OUTLET-6131` / `execution.stream-gap`** (consolidated). `SLUG_EXECUTION_STREAM_GAP = "execution.stream-gap"` shares `CODE_EXECUTION_CREDIT` (`SCP-OUTLET-6131`) with `execution.credit-exhausted` and `execution.stream-cap-exhausted` — three Execution-class resource/ordering slugs under one code.
+
+### Replay locations
+
+The vectors are replayed at every layer so a regression at any tier is caught:
+
+| Layer | Location | Coverage |
+|-------|----------|----------|
+| Runtime (direct) | `crates/scp-testing/tests/integration/outlet_stream_conformance.rs` | All 7 through the raw `open_stream_session` dispatch pump; `sequence_gap` via the receiver tracker; `credit_stall` via a real 1-second credit-stall timer. |
+| Runtime (through-open-path) | `crates/scp-testing/tests/integration/outlet_stream_vectors_through_open_path.rs` | All 7 through the real `Supervisor::open_outlet_stream` control path with context/outlet/member/UCAN registration and runtime-derived-cursor cancel signing. |
+| PyO3 bridge | `crates/scp-ffi/tests/outlet_stream_vectors_real.rs` | `non_streaming`, `cancellation`, `error_terminal` driven live through `outlet_stream_open`→`poll_next`→`grant_credit`/`cancel`; `sequence_gap` via the receiver tracker over a signed transcript; `multi_chunk`/`error_recoverable`/`credit_stall` are covered at the runtime layer (the PyO3 handler seam is single-shot per `BridgeStreamExecutor`). |
+| NAPI bridge | `crates/scp-ffi/napi/src/outlet_stream/tests.rs` (`#[cfg(test)]` `mod streaming_vectors` + `mod streaming_vectors_live`) | Same live/runtime split, driven through the NAPI `_on` exports. Internal module, not an external `tests/` target: the napi addon is a `cdylib` whose runtime symbols only link under `#[cfg(test)]`, so an external test target cannot resolve them. `mod streaming_vectors` carries all-7-vector wire integrity + `sequence_gap`; `mod streaming_vectors_live` drives `non_streaming`/`cancellation`/`error_terminal` live. |
+| UniFFI bridge | `crates/scp-ffi/uniffi/tests/outlet_stream_vectors_real.rs` (external, all-7 wire integrity + `sequence_gap`) + `crates/scp-ffi/uniffi/src/outlet_stream/tests.rs` (`#[cfg(test)]` `mod streaming_vectors_live`) | The external target verifies wire integrity for all 7; the live open→poll of `non_streaming`/`cancellation`/`error_terminal` needs crate-internal setup seams (`Scp.inner` is `pub(crate)`), so it lives in the internal module. |
+| WASM (pure wrappers) | `crates/scp-client-wasm/src/lib.rs` (`#[cfg(test)]`) | For each of the 7 vectors, every chunk is signed under the §25.2 operator key and asserted `true` under `outletStreamVerifyChunkSignature` (and `false` under a wrong key); `outletStreamComputeCaveatsBinding` matches the core helper. WASM has no tokio runtime (ADR-034/057), so it verifies **wire integrity**, not terminal status. |
+| SDK drains | Python / TypeScript / Swift / Kotlin SDK smoke tests | Land via the SDK half of SCP-OUT-039, consuming this same vector JSON. |
+
+Because the PyO3/NAPI/UniFFI handler-registration seam produces a single aggregate value (`BridgeStreamExecutor`, `crates/scp-ffi/src/outlet_stream.rs`), the three multi-emission vectors — `multi_chunk` (10 `Data` chunks plus an interleaved `Progress` chunk), `error_recoverable` (`Data` → non-terminal `Error` → `Data`), and `credit_stall` (needs a second billable chunk to park past the window) — cannot be produced by a single-shot handler and are therefore **not faked** at the bridge layer; they are covered at the runtime tiers (every real-bridge test documents this deferral explicitly). `error_terminal` is NOT deferred — a single-shot handler that returns `Err` maps to the framework terminal `Error` `SCP-OUTLET-6130`, so it is driven live at all three bridges. The receiver-side `sequence_gap` check is a Rust-layer receiver *test oracle* at every runtime/bridge tier because a lossless same-context pump cannot produce a gap; the runtime pump is the *producer* in the same-context case and therefore has no gap of its own to detect. The **permanent, transport-agnostic receiver check** is the SDK `InvocationHandle` drain (§5.4.5 "Ordering and gaps" — the receiver locus is the invoker-side SDK framework): it is dormant over the lossless same-context transport and becomes load-bearing when chunks are consumed over a lossy cross-context / relayed transport. The tracker's emitted code is the consolidated `SCP-OUTLET-6131` (`execution.stream-gap`), a test-local reimplementation of the §5.4.5 receiver rule. When slice-3 introduces a cross-context reassembly layer, any additional authoritative gap-detection there is **reconciled with the SDK-drain check as defense-in-depth** (mirroring the revocation dual-locus), NOT as a replacement for it — the SDK-drain receiver check remains the transport-agnostic invariant.
+
+## 25.22 Cross-Context Streaming-Saga Conformance Vectors (§6.2.4 / §6.2.5)
+
+The **transactional-streaming** corner of the outlet taxonomy (ADR-061 *streaming saga*; §6.2.4 cross-context outlet invocation saga; §6.2.5 outlet invocation modes) is exercised by a set of **6 scenario vectors** that pin the observable artifacts of a cross-context stream: the sealed RFC-6962 `stream_manifest_hash` (§5.4.5 chunk manifest; a fixed 32 bytes regardless of stream length, ADR-061), the self-verifying `SCP-XCTX-STREAM-RECEIPT-V1` receipt over that root (`crates/scp-protocol/src/context/outlets/cross_context_saga.rs`), the atomic dual event-log join, the receive-side gap terminal, and the aggregate-schema terminal. This complements the same-context §25.21 set (`§5.4.5` progressive output), which does not exercise the saga's seal/receipt/dual-log artifacts.
+
+The canonical vector file is `tests/conformance/vectors/outlet_streaming_saga_vectors.json` (top-level `{version, vectors:[6]}`, each entry a `{name, spec}` envelope). Every chunk signature and every `caveats_binding` is **recomputed** at replay time under the §25.2 reference operator key (RFC 8032 §7.1 Test Vector 1, seed `0x9d61…7f60`); the receipt round-trip KAT signs under that same §25.2 seed so its preimage and Ed25519 signature are byte-exact and checked in.
+
+### Scenario matrix
+
+| Vector | Scenario | Pinned artifact | Terminal / code |
+|--------|----------|-----------------|-----------------|
+| `stream_receipt_kat` | Fixed 9-field `SCP-XCTX-STREAM-RECEIPT-V1` input → byte-exact preimage + deterministic Ed25519 signature; `verify()` accepts, every single-field mutation rejects | `expected_preimage_hex` (32 B), `expected_signature_hex` (64 B) | — |
+| `seal_phase` | A sealed chunk sequence reaches Committed at seal-close with a non-zero manifest root and a verifiable receipt (§6.2.5) | `expected_stream_manifest_hash` | `Ok` |
+| `xctx_10_chunk` | A 10-chunk A→B stream; the target `OutletInvoked` and caller `CrossContextOutletInvoked` dual-log leaves carry the IDENTICAL root (§6.2.4 dual event-log) | `expected_stream_manifest_hash` + `dual_log_identity` | `Ok` |
+| `truncated_close` | A mid-stream crash after chunk 5 of 10 seals the durable PREFIX; the receipt is over the truncated (prefix) root, distinct from the full-stream root; escrow settles at the prefix `billed_count`; the outlet exec fn is invoked exactly once (§17.16.4 recovery) | `expected_prefix_manifest_hash` (≠ `expected_full_manifest_hash`), `billed_count`, `exec_invocations` | `Ok` (truncated) |
+| `receive_side_drain_lossy` | A lossy A-leg dropping a chunk (delivered sequences 0,1,3) is caught by the invoker-side SDK-drain gap detector (SCP-OUT-037, §5.4.5:515), NOT a runtime bridge detector (SCP-OUT-045) | `expected_caveats_binding` | `Cancelled` / `SCP-OUTLET-6131` |
+| `aggregate_schema_violation` | An `End.aggregate` violating the outlet's `aggregate_schema` is an Output-class schema violation | `aggregate_schema` + `violating_aggregate` | `Error` / `SCP-OUTLET-6140` |
+
+### Layered coverage and replay locations (Class-S boundary, honest scope)
+
+The checked-in vectors + the `scp-testing` harness VERIFY the declared cryptographic artifacts through **public protocol primitives only** — `CrossContextOutletStreamReceipt::{signing_preimage, verify}`, `compute_chunk_manifest_root`, dual-hash structural identity, the §25.21 `ReceiverSequenceTracker` oracle, and `validate_value_against_schema` → error-code mapping. Driving a LIVE resident-actor streaming saga to `Committed` (seal-close) or a truncated close requires seeding resident-actor `StreamCapture` state, reachable only via `spawn_actor_with_state`, which is `pub(in crate::context)` — the deliberate **Class-S actor-state isolation boundary** (a security property, NOT a test shortcut; the SAME boundary SCP-OUT-047's AC8 documents). The external `scp-testing` crate does not breach it; the live substance is proven runtime-side.
+
+| Scenario | Verified in-vector (harness, public primitives) | Live substance proven runtime-side |
+|----------|--------------------------------------------------|------------------------------------|
+| `stream_receipt_kat` | `outlet_streaming_saga_conformance.rs` `stream_receipt_kat_is_byte_exact_and_tamper_evident` — byte-exact preimage + signature, `verify()` accept, 9 single-field mutation rejects | fully covered in-vector (pure known-answer) |
+| `receive_side_drain_lossy` | `receive_side_drain_lossy_fires_stream_gap_6131` — per-chunk-signed gapped transcript → `ReceiverSequenceTracker` fires `SCP-OUTLET-6131` | fully covered in-vector (the SDK-drain receiver rule is the permanent invariant, §25.21) |
+| `aggregate_schema_violation` | `aggregate_schema_violation_maps_to_6140` — `validate_value_against_schema` Err → `CODE_OUTPUT_VIOLATION` (a conforming aggregate passes) | fully covered in-vector (pure validator) |
+| `seal_phase` | `seal_phase_manifest_root_and_receipt_verify` — `compute_chunk_manifest_root` == pinned non-zero hash; reconstructed receipt `verify()`s | the drive to `Committed` at seal-close: `xctx_streaming_saga_paid_drive_ac1_ac3_ac5_ac6` (`crates/scp-runtime/src/context/supervisor/supervisor.rs`) |
+| `xctx_10_chunk` | `xctx_10_chunk_dual_log_carries_identical_root` — root == pinned hash; receipt `verify()`s; both dual-log leaf payloads byte-identical | the live 10-chunk drive recording BOTH event logs over the same root: `xctx_streaming_saga_paid_drive_ac1_ac3_ac5_ac6` |
+| `truncated_close` | `truncated_close_prefix_root_and_receipt_verify` — prefix root == pinned non-zero hash (≠ full root); prefix `billed_count` == prefix Data count; receipt over the prefix root `verify()`s | the escrow settlement at the prefix `billed_count` + exactly-once outlet-exec (no re-invoke on replayed close): `xctx_streaming_saga_truncated_close_ac7`. (The live drive's `billed_count` may fall in a small range around the pinned prefix count depending on which durable `StreamCaptureAppend` landed before the crash window; the vector pins the deterministic prefix.) |
+
+All rows cite §6.2.4 / §6.2.5 / ADR-061. The harness reuses the SCP-OUT-039 shared oracle (`crates/scp-testing/tests/integration/outlet_stream_vectors_common.rs`) for the §25.2 key, chunk signing, `compute_caveats_binding`, and the `ReceiverSequenceTracker`, so the two streaming vector sets stay byte-consistent.
+
+## 25.23 KeyPackage Attestation Signing Vectors (§9.7.1, §9.5.2, §9.18.7)
+
+Domain: `"SCP-KEYPACKAGE-ATTESTATION-V1:"`
+
+### Vector 37: KeyPackage Attestation Signature + `0xFF03` Extension Body
+
+The `KeyPackageAttestation` (§9.5.2) binds **all four** of the leaf's public keys — the ephemeral MLS leaf `signature_key` (Ed25519), and three **distinct** X25519 HPKE keys: the LeafNode ratchet-tree `encryption_key`, the KeyPackage `init_key` (the Welcome-seal key), and the `scp_wrapping_key` (`0xFF01`) extension `wrapping_key` — to a DID. It is **context-agnostic** — eight fields, no `context_id`. The canonical hash uses the §9.5.1 construction; the Ed25519 signature is computed over the 32-byte hash with the reference key (§25.2). The `scp_keypackage_attestation` (`0xFF03`) LeafNode extension body is the eight fields in preimage order (deterministic length-prefixed binary — NOT MessagePack/JCS) followed by the raw 64-byte signature.
+
+This vector is fully regenerable from the inputs below. `leaf_signature_key` reuses the §25.2 secondary Ed25519 public key as a fixed, documented 32-byte value standing in for the ephemeral leaf `signature_key` being bound. The three X25519 public keys are each obtained by loading a **fixed, documented 32-byte seed** as a raw X25519 private scalar (`X25519PrivateKey.from_private_bytes(seed).public_key()`), yielding three distinct keys standing in for the leaf's distinct HPKE keys: `leaf_encryption_key` from the §25.2 **secondary Ed25519 seed** (`0x4ccd08…a6fb`); `init_key` from the fixed seed `0x11×32`; `wrapping_key` from the fixed seed `0x22×32`. These are distinct keys by construction — `init_key != encryption_key` (RFC 9420: the Welcome's `EncryptedGroupSecrets` is HPKE-sealed to the KeyPackage `init_key`, NOT the LeafNode `encryption_key`), and `wrapping_key` is the separate §9.16 sender-key wrapping key.
+
+```
+Input:
+  signing key:         reference Ed25519 key (§25.2, seed 0x9d61b1…7f60)
+  did:                 "did:dht:z6MkLeafAttest"                (22 bytes)
+  leaf_signature_key:  0x3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c   (32 bytes, §25.2 secondary Ed25519 public key)
+  leaf_encryption_key: 0xb6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20   (32 bytes, X25519 public from §25.2 secondary seed 0x4ccd08…a6fb as X25519 scalar — LeafNode ratchet-tree HPKE key)
+  init_key:            0x7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13   (32 bytes, X25519 public from fixed seed 0x11×32 as X25519 scalar — KeyPackage Welcome-seal HPKE key)
+  wrapping_key:        0x0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20   (32 bytes, X25519 public from fixed seed 0x22×32 as X25519 scalar — scp_wrapping_key 0xFF01 §9.16 sender-key wrapping key)
+  signing_key_id:      "#active"                               (7 bytes)
+  issued_at:           1700000000                              (== leaf Lifetime.not_before)
+  expires_at:          1700086400                              (== leaf Lifetime.not_after; issued_at + 86400)
+
+Canonical hash input (per §9.5.1 / §9.5.2 KeyPackageAttestation):
+  "SCP-KEYPACKAGE-ATTESTATION-V1:"                 (30 bytes, no length prefix)
+  || BE32(22) || "did:dht:z6MkLeafAttest"          (4 + 22 = 26 bytes — did)
+  || leaf_signature_key                            (32 bytes, fixed-length, no length prefix)
+  || leaf_encryption_key                           (32 bytes, fixed-length, no length prefix)
+  || init_key                                      (32 bytes, fixed-length, no length prefix)
+  || wrapping_key                                  (32 bytes, fixed-length, no length prefix)
+  || BE32(7)  || "#active"                         (4 + 7 = 11 bytes — signing_key_id)
+  || BE64(1700000000)                              (8 bytes — issued_at)
+  || BE64(1700086400)                              (8 bytes — expires_at)
+
+Total preimage: 30 + 26 + 32 + 32 + 32 + 32 + 11 + 8 + 8 = 211 bytes
+
+Preimage (hex, 211 bytes):
+  5343502d4b45595041434b4147452d4154544553544154494f4e2d56313a
+  000000166469643a6468743a7a364d6b4c656166417474657374
+  3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c
+  b6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20
+  7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13
+  0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20
+  0000000723616374697665
+  000000006553f100
+  0000000065554280
+
+Canonical hash SHA-256(preimage) (32 bytes):
+  50cf61db5a97e0ddbd762de07e107684dfd0f00cfe53bad2750a70103ac38957
+
+Ed25519 signature over the 32-byte hash, reference key (64 bytes):
+  fcf01ea58941c9e88acc14ef1ada7d00ac4c0239c75655160fc5b248ee0299e0
+  18526235bc9b6d2a3efa37ab8db5d86b45b58deb5ad24540229d2804052e3509
+
+scp_keypackage_attestation (0xFF03) extension body = 8 fields in preimage order
+(NO domain separator) || 64-byte signature (181 + 64 = 245 bytes):
+  000000166469643a6468743a7a364d6b4c656166417474657374
+  3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c
+  b6c6192e66300f4bbb4e3d870bfd02e416154ebb06661a70a84ea376244b3c20
+  7b4e909bbe7ffe44c465a220037d608ee35897d31ef972f07f74892cb0f73f13
+  0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20
+  0000000723616374697665
+  000000006553f100
+  0000000065554280
+  fcf01ea58941c9e88acc14ef1ada7d00ac4c0239c75655160fc5b248ee0299e0
+  18526235bc9b6d2a3efa37ab8db5d86b45b58deb5ad24540229d2804052e3509
+```
+
+Ed25519 is deterministic (RFC 8032), so the reference implementation reproduces these exact signature bytes on every run. Verify with Ed25519-verify(reference_public_key, hash, signature) per §25.17 step 5. Note the extension body omits the domain separator (present only in the signed preimage) and shares the eight fields byte-for-byte with the preimage's post-domain portion.

@@ -145,7 +145,7 @@ public actor McpClient {
     ///     stores the connection.
     ///   - config: The ``McpClientConfig`` specifying the connection transport.
     /// - Returns: A connected ``McpClient`` ready to list and invoke tools.
-    /// - Throws: ``ScpError/Tool(msg:code:)`` if the connection or
+    /// - Throws: ``ScpError/Outlet(msg:code:)`` if the connection or
     ///   handshake fails.
     public static func connect(
         scp: SCP,
@@ -169,7 +169,7 @@ public actor McpClient {
     ///
     /// - Returns: An array of ``McpToolDefinition`` values describing available
     ///   tools.
-    /// - Throws: ``ScpError/Tool(msg:code:)`` if the listing fails.
+    /// - Throws: ``ScpError/Outlet(msg:code:)`` if the listing fails.
     public func listTools() async throws -> [McpToolDefinition] {
         let tools = try await scp.mcpClientListTools(handle: handle)
         return tools.map { info in
@@ -195,7 +195,7 @@ public actor McpClient {
     ///   - contextId: The SCP context ID for provenance tracking.
     ///   - invokerDid: The DID of the agent invoking the tool.
     /// - Returns: An ``McpToolResult`` containing the output and provenance.
-    /// - Throws: ``ScpError/Tool(msg:code:)`` if invocation fails.
+    /// - Throws: ``ScpError/Outlet(msg:code:)`` if invocation fails.
     public func invoke(
         tool: String,
         input: Data,
@@ -205,7 +205,7 @@ public actor McpClient {
         let inputString = String(data: input, encoding: .utf8) ?? ""
         let result = try await scp.mcpClientInvoke(
             handle: handle,
-            toolName: tool,
+            outletName: tool,
             inputJson: inputString,
             contextId: contextId,
             invokerDid: invokerDid

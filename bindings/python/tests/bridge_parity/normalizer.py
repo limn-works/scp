@@ -88,7 +88,7 @@ def _is_raw_bytes_like(value: object) -> bool:
     """True for byte-like values that do NOT need encoding declaration.
 
     Covers native byte types across bridges: Python `bytes`/`bytearray`/
-    `memoryview`, NAPI `Buffer` (surfaces as `bytes`), WASM `Uint8Array`
+    `memoryview`, NAPI `Buffer` (surfaces as `bytes`), and `Uint8Array`
     (surfaces as `list[int]` after JSON serialization).
     """
     if isinstance(value, (bytes, bytearray, memoryview)):

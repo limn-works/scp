@@ -29,7 +29,7 @@
 
 use std::borrow::Cow;
 
-use scp_primitives::DID;
+use scp_did::DID;
 use serde::{Deserialize, Serialize};
 
 use super::attestation::IdentityLinkAttestation;

@@ -2,7 +2,7 @@
 //!
 //! Extracts `SCPCapabilities` service entries from DID documents resolved via
 //! `did:dht`. Any agent can publish capabilities in their DID document -- zero
-//! setup, zero registration, zero dependency on contexts with discovery tools.
+//! setup, zero registration, zero dependency on contexts with discovery outlets.
 //!
 //! Each individual capability string within an `SCPCapabilities` service
 //! endpoint is a validated [`CapabilityUri`] (ADR-041, §7.3.4.1). The
@@ -15,14 +15,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::dht_client::DhtClient;
-use scp_identity::document::DidDocument;
+use scp_clock::Clock;
+use scp_dht::DhtClient;
+use scp_did::DidDocument;
 use scp_identity::{DidDht, DidMethod};
-use scp_primitives::Clock;
 
 use scp_protocol::trust::CapabilityUri;
 
-use scp_primitives::DID;
+use scp_did::DID;
 use scp_protocol::discovery::DiscoveryError;
 
 /// The service type string for `SCPCapabilities` entries in DID documents.
@@ -194,9 +194,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use scp_identity::cache::{DidCache, SystemClock};
-    use scp_identity::dht_client::InMemoryDhtClient;
-    use scp_identity::document::DidDocument;
+    use scp_clock::SystemClock;
+    use scp_dht::InMemoryDhtClient;
+    use scp_did::DidDocument;
+    use scp_identity::cache::DidCache;
     use scp_identity::{DidDht, DidMethod};
 
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
@@ -224,7 +225,7 @@ mod tests {
 
         // Add SCPCapabilities service.
         let cap_str = capabilities.join(",");
-        let service = scp_identity::document::Service {
+        let service = scp_did::Service {
             id: format!("{}#scp-capabilities", document.id),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint: format!("scp:capabilities:{cap_str}"),
@@ -333,14 +334,14 @@ mod tests {
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         // Two services with overlapping capabilities.
-        doc.service.push(scp_identity::document::Service {
+        doc.service.push(scp_did::Service {
             id: format!("{did}#scp-capabilities-1"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint:
                 "scp:capabilities:scp:capability:schema-validation/v1,scp:capability:rate-limit-compliance/v1"
                     .to_owned(),
         });
-        doc.service.push(scp_identity::document::Service {
+        doc.service.push(scp_did::Service {
             id: format!("{did}#scp-capabilities-2"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint:
@@ -348,7 +349,7 @@ mod tests {
                     .to_owned(),
         });
 
-        let entry = extract_capabilities(did, &doc, &scp_primitives::SystemClock).unwrap();
+        let entry = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap();
         // rate-limit-compliance/v1 appears in both but should be deduplicated.
         assert_eq!(entry.capabilities.len(), 3);
         assert_eq!(
@@ -371,7 +372,7 @@ mod tests {
         let did = "did:dht:zTestDid";
         let doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
-        let err = extract_capabilities(did, &doc, &scp_primitives::SystemClock).unwrap_err();
+        let err = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap_err();
         assert!(matches!(err, DiscoveryError::NoCapabilitiesService(_)));
     }
 
@@ -380,7 +381,7 @@ mod tests {
         let did = "did:dht:zTestDid";
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
-        doc.service.push(scp_identity::document::Service {
+        doc.service.push(scp_did::Service {
             id: format!("{did}#scp-capabilities"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint:
@@ -388,7 +389,7 @@ mod tests {
                     .to_owned(),
         });
 
-        let entry = extract_capabilities(did, &doc, &scp_primitives::SystemClock).unwrap();
+        let entry = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap();
         assert_eq!(entry.did, did);
         assert_eq!(entry.capabilities.len(), 2);
         assert_eq!(
@@ -423,7 +424,7 @@ mod tests {
         )
         .await;
 
-        let entry = resolve_capabilities(&did, &did_dht, &scp_primitives::SystemClock)
+        let entry = resolve_capabilities(&did, &did_dht, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -454,7 +455,7 @@ mod tests {
             .unwrap();
         did_dht.publish(&identity, &document).await.unwrap();
 
-        let err = resolve_capabilities(&identity.did, &did_dht, &scp_primitives::SystemClock)
+        let err = resolve_capabilities(&identity.did, &did_dht, &scp_clock::SystemClock)
             .await
             .unwrap_err();
         assert!(matches!(err, DiscoveryError::NoCapabilitiesService(_)));
@@ -462,15 +463,11 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_capabilities_invalid_did_returns_error() {
-        let did_dht = DidDht::new();
+        let did_dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
-        let err = resolve_capabilities(
-            "did:dht:zInvalidDid",
-            &did_dht,
-            &scp_primitives::SystemClock,
-        )
-        .await
-        .unwrap_err();
+        let err = resolve_capabilities("did:dht:zInvalidDid", &did_dht, &scp_clock::SystemClock)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DiscoveryError::DidResolutionFailed(_)));
     }
 
@@ -561,20 +558,20 @@ mod tests {
         let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
 
         // Two services both advertising relay-operation.
-        doc.service.push(scp_identity::document::Service {
+        doc.service.push(scp_did::Service {
             id: format!("{did}#scp-capabilities-1"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint:
                 "scp:capabilities:scp:system:relay-operation,scp:capability:schema-validation/v1"
                     .to_owned(),
         });
-        doc.service.push(scp_identity::document::Service {
+        doc.service.push(scp_did::Service {
             id: format!("{did}#scp-capabilities-2"),
             service_type: SCP_CAPABILITIES_SERVICE_TYPE.to_owned(),
             service_endpoint: "scp:capabilities:scp:system:relay-operation,scp:system:bridge-operation".to_owned(),
         });
 
-        let entry = extract_capabilities(did, &doc, &scp_primitives::SystemClock).unwrap();
+        let entry = extract_capabilities(did, &doc, &scp_clock::SystemClock).unwrap();
         // relay-operation appears in both but should be deduplicated.
         assert_eq!(entry.capabilities.len(), 3);
         assert_eq!(entry.capabilities[0], cap("scp:system:relay-operation"));

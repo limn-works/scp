@@ -3,7 +3,7 @@
 //! result types, plus pseudonym + commit-retry primitives.
 //!
 //! This module is the canonical home for context state types. Hoisted
-//! out of the deleted `manager/` directory in ADR-049 commit 12.
+//! out of the deleted `manager/` directory in ADR-049 §15.
 //!
 //! # Visibility
 //!
@@ -19,11 +19,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::ContextHandle;
-use super::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+use super::governance::timeout::DeadlockDetectionState;
 use super::ttl::{TtlExtension, TtlTimer};
-use scp_identity::DID;
-use scp_primitives::Clock;
-use scp_protocol::context::broadcast::GovernanceBanResult;
+use scp_clock::Clock;
+use scp_did::DID;
+use scp_protocol::context::broadcast::{BroadcastContextSnapshot, GovernanceBanResult};
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::{
     AccessScope, GovernanceEngine, GovernanceModelConfig, GovernanceProposal, KeyResolver,
@@ -33,11 +33,13 @@ use scp_protocol::context::governance::{
     multisig::ThresholdEngine,
     unanimity::UnanimityEngine,
 };
-use scp_protocol::context::membership::{ContextEvent, MembershipState, ReceiveBuffer};
+use scp_protocol::context::membership::{
+    ContextEvent, MembershipState, ReceiveBuffer, RedactedBytes,
+};
+use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::params::GovernanceModel;
-use scp_protocol::context::params::ToolRegistration;
+use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{Capability, ContextRoleState};
-use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::budget::MemberBudgetTracker;
 use scp_protocol::economy::types::EconomicPolicy;
@@ -47,11 +49,11 @@ use scp_protocol::trust::consequence::ConsequenceRule;
 // Protocol-level collection size limits (§5.9)
 // ---------------------------------------------------------------------------
 
-/// Maximum number of registered tools per context.
-pub(crate) const MAX_REGISTERED_TOOLS: usize = 256;
+/// Maximum number of registered outlets per context.
+pub(crate) const MAX_REGISTERED_OUTLETS: usize = 256;
 
-/// Maximum number of cross-context tool interfaces per context.
-pub(crate) const MAX_TOOL_INTERFACES: usize = 256;
+/// Maximum number of cross-context outlet interfaces per context.
+pub(crate) const MAX_OUTLET_INTERFACES: usize = 256;
 
 /// Maximum number of governance threshold signers per context.
 pub(crate) const MAX_THRESHOLD_SIGNERS: usize = 64;
@@ -92,7 +94,7 @@ pub const MAX_COMMIT_AGE_SECS: u64 = 3600; // 1 hour
 /// Maximum number of pending commits allowed in the retry queue per context.
 ///
 /// Prevents unbounded memory growth during sustained transport outages.
-/// When this cap is reached, [`try_broadcast_commit_or_enqueue`](crate::context::governance_helpers::try_broadcast_commit_or_enqueue) sets the
+/// When this cap is reached, [`apply_broadcast_failure`](crate::context::governance_helpers::apply_broadcast_failure) sets the
 /// `commit_fault` marker immediately rather than enqueuing, fail-closing
 /// the context for operator attention.
 pub const MAX_PENDING_COMMITS: usize = 50;
@@ -128,6 +130,17 @@ pub fn commit_retry_backoff(failed_attempts: u32) -> u64 {
 /// canonical Merkle event log (§9.9.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommitOperation {
+    /// Commit produced by `execute_add_member` for the given target DID.
+    ///
+    /// An MLS Add advances the group epoch exactly like a Remove, so the
+    /// existing members MUST process this Commit or they desync from the
+    /// admin. The add's Commit is broadcast through the same persistent
+    /// retry queue as the remove/reset commits (parity restored — the add
+    /// path historically dropped it).
+    AddMember {
+        /// The DID that was added to the MLS group.
+        target_did: DID,
+    },
     /// Commit produced by `execute_remove_member` for the given target DID.
     RemoveMember {
         /// The DID that was removed from the MLS group.
@@ -154,6 +167,17 @@ pub enum CommitOperation {
         /// The DID of the member who left.
         member_did: DID,
     },
+    /// Commit produced by `recovery_advance_epoch` — the spec §9.12 step-2
+    /// post-compromise recovery epoch advance (an MLS Update + self-Commit).
+    ///
+    /// Broadcasting this Commit is what re-keys the group away from the
+    /// compromised material: until remaining members process it they stay on
+    /// the compromised epoch and the excluded/compromised party retains read
+    /// access. It carries no reason/target payload — the epoch advance is fully
+    /// determined by the context state. Like the other epoch-advancing commits
+    /// it rides the persistent retry queue, so a dropped broadcast fail-closes
+    /// the context rather than silently completing recovery.
+    RecoveryAdvanceEpoch,
 }
 
 impl CommitOperation {
@@ -161,6 +185,7 @@ impl CommitOperation {
     #[must_use]
     pub fn label(&self) -> String {
         match self {
+            Self::AddMember { .. } => "AddMember".to_owned(),
             Self::RemoveMember { .. } => "RemoveMember".to_owned(),
             Self::RotateContentKeys { .. } => "RotateContentKeys".to_owned(),
             Self::ResetMember {
@@ -170,6 +195,7 @@ impl CommitOperation {
                 is_remove: false, ..
             } => "ResetMemberAdd".to_owned(),
             Self::LeaveContext { .. } => "LeaveContext".to_owned(),
+            Self::RecoveryAdvanceEpoch => "RecoveryAdvanceEpoch".to_owned(),
         }
     }
 }
@@ -447,15 +473,32 @@ pub struct MigrationProposedResult {
 #[derive(Debug)]
 pub enum GovernanceActionResult {
     /// A member was added to the context.
-    MemberAdded,
+    ///
+    /// Carries the MLS `Welcome` (for the newly added member, delivered
+    /// out-of-band inside a signed §5.12.3 `InvitationBundle`) and the MLS
+    /// `Commit` (broadcast to the EXISTING members so they advance to the new
+    /// epoch). `execute_add_member` broadcasts the Commit itself; the Welcome
+    /// is surfaced here so the invitation-sealing caller
+    /// ([`crate::context::supervisor::Supervisor::invite_member`]) can seal it
+    /// to the invitee. Both are redacting-`Debug` byte wrappers — they are
+    /// public protocol messages, not key material, but the redaction keeps the
+    /// generic `format!("{result:?}")` FFI surface quiet.
+    MemberAdded {
+        /// TLS-serialized MLS `Welcome` for the newly added member.
+        welcome_bytes: RedactedBytes,
+        /// TLS-serialized MLS `Commit` for the existing members (already
+        /// broadcast by `execute_add_member`; surfaced for observability /
+        /// caller-side delivery fallback).
+        commit_bytes: RedactedBytes,
+    },
     /// A member was ejected from the context (MLS removal).
     MemberRemoved,
     /// A member's role was changed.
     RoleChanged,
-    /// A tool was registered in the context.
-    ToolRegistered,
-    /// A tool was removed from the context.
-    ToolRemoved,
+    /// A outlet was registered in the context.
+    OutletRegistered,
+    /// A outlet was removed from the context.
+    OutletRemoved,
     /// The capability ceiling was modified.
     CeilingModified,
     /// The context was closed.
@@ -474,8 +517,8 @@ pub enum GovernanceActionResult {
     ThresholdModified,
     /// A child context was created.
     ChildContextCreated,
-    /// A tool interface was established.
-    ToolInterfaceEstablished,
+    /// A outlet interface was established.
+    OutletInterfaceEstablished,
     /// A member was reset (ADR-029, Tier 3).
     MemberReset,
     /// A governance conflict was resolved (ADR-031 §7).
@@ -652,12 +695,27 @@ pub struct ContextSnapshot {
     /// context-export digest is reproducible (§23.16.8, ADR-050).
     #[serde(with = "scp_protocol::serde_util::serde_sorted_set")]
     pub executed_proposals: HashSet<ProposalId>,
-    /// Remaining TTL in seconds, if a TTL timer was active. `None` if no
-    /// TTL was configured or the timer was not running.
-    pub ttl_remaining_secs: Option<u64>,
-    /// Dynamically registered tools (beyond initial `ContextParams.tools`).
+    /// Absolute TTL expiry deadline in Unix seconds, if a TTL timer was armed.
+    /// `None` if no TTL was configured.
+    ///
+    /// Persisted as the CONVERGENT `state.ttl.timer.deadline_unix_secs`
+    /// (`creation_timestamp_secs + params.ttl`, or an already-extended
+    /// convergent deadline) — an ABSOLUTE instant, identical across members,
+    /// NOT a relative remaining-time. Restore/import re-arm the SAME absolute
+    /// deadline the context held before the restart, so (a) the create-window
+    /// stays closed (a `None`-remaining Active snapshot still re-arms via the
+    /// `creation + ttl` fallback) and (b) a prior TTL extension is preserved
+    /// verbatim rather than being silently recomputed back to `creation + ttl`
+    /// (ADR-049 §9, D1/D2).
+    ///
+    /// `#[serde(default)]` so a legacy snapshot that predates this field (it
+    /// carried the retired RELATIVE remaining-seconds field) decodes as `None`
+    /// and falls back to the `creation + ttl` re-derivation on restore.
     #[serde(default)]
-    pub registered_tools: Vec<ToolRegistration>,
+    pub ttl_deadline_secs: Option<u64>,
+    /// Dynamically registered outlets (beyond initial `ContextParams.outlets`).
+    #[serde(default)]
+    pub registered_outlets: Vec<OutletRegistration>,
     /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`).
     /// These members won't receive new content keys but retain access to
     /// historical content encrypted before the revocation (ADR-038, §9.17).
@@ -666,9 +724,9 @@ pub struct ContextSnapshot {
     /// context-export digest is reproducible (§23.16.8, ADR-050).
     #[serde(default, with = "scp_protocol::serde_util::serde_sorted_set")]
     pub read_exclusion_list: HashSet<DID>,
-    /// Established cross-context tool interfaces (§6.2).
+    /// Established cross-context outlet interfaces (§6.2).
     #[serde(default)]
-    pub tool_interfaces: Vec<ToolInterface>,
+    pub outlet_interfaces: Vec<OutletInterface>,
     /// Governance threshold signers (for `ThresholdApproval` model).
     #[serde(default)]
     pub threshold_signers: Vec<DID>,
@@ -765,13 +823,13 @@ pub struct ContextSnapshot {
     pub epoch_coordination_records: Vec<CoordinationRecord>,
     /// Persisted epoch grace window entries (§23.11).
     ///
-    /// Captured from [`EpochGraceStore::to_grace_entries`](crate::crypto::mls::epoch_grace::EpochGraceStore::to_grace_entries)
+    /// Captured from [`EpochGraceStore::to_grace_entries`](scp_mls::epoch_grace::EpochGraceStore::to_grace_entries)
     /// during snapshot creation. On recovery, fed to
-    /// [`EpochGraceStore::restore_from_entries`](crate::crypto::mls::epoch_grace::EpochGraceStore::restore_from_entries)
+    /// [`EpochGraceStore::restore_from_entries`](scp_mls::epoch_grace::EpochGraceStore::restore_from_entries)
     /// to reconstruct the grace store. Persisted alongside all other context
     /// state to ensure transactional consistency (§23.11 step 2).
     #[serde(default)]
-    pub grace_entries: Vec<crate::crypto::mls::epoch_grace::GraceEntry>,
+    pub grace_entries: Vec<scp_mls::epoch_grace::GraceEntry>,
     /// Whether this context needs to re-enter the reconnection protocol
     /// (§23.3) before processing new messages (§23.11 inconsistent state
     /// fallback step 3). Persisted so the flag survives additional restarts
@@ -926,11 +984,11 @@ pub struct ContextSnapshot {
     ///
     /// Encrypted contexts persist the member's pseudonym routing ID and the
     /// learned peer registry; broadcast contexts persist
-    /// [`ContextRouting::Broadcast`] and carry no pseudonym state.
+    /// [`ContextRouting::Broadcast`](crate::context::actor::state::ContextRouting::Broadcast) and carry no pseudonym state.
     ///
     /// Degraded / pre-routing-field snapshots (those persisted before this
     /// field existed, or `strip_snapshot_for_public` redactions) default to
-    /// [`ContextRouting::Broadcast`] via [`default_context_routing`] — a
+    /// [`ContextRouting::Broadcast`](crate::context::actor::state::ContextRouting::Broadcast) via [`default_context_routing`] — a
     /// no-pseudonym placeholder that carries no routing secret.
     ///
     /// The restore path does NOT silently coerce this placeholder onto an
@@ -996,23 +1054,23 @@ pub struct ContextSnapshot {
         crate::context::supervisor::saga_prepared_state::SagaPreparedStateSnapshot,
     >,
 
-    /// Target-side (B-owned) durable capture of COMMITTED cross-context tool
+    /// Target-side (B-owned) durable capture of COMMITTED cross-context outlet
     /// invocations, keyed by `SagaId` (spec §6.2.4 "Exactly-once execution with
     /// durable output capture"). **Class S** — synchronously-persisted,
     /// fail-closed, mirroring [`Self::saga_pending`].
     ///
     /// The live actor-side slot is
-    /// [`PerContextState::xctx_committed_outputs`](crate::context::actor::state::PerContextState::xctx_committed_outputs).
-    /// Commit-B captures the tool output + signed receipt here BEFORE acking, so
+    /// [`ClassSState::xctx_committed_outputs`](crate::context::actor::state::ClassSState::xctx_committed_outputs).
+    /// Commit-B captures the outlet output + signed receipt here BEFORE acking, so
     /// a Commit replayed after a crash (§17.16.4) re-emits the stored output and
     /// re-signs nothing — it returns the IDENTICAL receipt. A coalesce-window
-    /// rollback of this capture would re-invoke the tool on replay, the exact
+    /// rollback of this capture would re-invoke the outlet on replay, the exact
     /// exactly-once violation the synchronous persist forecloses.
     ///
     /// Unlike `saga_pending` this carries no §9.4.3 non-derive barrier — the
     /// receipt + output are public protocol artifacts (no bearer bytes), so the
     /// snapshot stores the live
-    /// [`CommittedToolInvocation`](crate::context::supervisor::saga_prepared_state::CommittedToolInvocation)
+    /// [`CommittedOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation)
     /// directly. Same local-only coordination semantics: same-node restore
     /// REHYDRATES it; cross-node `import_context` / `strip_snapshot_for_public`
     /// DROP it to empty (a foreign saga must never drive local Commit replay).
@@ -1020,16 +1078,40 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub xctx_committed_outputs: HashMap<
         crate::context::supervisor::saga_journal::SagaId,
-        crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
+        crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation,
     >,
 
-    /// Caller-side (A-owned) durable set of COMMITTED cross-context tool
+    /// Target-side (B-owned) durable, `SagaId`-keyed capture of COMMITTED
+    /// cross-context **streaming** outlet invocations (ADR-061 seal phase; spec
+    /// §6.2.5 streaming saga). **Class S** — synchronously-persisted, fail-closed,
+    /// mirroring [`Self::xctx_committed_outputs`].
+    ///
+    /// The live slot is
+    /// [`ClassSState::xctx_committed_stream_outputs`](crate::context::actor::state::ClassSState::xctx_committed_stream_outputs).
+    /// The seal at stream-close captures the signed streaming receipt + sealed
+    /// `stream_manifest_hash` + billing/chunk counters here BEFORE journaling
+    /// `Committed`, so a Commit replayed after a crash (§17.16.4) re-emits the
+    /// IDENTICAL receipt and re-acks the SAME event id **without re-invoking the
+    /// outlet**. A coalesce-window rollback would re-invoke a non-deterministic
+    /// LLM on replay, the exact hazard the synchronous persist forecloses. It also
+    /// makes the AC7 mid-stream-crash truncated-close well-defined: recovery seals
+    /// the restored durable frontier prefix once, and a replayed seal short-circuits
+    /// on this witness. Same-node restore REHYDRATES it; cross-node export/import
+    /// DROP it to empty. `#[serde(default)]` so legacy / stripped snapshots
+    /// deserialize as empty.
+    #[serde(default)]
+    pub xctx_committed_stream_outputs: HashMap<
+        crate::context::supervisor::saga_journal::SagaId,
+        crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation,
+    >,
+
+    /// Caller-side (A-owned) durable set of COMMITTED cross-context outlet
     /// invocations, keyed by `SagaId` (spec §6.2.4 "Commit", caller side;
     /// §17.16.4). **Class S** — synchronously-persisted, fail-closed, mirroring
     /// [`Self::saga_pending`].
     ///
     /// The live slot is
-    /// [`PerContextState::xctx_committed_invocations`](crate::context::actor::state::PerContextState::xctx_committed_invocations).
+    /// [`ClassSState::xctx_committed_invocations`](crate::context::actor::state::ClassSState::xctx_committed_invocations).
     /// Commit-A inserts the `SagaId` here as the idempotency witness BEFORE
     /// acking; a replayed Commit-A re-acks as a no-op. A coalesce-window
     /// rollback would let a replay double-settle the escrow, the exact hazard
@@ -1041,12 +1123,12 @@ pub struct ContextSnapshot {
         std::collections::HashSet<crate::context::supervisor::saga_journal::SagaId>,
 
     /// Caller-side (A-owned) durable reversal records for in-flight
-    /// cross-context tool-invocation Prepare-A reservations, keyed by `SagaId`
+    /// cross-context outlet-invocation Prepare-A reservations, keyed by `SagaId`
     /// (spec §6.2.4 "Reservation release on every terminal path"). **Class S** —
     /// synchronously-persisted, fail-closed, mirroring [`Self::saga_pending`].
     ///
     /// The live slot is
-    /// [`PerContextState::xctx_caller_reservations`](crate::context::actor::state::PerContextState::xctx_caller_reservations).
+    /// [`ClassSState::xctx_caller_reservations`](crate::context::actor::state::ClassSState::xctx_caller_reservations).
     /// Prepare-A inserts a record here in the same Class-S snapshot as the
     /// deduction it reverses; on a `PreparingB`-window crash the recovery sweep's
     /// clean abort (`Abort { reservation: None }`) reverses the caller's
@@ -1072,18 +1154,18 @@ pub struct ContextSnapshot {
     >,
 
     /// Target-side (B-owned) anti-replay nonce-dedup cache for cross-context
-    /// tool invocation (spec §6.2.4 "Freshness / anti-replay"). The serialized
+    /// outlet invocation (spec §6.2.4 "Freshness / anti-replay"). The serialized
     /// projection of
-    /// [`PerContextState::xctx_nonce_dedup`](crate::context::actor::state::PerContextState::xctx_nonce_dedup):
+    /// [`ClassSState::xctx_nonce_dedup`](crate::context::actor::state::ClassSState::xctx_nonce_dedup):
     /// `{16-byte nonce → first-seen Unix secs}`.
     ///
     /// **Class S** — synchronously-persisted, fail-closed, mirroring
     /// [`Self::saga_pending`]. This cache is the ONLY gate against a replayed
-    /// `CrossContextToolInvoke` envelope re-submitted under a FRESH `SagaId`
+    /// `CrossContextOutletInvoke` envelope re-submitted under a FRESH `SagaId`
     /// within the 5-minute TTL (the `SagaId` idempotency witnesses and the
     /// `xctx_committed_outputs` short-circuit only catch a SAME-`SagaId` replay).
     /// If it reinitialized empty on restore, an actor crash inside the TTL window
-    /// would let an attacker re-run a charging tool (BLACK-624-01). Persisting it
+    /// would let an attacker re-run a charging outlet (BLACK-624-01). Persisting it
     /// makes Prepare-B's recorded-nonce rejection actually survive a restart —
     /// the recorded nonce is already deliberately KEPT on the reject path "for
     /// replay protection", and this is what makes that intent durable.
@@ -1097,11 +1179,63 @@ pub struct ContextSnapshot {
     /// snapshots deserialize as an empty cache.
     #[serde(default)]
     pub xctx_nonce_dedup: HashMap<[u8; 16], u64>,
+
+    /// §7.3.8 value-caveat runtime enforcement counters, keyed by the
+    /// invocation-authorizing UCAN CID. The serialized projection of
+    /// [`PerContextState::caveat_counters`](crate::context::actor::state::ClassSState::caveat_counters).
+    ///
+    /// **Class S** — synchronously-persisted, fail-closed (ADR-049 §9). A
+    /// consumed `max_calls` / `amount_max_cumulative` / `rate_window` cap must
+    /// NEVER un-consume: a coalesce-window crash that rolled a consume back
+    /// behind an acked invocation would re-open the spend/rate window the
+    /// counter closes. Same-node restore REHYDRATES the map; cross-node public
+    /// export STRIPS it to empty (a foreign node starts its own accounting,
+    /// exactly like the budget tracker and the xctx witnesses).
+    /// `#[serde(default)]` so legacy / stripped snapshots deserialize empty.
+    #[serde(default)]
+    pub caveat_counters: HashMap<String, crate::trust::caveat_counters::CaveatCounters>,
+
+    /// Fix-D durable crash-recovery records for in-flight STREAMING
+    /// reservations, keyed by the stream `request_id` (hex). The serialized
+    /// projection of
+    /// [`ClassSState::stream_reservations`](crate::context::actor::state::ClassSState::stream_reservations).
+    ///
+    /// **Class S** — synchronously-persisted, fail-closed (ADR-049 §9). Each
+    /// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+    /// is the only durable handle to RELEASE a stream's open-time escrow hold +
+    /// §7.3.8 cumulative counter reserve when the off-mailbox pump — a `tokio`
+    /// task that SURVIVES an actor crash + respawn — would otherwise strand them
+    /// (its close-time settle lands on the respawned generation and is dropped).
+    /// Same-node restore REHYDRATES the map so the post-restore reconcile sweep
+    /// can drain it; cross-node public export STRIPS it to empty (a foreign node
+    /// must never drive a local invoker-economy release). `#[serde(default)]` so
+    /// legacy / stripped snapshots deserialize empty.
+    #[serde(default)]
+    pub stream_reservations:
+        HashMap<String, crate::context::outlets::invoke::StreamReservationRecord>,
+
+    /// Broadcast context security + roster state (§5.14, §5.14.8).
+    ///
+    /// **Class S** — the per-author key epochs, block lists, and the subscriber
+    /// registry ride the fail-closed [`ContextSnapshot`] so a block / governance
+    /// ban / key-epoch advance is durable BEFORE the operation acks (ADR-049 §9).
+    /// Previously broadcast state was persisted best-effort through a SEPARATE
+    /// `persist_broadcast` write that warn!-and-continued on failure: an author
+    /// crash in the coalesce window after a block returned success silently
+    /// re-granted the revoked member post-block key access
+    /// (encryption-as-access-control violation, §5.14.8 block-before-serve). Folding
+    /// it here makes the block / ban / epoch-advance atomic with
+    /// `read_exclusion_list` in one fail-closed row.
+    ///
+    /// `None` for non-broadcast contexts. `#[serde(default)]` so legacy /
+    /// non-broadcast snapshots deserialize cleanly.
+    #[serde(default)]
+    pub broadcast: Option<BroadcastContextSnapshot>,
 }
 
 /// Default routing variant for degraded / pre-routing-field snapshots.
 ///
-/// Returns [`ContextRouting::Broadcast`] — a placeholder that carries no
+/// Returns [`ContextRouting::Broadcast`](crate::context::actor::state::ContextRouting::Broadcast) — a placeholder that carries no
 /// pseudonym secret. The restore path requires this to agree with the
 /// reconstructed mode (§9.10.4): a degraded *broadcast* snapshot restores
 /// fine, but a degraded *encrypted* snapshot fails closed
@@ -1128,7 +1262,7 @@ pub struct VelocityTrackerSnapshot {
 }
 
 // `ContextPersistence` trait moved to `crate::context::persistence` in
-// ADR-049 commit 12.
+// ADR-049 §15.
 
 // ---------------------------------------------------------------------------
 // PerContextState -- internal per-context tracking
@@ -1136,10 +1270,10 @@ pub struct VelocityTrackerSnapshot {
 
 /// Governance-related per-context state.
 ///
-/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
 /// actor's [`crate::context::actor::state::PerContextState`] can carry a
 /// field of this type while the handler-body migration is under way.
-/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
 /// module.
 pub(crate) struct GovernanceState {
     /// The governance engine for this context (ADR-031, spec §5.9).
@@ -1169,18 +1303,16 @@ pub(crate) struct GovernanceState {
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
     /// Contains the conflicting proposal IDs and freeze start timestamp.
     pub(crate) freeze: Option<(ProposalId, ProposalId, u64)>,
-    /// Governance timeout task (SCP-271, ADR-031 §5).
-    pub(crate) timeout_task: GovernanceTimeoutTask,
     /// Per-context deadlock detection tracking (ADR-031 §10).
     pub(crate) deadlock: DeadlockDetectionState,
     /// Pending ceiling modification awaiting notification period (M7, §5.3.2).
     pub(crate) pending_ceiling_modification: Option<PendingCeilingModification>,
     /// Pending economic policy change awaiting notification period (§19.3).
     pub(crate) pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
-    /// Dynamically registered tools (beyond initial `ContextParams.tools`).
-    pub(crate) registered_tools: Vec<ToolRegistration>,
-    /// Established cross-context tool interfaces (§6.2).
-    pub(crate) tool_interfaces: Vec<ToolInterface>,
+    /// Dynamically registered outlets (beyond initial `ContextParams.outlets`).
+    pub(crate) registered_outlets: Vec<OutletRegistration>,
+    /// Established cross-context outlet interfaces (§6.2).
+    pub(crate) outlet_interfaces: Vec<OutletInterface>,
     /// Pruning policy override (ADR-030 §6).
     pub(crate) pruning_policy: Option<PruningPolicy>,
     /// Mutable economic policy (§19.3, ADR-033).
@@ -1203,7 +1335,7 @@ pub(crate) struct GovernanceState {
     pub(crate) velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker,
     /// Per-member participation record cache for proposer eligibility (#1530).
     ///
-    /// Widened to `pub(crate)` in ADR-049 commit 12c.1b so the hoisted
+    /// Widened to `pub(crate)` in ADR-049 §15 so the hoisted
     /// [`crate::context::messaging_helpers::finalize_send`] free function
     /// can refresh the cache after a successful send (matches the legacy
     /// behavior — the legacy method body lived in `manager/messaging.rs`
@@ -1232,7 +1364,7 @@ pub(crate) struct GovernanceState {
     /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
     ///
     /// Consulted by `enforce_economy` via the
-    /// [`super::economy::ContextRevocationChecker`] adapter when validating
+    /// [`ContextRevocationChecker`](crate::context::economy_logic::ContextRevocationChecker) adapter when validating
     /// spending UCANs through the full cryptographic pipeline. Currently
     /// empty in steady state — spending UCAN revocation lists have not been
     /// wired through governance — but the field exists so the only change
@@ -1400,10 +1532,10 @@ impl GovernanceState {
 
 /// MLS epoch and reconnection state.
 ///
-/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
 /// actor's [`crate::context::actor::state::PerContextState`] can carry a
 /// field of this type while the handler-body migration is under way.
-/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
 /// module.
 pub(crate) struct EpochState {
     /// Monotonic MLS epoch counter. Incremented each time a governance action
@@ -1424,7 +1556,7 @@ pub(crate) struct EpochState {
     /// epoch advances. Persisted alongside the context snapshot and restored
     /// on startup. Used by the MLS decrypt path to determine whether to
     /// attempt decryption for a given past epoch.
-    pub(crate) grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore,
+    pub(crate) grace_store: scp_mls::epoch_grace::EpochGraceStore,
     /// Whether this context needs to re-enter the reconnection protocol
     /// (§23.3) before processing new messages (§23.11 inconsistent state
     /// fallback step 3). Set during `restore_context` when grace store
@@ -1440,10 +1572,10 @@ pub(crate) struct EpochState {
 /// Capability suspension is now handled by `ContextRoleState::suspended_capabilities`.
 /// This struct retains the CEK exclusion list and per-member access key store.
 ///
-/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
 /// actor's [`crate::context::actor::state::PerContextState`] can carry a
 /// field of this type while the handler-body migration is under way.
-/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
 /// module.
 pub(crate) struct AccessControlState {
     /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`,
@@ -1459,8 +1591,8 @@ pub(crate) struct AccessControlState {
 impl AccessControlState {
     /// Construct a fresh, empty `AccessControlState`. Used by the actor's
     /// [`crate::context::actor::state::PerContextState`] default-for-test
-    /// fixture (commit 12a of ADR-049) to populate the corresponding field
-    /// without peeking at private fields. Deleted in commit 12d alongside
+    /// fixture (ADR-049 §15) to populate the corresponding field
+    /// without peeking at private fields. Deleted in ADR-049 §15 alongside
     /// the rest of the legacy manager module.
     #[must_use]
     pub(crate) fn new_empty_for_actor() -> Self {
@@ -1476,14 +1608,18 @@ impl EpochState {
     /// coordinator scoped to the given context, a fresh grace store, and
     /// `needs_reconnect = false`. Used by the actor's
     /// [`crate::context::actor::state::PerContextState`] default-for-test
-    /// fixture (commit 12a of ADR-049). Deleted in commit 12d alongside
+    /// fixture (ADR-049 §15). Deleted in ADR-049 §15 alongside
     /// the rest of the legacy manager module.
     #[must_use]
     pub(crate) fn new_fresh_for_actor(context_id: &str) -> Self {
         Self {
             mls_epoch: 0,
             coordinator: EpochCoordinator::from_records(Vec::new(), context_id),
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
+            // Native runtime injects the production SystemClock; an in-browser
+            // client injects its hardened clock (ADR-057 §Prereq-2).
+            grace_store: scp_mls::epoch_grace::EpochGraceStore::with_clock(std::sync::Arc::new(
+                scp_clock::SystemClock,
+            )),
             needs_reconnect: false,
         }
     }
@@ -1493,7 +1629,7 @@ impl TtlState {
     /// Construct a fresh `TtlState` with a clock-less `TtlTimer` and no
     /// active extension. Used by the actor's
     /// [`crate::context::actor::state::PerContextState`] default-for-test
-    /// fixture (commit 12a of ADR-049). Deleted in commit 12d alongside
+    /// fixture (ADR-049 §15). Deleted in ADR-049 §15 alongside
     /// the rest of the legacy manager module.
     #[must_use]
     pub(crate) fn new_fresh_for_actor() -> Self {
@@ -1509,9 +1645,9 @@ impl GovernanceState {
     /// `SingleAdminEngine` for `admin_did`, a no-op key resolver, and the
     /// given clock. Intended exclusively as the default fixture for the
     /// actor's [`crate::context::actor::state::PerContextState`]
-    /// default-for-test helper (commit 12a of ADR-049). Production paths
+    /// default-for-test helper (ADR-049 §15). Production paths
     /// continue to construct the struct inline from the lifecycle handler.
-    /// Deleted in commit 12d alongside the rest of the legacy manager
+    /// Deleted in ADR-049 §15 alongside the rest of the legacy manager
     /// module.
     #[must_use]
     pub(crate) fn new_fresh_for_actor(
@@ -1520,7 +1656,7 @@ impl GovernanceState {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let resolver: scp_protocol::context::governance::KeyResolver =
-            Arc::new(|_did: &DID, _kid: scp_protocol::identity::SigningKeyId| None);
+            Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None);
         let engine: Box<dyn GovernanceEngine> =
             Box::new(SingleAdminEngine::new(admin_did, resolver));
         Self {
@@ -1528,12 +1664,11 @@ impl GovernanceState {
             approved_proposals: HashMap::new(),
             next_proposal_seq: 0,
             freeze: None,
-            timeout_task: GovernanceTimeoutTask::new(),
             deadlock: DeadlockDetectionState::default(),
             pending_ceiling_modification: None,
             pending_economic_policy_change: None,
-            registered_tools: Vec::new(),
-            tool_interfaces: Vec::new(),
+            registered_outlets: Vec::new(),
+            outlet_interfaces: Vec::new(),
             pruning_policy: None,
             economic_policy: None,
             budget_tracker: MemberBudgetTracker::new(),
@@ -1564,10 +1699,10 @@ impl GovernanceState {
 
 /// TTL timer and extension state.
 ///
-/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// **Visibility:** elevated to `pub(crate)` by ADR-049 §15 so the
 /// actor's [`crate::context::actor::state::PerContextState`] can carry a
 /// field of this type while the handler-body migration is under way.
-/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// ADR-049 §15 deletes this struct along with the rest of the legacy manager
 /// module.
 pub(crate) struct TtlState {
     /// TTL timer management (SCP-021).
@@ -1576,36 +1711,14 @@ pub(crate) struct TtlState {
     pub(crate) extension: Option<TtlExtension>,
 }
 
-/// Wire format for pseudonym announcements sent as MLS application messages.
-///
-/// When a member joins or creates a context with a pre-derived pseudonym,
-/// they announce it to other members via this structure serialized with
-/// `MessagePack`. Recipients store the mapping in their pseudonym registry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PseudonymAnnouncement {
-    /// Magic prefix to distinguish from regular application messages.
-    pub tag: String,
-    /// The announcing member's DID.
-    pub member_did: String,
-    /// The 32-byte pseudonym routing ID.
-    #[serde(with = "serde_bytes")]
-    pub pseudonym: [u8; 32],
-}
-
-/// Magic tag used to identify pseudonym announcement messages in the MLS
-/// application message stream. Prefixed with `\0` to avoid collision with
-/// user-generated content (which is always valid UTF-8 and will never start
-/// with a null byte when deserialized from `MessagePack`).
-pub(crate) const PSEUDONYM_ANNOUNCEMENT_TAG: &str = "\0scp:pseudonym-announce:v1";
-
 /// Wire wrapper for a consistency-checkpoint exchange message (§9.9.3, §23.7).
 ///
-/// Carries the canonical signed [`ConsistencyCheckpoint`] behind a magic tag
+/// Carries the canonical signed [`ConsistencyCheckpoint`](scp_event_log::checkpoint::ConsistencyCheckpoint) behind a magic tag
 /// so the receive path can positively identify it. Although the inner envelope
 /// already discriminates checkpoints via
 /// [`MessageType::ConsistencyCheckpoint`](scp_protocol::envelope::inner::MessageType::ConsistencyCheckpoint),
-/// the tag is a defense-in-depth guard mirroring [`PseudonymAnnouncement`]:
+/// the tag is a defense-in-depth guard mirroring
+/// [`PseudonymAnnouncement`](scp_protocol::context::pseudonym::PseudonymAnnouncement):
 /// it makes a payload that fails to deserialize as a tagged checkpoint a
 /// hard error rather than a silently mis-routed application message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1619,11 +1732,12 @@ pub(crate) struct CheckpointMessage {
 
 /// Magic tag identifying consistency-checkpoint messages in the MLS application
 /// message stream. Prefixed with `\0` for the same reason as
-/// [`PSEUDONYM_ANNOUNCEMENT_TAG`]: user content is valid UTF-8 and never starts
-/// with a null byte when `MessagePack`-decoded, so the tag cannot collide.
+/// [`PSEUDONYM_ANNOUNCEMENT_TAG`](scp_protocol::context::pseudonym::PSEUDONYM_ANNOUNCEMENT_TAG):
+/// user content is valid UTF-8 and never starts with a null byte when
+/// `MessagePack`-decoded, so the tag cannot collide.
 pub(crate) const CHECKPOINT_PAYLOAD_TAG: &str = "\0scp:checkpoint:v1";
 
-// ADR-049 Phase 2A finalization keystone (commit 12 phase 2A finalization
+// ADR-049 Phase 2A finalization keystone (ADR-049 §15 phase 2A finalization
 // — type unification, single PerContextState): the legacy
 // `state::PerContextState` struct + its `impl` block are deleted here. The
 // single surviving `PerContextState` lives at
@@ -1780,7 +1894,76 @@ pub(crate) fn create_governance_engine(
     }
 }
 
-/// Restores the [`EpochGraceStore`](crate::crypto::mls::epoch_grace::EpochGraceStore)
+/// Builds the fresh-context [`GovernanceState`] shared by BOTH the creator-side
+/// create path ([`crate::context::lifecycle_helpers::create_context`]) and the
+/// join-side spawn-from-Welcome path
+/// ([`crate::context::supervisor::Supervisor::build_welcome_joiner_state`]).
+///
+/// Both entrypoints stand up an identical fresh governance bucket — empty
+/// proposal/outlet/ceiling/economy maps, the matrix-default hard rate limiter, a
+/// 60-second velocity window, and a fresh spending-nonce tracker — differing
+/// only in the already-built `engine`, the initial `last_known_members` roster,
+/// and the `context_id`/`clock` the nonce tracker binds. Extracting the field
+/// set here means the two paths cannot silently DRIFT: a new `GovernanceState`
+/// field forces one edit, not two. The import/restore paths are deliberately
+/// NOT routed through this helper — they populate the bucket from a persisted
+/// snapshot, not from fresh defaults.
+///
+/// The threshold signer set + quorum value are derived from
+/// `params.governance` here (empty / zero for non-`Threshold` models), matching
+/// what both call sites computed inline before.
+pub(crate) fn fresh_governance_state(
+    engine: Box<dyn GovernanceEngine>,
+    params: &ContextParams,
+    last_known_members: HashSet<DID>,
+    context_id: &str,
+    clock: Arc<dyn Clock>,
+) -> GovernanceState {
+    let (threshold_signers, threshold_value) = match &params.governance {
+        GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
+        _ => (Vec::new(), 0),
+    };
+    GovernanceState {
+        engine,
+        approved_proposals: HashMap::new(),
+        // H10: fresh contexts start with a zero monotonic counter.
+        next_proposal_seq: 0,
+        freeze: None,
+        deadlock: DeadlockDetectionState::default(),
+        pending_ceiling_modification: None,
+        pending_economic_policy_change: None,
+        registered_outlets: Vec::new(),
+        outlet_interfaces: Vec::new(),
+        pruning_policy: None,
+        message_pricing: crate::context::lifecycle_logic::derive_message_pricing(
+            params.economic_policy.as_ref(),
+        ),
+        hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
+            scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults(),
+        ),
+        economic_policy: params.economic_policy.clone(),
+        budget_tracker: MemberBudgetTracker::new(),
+        last_known_members,
+        pending_epoch_resets: Vec::new(),
+        consequence_rules: params.consequence_rules.clone(),
+        velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
+        participation_cache: HashMap::new(),
+        cooldown_until: HashMap::new(),
+        revoked_spending_ucan_cids: HashSet::new(),
+        proposal_timestamps: HashMap::new(),
+        class_s: GovernanceClassS {
+            executed_proposals: HashMap::new(),
+            threshold_signers,
+            threshold_value,
+            spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                context_id.to_owned(),
+                clock,
+            ),
+        },
+    }
+}
+
+/// Restores the [`EpochGraceStore`](scp_mls::epoch_grace::EpochGraceStore)
 /// from persisted snapshot entries, applying the §23.11 inconsistency
 /// detection and fallback steps.
 ///
@@ -1789,8 +1972,11 @@ pub(crate) fn create_governance_engine(
 pub(crate) fn restore_grace_store_from_snapshot(
     context_id: &str,
     snapshot: &ContextSnapshot,
-) -> (crate::crypto::mls::epoch_grace::EpochGraceStore, bool) {
-    let mut grace_store = crate::crypto::mls::epoch_grace::EpochGraceStore::new();
+) -> (scp_mls::epoch_grace::EpochGraceStore, bool) {
+    // Native runtime injects the production SystemClock (ADR-057 §Prereq-2).
+    let mut grace_store = scp_mls::epoch_grace::EpochGraceStore::with_clock(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    ));
     let mut needs_reconnect = snapshot.needs_reconnect;
 
     if !snapshot.grace_entries.is_empty() {
@@ -1928,12 +2114,6 @@ pub(crate) fn restore_governance_engine_from_snapshot(
     }
 }
 
-/// Reads the context state synchronously via [`ContextHandle::try_read_state`].
-/// Returns `ContextNotActive` if the read lock cannot be acquired (a state
-/// transition is in progress) or if the state is not `Active`.
-///
-/// This is used inside `Mutex` lock scopes to avoid TOCTOU races: the state
-/// check and the subsequent mutation happen within the same lock acquisition,
 /// Validates governance model parameters at context creation time.
 ///
 /// Rejects configurations that would make governance impossible:
@@ -1992,12 +2172,16 @@ pub(crate) fn validate_governance_model(
     }
 }
 
-/// guaranteeing that no concurrent `close_context` or `handle_ttl_expiry` can
-/// interleave between the check and the mutation.
+/// Returns [`ContextError::ContextNotActive`] unless the handle's cached
+/// lifecycle state is [`ContextState::Active`].
+///
+/// This is a lock-free point-in-time check of the per-handle `ArcSwap` state
+/// cell; it does not serialize against concurrent transitions (e.g. a
+/// `close_context` or `handle_ttl_expiry` may still interleave between this
+/// check and any later mutation — the actor command loop is the authority for
+/// check-then-act atomicity).
 pub(crate) fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
-    let state = handle
-        .try_read_state()
-        .ok_or(ContextError::ContextNotActive)?;
+    let state = handle.state();
     if state != ContextState::Active {
         return Err(ContextError::ContextNotActive);
     }
@@ -2007,9 +2191,7 @@ pub(crate) fn require_active(handle: &ContextHandle) -> Result<(), ContextError>
 /// Requires the context to be in `MigratingOut` state (§5.11A).
 /// Used for `CancelContextMigration` which is only valid during migration.
 pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), ContextError> {
-    let state = handle
-        .try_read_state()
-        .ok_or(ContextError::ContextNotActive)?;
+    let state = handle.state();
     if state != ContextState::MigratingOut {
         return Err(ContextError::PermissionDenied(
             "action requires MigratingOut state".to_owned(),
@@ -2023,11 +2205,68 @@ pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), Contex
 // submodules' `impl ContextManager` blocks. The active alternative
 // (`create_governance_engine` above) covers the same surface for the
 // hoisted `lifecycle_helpers::create_context` path. Removed in
-// ADR-049 commit 12 alongside the rest of the manager-only code.
+// ADR-049 §15 alongside the rest of the manager-only code.
 
-/// Uses the canonical SHA-256 context ID byte derivation.
-/// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.
-pub(crate) fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
+/// Resolves a context-ID string to the canonical 32-byte value that keys its
+/// MLS group, sender keys, and event log.
+///
+/// This is the SINGLE chokepoint (ADR-056) through which every context-id
+/// string is turned into keying bytes. Per ADR-056 (Model A) and spec
+/// §6.2.4:276, a context's canonical identity IS its 32-byte digest, and the
+/// id STRING is `hex(digest)` — exactly the form `generate_context_id`
+/// produces (32 CSPRNG bytes, lowercase-hex encoded, §18.4.1). For such a
+/// real context id the canonical bytes are the digest itself, recovered by
+/// **decoding** the hex — NOT by re-hashing the already-hex-encoded digest
+/// (which would double-hash and diverge from the raw digest the §6.2.4
+/// cross-context outlet saga compares against on the wire).
+///
+/// Resolution rule:
+/// - If `context_id` is a canonical context id — exactly 64 characters, all
+///   lowercase hexadecimal — it is `hex::decode`d into the `[u8; 32]` digest.
+///   This is the single branch that makes the redirect blanket-safe: every
+///   real context id hits it and resolves to its digest.
+/// - Otherwise `context_id` is NOT a real context id — a synthetic namespace
+///   (`"identity-private-state"`), a standing-pair id (`"standing-" + hex`,
+///   which carries the prefix and so is never bare 64-hex), or an arbitrary
+///   test id (`"ctx-…"`). These fall through to the raw `SHA-256(id)`
+///   derivation, producing **byte-for-byte the same value as before this
+///   change** — they were never 64-hex, so their behavior is unchanged.
+///
+/// The 64-hex guard is strict (length 64 AND all `0-9a-f`): `hex::decode`
+/// alone would also accept uppercase, but `generate_context_id` emits only
+/// lowercase, so requiring lowercase keeps an uppercase 64-char test id on
+/// the hashing fallback rather than silently decoding it.
+///
+/// The fallback calls [`scp_protocol::context::context_id_bytes`] (the raw
+/// SHA-256 primitive) directly — that primitive stays a pure SHA-256
+/// derivation for synthetic / non-context labels only, never re-hashing a
+/// canonical context id (ADR-056, the double-hash trap).
+///
+/// This is the canonical CROSS-CRATE keying resolver: the single permitted way
+/// for ANY layer — the runtime core AND the FFI bridges (`PyO3` / NAPI /
+/// `UniFFI`), which reach it as `scp_core::context::state::context_id_to_bytes`
+/// — to turn a context-id string into keying bytes. The raw routing primitive
+/// [`scp_protocol::context::context_id_bytes`] is routing/fallback ONLY and
+/// must never be used for keying: it double-hashes a real 64-hex id and keys
+/// the wrong slot (the fail-open this ADR-056 chokepoint closes). Every storage
+/// / crypto / event-log keying site must funnel through here.
+#[must_use]
+pub fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
+    if context_id.len() == 64
+        && context_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        // A 64-char all-lowercase-hex string decodes to exactly 32 bytes, so
+        // neither branch can fail. The fallthrough keeps the function total
+        // (no panic/unwrap — clippy denies them) even if `hex::decode` ever
+        // rejected the input.
+        if let Ok(decoded) = hex::decode(context_id)
+            && let Ok(digest) = <[u8; 32]>::try_from(decoded.as_slice())
+        {
+            return digest;
+        }
+    }
     scp_protocol::context::context_id_bytes(context_id)
 }
 
@@ -2061,14 +2300,14 @@ mod notification_window_backdating_tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode(*b"USD\0"),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
             },
             payment_adapters: vec!["test".to_owned()],
             pricing_formula: None,
-            payee: scp_identity::DID::from("did:dht:z6MkPayee".to_owned()),
+            payee: scp_did::DID::from("did:dht:z6MkPayee".to_owned()),
         }
     }
 
@@ -2189,5 +2428,97 @@ mod notification_window_backdating_tests {
         let effective_at = created_at + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
         assert!(!pending.is_effective(effective_at - 1));
         assert!(pending.is_effective(observed + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS));
+    }
+}
+
+#[cfg(test)]
+mod canonical_context_id_tests {
+    //! ADR-056 (Model A) / §6.2.4:276: a context's canonical
+    //! identity IS its 32-byte digest, and the id STRING is `hex(digest)`.
+    //! [`context_id_to_bytes`] must DECODE a real 64-hex id to its digest (not
+    //! re-hash it), while leaving every synthetic / non-64-hex string on the
+    //! byte-for-byte unchanged SHA-256 fallback.
+
+    use super::context_id_to_bytes;
+
+    #[test]
+    fn real_64hex_id_decodes_to_digest_not_sha256() {
+        let digest: [u8; 32] = [
+            0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x1b, 0x1c,
+        ];
+        let id = hex::encode(digest);
+        assert_eq!(id.len(), 64);
+        // DECODE recovers the digest verbatim (single chokepoint).
+        assert_eq!(context_id_to_bytes(&id), digest);
+        // And that is NOT the same as hashing the hex string.
+        assert_ne!(
+            context_id_to_bytes(&id),
+            scp_protocol::context::context_id_bytes(&id),
+            "a real id must decode, not re-hash — that double-hash is the bug ADR-056 fixes"
+        );
+    }
+
+    #[test]
+    fn synthetic_namespace_id_falls_through_to_hash() {
+        // The identity-scoped PSK-rotation pseudo-context (§9.12 step 6).
+        let id = "identity-private-state";
+        assert_eq!(
+            context_id_to_bytes(id),
+            scp_protocol::context::context_id_bytes(id),
+            "a non-64-hex synthetic id must hash exactly as before"
+        );
+    }
+
+    #[test]
+    fn standing_prefixed_id_falls_through_to_hash() {
+        // Standing-pair display id: `"standing-" + 64-hex`. The prefix makes it
+        // longer than 64 chars, so it is never bare 64-hex and must hash —
+        // ADR-056 does not alter standing-context id derivation.
+        let id = format!("standing-{}", "ab".repeat(32));
+        assert!(id.len() > 64);
+        assert_eq!(
+            context_id_to_bytes(&id),
+            scp_protocol::context::context_id_bytes(&id)
+        );
+    }
+
+    #[test]
+    fn arbitrary_test_id_falls_through_to_hash() {
+        let id = "ctx-some-arbitrary-test-id";
+        assert_eq!(
+            context_id_to_bytes(id),
+            scp_protocol::context::context_id_bytes(id)
+        );
+    }
+
+    #[test]
+    fn uppercase_64hex_is_not_canonical_and_hashes() {
+        // `generate_context_id` emits only LOWERCASE hex. A 64-char UPPERCASE
+        // hex string is therefore not a canonical id: the strict lowercase
+        // guard keeps it on the hashing fallback rather than silently decoding.
+        let upper = "AB".repeat(32);
+        assert_eq!(upper.len(), 64);
+        assert_eq!(
+            context_id_to_bytes(&upper),
+            scp_protocol::context::context_id_bytes(&upper),
+            "uppercase 64-hex must hash, not decode (lowercase-only guard)"
+        );
+    }
+
+    #[test]
+    fn near_64_lengths_hash() {
+        // 63 and 65 lowercase-hex chars are not canonical ids.
+        let short = "a".repeat(63);
+        let long = "a".repeat(65);
+        assert_eq!(
+            context_id_to_bytes(&short),
+            scp_protocol::context::context_id_bytes(&short)
+        );
+        assert_eq!(
+            context_id_to_bytes(&long),
+            scp_protocol::context::context_id_bytes(&long)
+        );
     }
 }

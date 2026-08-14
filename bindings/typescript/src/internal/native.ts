@@ -8,7 +8,7 @@
  * optional dependency. If the package is not installed, loading fails with
  * a `TransportError` and an actionable message.
  *
- * Since ADR-048 (#1549 Phase 4 PR 4), all calls route through the caller-
+ * Since ADR-048 (Phase 4 PR 4), all calls route through the caller-
  * supplied {@link SCP} instance's class methods rather than module-level
  * free functions. The process-wide default-instance fallback was deleted
  * alongside `SCP.default()` in PR 4 — every bridge is constructed with an
@@ -27,6 +27,7 @@ import { TransportError } from "../errors";
 import { __getNativeScp, type SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
+  CapabilityValidation,
   Checkpoint,
   DIDDocument,
   Event,
@@ -34,9 +35,10 @@ import type {
   EventFilter,
   MemberRole,
   Message,
+  OutletDefinition,
+  OutletVerificationResult,
   Proof,
-  ToolDefinition,
-  ToolVerificationResult,
+  SagaResult,
   TransportStatus,
   UcanToken,
 } from "../types";
@@ -47,6 +49,7 @@ import type {
   BridgeTransportHandle,
   MessageCallback,
 } from "./bridge";
+import { toCapabilityValidation, wrapBridgeErrors } from "./bridge";
 import { safeJsonParse } from "./json-utils";
 
 // ---------------------------------------------------------------------------
@@ -77,7 +80,7 @@ function resolveNapiPackage(): string {
   if (pkg === undefined) {
     throw new TransportError(
       `No native addon available for platform ${key}. ` +
-        "Install the appropriate @limn-works/scp-ts-napi-* package or use the WASM bridge in a browser environment.",
+        "Install the appropriate @limn-works/scp-ts-napi-* package for this platform.",
       "SCP-TRANS-5001",
     );
   }
@@ -163,7 +166,7 @@ export function loadNativeAddon(): NativeAddon {
  *
  * @param scp The {@link SCP} wrapper whose native handle should receive
  *   all routable method calls. Required — the legacy process-wide
- *   default-instance fallback was removed in Phase 4 PR 4 (#1549)
+ *   default-instance fallback was removed in Phase 4 PR 4
  *   demolition.
  *
  * @internal
@@ -189,7 +192,7 @@ export function createNativeBridge(scp: SCP): Bridge {
   // the wrong handle.
   const native = __getNativeScp(scp) as unknown as Record<string, (...args: never[]) => unknown>;
 
-  return {
+  const bridge: Bridge = {
     // Identity
     async identityCreate(custody: string): Promise<BridgeIdentityHandle> {
       const handle = await (native.identityCreate as (c: string) => Promise<BridgeIdentityHandle>)(
@@ -310,7 +313,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       identityDid: string,
       callback: MessageCallback,
     ): Promise<void> {
-      // NAPI `context_subscribe` is `async` after coder H's #1549 Phase 4
+      // NAPI `context_subscribe` is `async` after Phase 4
       // PR 1 changes — the subscription task is now registered against
       // the bridge's `JoinSet` / cancel token so shutdown drains it
       // deterministically. The returned Promise resolves once the
@@ -366,11 +369,18 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // Broadcast operations
-    async broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void> {
-      await (native.broadcastSubscribe as (h: BridgeContextHandle, d: string) => Promise<void>)(
-        handle,
-        subscriberDid,
-      );
+    async broadcastSubscribe(
+      handle: BridgeContextHandle,
+      subscriberDid: string,
+      messagesReadUcanJwt?: string,
+    ): Promise<void> {
+      await (
+        native.broadcastSubscribe as (
+          h: BridgeContextHandle,
+          d: string,
+          u?: string,
+        ) => Promise<void>
+      )(handle, subscriberDid, messagesReadUcanJwt);
     },
 
     async broadcastUnsubscribe(
@@ -679,18 +689,6 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // TTL operations
-    async contextTtlRemaining(_handle: BridgeContextHandle): Promise<number | null> {
-      // The NAPI bridge does not export contextTtlRemaining — scp-core's
-      // ContextManager tracks TTL internally and does not expose a "remaining"
-      // query. Use contextProposeTtlExtension or contextResetTtlTimer instead.
-      throw new TransportError(
-        "contextTtlRemaining is not available in the native (NAPI) bridge. " +
-          "TTL remaining is a WASM-only concept. Use contextProposeTtlExtension " +
-          "or contextResetTtlTimer for TTL management in native environments.",
-        "SCP-TRANS-5004",
-      );
-    },
-
     async contextExtendTtl(
       _handle: BridgeContextHandle,
       _additionalSecs: number,
@@ -788,12 +786,16 @@ export function createNativeBridge(scp: SCP): Bridge {
       )(handle);
     },
 
-    // Tools
-    async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
-      // NapiToolDefinition has different field names from the Bridge ToolDefinition.
+    // Outlets
+    async outletRegister(
+      handle: BridgeContextHandle,
+      definition: OutletDefinition,
+    ): Promise<string> {
+      // NapiOutletDefinition has different field names from the Bridge OutletDefinition.
       const napiDef = {
         name: definition.name,
         description: definition.description,
+        kind: definition.kind,
         inputSchemaJson: JSON.stringify(definition.inputSchema),
         outputSchemaJson: JSON.stringify(definition.outputSchema),
         operatorDid: definition.operator,
@@ -812,27 +814,27 @@ export function createNativeBridge(scp: SCP): Bridge {
             }
           : undefined,
       };
-      const toolId = await (
-        native.toolRegister as (h: BridgeContextHandle, d: typeof napiDef) => Promise<string>
+      const outletId = await (
+        native.outletRegister as (h: BridgeContextHandle, d: typeof napiDef) => Promise<string>
       )(handle, napiDef);
-      return toolId;
+      return outletId;
     },
 
-    async toolInvoke(
+    async outletInvoke(
       handle: BridgeContextHandle,
-      toolId: string,
+      outletId: string,
       inputJson: string,
       identityDid: string,
       ucanToken: string,
       proofTokens?: readonly string[],
       spendingUcan?: string,
     ): Promise<string> {
-      // C4 (#1606): NAPI tool_invoke now routes through
-      // ContextManager.invoke_tool_with_economy. The bridge accepts an
+      // C4 (#1606): NAPI outlet_invoke now routes through
+      // ContextManager.invoke_outlet_with_economy. The bridge accepts an
       // optional spendingUcan JWT for AND-composition with the action
       // UCAN under spec section 19.5.
       const result = await (
-        native.toolInvoke as (
+        native.outletInvoke as (
           h: BridgeContextHandle,
           t: string,
           i: string,
@@ -841,54 +843,63 @@ export function createNativeBridge(scp: SCP): Bridge {
           p: readonly string[] | undefined,
           s: string | undefined,
         ) => Promise<string>
-      )(handle, toolId, inputJson, identityDid, ucanToken, proofTokens, spendingUcan);
+      )(handle, outletId, inputJson, identityDid, ucanToken, proofTokens, spendingUcan);
       return result;
     },
 
-    async toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult> {
+    async outletVerify(
+      handle: BridgeContextHandle,
+      outletId: string,
+    ): Promise<OutletVerificationResult> {
       const result = await (
-        native.toolVerify as (h: BridgeContextHandle, t: string) => Promise<ToolVerificationResult>
-      )(handle, toolId);
+        native.outletVerify as (
+          h: BridgeContextHandle,
+          t: string,
+        ) => Promise<OutletVerificationResult>
+      )(handle, outletId);
       return result;
     },
 
     // Bidirectional consent protocol (§6.2.0.1)
-    async toolInterfaceExpose(
+    async outletInterfaceExpose(
       handle: BridgeContextHandle,
-      toolId: string,
+      outletId: string,
       targetContextId: string,
       rateLimitJson?: string,
     ): Promise<string> {
       return await (
-        native.toolInterfaceExpose as (
+        native.outletInterfaceExpose as (
           h: BridgeContextHandle,
           t: string,
           tc: string,
           rl?: string,
         ) => Promise<string>
-      )(handle, toolId, targetContextId, rateLimitJson);
+      )(handle, outletId, targetContextId, rateLimitJson);
     },
 
-    async toolInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string> {
+    async outletInterfaceAccept(
+      handle: BridgeContextHandle,
+      interfaceJson: string,
+    ): Promise<string> {
       return await (
-        native.toolInterfaceAccept as (h: BridgeContextHandle, ij: string) => Promise<string>
+        native.outletInterfaceAccept as (h: BridgeContextHandle, ij: string) => Promise<string>
       )(handle, interfaceJson);
     },
 
-    async toolInterfaceRevoke(
+    async outletInterfaceRevoke(
       handle: BridgeContextHandle,
       interfaceIdHex: string,
     ): Promise<string> {
       return await (
-        native.toolInterfaceRevoke as (h: BridgeContextHandle, id: string) => Promise<string>
+        native.outletInterfaceRevoke as (h: BridgeContextHandle, id: string) => Promise<string>
       )(handle, interfaceIdHex);
     },
 
-    // Cross-context tool invocation (spec section 6.2)
-    async toolInvokeCrossContext(
+    // Cross-context outlet invocation (spec section 6.2)
+    async outletInvokeCrossContext(
       sourceHandle: BridgeContextHandle,
       targetHandle: BridgeContextHandle,
-      toolId: string,
+      outletId: string,
       inputJson: string,
       invokerDid: string,
       ucanToken: string,
@@ -896,10 +907,10 @@ export function createNativeBridge(scp: SCP): Bridge {
       proofTokens?: readonly string[],
     ): Promise<string> {
       return await (
-        native.toolInvokeCrossContext as (
+        native.outletInvokeCrossContext as (
           s: BridgeContextHandle,
           t: BridgeContextHandle,
-          tool: string,
+          outlet: string,
           input: string,
           did: string,
           ucan: string,
@@ -909,7 +920,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       )(
         sourceHandle,
         targetHandle,
-        toolId,
+        outletId,
         inputJson,
         invokerDid,
         ucanToken,
@@ -918,24 +929,69 @@ export function createNativeBridge(scp: SCP): Bridge {
       );
     },
 
-    // Stateful tool sessions (spec section 6.2.1)
-    async toolSessionCreate(
+    // The §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a)
+    async outletInvokeCrossContextSaga(
+      sourceHandle: BridgeContextHandle,
+      targetHandle: BridgeContextHandle,
+      callerDid: string,
+      outletRegistrationId: string,
+      inputJson: string,
+      assertedNonceHex: string,
+      timestampMs: bigint,
+      chainDepth: number,
+      ucanProofId?: string,
+    ): Promise<SagaResult> {
+      // `NapiSagaResult` arrives camelCase with `receipt`/`output` as a native
+      // `Buffer` (a faithful `Uint8Array` subtype) or `undefined`. Normalize the
+      // absent case to `null` — a faithful pass-through, never synthesized.
+      const raw = await (
+        native.outletInvokeCrossContextSaga as (
+          s: BridgeContextHandle,
+          t: BridgeContextHandle,
+          caller: string,
+          outlet: string,
+          input: string,
+          nonce: string,
+          ts: bigint,
+          depth: number,
+          proof: string | undefined,
+        ) => Promise<{ sagaId: string; receipt?: Uint8Array; output?: Uint8Array }>
+      )(
+        sourceHandle,
+        targetHandle,
+        callerDid,
+        outletRegistrationId,
+        inputJson,
+        assertedNonceHex,
+        timestampMs,
+        chainDepth,
+        ucanProofId,
+      );
+      return {
+        sagaId: raw.sagaId,
+        receipt: raw.receipt ?? null,
+        output: raw.output ?? null,
+      };
+    },
+
+    // Stateful outlet sessions (spec section 6.2.1)
+    async outletSessionCreate(
       handle: BridgeContextHandle,
-      toolId: string,
+      outletId: string,
       sourceContextId: string,
       ttlSeconds?: number,
     ): Promise<string> {
       return await (
-        native.toolSessionCreate as (
+        native.outletSessionCreate as (
           h: BridgeContextHandle,
           t: string,
           s: string,
           ttl: number | undefined,
         ) => Promise<string>
-      )(handle, toolId, sourceContextId, ttlSeconds);
+      )(handle, outletId, sourceContextId, ttlSeconds);
     },
 
-    async toolSessionInvoke(
+    async outletSessionInvoke(
       handle: BridgeContextHandle,
       sessionId: string,
       inputJson: string,
@@ -944,7 +1000,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       proofTokens?: readonly string[],
     ): Promise<string> {
       return await (
-        native.toolSessionInvoke as (
+        native.outletSessionInvoke as (
           h: BridgeContextHandle,
           sid: string,
           input: string,
@@ -955,8 +1011,8 @@ export function createNativeBridge(scp: SCP): Bridge {
       )(handle, sessionId, inputJson, invokerDid, ucanToken, proofTokens);
     },
 
-    async toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void> {
-      await (native.toolSessionClose as (h: BridgeContextHandle, sid: string) => Promise<void>)(
+    async outletSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void> {
+      await (native.outletSessionClose as (h: BridgeContextHandle, sid: string) => Promise<void>)(
         handle,
         sessionId,
       );
@@ -986,10 +1042,47 @@ export function createNativeBridge(scp: SCP): Bridge {
       handle: BridgeContextHandle,
       token: string,
       capability: string,
+      presentingAgentDid?: string,
+      proofTokens?: readonly string[],
     ): Promise<void> {
+      // FAIL CLOSED on the enforcing gate: `presentingAgentDid` is required by
+      // the bridge (it will not default to the token's own `aud`). Forward it
+      // (and the optional proof chain) so a facade caller can satisfy the gate;
+      // omitted optionals normalize to `null` for the napi-rs `Option<…>` shape.
       await (
-        native.ucanValidate as (h: BridgeContextHandle, t: string, c: string) => Promise<void>
-      )(handle, token, capability);
+        native.ucanValidate as (
+          h: BridgeContextHandle,
+          t: string,
+          c: string,
+          pa: string | null,
+          pt: readonly string[] | null,
+        ) => Promise<void>
+      )(handle, token, capability, presentingAgentDid ?? null, proofTokens ?? null);
+    },
+
+    async ucanEvaluate(
+      handle: BridgeContextHandle,
+      token: string,
+      capability?: string | null,
+      presentingAgentDid?: string,
+      proofTokens?: readonly string[],
+    ): Promise<CapabilityValidation> {
+      // NAPI `ucanEvaluate` (scp.rs) returns a NapiCapabilityValidation
+      // #[napi(object)] whose fields are already camelCased — no remap. The
+      // optional params map to `null` for the napi-rs `Option<…>` signature;
+      // a `null` capability runs the intrinsic-validity diagnostic (no
+      // invoked-capability grant-match challenge).
+      const raw = await (
+        native.ucanEvaluate as (
+          h: BridgeContextHandle,
+          t: string,
+          c: string | null,
+          pa: string | null,
+          pt: readonly string[] | null,
+        ) => Promise<CapabilityValidation>
+      )(handle, token, capability ?? null, presentingAgentDid ?? null, proofTokens ?? null);
+      // Shared six-field projection — pins the canonical shape in one place.
+      return toCapabilityValidation(raw);
     },
 
     async ucanMint(
@@ -1173,8 +1266,7 @@ export function createNativeBridge(scp: SCP): Bridge {
         epoch: raw.epoch ?? undefined,
         timestamp: raw.timestamp,
         // The NAPI bridge signs the checkpoint in-process; surface the Ed25519
-        // signature (hex). WASM signs the same way (see the `Checkpoint` type
-        // doc and `internal/wasm.ts`).
+        // signature (hex). See the `Checkpoint` type doc.
         signature: raw.signature,
       };
     },
@@ -1640,7 +1732,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       );
     },
 
-    // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+    // Recovery and custody migration (#632, spec §9.12)
     async identityExecuteRecovery(
       did: string,
       tier: string,
@@ -1756,8 +1848,8 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // Economy (§19, ADR-033)
-    economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): number {
-      return (native.economyEstimateCost as (p: string, a: string, m: string) => number)(
+    economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): bigint {
+      return (native.economyEstimateCost as (p: string, a: string, m: string) => bigint)(
         policyJson,
         actionType,
         metricsJson,
@@ -1783,27 +1875,27 @@ export function createNativeBridge(scp: SCP): Bridge {
       );
     },
 
-    economyEvaluateFormula(formulaJson: string, metricsJson: string): number {
-      return (native.economyEvaluateFormula as (f: string, m: string) => number)(
+    economyEvaluateFormula(formulaJson: string, metricsJson: string): bigint {
+      return (native.economyEvaluateFormula as (f: string, m: string) => bigint)(
         formulaJson,
         metricsJson,
       );
     },
 
-    economyBudgetRemaining(contextId: string, did: string): number {
-      return (native.economyBudgetRemaining as (c: string, d: string) => number)(contextId, did);
+    economyBudgetRemaining(contextId: string, did: string): bigint {
+      return (native.economyBudgetRemaining as (c: string, d: string) => bigint)(contextId, did);
     },
 
-    economyBudgetGrant(contextId: string, did: string, amount: number): void {
-      (native.economyBudgetGrant as (c: string, d: string, a: number) => void)(
+    economyBudgetGrant(contextId: string, did: string, amount: bigint): void {
+      (native.economyBudgetGrant as (c: string, d: string, a: bigint) => void)(
         contextId,
         did,
         amount,
       );
     },
 
-    economyBudgetRecordSpend(contextId: string, did: string, amount: number): void {
-      (native.economyBudgetRecordSpend as (c: string, d: string, a: number) => void)(
+    economyBudgetRecordSpend(contextId: string, did: string, amount: bigint): void {
+      (native.economyBudgetRecordSpend as (c: string, d: string, a: bigint) => void)(
         contextId,
         did,
         amount,
@@ -1830,21 +1922,21 @@ export function createNativeBridge(scp: SCP): Bridge {
       contextId: string,
       senderDid: string,
       now: number,
-      baseCost: number,
+      baseCost: bigint,
       thresholdsJson: string,
-      floor: number | null,
-      cap: number | null,
-    ): number {
+      floor: bigint | null,
+      cap: bigint | null,
+    ): bigint {
       return (
         native.economyAntispamEscalatedCost as (
           c: string,
           s: string,
           n: number,
-          b: number,
+          b: bigint,
           t: string,
-          f: number | null,
-          cp: number | null,
-        ) => number
+          f: bigint | null,
+          cp: bigint | null,
+        ) => bigint
       )(contextId, senderDid, now, baseCost, thresholdsJson, floor, cap);
     },
 
@@ -1965,11 +2057,35 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // Trust — participation verification (SCP-BA-004, §7.3.2.1)
-    verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean {
-      return (native.verifyParticipationRequirements as (p: string, r: string) => boolean)(
-        profileJson,
+    verifyParticipationRequirements(
+      expectedSubject: string,
+      requirementsJson: string,
+      profileJson: string,
+    ): void {
+      (native.verifyParticipationRequirements as (s: string, r: string, p: string) => void)(
+        expectedSubject,
         requirementsJson,
+        profileJson,
       );
+    },
+
+    // Trust — capability admission verification (§7.3.4.4, SCP-ACR-008)
+    checkCapabilityRequirements(
+      contextId: string,
+      subjectDid: string,
+      requirementsJson: string,
+      agentCapabilitiesJson: string,
+      challengeVerificationsJson: string,
+    ): void {
+      (
+        native.checkCapabilityRequirements as (
+          c: string,
+          s: string,
+          r: string,
+          a: string,
+          v: string,
+        ) => void
+      )(contextId, subjectDid, requirementsJson, agentCapabilitiesJson, challengeVerificationsJson);
     },
 
     // Lifecycle
@@ -1985,11 +2101,11 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     async shutdown(timeoutMillis: number): Promise<void> {
-      // #1692: NAPI `shutdown(timeoutMillis: u64)` — napi-rs exposes `u64`
+      // NAPI `shutdown(timeoutMillis: u64)` — napi-rs exposes `u64`
       // as JS `BigInt` on the wire, so the `number` at this layer is
       // coerced to `bigint` before hitting the native binding. The SDK
       // public surface (`BridgeApi.shutdown`, `SCP.shutdown`) keeps
-      // `number` so the WASM / mock paths stay uniform.
+      // `number` so the mock path stays uniform.
       const millis = BigInt(Math.max(0, Math.trunc(timeoutMillis)));
       await (native.shutdown as (t: bigint) => Promise<void>)(millis);
     },
@@ -2006,4 +2122,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       return (native.resume as () => Promise<void>)();
     },
   };
+  // Single error chokepoint: convert raw FFI errors thrown by any bridge
+  // method into typed ScpError subclasses at exactly one site (ADR-059).
+  return wrapBridgeErrors(bridge);
 }

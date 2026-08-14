@@ -25,16 +25,18 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use quinn::{ClientConfig, Endpoint};
-use scp_transport::native::protocol::{ClientMessage, RelayMessage};
+use scp_relay_client::{ClientMessage, RelayMessage};
+use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::quic::listener::SCP_ALPN;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use scp_clock::SystemClock;
+use scp_dht::InMemoryDhtClient;
 use scp_identity::DidCache;
-use scp_identity::InMemoryDhtClient;
-use scp_identity::cache::SystemClock;
 use scp_identity::dht::DidDht;
 use scp_node::{ApplicationNode, DhtMode, IdentitySource, Node, NodeConfig, Reach};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
 
 type TestDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
@@ -418,6 +420,7 @@ async fn build_tls_node(http_port: u16) -> ApplicationNode<InMemoryStorage> {
                 did_method,
             },
             InMemoryStorage::new(),
+            BlobStorageBackend::in_memory(),
         )
     })
     .await

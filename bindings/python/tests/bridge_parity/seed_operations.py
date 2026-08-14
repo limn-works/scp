@@ -20,14 +20,13 @@ Such ops use `OpContext.attached_scp()`, which calls
 seeds an encrypted in-memory store and attaches a local-transport
 supervisor in one shot. The alt-bridge runners need no equivalent explicit
 call: NAPI/UniFFI seed their in-memory `mls_storage` at CONSTRUCTION TIME
-(`new_napi` / `new_uniffi`), and WASM uses a self-initializing thread-local
-manager (ADR-034). Both sides therefore end up backed by an in-memory store
+(`new_napi` / `new_uniffi`). Both sides therefore end up backed by an in-memory store
 and emit identical canonical output. See `OpContext.attached_scp` for the
 full rationale. Non-context ops (identity_create, scpid_sign error paths,
 transport_status) need no supervisor and keep the bare `SCP({"type": "in_memory"})` constructor.
 
 Current op library: 12 ops. The first 5 are the MVP per ADR-046;
-ops 6-10 cover tool registration, UCAN mint/validate-error, transport
+ops 6-10 cover outlet registration, UCAN mint/validate-error, transport
 status, and filtered event-log query; op 11 pins the
 unregistered-DID rejection code (SCP-IDENT-1001) across every bridge;
 the structured `ucan_evaluate` op pins the six-boolean
@@ -37,12 +36,12 @@ Crypto outputs compare byte-exactly: `identity_create_deterministic`
 pins DID + identity-key verifying bytes under a fixed seed, and
 `sign_message` pins the SCPID signature byte-exactly under the
 `signed_at_override` testing affordance (see `scp-runtime::scpid_sign`).
-The latter also derives a distinct `#active` key from `seed[32..64]` on
-WASM under the `testing` feature, matching scp-core's two-key
+The latter also derives a distinct `#active` key from `seed[32..64]`
+under the `testing` feature, matching scp-core's two-key
 `DidDht::create` sequence.
 
 Resolved divergences (previously xfail'd tripwires, now full parity):
-  - context_id format (§18.4.1): all four bridges emit 64-char lowercase
+  - context_id format (§18.4.1): all three bridges emit 64-char lowercase
     hex via `hex::encode(32 random bytes)`. PyO3's `generate_context_id`
     (crates/scp-ffi/src/types.rs) remains the reference.
   - event_log_append starting sequence: all bridges emit `ContextCreated`
@@ -57,8 +56,8 @@ Resolved divergences (previously xfail'd tripwires, now full parity):
   - sign_message signature byte-exactness: previously shape-only because
     Ed25519 covers a wall-clock `signed_at`. Now byte-exact via the
     `signed_at_override` parameter on `scpid_sign`, wired across all
-    four bridges + scp-core under the `testing` feature. Paired with a
-    distinct `#active` key on WASM (derived from `seed[32..64]` to
+    three bridges + scp-core under the `testing` feature. Paired with a
+    distinct `#active` key (derived from `seed[32..64]` to
     match scp-core's two-key sequence) so the signature hashes are
     identical across every bridge.
 
@@ -101,8 +100,8 @@ from .normalizer import FieldSpec, OpSchema
 # zbase32 alphabet (RFC draft): ybndrfg8ejkmcpqxot1uwisza345h769
 DID_DHT_PATTERN = r"did:dht:z[ybndrfg8ejkmcpqxot1uwisza345h769]{40,200}"
 
-# Spec §18.4.1: context IDs MUST be 64-char lowercase hex. All four bridges
-# (PyO3, NAPI, WASM, UniFFI) now emit spec-compliant hex IDs via
+# Spec §18.4.1: context IDs MUST be 64-char lowercase hex. All three bridges
+# (PyO3, NAPI, UniFFI) now emit spec-compliant hex IDs via
 # `hex::encode(32 random bytes)` — regex is fully anchored to reject any
 # non-conformant format (e.g. the legacy `ctx-<uuidv4>` shape the parity
 # harness caught).
@@ -115,7 +114,7 @@ CONTEXT_ID_PATTERN = r"^[0-9a-f]{64}$"
 # agree on the code.
 #
 # Note: the valid-challenge + unregistered-DID path historically diverged
-# (PyO3 SCP-IDENT-1001, NAPI SCP-PERM-3023, WASM SCP-IDENT-1010). All three
+# (PyO3 SCP-IDENT-1001, NAPI SCP-PERM-3023). The
 # bridges are now aligned on SCP-IDENT-1001 (identity-domain, identity-not-
 # found). The MVP op below exercises the malformed-challenge path per
 # ADR-046; the companion `unregistered_did_rejected` op locks the
@@ -161,7 +160,7 @@ class OpContext:
         Storage-required model (ADR-049 / spec §17.6): the PyO3 runtime
         never defaults storage, and `PyBridgeInstance::new_py` (the bare
         `SCP({"type": "in_memory"})` constructor) carries no storage backend. Any context /
-        event-log / tool / UCAN-with-context op therefore needs a
+        event-log / outlet / UCAN-with-context op therefore needs a
         supervisor attached *with* a storage backend first, otherwise the
         supervisor build fails closed and the op surfaces SCP-CTX-2001.
 
@@ -178,8 +177,7 @@ class OpContext:
         constructors seed their in-memory `mls_storage` backend AT
         CONSTRUCTION TIME (see `new_napi` / `new_uniffi` in the respective
         `runtime.rs`), so their `context_create` auto-attaches a supervisor
-        with no explicit attach call. WASM uses a self-initializing
-        thread-local manager (ADR-034). PyO3 alone defers the dev
+        with no explicit attach call. PyO3 alone defers the dev
         affordance to `configure_local_transport`. This helper is the PyO3
         equivalent of those bridges' constructor-time seeding, so both
         sides of every parity comparison end up backed by an encrypted
@@ -256,7 +254,7 @@ PARITY_SEED_HEX = "7b" * 32
 
 # Expected outputs under `PARITY_SEED_HEX`. These are the ground truth
 # the bridges are being held to. If legitimate key-derivation changes
-# (e.g. StdRng algorithm update) require moving these, update all four
+# (e.g. StdRng algorithm update) require moving these, update all three
 # bridges AND these constants in the same PR.
 #
 # Derivation: `SigningKey::from_bytes(StdRng::from_seed([0x7b; 32])
@@ -303,7 +301,7 @@ OP_IDENTITY_CREATE = OpSpec(
     # the DID + verifying_key to the literal outputs produced by
     # `SigningKey::from_bytes(StdRng::from_seed([0x7b; 32]).fill_bytes(32))`.
     # If the KDF ever changes (e.g. rand crate algorithm bump), these
-    # constants must move in the same PR that changes all four bridges.
+    # constants must move in the same PR that changes all three bridges.
     expected_values=(
         ("did", EXPECTED_SEEDED_DID),
         # `bytes_from_hex` canonicalizes to base64 in the normalizer, so
@@ -324,7 +322,7 @@ OP_IDENTITY_CREATE = OpSpec(
 # Random context ID per bridge, freshly-created identity per bridge.
 # Compare shapes plus the deterministic `mode` echo. The context_id
 # regex is anchored to the spec-compliant hex form per §18.4.1 — all
-# four bridges (PyO3, NAPI, WASM, UniFFI) emit `hex::encode(32 random
+# three bridges (PyO3, NAPI, UniFFI) emit `hex::encode(32 random
 # bytes)`.
 # ---------------------------------------------------------------------------
 
@@ -364,9 +362,9 @@ OP_CONTEXT_CREATE = OpSpec(
 # attempt with a structured error code. The DID is unregistered (we
 # pass a syntactically valid but never-created DID).
 #
-# Real divergence caught by the harness: three bridges, three codes.
-# PyO3 returned SCP-IDENT-1001 (reference); NAPI returned SCP-PERM-3023;
-# WASM returned SCP-IDENT-1010. Aligned across all three on
+# Real divergence caught by the harness: differing codes per bridge.
+# PyO3 returned SCP-IDENT-1001 (reference); NAPI returned SCP-PERM-3023.
+# Aligned across the bridges on
 # SCP-IDENT-1001 for the unregistered-DID path; the op below exercises
 # the malformed-challenge path (SCP-IDENT-1038, shared), and
 # `OP_UNREGISTERED_DID_REJECTED` (op 11) locks in the IDENT-1001 path.
@@ -422,7 +420,7 @@ OP_INVALID_CAPABILITY = OpSpec(
 # Cross-bridge exposed path: create a context, then query the event log.
 # Compare event count + first event type + starting sequence exactly.
 #
-# All four bridges (PyO3, NAPI, WASM, UniFFI) emit a `ContextCreated`
+# All three bridges (PyO3, NAPI, UniFFI) emit a `ContextCreated`
 # event at context-create time via `builder_create_context` in scp-runtime.
 # The PyO3 bridge was previously wired to `NoOpEventLogProvider` and so
 # returned an empty log for this path; it now uses `MerkleEventLogProvider`
@@ -463,7 +461,7 @@ OP_EVENT_LOG_APPEND = OpSpec(
 #
 # Each bridge creates an identity using the shared parity seed, then
 # generates a challenge and signs it via SCPID. Under the `testing`-
-# gated `signed_at_override` affordance (wired across all four bridges
+# gated `signed_at_override` affordance (wired across all three bridges
 # and `scp-runtime::scpid_sign`), the harness pins `signed_at` in the
 # canonical hash to `PARITY_SIGNED_AT_MS`. Combined with:
 #
@@ -576,22 +574,22 @@ OP_SIGN_MESSAGE = OpSpec(
 
 
 # ---------------------------------------------------------------------------
-# op 6: tool_register
+# op 6: outlet_register
 #
-# Register a single tool in a fresh context. The tool_id is derived
-# deterministically across all four bridges from the tool name via the
-# shared `format!("tool-{}", name.replace(' ', "-").to_lowercase())`
-# convention (see scp-ffi/src/tools.rs, scp-ffi/napi/src/tools.rs,
-# scp-ffi/wasm/src/tools.rs, scp-ffi/uniffi/src/bridge.rs — all four
-# use the same format). That makes tool_id byte-exact for parity.
+# Register a single outlet in a fresh context. The outlet_id is derived
+# deterministically across all three bridges from the outlet name via the
+# shared `format!("outlet-{}", name.replace(' ', "-").to_lowercase())`
+# convention (see scp-ffi/common/src/outlet_id.rs, consumed by
+# scp-ffi/src, scp-ffi/napi/src, scp-ffi/uniffi/src/bridge.rs — all three
+# use the same format). That makes outlet_id byte-exact for parity.
 # ---------------------------------------------------------------------------
 
 
-# Ceiling must include `tool:register` to permit the registration action.
-_TOOL_CEILING = ["messages:read", "messages:write", "tool:register", "tool_invoke:*"]
-_TOOL_NAME = "parity_probe"
-_EXPECTED_TOOL_ID = f"tool-{_TOOL_NAME}"
-_TOOL_SCHEMA: dict[str, Any] = {
+# Ceiling must include `outlet:register` to permit the registration action.
+_OUTLET_CEILING = ["messages:read", "messages:write", "outlet:register", "outlet_call:*"]
+_OUTLET_NAME = "parity_probe"
+_EXPECTED_OUTLET_ID = f"outlet-{_OUTLET_NAME}"
+_OUTLET_SCHEMA: dict[str, Any] = {
     "input_schema": {
         "type": "object",
         "properties": {"x": {"type": "integer"}, "label": {"type": "string"}},
@@ -603,41 +601,43 @@ _TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
-def _py_tool_register(ctx: OpContext) -> dict[str, Any]:
+def _py_outlet_register(ctx: OpContext) -> dict[str, Any]:
     scp, identity = ctx.attached_scp()
     handle = scp.context_create(
         identity.did,
-        {"name": "parity-tools", "mode": "encrypted", "ceiling": _TOOL_CEILING},
+        {"name": "parity-outlets", "mode": "encrypted", "ceiling": _OUTLET_CEILING},
     )
-    tool_id = scp.tool_register(
+    outlet_id = scp.outlet_register(
         handle.context_id,
         {
-            "name": _TOOL_NAME,
-            "description": "parity harness probe tool",
+            "name": _OUTLET_NAME,
+            "description": "parity harness probe outlet",
+            "kind": "action",
             "operator_did": identity.did,
-            "schema": _TOOL_SCHEMA,
+            "schema": _OUTLET_SCHEMA,
         },
     )
-    return {"tool_id": tool_id}
+    return {"outlet_id": outlet_id}
 
 
-OP_TOOL_REGISTER = OpSpec(
-    name="tool_register",
-    py_call=_py_tool_register,
+OP_OUTLET_REGISTER = OpSpec(
+    name="outlet_register",
+    py_call=_py_outlet_register,
     node_call={
-        "op": "tool_register",
+        "op": "outlet_register",
         "args": {
-            "name": _TOOL_NAME,
-            "description": "parity harness probe tool",
-            "schema": _TOOL_SCHEMA,
-            "ceiling": _TOOL_CEILING,
+            "name": _OUTLET_NAME,
+            "description": "parity harness probe outlet",
+            "kind": "action",
+            "schema": _OUTLET_SCHEMA,
+            "ceiling": _OUTLET_CEILING,
         },
     },
-    schema=OpSchema(fields=(FieldSpec("tool_id", "exact"),)),
-    # Spec-pin the derivation: `tool-{name-lowercased-spaces-to-dashes}`.
+    schema=OpSchema(fields=(FieldSpec("outlet_id", "exact"),)),
+    # Spec-pin the derivation: `outlet-{name-lowercased-spaces-to-dashes}`.
     # Joint drift (e.g. all bridges hash instead of format) would pass
     # parity step 3 but violate the shared convention; this locks it.
-    expected_values=(("tool_id", _EXPECTED_TOOL_ID),),
+    expected_values=(("outlet_id", _EXPECTED_OUTLET_ID),),
 )
 
 
@@ -645,7 +645,7 @@ OP_TOOL_REGISTER = OpSpec(
 # op 7: ucan_mint
 #
 # Mint a UCAN in a freshly created context with a pinned member DID and
-# capability set. All four bridges return metadata — issuer, audience,
+# capability set. All three bridges return metadata — issuer, audience,
 # capabilities — byte-exactly under those inputs. The encoded JWT is
 # NOT compared: PyO3's PyUcanToken intentionally does not expose the
 # JWT (see crates/scp-ffi/src/ucan.rs), and both the signature and the
@@ -711,38 +711,24 @@ OP_UCAN_MINT = OpSpec(
         ("audience", _UCAN_MEMBER_DID),
         ("capability_count", len(_UCAN_REQUESTED_CAPS)),
     ),
-    # WASM has no in-bridge key custody by design (ADR-034): UCAN
-    # signing MUST happen JS-side via `SubtleCrypto` through the TS
-    # SDK wrapper's `mintUcan()` method, which delegates to the WASM
-    # bridge for metadata assembly and then signs the envelope in JS.
-    # The parity harness here exercises the raw bridge, so WASM can't
-    # complete the mint. Lifting this xfail requires exercising the
-    # SDK wrapper in the WASM runner, which is cross-cutting enough
-    # to warrant a dedicated op rather than conflating SDK vs. bridge
-    # coverage inside `ucan_mint`.
-    xfail_bridges=("wasm",),
-    xfail_reason=(
-        "WASM UCAN mint requires JS-side custody (SubtleCrypto) via the TS SDK"
-        " wrapper; raw-bridge parity has no custody to drive it (ADR-034)."
-    ),
 )
 
 
 # ---------------------------------------------------------------------------
 # op 8: ucan_validate_malformed
 #
-# Validate a clearly-malformed UCAN token ("not.a.jwt"). All four bridges
+# Validate a clearly-malformed UCAN token ("not.a.jwt"). All bridges
 # share `scp_protocol::crypto::ucan::validate::parse_ucan` and now map its
 # `UcanError` outputs through each bridge's canonical `From<UcanError>`
-# mapping to SCP-PERM-3001 — matching the reference PyO3 behaviour. WASM
-# and UniFFI previously emitted SCP-PERM-3000 / SCP-PERM-3002 via inline
+# mapping to SCP-PERM-3001 — matching the reference PyO3 behaviour. UniFFI
+# previously emitted SCP-PERM-3002 via inline
 # ad-hoc error construction; that divergence was fixed in the same PR
 # that removed the xfail on this op.
 # ---------------------------------------------------------------------------
 
 
 _MALFORMED_UCAN = "not.a.jwt"
-# Canonical PERM_3001 across all four bridges (UcanError → SCP-PERM-3001).
+# Canonical PERM_3001 across all three bridges (UcanError → SCP-PERM-3001).
 _EXPECTED_MALFORMED_UCAN_CODE = "SCP-PERM-3001"
 
 
@@ -756,8 +742,12 @@ def _py_ucan_validate_malformed(ctx: OpContext) -> dict[str, Any]:
             handle.context_id,
             _MALFORMED_UCAN,
             # Any well-formed capability string — the malformed-JWT
-            # rejection happens before capability matching.
+            # rejection happens at parse, before capability matching.
             "scp:ctx:any/messages:read",
+            # The enforcing gate fails closed without a presenting agent; supply
+            # one so the malformed JWT is still rejected at PARSE (the behavior
+            # under test), not short-circuited by the fail-closed audience gate.
+            identity.did,
         )
     except Exception as err:
         err_type = type(err).__name__
@@ -817,6 +807,9 @@ def _py_ucan_evaluate_malformed(ctx: OpContext) -> dict[str, Any]:
             handle.context_id,
             _MALFORMED_UCAN,
             "scp:ctx:any/messages:read",
+            # Fail-closed presenting-agent gate: supply one so the malformed JWT
+            # is rejected at PARSE (the behavior under test), not short-circuited.
+            identity.did,
         )
     except Exception as err:
         err_type = type(err).__name__
@@ -864,12 +857,8 @@ OP_UCAN_EVALUATE_MALFORMED = OpSpec(
 #    nonce_valid: false, not_revoked: false, time_bounds_valid: false}
 #
 # All six booleans are compared exactly across every bridge (PyO3 reference vs.
-# NAPI / WASM / UniFFI-Kotlin / UniFFI-Swift). The literals are pinned via
+# NAPI / UniFFI-Kotlin / UniFFI-Swift). The literals are pinned via
 # `expected_values` so joint drift (e.g. all bridges flipping a field) is caught.
-#
-# WASM has no in-bridge key custody (ADR-034), so it cannot mint a token on the
-# raw-bridge path the parity harness drives — same constraint as OP_UCAN_MINT.
-# WASM is therefore xfail'd here for the identical reason.
 # ---------------------------------------------------------------------------
 
 
@@ -891,7 +880,10 @@ def _py_ucan_evaluate_structured(ctx: OpContext) -> dict[str, Any]:
     # Evaluate against a capability the token does NOT grant. The required URI is
     # context-scoped exactly as minting scopes the granted caps.
     required = f"scp:ctx:{handle.context_id}/{_UCAN_STRUCTURED_REQUIRED_CAP}"
-    result = scp.ucan_evaluate(handle.context_id, token.encoded, required)
+    # Presenting agent is REQUIRED (fail-closed): pass the token's audience
+    # (the minted member DID) so the step-5 audience check passes and the
+    # failing stage is purely the grant-match, identical across bridges.
+    result = scp.ucan_evaluate(handle.context_id, token.encoded, required, _UCAN_MEMBER_DID)
     return {
         "tokens_valid": result.tokens_valid,
         "signatures_valid": result.signatures_valid,
@@ -932,14 +924,6 @@ OP_UCAN_EVALUATE_STRUCTURED = OpSpec(
         ("not_revoked", False),
         ("time_bounds_valid", False),
     ),
-    # WASM cannot mint on the raw-bridge path (no in-bridge custody, ADR-034) —
-    # identical constraint to OP_UCAN_MINT.
-    xfail_bridges=("wasm",),
-    xfail_reason=(
-        "WASM UCAN mint requires JS-side custody (SubtleCrypto) via the TS SDK"
-        " wrapper; the raw-bridge parity harness has no custody to mint the"
-        " token this op evaluates (ADR-034)."
-    ),
 )
 
 
@@ -954,10 +938,6 @@ OP_UCAN_EVALUATE_STRUCTURED = OpSpec(
 #     that state is `{connected: false, relay_url: None, latency_ms: None}`.
 #   - **NAPI**: `SCP.transportStatus(manager: Option<&NapiTransportManager>)`
 #     — pass `null` for the stateless probe path on the same instance.
-#   - **WASM**: `transport_status()` — free function, SHAPE ASSERTION only.
-#     WASM has no network-capable transport on `wasm32-unknown-unknown`
-#     (ADR-034), so the bridge hardcodes the disconnected triple. The
-#     parity gate pins the cross-bridge shape commitment.
 #   - **UniFFI (Kotlin/Swift)**: `Scp.transportStatus(manager:
 #     TransportManager)` — REQUIRES a non-optional TransportManager handle
 #     after ADR-048 Phase D / #1549 PR 4. The prior handleless probe was
@@ -1008,7 +988,7 @@ OP_TRANSPORT_STATUS = OpSpec(
 # op 10: event_log_query_filtered
 #
 # Create a context (emits ContextCreated), then query the event log
-# with an `event_type=ContextCreated` filter. All four bridges support
+# with an `event_type=ContextCreated` filter. All three bridges support
 # this filter key and must return exactly one event whose type matches
 # the filter. This locks in the filter semantics independently of op 4,
 # which does an unfiltered query.
@@ -1056,13 +1036,13 @@ OP_EVENT_LOG_FILTERED = OpSpec(
 # (SCP-IDENT-1038) — the challenge JSON fails shape validation before any
 # DID lookup happens. This op exercises the OTHER historically-divergent
 # path: a VALID challenge paired with a well-formed but unregistered
-# DID. Before alignment, PyO3 returned SCP-IDENT-1001, NAPI returned
-# SCP-PERM-3023, and WASM returned SCP-IDENT-1010. All four bridges
-# (PyO3, NAPI, WASM, UniFFI-Kotlin, UniFFI-Swift) now converge on
+# DID. Before alignment, PyO3 returned SCP-IDENT-1001 and NAPI returned
+# SCP-PERM-3023. All bridges
+# (PyO3, NAPI, UniFFI-Kotlin, UniFFI-Swift) now converge on
 # SCP-IDENT-1001 (identity-domain, identity-not-found) for this path.
 #
 # Bridge-specific dispatch:
-#   - PyO3/NAPI/WASM `scpid_sign(did_string, …)` looks the DID up in
+#   - PyO3/NAPI `scpid_sign(did_string, …)` looks the DID up in
 #     the bridge-local identity registry; an absent entry surfaces
 #     IDENT-1001 from `with_identity` / `sign_with_identity`.
 #   - UniFFI `scpid_sign(identity: Identity, …)` takes an opaque handle,
@@ -1141,7 +1121,7 @@ SEED_OPS: tuple[OpSpec, ...] = (
     OP_INVALID_CAPABILITY,
     OP_EVENT_LOG_APPEND,
     OP_SIGN_MESSAGE,
-    OP_TOOL_REGISTER,
+    OP_OUTLET_REGISTER,
     OP_UCAN_MINT,
     OP_UCAN_VALIDATE_MALFORMED,
     OP_UCAN_EVALUATE_MALFORMED,

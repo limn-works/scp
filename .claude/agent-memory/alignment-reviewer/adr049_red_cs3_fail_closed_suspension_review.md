@@ -1,0 +1,24 @@
+---
+name: adr049-red-cs3-fail-closed-suspension-review
+description: ADR-049 §9 RED-CS3 review — consequence-engine auto-suspension now persists fail-closed at all cell sites incl tool-settle Err path; ALIGNED zero findings (branch classs-fix-residual, base 272c4d079)
+metadata:
+  type: project
+---
+
+# ADR-049 §9 RED-CS3 fail-closed auto-suspension — ALIGNED, ZERO findings (2026-06-23)
+
+Branch `classs-fix-residual`, base `272c4d079`, UNCOMMITTED working-tree review. 10 files +1264/-185 (1 ADR + 9 Rust). Closes the BEHAVIORAL §9 hole: the consequence ENGINE auto-suspending a member writes the Class-S downward-auth field `suspended_capabilities` through the best-effort `ClassCSplit.role_state` whole-`&mut`, and it rode ONLY the ≤50ms coalesced persist → a crash silently re-granted a denied capability (not re-derived on respawn).
+
+**Fix shape:** `enforce_triggered_consequences` is now `#[must_use] -> bool` (true iff a suspension was APPLIED — GROW direction `suspend_capabilities`/`suspend_all`). New `EnforcementOutcome{success,suspended}` struct splits the two signals. Every cell-holding consequence site persists fail-closed (keep-direction) when the flag is set, before acking; EVALUATION (velocity/cooldown/event/checkpoint-counter/Merkle append) stays best-effort. Five sites verified: send (`persist_finalized_send` free-path upgraded; paid path already token-commit), receive (`handle_deliver_incoming` owns sink, threaded via `&mut bool suspension_sink` through deliver_incoming→validate_and_drain_timeouts/buffer_ahead_message/deliver_message_and_drain_buffered), tool-settle (`settle_tool_economy` persists on **BOTH Ok and Err** arms before `capture_result?`), periodic (`handle_evaluate_periodic_consequences_actor`), governance-execution (`finalize_governance_action` already fail-closed inside `token.discharge_with` at governance_helpers.rs:4903 — flag accumulated then `let _ =` to honor must_use).
+
+**Why the tool-settle sink is the load-bearing design:** suspension is applied IN MEMORY before the fallible payment capture; on capture failure the callee returns Err early — a return-VALUE flag would be stranded by `?`. So it's a CALLER-OWNED `&mut bool` sink. Persist runs regardless of Ok/Err; error precedence = §9 durability (PersistenceFailed) surfaces OVER the capture error, capture cause preserved in message.
+
+**AssignRole = `suspended: false` is CORRECT:** it touches `suspended_capabilities` ONLY via the SHRINK-only `prune_suspensions_to_role_grants` (roles.rs:996, `retain`+remove-if-empty). A coalesce-window rollback of a prune can only RE-SUSPEND (re-narrow, safe direction), never re-grant; rolls back in lockstep with same-persist member_capabilities. In-code comment justifies on rollback-direction basis, NOT by denying the mutation. The two `system_assign_role` callers are member ADD/JOIN (no prior suspension → prune is no-op).
+
+**role_state_mut claim verified:** docs say "now used only by the few system_assign_role sites" — confirmed: 3 prod callers (lifecycle_helpers.rs:1116/1130, governance_helpers.rs:1162) all member ADD/JOIN. Pure-read/clone callers migrated to new `role_state()` (tools_helpers.rs:533) / `role_state_class_c_mut()` (queries_helpers.rs:418/455/487).
+
+**Honest framing:** "behavioral hole CLOSED vs structural surface disclosed" is accurate — whole-`&mut ContextRoleState` still NAMES ceiling/suspended_capabilities (not behind compile-time boundary; closes when system_assign_role reshaped onto RoleStateClassCMut). pub retention attributed to real cross-crate destructure constraint (RoleStateClassCMut::new in scp-runtime destructures ContextRoleState defined in scp-protocol). All false-framing greps (`never the downward-auth`, `mutate ONLY structural fields — never`, `never .suspended_capabilities`, `Slated for deletion`, `residual to CLOSE`, `NOT an ADR-sanctioned`) return ZERO stale hits in crates/+.docs/.
+
+**Artifact flow:** only ADR changed under .docs/ (no spec); §9 invariant text unchanged (as-built strengthening recorded downstream = correct direction). No #NNNN in code (RED-CS3 = ADR-internal finding tag, file convention). Tests: periodic/send/receive (sink-reaches-boundary)/tool-settle-capture-failure all present; `cargo check -p scp-runtime --tests` clean 12.3s. new_for_test_with_escrow is cfg(test,testing)-gated.
+
+LESSON: for a "lift a code invariant + strengthen behavior" review where a fallible op sits AFTER the security-relevant mutation, the must-check is that the persist obligation is carried on a CALLER-OWNED sink (not a return value the `?` strands) and that the persist runs on BOTH success and error arms with correct error precedence. Verify the must_use bool is captured at EVERY call site (grep all callers), and that the "shrink owes no fail-closed persist" classification rests on rollback-DIRECTION reasoning, not on denying the field is touched.

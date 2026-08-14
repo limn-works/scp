@@ -19,3 +19,24 @@
 # is FAIL, not allow. Use this file only when the §1 rule does not fit
 # (e.g., a method that must satisfy a trait's `&self` signature for cross-
 # bridge composability but happens not to dereference `self`).
+
+# ---------------------------------------------------------------------------
+# Outlet-streaming pure verification wrappers (SCP-OUT-037, C10).
+#
+# `outlet_stream_verify_chunk_signature` and
+# `outlet_stream_compute_caveats_binding` are pure, stateless helpers: the
+# former verifies a streamed chunk's signature, the latter derives the
+# caveats-binding hash — neither touches context/actor state, so neither
+# dereferences `self`. They are exposed as `&self` methods (rather than free
+# fns) solely so the four SDKs can present them under the same `outlet_stream_*`
+# API grouping as the stateful control ops (open/poll_next/grant_credit/
+# cancel/terminate). Moving them to free fns would fracture that identical
+# cross-binding shape the SDK surface mirrors, so the ADR-048 §1 escape hatch
+# applies. Registered as parity ops in bridge-aliases.json (all three bridges);
+# this allowlist covers only the orthogonal §1 `&self`-purity concern.
+crates/scp-ffi/src/outlet_stream.rs::outlet_stream_verify_chunk_signature
+crates/scp-ffi/src/outlet_stream.rs::outlet_stream_compute_caveats_binding
+crates/scp-ffi/napi/src/scp.rs::outlet_stream_verify_chunk_signature
+crates/scp-ffi/napi/src/scp.rs::outlet_stream_compute_caveats_binding
+crates/scp-ffi/uniffi/src/outlet_stream.rs::outlet_stream_verify_chunk_signature
+crates/scp-ffi/uniffi/src/outlet_stream.rs::outlet_stream_compute_caveats_binding

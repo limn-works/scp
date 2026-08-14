@@ -34,9 +34,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
+use scp_protocol::context::builder::ReceiveFloor;
+use scp_protocol::crypto::sender_keys::MergePolicy;
 
+use crate::context::supervisor::floors::FloorAdvanceError;
 use crate::context::supervisor::identity_capability::OwnedIdentityDid;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::supervisor::{SagaInput, SagaOutput, Supervisor};
@@ -59,18 +62,169 @@ pub struct SupervisorHandle {
 }
 
 impl SupervisorHandle {
+    // AXIS: actor-internal (ADR-049 §5 placement invariant). Every
+    // PER-IDENTITY method on this handle takes `&OwnedIdentityDid`, never a
+    // bare `&DID` — an actor reaches only the identity that owns it, even for
+    // PUBLIC reads (`my_wrapping_public_key` returns public data yet is
+    // token-gated, because the discriminator is caller-isolation, not
+    // data-sensitivity). A per-identity op callable by the FFI/bridge
+    // orchestrator does NOT belong here: add a bare-`DID` `pub fn` on
+    // `Supervisor` instead (see `Supervisor::create_context`). The
+    // non-per-identity methods below (registry fan-out, saga dispatch,
+    // lifecycle bootstrap) are unaffected by this rule.
+
     /// Wrap an `Arc<Supervisor>`. Visible only to supervisor-module
-    /// code; the bridge instance constructs one at actor spawn time
-    /// (commit 11 wires this through), and handlers receive the handle
-    /// via `ActorDeps` at dispatch time.
-    ///
-    /// `dead_code` allow: commit 6 lands the constructor; the first
-    /// production caller lands with the `BridgeInstance` integration
-    /// in commit 11. The allow is removed then.
+    /// code; the supervisor constructs one in
+    /// [`Supervisor::build_actor_deps`](crate::context::supervisor::Supervisor)
+    /// at actor-spawn time, and handlers receive the handle via
+    /// `ActorDeps` at dispatch time.
     #[must_use]
-    #[allow(dead_code)]
     pub(in crate::context::supervisor) const fn wrap(supervisor: Arc<Supervisor>) -> Self {
         Self { supervisor }
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-049 (read-authority switch) — supervisor-owned floor registry fan-out.
+    //
+    // These accessors are PER-CONTEXT (they take `&[u8; 32]`, NOT
+    // `&OwnedIdentityDid` and NOT `&DID`): they are registry fan-out, which the
+    // AXIS comment above explicitly exempts from the per-identity token rule.
+    // They forward to the same-named `Supervisor` primitives on
+    // `Supervisor.floors`. NONE returns (or exposes) a `ContextActorHandle`, so
+    // Invariant 3 (actors cannot reach sibling actors) is preserved.
+    //
+    // Single-writer / security separation (inquisitor-sharpened, verbatim — it
+    // SEPARATES structural security from liveness): SECURITY — "never accept a
+    // key below the floor" — is STRUCTURAL and caller-topology-independent: the
+    // single-`entry()`-guard body (atomic read → reject-`<=` → reject-overshoot
+    // → write, all under one guard) plus the fail-safe gate-then-key-insert
+    // ordering make key-below-floor impossible no matter who calls. The
+    // per-context single-writer actor (`ContextActor::run()` serializes
+    // gate-then-insert) preserves only LIVENESS (avoids spurious rejects). If
+    // `check_and_advance` were ever called for a LIVE context from OUTSIDE its
+    // owning actor, the gate→insert window would open but stays FAIL-SAFE — it
+    // degrades liveness (a spurious reject / retry), NEVER fail-open. Do NOT
+    // read this as "security depends on single-writer"; security is the
+    // structural gate, single-writer is a liveness convention. PR-6 made the
+    // call: NO separate structural guard is warranted — the single-`entry()`
+    // gate + fail-safe ordering is sufficient now that the gate RESULT is
+    // security-enforced (fail-closed at the seams); co-locating the gate with the
+    // key insert is deferred to PR-7's key-move, which co-serializes it for free.
+
+    /// Advance a per-sender epoch floor in the authoritative registry, FAIL-CLOSED.
+    /// See [`Supervisor::check_and_advance_sender_epoch`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting epoch;
+    /// the live receive seams surface it via `?` and abort the operation (it is
+    /// NEVER log-and-dropped).
+    pub(in crate::context) fn check_and_advance_sender_epoch(
+        &self,
+        ctx: &[u8; 32],
+        did: &str,
+        epoch: u64,
+        max_advance: u64,
+    ) -> Result<(), FloorAdvanceError> {
+        self.supervisor
+            .check_and_advance_sender_epoch(ctx, did, epoch, max_advance)
+    }
+
+    /// Advance a per-sender receive-sequence floor in the authoritative registry,
+    /// FAIL-CLOSED. See [`Supervisor::check_and_advance_recv_sequence`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`FloorAdvanceError`] on a non-monotonic or overshooting
+    /// `(epoch, sequence)`; the recv seam surfaces it via `?` (never dropped).
+    pub(in crate::context) fn check_and_advance_recv_sequence(
+        &self,
+        ctx: &[u8; 32],
+        did: &str,
+        next: ReceiveFloor,
+        max_advance: u64,
+    ) -> Result<(), FloorAdvanceError> {
+        self.supervisor
+            .check_and_advance_recv_sequence(ctx, did, next, max_advance)
+    }
+
+    /// Read the registry's per-sender epoch floors for `ctx`. See
+    /// [`Supervisor::export_sender_key_epochs`].
+    ///
+    /// ADR-049 PR-6: the authoritative durable-blob export source (the 6
+    /// production `export_crypto_state` callers).
+    #[must_use]
+    pub(in crate::context) fn export_sender_key_epochs(
+        &self,
+        ctx: &[u8; 32],
+    ) -> Vec<(String, u64)> {
+        self.supervisor.export_sender_key_epochs(ctx)
+    }
+
+    /// Read the registry's per-sender receive-sequence floors for `ctx`. See
+    /// [`Supervisor::export_recv_sequence_floors`].
+    ///
+    /// ADR-049 PR-6: the authoritative durable-blob export source (the 6
+    /// production `export_crypto_state` callers).
+    #[must_use]
+    pub(in crate::context) fn export_recv_sequence_floors(
+        &self,
+        ctx: &[u8; 32],
+    ) -> Vec<(String, ReceiveFloor)> {
+        self.supervisor.export_recv_sequence_floors(ctx)
+    }
+
+    /// Atomically merge BOTH the per-sender epoch floors AND the receive-sequence
+    /// floors into the registry under one guard (the restore/import sink). See
+    /// [`Supervisor::validate_and_merge_all_floors`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`FloorAdvanceError`] on an Inv-3 regression
+    /// ([`MergePolicy::RejectRegression`]) or an overshoot (RejectRegression only).
+    pub(in crate::context) fn validate_and_merge_all_floors(
+        &self,
+        ctx: &[u8; 32],
+        epochs: Vec<(String, u64)>,
+        recv: Vec<(String, ReceiveFloor)>,
+        max_advance: u64,
+        policy: MergePolicy,
+    ) -> Result<(), FloorAdvanceError> {
+        self.supervisor
+            .validate_and_merge_all_floors(ctx, epochs, recv, max_advance, policy)
+    }
+
+    /// Create-seed the floor registry for `ctx` (insert-if-absent). See
+    /// [`Supervisor::seed_context_floors`].
+    pub(in crate::context) fn seed_context_floors(&self, ctx: &[u8; 32]) {
+        self.supervisor.seed_context_floors(ctx);
+    }
+
+    /// Permanent-teardown prune of the floor registry entry for `ctx`. See
+    /// [`Supervisor::remove_context_floors`] — including the permanent-vs-
+    /// transient safety argument. Callers (the terminal close / TTL-expiry /
+    /// shutdown paths) invoke this only when the context is permanently gone.
+    pub(in crate::context) fn remove_context_floors(&self, ctx: &[u8; 32]) {
+        self.supervisor.remove_context_floors(ctx);
+    }
+
+    /// Member-granular floor prune of `did` from `ctx`'s registry entry. See
+    /// [`Supervisor::remove_member_floors`] — the member-granular twin of
+    /// `remove_context_floors` (keeps siblings + the local scalar; drops only the
+    /// departed member's floors under one guard). ADR-049 PR-6: called from every
+    /// member-removal seam.
+    pub(in crate::context) fn remove_member_floors(&self, ctx: &[u8; 32], did: &str) {
+        self.supervisor.remove_member_floors(ctx, did);
+    }
+
+    /// Permanent-teardown drop of the per-context outlet-stream admission
+    /// registry entry for `context_id` (spec §5.4.5) — the streaming twin of
+    /// [`Self::remove_context_floors`]. See
+    /// [`Supervisor::reap_stream_admission`] for the live-Arc safety
+    /// argument. Callers (the terminal close / TTL-expiry paths) invoke this
+    /// only when the context is permanently gone.
+    pub(in crate::context) fn reap_stream_admission(&self, context_id: &str) {
+        self.supervisor.reap_stream_admission(context_id);
     }
 
     /// Start a cross-context saga. The ONLY way for an actor to affect
@@ -78,8 +232,8 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// See `Supervisor::start_saga`. Commit 6: always
-    /// [`ContextError::NotImplemented`].
+    /// Errors propagate from `Supervisor::start_saga` — the saga
+    /// terminal/abort mapping.
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
         self.supervisor.start_saga(input).await
     }
@@ -374,24 +528,6 @@ impl SupervisorHandle {
         .await;
     }
 
-    /// **TRANSITIONAL — shim dispatch period only.** Returns the inner
-    /// `Arc<Supervisor>` so the actor's `run()` loop can route commands
-    /// through the legacy `dispatch_from_shim` handler entry points
-    /// during the Phase 2A → 2I migration window. Removed when handlers
-    /// are migrated to the `(&mut PerContextState, &ActorDeps)`
-    /// signature in the per-domain rows of Phase 2.
-    ///
-    /// Visibility is `pub(in crate::context)` so only code within the
-    /// `context` module tree (the actor's run loop) can call this.
-    /// Handler bodies under `actor/handlers/` MUST NOT call this — they
-    /// receive the supervisor via the explicit `&Supervisor` parameter
-    /// of their `dispatch_from_shim` entry point.
-    #[must_use]
-    #[allow(dead_code)]
-    pub(in crate::context) fn shim_supervisor(&self) -> Arc<Supervisor> {
-        Arc::clone(&self.supervisor)
-    }
-
     /// Spawn a per-context [`ContextActor`](crate::context::actor::ContextActor)
     /// task that owns the supplied
     /// [`PerContextState`](crate::context::actor::state::PerContextState) +
@@ -404,16 +540,15 @@ impl SupervisorHandle {
     /// in [`crate::context::lifecycle_helpers`] (`create_context`,
     /// `restore_context`, `import_context`) call this after building the
     /// actor-shape state so production paths populate
-    /// `Supervisor::actors` instead of going through the legacy
-    /// contexts-map insert. Subsequent finalization commits delete the
-    /// legacy DashMap once every consumer is ported.
+    /// `Supervisor::actors`, the sole context registry; there is no
+    /// legacy contexts-map.
     ///
     /// # Visibility
     ///
     /// `pub(in crate::context)` — only lifecycle bootstrap callers
     /// (`crate::context::lifecycle_helpers`) reach this. The
-    /// `private_interfaces` allow mirrors the discipline used by
-    /// [`Self::insert_context`] / [`Self::replace_context`]:
+    /// `private_interfaces` allow mirrors the discipline used by the other
+    /// owned-state `pub(in crate::context)` registry methods on this handle:
     /// `PerContextState` and `ActorDeps` are `pub(crate)` while the
     /// method itself is reachable from inside the `context` module
     /// tree.
@@ -434,7 +569,21 @@ impl SupervisorHandle {
             .await
     }
 
-    /// Dispatch [`LifecycleControlCommand::PrepareForReplace`] to the
+    // NOTE (ADR-049 Phase 2J): the spawn-from-Welcome joiner seam is NOT a
+    // `SupervisorHandle` method. `Supervisor::reserve_key_package` and
+    // `Supervisor::spawn_actor_from_welcome` are bridge-initiated node-level
+    // bootstraps (the app receives a Welcome, or pre-publishes KeyPackages), so
+    // they live as genuinely-`pub` `Supervisor` entrypoints taking a bare `DID`
+    // — the same shape as `Supervisor::create_context`, with local-identity
+    // custody enforced at the FFI bridge layer. They are deliberately NOT gated
+    // on `&OwnedIdentityDid`: that token is the actor-internal per-identity-
+    // secret axis (ADR-049 Decision 5), and neither op returns identity-private
+    // crypto — `reserve_key_package` yields only a `ReservationId` + PUBLIC
+    // KeyPackage bytes, and `spawn_actor_from_welcome` yields a `ContextHandle`
+    // (context state), so §5's "no `&DID` method returning identity state" rule
+    // is not triggered.
+
+    /// Dispatch [`LifecycleControlCommand::PrepareForReplace`](crate::context::actor::commands::LifecycleControlCommand::PrepareForReplace) to the
     /// actor currently registered for `context_id`, awaiting its verdict.
     ///
     /// This is the actor-native replacement gate for
@@ -489,22 +638,30 @@ impl SupervisorHandle {
     /// entry from `Supervisor::actors` under the supervisor's
     /// `write_lock` so concurrent registrations cannot race.
     ///
-    /// Used by [`crate::context::lifecycle_helpers::import_context`] —
-    /// import overwrites an existing context, so the prior actor's
-    /// mailbox is shut down before the fresh actor is spawned. The
-    /// handle's [`Drop`](crate::context::actor::handle::ContextActorHandle)
-    /// closes the underlying `mpsc::Sender`, which causes the actor
-    /// task's `run()` loop to exit on the next inbox-empty poll.
+    /// Two callers:
+    /// - `import_context` — import overwrites an existing context, so the
+    ///   prior actor's mailbox is shut down before the fresh actor is
+    ///   spawned.
+    /// - `ContextActor::run()` on a terminal TTL self-expiry — the actor
+    ///   despawns its OWN registry handle (`&self.context_id`) before
+    ///   breaking the run loop, so the dead-but-registered handle does not
+    ///   linger (the watchdog deliberately leaves clean `Ok(())` exits
+    ///   registered to avoid racing PrepareForReplace; ADR-049 finding A3).
+    ///
+    /// Removing the entry drops the registered
+    /// [`ContextActorHandle`](crate::context::actor::handle::ContextActorHandle),
+    /// whose `Drop` closes the `mpsc::Sender`, so the actor task's `run()`
+    /// loop exits on the next inbox-empty poll (a no-op when the caller is
+    /// the exiting actor itself).
     ///
     /// Returns `true` if a handle was registered and removed,
     /// `false` if no entry existed for `context_id`.
     ///
     /// # Visibility
     ///
-    /// `pub(in crate::context)` — the import-bootstrap path is the
-    /// only caller. Removed when the actor map is the sole context
-    /// registry and `Supervisor::contexts` is deleted.
-    #[allow(dead_code)]
+    /// `pub(in crate::context)` — reachable by lifecycle bootstrap and by
+    /// the actor's own run loop, not by handler bodies under
+    /// `actor/handlers/`.
     pub(in crate::context) async fn despawn_actor(&self, context_id: &str) -> bool {
         self.supervisor.despawn_actor(context_id).await
     }
@@ -563,68 +720,38 @@ impl SupervisorHandle {
     }
 
     // -----------------------------------------------------------------
-    // Timer-task surface (ADR-049 Phase 2A finalization — TTL +
-    // governance timer → actor registry + mailbox tick).
+    // Actor-resolution surface.
     //
-    // Per-context timer tasks (TTL expiry, governance timeout) are
-    // supervisor-scoped infrastructure: they are spawned onto the
-    // supervisor's `task_set` so shutdown can abort them, and on each
-    // wake they resolve the target actor through the lock-free `actors`
-    // registry and mailbox a tick command (`TtlCloseCommand::FireTimer`
-    // / `GovernanceCommand::EvaluateTimeouts`). A `lookup → None`
-    // (despawned actor) replaces the legacy stale-generation gate: the
-    // timer stops cleanly when the context's actor no longer exists.
+    // `lookup` resolves a `context_id` to the owning `ContextActorHandle`
+    // through the lock-free `actors` registry. It is used by the
+    // supervisor-side dispatch routing (`dispatch_*_command`) and the
+    // bootstrap TTL-arm dispatch (`dispatch_start_ttl_timer`). It is NOT a
+    // timer surface: TTL + governance timers are ACTOR-OWNED arms
+    // reconciled inside `ContextActor::run()` (ADR-049 Decision-1 /
+    // finding A3), so no detached timer task resolves actors this way.
     //
     // `lookup` is the ONE place a `SupervisorHandle` yields a
     // `ContextActorHandle`. It does NOT breach the "actors cannot reach
-    // sibling actors" contract: the caller is a detached timer task, not
-    // a handler running inside another actor's dispatch turn. Visibility
-    // is `pub(in crate::context)` so only `crate::context` infra (the
-    // timer-spawn helpers in `ttl_close_helpers` / `governance_helpers`)
-    // can reach it — handler bodies under `actor/handlers/` are
-    // `pub`-only consumers of the handle and cannot name this method.
+    // sibling actors" contract: the callers are supervisor-side dispatch
+    // and bootstrap helpers, not a handler running inside another actor's
+    // dispatch turn. Visibility is `pub(in crate::context)` so only
+    // `crate::context` infra can reach it — handler bodies under
+    // `actor/handlers/` are `pub`-only consumers of the handle and cannot
+    // name this method.
     // -----------------------------------------------------------------
 
     /// Resolve the actor handle for `context_id` through the lock-free
     /// `Supervisor::actors` registry. Returns `None` if no actor is
     /// registered (context gone / not yet spawned).
     ///
-    /// Used by the per-context timer tasks to mailbox their tick command
-    /// to the owning actor. See the timer-task surface comment above for
-    /// why this is the single sanctioned `ContextActorHandle` yield.
+    /// See the actor-resolution surface comment above for why this is the
+    /// single sanctioned `ContextActorHandle` yield.
     #[must_use]
     pub(in crate::context) fn lookup(
         &self,
         context_id: &str,
     ) -> Option<crate::context::actor::handle::ContextActorHandle> {
         self.supervisor.lookup(context_id)
-    }
-
-    /// Spawn `fut` onto the supervisor's shared `task_set` JoinSet so the
-    /// task is tracked and aborted on supervisor shutdown. Returns the
-    /// task's [`AbortHandle`](tokio::task::AbortHandle) so the caller can
-    /// store it on actor-owned timer state for cancel/reset.
-    ///
-    /// Returns `None` if the supervisor has no task set (built via
-    /// [`Supervisor::new`] / `for_query_shim` rather than
-    /// [`Supervisor::with_providers`]); in that degraded configuration no
-    /// background timer can be spawned, matching the legacy
-    /// `task_set_ref() == None` early-return.
-    ///
-    /// Lock note: acquires the `task_set` mutex only to call
-    /// `JoinSet::spawn` (a synchronous push), then releases it. This is a
-    /// supervisor-scoped write-path lock, not a read-path lock — ADR-049
-    /// §12 (no `Mutex`/`RwLock` on read paths) is not implicated.
-    pub(in crate::context) async fn tracked_spawn<F>(
-        &self,
-        fut: F,
-    ) -> Option<tokio::task::AbortHandle>
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        let task_set_arc = std::sync::Arc::clone(self.supervisor.task_set_ref()?);
-        let mut task_set = task_set_arc.lock().await;
-        Some(task_set.spawn(fut))
     }
 
     /// Install the per-context TTL timer for `context_id` by mailboxing
@@ -640,23 +767,24 @@ impl SupervisorHandle {
     /// installation to the actor through this mailbox dispatch.
     ///
     /// Best-effort: a `lookup → None` (actor not yet registered) or a
-    /// mailbox-send failure is logged and skipped — the timer is a
-    /// background facility, not part of the create/restore success
-    /// contract (matching the legacy `spawn_ttl_timer_legacy`
-    /// no-actor / no-task-set early-returns).
+    /// mailbox-send failure is logged and skipped — arming the TTL deadline
+    /// is a background facility, not part of the create/restore success
+    /// contract. (The actor's own `reconcile_timers` arms the one-shot TTL
+    /// sleep from the recorded `deadline_unix_secs`; ADR-049 finding A3.)
     pub(in crate::context) async fn dispatch_start_ttl_timer(
         &self,
         context_id: &str,
         params: scp_protocol::context::params::ContextParams,
-        duration: std::time::Duration,
-        // `true` for both the initial-create path and the restore/import path:
-        // anchor the convergent expiry deadline on the actor's
-        // `creation_timestamp_secs + params.ttl`. The signed snapshot carries
-        // the convergent creator-assigned creation time, consumed verbatim on
-        // import, so import/restore arms identically to create. `false` arms
-        // relative to the local clock and is used only when no convergent
-        // creation time is available. See `TtlTimerPayload`.
-        anchor_deadline_to_creation: bool,
+        // The ABSOLUTE convergent expiry deadline to record, as a
+        // [`ConvergentDeadline`](crate::context::ttl_close_helpers::ConvergentDeadline)
+        // — the arming-seam newtype that can only be minted from the single
+        // authoritative source (B1). `None` (initial-create / spawn-from-Welcome)
+        // lets the actor handler derive the convergent create base
+        // `creation_timestamp_secs + params.ttl`. The restore/import paths pass
+        // `Some` — the deadline `convergent_ttl_deadline` derived from the event
+        // log — so a prior extension survives and a `None`-remaining Active
+        // snapshot still re-arms (D1/D2). See `TtlTimerPayload::deadline_override`.
+        deadline_override: Option<crate::context::ttl_close_helpers::ConvergentDeadline>,
     ) {
         use crate::context::actor::commands::{ContextCommand, TtlCloseCommand, TtlTimerPayload};
 
@@ -672,8 +800,11 @@ impl SupervisorHandle {
             payload: Box::new(TtlTimerPayload {
                 context_id: context_id.to_owned(),
                 params,
-                duration,
-                anchor_deadline_to_creation,
+                // Vestigial for `StartTtlTimer` — only `ResetTtlTimer` reads
+                // `duration` (as the extension amount). The absolute deadline is
+                // carried by `deadline_override`.
+                duration: std::time::Duration::ZERO,
+                deadline_override,
             }),
             reply: reply_tx,
         });
@@ -698,6 +829,23 @@ impl SupervisorHandle {
             );
         }
     }
+
+    /// Fix-D — dispatch the restore-time streaming crash-recovery sweep to a
+    /// freshly-respawned actor, delegating to
+    /// [`Supervisor::reconcile_stream_reservations_via_actor`](crate::context::supervisor::Supervisor::reconcile_stream_reservations_via_actor).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the dispatch / reply-channel [`ContextError`] from the inner
+    /// supervisor (callers on the restore path treat it best-effort).
+    pub(in crate::context) async fn reconcile_stream_reservations_via_actor(
+        &self,
+        context_id: &str,
+    ) -> Result<usize, scp_protocol::context::ContextError> {
+        self.supervisor
+            .reconcile_stream_reservations_via_actor(context_id)
+            .await
+    }
 }
 
 // Explicit non-exposure check: ensure no public method returns
@@ -707,8 +855,8 @@ impl SupervisorHandle {
 //
 // Any method added to this impl that returns `ContextActorHandle`,
 // `Arc<Supervisor>`, `&Supervisor`, or `&mut Supervisor` breaks the
-// capability-reduction contract. Plan §"Mechanical enforcement" adds a
-// CI grep-ban against those return types in this file in commit 12.
+// capability-reduction contract. The contract is maintained by this
+// documented rule plus review — there is no CI grep-ban for it.
 
 // ---------------------------------------------------------------------------
 // Forbidden trait impls — compile-time checklist
@@ -721,8 +869,8 @@ impl SupervisorHandle {
 //   Arc out past the capability boundary.
 //
 // These are documentation, not static assertions — Rust has no
-// "forbid impl of trait X" attribute. The CI grep-ban landing in
-// commit 12 is the mechanical enforcement.
+// "forbid impl of trait X" attribute. The rule is upheld by review,
+// not a CI grep-ban.
 
 // Compile-time witness that `SupervisorHandle` is `Send + Sync` — the
 // handle rides inside `ActorDeps`, which is moved into `tokio::spawn`.
@@ -744,19 +892,20 @@ mod tests {
     use crate::context::supervisor::saga_journal::{ProtocolRepositorySagaJournal, SagaJournal};
     use crate::context::supervisor::supervisor::SupervisorConfig;
     use arc_swap::ArcSwap;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
     use zeroize::Zeroizing;
 
     struct TestPersistence;
+    #[async_trait::async_trait]
     impl crate::context::persistence::ContextPersistence for TestPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -765,26 +914,13 @@ mod tests {
         > {
             Ok(None)
         }
-        fn persist_broadcast(
+        async fn delete_context(
             &self,
             _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -853,19 +989,22 @@ mod tests {
     #[tokio::test]
     async fn my_key_package_store_returns_registered_handle() {
         use crate::context::supervisor::key_package_actor::KeyPackageStoreDeps;
-        use crate::crypto::mls::provider::MlsCryptoProvider;
+        use crate::crypto::mls::provider::NodeMlsFactory;
         use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
 
         let (sup, handle) = test_handle();
         let did = DID("did:dht:z6MkAliceKpStore".to_owned());
-        let crypto = Arc::new(MlsCryptoProvider::new(did.0.clone()));
+        let crypto = Arc::new(NodeMlsFactory::new(
+            did.0.clone(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(SpawnBlockingStorageAdapter::new(Arc::new(
                 InMemoryStorage::new(),
             )));
         let transport: Arc<dyn crate::context::builder::ContextTransportProvider> =
             Arc::new(crate::context::builder::NotConfiguredTransportProvider);
-        let clock: Arc<dyn scp_primitives::Clock> = Arc::new(scp_primitives::SystemClock);
+        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::SystemClock);
         let deps = KeyPackageStoreDeps {
             mls: Arc::clone(crypto.mls_backend()),
             mls_storage,

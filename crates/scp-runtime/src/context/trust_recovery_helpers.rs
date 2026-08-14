@@ -46,7 +46,7 @@
 // contract.
 #![allow(clippy::needless_pass_by_ref_mut)]
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
@@ -55,7 +55,8 @@ use scp_protocol::context::governance::{
 use crate::context::actor::class_s::ClassSCell;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
-use crate::context::state::{context_id_to_bytes, require_active};
+use crate::context::governance_helpers::{keep_broadcast_failure, try_broadcast_commit};
+use crate::context::state::{CommitOperation, context_id_to_bytes, require_active};
 
 // ---------------------------------------------------------------------------
 // 1. create_governance_checkpoint
@@ -73,7 +74,7 @@ use crate::context::state::{context_id_to_bytes, require_active};
 /// flags this as `mutated: true` only because pruning has external side
 /// effects worth coalescing into the actor's persist tick.
 #[allow(clippy::too_many_arguments)]
-pub fn create_governance_checkpoint(
+pub async fn create_governance_checkpoint(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -120,6 +121,7 @@ pub fn create_governance_checkpoint(
         if deps
             .event_log
             .prune_before_checkpoint(&context_id_bytes, event_count, policy)
+            .await
             .is_some_and(|pruned| pruned > 0)
         {
             tracing::info!(
@@ -191,6 +193,22 @@ pub fn add_checkpoint_cosignature(
 /// `deps.transport`; the epoch-advancement event is appended via
 /// `deps.event_log`.
 ///
+/// # Fail-closed broadcast (spec §9.12 / ADR-049 §9)
+///
+/// The epoch-advance Commit rides the SAME persistent retry queue as the other
+/// epoch-advancing commits: [`try_broadcast_commit`] +
+/// [`keep_broadcast_failure`]. On transport failure the `commit_fault`
+/// safety-gate marker and the `pending_commits` retry entry are persisted
+/// FAIL-CLOSED (a second `commit_class_s_keep`), and a second-persist failure
+/// aborts recovery with [`ContextError::PersistenceFailed`] — recovery is NOT
+/// acked unless the retry is durable. This replaces the former warn-and-drop,
+/// which could leave this node at epoch N+1 believing recovery succeeded while
+/// remaining members stayed at epoch N still using the compromised keys (silent
+/// post-compromise desync). Recovery re-entry itself does NOT read `commit_fault`
+/// (that gate trips on a full retry queue OR on retry exhaustion
+/// (`MAX_COMMIT_RETRIES`) in the retry drain, and only blocks
+/// send/lifecycle/governance), so the fail-close here cannot deadlock recovery.
+///
 /// # No relock / generation gate
 ///
 /// The legacy version dropped the per-context lock around the MLS
@@ -202,7 +220,7 @@ pub fn add_checkpoint_cosignature(
 /// on the actor's mailbox between awaits, but the ordering of mailbox
 /// commands means a `LifecycleControl::Pause` would have already
 /// completed by the time we resume here. Re-checking is defense-in-depth.
-pub fn recovery_advance_epoch(
+pub async fn recovery_advance_epoch(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -212,27 +230,44 @@ pub fn recovery_advance_epoch(
     // 1. Validate the context is active.
     require_active(&cell.handle)?;
 
-    // 2. Perform the MLS epoch advance (Update + self-Commit). Operates
-    //    on the supervisor-scoped `MlsCryptoProvider` contexts map; this
-    //    will move onto `state.mode` directly when the MLS provider
-    //    dissolves (plan §"MlsCryptoProvider dissolution"). If this
-    //    fails the bookkeeping counter is NOT incremented.
-    let epoch_output = deps.crypto.advance_epoch(&context_id_bytes)?;
+    // 2. Perform the MLS epoch advance (Update + self-Commit). ADR-049 PR-7
+    //    (SCP-CRYPTOMOVE-001): now driven on the actor `state.mode` via
+    //    `commit_class_s_keep` -> `rest_mut` — §9 Class-S, the ratchet is durable
+    //    before the Commit is broadcast (this is the highest-stakes safety-gated
+    //    advance; see the broadcast note below). `wrapping_public_key` from the
+    //    retained `deps.crypto.wrapping_keypair()`. If this fails (or its
+    //    fail-closed persist fails) the error `?`-propagates and the bookkeeping
+    //    counter is NOT incremented — disposition preserved.
+    let wrapping_public_key = deps.crypto.wrapping_keypair().0;
+    let epoch_commit_bytes = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            v.rest_mut()
+                .advance_epoch(wrapping_public_key)
+                .map(|out| out.commit_bytes)
+        })
+        .await?;
 
-    // 2b. Broadcast the MLS Commit to all members so they can advance
-    //     their group epoch and ratchet key material.
-    if !epoch_output.commit_bytes.is_empty() {
-        let routing_id = scp_protocol::context::context_routing_id(context_id);
-        if let Err(e) = deps
-            .transport
-            .send_message(&routing_id, &epoch_output.commit_bytes)
-        {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to broadcast recovery epoch advance MLS Commit"
-            );
-        }
+    // 2b. Broadcast the MLS Commit to all members so they advance their group
+    //     epoch and ratchet key material AWAY from the compromised keys. Broadcast
+    //     async (ADR-049 Decision 7); on FAILURE the retry-queue bookkeeping — the
+    //     `commit_fault` safety-gate marker and the `pending_commits` entry that is
+    //     the ONLY re-delivery of this Commit — is persisted FAIL-CLOSED via
+    //     `keep_broadcast_failure`. This is the highest-stakes safety-gated
+    //     broadcast in the system: a warn-and-drop here would leave the local node
+    //     at epoch N+1 believing recovery succeeded while remaining members stay at
+    //     epoch N still using the compromised keys — silent post-compromise desync
+    //     letting the excluded/compromised party retain read access (spec §9.12).
+    //     `try_broadcast_commit` no-ops on empty bytes (the cfg(test) no-crypto
+    //     pipeline), so no `is_empty` guard is needed here.
+    if let Some(failure) = try_broadcast_commit(
+        deps,
+        context_id,
+        epoch_commit_bytes,
+        &CommitOperation::RecoveryAdvanceEpoch,
+    )
+    .await
+    {
+        keep_broadcast_failure(cell, deps, context_id, failure).await?;
     }
 
     // 3. Re-validate after the crypto op to close the TOCTOU window
@@ -268,18 +303,28 @@ pub fn recovery_advance_epoch(
     // initiator's clock — the source of the `created_at` on the broadcast MLS
     // Commit, copied by every member (§7.3.1, §9.9.3).
     let recovery_ts = deps.clock.now_secs();
-    if let Err(e) = recovery_payload
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))
-        .and_then(|payload| {
-            deps.event_log.append_context_event_with_payload(
-                &context_id_bytes,
-                scp_event_log::EventType::RecoveryEpochAdvanced,
-                "system:recovery",
-                payload,
-                recovery_ts,
-            )
-        })
-    {
+    // The append is now async (ADR-049 Decision 7), so the former
+    // `.map_err(..).and_then(|payload| ...)` combinator chain (whose closure
+    // cannot `.await`) is unrolled imperatively: encode the payload first, then
+    // await the append. Both the encode failure and the append failure are
+    // non-fatal (recovery must not be blocked by logging issues), warned with
+    // the same message as before.
+    let append_result =
+        match recovery_payload.map_err(|e| ContextError::EventLogFailed(e.to_string())) {
+            Ok(payload) => {
+                deps.event_log
+                    .append_context_event_with_payload(
+                        &context_id_bytes,
+                        scp_event_log::EventType::RecoveryEpochAdvanced,
+                        "system:recovery",
+                        payload,
+                        recovery_ts,
+                    )
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+    if let Err(e) = append_result {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
@@ -293,7 +338,7 @@ pub fn recovery_advance_epoch(
     //    the next 50ms tick anyway, but the legacy path persisted
     //    inline — preserve that timing for behaviour parity. Best-effort
     //    persist of the just-mutated Class-C state via a shared read.
-    persist_state_best_effort(cell, deps, context_id);
+    persist_state_best_effort(cell, deps, context_id).await;
 
     Ok(new_epoch)
 }
@@ -306,11 +351,12 @@ pub fn recovery_advance_epoch(
 /// purposes (spec §9.12 step 5).
 ///
 /// State-owning signature: reads `state.epoch.mls_epoch` for envelope
-/// construction and `deps.clock` for the timestamp. Sealing routes
-/// through `deps.crypto` (still supervisor-scoped during the migration
-/// window); transport delivery via `deps.transport`. Does NOT mutate
-/// `state`.
-pub fn recovery_send_notification(
+/// construction and `deps.clock` for the timestamp. Sealing routes through
+/// the actor-owned `ContextCryptoState` (the Class-C `crypto_mut()` view),
+/// reserving from the actor's authoritative `send_tracker`; transport
+/// delivery via `deps.transport`. Mutates only the coalesced Class-C
+/// `send_tracker` counter (advanced once per successful seal).
+pub async fn recovery_send_notification(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -340,24 +386,61 @@ pub fn recovery_send_notification(
         message_type: scp_protocol::envelope::inner::MessageType::Recovery,
         payload,
         provenance: None,
-        signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+        signing_key_id: scp_did::SigningKeyId::Active,
     };
 
     let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-    // Use domain-separated routing ID for relay routing, distinct from
-    // the raw context_id_bytes used for MLS crypto keying.
+    // Use domain-separated routing ID for relay routing, distinct from the
+    // chokepoint-resolved 32-byte digest `context_id_bytes` (per ADR-056,
+    // resolved above via `context_id_to_bytes`) used for MLS crypto keying.
     let routing_id = scp_protocol::context::context_routing_id(context_id);
-    let encrypted = deps.crypto.seal(
-        &context_id_bytes,
-        &inner,
-        &routing_id,
-        300, // 5 minute blob TTL
-    )?;
+
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): seal through the actor-owned
+    // `ContextCryptoState` (the field-granular Class-C `crypto_mut()` view), not
+    // the retired supervisor-scoped provider. Recovery notifications share the
+    // actor's authoritative send-sequence counter with ordinary sends, so this
+    // reserves from the same `send_tracker`: read the pre-increment high-water
+    // mark as the sender-layer AAD sequence (byte-identical to the provider,
+    // which read `state.send_sequence` then post-incremented), guard the
+    // `u64::MAX` overflow boundary fail-closed BEFORE sealing so nothing is
+    // emitted and the counter is left untouched at the ceiling, seal, then
+    // advance the tracker exactly once on a successful seal via the single
+    // canonical `SequenceReservation`. A `?`-early return on seal failure leaves
+    // the counter untouched, matching the provider's `checked_add(1)`
+    // fail-closed. The send-tracker bookkeeping is a coalesced Class-C mutation
+    // (the run loop persists on `mutated`), routed through the non-persisting
+    // `class_c_view`.
+    // Seal inside a block so the `class_c_view` (whose field-granular borrows of
+    // `PerContextState` are `Send + !Sync`) is dropped BEFORE the transport
+    // `.await` below — the enclosing actor future must stay `Send`.
+    let encrypted = {
+        let mut view = cell.class_c_view();
+        let aad_sequence = view.send_tracker_mut().last_issued();
+        if aad_sequence == u64::MAX {
+            return Err(ContextError::CryptoFailed(
+                "send sequence counter overflow".into(),
+            ));
+        }
+        let crypto = view.mode_mut().crypto_mut().ok_or_else(|| {
+            ContextError::CryptoFailed("no MLS group for this context".to_string())
+        })?;
+        let encrypted = crypto.seal(
+            &context_id_bytes,
+            deps.crypto.local_did(),
+            &inner,
+            &routing_id,
+            300, // 5 minute blob TTL
+            aad_sequence,
+        )?;
+        crate::context::actor::sequence::SequenceReservation::reserve(view.send_tracker_mut())
+            .commit();
+        encrypted
+    };
 
     // Send via transport using the domain-separated routing ID.
-    deps.transport.send_message(&routing_id, &encrypted)?;
+    deps.transport.send_message(&routing_id, &encrypted).await?;
 
     Ok(())
 }
@@ -374,13 +457,13 @@ pub fn recovery_send_notification(
 ///
 /// This helper is cross-context but stays actor-shape: the
 /// shared-context lookup goes through
-/// [`SupervisorHandle::find_shared_context`], the only narrow
+/// [`SupervisorHandle::find_shared_context`](crate::context::supervisor::handle::SupervisorHandle::find_shared_context), the only narrow
 /// capability the actor's `deps.supervisor` exposes for cross-context
 /// membership reads. The actor making the call cannot reach the
 /// target context's actor directly (capability-reduced handle, see
 /// ADR-049 §2 / plan §`ActorDeps` and `SupervisorHandle`). Once the
 /// shared context is identified, the notification dispatches through
-/// [`SupervisorHandle::dispatch_recovery_send_notification`] which
+/// [`SupervisorHandle::dispatch_recovery_send_notification`](crate::context::supervisor::handle::SupervisorHandle::dispatch_recovery_send_notification) which
 /// routes a `RecoverySendNotification` command to the target
 /// context's actor mailbox (or falls through to the legacy lock-
 /// shaped handler if no actor is registered yet).
@@ -440,17 +523,34 @@ pub async fn recovery_notify_contact(
 /// `manager_methods::persist_context_snapshot` but reads fields off
 /// the actor's `PerContextState` rather than the legacy lock-shaped
 /// type. The MLS crypto state export still goes through the
-/// supervisor-scoped `MlsCryptoProvider` (matches the legacy path);
+/// supervisor-scoped `NodeMlsFactory` (matches the legacy path);
 /// this collapses into `state.mode` after the MLS provider dissolution
 /// in a later Phase 2 sub-chunk.
-fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
+fn persist_state_best_effort<'d, 'c>(
+    state: &PerContextState,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
+) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
     let mut snapshot = build_snapshot_from_state(state);
 
     // Export MLS crypto state alongside the context snapshot (#645).
     // AC3 bug 2: on export failure, mark the snapshot
     // `needs_reconnect = true` and persist an empty crypto blob.
     let ctx_id_bytes = context_id_to_bytes(context_id);
-    match deps.crypto.export_crypto_state(&ctx_id_bytes) {
+    // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
+    // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
+    // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
+    // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
+    // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
+    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
+    // sequence is read from `state.send_tracker` inside the twin.
+    let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
+    match state.export_crypto_state(
+        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
+        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
+        wrapping_public_key,
+        &*wrapping_secret_key,
+    ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {
             snapshot.needs_reconnect = true;
@@ -465,15 +565,21 @@ fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_
         }
     }
 
-    if let Err(e) = deps.persistence.persist_context(context_id, &snapshot) {
-        // Best-effort persistence: log but don't fail the operation.
-        // In-memory state remains authoritative.
-        crate::metrics::record_persistence_failure();
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist context snapshot"
-        );
+    async move {
+        if let Err(e) = deps
+            .persistence
+            .persist_context(context_id, &snapshot)
+            .await
+        {
+            // Best-effort persistence: log but don't fail the operation.
+            // In-memory state remains authoritative.
+            crate::metrics::record_persistence_failure();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist context snapshot"
+            );
+        }
     }
 }
 
@@ -483,89 +589,8 @@ fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_
 /// actor-owned `PerContextState` rather than the legacy lock-shaped
 /// type.
 fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::ContextSnapshot {
-    use crate::context::state::VelocityTrackerSnapshot;
-    use scp_protocol::context::ContextState;
-
-    let context_state_value = state
-        .handle
-        .try_read_state()
-        .unwrap_or(ContextState::Active);
-    let ttl_remaining_secs = state.ttl.timer.remaining_secs();
-    let grace_entries = state.epoch.grace_store.to_grace_entries();
-
-    crate::context::state::ContextSnapshot {
-        context_id: state.handle.context_id().to_owned(),
-        creation_timestamp_secs: state.creation_timestamp_secs,
-        state: context_state_value,
-        context_params: state.handle.params().clone(),
-        membership: state.membership.clone(),
-        role_state: state.role_state.clone(),
-        event_log_merkle_root: [0u8; 32],
-        executed_proposals: state
-            .governance
-            .class_s
-            .executed_proposals
-            .keys()
-            .copied()
-            .collect(),
-        ttl_remaining_secs,
-        registered_tools: state.governance.registered_tools.clone(),
-        read_exclusion_list: state.access.read_exclusion_list.clone(),
-        tool_interfaces: state.governance.tool_interfaces.clone(),
-        threshold_signers: state.governance.class_s.threshold_signers.clone(),
-        threshold_value: state.governance.class_s.threshold_value,
-        pruning_policy: state.governance.pruning_policy.clone(),
-        governance_model_config: Some(state.governance.engine.model_config()),
-        economic_policy: state.governance.economic_policy.clone(),
-        budget_tracker: state.governance.budget_tracker.clone(),
-        approved_proposals: state.governance.approved_proposals.clone(),
-        next_proposal_seq: state.governance.next_proposal_seq,
-        governance_freeze: state.governance.freeze,
-        pending_ceiling_modification: state.governance.pending_ceiling_modification.clone(),
-        pending_economic_policy_change: state.governance.pending_economic_policy_change.clone(),
-        mls_epoch: state.epoch.mls_epoch,
-        epoch_coordination_records: state.epoch.coordinator.records().to_vec(),
-        grace_entries,
-        needs_reconnect: state.epoch.needs_reconnect,
-        // MLS crypto state is populated in `persist_state_best_effort`
-        // where the crypto provider is available. Initialized empty here.
-        mls_crypto_state: Vec::new(),
-        migration_state: state.migration_state.clone(),
-        access_key_store: state.access.access_key_store.clone(),
-        consequence_rules: state.governance.consequence_rules.clone(),
-        participation_cache: state.governance.participation_cache.clone(),
-        velocity_tracker: Some(state.governance.velocity_tracker.window_secs()),
-        velocity_tracker_state: Some(VelocityTrackerSnapshot {
-            window_secs: state.governance.velocity_tracker.window_secs(),
-            entries: state.governance.velocity_tracker.snapshot_entries(),
-        }),
-        cooldown_until: state.governance.cooldown_until.clone(),
-        proposal_timestamps: state.governance.proposal_timestamps.clone(),
-        message_pricing: state.governance.message_pricing.clone(),
-        hard_rate_limit_config: Some(state.governance.hard_rate_limit.config().clone()),
-        hard_rate_limit_state: state.governance.hard_rate_limit.snapshot_entries(),
-        spending_nonce_tracker_state: state
-            .governance
-            .class_s
-            .spending_nonce_tracker
-            .snapshot_entries(),
-        revoked_spending_ucan_cids: state.governance.revoked_spending_ucan_cids.clone(),
-        pending_commits: state.pending_commits.clone(),
-        commit_fault: state.commit_fault.clone(),
-        checkpoint_events_since: state.checkpoint_events_since,
-        checkpoint_last_time_secs: state.checkpoint_last_time_secs,
-        generation: state.generation,
-        routing: state.routing.clone(),
-        // ADR-049 §9 Class S (line 144): persist the staged saga slot
-        // through its sanctioned mirror via the shared helper.
-        saga_pending: crate::context::messaging_helpers::saga_pending_snapshot(state),
-        xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
-            state,
-        ),
-        xctx_committed_invocations:
-            crate::context::messaging_helpers::xctx_committed_invocations_snapshot(state),
-        xctx_caller_reservations:
-            crate::context::messaging_helpers::xctx_caller_reservations_snapshot(state),
-        xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(state),
-    }
+    // Single source of truth (ADR-049 §9): delegate to the canonical builder so
+    // the broadcast Class-S fold and the field-round-trip tripwire cover every
+    // persist path. This copy was value-identical to the canonical one.
+    crate::context::messaging_helpers::build_snapshot_from_state(state)
 }

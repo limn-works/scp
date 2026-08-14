@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::Signer;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::majority::MajorityVoteEngine;
 use scp_protocol::context::governance::multisig::ThresholdEngine;
@@ -52,7 +52,7 @@ use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportPro
 use scp_runtime::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
 use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
 use scp_runtime::context::supervisor::Supervisor;
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // Mock providers
@@ -71,21 +71,26 @@ impl MockTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for MockTransport {
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn send_message(&self, _id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        _id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
         Ok(())
     }
 }
@@ -93,11 +98,12 @@ impl ContextTransportProvider for MockTransport {
 #[derive(Default)]
 struct MockEventLog;
 
+#[async_trait::async_trait]
 impl ContextEventLogProvider for MockEventLog {
-    fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(
+    async fn append_event(
         &self,
         _id: &[u8; 32],
         _event: scp_event_log::EventType,
@@ -107,7 +113,7 @@ impl ContextEventLogProvider for MockEventLog {
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 }
@@ -126,7 +132,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|did, _kid: scp_did::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -166,8 +172,9 @@ fn new_manager() -> std::sync::Arc<Supervisor> {
     // passthrough methods (`is_member`, `list_proposals`, etc.) that
     // forward to the per-domain `*_helpers`.
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
@@ -178,12 +185,12 @@ fn new_manager() -> std::sync::Arc<Supervisor> {
 /// Standard ceiling that includes all governance-relevant capabilities.
 fn governance_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
         Capability::MemberBan,
     ]
 }
@@ -204,7 +211,7 @@ async fn ac1_create_single_admin_context() {
         .create_context("ctx-single-admin".into(), params, alice(), None)
         .await
         .unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 }
 
 #[tokio::test]
@@ -222,7 +229,7 @@ async fn ac1_create_threshold_context() {
         .create_context("ctx-threshold".into(), params, alice(), None)
         .await
         .unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 }
 
 #[tokio::test]
@@ -239,7 +246,7 @@ async fn ac1_create_majority_context() {
         .create_context("ctx-majority".into(), params, alice(), None)
         .await
         .unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 }
 
 #[tokio::test]
@@ -256,7 +263,7 @@ async fn ac1_create_unanimity_context() {
         .create_context("ctx-unanimity".into(), params, alice(), None)
         .await
         .unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 }
 
 // =========================================================================
@@ -461,14 +468,14 @@ async fn ac4_majority_propose_approve_execute() {
 }
 
 // =========================================================================
-// §9.9.3 native↔WASM convergence: GovernanceActionExecuted leaf actor_did is
+// §9.9.3 convergence: GovernanceActionExecuted leaf actor_did is
 // the EXECUTOR (the quorum-crossing committing member), NOT the proposer.
 //
 // ADR-031 §8 ("executor DID") / §7.3.1 ("committing member") / ADR-051 §6.
-// The WASM bridge stamps `initiator_did` (the committing voter) on its
-// `GovernanceActionExecuted` leaf; native MUST do the same so the same logical
-// commit yields a byte-identical leaf actor_did — and therefore the same leaf
-// hash and Merkle root — across the two bridges. This drives the REAL native
+// Every honest member stamps `initiator_did` (the committing voter) on its
+// `GovernanceActionExecuted` leaf, so the same logical commit yields a
+// byte-identical leaf actor_did — and therefore the same leaf hash and Merkle
+// root — across all honest members. This drives the REAL native
 // quorum-approval path through the `Supervisor` with a REAL
 // `MerkleEventLogProvider`, then reads the landed leaf back out.
 // =========================================================================
@@ -479,8 +486,9 @@ async fn ac4_majority_propose_approve_execute() {
 fn new_manager_with_real_event_log() -> std::sync::Arc<Supervisor> {
     use scp_runtime::context::providers::MerkleEventLogProvider;
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         )),
         Box::new(MockTransport::connected()),
         Box::new(MerkleEventLogProvider::new()),
@@ -551,29 +559,28 @@ async fn governance_action_executed_leaf_stamps_executor_not_proposer() {
         executed_leaf.actor_did.as_ref(),
         bob().as_ref(),
         "the GovernanceActionExecuted leaf actor_did MUST be the quorum-crossing executor (bob), \
-         NOT the proposer (alice) — ADR-031 §8 executor DID; §9.9.3 native↔WASM convergence"
+         NOT the proposer (alice) — ADR-031 §8 executor DID; §9.9.3 convergence"
     );
     // Non-vacuity: alice (proposer) != bob (executor), so a proposer stamp
     // would be a distinct, divergent leaf actor_did.
     assert_ne!(
         executed_leaf.actor_did.as_ref(),
         alice().as_ref(),
-        "stamping the proposer would diverge from the WASM bridge, which stamps the committing voter"
+        "stamping the proposer would diverge from the committing voter that every honest member stamps"
     );
 }
 
 // =========================================================================
-// §9.9.3 native↔WASM ACCEPT-decision parity: a quorum-crossing eligible voter
+// §9.9.3 ACCEPT-decision behavior: a quorum-crossing eligible voter
 // who is NOT the proposer and holds no per-action capability still causes the
 // action to execute and mint EXACTLY ONE GovernanceActionExecuted leaf.
 //
-// Native `execute_governance_action` performs NO per-member action-capability
-// check (only status / context-id / replay / commit-fault). The WASM bridge
-// previously gated on `member_has_capability(voter, action_cap)` at execute,
-// which a vote-eligible-but-action-less voter fails — minting 0 where native
-// mints 1. That per-member check has been removed from WASM so both bridges
-// mint exactly 1. This native test pins the "native mints 1" half (the WASM
-// half is `cross_impl_nonadmin_voter_crosses_quorum_mints_one_leaf_wasm`).
+// `execute_governance_action` performs NO per-member action-capability
+// check (only status / context-id / replay / commit-fault). Gating on
+// `member_has_capability(voter, action_cap)` at execute would make a
+// vote-eligible-but-action-less voter mint 0 where the correct behavior is
+// to mint 1. This test pins the mint-exactly-one behavior; the §9.9.3
+// convergence requirement is that all honest members mint the identical leaf.
 // =========================================================================
 #[tokio::test]
 async fn governance_quorum_voter_without_action_capability_mints_one_leaf() {
@@ -635,17 +642,16 @@ async fn governance_quorum_voter_without_action_capability_mints_one_leaf() {
     assert_eq!(
         executed, 1,
         "native MUST mint EXACTLY ONE GovernanceActionExecuted leaf for a quorum-crossing voter \
-         lacking the action capability — the convergent target the WASM bridge must match (§9.9.3)"
+         lacking the action capability — the convergent target all honest members must produce (§9.9.3)"
     );
 }
 
 // =========================================================================
-// §9.9.3 native↔WASM REJECT-decision parity: an action whose required
+// §9.9.3 REJECT-decision behavior: an action whose required
 // capability is NOT in the context ceiling is rejected, minting no
 // GovernanceActionExecuted leaf. `RevokeAccess` is gated on `member:ban` in
-// native (`execute_revoke`). With `member:ban` absent from the ceiling, native
-// rejects — the WASM bridge now applies the same per-action ceiling gate
-// (`cross_impl_out_of_ceiling_action_rejected_wasm`).
+// `execute_revoke`. With `member:ban` absent from the ceiling, the action
+// is rejected — the convergent reject all honest members must produce (§9.9.3).
 // =========================================================================
 #[tokio::test]
 async fn governance_out_of_ceiling_action_rejected_native() {
@@ -653,12 +659,12 @@ async fn governance_out_of_ceiling_action_rejected_native() {
     let ctx_id = "ctx-single-admin-out-of-ceiling";
     // Ceiling deliberately EXCLUDES `member:ban` (MemberBan).
     let ceiling = vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
     ];
     let params = ContextParams {
         ceiling,
@@ -683,7 +689,7 @@ async fn governance_out_of_ceiling_action_rejected_native() {
     assert!(
         result.is_err(),
         "an out-of-ceiling RevokeAccess (member:ban not in ceiling) MUST be rejected by native — \
-         the convergent reject decision the WASM bridge must match (§9.9.3; ADR-031 §8)"
+         the convergent reject decision all honest members must produce (§9.9.3; ADR-031 §8)"
     );
 
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
@@ -702,13 +708,12 @@ async fn governance_out_of_ceiling_action_rejected_native() {
 }
 
 // =========================================================================
-// §9.9.3 native↔WASM REJECT-decision parity for `CreateChildContext`.
-// Native gates this on `Capability::ChildContextCreate` in
+// §9.9.3 REJECT-decision behavior for `CreateChildContext`.
+// Gated on `Capability::ChildContextCreate` in
 // `execute_create_child_context` (`governance_helpers.rs`). With the capability
-// absent from the ceiling, native rejects and mints ZERO leaves — pinning the
-// convergent reject that the WASM bridge now also enforces
-// (`cross_impl_out_of_ceiling_create_child_context_rejected_wasm`). Previously
-// WASM EXECUTED this action (ungated), a §9.9.3 divergence and security gap.
+// absent from the ceiling, the action is rejected and mints ZERO leaves —
+// pinning the convergent reject all honest members must produce. Executing this
+// action ungated would be a §9.9.3 divergence and security gap.
 // =========================================================================
 #[tokio::test]
 async fn governance_out_of_ceiling_create_child_context_rejected_native() {
@@ -716,12 +721,12 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
     let ctx_id = "ctx-single-admin-child-out-of-ceiling";
     // Ceiling deliberately EXCLUDES ChildContextCreate (context:child:create).
     let ceiling = vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
     ];
     let params = ContextParams {
         ceiling,
@@ -733,11 +738,11 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
         .await
         .unwrap();
 
-    // Built via serde to mirror the WASM KAT fixture exactly.
+    // Built via serde to mirror the convergence KAT fixture exactly.
     let action: GovernanceAction = serde_json::from_value(serde_json::json!({
         "CreateChildContext": {"params": {
             "mode": "Encrypted", "ceiling": [], "ceiling_policy": "Immutable",
-            "promotion_policy": "NoPromotion", "roles": [], "tools": [],
+            "promotion_policy": "NoPromotion", "roles": [], "outlets": [],
             "ttl": null, "memory_scope": "Ephemeral", "governance": "SingleAdmin",
             "template_id": null
         }}
@@ -751,7 +756,7 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
     assert!(
         result.is_err(),
         "an out-of-ceiling CreateChildContext (context:child:create not in ceiling) MUST be \
-         rejected by native — the convergent reject the WASM bridge must match (§9.9.3; ADR-031 §8)"
+         rejected by native — the convergent reject all honest members must produce (§9.9.3; ADR-031 §8)"
     );
 
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
@@ -771,25 +776,24 @@ async fn governance_out_of_ceiling_create_child_context_rejected_native() {
 }
 
 // =========================================================================
-// §9.9.3 native↔WASM REJECT-decision parity for `EstablishToolInterface`.
-// Native gates this on `Capability::ToolInterface` in
-// `execute_establish_tool_interface` (`governance_helpers.rs`). With the
-// capability absent from the ceiling, native rejects and mints ZERO leaves —
-// pinning the convergent reject the WASM bridge now also enforces
-// (`cross_impl_out_of_ceiling_establish_tool_interface_rejected_wasm`).
+// §9.9.3 REJECT-decision behavior for `EstablishOutletInterface`.
+// Gated on `Capability::OutletInterface` in
+// `execute_establish_outlet_interface` (`governance_helpers.rs`). With the
+// capability absent from the ceiling, the action is rejected and mints ZERO
+// leaves — pinning the convergent reject all honest members must produce.
 // =========================================================================
 #[tokio::test]
-async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
+async fn governance_out_of_ceiling_establish_outlet_interface_rejected_native() {
     let manager = new_manager_with_real_event_log();
     let ctx_id = "ctx-single-admin-iface-out-of-ceiling";
-    // Ceiling deliberately EXCLUDES ToolInterface (tool:interface).
+    // Ceiling deliberately EXCLUDES OutletInterface (outlet:interface).
     let ceiling = vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
     ];
     let params = ContextParams {
         ceiling,
@@ -802,14 +806,14 @@ async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
         .unwrap();
 
     let action: GovernanceAction = serde_json::from_value(serde_json::json!({
-        "EstablishToolInterface": {"interface": {
+        "EstablishOutletInterface": {"interface": {
             "source_context": "ctx-src", "target_context": "ctx-tgt",
-            "tool_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
+            "outlet_id": "outlet-1", "rate_limit": null, "per_caller_rate_limit": null,
             "approved_by_source": false, "approved_by_target": false,
             "outbound_policy": null, "inbound_policy": null
         }}
     }))
-    .expect("EstablishToolInterface action deserializes");
+    .expect("EstablishOutletInterface action deserializes");
 
     let sk_alice = signing_key_for_did(&alice());
     let result = manager
@@ -817,8 +821,8 @@ async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
         .await;
     assert!(
         result.is_err(),
-        "an out-of-ceiling EstablishToolInterface (tool:interface not in ceiling) MUST be \
-         rejected by native — the convergent reject the WASM bridge must match (§9.9.3; ADR-031 §8)"
+        "an out-of-ceiling EstablishOutletInterface (outlet:interface not in ceiling) MUST be \
+         rejected by native — the convergent reject all honest members must produce (§9.9.3; ADR-031 §8)"
     );
 
     let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
@@ -832,7 +836,7 @@ async fn governance_out_of_ceiling_establish_tool_interface_rejected_native() {
         .count();
     assert_eq!(
         executed, 0,
-        "a rejected out-of-ceiling EstablishToolInterface MUST mint ZERO GovernanceActionExecuted \
+        "a rejected out-of-ceiling EstablishOutletInterface MUST mint ZERO GovernanceActionExecuted \
          leaves on native"
     );
 }
@@ -1212,8 +1216,8 @@ async fn ac9_checked_propose_requires_capability() {
     let params = ContextParams {
         // Deliberately omit governance:propose from ceiling to test permission denial.
         ceiling: vec![
-            Capability::new("messages:read"),
-            Capability::new("messages:write"),
+            Capability::new("messages:read").expect("known capability"),
+            Capability::new("messages:write").expect("known capability"),
         ],
         governance: GovernanceModel::SingleAdmin,
         ..ContextParams::default()
@@ -1289,6 +1293,298 @@ async fn ac10_remove_member_action() {
         .await
         .unwrap();
     assert_eq!(remove_proposal.status, ProposalStatus::Approved);
+}
+
+// -------------------------------------------------------------------------
+// Member-removal clean teardown (spec §5.6.1): removing a member clears the
+// removed DID's suspended_capabilities and read_exclusion_list, and a
+// re-admitted same-DID member inherits no phantom suspension/exclusion.
+// -------------------------------------------------------------------------
+
+/// Helper: create a `SingleAdmin` context with alice as admin and add bob as a
+/// member. Returns the supervisor and context id.
+async fn ctx_with_alice_admin_bob_member(ctx_id: &str) -> std::sync::Arc<Supervisor> {
+    let manager = new_manager();
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let sk_alice = signing_key_for_did(&alice());
+    let (add_proposal, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddMember {
+                did: bob(),
+                role: "member".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(add_proposal.status, ProposalStatus::Approved);
+    manager
+}
+
+#[tokio::test]
+async fn execute_remove_member_clears_suspension() {
+    let ctx_id = "ctx-remove-clears-suspension";
+    let manager = ctx_with_alice_admin_bob_member(ctx_id).await;
+    let sk_alice = signing_key_for_did(&alice());
+
+    // Suspend a capability bob's `member` role grants.
+    let (susp, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::SuspendCapability {
+                did: bob(),
+                capabilities: vec![Capability::new("messages:write").expect("known capability")],
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(susp.status, ProposalStatus::Approved);
+
+    // Precondition: the suspension is present in role state.
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(
+        rs.suspended_for(bob().as_ref()).is_some(),
+        "bob should have a suspended_capabilities entry before removal"
+    );
+
+    // Remove bob.
+    let (rm, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RemoveMember {
+                did: bob(),
+                reason: Some("test".into()),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rm.status, ProposalStatus::Approved);
+
+    // Postcondition: the suspension entry is gone (spec §5.6.1).
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(
+        rs.suspended_for(bob().as_ref()).is_none(),
+        "execute_remove_member MUST clear the removed member's suspended_capabilities (spec §5.6.1)"
+    );
+    assert!(!rs.members.contains(bob().as_ref()));
+    assert!(!rs.assignments.contains_key(bob().as_ref()));
+    assert!(!rs.member_capabilities.contains_key(bob().as_ref()));
+}
+
+#[tokio::test]
+async fn execute_remove_member_clears_read_exclusion() {
+    let ctx_id = "ctx-remove-clears-read-exclusion";
+    let manager = ctx_with_alice_admin_bob_member(ctx_id).await;
+    let sk_alice = signing_key_for_did(&alice());
+
+    // Revoke bob's read access -> populates read_exclusion_list.
+    let (rev, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RevokeAccess {
+                did: bob(),
+                access: AccessScope::Read,
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rev.status, ProposalStatus::Approved);
+
+    // Precondition: bob is in the read_exclusion_list (observed via export).
+    let export = manager
+        .export_context(ctx_id, alice(), |digest| {
+            use ed25519_dalek::Signer;
+            Ok::<_, std::convert::Infallible>(sk_alice.sign(digest).to_bytes())
+        })
+        .await
+        .unwrap();
+    assert!(
+        export.snapshot.read_exclusion_list.contains(&bob()),
+        "bob should be read-excluded before removal"
+    );
+
+    // Remove bob.
+    let (rm, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RemoveMember {
+                did: bob(),
+                reason: Some("test".into()),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rm.status, ProposalStatus::Approved);
+
+    // Postcondition: bob's read-exclusion entry is gone (spec §5.6.1).
+    let export = manager
+        .export_context(ctx_id, alice(), |digest| {
+            use ed25519_dalek::Signer;
+            Ok::<_, std::convert::Infallible>(sk_alice.sign(digest).to_bytes())
+        })
+        .await
+        .unwrap();
+    assert!(
+        !export.snapshot.read_exclusion_list.contains(&bob()),
+        "execute_remove_member MUST drop the removed member's read_exclusion_list entry (spec §5.6.1)"
+    );
+}
+
+#[tokio::test]
+async fn execute_remove_then_readmit_regression() {
+    // Core regression (spec §5.6.1): suspend a granted cap, remove, re-add the
+    // SAME DID, and the re-admitted member must hold the capability their role
+    // grants (no phantom suspension).
+    let ctx_id = "ctx-remove-readmit-regression";
+    let manager = ctx_with_alice_admin_bob_member(ctx_id).await;
+    let sk_alice = signing_key_for_did(&alice());
+
+    manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::SuspendCapability {
+                did: bob(),
+                capabilities: vec![Capability::new("messages:write").expect("known capability")],
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+
+    // During suspension bob is denied messages:write.
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(!rs.member_has_capability(
+        bob().as_ref(),
+        &Capability::new("messages:write").expect("known capability")
+    ));
+
+    // Remove.
+    manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::RemoveMember {
+                did: bob(),
+                reason: Some("test".into()),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+
+    // Re-add the SAME DID with the SAME role. The proposal ID is derived in part
+    // from a seconds-granularity timestamp (compute_proposal_id), so advance the
+    // wall clock past the original AddMember's second to avoid a benign
+    // duplicate-proposal rejection (§5.9 replay protection) — this is a
+    // test-harness clock artifact, not part of the behavior under test.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (re_add, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddMember {
+                did: bob(),
+                role: "member".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(re_add.status, ProposalStatus::Approved);
+
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(
+        rs.member_has_capability(
+            bob().as_ref(),
+            &Capability::new("messages:write").expect("known capability")
+        ),
+        "re-admitted same-DID member MUST hold the capability their role grants (spec §5.6.1)"
+    );
+}
+
+#[tokio::test]
+async fn leave_context_clears_suspension() {
+    // Spec §5.6.1: a self-leave is also a clean teardown — a suspended member who
+    // leaves must not leave a dangling suspended_capabilities entry behind.
+    let ctx_id = "ctx-leave-clears-suspension";
+    let manager = new_manager();
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::SingleAdmin,
+        ..ContextParams::default()
+    };
+    let handle = manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let sk_alice = signing_key_for_did(&alice());
+    let (add, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::AddMember {
+                did: bob(),
+                role: "member".into(),
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(add.status, ProposalStatus::Approved);
+
+    // Suspend a granted capability for bob.
+    let (susp, _, _) = manager
+        .propose_governance_action(
+            ctx_id,
+            &alice(),
+            GovernanceAction::SuspendCapability {
+                did: bob(),
+                capabilities: vec![Capability::new("messages:write").expect("known capability")],
+            },
+            &sk_alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(susp.status, ProposalStatus::Approved);
+
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(rs.suspended_for(bob().as_ref()).is_some());
+
+    // Bob self-leaves.
+    manager
+        .leave_context(&handle, &bob(), &bob())
+        .await
+        .unwrap();
+
+    let rs = manager.get_role_state(ctx_id).await.unwrap();
+    assert!(
+        rs.suspended_for(bob().as_ref()).is_none(),
+        "leave_context MUST clear the departing member's suspended_capabilities (spec §5.6.1)"
+    );
+    assert!(!rs.members.contains(bob().as_ref()));
+    assert!(!rs.assignments.contains_key(bob().as_ref()));
+    assert!(!rs.member_capabilities.contains_key(bob().as_ref()));
 }
 
 #[tokio::test]
@@ -2642,5 +2938,122 @@ async fn direct_execute_of_genuine_proposal_runs_once_then_replay_rejected() {
     assert!(
         format!("{err}").contains("already been executed"),
         "replay rejection should name the executed proposal: {err}"
+    );
+}
+
+// =========================================================================
+// Issue #1847: GovernanceDeadlockRecovery event log append
+//
+// After a successful ReconfigureGovernance action the event log MUST contain
+// BOTH a GovernanceReconfigured leaf (configuration change) AND a
+// GovernanceDeadlockRecovery leaf (structured justification payload).
+// The payload fields must match the DeadlockJustification supplied.
+// =========================================================================
+
+#[tokio::test]
+async fn governance_deadlock_recovery_appends_both_event_leaves() {
+    use scp_protocol::context::governance::{DeadlockJustification, GovernanceReconfigAction};
+
+    let manager = new_manager_with_real_event_log();
+    let ctx_id = "ctx-deadlock-recovery-1847";
+
+    // Threshold(1-of-2): alice's auto-vote on propose immediately crosses the
+    // threshold so ReconfigureGovernance executes inline without a second voter.
+    let params = ContextParams {
+        ceiling: governance_ceiling(),
+        governance: GovernanceModel::Threshold {
+            threshold: 1,
+            signers: vec![alice(), bob()],
+        },
+        ..ContextParams::default()
+    };
+    manager
+        .create_context(ctx_id.into(), params, alice(), None)
+        .await
+        .unwrap();
+
+    let justification = DeadlockJustification {
+        unavailable_dids: vec![bob()],
+        missed_windows: vec![(bob(), 5)],
+        detected_at: 1_700_000_000,
+    };
+    let action = GovernanceAction::ReconfigureGovernance {
+        changes: vec![GovernanceReconfigAction::RemoveInactiveSigner { did: bob() }],
+        justification: justification.clone(),
+    };
+    let sk_alice = signing_key_for_did(&alice());
+
+    // Proposal auto-executes (threshold=1, alice auto-votes).
+    let (proposal, _events, _) = manager
+        .propose_governance_action(ctx_id, &alice(), action, &sk_alice)
+        .await
+        .unwrap();
+    assert_eq!(
+        proposal.status,
+        ProposalStatus::Approved,
+        "threshold=1: proposer auto-vote must immediately approve and execute"
+    );
+
+    // Query the durable event log.
+    let ctx_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    let entries = manager
+        .event_log_entries(&ctx_bytes)
+        .unwrap()
+        .expect("event log must exist for the active context");
+
+    // --- Assert GovernanceReconfigured leaf is present ---
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.event_type == scp_event_log::EventType::GovernanceReconfigured),
+        "event log must contain a GovernanceReconfigured leaf after ReconfigureGovernance"
+    );
+
+    // --- Assert GovernanceDeadlockRecovery leaf is present ---
+    let recovery_entry = entries
+        .iter()
+        .find(|e| e.event_type == scp_event_log::EventType::GovernanceDeadlockRecovery)
+        .expect("event log must contain a GovernanceDeadlockRecovery leaf (issue #1847)");
+
+    // --- Decode and verify the payload fields ---
+    let payload: scp_event_log::payload::GovernanceDeadlockRecoveryPayload =
+        scp_event_log::payload::decode_payload(&recovery_entry.payload)
+            .expect("GovernanceDeadlockRecovery payload must decode successfully");
+
+    let expected_unavailable: Vec<String> = justification
+        .unavailable_dids
+        .iter()
+        .map(|d| d.0.clone())
+        .collect();
+    assert_eq!(
+        payload.unavailable_dids, expected_unavailable,
+        "payload.unavailable_dids must match justification.unavailable_dids"
+    );
+    let expected_missed_windows: Vec<(String, u32)> = justification
+        .missed_windows
+        .iter()
+        .map(|(d, n)| (d.0.clone(), *n))
+        .collect();
+    assert_eq!(
+        payload.missed_windows, expected_missed_windows,
+        "payload.missed_windows must carry the full per-DID evidence from the justification"
+    );
+    assert_eq!(
+        payload.detected_at, justification.detected_at,
+        "payload.detected_at must match justification.detected_at"
+    );
+
+    // GovernanceReconfigured and GovernanceDeadlockRecovery must appear
+    // sequentially: the recovery leaf must come after the reconfigured leaf.
+    let reconfigured_seq = entries
+        .iter()
+        .find(|e| e.event_type == scp_event_log::EventType::GovernanceReconfigured)
+        .map(|e| e.sequence)
+        .unwrap();
+    assert!(
+        recovery_entry.sequence > reconfigured_seq,
+        "GovernanceDeadlockRecovery (seq {}) must follow GovernanceReconfigured (seq {})",
+        recovery_entry.sequence,
+        reconfigured_seq
     );
 }

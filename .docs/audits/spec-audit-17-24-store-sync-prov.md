@@ -31,7 +31,7 @@ The findings are organized per-file, then by severity.
 ### [17.3] Missing Maximum Value Size
 - **Category**: Missing constants/defaults
 - **Location**: Section 17.3-17.4
-- **What's missing**: No maximum value size is specified for `store()`. The `ProtocolRepository` methods accept `&[u8]` values with no documented upper bound. Context state, MLS group state, and tool registrations could theoretically be arbitrarily large.
+- **What's missing**: No maximum value size is specified for `store()`. The `ProtocolRepository` methods accept `&[u8]` values with no documented upper bound. Context state, MLS group state, and outlet registrations could theoretically be arbitrarily large.
 - **Why it matters**: Without a value size limit, a malicious or buggy protocol layer could cause OOM in storage backends that buffer the full value in memory. The streaming API exists for `BlobStorage` but not for `Storage`.
 - **Severity**: MEDIUM
 
@@ -267,10 +267,10 @@ The findings are organized per-file, then by severity.
 - **Why it matters**: A compromised admin could change the payee DID to their own, redirecting all payments. Without verification requirements, this is an expected attack vector.
 - **Severity**: MEDIUM
 
-### [19.3] Tool-Level Cost Payee and Currency Independence
+### [19.3] Outlet-Level Cost Payee and Currency Independence
 - **Category**: Missing edge cases
 - **Location**: Section 19.3, line 314
-- **What's missing**: "Tool costs carry their own payee DID (may differ from context payee)." But what if the tool's currency differs from the context's currency? Must the payer hold adapter credentials for both? What if the payer has a spending UCAN for USD but the tool costs BTC?
+- **What's missing**: "Outlet costs carry their own payee DID (may differ from context payee)." But what if the outlet's currency differs from the context's currency? Must the payer hold adapter credentials for both? What if the payer has a spending UCAN for USD but the outlet costs BTC?
 - **Why it matters**: Multi-currency contexts create combinatorial adapter requirements that the spec doesn't address.
 - **Severity**: LOW
 
@@ -379,14 +379,14 @@ The findings are organized per-file, then by severity.
 ### [22.2] Scope Disambiguation for Single-Label Domains
 - **Category**: Missing edge cases
 - **Location**: Section 22.2, lines 33-38
-- **What's missing**: Scope disambiguation relies on the presence of a `.` to distinguish domain handles from context handles. But single-label domains exist (e.g., `localhost`, `.internal` TLDs, some ccTLDs like `.ai`). `alice@ai` -- is this a context with discovery tools named "ai" or the domain `ai`?
+- **What's missing**: Scope disambiguation relies on the presence of a `.` to distinguish domain handles from context handles. But single-label domains exist (e.g., `localhost`, `.internal` TLDs, some ccTLDs like `.ai`). `alice@ai` -- is this a context with discovery outlets named "ai" or the domain `ai`?
 - **Why it matters**: The disambiguation rule is fragile. In practice, new TLDs and single-label domains mean the "contains a dot" heuristic has edge cases.
 - **Severity**: LOW
 
-### [22.3.1] Handle Tool DID-Signature Verification Scheme Not Specified
+### [22.3.1] Handle Outlet DID-Signature Verification Scheme Not Specified
 - **Category**: Security-relevant omissions
 - **Location**: Section 22.3.1, line 148
-- **What's missing**: "All handle tool requests MUST carry a DID signature over the request payload." But: (a) What is "the request payload" -- the JSON body? A canonical serialization? (b) What signature scheme -- Ed25519 over the raw bytes? JWS? (c) Where is the signature carried -- an HTTP header? A field in the request body? A UCAN?
+- **What's missing**: "All handle outlet requests MUST carry a DID signature over the request payload." But: (a) What is "the request payload" -- the JSON body? A canonical serialization? (b) What signature scheme -- Ed25519 over the raw bytes? JWS? (c) Where is the signature carried -- an HTTP header? A field in the request body? A UCAN?
 - **Why it matters**: Without specifying the signature format, implementations cannot verify each other's registrations. Cross-implementation context participation would fail.
 - **Severity**: HIGH
 
@@ -401,7 +401,7 @@ The findings are organized per-file, then by severity.
 - **Category**: Ambiguous state transitions
 - **Location**: Section 22.3.2, line 160
 - **What's missing**: "If multiple contexts share a name, the SDK uses the most recently used or user-preferred context." This is implementation guidance, not a protocol rule. No default is specified. "Most recently used" requires tracking usage history. "User-preferred" requires explicit configuration. Neither is mandatory.
-- **Why it matters**: Two SDKs resolving the same address could resolve to different contexts with discovery tools, breaking resolution consistency.
+- **Why it matters**: Two SDKs resolving the same address could resolve to different contexts with discovery outlets, breaking resolution consistency.
 - **Severity**: MEDIUM
 
 ### [22.4] Petname Maximum Length Not Specified
@@ -414,14 +414,14 @@ The findings are organized per-file, then by severity.
 ### [22.5.1] Attestation Lookup Pagination Not Specified
 - **Category**: Missing constants/defaults
 - **Location**: Section 22.5.1, lines 263-279
-- **What's missing**: The `attestation_lookup` tool returns `results: [{...}]` with no pagination mechanism. If a popular handle has hundreds of claiming DIDs, the response could be very large.
-- **Why it matters**: Unbounded response size in a discovery tool call.
+- **What's missing**: The `attestation_lookup` outlet returns `results: [{...}]` with no pagination mechanism. If a popular handle has hundreds of claiming DIDs, the response could be very large.
+- **Why it matters**: Unbounded response size in a discovery outlet call.
 - **Severity**: LOW
 
 ### [22.5.2] Auto-Registration Failure Behavior Not Specified
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 22.5.2, lines 286-293
-- **What's missing**: "SDK SHOULD register the mapping in known contexts with discovery tools." But what happens when registration fails (context unreachable, registration rejected by governance, network error)? Is the attestation still created? Is the user notified? Is registration retried?
+- **What's missing**: "SDK SHOULD register the mapping in known contexts with discovery outlets." But what happens when registration fails (context unreachable, registration rejected by governance, network error)? Is the attestation still created? Is the user notified? Is registration retried?
 - **Why it matters**: Silent registration failure means the attestation exists but is not discoverable via reverse-lookup, which the user might not realize.
 - **Severity**: LOW
 
@@ -442,14 +442,14 @@ The findings are organized per-file, then by severity.
 ### [22.8.2] Unscoped Resolution Timeout Not Specified
 - **Category**: Missing constants/defaults
 - **Location**: Section 22.8.2, lines 443-461
-- **What's missing**: Unscoped resolution queries "in parallel: domain handles, contexts with discovery tools, attestation indexes." No timeout is specified for the parallel resolution phase. If one context is slow, does the resolver wait indefinitely? Return partial results after a timeout?
+- **What's missing**: Unscoped resolution queries "in parallel: domain handles, contexts with discovery outlets, attestation indexes." No timeout is specified for the parallel resolution phase. If one context is slow, does the resolver wait indefinitely? Return partial results after a timeout?
 - **Why it matters**: In practice, resolution latency determines UX quality. Without a timeout, a single slow context blocks the entire resolution.
 - **Severity**: MEDIUM
 
 ### [22.8.4] Resolution Cache Invalidation Not Specified
 - **Category**: Missing edge cases
 - **Location**: Section 22.8.4, line 479
-- **What's missing**: Cache entries have per-layer TTLs but no invalidation mechanism beyond TTL expiry. If a handle is deregistered from a context with discovery tools, the cache could serve stale results for up to 15 minutes (the context TTL). No push-based invalidation or event-based cache clearing is specified.
+- **What's missing**: Cache entries have per-layer TTLs but no invalidation mechanism beyond TTL expiry. If a handle is deregistered from a context with discovery outlets, the cache could serve stale results for up to 15 minutes (the context TTL). No push-based invalidation or event-based cache clearing is specified.
 - **Why it matters**: 15 minutes of stale handle resolution could lead a user to contact the wrong DID.
 - **Severity**: LOW
 
@@ -544,7 +544,7 @@ The findings are organized per-file, then by severity.
 ### [23.6.1] GovernanceFreeze Resolution Protocol Not Specified
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 23.6.1, line 146
-- **What's missing**: "The context enters a `GovernanceFreeze` state. No new governance actions are accepted until an admin explicitly resolves the conflict." But: (a) How does the admin resolve? Is there a `ResolveConflict` governance action? (b) Does `GovernanceFreeze` affect non-governance operations (messages, tool calls)? (c) What if the admin is one of the conflicting parties?
+- **What's missing**: "The context enters a `GovernanceFreeze` state. No new governance actions are accepted until an admin explicitly resolves the conflict." But: (a) How does the admin resolve? Is there a `ResolveConflict` governance action? (b) Does `GovernanceFreeze` affect non-governance operations (messages, outlet calls)? (c) What if the admin is one of the conflicting parties?
 - **Why it matters**: `GovernanceFreeze` is a DoS vector. Two colluding members can freeze a context's governance by submitting simultaneous proposals. Without a resolution mechanism, the freeze could be permanent.
 - **Severity**: HIGH
 
@@ -625,7 +625,7 @@ The findings are organized per-file, then by severity.
 ### [24.3.2] First Crossing chain_depth = 0 vs chain_depth = 1 Discrepancy
 - **Category**: Cross-reference inconsistencies
 - **Location**: Section 24.3.2, lines 95-99
-- **What's missing**: "When data crosses its first context boundary, `chain_depth` is 0." But section 24.4 says "At the maximum depth, data cannot trigger further cross-context tool calls" with default maximum now 8 (ADR-043, raised from 3). If the first crossing is depth 0, then 9 crossings are possible (0-8) before hitting the default max of 8. The semantics question remains: does "8 hops" mean 8 crossings (depth 0-7) or depth value 8 (9 crossings)?
+- **What's missing**: "When data crosses its first context boundary, `chain_depth` is 0." But section 24.4 says "At the maximum depth, data cannot trigger further cross-context outlet calls" with default maximum now 8 (ADR-043, raised from 3). If the first crossing is depth 0, then 9 crossings are possible (0-8) before hitting the default max of 8. The semantics question remains: does "8 hops" mean 8 crossings (depth 0-7) or depth value 8 (9 crossings)?
 - **Why it matters**: Off-by-one in chain depth enforcement means either one too many or one too few cross-context hops are allowed.
 - **Severity**: MEDIUM
 
@@ -639,7 +639,7 @@ The findings are organized per-file, then by severity.
 ### [24.4] chain_depth Check Timing Not Specified
 - **Category**: Missing edge cases
 - **Location**: Section 24.4
-- **What's missing**: "Called before any cross-context tool invocation to enforce the bound." But is the check against the incoming data's current depth (before increment) or the would-be depth (after increment)? If max is 3 and incoming data has depth 2, can it cross one more boundary (becoming 3) or is it rejected because 2+1 > 2 (the last allowed hop)?
+- **What's missing**: "Called before any cross-context outlet invocation to enforce the bound." But is the check against the incoming data's current depth (before increment) or the would-be depth (after increment)? If max is 3 and incoming data has depth 2, can it cross one more boundary (becoming 3) or is it rejected because 2+1 > 2 (the last allowed hop)?
 - **Why it matters**: Determines the actual maximum number of hops. Combined with the depth-0-first-crossing question above, this compounds the ambiguity.
 - **Severity**: MEDIUM
 

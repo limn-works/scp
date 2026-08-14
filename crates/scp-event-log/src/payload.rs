@@ -5,7 +5,7 @@
 //! Several runtime call sites historically baked event parameters into the
 //! event *name* — either as `format!` strings
 //! (`"ContextTombstoned:{dest}:{pid}"`) or as an entire JSON blob used as the
-//! type tag (`{"event":"SpendApproved",…}`). The ADR-011 native↔WASM
+//! type tag (`{"event":"SpendApproved",…}`). The ADR-011 typed-event
 //! unification amendment (`.docs/adrs/phase-2.md`) identifies each as a defect:
 //! it makes the signed Merkle-leaf preimage non-convergent and un-enumerable.
 //! The correct end state is a typed [`EventType`](crate::EventType) variant
@@ -13,9 +13,9 @@
 //!
 //! This module is the **single source** of the payload bytes for those
 //! structured variants. As the emit sites are wired (in later phases of the
-//! native↔WASM unification — Phase 1 establishes the types; production callers
-//! land later), both the native runtime (`scp-runtime`) and the WASM bridge
-//! MUST route through these functions so that native↔WASM Merkle roots match:
+//! typed-event unification — Phase 1 establishes the types; production callers
+//! land later), every honest member MUST route through these functions so that
+//! their Merkle roots match:
 //! the leaf preimage is `SHA-256(0x00 ‖ rmp_serde(Event))`, and `Event.payload`
 //! is `EventPayload { data: <bytes from this module> }`. If two implementations
 //! encoded the same logical payload differently, the leaf hashes would diverge
@@ -34,12 +34,12 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{EventLogError, EventPayload};
+use crate::{EventLogError, EventPayload, EventType};
 
 /// Encodes a structured payload struct into [`EventPayload`] bytes using
 /// positional `MessagePack`.
 ///
-/// This is the single shared entry point that both native and WASM callers use
+/// This is the single shared entry point that all callers use
 /// to produce the leaf-preimage payload bytes.
 ///
 /// # Errors
@@ -165,6 +165,22 @@ pub struct RecoveryEpochAdvancedPayload {
     pub new_epoch: u64,
 }
 
+/// Payload for [`EventType::KeyEpochAdvance`](crate::EventType::KeyEpochAdvance)
+/// (ADR-007 §5 sender-key epoch rotation triggered by blocking a subscriber).
+///
+/// Distinct from [`RecoveryEpochAdvancedPayload`], which covers the MLS group
+/// epoch advance during trust recovery (§9.12). This struct tracks the
+/// **sender-key** epoch for the ADR-007 Broadcast / Encrypted sender-key modes.
+/// Field order is the wire contract under positional `MessagePack` —
+/// **never reorder**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyEpochAdvancePayload {
+    /// The sender-key epoch before the advance.
+    pub old_epoch: u64,
+    /// The sender-key epoch after the advance.
+    pub new_epoch: u64,
+}
+
 /// Payload for [`EventType::AccessRevoked`](crate::EventType::AccessRevoked)
 /// (`RevokeReadAccess` / `RevokeWriteAccess`; ADR-031 §3, §5).
 ///
@@ -193,6 +209,109 @@ pub struct GovernanceActionExecutedPayload {
     pub action_type: String,
 }
 
+/// Payload for
+/// [`EventType::GovernanceDeadlockRecovery`](crate::EventType::GovernanceDeadlockRecovery)
+/// (ADR-011 amendment; issue #1847).
+///
+/// Records the deadlock justification evidence emitted **immediately after**
+/// [`EventType::GovernanceReconfigured`](crate::EventType::GovernanceReconfigured)
+/// so the recovery evidence is durably anchored in the Merkle log.
+/// The two leaves share the same `actor_did` and `timestamp_secs`.
+/// Field order is the wire contract under positional `MessagePack` —
+/// **never reorder**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernanceDeadlockRecoveryPayload {
+    /// DIDs of signers who were unavailable during deadlock detection.
+    pub unavailable_dids: Vec<String>,
+    /// Per-signer missed-window evidence: (DID, consecutive missed voting windows).
+    ///
+    /// Each tuple is the DID of a signer who had evidence of unavailability and
+    /// the number of consecutive voting windows they missed. Distinct from
+    /// `unavailable_dids` (completely absent — no response at all); these signers
+    /// sent some responses but missed enough windows to be declared unavailable.
+    pub missed_windows: Vec<(String, u32)>,
+    /// Unix timestamp (seconds) when deadlock was detected.
+    pub detected_at: u64,
+}
+
+/// Payload for [`EventType::RoleAssigned`](crate::EventType::RoleAssigned)
+/// (`ChangeRole` governance action, §5; ADR-011 amendment subject-bearing
+/// leaves).
+///
+/// `subject_did` is the member whose role was assigned/changed — the *affected
+/// member*, NOT the governance actor who executed the change (for admin-driven
+/// assignments the leaf `actor_did` is the admin). The participation-record
+/// `role_progression_count` fact (§7.3.2) attributes the role transition to
+/// this `subject_did`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleAssignedPayload {
+    /// The DID of the member whose role was assigned/changed.
+    pub subject_did: String,
+    /// The role name assigned to the subject.
+    pub role: String,
+}
+
+/// Payload for [`EventType::MemberJoined`](crate::EventType::MemberJoined) and
+/// [`EventType::MemberLeft`](crate::EventType::MemberLeft) (§5 membership
+/// changes; ADR-011 amendment subject-bearing leaves).
+///
+/// `subject_did` is the member who joined/left — the *affected member*, NOT the
+/// governance actor (for admin-driven joins/removals the leaf `actor_did` is the
+/// admin; on self-join/leave and broadcast subscribe/unsubscribe the two
+/// coincide, but the payload still carries the member so the leaf shape is
+/// uniform). The participation-record `participation_duration_secs` fact
+/// (§7.3.2) attributes the join/leave interval to this `subject_did`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipChangePayload {
+    /// The DID of the member who joined or left.
+    pub subject_did: String,
+    /// The role name held by the member at the time of the membership change.
+    pub role_name: String,
+}
+
+/// Payload for [`EventType::MediaSessionStarted`](crate::EventType::MediaSessionStarted)
+/// (ADR-024 AC 8 — session metadata recorded in context event log).
+///
+/// Captures the session identity and initial configuration at the point the
+/// session transitions from `Initiating` to `Active`. Field order is the
+/// wire contract under positional `MessagePack` — **never reorder**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaSessionStartedPayload {
+    /// The media session identifier (e.g. `"ms-<hex>"`).
+    pub session_id: String,
+    /// The context hosting the session.
+    pub context_id: String,
+    /// DIDs of participants at session activation.
+    pub participants: Vec<String>,
+    /// Ceiling names of active media capabilities (e.g. `"media:voice"`).
+    pub capabilities: Vec<String>,
+    /// Unix timestamp (seconds) when the session was created.
+    pub started_at: u64,
+}
+
+/// Payload for [`EventType::MediaSessionEnded`](crate::EventType::MediaSessionEnded)
+/// (ADR-024 AC 8 — session metadata recorded in context event log).
+///
+/// Captures the full session record at teardown: participants, capabilities,
+/// and both timestamps, sufficient for participation-record derivation
+/// (ADR-017 §7.3.2). Field order is the wire contract under positional
+/// `MessagePack` — **never reorder**.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaSessionEndedPayload {
+    /// The media session identifier.
+    pub session_id: String,
+    /// The context hosting the session.
+    pub context_id: String,
+    /// DIDs of participants at session end.
+    pub participants: Vec<String>,
+    /// Ceiling names of active media capabilities (e.g. `"media:voice"`).
+    pub capabilities: Vec<String>,
+    /// Unix timestamp (seconds) when the session started.
+    pub started_at: u64,
+    /// Unix timestamp (seconds) when the session ended.
+    pub ended_at: u64,
+}
+
 /// Builds the durable Merkle-leaf payload bytes for a consequence-enforcement
 /// event.
 ///
@@ -206,12 +325,12 @@ pub struct GovernanceActionExecutedPayload {
 ///
 /// # Why this is the single source
 ///
-/// Both the native runtime (`scp-runtime`) and the WASM bridge (`scp-ffi-wasm`)
-/// mint these leaves for convergent-trigger consequences. The leaf preimage is
+/// The native runtime (`scp-runtime`) mints these leaves for convergent-trigger
+/// consequences. The leaf preimage is
 /// `SHA-256(0x00 ‖ rmp_serde(Event))`, and `Event.payload` is
 /// `EventPayload { data }` — so the `data` bytes MUST be byte-identical across
-/// platforms or §9.9.3 equivocation detection produces false positives. This
-/// function is the shared producer of those bytes.
+/// all honest members or §9.9.3 equivocation detection produces false
+/// positives. This function is the shared producer of those bytes.
 ///
 /// # Encoding — JSON, NOT positional `MessagePack`
 ///
@@ -226,7 +345,7 @@ pub struct GovernanceActionExecutedPayload {
 /// ```
 ///
 /// That sorted order is deterministic and implementation-independent (same
-/// `serde_json`, same default features on both native and WASM), which is exactly
+/// `serde_json`, same default features across all members), which is exactly
 /// why it converges. The JSON shape is also load-bearing because the consequence
 /// engine reads `target_did` back out of these bytes via
 /// `scp_protocol::trust::consequence::payload_target_is` to close the recursive
@@ -254,6 +373,95 @@ pub fn consequence_event_payload(
     });
     EventPayload {
         data: serde_json::to_vec(&value).unwrap_or_default(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-bridge payload projection
+// ---------------------------------------------------------------------------
+
+/// A bridge-agnostic projection of the fields an FFI `event_log_query` consumer
+/// needs to read out of a typed [`EventPayload`] without re-implementing the
+/// per-variant decode logic in each bridge.
+///
+/// # Why this exists
+///
+/// The FFI `event_log_query` projection historically discarded the event
+/// payload, emitting only the leaf hash. Layer-2 behavioral records need the
+/// `target_did` carried by governance/access-revocation events to compute
+/// participation facts (e.g. `governance_actions_against`). This struct is the
+/// single shared decode surface so that the three native bridges (`PyO3`,
+/// NAPI, `UniFFI`) project byte-identical values for the same event — the
+/// cross-bridge parity contract. It lives alongside the payload types in
+/// `scp-event-log` (not `scp-ffi-common`), so every bridge shares one decoder
+/// by construction.
+///
+/// Fields default to `None`; only variants that carry the field decode it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventPayloadProjection {
+    /// The target DID for events that carry one (governance actions, access
+    /// revocation); `None` otherwise. An empty `target_did` in the underlying
+    /// payload (e.g. an untargeted, context-wide governance action) projects to
+    /// `None` so consumers do not key participation facts on an empty subject.
+    pub target_did: Option<String>,
+    /// The subject DID for role/membership events that carry one
+    /// (`RoleAssigned`, `MemberJoined`, `MemberLeft`) — the *affected member*,
+    /// not the governance actor; `None` otherwise. An empty `subject_did` in the
+    /// underlying payload (e.g. a historical empty-payload leaf) projects to
+    /// `None` so consumers do not key participation facts on an empty subject.
+    ///
+    /// This is a separate field from [`target_did`](Self::target_did) by design:
+    /// governance/access events project the targeted member into `target_did`,
+    /// while role/membership events project the affected member into
+    /// `subject_did`. Two precise fields keep participation-fact attribution
+    /// (§7.3.2) unambiguous about which leaf class a DID came from.
+    pub subject_did: Option<String>,
+}
+
+/// Decodes the bridge-facing projection fields from a typed event payload.
+///
+/// This is the single shared entry point every FFI bridge's `event_log_query`
+/// projection calls to expose payload fields. It decodes ONLY the variants that
+/// carry a projected field; all other variants return
+/// [`EventPayloadProjection::default`] (all fields `None`).
+///
+/// # Panics
+///
+/// Never. Malformed payload bytes decode to `None` via [`decode_payload`]'s
+/// `Result`, never a panic, so a corrupt leaf cannot crash a query.
+#[must_use]
+pub fn project_payload(event_type: &EventType, payload: &EventPayload) -> EventPayloadProjection {
+    /// Maps an empty string to `None`; a non-empty string to `Some`.
+    fn non_empty(value: String) -> Option<String> {
+        if value.is_empty() { None } else { Some(value) }
+    }
+
+    match event_type {
+        EventType::GovernanceActionExecuted => EventPayloadProjection {
+            target_did: decode_payload::<GovernanceActionExecutedPayload>(payload)
+                .ok()
+                .and_then(|p| non_empty(p.target_did)),
+            ..EventPayloadProjection::default()
+        },
+        EventType::AccessRevoked => EventPayloadProjection {
+            target_did: decode_payload::<AccessRevokedPayload>(payload)
+                .ok()
+                .and_then(|p| non_empty(p.target_did)),
+            ..EventPayloadProjection::default()
+        },
+        EventType::RoleAssigned => EventPayloadProjection {
+            subject_did: decode_payload::<RoleAssignedPayload>(payload)
+                .ok()
+                .and_then(|p| non_empty(p.subject_did)),
+            ..EventPayloadProjection::default()
+        },
+        EventType::MemberJoined | EventType::MemberLeft => EventPayloadProjection {
+            subject_did: decode_payload::<MembershipChangePayload>(payload)
+                .ok()
+                .and_then(|p| non_empty(p.subject_did)),
+            ..EventPayloadProjection::default()
+        },
+        _ => EventPayloadProjection::default(),
     }
 }
 
@@ -310,7 +518,7 @@ mod tests {
             app_did: "did:key:app".to_owned(),
             app_name: "Scheduler".to_owned(),
             app_version: "1.2.3".to_owned(),
-            capabilities: vec!["tool:invoke:*".to_owned(), "message:send".to_owned()],
+            capabilities: vec!["outlet:call:*".to_owned(), "message:send".to_owned()],
         };
         let encoded = encode_payload(&p).unwrap();
         assert_positional_array(&encoded.data, 4);
@@ -381,6 +589,20 @@ mod tests {
     }
 
     #[test]
+    fn key_epoch_advance_round_trip() {
+        // ADR-007 §5 sender-key epoch advance (distinct from MLS group recovery epoch).
+        let p = KeyEpochAdvancePayload {
+            old_epoch: 5,
+            new_epoch: 6,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // 2-field struct → fixarray of length 2
+        assert_positional_array(&encoded.data, 2);
+        let decoded: KeyEpochAdvancePayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
     fn access_revoked_round_trip() {
         let p = AccessRevokedPayload {
             target_did: "did:key:alice".to_owned(),
@@ -418,6 +640,63 @@ mod tests {
     }
 
     #[test]
+    fn governance_deadlock_recovery_round_trip() {
+        let p = GovernanceDeadlockRecoveryPayload {
+            unavailable_dids: vec!["did:key:carol".to_owned(), "did:key:dave".to_owned()],
+            missed_windows: vec![
+                ("did:key:carol".to_owned(), 4),
+                ("did:key:dave".to_owned(), 3),
+            ],
+            detected_at: 1_700_000_000,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // 3 fields: unavailable_dids (Vec<String>), missed_windows (Vec<(String,u32)>),
+        // detected_at (u64)
+        assert_positional_array(&encoded.data, 3);
+        let decoded: GovernanceDeadlockRecoveryPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn governance_deadlock_recovery_missed_windows_only_round_trip() {
+        // Boundary: missed_windows evidence only (unavailable_dids empty — signers
+        // responded but missed enough windows to trigger the fallback threshold).
+        let p = GovernanceDeadlockRecoveryPayload {
+            unavailable_dids: Vec::new(),
+            missed_windows: vec![("did:key:eve".to_owned(), 5)],
+            detected_at: 0,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 3);
+        let decoded: GovernanceDeadlockRecoveryPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn role_assigned_round_trip() {
+        let p = RoleAssignedPayload {
+            subject_did: "did:key:carol".to_owned(),
+            role: "admin".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 2);
+        let decoded: RoleAssignedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn membership_change_round_trip() {
+        let p = MembershipChangePayload {
+            subject_did: "did:key:dave".to_owned(),
+            role_name: "member".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 2);
+        let decoded: MembershipChangePayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
     fn empty_collections_round_trip() {
         // Boundary: empty consenting/rejecting/capability vectors must survive
         // the round trip and still produce a fixarray of the struct's field
@@ -431,6 +710,220 @@ mod tests {
         let encoded = encode_payload(&p).unwrap();
         assert_positional_array(&encoded.data, 4);
         let decoded: TtlExtendedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn project_governance_action_executed_round_trips_target_did() {
+        let p = GovernanceActionExecutedPayload {
+            target_did: "did:key:bob".to_owned(),
+            action_type: "RemoveMember".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::GovernanceActionExecuted, &encoded);
+        assert_eq!(projection.target_did.as_deref(), Some("did:key:bob"));
+    }
+
+    #[test]
+    fn project_access_revoked_round_trips_target_did() {
+        let p = AccessRevokedPayload {
+            target_did: "did:key:alice".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::AccessRevoked, &encoded);
+        assert_eq!(projection.target_did.as_deref(), Some("did:key:alice"));
+    }
+
+    #[test]
+    fn project_untargeted_governance_action_yields_none() {
+        // An untargeted governance action carries an empty target_did, which
+        // must project to None so consumers do not key facts on an empty
+        // subject.
+        let p = GovernanceActionExecutedPayload {
+            target_did: String::new(),
+            action_type: "ModifyPolicy".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::GovernanceActionExecuted, &encoded);
+        assert_eq!(projection.target_did, None);
+    }
+
+    #[test]
+    fn project_non_target_event_yields_none() {
+        // A variant that carries no target_did returns the default projection,
+        // even when handed bytes that would decode to a targeted payload.
+        let p = GovernanceActionExecutedPayload {
+            target_did: "did:key:carol".to_owned(),
+            action_type: "RemoveMember".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::ContextCreated, &encoded);
+        assert_eq!(projection, EventPayloadProjection::default());
+        assert_eq!(projection.target_did, None);
+    }
+
+    #[test]
+    fn project_role_assigned_round_trips_subject_did() {
+        let p = RoleAssignedPayload {
+            subject_did: "did:key:carol".to_owned(),
+            role: "admin".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::RoleAssigned, &encoded);
+        assert_eq!(projection.subject_did.as_deref(), Some("did:key:carol"));
+        // RoleAssigned carries a subject, never a target.
+        assert_eq!(projection.target_did, None);
+    }
+
+    #[test]
+    fn project_member_joined_round_trips_subject_did() {
+        let p = MembershipChangePayload {
+            subject_did: "did:key:dave".to_owned(),
+            role_name: "member".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::MemberJoined, &encoded);
+        assert_eq!(projection.subject_did.as_deref(), Some("did:key:dave"));
+        assert_eq!(projection.target_did, None);
+    }
+
+    #[test]
+    fn project_member_left_round_trips_subject_did() {
+        let p = MembershipChangePayload {
+            subject_did: "did:key:erin".to_owned(),
+            role_name: "subscriber".to_owned(),
+        };
+        let encoded = encode_payload(&p).unwrap();
+        let projection = project_payload(&EventType::MemberLeft, &encoded);
+        assert_eq!(projection.subject_did.as_deref(), Some("did:key:erin"));
+        assert_eq!(projection.target_did, None);
+    }
+
+    #[test]
+    fn project_empty_subject_role_membership_yields_none() {
+        // A role/membership leaf with an empty subject_did (e.g. a historical
+        // empty-payload leaf reconstructed with a blank subject) must project to
+        // None so consumers do not key facts on an empty subject.
+        let role = RoleAssignedPayload {
+            subject_did: String::new(),
+            role: "admin".to_owned(),
+        };
+        let role_enc = encode_payload(&role).unwrap();
+        assert_eq!(
+            project_payload(&EventType::RoleAssigned, &role_enc).subject_did,
+            None
+        );
+
+        let membership = MembershipChangePayload {
+            subject_did: String::new(),
+            role_name: "member".to_owned(),
+        };
+        let membership_enc = encode_payload(&membership).unwrap();
+        assert_eq!(
+            project_payload(&EventType::MemberJoined, &membership_enc).subject_did,
+            None
+        );
+        assert_eq!(
+            project_payload(&EventType::MemberLeft, &membership_enc).subject_did,
+            None
+        );
+    }
+
+    #[test]
+    fn project_malformed_bytes_yields_none_without_panic() {
+        // Garbage bytes for a target-carrying variant must decode to None, not
+        // panic — a corrupt leaf cannot crash a query.
+        let malformed = EventPayload {
+            data: vec![0xff, 0x00, 0x13, 0x37],
+        };
+        let governance = project_payload(&EventType::GovernanceActionExecuted, &malformed);
+        assert_eq!(governance.target_did, None);
+        let revoked = project_payload(&EventType::AccessRevoked, &malformed);
+        assert_eq!(revoked.target_did, None);
+        // Subject-bearing variants must also tolerate garbage without panic.
+        assert_eq!(
+            project_payload(&EventType::RoleAssigned, &malformed).subject_did,
+            None
+        );
+        assert_eq!(
+            project_payload(&EventType::MemberJoined, &malformed).subject_did,
+            None
+        );
+        assert_eq!(
+            project_payload(&EventType::MemberLeft, &malformed).subject_did,
+            None
+        );
+    }
+
+    #[test]
+    fn project_empty_payload_yields_none_without_panic() {
+        let empty = EventPayload::default();
+        let governance = project_payload(&EventType::GovernanceActionExecuted, &empty);
+        assert_eq!(governance.target_did, None);
+        let revoked = project_payload(&EventType::AccessRevoked, &empty);
+        assert_eq!(revoked.target_did, None);
+        // Subject-bearing variants project None from an empty payload, never panic.
+        assert_eq!(
+            project_payload(&EventType::RoleAssigned, &empty).subject_did,
+            None
+        );
+        assert_eq!(
+            project_payload(&EventType::MemberJoined, &empty).subject_did,
+            None
+        );
+        assert_eq!(
+            project_payload(&EventType::MemberLeft, &empty).subject_did,
+            None
+        );
+    }
+
+    #[test]
+    fn media_session_started_round_trip() {
+        let p = MediaSessionStartedPayload {
+            session_id: "ms-abc123".to_owned(),
+            context_id: "ctx-test-001".to_owned(),
+            participants: vec!["did:dht:zAlice".to_owned(), "did:dht:zBob".to_owned()],
+            capabilities: vec!["media:voice".to_owned()],
+            started_at: 1_700_000_000,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // 5-field struct → fixarray of length 5
+        assert_positional_array(&encoded.data, 5);
+        let decoded: MediaSessionStartedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn media_session_ended_round_trip() {
+        let p = MediaSessionEndedPayload {
+            session_id: "ms-abc123".to_owned(),
+            context_id: "ctx-test-001".to_owned(),
+            participants: vec!["did:dht:zAlice".to_owned()],
+            capabilities: vec!["media:voice".to_owned(), "media:video".to_owned()],
+            started_at: 1_700_000_000,
+            ended_at: 1_700_003_600,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        // 6-field struct → fixarray of length 6
+        assert_positional_array(&encoded.data, 6);
+        let decoded: MediaSessionEndedPayload = decode_payload(&encoded).unwrap();
+        assert_eq!(p, decoded);
+    }
+
+    #[test]
+    fn media_session_started_empty_participants_round_trip() {
+        // Boundary: empty participant/capability vectors survive the round-trip
+        // and still produce a 5-element fixarray.
+        let p = MediaSessionStartedPayload {
+            session_id: "ms-empty".to_owned(),
+            context_id: "ctx-x".to_owned(),
+            participants: Vec::new(),
+            capabilities: Vec::new(),
+            started_at: 0,
+        };
+        let encoded = encode_payload(&p).unwrap();
+        assert_positional_array(&encoded.data, 5);
+        let decoded: MediaSessionStartedPayload = decode_payload(&encoded).unwrap();
         assert_eq!(p, decoded);
     }
 }

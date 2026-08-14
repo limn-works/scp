@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::params::{ContextParams, TemplateId};
@@ -21,7 +21,7 @@ use scp_protocol::context::{ContextError, ContextState};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::config::{ContextConfig, ContextCreation};
 use scp_runtime::context::supervisor::Supervisor;
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // Mock providers (mirrors governance_integration.rs)
@@ -40,21 +40,26 @@ impl MockTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for MockTransport {
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn send_message(&self, _id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        _id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
         Ok(())
     }
 }
@@ -62,11 +67,12 @@ impl ContextTransportProvider for MockTransport {
 #[derive(Default)]
 struct MockEventLog;
 
+#[async_trait::async_trait]
 impl ContextEventLogProvider for MockEventLog {
-    fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(
+    async fn append_event(
         &self,
         _id: &[u8; 32],
         _event: scp_event_log::EventType,
@@ -76,7 +82,7 @@ impl ContextEventLogProvider for MockEventLog {
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 }
@@ -91,7 +97,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|did, _kid: scp_did::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -103,8 +109,9 @@ fn alice() -> DID {
 
 fn new_manager() -> Arc<Supervisor> {
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
@@ -135,7 +142,7 @@ async fn create_with_template_config_returns_active_handle() {
         .await
         .unwrap();
 
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 
     // The handle's params must match the equivalent `from_template` path with
     // the TTL applied — proving `create` is a front-end over the same engine.
@@ -169,8 +176,8 @@ async fn create_matches_create_context_for_equivalent_inputs() {
         .await
         .unwrap();
 
-    assert_eq!(via_create.try_read_state().unwrap(), ContextState::Active);
-    assert_eq!(via_engine.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(via_create.state(), ContextState::Active);
+    assert_eq!(via_engine.state(), ContextState::Active);
     assert_eq!(via_create.params(), via_engine.params());
 }
 
@@ -225,5 +232,5 @@ async fn create_without_peer_succeeds() {
         .create("ctx-no-peer".into(), config, alice(), None)
         .await
         .unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 }

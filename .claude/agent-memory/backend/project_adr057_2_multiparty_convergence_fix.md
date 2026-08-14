@@ -1,0 +1,29 @@
+---
+name: project-adr057-2-multiparty-convergence-fix
+description: ADR-057 Slice 2 review-fix — existing-member add-Commit convergence in scp-client multi-party contexts; new scp-mls decrypt_with_membership_changes seam
+metadata:
+  type: project
+---
+
+ADR-057 Slice 2 (`crates/scp-client`) review-fix, commit d8b4e4c82 on branch feat/adr057-2-scp-client (NOT pushed; tip was 566dbe288). Fixes the HIGH multi-party divergence bug.
+
+**Bug:** existing member receiving an MLS Commit that adds a member merged the commit but appended NO MemberJoined leaf and updated NO membership/sequence — returned Ok(false). The convergent leaf was handed only to the new joiner (via AddMemberOutput.event_log replay). With 3+ parties, existing members' logs/roots/membership permanently diverged.
+
+**Root cause:** `decrypt_with_sender_did` merges the staged commit and discards the add-proposal info; the driver's `Inbound::Control` arm dropped everything.
+
+**Fix:**
+- NEW scp-mls seam `encrypt::decrypt_with_membership_changes` (+ `InboundChange` enum, both re-exported from lib.rs). Existing-member counterpart of decrypt_with_sender_did. For a StagedCommit it recovers added DIDs from Add proposals' validated KeyPackage leaf credentials and removed DIDs from Remove proposals mapped to the PRE-MERGE tree, THEN merges. openmls API: `StagedCommit::add_proposals()`→`QueuedAddProposal::add_proposal()`→`AddProposal::key_package()`→`.leaf_node().credential()`; `remove_proposals()`→`RemoveProposal::removed()` (LeafNodeIndex)→map via group.members() BEFORE merge. Added DIDs are authenticated (process_message already validated the KeyPackages). Shared private helper `credential_to_did` dedups the credential→DID parse (decrypt_with_sender_did refactored onto it).
+- scp-client: `AddMemberOutput.committer_timestamp_secs` transports the convergent T to existing members exactly as SendOutput does for messages. `crypto_state::Inbound::Control` split into `Commit{sender_did,added_dids,removed_dids}` + `Proposal`. `receive_message` Commit arm appends the identical MemberJoined leaf (committer DID from MLS + transported T) per added DID and records the member. Leaf byte-identity holds because each member's log is at the same state the committer's was pre-add (convergence-by-replay invariant).
+- REMOVES are guarded loud with new `ClientError::UnsupportedMembershipChange` (Slice 2 has no convergent removal-leaf transport; driver exposes no remove/leave op anyway — close_context only destroys the LOCAL group). Guard checks removes FIRST so the error path writes nothing to the SCP log.
+- LOW: corrected key_package_in_did doc (runs full .validate → DID is cryptographically authenticated, NOT advisory); dropped never-constructed ClientError::NotApplicationMessage.
+
+**FOLLOW-UP review-fix @ commit b4c1db87e (NOT pushed; on top of the above, branch rebased onto main):**
+- Fix 1 (the real one): remove-Commit is now rejected PRE-merge, not post-merge. The earlier design merged the staged commit inside `decrypt_message` THEN errored → internal MLS-vs-SCP skew (MLS epoch advanced + leaf evicted while SCP membership/log stayed put). Now `decrypt_with_membership_changes` reads `staged_commit.remove_proposals()` BEFORE any merge; if non-empty it DROPS the StagedCommit (never calls `merge_staged_commit`) and returns NEW `InboundChange::UnsupportedMembershipChange{sender_did,removed_dids}`. MLS+SCP stay mutually consistent (both pre-remove), group usable on old epoch. `InboundChange::Commit` lost its `removed_dids` field (add-only now); same split mirrored into scp-client `Inbound`. openmls KEY FACT: `process_message` CONSUMES the message generation even when you don't merge — re-receiving the SAME Commit fails with "secret was deleted to preserve forward secrecy" (DecryptionFailed), so you cannot assert idempotent re-receive of a rejected commit.
+- Fix 2: `// SECURITY:` note at `receive_message` — transported `committer_timestamp_secs` is UNAUTHENTICATED (not in §9.16 AAD, leaves unsigned); a hostile relay could forge it and diverge the root; MUST be bound to a signed leaf/envelope before a real transport (leaf-signing/custody slice). No #NNNN in source.
+- Fix 3: integration test `remove_commit_is_rejected_fail_closed_without_skew` drives ALICE as a RAW scp-mls group (dev-dep) + BOB as ScpClient. WHY raw: ScpClient has no remove op, and a `testing`-gated `test_only_remove_member_commit` method does NOT work under the canonical verify cmd `--features scp-runtime/testing` (that does NOT enable scp-client's OWN `testing` feature — only scp-mls/testing via unification, which is enough for did:key: but not the gated method). Asserts UnsupportedMembershipChange + Bob's mls_epoch/membership/leaf_count/root ALL unchanged. New `ScpClient::mls_epoch(ctx)->Result<u64>` query accessor.
+- Fix 4: manual redacting `Debug` for `Application` variant of BOTH `InboundChange` (scp-mls) and `Inbound` (scp-client): prints `<redacted N bytes>` not plaintext (ADR-057 tab=plaintext boundary). 2 unit tests prove no leak via {:?}.
+- Verify: 2277 tests pass (scp-client+scp-mls+scp-runtime, --features scp-runtime/testing); full-feature clippy -D warnings clean; fmt clean; wasm32 check exit 0; fence empty; workspace build clean. scp-runtime untouched (uses its own decrypt_with_sender_did).
+
+**Convergence ordering caveat (pre-existing to the design, not introduced):** existing-member leaf byte-identity requires the member to process the committer's messages+commits IN ORDER (the MVP "dumb pipe" delivers in order). Not a new defect.
+
+Tests: `crates/scp-client/tests/multi_party_convergence.rs` (3-party convergence + reciprocal Bob→Alice send with 3 differing clocks). Pre-fix probe confirmed divergence (Bob stuck at 2 leaves, Carol missing, root≠Alice's). scp-mls unit tests for surfacing added+removed DIDs. All 115 tests pass; clippy -D warnings clean; wasm32 check exit 0; dep fence empty; workspace build clean.

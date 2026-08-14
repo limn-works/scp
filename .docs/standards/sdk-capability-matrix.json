@@ -28,11 +28,10 @@
         {
           "name": "rotate_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts, internal/wasm.ts identity_rotate_key) but no public SDK wrapper on the Identity class yet; the named public rotateKey() wrapper lands in the SDK-parity PR carved from the same bundled branch.",
             "kotlin": "UniFFI bridge exports rotate_key; Kotlin SDK has no idiomatic wrapper exposing it yet",
             "swift": "UniFFI bridge exports rotate_key (ScpBindings.swift open func rotateKey()); no public SDK wrapper written yet"
           }
@@ -54,32 +53,23 @@
         {
           "name": "add_agent_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts addAgentKey, internal/wasm.ts identity_add_agent_key) but no public SDK wrapper on the Identity class yet; the named public addAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "rotate_agent_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts rotateAgentKey) but no public SDK wrapper on the Identity class yet; the named public rotateAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "remove_agent_key",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts removeAgentKey) but no public SDK wrapper on the Identity class yet; the named public removeAgentKey() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "identity_remove",
@@ -87,7 +77,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Per-instance removal of retained SCP-side identity state for a DID. Surfaced in all four SDKs (scp.identityRemove / identity_remove). Validates the DID via the shared validate_did gate on every bridge (pyo3/napi/uniffi/wasm). Exported by all four bridges; see scripts/bridge-aliases.json (wasm_required true)."
+          "notes": "Per-instance removal of retained SCP-side identity state for a DID. Surfaced in all four SDKs (scp.identityRemove / identity_remove). Validates the DID via the shared validate_did gate on every bridge (pyo3/napi/uniffi). Exported by all three bridges; see scripts/bridge-aliases.json."
         },
         {
           "name": "identity_remove_if_present",
@@ -95,17 +85,14 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Conditional companion to identity_remove reporting whether the DID was present. Surfaced in all four SDKs. Validates the DID via the shared validate_did gate on every bridge. Exported by all four bridges; see scripts/bridge-aliases.json (wasm_required true)."
+          "notes": "Conditional companion to identity_remove reporting whether the DID was present. Surfaced in all four SDKs. Validates the DID via the shared validate_did gate on every bridge. Exported by all three bridges; see scripts/bridge-aliases.json."
         },
         {
           "name": "migrate",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "Bridge plumbing exists (internal/native.ts migrate, internal/wasm.ts identity_migrate) but no public SDK wrapper on the Identity class yet; the named public migrate() wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "resume_migration_publish",
@@ -127,10 +114,10 @@
           "typescript": false,
           "kotlin": true,
           "swift": true,
-          "notes": "Only wired DeviceAttestation backend is the software InMemoryDeviceAttestation; production hardware attestation (Apple App Attest / Android Key Attestation) is unimplemented (ADR-025 stub). PyO3 and NAPI gate identity_attest_device out of production builds entirely; the UniFFI bridge exports it but its impl fails closed (SCP-IDENT-1010) in bare/production builds. Present in the Swift/Kotlin surface but always denies until ADR-025 hardware attestation lands.",
+          "notes": "The only wired DeviceAttestation backend is the test-harness software InMemoryDeviceAttestation, now #[cfg(feature = \"testing\")]-gated (ADR-062 §Decision 3/6); production hardware attestation (Apple App Attest / Android Key Attestation) is unimplemented (ADR-025 stub). On a shipped build the attestation capability is DECLINED with a typed error (spec §9:187 — a conformant scoped decline), never a silent attest-valid: the shipped PyO3, NAPI, and UniFFI attest surfaces all resolve the identity against their instance registry, then return SCP-IDENT-1015. Present in the Swift/Kotlin surface but always denies until ADR-025 hardware attestation lands.",
           "exemptions": {
-            "python": "identity_attest_device #[cfg(allow_in_memory_custody)]-gated out of production PyO3 builds; only wired backend is software InMemoryDeviceAttestation (ADR-025 hardware attestation unimplemented)",
-            "typescript": "lives in an #[cfg(allow_in_memory_custody)]-gated #[napi] impl block, absent from production NAPI builds (ADR-025)"
+            "python": "InMemoryDeviceAttestation is #[cfg(feature = \"testing\")]-gated; on a shipped PyO3 build identity_attest_device DECLINES with a typed SCP-IDENT-1015 error (spec §9:187 attestation declined), never a silent attest-valid (ADR-025 hardware attestation unimplemented)",
+            "typescript": "InMemoryDeviceAttestation is #[cfg(feature = \"testing\")]-gated out of production NAPI builds; the shipped attestation op declines with a typed error (spec §9:187, ADR-025)"
           }
         },
         {
@@ -139,10 +126,10 @@
           "typescript": false,
           "kotlin": true,
           "swift": true,
-          "notes": "Companion verify for device attestation; same gating as attest_device. Only wired backend is software InMemoryDeviceAttestation (ADR-025 hardware attestation unimplemented). PyO3/NAPI gate it out of production builds; UniFFI exports it but fails closed in bare builds.",
+          "notes": "Companion verify for device attestation; same classification as attest_device. The only wired backend is the test-harness software InMemoryDeviceAttestation, now #[cfg(feature = \"testing\")]-gated (ADR-062 §Decision 3/6; ADR-025 hardware attestation unimplemented). On a shipped build verification is DECLINED with a typed error (spec §9:187): the shipped PyO3, NAPI, and UniFFI verify surfaces all return SCP-IDENT-1016, never a silent verify-valid. PyO3 exposes verify as a real module-level free #[pyfunction] present in both build configs (the shipped arm declines); it is not merely an SDK-shim absence.",
           "exemptions": {
-            "python": "identity_verify_device_attestation #[cfg(allow_in_memory_custody)]-gated out of production PyO3 builds; only wired backend is software InMemoryDeviceAttestation (ADR-025 hardware attestation unimplemented)",
-            "typescript": "lives in an #[cfg(allow_in_memory_custody)]-gated #[napi] impl block, absent from production NAPI builds (ADR-025)"
+            "python": "On a shipped PyO3 build identity_verify_device_attestation is a real module-level free #[pyfunction] (InMemoryDeviceAttestation is #[cfg(feature = \"testing\")]-gated out of its body) that DECLINES with a typed SCP-IDENT-1016 error (spec §9:187 attestation declined), never a silent verify-valid (ADR-025 hardware attestation unimplemented)",
+            "typescript": "InMemoryDeviceAttestation is #[cfg(feature = \"testing\")]-gated out of production NAPI builds; the shipped verify op declines with a typed error (spec §9:187, ADR-025)"
           }
         },
         {
@@ -224,6 +211,30 @@
           "swift": true
         },
         {
+          "name": "reserve_key_package",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "ADR-049 Phase 2J joiner handshake (step 1): reserve a single-use MLS KeyPackage. PyO3 bridge PyScp::reserve_key_package (scp-ffi/src/context.rs) reaches Supervisor::reserve_key_package; SDK wrapper SCP.reserve_key_package (bindings/python/scp_sdk/scp.py). NAPI bridge export reserve_key_package_on (scp-ffi/napi/src/context.rs) with TS wrapper SCP.reserveKeyPackage (bindings/typescript/src/scp.ts); UniFFI export Scp::reserve_key_package (scp-ffi/uniffi/src/bridge.rs) with Swift SCP.reserveKeyPackage (bindings/swift/Sources/SCP/Scp.swift) and Kotlin Scp.reserveKeyPackage (bindings/kotlin/scp-kt)."
+        },
+        {
+          "name": "join_from_welcome",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "ADR-049 Phase 2J joiner handshake (step 2): join a context by processing a received MLS Welcome, standing the joiner up as a send-capable participant. Reshaped for FFI-02 Option A: the joiner consumes a sealed, signed InvitationBundle (SealedInvitation: enc + ciphertext) produced by invite_member — not loose plaintext params. PyO3 bridge PyScp::context_join_from_welcome (scp-ffi/src/context.rs) reaches Supervisor::spawn_actor_from_welcome; SDK wrapper SCP.context_join_from_welcome (bindings/python/scp_sdk/scp.py). NAPI bridge export context_join_from_welcome_on (scp-ffi/napi/src/context.rs) with TS wrapper SCP.contextJoinFromWelcome (bindings/typescript/src/scp.ts); UniFFI export Scp::context_join_from_welcome (scp-ffi/uniffi/src/bridge.rs) with Swift Context.joinFromWelcome (bindings/swift/Sources/SCP/Context.swift) and Kotlin Scp.contextJoinFromWelcome (bindings/kotlin/scp-kt)."
+        },
+        {
+          "name": "invite_member",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "ADR-049 Phase 2J / FFI-02 Option A creator-side invite: adds an invitee to a SingleAdmin context (unilateral MLS add) and returns an InviteMemberOutcome::Sealed { bundle: SealedInvitation, delivered } — the creator-signed, HPKE-sealed bundle (enc + ciphertext) directly usable as the sealed join input to context_join_from_welcome, plus a delivered flag (true if the runtime published it to the invitee's routing id). Peer of join_from_welcome (step 2's producer). Only SingleAdmin contexts are supported today: a voting / non-SingleAdmin (Threshold/Majority/Unanimity) context throws InvalidState — governed-context invitations are not yet implemented (#2027 adds the governed path additively). PyO3 bridge PyScp::invite_member (scp-ffi/src/context.rs) reaches Supervisor::invite_member; SDK wrapper SCP.invite_member (bindings/python/scp_sdk/scp.py). NAPI bridge export invite_member (scp-ffi/napi/src/scp.rs, delegating to invite_member_on in scp-ffi/napi/src/context.rs) with TS wrapper SCP.inviteMember (bindings/typescript/src/scp.ts); UniFFI export Scp::invite_member (scp-ffi/uniffi/src/bridge.rs) with Swift SCP.inviteMember (bindings/swift/Sources/SCP/Scp.swift) and Kotlin Scp.inviteMember (bindings/kotlin/scp-kt/.../Scp.kt)."
+        },
+        {
           "name": "leave",
           "python": true,
           "typescript": true,
@@ -249,10 +260,7 @@
           "python": true,
           "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "notes": {
-            "wasm": "ADR-034 divergence: the WASM core has no Supervisor/actor and no relay QUERY-since retrieval surface, so the ADR-029 reconnection driver cannot run in-process. The TypeScript SDK's SCP class is NAPI-only (the browser/WASM build throws on `new SCP()`), so this `typescript: true` entry is satisfied by the NAPI backend. The WASM SDK reconnects via its own constrained JS-driven path: JS retrieves relay-buffered blobs and feeds each to context_decrypt_message (which advances the MLS epoch on Commit), and signs/exchanges checkpoints via the in-process event_log_checkpoint path (#1540 Step 5/WASM)."
-          }
+          "swift": true
         },
         {
           "name": "receive",
@@ -308,6 +316,22 @@
           "exemptions": {
             "kotlin": "SDK does not expose validateCapabilityDeclaration wrapper"
           }
+        },
+        {
+          "name": "app_bind",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Binds an app to a context (spec §8.4.1), appending a durable AppBound event (tag 74). Returns JSON with app_did and granted_capabilities."
+        },
+        {
+          "name": "app_unbind",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Unbinds an app from a context (spec §8.4.2), appending a durable AppUnbound event (tag 75)."
         },
         {
           "name": "metadata_record_serialize",
@@ -369,7 +393,7 @@
           "typescript": true,
           "kotlin": false,
           "swift": true,
-          "notes": "ContextParams now carries optional consequence_rules JSON field (ADR-017, #1531). PyO3, NAPI, UniFFI, and WASM bridges parse and persist the field; PyO3/NAPI/UniFFI Swift SDK wrappers expose it via params struct field. Kotlin SDK has no Context wrapper that surfaces ContextParams construction.",
+          "notes": "ContextParams now carries optional consequence_rules JSON field (ADR-017, #1531). PyO3, NAPI, and UniFFI bridges parse and persist the field; PyO3/NAPI/UniFFI Swift SDK wrappers expose it via params struct field. Kotlin SDK has no Context wrapper that surfaces ContextParams construction.",
           "exemptions": {
             "kotlin": "Kotlin SDK exposes ContextParams via UniFFI generated bindings only; no idiomatic wrapper accepts consequence_rules"
           }
@@ -380,7 +404,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: lifecycle_helpers::import_context now calls validate_and_sanitize_snapshot on velocity tracker, hard-rate-limit token bucket, and spending nonce tracker (lifecycle_helpers.rs:1476/1490, batch-2 wiring). No direct SDK call site \u2014 invoked transitively from import_context.",
+          "notes": "Internal: lifecycle_helpers::import_context now calls validate_and_sanitize_snapshot on velocity tracker, hard-rate-limit token bucket, and spending nonce tracker (lifecycle_helpers.rs:1476/1490, batch-2 wiring). No direct SDK call site — invoked transitively from import_context.",
           "exemptions": {
             "python": "internal wiring inside import_context, not a separate SDK operation",
             "typescript": "internal wiring inside import_context, not a separate SDK operation",
@@ -394,7 +418,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextSnapshot now serializes consequence_rules, velocity_tracker_snapshot, hard_rate_limit_snapshot, spending_nonce_state. No direct SDK call site \u2014 invoked transitively from export_context/snapshot_context.",
+          "notes": "Internal: ContextSnapshot now serializes consequence_rules, velocity_tracker_snapshot, hard_rate_limit_snapshot, spending_nonce_state. No direct SDK call site — invoked transitively from export_context/snapshot_context.",
           "exemptions": {
             "python": "internal wiring inside export_context, not a separate SDK operation",
             "typescript": "internal wiring inside export_context, not a separate SDK operation",
@@ -408,7 +432,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::restore_context rebuilds consequence_rules, velocity_tracker, hard_rate_limit, spending_nonce_tracker from snapshot. No direct SDK call site \u2014 invoked transitively from restore_context.",
+          "notes": "Internal: ContextManager::restore_context rebuilds consequence_rules, velocity_tracker, hard_rate_limit, spending_nonce_tracker from snapshot. No direct SDK call site — invoked transitively from restore_context.",
           "exemptions": {
             "python": "internal wiring inside restore_context, not a separate SDK operation",
             "typescript": "internal wiring inside restore_context, not a separate SDK operation",
@@ -422,7 +446,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec \u00a723.16.8): ContextExport carries an Ed25519 snapshot_signature over the full-JCS canonical_snapshot_hash = SHA-256(domain SCP-CONTEXT-EXPORT-V1: || scope_tag || JCS(snapshot)) \u2014 the entire RFC 8785 canonical snapshot, NOT a 7-field subset recipe (domain distinct from the §23.16.4 sync-delta SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge that signs the export digest via KeyCustody::sign (custody-delegated through a per-bridge export-path signer helper; the private key never crosses the FFI boundary, ADR-006) across PyO3, NAPI, and UniFFI — the raw signing key is never exported. WASM signs SHA-256(domain || scope_tag || snapshot_jcs) in-bridge with the creator's #active key (WASM_EXPORT_VERSION=5). Native exports (MessagePack, version 4) and WASM exports (JSON, version 5) are mutually NON-importable by design (ADR-034): only the signing construction converges, not the serialized bytes. A WASM export fed to a native bridge is rejected at the version gate with SCP-CTX-2094 (a version error, not a signature forgery). No direct SDK call site \u2014 invoked transitively from context_export.",
+          "notes": "Internal (spec §23.16.8): ContextExport carries an Ed25519 snapshot_signature over the full-JCS canonical_snapshot_hash = SHA-256(domain SCP-CONTEXT-EXPORT-V1: || scope_tag || JCS(snapshot)) — the entire RFC 8785 canonical snapshot, NOT a 7-field subset recipe (domain distinct from the §23.16.4 sync-delta SCP-CONTEXT-SNAPSHOT-V1:). create_export takes a sign closure supplied by each FFI bridge that signs the export digest via KeyCustody::sign (custody-delegated through a per-bridge export-path signer helper; the private key never crosses the FFI boundary, ADR-006) across PyO3, NAPI, and UniFFI — the raw signing key is never exported. The native export envelope is MessagePack at version 4. No direct SDK call site — invoked transitively from context_export.",
           "exemptions": {
             "python": "internal wiring inside context_export, not a separate SDK operation",
             "typescript": "internal wiring inside context_export, not a separate SDK operation",
@@ -436,7 +460,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal (spec \u00a723.16.8): lifecycle_helpers::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI) or the WASM identity registry, failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. Cross-family imports are rejected there too: native (MessagePack, version 4) and WASM (JSON, version 5) exports are mutually NON-importable by design (ADR-034) \u2014 a WASM export handed to a native bridge surfaces SCP-CTX-2094 (version error), not a signature failure, even though the signing construction itself converges. No direct SDK call site \u2014 invoked transitively from context_import.",
+          "notes": "Internal (spec §23.16.8): lifecycle_helpers::import_context takes the exporter VerifyingKey and runs validate_export_for_import, which verify_strict's the snapshot signature (fail SCP-CTX-2093) before the Merkle check. Each FFI bridge resolves the exporter DID's #active/#agent key via IdentityBackedDidResolver (PyO3/NAPI/UniFFI), failing closed when no key resolves. Legacy/unsigned exports rejected at the version gate. No direct SDK call site — invoked transitively from context_import.",
           "exemptions": {
             "python": "internal wiring inside context_import, not a separate SDK operation",
             "typescript": "internal wiring inside context_import, not a separate SDK operation",
@@ -466,7 +490,7 @@
             "swift": "subscribe not yet exposed as public API on Context actor"
           },
           "notes": {
-            "napi": "NAPI-only: context_subscribe_on co-spawns the §9.9.2 suppression-detection heartbeat scheduler (run_heartbeat_scheduler) alongside the relay subscribe loop, sharing the per-subscription cancel token so unsubscribe/disconnect/bridge-shutdown tears both down in lockstep. The send cadence is the local node's per-profile interval (HeartbeatConfig::for_profile); the receive-side monitor sizes its suppression threshold to the slowest honest sender (240s uniform). Mirrors the reconnection-driver note: this lives at the NAPI subscribe boundary, not in the WASM SDK."
+            "napi": "NAPI-only: context_subscribe_on co-spawns the §9.9.2 suppression-detection heartbeat scheduler (run_heartbeat_scheduler) alongside the relay subscribe loop, sharing the per-subscription cancel token so unsubscribe/disconnect/bridge-shutdown tears both down in lockstep. The send cadence is the local node's per-profile interval (HeartbeatConfig::for_profile); the receive-side monitor sizes its suppression threshold to the slowest honest sender (240s uniform). This lives at the NAPI subscribe boundary."
           }
         },
         {
@@ -474,7 +498,8 @@
           "python": true,
           "typescript": true,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "notes": "All four SDK wrappers accept an optional messages:read UCAN JWT (Python `messages_read_ucan_jwt`, TS/Swift/Kotlin `messagesReadUcanJwt`) threaded through the bridge into SubscribeBroadcastPayload.ucan. For a GATED broadcast context this token is REQUIRED (spec §5.14.4): the actor handle_subscribe_broadcast turn builds a real ValidationContext and runs the full UCAN validation pipeline on it (spec §07:70). Omitting it for a gated context is rejected; it is unused for an OPEN context. Admission also fails closed for a governance-banned/read-revoked DID via the read_exclusion_list gate in subscribe_broadcast (uniform SUBSCRIBE_DENY_REASON), so a banned subscriber cannot replay a still-valid grant to re-appear on the roster."
         },
         {
           "name": "broadcast_publish",
@@ -524,7 +549,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "WASM coverage is satisfied via the TypeScript SDK's WASM backend path (the broadcast_open_key wasm export); the matrix tracks the four language SDKs, and the TypeScript SDK covers both the NAPI and WASM bridges."
+          "notes": "TypeScript coverage is satisfied via the NAPI-backed broadcast_open_key export; the matrix tracks the four language SDKs."
         },
         {
           "name": "validate_broadcast_key",
@@ -539,7 +564,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "context_send / Context.send accepts an optional spending_ucan_jwt parameter that AND-composes the per-action UCAN with a spending UCAN authorizing the message cost (#1537, batch-2 wiring). PyO3 bridge wires it through send_message. NAPI bridge accepts the parameter and threads it to ContextManager::send_message. UniFFI bridge: regenerated Swift/Kotlin bindings expose spendingUcanJwt; the Rust UniFFI bridge source still passes None to ContextManager::send_message \u2014 drift to be reconciled before the spending UCAN path is enforced on UniFFI consumers. WASM bridge accepts the parameter but ignores it (underscore-prefixed in manager.rs:1356)."
+          "notes": "context_send / Context.send accepts an optional spending_ucan_jwt parameter that AND-composes the per-action UCAN with a spending UCAN authorizing the message cost (#1537, batch-2 wiring). PyO3 bridge wires it through send_message. NAPI bridge accepts the parameter and threads it to ContextManager::send_message. UniFFI bridge: regenerated Swift/Kotlin bindings expose spendingUcanJwt; the Rust UniFFI bridge source still passes None to ContextManager::send_message — drift to be reconciled before the spending UCAN path is enforced on UniFFI consumers."
         },
         {
           "name": "join_with_spending_ucan",
@@ -547,7 +572,7 @@
           "typescript": true,
           "kotlin": false,
           "swift": true,
-          "notes": "context_join accepts an optional spending_ucan_jwt parameter for join-cost authorization (#1537, batch-2 wiring). PyO3 bridge wires it through join_context (scp-ffi/src/context.rs context_join). Swift wrapper Context.join exposes spendingUcanJwt via the regenerated UniFFI bindings (Context.swift:620). TypeScript wrapper Context.join exposes spendingUcanJwt (typescript/src/context.ts:368). HOWEVER: the underlying NAPI bridge context_join hard-codes None (napi/src/context.rs:606), the UniFFI bridge context_join hard-codes None (uniffi/src/bridge.rs:2931), and WASM ignores the parameter (manager.rs:1265 _spending_ucan_jwt). Only the PyO3 bridge actually threads the spending UCAN through to ContextManager::join_context. The wrapper-level marks reflect the SDK surface visible to users; bridge drift is tracked here as a known follow-up.",
+          "notes": "context_join accepts an optional spending_ucan_jwt parameter for join-cost authorization (#1537, batch-2 wiring). PyO3 bridge wires it through join_context (scp-ffi/src/context.rs context_join). Swift wrapper Context.join exposes spendingUcanJwt via the regenerated UniFFI bindings (Context.swift:620). TypeScript wrapper Context.join exposes spendingUcanJwt (typescript/src/context.ts:368). HOWEVER: the underlying NAPI bridge context_join hard-codes None (napi/src/context.rs:606), the UniFFI bridge context_join hard-codes None (uniffi/src/bridge.rs:2931). Only the PyO3 bridge actually threads the spending UCAN through to ContextManager::join_context. The wrapper-level marks reflect the SDK surface visible to users; bridge drift is tracked here as a known follow-up.",
           "exemptions": {
             "kotlin": "Kotlin SDK has no idiomatic Context.join wrapper exposing spendingUcanJwt"
           }
@@ -555,7 +580,7 @@
       ]
     },
     {
-      "domain": "Tools",
+      "domain": "Outlets",
       "operations": [
         {
           "name": "register",
@@ -584,6 +609,30 @@
           "typescript": true,
           "kotlin": true,
           "swift": true
+        },
+        {
+          "name": "invoke_cross_context_saga",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "The §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a). Exported by all three native bridges — PyO3 outlet_invoke_cross_context_saga, UniFFI outlet_invoke_cross_context_saga, NAPI outletInvokeCrossContextSaga (js_name); see scripts/bridge-aliases.json (category outlets). Each export binds the caller principal to the authenticated FFI identity (enforce_caller_principal_binding) before dispatching to Supervisor::start_cross_context_outlet_invocation_saga, pinned by the pyo3/napi/uniffi saga-export assertions in pipeline_wiring.rs. All four SDK wrappers are live: Python (SCP.outlet_invoke_cross_context_saga), TypeScript (SCP.outletInvokeCrossContextSaga), Swift (Context.invokeOutletCrossContextSaga), and Kotlin (SCP.outletInvokeCrossContextSaga / OutletBridge.invokeCrossContextSaga)."
+        },
+        {
+          "name": "invoke_cross_context_streaming_saga",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "The §6.2.5 STREAMING cross-context outlet-invocation saga (ADR-049 §3a streaming wait-model amendment + ADR-061 seal phase, SCP-OUT-047) — DISTINCT from the unary invoke_cross_context_saga above: the streaming surface does NOT block-until-Committed. The open mints a durable saga_id PROMPTLY at the Commit-transition and the SDK drives chunks behind a StreamingSagaHandle by polling the bridge outlet_streaming_saga_poll_next; the saga reaches Committed ASYNCHRONOUSLY at seal-close (terminal on the channel + durable journal, not a saga_state poll). Exported by all three native bridges — PyO3 outlet_streaming_saga_open (+ outlet_streaming_saga_poll_next), UniFFI outlet_streaming_saga_open (+ outlet_streaming_saga_poll_next), NAPI outletStreamingSagaOpen (+ outletStreamingSagaPollNext) js_name; see scripts/bridge-aliases.json (canonical outlet_streaming_saga_open / outlet_streaming_saga_poll_next). Each open binds caller_did to the authenticated FFI principal/channel (the §3a forward obligation) BEFORE handing out the receiver, dispatching to Supervisor::start_cross_context_streaming_outlet_invocation_saga, pinned by out047_pyo3_streaming_saga_open_binds_caller_and_reaches_start_saga in pipeline_wiring.rs. All four SDK wrappers are live: Python (SCP.outlet_invoke_cross_context_streaming_saga → StreamingSagaHandle), TypeScript (SCP.outletInvokeCrossContextStreamingSaga), Swift (Context.invokeOutletCrossContextStreamingSaga), and Kotlin (SCP.outletInvokeCrossContextStreamingSaga). WASM (scp-client-wasm) is NODE-DELEGATED per the ADR-057 scope fence — it does NOT host the saga pump/open/poll/seal/escrow/receipt (that is SCP-OUT-048); WASM's streaming-saga surface is invoker-side pure predicates only (outlet_stream_compute_caveats_binding / outlet_stream_verify_chunk_signature, BrowserParticipant domain). SCP-OUT-048 adds the invoker credit signing predicate (outletStreamSignCredit) + its #1980-forward WebCrypto preimage seam to the scp-client-wasm crate; their BrowserParticipant matrix rows land with the @limn-works/scp-ts-wasm wrapper (SCP-OUT-048 unit B), when the typescript-wasm cell is verified true. Browser-initiated CANCEL is node-delegated (ADR-057; §5.4.5 runtime-derived next_seq — see outlet.json CRITICAL #3), deferred to a future cross-context-cancel slice, so WASM has no cancel signing predicate."
+        },
+        {
+          "name": "recover_streaming_saga_truncated_close",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "The FFI-reconnect KEY-BEARING crash-recovery driver for a witness-ABSENT truncated streaming-saga prefix (SCP-OUT-046 #136 / SCP-OUT-047, ADR-049 §3a). On reconnect the export authenticates the caller (invoker gate — caller_did must equal the saga's pinned invoker_did, else SCP-PERM-3001), surfaces the target's Active Signing Key per-call from custody (never envelope-asserted, per the §3a forward obligation), and dispatches to Supervisor::recover_streaming_saga_truncated_close via the shared drive_recover_truncated_close helper — pinned by out047_pyo3_streaming_saga_recover_reaches_truncated_close in pipeline_wiring.rs. Exported by all three native bridges — PyO3 outlet_streaming_saga_recover_truncated_close, UniFFI outlet_streaming_saga_recover_truncated_close, NAPI outletStreamingSagaRecoverTruncatedClose (js_name); see scripts/bridge-aliases.json. All four SDK wrappers are live: Python (SCP.recover_streaming_saga_truncated_close), TypeScript (SCP.recoverStreamingSagaTruncatedClose), Swift (Context.recoverStreamingSagaTruncatedClose), and Kotlin (SCP.recoverStreamingSagaTruncatedClose). WASM (scp-client-wasm) is NODE-DELEGATED per the ADR-057 scope fence — it does NOT host the key-bearing recovery driver (SCP-OUT-048)."
         },
         {
           "name": "session_create",
@@ -626,6 +675,22 @@
           "typescript": true,
           "kotlin": true,
           "swift": true
+        },
+        {
+          "name": "stream_grant_credit",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "InvocationHandle control-plane method that extends the executor's billable credit window (§5.4.5, SCP-OUT-038). Wrapped BEHIND the single public invoke() verb in all four SDKs, consuming a validated Credit newtype (non-zero u32; Credit(0)/negative/>=2**32 raise InvalidGrant), never a raw int: Python InvocationHandle.grant_credit(Credit) (bindings/python/scp_sdk/outlets.py, C11a reference), TypeScript InvocationHandle.grantCredit(Credit) (bindings/typescript/src/outlets.ts, wraps NAPI outlet_stream_grant_credit), Swift InvocationHandle.grantCredit(Credit) (bindings/swift/Sources/SCP/Outlets+Streaming.swift, wraps UniFFI outlet_stream_grant_credit), Kotlin InvocationHandle.grantCredit(Credit) (bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/OutletsStreaming.kt, wraps UniFFI outlet_stream_grant_credit). All dispatch to the outlet_stream_grant_credit bridge export (crates/scp-ffi/**/outlet_stream.rs)."
+        },
+        {
+          "name": "stream_cancel",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "InvocationHandle control-plane method that requests stream cancellation (§5.4.5, SCP-OUT-038). Wrapped BEHIND the single public invoke() verb in all four SDKs; the bridge signs the OutletCancel internally at the runtime-derived cursor, and cancel() on a never-opened handle is a local no-op close: Python InvocationHandle.cancel() (bindings/python/scp_sdk/outlets.py, C11a reference), TypeScript InvocationHandle.cancel() (bindings/typescript/src/outlets.ts, wraps NAPI outlet_stream_cancel), Swift InvocationHandle.cancel() (bindings/swift/Sources/SCP/Outlets+Streaming.swift, wraps UniFFI outlet_stream_cancel), Kotlin InvocationHandle.cancel() (bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/OutletsStreaming.kt, wraps UniFFI outlet_stream_cancel). All dispatch to the outlet_stream_cancel bridge export (crates/scp-ffi/**/outlet_stream.rs)."
         }
       ]
     },
@@ -635,13 +700,10 @@
         {
           "name": "evaluate_trust",
           "python": true,
-          "typescript": false,
-          "kotlin": false,
+          "typescript": true,
+          "kotlin": true,
           "swift": true,
-          "exemptions": {
-            "typescript": "The public TS surface exposes verifyParticipationRequirements (scp.ts), not a named evaluateTrust wrapper; the named evaluateTrust() sugar lands in the SDK-parity PR carved from the same bundled branch.",
-            "kotlin": "SDK does not expose evaluate_trust wrapper, only aggregate_trust_input"
-          }
+          "notes": "All four SDKs expose an idiomatic evaluate_trust/evaluateTrust wrapper composing the structured Layer-1 (ucan_evaluate) and Layer-2 (participation_record) results: Python scp_sdk.trust.evaluate_trust, TypeScript SCP.evaluateTrust, Kotlin SCP.evaluateTrust, Swift SCP.evaluateTrust."
         },
         {
           "name": "aggregate_trust_input",
@@ -651,6 +713,30 @@
           "swift": true
         },
         {
+          "name": "trust_create_challenge",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Challenge-issuance op (ADR-017, §7.3.4): all four SDKs expose an idiomatic wrapper over the bridge free function (Python scp_sdk.trust_create_challenge, TypeScript SCP.trustCreateChallenge, Kotlin SCP.trustCreateChallenge, Swift SCP.trustCreateChallenge)."
+        },
+        {
+          "name": "trust_verify_attestation",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Attestation verification op (ADR-017, §7.4): all four SDKs expose an idiomatic typed wrapper taking the CachedAttestationEnvelope wire DTO (Python scp_sdk.trust_verify_attestation, TypeScript SCP.trustVerifyAttestation, Kotlin SCP.trustVerifyAttestation, Swift free function trustVerifyAttestation per ADR-048 §1 + §7)."
+        },
+        {
+          "name": "trust_verify_response",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Challenge-response verification op (ADR-017, §7.3.4): all four SDKs expose an idiomatic typed wrapper taking the ChallengeRequest/ChallengeResponse wire DTOs (Python scp_sdk.trust_verify_response, TypeScript SCP.trustVerifyResponse, Kotlin SCP.trustVerifyResponse, Swift SCP.trustVerifyResponse)."
+        },
+        {
           "name": "verify_participation_requirements",
           "python": true,
           "typescript": true,
@@ -658,12 +744,28 @@
           "swift": true
         },
         {
+          "name": "check_capability_requirements",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Capability-admission op (spec §7.3.4.4, SCP-ACR-008): sibling of verify_participation_requirements. PyO3 (py_check_capability_requirements), NAPI (checkCapabilityRequirements), and UniFFI (check_capability_requirements) bridges take the JSON envelope (context_id, subject_did, requirements_json, agent_capabilities_json, challenge_verifications_json), validate_did(subject_did) at the boundary, and delegate to scp_protocol::trust::check_capability_requirements with the production IdentityDidPublicKeyResolver + fail-closed SystemClock so each ChallengeVerification is signature/subject/context/expiry bound. All four SDKs expose idiomatic wrappers (Python scp_sdk.check_capability_requirements, TypeScript SCP.checkCapabilityRequirements, Kotlin SCP.checkCapabilityRequirements, Swift free function checkCapabilityRequirements)."
+        },
+        {
+          "name": "participation_record",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Typed participation-record op (§7.3.2): the PyO3, NAPI, and UniFFI bridges export a typed structured result (PyParticipationRecord / NapiParticipationRecord / ParticipationRecordView) mirroring scp-core's ParticipationFacts; the shared Supervisor::participation_record gathers the full event log and the bridge sources verified attestations from its ProtocolRepository. All four SDKs expose idiomatic wrappers (Python scp_sdk participation_record, TypeScript SCP.participationRecord, Kotlin SCP.participationRecord, Swift SCP.participationRecord) returning the twelve-field BehavioralRecord and feed evaluate_trust/evaluateTrust Layer 2 from the Rust-computed record."
+        },
+        {
           "name": "consequence_rule_validate",
           "python": true,
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "ConsequenceRule::validate / validate_against_config (scp-protocol trust/consequence.rs) is invoked at every consequence-rule ingestion path: ContextParams construction in all four bridges, aggregate_trust_input across all four SDKs (consequenceRulesJson is parsed and validated). PyO3, NAPI, UniFFI, and WASM bridges all call validate_against_config when consequence rules are submitted. Error responses surface as ScpError::Validation."
+          "notes": "ConsequenceRule::validate / validate_against_config (scp-protocol trust/consequence.rs) is invoked at every consequence-rule ingestion path: ContextParams construction in all three bridges, aggregate_trust_input across all four SDKs (consequenceRulesJson is parsed and validated). PyO3, NAPI, and UniFFI bridges all call validate_against_config when consequence rules are submitted. Error responses surface as ScpError::Validation."
         },
         {
           "name": "evaluate_consequence_rules",
@@ -679,12 +781,12 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::dispatch_consequences (scp-runtime/src/context/manager/governance.rs:70) and the WASM bridge dispatch_consequences_for_subject (scp-ffi-wasm/src/consequence.rs) are invoked transitively from send_message and execute_governance_action. No SDK-level wrapper exposes the dispatcher directly \u2014 consequence enforcement is automatic on send and governance dispatch.",
+          "notes": "Internal: ContextManager::dispatch_consequences (scp-runtime/src/context/manager/governance.rs:70) is invoked transitively from send_message and execute_governance_action. No SDK-level wrapper exposes the dispatcher directly — consequence enforcement is automatic on send and governance dispatch.",
           "exemptions": {
-            "python": "internal pipeline wiring; consequences are dispatched automatically during send and governance \u2014 no separate SDK operation",
-            "typescript": "internal pipeline wiring; consequences are dispatched automatically during send and governance \u2014 no separate SDK operation",
-            "kotlin": "internal pipeline wiring; consequences are dispatched automatically during send and governance \u2014 no separate SDK operation",
-            "swift": "internal pipeline wiring; consequences are dispatched automatically during send and governance \u2014 no separate SDK operation"
+            "python": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation",
+            "typescript": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation",
+            "kotlin": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation",
+            "swift": "internal pipeline wiring; consequences are dispatched automatically during send and governance — no separate SDK operation"
           }
         }
       ]
@@ -698,10 +800,10 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "ContextManager::standing_context (scp-runtime/src/context/manager/standing.rs:81) is the get-or-create operation for bilateral-persistent contact graph contexts (spec section 5.12.4, SCP-138). The submodule is internal \u2014 no FFI bridge or SDK wrapper currently exposes standing_context() to applications. The contact-graph API is a pending follow-up to wire end-to-end.",
+          "notes": "ContextManager::standing_context (scp-runtime/src/context/manager/standing.rs:81) is the get-or-create operation for bilateral-persistent contact graph contexts (spec section 5.12.4, SCP-138). The submodule is internal — no FFI bridge or SDK wrapper currently exposes standing_context() to applications. The contact-graph API is a pending follow-up to wire end-to-end.",
           "exemptions": {
             "python": "ContextManager submodule not yet exposed via PyO3 bridge",
-            "typescript": "ContextManager submodule not yet exposed via NAPI or WASM bridges",
+            "typescript": "ContextManager submodule not yet exposed via NAPI bridge",
             "kotlin": "ContextManager submodule not yet exposed via UniFFI bridge",
             "swift": "ContextManager submodule not yet exposed via UniFFI bridge"
           }
@@ -712,7 +814,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "ContextManager::standing_context_count (standing.rs:155). Internal query \u2014 no SDK exposure pending the contact-graph follow-up.",
+          "notes": "ContextManager::standing_context_count (standing.rs:155). Internal query — no SDK exposure pending the contact-graph follow-up.",
           "exemptions": {
             "python": "internal query, not yet exposed",
             "typescript": "internal query, not yet exposed",
@@ -726,7 +828,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "ContextManager::has_standing_context (standing.rs:160). Internal query \u2014 no SDK exposure pending the contact-graph follow-up.",
+          "notes": "ContextManager::has_standing_context (standing.rs:160). Internal query — no SDK exposure pending the contact-graph follow-up.",
           "exemptions": {
             "python": "internal query, not yet exposed",
             "typescript": "internal query, not yet exposed",
@@ -740,7 +842,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "ContextManager::register_standing_context (standing.rs:172). Used during startup to restore standing contexts from persisted state \u2014 invoked by SDK init flows when standing-context persistence lands.",
+          "notes": "ContextManager::register_standing_context (standing.rs:172). Used during startup to restore standing contexts from persisted state — invoked by SDK init flows when standing-context persistence lands.",
           "exemptions": {
             "python": "startup-only registration, not yet exposed",
             "typescript": "startup-only registration, not yet exposed",
@@ -801,7 +903,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Direct-execute is BY ID across all four bridges with a uniform (handle, proposal_id_hex) shape — PyO3 governance_execute, UniFFI governance_execute, NAPI contextExecuteGovernanceAction, WASM context_execute_governance. There is no caller-supplied identity/subject parameter: the executor (the GovernanceActionExecuted leaf actor_did) and the consequence subject are both resolved from the tracked proposal's proposer inside the runtime, never from a caller DID. The bridge supplies no proposal/action/status; the runtime resolves the authoritative proposal from the context actor's own quorum-validated governance engine by id and dispatches its tracked action, closing the direct-execute quorum bypass (an untracked/unapproved id is rejected; action substitution is structurally impossible — there is no action parameter)."
+          "notes": "Direct-execute is BY ID across all three bridges with a uniform (handle, proposal_id_hex) shape — PyO3 governance_execute, UniFFI governance_execute, NAPI contextExecuteGovernanceAction. There is no caller-supplied identity/subject parameter: the executor (the GovernanceActionExecuted leaf actor_did) and the consequence subject are both resolved from the tracked proposal's proposer inside the runtime, never from a caller DID. The bridge supplies no proposal/action/status; the runtime resolves the authoritative proposal from the context actor's own quorum-validated governance engine by id and dispatches its tracked action, closing the direct-execute quorum bypass (an untracked/unapproved id is rejected; action substitution is structurally impossible — there is no action parameter)."
         },
         {
           "name": "propose_action",
@@ -920,7 +1022,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::SuspendCapability variant dispatched via the existing execute_action / propose_action entry points (PyO3 py_governance_execute, NAPI context_execute_governance_action, UniFFI governance_execute, WASM execute_governance_action). The wiring of cross-type enforcement conflict detection (#1530, batch-2) is invoked transitively from execute_governance_action."
+          "notes": "GovernanceAction::SuspendCapability variant dispatched via the existing execute_action / propose_action entry points (PyO3 py_governance_execute, NAPI context_execute_governance_action, UniFFI governance_execute). The wiring of cross-type enforcement conflict detection (#1530, batch-2) is invoked transitively from execute_governance_action."
         },
         {
           "name": "execute_suspend_access",
@@ -928,7 +1030,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::SuspendAccess variant dispatched via execute_action / propose_action across all four bridges (B1 enforcement model unification, batch-2)."
+          "notes": "GovernanceAction::SuspendAccess variant dispatched via execute_action / propose_action across all three bridges (B1 enforcement model unification, batch-2)."
         },
         {
           "name": "execute_revoke_access",
@@ -936,7 +1038,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::RevokeAccess variant (renamed from MemberRevoke per commit 31885c7e) dispatched via execute_action / propose_action across all four bridges. Triggers content access key revocation through the existing access-key pipeline (#1529, batch-2 wiring)."
+          "notes": "GovernanceAction::RevokeAccess variant (renamed from MemberRevoke per commit 31885c7e) dispatched via execute_action / propose_action across all three bridges. Triggers content access key revocation through the existing access-key pipeline (#1529, batch-2 wiring)."
         },
         {
           "name": "execute_restore_access",
@@ -944,7 +1046,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::RestoreAccess variant dispatched via execute_action / propose_action across all four bridges. Inverse of RevokeAccess; restores access keys for a previously revoked member (B1 enforcement model unification)."
+          "notes": "GovernanceAction::RestoreAccess variant dispatched via execute_action / propose_action across all three bridges. Inverse of RevokeAccess; restores access keys for a previously revoked member (B1 enforcement model unification)."
         },
         {
           "name": "execute_remove_member",
@@ -952,7 +1054,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::RemoveMember variant (also known as MLS ejection) dispatched via execute_action / propose_action across all four bridges. Internal wiring (#1541, batch-2) calls remove_member_sender_key and rotate_sender_key on the crypto provider after a successful member ejection \u2014 see the Crypto domain rows."
+          "notes": "GovernanceAction::RemoveMember variant (also known as MLS ejection) dispatched via execute_action / propose_action across all three bridges. Internal wiring (#1541, batch-2) calls remove_member_sender_key and rotate_sender_key on the crypto provider after a successful member ejection — see the Crypto domain rows."
         },
         {
           "name": "execute_rotate_content_keys",
@@ -960,7 +1062,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "GovernanceAction::RotateContentKeys variant dispatched via execute_action / propose_action across all four bridges. Wired to the crypto provider's advance_epoch / propose_update flow inside execute_rotate_content_keys (#1548, batch-2 wiring)."
+          "notes": "GovernanceAction::RotateContentKeys variant dispatched via execute_action / propose_action across all three bridges. Wired to the crypto provider's advance_epoch / propose_update flow inside execute_rotate_content_keys (#1548, batch-2 wiring)."
         },
         {
           "name": "propose_governance_action_checked",
@@ -968,7 +1070,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "ContextManager::propose_governance_action_checked validates the proposer's GovernancePropose capability and the proposer eligibility (pending removal + participation threshold) before submitting the proposal (#1530, batch-2 wiring). All four bridges' propose_action entry points delegate to this checked variant: PyO3 py_governance_propose, NAPI context_governance_propose, UniFFI propose_governance_action, WASM propose_governance_action. Already covered structurally by the existing propose_action row; this row makes the wiring explicit."
+          "notes": "ContextManager::propose_governance_action_checked validates the proposer's GovernancePropose capability and the proposer eligibility (pending removal + participation threshold) before submitting the proposal (#1530, batch-2 wiring). All three bridges' propose_action entry points delegate to this checked variant: PyO3 py_governance_propose, NAPI context_governance_propose, UniFFI propose_governance_action. Already covered structurally by the existing propose_action row; this row makes the wiring explicit."
         }
       ]
     },
@@ -1002,7 +1104,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Every runtime signs the canonical checkpoint payload in-process with the identity's #active Ed25519 key. On TypeScript this holds for BOTH backends: the NAPI-backed (Node/Bun) runtime signs and surfaces the signature on Checkpoint.signature via bindings/typescript/src/internal/native.ts, and the WASM/browser runtime ALSO signs in-process (WASM identities are Rust-custodied in the DID-keyed IDENTITY_REGISTRY; the private key never crosses FFI, ADR-006) and surfaces the same Checkpoint.signature via bindings/typescript/src/internal/wasm.ts. Checkpoint is a flat always-signed interface matching the Python/Swift/Kotlin SDKs; both backends populate the 64-byte (128-hex-char) Ed25519 signature. There is no `signed` discriminant. The byte layout of the signing payload is identical across all bridges (compute_checkpoint_canonical_hash). The former WASM-vs-native asymmetry recorded under ADR-048 §7b is RESOLVED — WASM no longer returns an unsigned payload."
+          "notes": "Every runtime signs the canonical checkpoint payload in-process with the identity's #active Ed25519 key. On TypeScript the NAPI-backed (Node/Bun) runtime signs and surfaces the signature on Checkpoint.signature via bindings/typescript/src/internal/native.ts. Checkpoint is a flat always-signed interface matching the Python/Swift/Kotlin SDKs; the runtime populates the 64-byte (128-hex-char) Ed25519 signature. There is no `signed` discriminant. The byte layout of the signing payload is identical across all bridges (compute_checkpoint_canonical_hash)."
         },
         {
           "name": "checkpoint_by_did",
@@ -1047,7 +1149,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Attaches the in-process loopback transport for a local DID. Surfaced in all four SDKs (scp.configureLocalTransport / configure_local_transport) and validates the DID at the boundary. Exported by the pyo3/napi/uniffi bridges; the wasm bridge is exempt (no scp-runtime LocalTransportProvider / ContextManager on wasm32 per ADR-034). See the wasm exemption in scripts/bridge-aliases.json."
+          "notes": "Attaches the in-process loopback transport for a local DID. Surfaced in all four SDKs (scp.configureLocalTransport / configure_local_transport) and validates the DID at the boundary. Exported by the pyo3/napi/uniffi bridges."
         }
       ]
     },
@@ -1159,13 +1261,10 @@
         },
         {
           "name": "discover",
-          "python": false,
+          "python": true,
           "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "python": "discovery.py exposes parse_address / create_query / normalize_address only; no named discover / discover_contexts / context_discover public function yet. The Python discovery wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "address_resolve",
@@ -1296,6 +1395,25 @@
       ]
     },
     {
+      "domain": "DHT",
+      "operations": [
+        {
+          "name": "dht_backend",
+          "python": false,
+          "typescript": false,
+          "kotlin": false,
+          "swift": false,
+          "notes": "DID/DHT resolution backend (spec §17.17.3, §3.10.6). The single shipped DHT backend is the real Mainline **Pkarr** client (PkarrDhtClient, scp-dht production-dht) selected by construction in the FFI layer via scp_ffi_common::dht::FfiDhtClient / ClientDhtConfig::into_client (fail-closed). It is an internal provider selected below the SDK surface — the same Pkarr backend underlies every binding — not a per-SDK operation; the in-memory arm is a §17.17.3 nullifier compiled only under `testing` (ADR-062 §Decision 1).",
+          "exemptions": {
+            "python": "Pkarr — shipped DHT backend is Pkarr (PkarrDhtClient), selected internally by scp_ffi_common::dht for all bindings; no per-SDK symbol — identity publish/resolve wrap it transitively (identity_create / identity_resolve).",
+            "typescript": "Pkarr — shipped DHT backend is Pkarr (PkarrDhtClient), selected internally by scp_ffi_common::dht for all bindings; no per-SDK symbol — identity publish/resolve wrap it transitively (identity_create / identity_resolve).",
+            "kotlin": "Pkarr — shipped DHT backend is Pkarr (PkarrDhtClient), selected internally by scp_ffi_common::dht for all bindings; no per-SDK symbol — identity publish/resolve wrap it transitively (identity_create / identity_resolve).",
+            "swift": "Pkarr — shipped DHT backend is Pkarr (PkarrDhtClient), selected internally by scp_ffi_common::dht for all bindings; no per-SDK symbol — identity publish/resolve wrap it transitively (identity_create / identity_resolve)."
+          }
+        }
+      ]
+    },
+    {
       "domain": "UCAN",
       "operations": [
         {
@@ -1307,16 +1425,11 @@
         },
         {
           "name": "evaluate",
-          "python": false,
-          "typescript": false,
-          "kotlin": false,
-          "swift": false,
-          "exemptions": {
-            "python": "Bridge plumbing exists (scp-ffi PyScp.ucan_evaluate returning CapabilityValidation, the read-only structured diagnostic counterpart to ucan_validate) but no public SDK wrapper yet; the named public evaluate()/evaluateTrust() wrapper lands in the C3c SDK-parity follow-up that rebuilds the trust-signal consumer on top of this bridge op.",
-            "typescript": "Bridge plumbing exists (NAPI ucanEvaluate + WASM ucan_evaluate returning a structured CapabilityValidation) but no public SDK wrapper yet; the named public evaluate() wrapper lands in the C3c SDK-parity follow-up.",
-            "kotlin": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Kotlin SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up.",
-            "swift": "UniFFI bridge exports ucan_evaluate (CapabilityValidationRecord); the Swift SDK has no idiomatic public wrapper exposing it yet — lands in the C3c SDK-parity follow-up."
-          }
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Structured read-only diagnostic (ADR-059, §7.2.4). All four bindings expose an idiomatic wrapper over the typed CapabilityValidationRecord: Python SCP.ucan_evaluate / evaluate_trust, TypeScript SCP.ucanEvaluate / evaluateTrust, Kotlin SCP.ucanEvaluate / evaluateTrust (Scp.kt, types in Trust.kt), Swift SCP.ucanEvaluate / evaluateTrust (Trust.swift). Per the per-SDK-idiom lesson the record SHAPE is identical (only casing differs); the wrappers are language-idiomatic."
         },
         {
           "name": "mint",
@@ -1430,14 +1543,11 @@
         },
         {
           "name": "verify_payment_receipts",
-          "python": false,
+          "python": true,
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + TypeScript/Kotlin/Swift SDKs. WASM cannot link the async runtime payment adapter (ADR-034); the TS WASM bridge surfaces a fail-closed throw (SCP-ECON-12095).",
-          "exemptions": {
-            "python": "economy.py exposes estimate_cost / policy helpers / evaluate_formula only; no named verify_payment_receipts public function yet. The Python verify_payment_receipts wrapper lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "notes": "Verifies payment receipts against the configured runtime payment adapter (verify_dyn per receipt) via EconomyCommand::VerifyPaymentReceipts. Implemented in pyo3/napi/uniffi + TypeScript/Kotlin/Swift SDKs."
         },
         {
           "name": "enforce_economy_send_path",
@@ -1445,7 +1555,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::enforce_send_economy delegates to enforce_economy (scp-runtime/src/context/manager/economy.rs:242, F9 refactor) which calls evaluate_cost, records anti-spam velocity, and authorizes the spending UCAN. Invoked transitively from send_message \u2014 no separate SDK operation. Pipeline-wiring assertion enforce_send_economy_calls_enforce_economy in pipeline_wiring.rs.",
+          "notes": "Internal: ContextManager::enforce_send_economy delegates to enforce_economy (scp-runtime/src/context/manager/economy.rs:242, F9 refactor) which calls evaluate_cost, records anti-spam velocity, and authorizes the spending UCAN. Invoked transitively from send_message — no separate SDK operation. Pipeline-wiring assertion enforce_send_economy_calls_enforce_economy in pipeline_wiring.rs.",
           "exemptions": {
             "python": "internal pipeline wiring inside send_message; not a standalone SDK operation",
             "typescript": "internal pipeline wiring inside send_message; not a standalone SDK operation",
@@ -1459,7 +1569,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::enforce_join_economy delegates to enforce_economy with EnforceEconomyRequest. Invoked transitively from join_context \u2014 no separate SDK operation. Currently effective only on the PyO3 bridge because UniFFI and NAPI hard-code spending_ucan to None on the join path (drift documented in Messaging/join_with_spending_ucan).",
+          "notes": "Internal: ContextManager::enforce_join_economy delegates to enforce_economy with EnforceEconomyRequest. Invoked transitively from join_context — no separate SDK operation. Currently effective only on the PyO3 bridge because UniFFI and NAPI hard-code spending_ucan to None on the join path (drift documented in Messaging/join_with_spending_ucan).",
           "exemptions": {
             "python": "internal pipeline wiring inside join_context; not a standalone SDK operation",
             "typescript": "internal pipeline wiring inside join_context; not a standalone SDK operation",
@@ -1468,17 +1578,17 @@
           }
         },
         {
-          "name": "invoke_tool_with_economy",
+          "name": "invoke_outlet_with_economy",
           "python": false,
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::invoke_tool_with_economy (scp-runtime/src/context/manager/tools.rs:442) wraps tool invocation with hard-rate-limit consume/refund, anti-spam velocity record/rollback, and the EconomyTicket authorize/capture/void lifecycle (F1-F5, D4 wiring). Invoked transitively from the tool invocation entry points; not a standalone SDK operation.",
+          "notes": "Internal: Supervisor::invoke_outlet_with_economy (scp-runtime/src/context/outlets_helpers.rs) wraps outlet invocation with hard-rate-limit consume/refund, anti-spam velocity record/rollback, and the EconomyTicket authorize/capture/void lifecycle (F1-F5, D4 wiring). Invoked transitively from the outlet invocation entry points; not a standalone SDK operation.",
           "exemptions": {
-            "python": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation",
-            "typescript": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation",
-            "kotlin": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation",
-            "swift": "internal pipeline wiring inside tool_invoke; not a standalone SDK operation"
+            "python": "internal pipeline wiring inside outlet_invoke; not a standalone SDK operation",
+            "typescript": "internal pipeline wiring inside outlet_invoke; not a standalone SDK operation",
+            "kotlin": "internal pipeline wiring inside outlet_invoke; not a standalone SDK operation",
+            "swift": "internal pipeline wiring inside outlet_invoke; not a standalone SDK operation"
           }
         },
         {
@@ -1487,7 +1597,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextManager::authorize_paid_action (economy.rs:488) issues a PaidActionAuthorization handle through the configured payment adapter. Invoked transitively from enforce_economy and invoke_tool_with_economy.",
+          "notes": "Internal: ContextManager::authorize_paid_action (economy.rs:488) issues a PaidActionAuthorization handle through the configured payment adapter. Invoked transitively from enforce_economy and invoke_outlet_with_economy.",
           "exemptions": {
             "python": "internal sub-operation of enforce_economy",
             "typescript": "internal sub-operation of enforce_economy",
@@ -1538,17 +1648,17 @@
           }
         },
         {
-          "name": "velocity_tracker_record_tool_invocation",
+          "name": "velocity_tracker_record_outlet_invocation",
           "python": false,
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: invoke_tool_with_economy threads SenderVelocityTracker::record_message into the tool path so the per-DID anti-spam escalation (spec section 19.7) applies to tool invocations as well as messages. Pipeline-wiring assertion invoke_tool_with_economy_wires_escalation_and_rollback covers this.",
+          "notes": "Internal: invoke_outlet_with_economy threads SenderVelocityTracker::record_message into the outlet path so the per-DID anti-spam escalation (spec section 19.7) applies to outlet invocations as well as messages. Pipeline-wiring assertion invoke_outlet_with_economy_wires_escalation_and_rollback covers this.",
           "exemptions": {
-            "python": "internal anti-spam state mutation invoked from invoke_tool_with_economy",
-            "typescript": "internal anti-spam state mutation invoked from invoke_tool_with_economy",
-            "kotlin": "internal anti-spam state mutation invoked from invoke_tool_with_economy",
-            "swift": "internal anti-spam state mutation invoked from invoke_tool_with_economy"
+            "python": "internal anti-spam state mutation invoked from invoke_outlet_with_economy",
+            "typescript": "internal anti-spam state mutation invoked from invoke_outlet_with_economy",
+            "kotlin": "internal anti-spam state mutation invoked from invoke_outlet_with_economy",
+            "swift": "internal anti-spam state mutation invoked from invoke_outlet_with_economy"
           }
         },
         {
@@ -1599,12 +1709,12 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: TokenBucketLimiter::try_consume (scp-protocol/src/economy/antispam.rs:724) is the Matrix Synapse-style defense-in-depth cap. ContextManager wires it into enforce_send_economy and invoke_tool_with_economy (D4 wiring). Pipeline-wiring assertion invoke_tool_with_economy_enforces_hard_rate_limit covers this.",
+          "notes": "Internal: TokenBucketLimiter::try_consume (scp-protocol/src/economy/antispam.rs:724) is the Matrix Synapse-style defense-in-depth cap. ContextManager wires it into enforce_send_economy and invoke_outlet_with_economy (D4 wiring). Pipeline-wiring assertion invoke_outlet_with_economy_enforces_hard_rate_limit covers this.",
           "exemptions": {
-            "python": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation",
-            "typescript": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation",
-            "kotlin": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation",
-            "swift": "internal rate-limit gate inside send and tool paths, not a standalone SDK operation"
+            "python": "internal rate-limit gate inside send and outlet paths, not a standalone SDK operation",
+            "typescript": "internal rate-limit gate inside send and outlet paths, not a standalone SDK operation",
+            "kotlin": "internal rate-limit gate inside send and outlet paths, not a standalone SDK operation",
+            "swift": "internal rate-limit gate inside send and outlet paths, not a standalone SDK operation"
           }
         },
         {
@@ -1613,12 +1723,12 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: TokenBucketLimiter::refund (antispam.rs:802) is invoked at every Phase 1 failure branch in invoke_tool_with_economy and enforce_send_economy. Dropping any branch leaks a token; pipeline-wiring assertion invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure ensures at least 3 refund sites exist on the tool path.",
+          "notes": "Internal: TokenBucketLimiter::refund (antispam.rs:802) is invoked at every Phase 1 failure branch in invoke_outlet_with_economy and enforce_send_economy. Dropping any branch leaks a token; pipeline-wiring assertion invoke_outlet_with_economy_refunds_hard_rate_limit_on_every_phase1_failure ensures at least 3 refund sites exist on the outlet path.",
           "exemptions": {
-            "python": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation",
-            "typescript": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation",
-            "kotlin": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation",
-            "swift": "internal rate-limit recovery inside send and tool paths, not a standalone SDK operation"
+            "python": "internal rate-limit recovery inside send and outlet paths, not a standalone SDK operation",
+            "typescript": "internal rate-limit recovery inside send and outlet paths, not a standalone SDK operation",
+            "kotlin": "internal rate-limit recovery inside send and outlet paths, not a standalone SDK operation",
+            "swift": "internal rate-limit recovery inside send and outlet paths, not a standalone SDK operation"
           }
         }
       ]
@@ -1677,7 +1787,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextCryptoProvider::rotate_sender_key (MlsCryptoProvider impl at scp-runtime/src/crypto/mls/provider.rs:739) generates a fresh sender key after a member is removed or leaves (#1541, batch-2 wiring). Invoked transitively from execute_remove_member and leave_context. Pipeline-wiring assertions execute_remove_member_calls_rotate_sender_key and leave_context_calls_rotate_sender_key cover this.",
+          "notes": "Internal: PerContextState::rotate_sender_key (actor-owned, ADR-049 §6; scp-runtime/src/context/actor/state.rs — relocated off the former MlsCryptoProvider by PR-7/#2148) generates a fresh sender key after a member is removed or leaves (#1541, batch-2 wiring). Invoked transitively from execute_remove_member and leave_context. Pipeline-wiring assertions execute_remove_member_calls_rotate_sender_key and leave_context_calls_rotate_sender_key cover this.",
           "exemptions": {
             "python": "internal crypto-provider trait method, not a standalone SDK operation",
             "typescript": "internal crypto-provider trait method, not a standalone SDK operation",
@@ -1691,7 +1801,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextCryptoProvider::remove_member_sender_key (MlsCryptoProvider impl at provider.rs:706) deletes the removed member's sender key from the local store. Invoked transitively from execute_remove_member alongside rotate_sender_key. Pipeline-wiring assertion execute_remove_member_calls_remove_member_sender_key covers this.",
+          "notes": "Internal: PerContextState::remove_member_sender_key (actor-owned, ADR-049 §6; scp-runtime/src/context/actor/state.rs — relocated off the former MlsCryptoProvider by PR-7/#2148) deletes the removed member's sender key from the local store. Invoked transitively from execute_remove_member alongside rotate_sender_key. Pipeline-wiring assertion execute_remove_member_calls_remove_member_sender_key covers this.",
           "exemptions": {
             "python": "internal crypto-provider trait method, not a standalone SDK operation",
             "typescript": "internal crypto-provider trait method, not a standalone SDK operation",
@@ -1705,7 +1815,7 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Internal: ContextCryptoProvider::advance_epoch (MlsCryptoProvider impl at provider.rs:1240) is the MLS commit/welcome processing entry point used by execute_rotate_content_keys (#1548, batch-2 wiring). Invoked transitively from the governance dispatch path; not a standalone SDK operation.",
+          "notes": "Internal: PerContextState::advance_epoch (actor-owned, ADR-049 §6; scp-runtime/src/context/actor/state.rs — relocated off the former MlsCryptoProvider by PR-7/#2148) is the MLS commit/welcome processing entry point used by execute_rotate_content_keys (#1548, batch-2 wiring). Invoked transitively from the governance dispatch path; not a standalone SDK operation.",
           "exemptions": {
             "python": "internal MLS state advance, not a standalone SDK operation",
             "typescript": "internal MLS state advance, not a standalone SDK operation",
@@ -1753,15 +1863,15 @@
           }
         },
         {
-          "name": "register_tool_handler",
+          "name": "register_outlet_handler",
           "python": true,
           "typescript": false,
           "kotlin": false,
           "swift": false,
           "exemptions": {
-            "typescript": "register_tool_handler not exposed in TypeScript SDK",
+            "typescript": "register_outlet_handler not exposed in TypeScript SDK",
             "kotlin": "MCP module not implemented in Kotlin SDK",
-            "swift": "register_tool_handler not exposed in Swift SDK"
+            "swift": "register_outlet_handler not exposed in Swift SDK"
           }
         }
       ]
@@ -1782,12 +1892,9 @@
         {
           "name": "evaluate_trust",
           "python": true,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": true,
-          "exemptions": {
-            "typescript": "The public TS surface exposes verifyParticipationRequirements (scp.ts), not a named evaluateTrust wrapper; the named evaluateTrust() sugar lands in the SDK-parity PR carved from the same bundled branch."
-          }
+          "swift": true
         },
         {
           "name": "create_shadow",
@@ -1847,6 +1954,13 @@
         },
         {
           "name": "credential_delete_key",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
+          "name": "credential_backend_durable",
           "python": true,
           "typescript": true,
           "kotlin": true,
@@ -1958,29 +2072,457 @@
     {
       "domain": "Lifecycle",
       "operations": [
-        {"name": "scp_new", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP(storage) constructor — the only entry point into the SDK. Storage selection is MANDATORY and fail-closed (spec §17.6): there is no zero-argument constructor and no default backend. Python scp_sdk.SCP(storage={...}), TypeScript new SCP({ storage: {...} }), Kotlin SCP(storage), Swift SCP(storage:) / SCP.withStorage(_:). The two selections are {type: in_memory} (development) and {type: sqlite, ...} (production). Statically-typed bridges (UniFFI typed StorageConfig, required Swift/Kotlin/TS argument) reject a missing selection at compile time; dynamically-typed bridges (PyO3 dict, NAPI JSON string) reject it at runtime with SCP-STORAGE-8000. Each constructor allocates a fresh BridgeInstance (PyBridgeInstance / NapiBridgeInstance / UniffiBridgeInstance) with its own registries, ContextManager, transport manager, and monotonic instance_id. Multiple instances in one process are supported — identities and relay connections do not leak across them. See ADR-048 §Decision 1 and spec §17.6. The pre-PR-4 `SCP.default()` accessor and underlying `DEFAULT_BRIDGE_INSTANCE` OnceLock were DELETED in PR 4 (re-scoped 2026-04-19): no deprecation window, no sunset scaffold. WASM remains a no-bridge-globals fixture: no parallel construct needed there.",
-         "exemptions": {"wasm": "WASM bridge is stateless between calls — no long-lived bridge instance to construct."}},
-        {"name": "scp_with_storage_in_memory", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP.withStorage({type: \"in_memory\"}) — in-memory storage variant. Default for tests and ephemeral workflows. Symmetric with with_storage_sqlite below. PyO3 SCP(storage={\"type\": \"in_memory\"}), NAPI SCP.withStorage({type: \"in_memory\"}), Swift SCP.withStorage(.inMemory), Kotlin SCP.withStorage(StorageConfig.InMemory).",
-         "exemptions": {}},
-        {"name": "scp_instance_id", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "Monotonic u64 instance identifier assigned at SCP() construction. Exposed as a read-only property ON THE SCP CLASS ONLY. Every handle type (ContextHandle, Identity, UcanToken, MessageReceiver, ...) carries its owning SCP's instance_id as a Rust-internal field — this per-handle id is NOT host-visible (no per-handle instanceId getter/export on any bridge; see ADR-048 §Per-handle host-visible instanceId is NOT exposed). Every handle-accepting FFI function runs a runtime affinity check (SCP-PERM-3030 on mismatch) enforced by scripts/check-handle-affinity.sh. Python scp.instance_id, TypeScript scp.instanceId, Kotlin scp.instanceId, Swift scp.instanceId.",
-         "exemptions": {}},
-        {"name": "shutdown_timeout", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP.shutdown(timeout) — bounded graceful shutdown replacing the Phase 4 PR 1 terminal infallible shutdown. Propagates a tokio_util::sync::CancellationToken into every long-running task, waits on a JoinSet up to the timeout, and forcibly cancels anything still running at the deadline. Async across all non-WASM bridges: PyO3 returns a coroutine, NAPI returns Promise<void>, UniFFI generates Kotlin suspend fun / Swift async throws. Timeout is carried as u64 milliseconds across all three bridges (NAPI was widened from u32 in #1692). Each SDK wrapper clamps to its bridge's maximum at the boundary. See ADR-048 §Decision 5 and §Notes/Shutdown-timeout integer width across FFI bridges.",
-         "exemptions": {"wasm": "No long-lived native runtime to drain on WASM."}},
-        {"name": "suspend", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "Disconnects transport and marks BridgeInstance as suspended for mobile/desktop backgrounding. No-op on WASM (no long-lived native runtime). All three FFI bridges (PyO3 scp_suspend, NAPI scpSuspend, UniFFI scpSuspend) call BridgeInstance::suspend. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.suspend() is now the only entry point in every SDK: Python scp.suspend(), TypeScript scp.suspend(), Kotlin scp.suspend(), Swift scp.suspend()."},
-        {"name": "resume", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "ASYNC as of Phase 4 PR 3 (#1678, 2026-04-18) — BREAKING CHANGE. BridgeInstanceCore::resume is async fn; per-bridge overrides reconnect every pending relay URL and restore persisted contexts before returning. Reconnect failures surface as LifecycleError::ReconnectFailed { url, reason }. All three FFI bridges expose the async path: PyO3 releases the GIL and block_ons, NAPI returns a Promise, UniFFI generates Kotlin suspend fun / Swift async throws. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.resume() is now the only entry point in every SDK: Python async def resume(), TypeScript scp.resume(): Promise<void>, Kotlin scp.resume() (suspend fun), Swift func resume() async throws. WASM is a no-op (no long-lived native runtime)."},
-        {"name": "with_storage_sqlite", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "SCP.withStorage(Sqlite { path, key }) exposes the SQLCipher-backed SqliteStorage across all three non-WASM bridges (#1491, #1260; Phase 4 PR 3, 2026-04-18). The StorageConfig::Sqlite key field is a SqliteKeyMaterial sum type accepting EITHER raw key material (Raw, 32-byte key validated at the FFI boundary) OR a passphrase (Passphrase, SQLCipher key derived via Argon2id with a persisted per-database salt sidecar). For sqlite, exactly ONE of key/passphrase must be supplied — both or neither is a ValidationError; both forms are wrapped in Zeroizing. PyO3 accepts Python bytes (key) or a str (passphrase); NAPI accepts a hex string OR Uint8Array (key) or a string (passphrase); UniFFI generates Swift StorageConfig.sqlite(path:key:) / SqliteKeyMaterial.raw|.passphrase and the Kotlin equivalents via #[derive(uniffi::Enum)]. SDK convenience constructors: Swift SCP.withStorage(sqliteDir:key:)/passphrase variant, Kotlin SCP.withSqlite(dir, key)/passphrase variant, Python SCP.with_storage({...}), TypeScript SCP.withStorage({...}). The Supervisor's mls_storage view, context-snapshot persistence, and event log all share a single rusqlite::Connection via the one Arc<SqliteStorage>.",
-         "exemptions": {}},
-        {"name": "add_relay_url", "python": true, "typescript": true, "kotlin": true, "swift": true,
-         "notes": "CoreFields::relay_url (Mutex<Option<String>>) replaced with relay_urls (Mutex<HashSet<String>>) in Phase 4 PR 3 (#1678, 2026-04-18). New accessors add_relay_url / remove_relay_url / pending_relay_urls; each per-bridge resume() iterates the HashSet and reconnects each URL. First reconnect failure surfaces as LifecycleError::ReconnectFailed { url, reason }; successfully-connected URLs remain in the pending set for retry.",
-         "exemptions": {},
-         "coverage_exemptions": {"kotlin": "Present in the UniFFI bridge as `addRelay` (generated from `crates/scp-ffi/uniffi/src/bridge.rs` \u2014 the `add_relay_url` export in TransportManager). The generated Kotlin file (`works.limn.scp.internal.uniffi.scp.TransportManager.addRelay`) is not git-tracked; verify via `cargo build -p scp-ffi-uniffi`. The generated file's backtick-quoted, @Throws-annotated override methods are not surfaced as clean function_declaration nodes by the tree-sitter-kotlin grammar the coverage extractor uses, so the symbol cannot be statically matched."}}
+        {
+          "name": "scp_new",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "SCP(storage) constructor — the only entry point into the SDK. Storage selection is MANDATORY and fail-closed (spec §17.6): there is no zero-argument constructor and no default backend. Python scp_sdk.SCP(storage={...}), TypeScript new SCP({ storage: {...} }), Kotlin SCP(storage), Swift SCP(storage:) / SCP.withStorage(_:). The two selections are {type: in_memory} (development) and {type: sqlite, ...} (production). Statically-typed bridges (UniFFI typed StorageConfig, required Swift/Kotlin/TS argument) reject a missing selection at compile time; dynamically-typed bridges (PyO3 dict, NAPI JSON string) reject it at runtime with SCP-STORAGE-8000. Each constructor allocates a fresh BridgeInstance (PyBridgeInstance / NapiBridgeInstance / UniffiBridgeInstance) with its own registries, ContextManager, transport manager, and monotonic instance_id. Multiple instances in one process are supported — identities and relay connections do not leak across them. See ADR-048 §Decision 1 and spec §17.6. The pre-PR-4 `SCP.default()` accessor and underlying `DEFAULT_BRIDGE_INSTANCE` OnceLock were DELETED in PR 4 (re-scoped 2026-04-19): no deprecation window, no sunset scaffold."
+        },
+        {
+          "name": "scp_with_storage_in_memory",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "SCP.withStorage({type: \"in_memory\"}) — in-memory storage variant. Default for tests and ephemeral workflows. Symmetric with with_storage_sqlite below. PyO3 SCP(storage={\"type\": \"in_memory\"}), NAPI SCP.withStorage({type: \"in_memory\"}), Swift SCP.withStorage(.inMemory), Kotlin SCP.withStorage(StorageConfig.InMemory).",
+          "exemptions": {}
+        },
+        {
+          "name": "scp_instance_id",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Monotonic u64 instance identifier assigned at SCP() construction. Exposed as a read-only property ON THE SCP CLASS ONLY. Every handle type (ContextHandle, Identity, UcanToken, MessageReceiver, ...) carries its owning SCP's instance_id as a Rust-internal field — this per-handle id is NOT host-visible (no per-handle instanceId getter/export on any bridge; see ADR-048 §Per-handle host-visible instanceId is NOT exposed). Every handle-accepting FFI function runs a runtime affinity check (SCP-PERM-3030 on mismatch) enforced by scripts/check-handle-affinity.sh. Python scp.instance_id, TypeScript scp.instanceId, Kotlin scp.instanceId, Swift scp.instanceId.",
+          "exemptions": {}
+        },
+        {
+          "name": "shutdown_timeout",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "SCP.shutdown(timeout) — bounded graceful shutdown replacing the Phase 4 PR 1 terminal infallible shutdown. Propagates a tokio_util::sync::CancellationToken into every long-running task, waits on a JoinSet up to the timeout, and forcibly cancels anything still running at the deadline. Async across all bridges: PyO3 returns a coroutine, NAPI returns Promise<void>, UniFFI generates Kotlin suspend fun / Swift async throws. Timeout is carried as u64 milliseconds across all three bridges (NAPI was widened from u32 in #1692). Each SDK wrapper clamps to its bridge's maximum at the boundary. See ADR-048 §Decision 5 and §Notes/Shutdown-timeout integer width across FFI bridges."
+        },
+        {
+          "name": "suspend",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "Disconnects transport and marks BridgeInstance as suspended for mobile/desktop backgrounding. All three FFI bridges (PyO3 scp_suspend, NAPI scpSuspend, UniFFI scpSuspend) call BridgeInstance::suspend. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.suspend() is now the only entry point in every SDK: Python scp.suspend(), TypeScript scp.suspend(), Kotlin scp.suspend(), Swift scp.suspend()."
+        },
+        {
+          "name": "resume",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "ASYNC as of Phase 4 PR 3 (#1678, 2026-04-18) — BREAKING CHANGE. BridgeInstanceCore::resume is async fn; per-bridge overrides reconnect every pending relay URL and restore persisted contexts before returning. Reconnect failures surface as LifecycleError::ReconnectFailed { url, reason }. All three FFI bridges expose the async path: PyO3 releases the GIL and block_ons, NAPI returns a Promise, UniFFI generates Kotlin suspend fun / Swift async throws. Phase 4 PR 4 (#1549) deleted the free-function SDK wrappers; SCP.resume() is now the only entry point in every SDK: Python async def resume(), TypeScript scp.resume(): Promise<void>, Kotlin scp.resume() (suspend fun), Swift func resume() async throws."
+        },
+        {
+          "name": "with_storage_sqlite",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "SCP.withStorage(Sqlite { path, key }) exposes the SQLCipher-backed SqliteStorage across all three bridges (#1491, #1260; Phase 4 PR 3, 2026-04-18). The StorageConfig::Sqlite key field is a SqliteKeyMaterial sum type accepting EITHER raw key material (Raw, 32-byte key validated at the FFI boundary) OR a passphrase (Passphrase, SQLCipher key derived via Argon2id with a persisted per-database salt sidecar). For sqlite, exactly ONE of key/passphrase must be supplied — both or neither is a ValidationError; both forms are wrapped in Zeroizing. PyO3 accepts Python bytes (key) or a str (passphrase); NAPI accepts a hex string OR Uint8Array (key) or a string (passphrase); UniFFI generates Swift StorageConfig.sqlite(path:key:) / SqliteKeyMaterial.raw|.passphrase and the Kotlin equivalents via #[derive(uniffi::Enum)]. SDK convenience constructors: Swift SCP.withStorage(sqliteDir:key:)/passphrase variant, Kotlin SCP.withSqlite(dir, key)/passphrase variant, Python SCP.with_storage({...}), TypeScript SCP.withStorage({...}). The Supervisor's mls_storage view, context-snapshot persistence, and event log all share a single rusqlite::Connection via the one Arc<SqliteStorage>.",
+          "exemptions": {}
+        },
+        {
+          "name": "add_relay_url",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "CoreFields::relay_url (Mutex<Option<String>>) replaced with relay_urls (Mutex<HashSet<String>>) in Phase 4 PR 3 (#1678, 2026-04-18). New accessors add_relay_url / remove_relay_url / pending_relay_urls; each per-bridge resume() iterates the HashSet and reconnects each URL. First reconnect failure surfaces as LifecycleError::ReconnectFailed { url, reason }; successfully-connected URLs remain in the pending set for retry.",
+          "exemptions": {},
+          "coverage_exemptions": {
+            "kotlin": "Present in the UniFFI bridge as `addRelay` (generated from `crates/scp-ffi/uniffi/src/bridge.rs` — the `add_relay_url` export in TransportManager). The generated Kotlin file (`works.limn.scp.internal.uniffi.scp.TransportManager.addRelay`) is not git-tracked; verify via `cargo build -p scp-ffi-uniffi`. The generated file's backtick-quoted, @Throws-annotated override methods are not surfaced as clean function_declaration nodes by the tree-sitter-kotlin grammar the coverage extractor uses, so the symbol cannot be statically matched."
+          }
+        }
+      ]
+    },
+    {
+      "domain": "BrowserParticipant",
+      "operations": [
+        {
+          "name": "create_context",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Create an encrypted context with the caller as sole member.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "generate_key_package_for_join",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Generate a single-use join KeyPackage.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "add_member",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Add a member from their KeyPackage; returns commit/welcome/replay material.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "join_context_encrypted",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Join from a Welcome, replaying the adder's event-log stream.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "send_message",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Encrypt an app message and fan it out over the injected socket (§9.10.4).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "handle_relay_frame",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Feed one inbound relay frame into the driver.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "resubscribe_all",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Re-drive SUBSCRIBEs for every tracked routing id (on socket (re)open).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "receive_message",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Receive an inbound MLS message (out-of-band delivery path).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "drain_events",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Drain buffered receive events in FIFO order.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "close_context",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Close a context, destroying its crypto state (forward secrecy).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "rotate_sender_key",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Rotate the §9.16 sender key and re-distribute it (§9.16.5).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "context_ids",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "List held context ids (live and poisoned), sorted.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "context_status",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Report a context as live/poisoned/absent (non-throwing).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "member_dids",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return a context's member DIDs, or undefined if not held.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "event_log_root",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return a context's event-log Merkle root (32 bytes).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "event_log_leaf_count",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return a context's event-log leaf count (u64 -> bigint, #1229).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "event_log_leaf_hashes",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return a context's concatenated event-log leaf hashes.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "mls_epoch",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return a context's MLS group epoch (u64 -> bigint, #1229).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "did",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return the participant's bound DID.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "init",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "One-time wasm init + redacting panic hook install.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "version",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "Return the wasm crate version string.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "outlet_stream_compute_caveats_binding",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "§5.4.5 pure caveats-binding predicate (browser invoker).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "outlet_stream_verify_chunk_signature",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "§5.4.5 pure chunk operator-signature verify (browser invoker).",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "outlet_stream_sign_credit",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "§5.4.5 pure invoker signing predicate (browser invoker), SCP-OUT-048 — signs an OutletStreamCredit (SCP-OUTLET-CREDIT-V1) in-tab; the outletStreamSignCredit wrapper over @limn-works/scp-ts-wasm. Saga coordination is node-delegated (SCP-OUT-047) per the ADR-057 scope fence.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        },
+        {
+          "name": "outlet_stream_compute_credit_preimage",
+          "python": false,
+          "typescript": false,
+          "typescript-wasm": true,
+          "kotlin": false,
+          "swift": false,
+          "notes": "§5.4.5 pure invoker signing predicate (browser invoker), SCP-OUT-048 — the #1980-forward WebCrypto seam: computes the 32-byte SCP-OUTLET-CREDIT-V1 preimage without touching any private key; the outletStreamComputeCreditPreimage wrapper over @limn-works/scp-ts-wasm. Saga coordination is node-delegated (SCP-OUT-047) per the ADR-057 scope fence.",
+          "exemptions": {
+            "python": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "typescript": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "kotlin": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation.",
+            "swift": "In-browser wasm participant DRIVER surface (ADR-057 Slice 3, @limn-works/scp-ts-wasm) — a capability subset exposed only via typescript-wasm. The node tiers run the full ContextManager over the NAPI bridge, not this in-tab single-threaded participant driver, so they do not expose this operation."
+          }
+        }
       ]
     }
   ],
@@ -2000,7 +2542,7 @@
       "evidence": {
         "pipeline_wiring_test": "governance_enforces_economic_policy",
         "code_sites": [
-          "crates/scp-runtime/src/context/messaging_helpers.rs:211 enforce_send_economy \u2192 economy_logic::enforce_economy",
+          "crates/scp-runtime/src/context/messaging_helpers.rs:211 enforce_send_economy → economy_logic::enforce_economy",
           "crates/scp-runtime/src/context/economy_logic.rs:313 enforce_economy definition"
         ]
       }
@@ -2019,14 +2561,14 @@
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-runtime/src/context/lifecycle_helpers.rs:1324 import_context \u2192 validate_export_for_import",
-          "crates/scp-runtime/src/context/supervisor/supervisor.rs:3750 import_context \u2192 validate_export_for_import (public API boundary, verify-before-dispatch)"
+          "crates/scp-runtime/src/context/lifecycle_helpers.rs:1324 import_context → validate_export_for_import",
+          "crates/scp-runtime/src/context/supervisor/supervisor.rs:3750 import_context → validate_export_for_import (public API boundary, verify-before-dispatch)"
         ]
       }
     },
     {
       "rule_id": "did-resolver-init-on-identity-create",
-      "description": "Every non-WASM bridge's `identity_create` entrypoint must call `ensure_did_resolver_initialized_on` before returning. The resolver is a per-bridge-instance slot used by UCAN validation (#311, ADR-048 renamed the helper from `ensure_did_resolver_initialized` to the `_on` suffix convention for per-instance helpers in Phase 4 PR 5); skipping initialization degrades UCAN verification to string-only lookups. WASM is exempt per ADR-034 (BridgeDidResolver stays in-process).",
+      "description": "Every bridge's `identity_create` entrypoint must call `ensure_did_resolver_initialized_on` before returning. The resolver is a per-bridge-instance slot used by UCAN validation (#311, ADR-048 renamed the helper from `ensure_did_resolver_initialized` to the `_on` suffix convention for per-instance helpers in Phase 4 PR 5); skipping initialization degrades UCAN verification to string-only lookups.",
       "applies_to": [
         "pyo3",
         "napi",
@@ -2040,13 +2582,10 @@
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-ffi/src/identity.rs PyScp::identity_create \u2192 ensure_did_resolver_initialized_on",
-          "crates/scp-ffi/napi/src/scp.rs Scp::identity_create \u2192 ensure_did_resolver_initialized_on",
-          "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_create (in-memory arm) \u2192 ensure_did_resolver_initialized_on"
+          "crates/scp-ffi/src/identity.rs PyScp::identity_create → ensure_did_resolver_initialized_on",
+          "crates/scp-ffi/napi/src/scp.rs Scp::identity_create → ensure_did_resolver_initialized_on",
+          "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_create (in-memory arm) → ensure_did_resolver_initialized_on"
         ]
-      },
-      "exemptions": {
-        "wasm": "ADR-034: WASM bridge uses BridgeDidResolver directly (string-only resolver, no tokio runtime) \u2014 no ensure_did_resolver_initialized_on to precede."
       }
     }
   ]

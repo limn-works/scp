@@ -11,14 +11,22 @@ keywords = ["did", "identity", "decentralized", "dht"]
 categories = ["authentication", "cryptography"]
 
 [dependencies]
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
-# `testing` is enabled non-optionally because the standalone identity
-# construction front-end (`config.rs`, ADR-052 Phase B-P3e) mints an
-# `InMemoryPreRotationCustody` on its production `Identity::create` path —
-# the only `PreRotationCustody` backend that exists today. This mirrors
-# `scp-node`, which enables `scp-platform/testing` non-optionally for the
-# identical reason on its production `Node::start` path.
-scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["testing"] }
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
+scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
+# Crypto primitives ONLY (ADR-062 §Decision 6). `testing` is NO LONGER enabled
+# here: the standalone identity construction front-end (`config.rs`, ADR-052
+# Phase B-P3e) previously minted an `InMemoryPreRotationCustody` (a §17.17.2
+# security nullifier) on its production `Identity::create` path. With no real
+# pre-rotation backend yet (RFC #2130 / #1729), that create path now FAILS CLOSED
+# with a typed `IdentityError` (SCP-IDENT-1059) rather than mint the nullifier —
+# so `scp-platform/testing` is gone from the shipped graph. The `testing`
+# crate-feature (below) re-adds it for the test harness only. `software_platform`
+# supplies the Ed25519/X25519 crypto primitives. `in-memory-storage` is NOT
+# enabled on this normal edge: `InMemoryStorage` is used only by `config.rs`'s
+# `#[cfg(test)]` persisted-round-trip test, which reaches it via the `testing`
+# dev-dependency (which pulls `in-memory-storage`) — no non-test code needs it.
+scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", features = ["software_platform"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -33,19 +41,25 @@ hex = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 rand = { workspace = true }
-mainline = { version = "6", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
 
 [features]
 default = []
-production-dht = ["dep:mainline", "dep:reqwest"]
-testing = ["scp-platform/testing"]
+production-dht = ["scp-dht/production-dht"]
+# Carries `scp-dht/testing` so downstream crates enabling `scp-identity/testing`
+# get the in-memory DHT arm (`DidDht::with_in_memory_custody`, the SCP-006 test
+# constructors). `scp-dht/testing` MUST appear only here / in dev-dependencies —
+# never a default/non-testing list (ADR-062 §Decision 1).
+testing = ["scp-platform/testing", "scp-dht/testing"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # `encrypting` provides `EncryptingAdapter`, the `EncryptedStorage` test backend
 # used by the persisted-`Identity::create` round-trip test in `config.rs`.
 scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] }
+# The dht.rs `#[cfg(test)]` module constructs `InMemoryDhtClient` (now gated
+# behind `scp-dht/testing`); this dev-dep activates that feature for this
+# crate's own test build (per-crate `cargo test -p scp-identity`).
+scp-dht = { path = "../scp-dht", features = ["testing"] }
 ed25519-dalek = { workspace = true }
 
 [lints]

@@ -31,16 +31,17 @@ public nonisolated enum AccessScope: String, Sendable, Codable, CaseIterable {
 ///
 /// Mirrors `scp_protocol::context::roles::Capability`. The unit variants are
 /// represented by ``unit(name:)`` carrying the variant name; payload-bearing
-/// variants ([toolInvoke], [custom]) carry their string field directly.
+/// variants ([outletCall], [custom]) carry their string field directly.
 public nonisolated enum ConsequenceCapability: Sendable, Codable, Equatable {
     /// A unit-variant capability. The `name` must match a Rust `Capability`
     /// enum variant name exactly, e.g. `MessagesRead`, `MessagesWrite`,
     /// `GovernanceVote`.
     case unit(name: String)
 
-    /// Tool invocation capability for a specific registered tool.
-    /// Encodes as `{"ToolInvoke": "<id>"}`.
-    case toolInvoke(toolId: String)
+    /// Action-outlet invocation capability for a specific registered outlet.
+    /// Mirrors `Capability::OutletCall(OutletId)`. Encodes as
+    /// `{"OutletCall": "<id>"}`.
+    case outletCall(outletId: String)
 
     /// Context-specific custom capability.
     /// Encodes as `{"Custom": "<name>"}`.
@@ -51,8 +52,8 @@ public nonisolated enum ConsequenceCapability: Sendable, Codable, Equatable {
         switch self {
         case let .unit(name):
             try container.encode(name)
-        case let .toolInvoke(toolId):
-            try container.encode(["ToolInvoke": toolId])
+        case let .outletCall(outletId):
+            try container.encode(["OutletCall": outletId])
         case let .custom(name):
             try container.encode(["Custom": name])
         }
@@ -65,8 +66,8 @@ public nonisolated enum ConsequenceCapability: Sendable, Codable, Equatable {
             return
         }
         let dict = try container.decode([String: String].self)
-        if let toolId = dict["ToolInvoke"] {
-            self = .toolInvoke(toolId: toolId)
+        if let outletId = dict["OutletCall"] {
+            self = .outletCall(outletId: outletId)
             return
         }
         if let name = dict["Custom"] {
@@ -193,7 +194,7 @@ public let enforcementSeverityVariantNames: [String] = [
 /// The variant names are pinned in ``CONSEQUENCE_TRIGGER_VARIANT_NAMES``.
 public nonisolated enum ConsequenceTrigger: Sendable, Codable, Equatable {
     case messageVelocity
-    case toolRateExceeded
+    case outletRateExceeded
     case warningCount
     case custom(key: String)
 
@@ -202,8 +203,8 @@ public nonisolated enum ConsequenceTrigger: Sendable, Codable, Equatable {
         switch self {
         case .messageVelocity:
             try container.encode("MessageVelocity")
-        case .toolRateExceeded:
-            try container.encode("ToolRateExceeded")
+        case .outletRateExceeded:
+            try container.encode("OutletRateExceeded")
         case .warningCount:
             try container.encode("WarningCount")
         case let .custom(key):
@@ -218,8 +219,8 @@ public nonisolated enum ConsequenceTrigger: Sendable, Codable, Equatable {
             case "MessageVelocity":
                 self = .messageVelocity
                 return
-            case "ToolRateExceeded":
-                self = .toolRateExceeded
+            case "OutletRateExceeded":
+                self = .outletRateExceeded
                 return
             case "WarningCount":
                 self = .warningCount
@@ -246,7 +247,7 @@ public nonisolated enum ConsequenceTrigger: Sendable, Codable, Equatable {
 /// Frozen list of ``ConsequenceTrigger`` variant short names.
 public let consequenceTriggerVariantNames: [String] = [
     "MessageVelocity",
-    "ToolRateExceeded",
+    "OutletRateExceeded",
     "WarningCount",
     "Custom"
 ]

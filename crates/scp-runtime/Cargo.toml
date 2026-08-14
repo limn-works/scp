@@ -14,22 +14,34 @@ categories = ["cryptography", "network-programming"]
 # Enables non-standard did:key:{hex} DID format acceptance. Only for
 # integration tests that run outside `#[cfg(test)]`. Production builds
 # must never enable this feature. See issue #128.
-testing = ["allow_unencrypted_storage", "scp-protocol/testing", "scp-platform/testing"]
+testing = ["allow_unencrypted_storage", "scp-protocol/testing", "scp-platform/testing", "scp-mls/testing"]
 # Gates `ProtocolRepository::new_for_testing()` — accepts any `Storage` backend
 # without the `EncryptedStorage` bound. Production `ProtocolRepository::new()`
-# requires `EncryptedStorage`. Follows the `allow_in_memory_custody` pattern
+# requires `EncryptedStorage`. Follows the test-harness feature-gating pattern
 # in scp-ffi. See issue #695.
 allow_unencrypted_storage = []
 # Gates `RestoredContexts::for_test` — the test-only minter for the
 # restore-then-replay ordering witness, used by the saga-FSM / crash-recovery
 # integration suites that drive replay in isolation. Deliberately NOT implied by
-# `testing`: a `testing`-gated minter would leak into every
-# `allow_in_memory_custody` build via `scp-ffi → dep:scp-testing →
-# scp-core{testing} → scp-runtime/testing`, re-opening the forge. This feature is
+# `testing`: a `testing`-gated minter would leak into every bridge test
+# build via `scp-ffi/testing → dep:scp-testing →
+# scp-core/testing → scp-runtime/testing`, re-opening the forge. This feature is
 # enabled ONLY by the `required-features` of the `actor_saga_coordinator` /
 # `actor_saga_crash_recovery` test targets, so no production or FFI build can
 # reach the witness back-door.
 saga-witness-test-mint = []
+# Gates `Supervisor::test_grant_member_capability` — the test-only seam that
+# grants a §7.2.2 Tier-2 capability (e.g. `OutletCallAll`) directly into a
+# member's `role_state.member_capabilities`, bypassing the governance role-
+# assignment round-trip. This is an AUTHORITY-ESCALATION primitive, so it is
+# deliberately NOT implied by `testing`: a `testing`-gated grant would leak into
+# every bridge test build via `scp-ffi/testing → dep:scp-testing →
+# scp-core/testing → scp-runtime/testing`, compiling a capability-escalation
+# back-door into test-harness builds. Enabled ONLY by the
+# `required-features` / explicit `--features` of the outlet-stream live-flow test
+# that needs to authorize a member invoker, so no production or FFI build can
+# reach it. Follows the `saga-witness-test-mint` precedent above.
+outlet-capability-test-grant = []
 
 [dependencies]
 openmls = { workspace = true }
@@ -42,10 +54,14 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
 scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
+scp-dht = { path = "../scp-dht", version = "=0.1.0-beta.2" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
 async-trait = { workspace = true }
 aes = { workspace = true }
@@ -77,6 +93,11 @@ futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# The discovery test modules construct `InMemoryDhtClient` (now gated behind
+# `scp-dht/testing`); activate it for this crate's own test build (ADR-062
+# §Decision 1). `scp-dht/testing` never appears in a non-testing feature list.
+scp-dht = { path = "../scp-dht", features = ["testing"] }
+scp-mls = { path = "../scp-mls", features = ["testing"] }
 scp-protocol = { path = "../scp-protocol", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing", "encrypting"] }
 scp-event-log = { path = "../scp-event-log", features = ["testing"] }
@@ -85,9 +106,29 @@ proptest = "1"
 scp-media = { path = "../scp-media" }
 static_assertions = { workspace = true }
 metrics-util = "0.19"
+# ADR-049 Decision 14 `perf_baseline` harness only. `scp-testing` re-exports the
+# `FullStackNetwork`/`FullStackNode` two-node MLS harness needed to drive the six
+# measured operations (notably `deliver_incoming`, which requires a genuine
+# second-member decryptable envelope). This is a DEV-only back-edge: dev-deps are
+# never part of the normal build graph, so it does NOT feed the
+# `scp-ffi → dep:scp-testing → scp-core{testing} → scp-runtime/testing` production
+# chain the feature-isolation comment above guards against.
+scp-testing = { path = "../scp-testing" }
 
 [[test]]
 name = "economy_integration"
+required-features = ["testing"]
+
+[[test]]
+name = "perf_baseline"
+required-features = ["testing"]
+
+[[test]]
+name = "cancel_safety"
+required-features = ["testing"]
+
+[[test]]
+name = "persistence_ordering"
 required-features = ["testing"]
 
 [[test]]
@@ -96,10 +137,6 @@ required-features = ["testing"]
 
 [[test]]
 name = "phase5_integration"
-required-features = ["testing"]
-
-[[test]]
-name = "wasm_conformance"
 required-features = ["testing"]
 
 [[test]]
@@ -166,7 +203,7 @@ name = "context"
 required-features = ["testing"]
 
 [[example]]
-name = "tools"
+name = "outlets"
 required-features = ["testing"]
 
 [[example]]

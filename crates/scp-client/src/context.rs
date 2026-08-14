@@ -1,0 +1,307 @@
+//! Per-context participant state.
+//!
+//! [`PerContextState`] is the driver's per-context record: the crypto state
+//! ([`ContextCryptoState`]), the canonical event log
+//! ([`scp_event_log::EventLog`]), the membership set with per-member message
+//! sequence counters, and the pull-based receive buffer of
+//! [`ContextEvent`](scp_protocol::context::membership::ContextEvent)s.
+//!
+//! It restores the deleted WASM bridge's `PerContextState` shape — a pull-based
+//! `drain_events` model and a committer-assigned event-log timestamp — while
+//! holding only the **participant message-path** fields (ADR-057 scope fence:
+//! no governance/economy/outlets/broadcast state).
+
+use std::collections::{HashMap, VecDeque};
+
+use scp_did::DID;
+use scp_event_log::tree::{GENESIS_PREV_HASH, append_unsigned_event, event_count, root};
+use scp_event_log::{Event, EventLog, EventPayload, EventType};
+use scp_protocol::context::membership::ContextEvent;
+
+use crate::crypto_state::ContextCryptoState;
+use crate::error::ClientError;
+
+/// Maximum events held in the pull-based receive buffer before the oldest is
+/// dropped (FIFO overflow).
+///
+/// Mirrors the deleted bridge's `WASM_EVENT_BUFFER_CAP` and the native `PyO3`
+/// channel capacity, so a slow drainer cannot grow memory without bound.
+pub const EVENT_BUFFER_CAP: usize = 1000;
+
+/// Participant state for a single context.
+pub struct PerContextState {
+    /// MLS + sender-key crypto state (the §9.16 double-encryption pipeline).
+    pub crypto: ContextCryptoState,
+    /// Canonical Merkle event log (shared `scp-event-log` implementation). The
+    /// convergence property the MVP test asserts is a property of THIS log
+    /// being driven by shared append logic on both members.
+    pub event_log: EventLog,
+    /// Per-member next-outgoing message sequence number, keyed by member DID.
+    ///
+    /// This is ENCRYPTION state (the next sequence each sender will stamp), not
+    /// membership state. Seeded to 0 when a member joins/is added, and
+    /// incremented after each `send_message`.
+    pub member_sequence_numbers: HashMap<String, u64>,
+    /// Pull-based receive buffer. Drained by `ScpClient::drain_events`.
+    pub event_buffer: VecDeque<ContextEvent>,
+    /// The §9.10.4 peer-pseudonym registry: `peer_did → 32-byte routing ID`.
+    /// Populated when a peer's `PseudonymAnnouncement` is ingested (§9.10.4). This
+    /// is the address book the app-data fan-out publishes to — each entry is one
+    /// peer's per-context relay routing ID. Excludes this member's own pseudonym
+    /// (that is [`Self::local_pseudonym`]); it is the exact registry
+    /// [`classify_pseudonym_announcement`](scp_protocol::context::pseudonym::classify_pseudonym_announcement)
+    /// consults for the cross-DID collision check.
+    pub peer_pseudonyms: HashMap<DID, [u8; 32]>,
+    /// This member's own per-context pseudonym (its 32-byte relay routing ID),
+    /// derived over the wasm-held MLS signing key (ADR-057 Option A). `None` until
+    /// derived on context entry (create/join). NOT persisted — re-derived on
+    /// restore from the MLS key, which is deterministic (see `snapshot.rs`).
+    pub local_pseudonym: Option<[u8; 32]>,
+    /// Poison flag: set when a `Storage` write failed *after* this context's
+    /// in-memory state had already advanced irreversibly (see
+    /// [`ClientError::ContextPoisoned`](crate::ClientError::ContextPoisoned)). A
+    /// poisoned context is refused by every op that would advance or expose its
+    /// diverged state; the caller reconstructs from the last durable snapshot.
+    ///
+    /// Deliberately **not** part of the serialized snapshot: a restored context
+    /// is unpoisoned by construction (it *is* the last durable state, so nothing
+    /// has diverged). It is in-memory-only session state.
+    pub(crate) poisoned: bool,
+}
+
+impl PerContextState {
+    /// Creates fresh per-context state around an already-built crypto state and
+    /// a fresh event log for `context_id`, with `creator_did` as the sole
+    /// initial member (sequence 0).
+    #[must_use]
+    pub fn new(context_id: &str, creator_did: &str, crypto: ContextCryptoState) -> Self {
+        let mut state = Self {
+            crypto,
+            event_log: EventLog::new(context_id.to_owned()),
+            member_sequence_numbers: HashMap::new(),
+            event_buffer: VecDeque::new(),
+            peer_pseudonyms: HashMap::new(),
+            local_pseudonym: None,
+            poisoned: false,
+        };
+        // The creator is the sole initial member; record it in the wrapping-key
+        // directory (the authoritative member set) with its own wrapping key.
+        let creator_wrapping_key = state.crypto.wrapping_public;
+        state.add_member_record(creator_did, creator_wrapping_key);
+        state
+    }
+
+    /// Creates fresh per-context state with an EMPTY event log and EMPTY
+    /// membership, for a joiner that will replay the adder's stream and adopt
+    /// the adder's membership snapshot (directory of wrapping keys).
+    #[must_use]
+    pub fn new_empty(context_id: &str, crypto: ContextCryptoState) -> Self {
+        Self {
+            crypto,
+            event_log: EventLog::new(context_id.to_owned()),
+            member_sequence_numbers: HashMap::new(),
+            event_buffer: VecDeque::new(),
+            peer_pseudonyms: HashMap::new(),
+            local_pseudonym: None,
+            poisoned: false,
+        }
+    }
+
+    /// Records a peer's announced per-context pseudonym in the §9.10.4 registry
+    /// (keyed by the peer's DID). Overwrites a prior value for the same DID (a
+    /// key-rotation re-announce). Never records this member's own DID — the local
+    /// pseudonym is tracked separately in [`Self::local_pseudonym`].
+    pub fn record_peer_pseudonym(&mut self, peer_did: DID, pseudonym: [u8; 32]) {
+        self.peer_pseudonyms.insert(peer_did, pseudonym);
+    }
+
+    /// The app-data fan-out address set: every announced peer pseudonym (the
+    /// registry values), in arbitrary order. Empty until peers announce.
+    #[must_use]
+    pub fn peer_pseudonym_values(&self) -> Vec<[u8; 32]> {
+        self.peer_pseudonyms.values().copied().collect()
+    }
+
+    /// Sets this member's own per-context pseudonym (derived on context entry).
+    pub const fn set_local_pseudonym(&mut self, pseudonym: [u8; 32]) {
+        self.local_pseudonym = Some(pseudonym);
+    }
+
+    /// This member's own per-context pseudonym, or `None` before it is derived.
+    #[must_use]
+    pub const fn local_pseudonym(&self) -> Option<[u8; 32]> {
+        self.local_pseudonym
+    }
+
+    /// Records a member in the context's wrapping-key directory (the
+    /// authoritative member set — ADR-057 sender-key distribution INVARIANT 1)
+    /// with the wrapping key a peer needs to HPKE-seal a sender key to it, and
+    /// seeds their outgoing-sequence counter. Re-recording updates the wrapping
+    /// key (e.g. a rotation) and leaves the sequence counter intact.
+    pub fn add_member_record(&mut self, member_did: &str, wrapping_key: [u8; 32]) {
+        self.crypto
+            .record_member_wrapping_key(member_did, wrapping_key);
+        self.member_sequence_numbers
+            .entry(member_did.to_owned())
+            .or_insert(0);
+    }
+
+    /// Returns the member DIDs of this context, sorted (the wrapping-key directory
+    /// keys — the authoritative member set).
+    #[must_use]
+    pub fn member_dids(&self) -> Vec<String> {
+        let mut dids: Vec<String> = self.crypto.member_wrapping_keys.keys().cloned().collect();
+        dids.sort();
+        dids
+    }
+
+    /// Returns and post-increments this member's next outgoing sequence number.
+    ///
+    /// Returns 0 (and seeds the counter) if the member has no counter yet.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed with [`ClientError::Driver`] at `u64::MAX` rather than
+    /// wrapping or saturating. The sequence is the §9.16 sender-layer AEAD's
+    /// authenticated **anti-replay input** — NOT a GCM nonce (the AES-256-GCM
+    /// nonce is a fresh 12-byte `OsRng` value per encryption; see
+    /// `scp-protocol::crypto::sender_keys::encrypt`). `encrypt_message` binds
+    /// `epoch || sequence` into the AEAD **AAD**, and the receiver enforces a
+    /// per-sender monotonic `(epoch, sequence)` replay floor
+    /// (`crypto_state.rs`). A `saturating_add` would stick at `u64::MAX` and
+    /// hand out the SAME sequence twice: the duplicate would wedge the
+    /// receiver's replay floor — a re-used `(epoch, sequence)` at or below the
+    /// last-accepted pair is rejected as a replay, silently dropping the
+    /// message and collapsing the anti-replay invariant. (This is distinct from
+    /// GCM nonce reuse, which the per-call random nonce already precludes.) The
+    /// send therefore refuses rather than reuse the counter (mirrors
+    /// `ContextCryptoState::rotate_sender_key`'s epoch-overflow guard). `u64::MAX`
+    /// sends is operationally unreachable, so this never fires in practice; it
+    /// exists so the footgun cannot silently arm.
+    pub fn next_sequence(&mut self, member_did: &str) -> Result<u64, ClientError> {
+        let entry = self
+            .member_sequence_numbers
+            .entry(member_did.to_owned())
+            .or_insert(0);
+        let seq = *entry;
+        *entry = entry.checked_add(1).ok_or_else(|| {
+            ClientError::Driver(format!(
+                "outgoing sequence number overflow for '{member_did}' (already at u64::MAX); \
+                 refusing to reuse a sequence (§9.16 AEAD anti-replay AAD input)"
+            ))
+        })?;
+        Ok(seq)
+    }
+
+    /// Pushes an event onto the receive buffer, evicting the oldest at capacity.
+    pub fn push_event(&mut self, event: ContextEvent) {
+        if self.event_buffer.len() >= EVENT_BUFFER_CAP {
+            self.event_buffer.pop_front();
+        }
+        self.event_buffer.push_back(event);
+    }
+
+    /// Drains all buffered receive events in FIFO order.
+    pub fn drain_events(&mut self) -> Vec<ContextEvent> {
+        self.event_buffer.drain(..).collect()
+    }
+
+    /// Returns the current event-log Merkle root.
+    #[must_use]
+    pub fn event_log_root(&self) -> [u8; 32] {
+        root(&self.event_log)
+    }
+
+    /// Returns the number of leaves (events) in the event log.
+    #[must_use]
+    pub const fn event_log_leaf_count(&self) -> u64 {
+        event_count(&self.event_log)
+    }
+
+    /// Returns a clone of the full ordered event stream.
+    ///
+    /// Used by the join path to hand a newly-added member the adder's prior log
+    /// so they can replay it and converge (§7.3.1 context-state import).
+    #[must_use]
+    pub fn events(&self) -> Vec<Event> {
+        self.event_log.events().to_vec()
+    }
+
+    /// Replays a verbatim event onto the log via the canonical append path.
+    ///
+    /// Unlike [`Self::append_log_event`], this does NOT recompute `sequence` or
+    /// `prev_hash` — it appends the event exactly as received, so the canonical
+    /// append validation ([`append_unsigned_event`]) enforces that the replayed
+    /// event chains correctly onto the current log. Replaying the adder's full
+    /// prior log this way reconstructs a byte-identical log on the joiner
+    /// (identical leaves and identical root), which is the §9.9.3 convergence
+    /// property realized by shared append code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scp_event_log::EventLogError`] if the event does not chain onto
+    /// the current log (sequence or `prev_hash` mismatch) — i.e. the replay
+    /// stream is out of order or does not start from this log's current head.
+    pub fn replay_event(&mut self, event: &Event) -> Result<(), scp_event_log::EventLogError> {
+        append_unsigned_event(&mut self.event_log, event)?;
+        Ok(())
+    }
+
+    /// Returns the event-log leaf hashes in sequence order.
+    ///
+    /// Each entry is the canonical leaf hash of the event at that sequence
+    /// position. Two members that recorded the same logical event with the same
+    /// committer-assigned inputs produce byte-identical leaf hashes here — the
+    /// per-leaf form of the §9.9.3 convergence property the participant driver
+    /// must satisfy across native and wasm32.
+    #[must_use]
+    pub fn event_log_leaf_hashes(&self) -> Vec<[u8; 32]> {
+        self.event_log.leaves().to_vec()
+    }
+
+    /// Appends a protocol event to the context's event log.
+    ///
+    /// Constructs a full [`Event`] with the correct sequence number and
+    /// `prev_hash` chain link, then delegates to
+    /// [`append_unsigned_event`]. The leaf carries an empty signature: the
+    /// driver MVP does not yet thread the on-device signing key into the leaf
+    /// (the leaf-signing seam is a later custody slice). The leaf *preimage*
+    /// (which excludes the signature) is what feeds the Merkle root, so an
+    /// unsigned leaf still converges byte-for-byte across members.
+    ///
+    /// `timestamp_secs` is the **committer-assigned** convergent leaf timestamp
+    /// (Unix seconds), matching the native runtime: every member that records
+    /// the same logical event stamps the SAME timestamp (the creator's, copied
+    /// by peers), NEVER each member's local `now()`. Per-member `now()` would
+    /// diverge the leaf preimage and break the equal-count / equal-root
+    /// convergence property a browser member and a native member must both
+    /// satisfy (§7.3.1, §9.9.3).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scp_event_log::EventLogError`] if the append fails (sequence
+    /// or `prev_hash` mismatch — unreachable here because both are computed
+    /// from the current log state).
+    pub fn append_log_event(
+        &mut self,
+        event_type: EventType,
+        actor_did: &str,
+        payload: Vec<u8>,
+        timestamp_secs: u64,
+    ) -> Result<(), scp_event_log::EventLogError> {
+        let sequence = event_count(&self.event_log);
+        let leaves = self.event_log.leaves();
+        let prev_hash = leaves.last().copied().unwrap_or(GENESIS_PREV_HASH);
+        let event = Event {
+            event_type,
+            actor_did: DID::from(actor_did.to_owned()),
+            timestamp: timestamp_secs,
+            sequence,
+            payload: EventPayload { data: payload },
+            prev_hash,
+            signature: vec![],
+        };
+        append_unsigned_event(&mut self.event_log, &event)?;
+        Ok(())
+    }
+}

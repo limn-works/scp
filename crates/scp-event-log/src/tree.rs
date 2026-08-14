@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::{Event, EventLog, EventLogError, EventType};
-use crate::crypto::verify_ed25519_signature;
-use scp_primitives::extract_public_key_from_did;
+use scp_crypto::verify_ed25519_signature;
+use scp_did::extract_public_key_from_did;
 
 /// The genesis sentinel hash used as `prev_hash` for the first event.
 ///
@@ -102,7 +102,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 /// # Why this exists
 ///
 /// The MCP FFI bridge (`crates/scp-ffi/src/mcp.rs`) calls
-/// `ContextProvider::invoke_tool` synchronously from within the tokio runtime.
+/// `ContextProvider::invoke_outlet` synchronously from within the tokio runtime.
 /// The `KeyCustody` signing trait is async, and calling `block_on` from inside
 /// the tokio runtime panics ("Cannot block the current thread from within a
 /// runtime"). Because signing key material cannot be accessed synchronously,
@@ -125,7 +125,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 /// The `signature` field is empty. This means:
 ///
 /// - A compromised in-process attacker with write access to the `EventLog`
-///   could inject fabricated events (e.g., fake `ToolInvokedEvent` entries)
+///   could inject fabricated events (e.g., fake `OutletInvokedEvent` entries)
 ///   that pass sequence and hash-chain validation but carry no proof of origin.
 /// - External verifiers cannot distinguish between legitimate unsigned events
 ///   and injected ones — both have empty signatures.
@@ -138,8 +138,8 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 /// must control the event content and the `EventLog` reference. Current
 /// legitimate callers:
 ///
-/// - `FfiBridgeProvider::invoke_tool` in `crates/scp-ffi/src/mcp.rs`
-///   (emits `ToolInvokedEvent` per ADR-010 criterion 3)
+/// - `FfiBridgeProvider::invoke_outlet` in `crates/scp-ffi/src/mcp.rs`
+///   (emits `OutletInvokedEvent` per ADR-010 criterion 3)
 /// - Test code
 ///
 /// # Migration plan
@@ -148,7 +148,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 /// bridges), this function should be replaced by calls to [`append`] with
 /// properly signed events. The migration path:
 ///
-/// 1. Make `ContextProvider::invoke_tool` async (or use a signing channel).
+/// 1. Make `ContextProvider::invoke_outlet` async (or use a signing channel).
 /// 2. Obtain the actor's `KeyCustody` handle in the FFI bridge.
 /// 3. Sign the event via `KeyCustody::sign()` before appending.
 /// 4. Replace all `append_unsigned_event` call sites with [`append`].
@@ -410,11 +410,11 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::RoleAssigned => 6,
         EventType::TokenRevoked => 7,
         EventType::MessageSent => 8,
-        EventType::ToolRegistered => 9,
-        EventType::ToolUpdated => 10,
-        EventType::ToolInvoked => 11,
-        EventType::ToolVerified => 12,
-        EventType::ToolInterfaceEstablished => 13,
+        EventType::OutletRegistered => 9,
+        EventType::OutletUpdated => 10,
+        EventType::OutletInvoked => 11,
+        EventType::OutletVerified => 12,
+        EventType::OutletInterfaceEstablished => 13,
         EventType::GovernanceAction => 14,
         EventType::ConsistencyCheckpoint => 15,
         EventType::AbsenceProofRequested => 16,
@@ -439,7 +439,7 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         // Provenance event types (issue #586)
         EventType::ProvenanceAttached => 34,
         EventType::ProvenanceReceived => 35,
-        // Native↔WASM unification variants (ADR-011 Amendment). Tags 36..=75
+        // Typed-event unification variants (ADR-011 Amendment). Tags 36..=75
         // are assigned in ADR declaration order, with tag 59 retired (see the
         // PseudonymAnnounced removal note below). Tags 76..=77 (below) are the
         // ADR-011 Amendment §6 cross-context-saga carve-out. Tags 0-35 above are
@@ -463,7 +463,7 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::HardRateLimitModified => 52,
         EventType::EconomicPolicyLocked => 53,
         EventType::ContextMigrationStarted => 54,
-        EventType::ToolRemoved => 55,
+        EventType::OutletRemoved => 55,
         EventType::PruningPolicyModified => 56,
         EventType::CommitBroadcasted => 57,
         EventType::CommitBroadcastPending => 58,
@@ -487,10 +487,10 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::RecoveryEpochAdvanced => 73,
         EventType::AppBound => 74,
         EventType::AppUnbound => 75,
-        // Cross-context tool-call saga (ADR-011 Amendment §6 carve-out). Tags
+        // Cross-context outlet-call saga (ADR-011 Amendment §6 carve-out). Tags
         // 76..=77 are the next free values after the current max (75); tag 59
         // stays retired. These are convergent commit-ordered durable leaves.
-        EventType::CrossContextToolInvoked => 76,
+        EventType::CrossContextOutletInvoked => 76,
         EventType::CrossContextDivergenceMarker => 77,
     }
 }
@@ -502,8 +502,8 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
 ///
 /// RFC 6962 structure: odd nodes are promoted (not duplicated).
 ///
-/// Algorithm ported from `WasmEventLog::incremental_update` in
-/// `crates/scp-ffi/wasm/src/runtime.rs` (M1 performance fix).
+/// Incremental path-only recompute (M1 performance fix) rather than a full
+/// O(n) tree rebuild on every append.
 fn incremental_update(log: &mut EventLog) {
     let n = log.leaves.len();
 
@@ -989,11 +989,11 @@ mod tests {
             EventType::RoleAssigned,
             EventType::TokenRevoked,
             EventType::MessageSent,
-            EventType::ToolRegistered,
-            EventType::ToolUpdated,
-            EventType::ToolInvoked,
-            EventType::ToolVerified,
-            EventType::ToolInterfaceEstablished,
+            EventType::OutletRegistered,
+            EventType::OutletUpdated,
+            EventType::OutletInvoked,
+            EventType::OutletVerified,
+            EventType::OutletInterfaceEstablished,
             EventType::GovernanceAction,
             EventType::ConsistencyCheckpoint,
             EventType::AbsenceProofRequested,
@@ -1137,12 +1137,12 @@ mod tests {
         let mut log = EventLog::new("ctx-unsigned-test".to_owned());
 
         let event = Event {
-            event_type: EventType::ToolInvoked,
+            event_type: EventType::OutletInvoked,
             actor_did: "did:dht:z6MkTest".into(),
             timestamp: 1_000_000,
             sequence: 0,
             payload: EventPayload {
-                data: b"tool invoked payload".to_vec(),
+                data: b"outlet invoked payload".to_vec(),
             },
             prev_hash: GENESIS_PREV_HASH,
             signature: Vec::new(), // No signature required.
@@ -1175,7 +1175,7 @@ mod tests {
         let mut log = EventLog::new("ctx-unsigned-seq".to_owned());
 
         let event0 = Event {
-            event_type: EventType::ToolInvoked,
+            event_type: EventType::OutletInvoked,
             actor_did: "did:dht:z6MkTest".into(),
             timestamp: 1_000_000,
             sequence: 0,
@@ -1191,7 +1191,7 @@ mod tests {
 
         // Second event with correct prev_hash.
         let event1 = Event {
-            event_type: EventType::ToolInvoked,
+            event_type: EventType::OutletInvoked,
             actor_did: "did:dht:z6MkTest".into(),
             timestamp: 1_000_001,
             sequence: 1,
@@ -1216,7 +1216,7 @@ mod tests {
         let mut log = EventLog::new("ctx-unsigned-seq-err".to_owned());
 
         let event = Event {
-            event_type: EventType::ToolInvoked,
+            event_type: EventType::OutletInvoked,
             actor_did: "did:dht:z6MkTest".into(),
             timestamp: 1_000_000,
             sequence: 5, // Wrong: should be 0.
@@ -1247,7 +1247,7 @@ mod tests {
         let mut log = EventLog::new("ctx-unsigned-prev-err".to_owned());
 
         let event = Event {
-            event_type: EventType::ToolInvoked,
+            event_type: EventType::OutletInvoked,
             actor_did: "did:dht:z6MkTest".into(),
             timestamp: 1_000_000,
             sequence: 0,
@@ -1305,7 +1305,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Closed-taxonomy tag invariants (ADR-011 native↔WASM unification):
+    // Closed-taxonomy tag invariants (ADR-011 typed-event unification):
     //   - tags 0-35 are protocol constants and MUST NOT change;
     //   - the 39 unification variants occupy tags 36..=75 with tag 59 retired
     //     (PseudonymAnnounced removed — a routing-bootstrap ContextEvent signal);
@@ -1325,11 +1325,11 @@ mod tests {
         EventType::RoleAssigned,
         EventType::TokenRevoked,
         EventType::MessageSent,
-        EventType::ToolRegistered,
-        EventType::ToolUpdated,
-        EventType::ToolInvoked,
-        EventType::ToolVerified,
-        EventType::ToolInterfaceEstablished,
+        EventType::OutletRegistered,
+        EventType::OutletUpdated,
+        EventType::OutletInvoked,
+        EventType::OutletVerified,
+        EventType::OutletInterfaceEstablished,
         EventType::GovernanceAction,
         EventType::ConsistencyCheckpoint,
         EventType::AbsenceProofRequested,
@@ -1371,7 +1371,7 @@ mod tests {
         EventType::HardRateLimitModified,
         EventType::EconomicPolicyLocked,
         EventType::ContextMigrationStarted,
-        EventType::ToolRemoved,
+        EventType::OutletRemoved,
         EventType::PruningPolicyModified,
         EventType::CommitBroadcasted,
         EventType::CommitBroadcastPending,
@@ -1391,7 +1391,7 @@ mod tests {
         EventType::RecoveryEpochAdvanced,
         EventType::AppBound,
         EventType::AppUnbound,
-        EventType::CrossContextToolInvoked,
+        EventType::CrossContextOutletInvoked,
         EventType::CrossContextDivergenceMarker,
     ];
 
@@ -1429,11 +1429,11 @@ mod tests {
         assert_eq!(event_type_tag(&EventType::RoleAssigned), 6);
         assert_eq!(event_type_tag(&EventType::TokenRevoked), 7);
         assert_eq!(event_type_tag(&EventType::MessageSent), 8);
-        assert_eq!(event_type_tag(&EventType::ToolRegistered), 9);
-        assert_eq!(event_type_tag(&EventType::ToolUpdated), 10);
-        assert_eq!(event_type_tag(&EventType::ToolInvoked), 11);
-        assert_eq!(event_type_tag(&EventType::ToolVerified), 12);
-        assert_eq!(event_type_tag(&EventType::ToolInterfaceEstablished), 13);
+        assert_eq!(event_type_tag(&EventType::OutletRegistered), 9);
+        assert_eq!(event_type_tag(&EventType::OutletUpdated), 10);
+        assert_eq!(event_type_tag(&EventType::OutletInvoked), 11);
+        assert_eq!(event_type_tag(&EventType::OutletVerified), 12);
+        assert_eq!(event_type_tag(&EventType::OutletInterfaceEstablished), 13);
         assert_eq!(event_type_tag(&EventType::GovernanceAction), 14);
         assert_eq!(event_type_tag(&EventType::ConsistencyCheckpoint), 15);
         assert_eq!(event_type_tag(&EventType::AbsenceProofRequested), 16);
@@ -1460,7 +1460,7 @@ mod tests {
 
     #[test]
     fn unification_variant_tags_occupy_36_through_77() {
-        // The 39 native↔WASM unification variants occupy tags 36..=75 in ADR
+        // The 39 typed-event unification variants occupy tags 36..=75 in ADR
         // declaration order, with tag 59 retired (PseudonymAnnounced removed).
         // The 2 ADR-011 Amendment §6 cross-context-saga variants occupy tags
         // 76..=77.
@@ -1483,7 +1483,7 @@ mod tests {
         assert_eq!(event_type_tag(&EventType::HardRateLimitModified), 52);
         assert_eq!(event_type_tag(&EventType::EconomicPolicyLocked), 53);
         assert_eq!(event_type_tag(&EventType::ContextMigrationStarted), 54);
-        assert_eq!(event_type_tag(&EventType::ToolRemoved), 55);
+        assert_eq!(event_type_tag(&EventType::OutletRemoved), 55);
         assert_eq!(event_type_tag(&EventType::PruningPolicyModified), 56);
         assert_eq!(event_type_tag(&EventType::CommitBroadcasted), 57);
         assert_eq!(event_type_tag(&EventType::CommitBroadcastPending), 58);
@@ -1509,7 +1509,7 @@ mod tests {
         assert_eq!(event_type_tag(&EventType::AppUnbound), 75);
         // Cross-context-saga carve-out (ADR-011 Amendment §6): the next free
         // tags after 75 (tag 59 stays retired).
-        assert_eq!(event_type_tag(&EventType::CrossContextToolInvoked), 76);
+        assert_eq!(event_type_tag(&EventType::CrossContextOutletInvoked), 76);
         assert_eq!(event_type_tag(&EventType::CrossContextDivergenceMarker), 77);
     }
 

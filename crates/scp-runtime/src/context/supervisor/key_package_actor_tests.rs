@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use scp_identity::DID;
-use scp_primitives::{Clock, SystemClock};
+use scp_clock::{Clock, SystemClock};
+use scp_did::DID;
 use scp_protocol::context::{ContextError, ContextParams};
 
 use super::{
@@ -33,15 +33,15 @@ use crate::crypto::mls::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
 };
-use crate::crypto::mls::credential::ScpCredential;
-use crate::crypto::mls::encrypt::DecryptedContent;
-use crate::crypto::mls::error::MlsError;
-use crate::crypto::mls::group::ScpMlsGroup;
 use crate::crypto::mls::production_backend::ProductionMlsBackend;
 use crate::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 use openmls::prelude::LeafNodeIndex;
+use scp_mls::credential::ScpCredential;
+use scp_mls::encrypt::DecryptedContent;
+use scp_mls::error::MlsError;
+use scp_mls::group::ScpMlsGroup;
 use scp_platform::PlatformError;
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::traits::Storage;
 
 // ---------------------------------------------------------------------------
@@ -53,13 +53,17 @@ fn alice() -> DID {
 }
 
 fn real_backend() -> Arc<dyn MlsBackend> {
-    Arc::new(ProductionMlsBackend::new())
+    Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )))
 }
 
 /// A real backend with the durable consumed-init-key set attached (A2), so the
 /// crypto-layer single-use backstop is active.
 fn backend_with_consumed_set(storage: &Arc<dyn OpenMlsStorageAdapter>) -> Arc<dyn MlsBackend> {
-    let backend = Arc::new(ProductionMlsBackend::new());
+    let backend = Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )));
     backend.set_consumed_init_key_store(Arc::clone(storage));
     backend
 }
@@ -172,7 +176,7 @@ async fn real_welcome_for(mls: &Arc<dyn MlsBackend>, kp_public_bytes: &[u8]) -> 
     let inviter = ScpCredential::new(
         "did:dht:z6MkInviterForWelcome".to_owned(),
         None,
-        scp_identity::SigningKeyId::Active,
+        scp_did::SigningKeyId::Active,
     )
     .unwrap();
     let mut group = mls.create_group(&inviter, None).await.unwrap();
@@ -342,7 +346,8 @@ async fn double_confirm_of_same_reservation_rejected() {
             reply,
         })
         .await
-        .expect_err("double-confirm fails");
+        .err()
+        .expect("double-confirm fails");
     assert!(matches!(err, ContextError::InvalidState(_)));
 
     handle.send_shutdown().await.unwrap();
@@ -359,7 +364,7 @@ async fn second_join_same_init_key_rejected_at_backend() {
     // Generate ONE key package and TWO independent Welcomes addressed to it
     // (two separate inviter groups both add the same KP). The first join
     // consumes the init key durably; the second must be rejected.
-    let joiner = ScpCredential::new(alice().0, None, scp_identity::SigningKeyId::Active).unwrap();
+    let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls.generate_key_package(&joiner, None).await.unwrap();
     let welcome_a = real_welcome_for(&mls, &generated.key_package_bytes).await;
     let welcome_b = real_welcome_for(&mls, &generated.key_package_bytes).await;
@@ -398,9 +403,11 @@ async fn second_join_same_init_key_rejected_at_backend() {
 #[tokio::test]
 async fn join_without_consumed_store_fails_closed() {
     // A store-less production backend (no `set_consumed_init_key_store`).
-    let mls: Arc<dyn MlsBackend> = Arc::new(ProductionMlsBackend::new());
+    let mls: Arc<dyn MlsBackend> = Arc::new(ProductionMlsBackend::new(std::sync::Arc::new(
+        scp_clock::SystemClock,
+    )));
 
-    let joiner = ScpCredential::new(alice().0, None, scp_identity::SigningKeyId::Active).unwrap();
+    let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls.generate_key_package(&joiner, None).await.unwrap();
     let welcome = real_welcome_for(&mls, &generated.key_package_bytes).await;
 
@@ -426,7 +433,7 @@ async fn join_with_mismatched_public_bytes_rejected() {
     let storage = in_memory_storage();
     let mls = backend_with_consumed_set(&storage);
 
-    let joiner = ScpCredential::new(alice().0, None, scp_identity::SigningKeyId::Active).unwrap();
+    let joiner = ScpCredential::new(alice().0, None, scp_did::SigningKeyId::Active).unwrap();
     let generated = mls.generate_key_package(&joiner, None).await.unwrap();
     // A DIFFERENT KP — its public bytes do not match `generated.signer_state`.
     let other = mls.generate_key_package(&joiner, None).await.unwrap();
@@ -469,7 +476,8 @@ async fn unknown_ref_and_unknown_reservation_yield_typed_errors() {
             reply,
         })
         .await
-        .expect_err("unknown reservation confirm fails");
+        .err()
+        .expect("unknown reservation confirm fails");
     assert!(matches!(err, ContextError::InvalidState(_)));
 
     let err = handle
@@ -614,12 +622,7 @@ async fn replenish_fails_closed_when_credential_absent() {
     let malformed = DID("did:malformed:no-credential".to_owned());
     // Sanity: this DID truly produces no credential.
     assert!(
-        ScpCredential::new(
-            malformed.0.clone(),
-            None,
-            scp_identity::SigningKeyId::Active
-        )
-        .is_err(),
+        ScpCredential::new(malformed.0.clone(), None, scp_did::SigningKeyId::Active).is_err(),
         "precondition: the malformed DID must not yield a valid credential"
     );
 
@@ -816,7 +819,8 @@ async fn confirm_persist_failure_retains_reservation_and_errs() {
             reply,
         })
         .await
-        .expect_err("confirm fails closed when the KP-record delete fails");
+        .err()
+        .expect("confirm fails closed when the KP-record delete fails");
     assert!(matches!(err, ContextError::PersistenceFailed(_)));
 
     // KP record still present (consume did NOT durably land).
@@ -833,11 +837,14 @@ async fn confirm_persist_failure_retains_reservation_and_errs() {
 /// SUCCESSFUL internal join must NOT permanently wedge the reservation. The
 /// first confirm errs (the consume did not fully land), but a RETRY — which
 /// re-runs the internal join and now hits the already-written init-key marker
-/// (`scp-kp-consumed-initkey/`) → `MlsError::KeyPackageReplay` — must be
-/// recognized as our own prior completion and converted into an idempotent
-/// SUCCESS that finishes the durable consume. Single-use must still hold.
+/// (`scp-kp-consumed-initkey/`) → `MlsError::KeyPackageReplay` — is recognized
+/// as our own prior completion and idempotently FINISHES the durable consume.
+/// Because the joined group is not retained across confirms (it was produced and
+/// dropped by the first, failed confirm), the retry replies `Err(InvalidState)`
+/// rather than a groupless `Ok`: the join is lost and the joiner must re-initiate
+/// with a fresh key package. Single-use must still hold across the retry.
 #[tokio::test]
-async fn confirm_tombstone_failure_then_healed_retry_succeeds_idempotently() {
+async fn confirm_tombstone_failure_then_healed_retry_completes_consume_but_errs_groupless() {
     let healthy = Arc::new(InMemoryStorage::new());
     let faulty = Arc::new(FaultyStorage::new(Arc::clone(&healthy)));
     let storage: Arc<dyn OpenMlsStorageAdapter> =
@@ -876,7 +883,8 @@ async fn confirm_tombstone_failure_then_healed_retry_succeeds_idempotently() {
             reply,
         })
         .await
-        .expect_err("first confirm errs when the tombstone store fails");
+        .err()
+        .expect("first confirm errs when the tombstone store fails");
     assert!(matches!(err, ContextError::PersistenceFailed(_)));
 
     // The internal join already ran: its init-key marker is durably present
@@ -892,16 +900,22 @@ async fn confirm_tombstone_failure_then_healed_retry_succeeds_idempotently() {
 
     // Heal storage and RETRY the SAME reservation. The retry's inner join hits
     // the marker → KeyPackageReplay → recognized as our own prior completion →
-    // idempotent durable-consume completion → Ok.
+    // idempotent durable-consume completion. The joined group is NOT retained
+    // across confirms (it was produced and dropped by the first, failed
+    // confirm), so the retry replies Err(InvalidState): the join is lost and the
+    // joiner must re-initiate with a FRESH key package. This is fail-closed —
+    // a groupless success is never returned, and the durable consume still lands.
     faulty.clear_fail();
-    handle
+    let retry = handle
         .send(|reply| KeyPackageCommand::ConfirmConsume {
             reservation_id: reservation_id.clone(),
             welcome_bytes: welcome.clone(),
             reply,
         })
         .await
-        .expect("healed retry completes the durable consume idempotently");
+        .err()
+        .expect("healed retry errs — the joined group is not retained across confirms");
+    assert!(matches!(retry, ContextError::InvalidState(_)));
 
     // The consume durably landed: the KP private record is gone (the journal
     // single-use anchor delete) and the reservation is cleared.
@@ -919,7 +933,8 @@ async fn confirm_tombstone_failure_then_healed_retry_succeeds_idempotently() {
             reply,
         })
         .await
-        .expect_err("a consumed reservation must not confirm again");
+        .err()
+        .expect("a consumed reservation must not confirm again");
     assert!(matches!(unknown, ContextError::InvalidState(_)));
 
     handle.send_shutdown().await.unwrap();
@@ -1877,7 +1892,8 @@ async fn malformed_consumed_tombstone_reconciles_fail_closed_and_a2_still_reject
             reply,
         })
         .await
-        .expect_err("a malformed-tombstone reservation must not be restored as reserved");
+        .err()
+        .expect("a malformed-tombstone reservation must not be restored as reserved");
     assert!(matches!(err, ContextError::InvalidState(_)));
 
     // (c) The A2 crypto-layer backstop's durable record survives the
@@ -2049,7 +2065,8 @@ async fn confirm_replay_with_surviving_kp_record_errs_not_false_ok() {
             reply,
         })
         .await
-        .expect_err("first confirm errs when the KP-record delete fails");
+        .err()
+        .expect("first confirm errs when the KP-record delete fails");
     assert!(matches!(err, ContextError::PersistenceFailed(_)));
 
     // Heal the delete fault, but the KP record was never deleted (the delete
@@ -2071,7 +2088,8 @@ async fn confirm_replay_with_surviving_kp_record_errs_not_false_ok() {
             reply,
         })
         .await
-        .expect_err("a replay with a surviving KP record must NOT be a false-success Ok");
+        .err()
+        .expect("a replay with a surviving KP record must NOT be a false-success Ok");
     assert!(
         matches!(retry_err, ContextError::KeyPackageReplay(_)),
         "the surviving-record replay must surface as KeyPackageReplay, got {retry_err:?}"
@@ -2163,7 +2181,8 @@ async fn consumed_precedence_overlapping_reservation_and_tombstone_not_restored(
             reply,
         })
         .await
-        .expect_err("a consumed ref must NOT be restored as a confirmable reservation");
+        .err()
+        .expect("a consumed ref must NOT be restored as a confirmable reservation");
     assert!(matches!(confirm_err, ContextError::InvalidState(_)));
 
     // Nor was it re-pooled: re-reserving the ref errs (not pooled).
@@ -2498,22 +2517,27 @@ async fn confirm_retry_with_different_welcome_completes_without_second_join() {
             reply,
         })
         .await
-        .expect_err("first confirm errs when the tombstone store fails");
+        .err()
+        .expect("first confirm errs when the tombstone store fails");
     assert!(matches!(err, ContextError::PersistenceFailed(_)));
 
     // Heal storage and RETRY with the ALTERNATE welcome. The retry's inner join
     // short-circuits on the already-written init-key marker → recognized as our
-    // own prior completion → idempotent durable-consume completion → Ok. The
-    // alternate welcome is NEVER processed into a join.
+    // own prior completion → idempotent durable-consume completion. The alternate
+    // welcome is NEVER processed into a join. The joined group is not retained
+    // across confirms, so the reply is Err(InvalidState) (not a groupless Ok);
+    // the durable consume still lands and single-use holds.
     faulty.clear_fail();
-    handle
+    let retry = handle
         .send(|reply| KeyPackageCommand::ConfirmConsume {
             reservation_id: reservation_id.clone(),
             welcome_bytes: welcome_alternate.clone(),
             reply,
         })
         .await
-        .expect("retry with a different welcome idempotently completes the consume");
+        .err()
+        .expect("retry errs — the joined group is not retained across confirms");
+    assert!(matches!(retry, ContextError::InvalidState(_)));
 
     // The consume durably landed (KP record gone) and single-use holds.
     assert!(
@@ -2549,7 +2573,8 @@ async fn confirm_retry_with_different_welcome_completes_without_second_join() {
             reply,
         })
         .await
-        .expect_err("a consumed reservation must not confirm again");
+        .err()
+        .expect("a consumed reservation must not confirm again");
     assert!(matches!(unknown, ContextError::InvalidState(_)));
 
     handle.send_shutdown().await.unwrap();
@@ -2925,7 +2950,8 @@ async fn confirm_with_bad_welcome_keeps_reservation_for_retry() {
             reply,
         })
         .await
-        .expect_err("a bad welcome makes the fused join fail");
+        .err()
+        .expect("a bad welcome makes the fused join fail");
     assert!(matches!(err, ContextError::CryptoFailed(_)));
 
     // KP NOT burned — record still present.
@@ -2960,7 +2986,7 @@ struct FailingBackend {
 impl FailingBackend {
     fn new(successes: usize) -> Self {
         Self {
-            inner: ProductionMlsBackend::new(),
+            inner: ProductionMlsBackend::new(std::sync::Arc::new(scp_clock::SystemClock)),
             remaining: AtomicUsize::new(successes),
         }
     }
@@ -3020,8 +3046,11 @@ impl MlsBackend for FailingBackend {
     async fn validate_key_package(
         &self,
         key_package_bytes: &[u8],
+        clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError> {
-        self.inner.validate_key_package(key_package_bytes).await
+        self.inner
+            .validate_key_package(key_package_bytes, clock)
+            .await
     }
     async fn generate_key_package(
         &self,
@@ -3086,28 +3115,33 @@ impl RecordingTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for RecordingTransport {
     fn is_connected(&self) -> bool {
         true
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _context_id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn send_message(
+    async fn send_message(
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
     ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn publish_key_package(&self, owner_did: &str, _kp_bytes: &[u8]) -> Result<(), ContextError> {
+    async fn publish_key_package(
+        &self,
+        owner_did: &str,
+        _kp_bytes: &[u8],
+    ) -> Result<(), ContextError> {
         if self.fail.load(Ordering::Acquire) {
             return Err(ContextError::TransportFailed("injected".to_owned()));
         }
@@ -3276,6 +3310,77 @@ fn newtype_kp_ref_serializes_transparently_as_string() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// ReserveAny — atomic reserve-first-pooled (concurrency-regression proof)
+// ---------------------------------------------------------------------------
+
+/// Two `ReserveAny` commands under the SAME identity must yield DISTINCT
+/// reservations over DISTINCT KeyPackages.
+///
+/// This is the regression proof for the non-atomic `Replenish` → `ListPooled`
+/// → `Reserve` composite the supervisor formerly used: two reserves that each
+/// `ListPooled` the same pool would both pick the first `kp_ref`, and the
+/// second `Reserve` would spuriously fail `InvalidState("already reserved")`.
+/// The atomic `ReserveAny` handler picks-and-reserves inside one command, so
+/// the first reserve has already moved its KP out of `pool` before the second
+/// handler runs — the second picks the NEXT ref and both succeed.
+#[tokio::test]
+async fn reserve_any_returns_distinct_reservations() {
+    let storage = in_memory_storage();
+    let (handle, _join) = spawn_filled(Arc::clone(&storage)).await;
+
+    let (rid1, public1) = handle
+        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .await
+        .expect("first ReserveAny succeeds");
+    let (rid2, public2) = handle
+        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .await
+        .expect("second ReserveAny succeeds despite the first holding a reservation");
+
+    assert_ne!(
+        rid1, rid2,
+        "the two ReserveAny calls must mint DISTINCT reservation ids"
+    );
+    // Distinct KeyPackages: the returned PUBLIC bytes (and therefore their
+    // content-hash KpRefs) must differ — the second reserve took a different
+    // pooled KP, not the one the first already holds.
+    assert_ne!(
+        KpRef::from_public_bytes(&public1),
+        KpRef::from_public_bytes(&public2),
+        "the two ReserveAny calls must reserve DISTINCT key packages"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
+/// `ReserveAny` on an EMPTY pool replenishes-then-reserves within the single
+/// command, returning a live reservation (the folded replenish barrier).
+#[tokio::test]
+async fn reserve_any_replenishes_empty_pool_then_reserves() {
+    let storage = in_memory_storage();
+    // Fresh spawn WITHOUT a warm-up Replenish barrier: the actor's startup
+    // replenish still fills the pool before serving commands, but ReserveAny
+    // owns its own replenish-if-empty step regardless, so a single ReserveAny
+    // must succeed on the first command.
+    let mls = backend_with_consumed_set(&storage);
+    let (handle, _join) = KeyPackageStoreActor::spawn(
+        alice(),
+        deps_with(mls, Arc::clone(&storage), no_transport()),
+    );
+
+    let (_rid, public_bytes) = handle
+        .send(|reply| KeyPackageCommand::ReserveAny { reply })
+        .await
+        .expect("ReserveAny fills the pool and reserves in one command");
+    assert!(
+        !public_bytes.is_empty(),
+        "ReserveAny returns PUBLIC bytes (not private signer-state)"
+    );
+
+    handle.send_shutdown().await.unwrap();
+}
+
 #[test]
 fn newtype_reservation_id_serializes_transparently_as_string() {
     let as_newtype = rmp_serde::to_vec(&vec![ReservationId::from_raw("rid-xyz")]).unwrap();
@@ -3298,3 +3403,46 @@ fn newtype_reservation_id_serializes_transparently_as_string() {
 // `clear_kp_poison` surface; see `kp_actor_watchdog_records_panic_and_respawns`,
 // `kp_actor_poisons_after_budget`, and `clear_kp_poison_recovers_poisoned_actor`
 // there.
+
+// ---------------------------------------------------------------------------
+// 8. handle reply-await is bounded (internal follow-up #129)
+// ---------------------------------------------------------------------------
+
+/// A command that enqueues successfully but is NEVER replied to (no actor
+/// drains the mailbox / no oneshot ack) must NOT hang the caller forever: the
+/// handle's post-enqueue reply-await is bounded by
+/// [`super::KP_REPLY_TIMEOUT`], returning a retryable
+/// [`ContextError::ActorBusy`] on elapse. Uses `start_paused` so tokio
+/// auto-advances virtual time to fire the timer — the test is deterministic
+/// and completes instantly instead of waiting the real 60 s.
+#[tokio::test(start_paused = true)]
+async fn send_reply_await_is_bounded_when_actor_never_replies() {
+    use super::{KP_MAILBOX_CAPACITY, KP_REPLY_TIMEOUT, KeyPackageStoreHandle};
+
+    // Buffered mailbox (capacity > 0) with the receiver held alive but NEVER
+    // drained: `inbox.send` succeeds and buffers the command, so we exercise
+    // the post-enqueue reply-await — the exact #129 wedge — rather than the
+    // enqueue-timeout or closed-inbox branches. `_rx` stays bound to keep the
+    // inbox open (dropping it would close the channel and take the other arm).
+    let (tx, _rx) = tokio::sync::mpsc::channel::<KeyPackageCommand>(KP_MAILBOX_CAPACITY);
+    let handle = KeyPackageStoreHandle::from_sender(tx);
+
+    let start = tokio::time::Instant::now();
+    let result = handle
+        .send(|reply| KeyPackageCommand::Replenish { reply })
+        .await;
+    let elapsed = start.elapsed();
+
+    // `panic!` is banned in this dispatch-layer file by check-handler-no-panic
+    // (the test module carries no inner `#[cfg(test)]` marker), so assert over
+    // a `matches!` rather than a catch-all panic arm.
+    assert!(
+        matches!(&result, Err(ContextError::ActorBusy(msg)) if msg.contains("did not reply")),
+        "expected the reply-timeout ActorBusy variant, got: {result:?}"
+    );
+    assert!(
+        elapsed >= KP_REPLY_TIMEOUT,
+        "reply-await must span the full KP_REPLY_TIMEOUT budget before failing \
+         closed (elapsed {elapsed:?} < {KP_REPLY_TIMEOUT:?})"
+    );
+}

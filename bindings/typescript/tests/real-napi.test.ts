@@ -10,7 +10,7 @@
  * executes for every contextSend / broadcastPublish call.
  *
  * Prerequisites:
- * - The NAPI bridge must be compiled with `allow_in_memory_custody` feature.
+ * - The NAPI bridge must be compiled with `testing` feature.
  * - The platform-specific `@limn-works/scp-ts-napi-*` package must be loadable.
  *
  * If the native addon is not available, all tests are skipped gracefully.
@@ -20,8 +20,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
-import { SCP } from "../src/scp";
+import { ContextError } from "../src/errors";
+import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
+import type { BehavioralRecord, CapabilityRequirement, ParticipationProfile } from "../src/types";
+import { allValid } from "../src/types";
 
 /**
  * Generates a raw X25519 keypair (32-byte secret + 32-byte public key) for
@@ -120,7 +123,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   // ---------------------------------------------------------------------------
   //
   // Every test gets its own fresh `SCP` + bridge + in-memory relay so no
-  // per-test state (UCAN nonces, blocked subscribers, registered tools,
+  // per-test state (UCAN nonces, blocked subscribers, registered outlets,
   // relay messages, event-log entries) leaks into any subsequent test. The
   // per-test bootstrap measured at ~1 ms/cycle on the target hardware —
   // negligible next to the suite's overall runtime.
@@ -501,19 +504,20 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   });
 
   // ---------------------------------------------------------------------------
-  // 4. Tools
+  // 4. Outlets
   // ---------------------------------------------------------------------------
 
-  describe("Tools (real NAPI)", () => {
-    test("registers a tool and returns a tool ID", async () => {
+  describe("Outlets (real NAPI)", () => {
+    test("registers an outlet and returns an outlet ID", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
-        JSON.stringify({ ceiling: ["tool:register"] }),
+        JSON.stringify({ ceiling: ["outlet:register"] }),
       );
-      const toolId = await napi.toolRegister(ctx, {
+      const outletId = await napi.outletRegister(ctx, {
         name: "echo",
         description: "Echoes input",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { input: { type: "string" }, mode: { type: "string" } },
@@ -526,22 +530,23 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         },
         operator: identity.did,
       });
-      expect(typeof toolId).toBe("string");
-      expect(toolId.length).toBeGreaterThan(0);
+      expect(typeof outletId).toBe("string");
+      expect(outletId.length).toBeGreaterThan(0);
     });
 
-    test("invokes a registered tool", async () => {
+    test("invokes a registered outlet", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         admin,
-        JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
+        JSON.stringify({ ceiling: ["outlet:register", "outlet:call:*"] }),
       );
       // Join member to context so they have role-based capabilities.
       await napi.contextJoin(ctx, member.did);
-      const toolId = await napi.toolRegister(ctx, {
-        name: "test-tool",
-        description: "A test tool",
+      const outletId = await napi.outletRegister(ctx, {
+        name: "test-outlet",
+        description: "A test outlet",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { x: { type: "number" }, y: { type: "number" } },
@@ -550,10 +555,10 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         operator: admin.did,
       });
       // Mint UCAN for the member (cross-delegation, not self).
-      const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
-      const resultJson = await napi.toolInvoke(
+      const ucan = await napi.ucanMint(ctx, member.did, ["outlet:call:*"]);
+      const resultJson = await napi.outletInvoke(
         ctx,
-        toolId,
+        outletId,
         JSON.stringify({ x: 42, y: 7 }),
         member.did,
         ucan.encoded,
@@ -563,15 +568,79 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(parsed).toBeTruthy();
     });
 
-    test("verifies a tool and returns a verification result", async () => {
+    test("registers an outlet whose cost.amount exceeds 2^53 (bigint boundary, ADR-060)", async () => {
       const identity = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         identity,
-        JSON.stringify({ ceiling: ["tool:register"] }),
+        JSON.stringify({ ceiling: ["outlet:register"] }),
       );
-      const toolId = await napi.toolRegister(ctx, {
+      // 2^53 + 1 — the first integer a JS `number` cannot hold exactly — and
+      // u64::MAX. Both cross the FFI boundary as a JS `bigint`; a `number`-typed
+      // cost field would have narrowed and either lost precision or thrown.
+      for (const amount of [9_007_199_254_740_993n, 18_446_744_073_709_551_615n]) {
+        const outletId = await napi.outletRegister(ctx, {
+          name: `priced-outlet-${amount}`,
+          description: "A outlet with a large per-invocation cost",
+          kind: "action",
+          inputSchema: {
+            type: "object",
+            properties: { a: { type: "string" }, b: { type: "number" } },
+            required: ["a", "b"],
+          },
+          outputSchema: {
+            type: "object",
+            properties: { result: { type: "string" }, ok: { type: "boolean" } },
+            required: ["result", "ok"],
+          },
+          operator: identity.did,
+          cost: {
+            amount,
+            currency: "SAT",
+            payee: identity.did,
+          },
+        });
+        expect(typeof outletId).toBe("string");
+        expect(outletId.length).toBeGreaterThan(0);
+      }
+    });
+
+    test("rejects a negative cost.amount (fail-closed, unsigned money)", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["outlet:register"] }),
+      );
+      await expect(
+        napi.outletRegister(ctx, {
+          name: "negative-cost-outlet",
+          description: "invalid",
+          kind: "action",
+          inputSchema: {
+            type: "object",
+            properties: { a: { type: "string" }, b: { type: "number" } },
+            required: ["a", "b"],
+          },
+          outputSchema: {
+            type: "object",
+            properties: { result: { type: "string" }, ok: { type: "boolean" } },
+            required: ["result", "ok"],
+          },
+          operator: identity.did,
+          cost: { amount: -1n, currency: "SAT", payee: identity.did },
+        }),
+      ).rejects.toThrow(/SCP-VALID-7001/);
+    });
+
+    test("verifies an outlet and returns a verification result", async () => {
+      const identity = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        identity,
+        JSON.stringify({ ceiling: ["outlet:register"] }),
+      );
+      const outletId = await napi.outletRegister(ctx, {
         name: "verify-me",
-        description: "Tool for verification",
+        description: "Outlet for verification",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { query: { type: "string" }, limit: { type: "number" } },
@@ -584,7 +653,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         },
         operator: identity.did,
       });
-      const result = await napi.toolVerify(ctx, toolId);
+      const result = await napi.outletVerify(ctx, outletId);
       expect(typeof result.passed).toBe("boolean");
       expect(Array.isArray(result.failures)).toBe(true);
     });
@@ -623,7 +692,9 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // NAPI bridge requires full capability URI with scp:ctx:{contextId}/ prefix.
       const fullUri = token.capabilities[0];
       expect(fullUri).toBeDefined();
-      await napi.ucanValidate(ctx, token.encoded, fullUri as string);
+      // The enforcing gate fails closed without a presenting agent — pass the
+      // subject the token was minted for (its `aud`).
+      await napi.ucanValidate(ctx, token.encoded, fullUri as string, member.did);
     });
 
     test("rejects validation for an ungranted capability", async () => {
@@ -632,7 +703,29 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
-      await expect(napi.ucanValidate(ctx, token.encoded, "messages:write")).rejects.toThrow();
+      await expect(
+        napi.ucanValidate(ctx, token.encoded, "messages:write", member.did),
+      ).rejects.toThrow();
+    });
+
+    test("ucanValidate fails closed when no presenting agent is supplied", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+
+      // Empty presenting agent → the gate MUST reject rather than default the
+      // audience check to the token's own `aud` (which would be a tautology that
+      // inflates trust). presenting_agent_did is a required (non-optional)
+      // parameter; an empty string is rejected by validate_did. The fail-closed
+      // check fires before nonce recording, so the token's nonce is NOT consumed
+      // and the control call below still works.
+      await expect(napi.ucanValidate(ctx, token.encoded, fullUri, "")).rejects.toThrow();
+
+      // Control: supplying the subject (the token's audience) passes.
+      await napi.ucanValidate(ctx, token.encoded, fullUri, member.did);
     });
 
     test("revokes a token", async () => {
@@ -643,6 +736,510 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
       // Revocation by the context creator should not throw.
       await napi.ucanRevoke(ctx, token.encoded, admin.did);
+    });
+
+    // C3c (ADR-059, §7.2.4): structured read-only diagnostic.
+    test("ucanEvaluate returns all-true for a valid token on a granted capability", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+      const result = await napi.ucanEvaluate(ctx, token.encoded, fullUri, member.did);
+      expect(result).toEqual({
+        tokensValid: true,
+        signaturesValid: true,
+        withinCeiling: true,
+        nonceValid: true,
+        notRevoked: true,
+        timeBoundsValid: true,
+      });
+    });
+
+    test("ucanEvaluate reports signaturesValid:false for a forged-signature token (no throw)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+
+      // Forge the signature: a UCAN is `header.payload.signature` (base64url).
+      // Replace ONLY the signature segment so the token still PARSES
+      // (tokensValid stays true) but signature verification fails.
+      const parts = token.encoded.split(".");
+      expect(parts.length).toBe(3);
+      // A different, structurally-valid base64url signature segment.
+      const forgedSig = "A".repeat((parts[2] as string).length);
+      const forged = `${parts[0]}.${parts[1]}.${forgedSig}`;
+
+      // Read-only diagnostic: must NOT throw — it reports the failure as bools.
+      const result = await napi.ucanEvaluate(ctx, forged, fullUri, member.did);
+      expect(result.tokensValid).toBe(true);
+      expect(result.signaturesValid).toBe(false);
+      // Everything downstream of the signature stage never ran → false.
+      expect(result.withinCeiling).toBe(false);
+      expect(result.nonceValid).toBe(false);
+      expect(result.notRevoked).toBe(false);
+      expect(result.timeBoundsValid).toBe(false);
+    });
+
+    test("ucanEvaluate is read-only: re-evaluating the same token keeps nonceValid:true", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const fullUri = token.capabilities[0] as string;
+
+      const first = await napi.ucanEvaluate(ctx, token.encoded, fullUri, member.did);
+      const second = await napi.ucanEvaluate(ctx, token.encoded, fullUri, member.did);
+      // The probe never records the nonce, so the second evaluation is NOT a
+      // replay — nonceValid stays true (unlike ucanValidate, which would
+      // consume the nonce and reject the second call).
+      expect(first.nonceValid).toBe(true);
+      expect(second.nonceValid).toBe(true);
+      expect(second).toEqual(first);
+    });
+
+    // Cross-bridge parity (Finding K): every bridge applies
+    // `capability.filter(|c| !c.trim().is_empty())`, so an empty/whitespace
+    // capability is coerced to "no challenge" — identical to omitting it
+    // (None). Sibling of the PyO3 test_ucan_evaluate_empty_capability_coerced
+    // _to_no_challenge test; the two assert the SAME coercion so a future edit
+    // to one bridge cannot silently diverge. A bare "*" is NOT this (it is a
+    // malformed URI the bridge rejects); absence is emptiness/omission only.
+    test("ucanEvaluate empty/whitespace capability coerces to no-challenge (NAPI parity)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+
+      // Presenting agent fixed to the token audience so the only variable is
+      // the capability argument's emptiness.
+      const omitted = await napi.ucanEvaluate(ctx, token.encoded, null, member.did);
+      const empty = await napi.ucanEvaluate(ctx, token.encoded, "", member.did);
+      const whitespace = await napi.ucanEvaluate(ctx, token.encoded, "   ", member.did);
+
+      // Empty / whitespace capability == omitted capability: identical record.
+      expect(empty).toEqual(omitted);
+      expect(whitespace).toEqual(omitted);
+      // A fresh, in-ceiling token is intrinsically valid on every stage.
+      expect(allValid(omitted)).toBe(true);
+    });
+
+    // C3c (ADR-059 / §7.2.4): evaluateTrust assesses each token's GENERAL
+    // (intrinsic) validity — it must NOT impose an invoked-capability
+    // grant-match. The previous implementation passed a `"*"` sentinel that the
+    // real bridge rejects ("missing scp:ctx: prefix"); the fix passes no
+    // challenge capability (intrinsic-validity mode). A single valid, in-ceiling
+    // token must therefore report all six checks true — this case would have
+    // FAILED under the old `"*"` behavior (grant-match against `*` never
+    // matches), so it is the regression guard for the actual bug.
+    test("evaluateTrust reports a single valid token as intrinsically valid (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+
+      const result = await scpInstance.evaluateTrust(ctx, member.did, [good.encoded]);
+      // No grant-match challenge: a fresh, well-signed, in-ceiling token is
+      // intrinsically valid on every stage.
+      expect(result.capabilityValidation.tokensValid).toBe(true);
+      expect(result.capabilityValidation.signaturesValid).toBe(true);
+      expect(result.capabilityValidation.withinCeiling).toBe(true);
+      expect(result.capabilityValidation.nonceValid).toBe(true);
+      expect(result.capabilityValidation.notRevoked).toBe(true);
+      expect(result.capabilityValidation.timeBoundsValid).toBe(true);
+      // The derived happy-path accessor collapses the six fields: all true.
+      expect(allValid(result.capabilityValidation)).toBe(true);
+      expect(result.subjectDid).toBe(member.did);
+      // The evaluation is labeled with the context the handle RESOLVES to (the
+      // canonical id the layers were computed against), not the bare label arg
+      // ("ctx-real") — the handle carries a real `contextId`, so a mismatched
+      // label does not relabel the result.
+      expect(result.contextId).toBe(ctx.contextId);
+    });
+
+    test("evaluateTrust AND-combines per-token validations (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      // Forge a second token whose signature is invalid.
+      const parts = good.encoded.split(".");
+      const forged = `${parts[0]}.${parts[1]}.${"A".repeat((parts[2] as string).length)}`;
+
+      const result = await scpInstance.evaluateTrust(ctx, member.did, [good.encoded, forged]);
+      // Intrinsic validity per token, AND-combined: the good token passes every
+      // stage; the forged one fails signatures — so the AND is false there while
+      // tokensValid (both parse) stays true.
+      expect(result.capabilityValidation.tokensValid).toBe(true);
+      expect(result.capabilityValidation.signaturesValid).toBe(false);
+      // A single failing stage makes the derived accessor false.
+      expect(allValid(result.capabilityValidation)).toBe(false);
+      expect(result.subjectDid).toBe(member.did);
+      // Labeled with the handle-resolved context id, not the bare label arg.
+      expect(result.contextId).toBe(ctx.contextId);
+      // Layer 2 behavioral record is present (event-log query succeeded).
+      expect(result.behavioralRecord).toBeDefined();
+    });
+
+    // C3c (Phase 2C-2): the Layer-2 behavioral record is now the TYPED
+    // participation record (§7.3.2) RECEIVED from the shared Rust core via
+    // `participationRecord` — the SDK no longer classifies raw events
+    // client-side, so the divergence-prone per-binding `outletInvocations` map is
+    // gone. The record exposes the flattened `ParticipationFacts` 1:1.
+    //
+    // After create+join the context's supervisor Merkle log holds convergent
+    // leaves (the `eventLogRoot` is a real, non-zero hash that advances with
+    // each lifecycle op), so `participationRecord` RETURNS a typed record — it
+    // does NOT throw. This test pins the baseline record SHAPE on a context with
+    // no governance activity yet: a real Merkle root, a real `computedAt`,
+    // `attestationCount == 0` (no attestations supplied — credential-layer, §7.4),
+    // `outletInvocationCountAnchored == false` (ADR-051), and the obsolete
+    // client-side fields absent. The per-fact governance/role COUNTS being
+    // exercised live (and asserted non-zero) is the job of the affirmative test
+    // below — the runtime DOES populate the ADR-011-amendment subject-bearing
+    // payloads on the live NAPI governance path, so those counts move with
+    // activity. This test deliberately does not assert them, since no governance
+    // action has occurred at this point.
+    test("participationRecord returns a typed record with a real Merkle root (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({ ceiling: ["messages:read"], governance: "single_admin" }),
+      );
+      await napi.contextJoin(ctx, member.did);
+
+      // Key the lookup by the context's canonical id (the 64-char hex the handle
+      // carries) — the same value `evaluateTrust` resolves from the handle — so
+      // the lookup hits the context's REAL supervisor log.
+      const realContextId = (ctx as { readonly contextId: string }).contextId;
+      const record = await scpInstance.participationRecord(realContextId, member.did);
+
+      expect(record.subjectDid).toBe(member.did);
+      // The log is non-empty: a real 32-byte Merkle root (64 hex chars), not the
+      // all-zero placeholder of an absent root.
+      expect(record.eventLogRoot).toMatch(/^[0-9a-f]{64}$/);
+      expect(record.eventLogRoot).not.toBe("0".repeat(64));
+      expect(record.computedAt).toBeGreaterThan(0);
+      // `outlet_invocation_count` is never Merkle-anchored until ADR-051 (§7.3.2).
+      expect(record.outletInvocationCountAnchored).toBe(false);
+      // No cached attestations supplied → credential-layer count is 0 (§7.4),
+      // honest and verifier-relative — the SDK fabricates none.
+      expect(record.attestationCount).toBe(0);
+      // The obsolete client-side fields are gone from the typed shape.
+      expect((record as unknown as Record<string, unknown>).outletInvocations).toBeUndefined();
+      expect((record as unknown as Record<string, unknown>).participationCount).toBeUndefined();
+    });
+
+    // C3c (Phase 2C-2): the leaf-derived participation facts (§7.3.2) MOVE in
+    // response to real governance activity. A `single_admin` context whose
+    // ceiling carries the governance capabilities auto-executes each proposal
+    // on `propose` (ADR-031), appending convergent `GovernanceActionExecuted` /
+    // `RoleAssigned` / `ChildContextCreated` leaves to the supervisor's Merkle
+    // log. The typed `participationRecord` then RECEIVES non-zero counts
+    // attributed by the subject-bearing payloads (ADR-011 amendment): the actor
+    // for `governance_actions_by` / `context_creation_count`, and the projected
+    // member for `role_progression_count` / `governance_actions_against`. This
+    // is the affirmative counterpart to the create+join-only test above — it
+    // proves the facts are real, not perpetually zero.
+    test("participationRecord reflects real governance activity (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      // The ceiling MUST carry the governance + child-creation capabilities, or
+      // the proposer (creator) lacks `governance:propose` / the child-creation
+      // capability and the proposal is permission-denied.
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({
+          ceiling: [
+            "messages:read",
+            "messages:write",
+            "role:assign",
+            "governance:propose",
+            "governance:vote",
+            "context:close",
+            "context:child:create",
+          ],
+          governance: "single_admin",
+        }),
+      );
+      const realContextId = (ctx as { readonly contextId: string }).contextId;
+      await napi.contextJoin(ctx, member.did);
+
+      // 1. ChangeRole(member → moderator): a RoleAssigned leaf projected to the
+      //    member + a GovernanceActionExecuted leaf actored by the admin.
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
+        admin.did,
+      );
+      // 2. RemoveMember(member): an adverse action → governance_actions_against
+      //    the member + another GovernanceActionExecuted by the admin.
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ RemoveMember: { did: member.did, reason: "participation-test" } }),
+        admin.did,
+      );
+      // 3. CreateChildContext: a ChildContextCreated leaf actored by the admin →
+      //    the admin's context_creation_count increments by one.
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({
+          CreateChildContext: {
+            params: {
+              mode: "Encrypted",
+              ceiling: [],
+              ceiling_policy: "Immutable",
+              promotion_policy: "NoPromotion",
+              roles: [],
+              outlets: [],
+              ttl: null,
+              memory_scope: "Ephemeral",
+              governance: "SingleAdmin",
+              template_id: null,
+            },
+          },
+        }),
+        admin.did,
+      );
+
+      const adminRecord = await scpInstance.participationRecord(realContextId, admin.did);
+      const memberRecord = await scpInstance.participationRecord(realContextId, member.did);
+
+      // Admin INITIATED all three governance actions and created one child.
+      expect(adminRecord.governanceActionsBy).toBe(3);
+      expect(adminRecord.governanceActionsAgainst).toBe(0);
+      expect(adminRecord.contextCreationCount).toBe(1);
+      expect(adminRecord.roleProgressionCount).toBe(0);
+      // Member was the TARGET of one role change and one (adverse) removal.
+      expect(memberRecord.roleProgressionCount).toBe(1);
+      expect(memberRecord.governanceActionsAgainst).toBe(1);
+      expect(memberRecord.governanceActionsBy).toBe(0);
+      expect(memberRecord.contextCreationCount).toBe(0);
+      // Credential-layer / anchoring invariants hold for both subjects.
+      expect(adminRecord.attestationCount).toBe(0);
+      expect(memberRecord.attestationCount).toBe(0);
+      expect(adminRecord.outletInvocationCountAnchored).toBe(false);
+      expect(memberRecord.outletInvocationCountAnchored).toBe(false);
+      // Real Merkle root over the convergent governance leaves.
+      expect(adminRecord.eventLogRoot).toMatch(/^[0-9a-f]{64}$/);
+      expect(adminRecord.eventLogRoot).not.toBe("0".repeat(64));
+
+      // evaluateTrust (handle-resolved contextId) RECEIVES the SAME record the
+      // direct op returns — no client-side recomputation, no divergence.
+      const evaluated = await scpInstance.evaluateTrust(ctx, admin.did);
+      expect(evaluated.behavioralRecord).toEqual(adminRecord);
+    });
+
+    // CROSS-SDK PARITY (the divergence-killer). Because both SDKs now RECEIVE
+    // the identical Rust-computed `ParticipationFacts` rather than each
+    // recomputing Layer 2, the SAME governance scenario MUST yield the SAME
+    // per-fact counts in TypeScript and Python. This test pins the canonical
+    // expected counts for the scenario; the Python sibling
+    // `test_participation_record_reflects_governance_real_ffi`
+    // (bindings/python/tests/test_real_ffi.py) asserts the IDENTICAL counts for
+    // the IDENTICAL scenario — so a divergence between the two bindings is a
+    // CI-visible test failure on one side, by construction. (DIDs and the
+    // Merkle root vary per run and are excluded from the parity tuple; the
+    // leaf-derived/credential counts are deterministic for the scenario.)
+    test("participation facts match the canonical cross-SDK counts (real SCP method)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(
+        admin,
+        JSON.stringify({
+          ceiling: [
+            "messages:read",
+            "messages:write",
+            "role:assign",
+            "governance:propose",
+            "governance:vote",
+            "context:close",
+            "context:child:create",
+          ],
+          governance: "single_admin",
+        }),
+      );
+      const realContextId = (ctx as { readonly contextId: string }).contextId;
+      await napi.contextJoin(ctx, member.did);
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ ChangeRole: { did: member.did, new_role: "moderator" } }),
+        admin.did,
+      );
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({ RemoveMember: { did: member.did, reason: "parity" } }),
+        admin.did,
+      );
+      await napi.contextGovernancePropose(
+        ctx,
+        JSON.stringify({
+          CreateChildContext: {
+            params: {
+              mode: "Encrypted",
+              ceiling: [],
+              ceiling_policy: "Immutable",
+              promotion_policy: "NoPromotion",
+              roles: [],
+              outlets: [],
+              ttl: null,
+              memory_scope: "Ephemeral",
+              governance: "SingleAdmin",
+              template_id: null,
+            },
+          },
+        }),
+        admin.did,
+      );
+
+      const adminRec = await scpInstance.participationRecord(realContextId, admin.did);
+      const memberRec = await scpInstance.participationRecord(realContextId, member.did);
+
+      // The CANONICAL counts the Python sibling test asserts verbatim. Keys are
+      // the deterministic, DID-independent facts (the Merkle root + subject_did
+      // are excluded since they vary per run).
+      const counts = (r: BehavioralRecord) => ({
+        governanceActionsAgainst: r.governanceActionsAgainst,
+        governanceActionsBy: r.governanceActionsBy,
+        outletInvocationCount: r.outletInvocationCount,
+        outletInvocationCountAnchored: r.outletInvocationCountAnchored,
+        contextCreationCount: r.contextCreationCount,
+        roleProgressionCount: r.roleProgressionCount,
+        attestationCount: r.attestationCount,
+        participationDurationSecs: r.participationDurationSecs,
+      });
+      expect(counts(adminRec)).toEqual({
+        governanceActionsAgainst: 0,
+        governanceActionsBy: 3,
+        outletInvocationCount: 0,
+        outletInvocationCountAnchored: false,
+        contextCreationCount: 1,
+        roleProgressionCount: 0,
+        attestationCount: 0,
+        participationDurationSecs: 0,
+      });
+      expect(counts(memberRec)).toEqual({
+        governanceActionsAgainst: 1,
+        governanceActionsBy: 0,
+        outletInvocationCount: 0,
+        outletInvocationCountAnchored: false,
+        contextCreationCount: 0,
+        roleProgressionCount: 1,
+        attestationCount: 0,
+        participationDurationSecs: 0,
+      });
+    });
+
+    // `evaluateTrust` must remain usable on a context with NO convergent leaves
+    // (the EmptyEventLog case): the core returns `EmptyEventLog`, which the SDK
+    // folds into a zeroed behavioral record rather than throwing, so a
+    // Layer-1-only trust check never has to populate the log first. Drive the
+    // genuinely-empty case by keying the (handle-resolved) lookup at a context
+    // label the supervisor has never seen, so the core's event-log lookup is
+    // empty and the graceful fold is exercised end-to-end against the real
+    // bridge. `participationRecord` on the same empty context propagates instead.
+    test("evaluateTrust folds an empty event log into a zeroed behavioral record (real SCP method)", async () => {
+      const member = await napi.identityCreate("in_memory");
+      // A handle whose resolved contextId is a never-created label → empty log.
+      const emptyHandle = { contextId: "ctx-never-created-empty-log" };
+
+      // Direct record request on the empty context → typed ContextError keyed
+      // on the dedicated, machine-detectable SCP-CTX-2076 code (the SDK branches
+      // on the code, not error prose).
+      const directError = await scpInstance
+        .participationRecord(emptyHandle.contextId, member.did)
+        .then(
+          () => undefined,
+          (err: unknown) => err,
+        );
+      expect(directError).toBeInstanceOf(ContextError);
+      expect((directError as ContextError).code).toBe("SCP-CTX-2076");
+
+      // evaluateTrust on the same empty context (no Layer-1 tokens, so only the
+      // Layer-2 empty-log fold is exercised) → graceful zeroed record.
+      const result = await scpInstance.evaluateTrust(emptyHandle, member.did);
+      const record = result.behavioralRecord;
+      expect(record.subjectDid).toBe(member.did);
+      expect(record.participationDurationSecs).toBe(0);
+      expect(record.governanceActionsAgainst).toBe(0);
+      expect(record.governanceActionsBy).toBe(0);
+      expect(record.outletInvocationCount).toBe(0);
+      expect(record.outletInvocationCountAnchored).toBe(false);
+      expect(record.contextCreationCount).toBe(0);
+      expect(record.roleProgressionCount).toBe(0);
+      expect(record.attestationCount).toBe(0);
+      // attestationCount is credential-layer, never Merkle-anchored.
+      expect(record.attestationCountAnchored).toBe(false);
+      // Empty-log fold uses the all-zero root placeholder, not a real hash.
+      expect(record.eventLogRoot).toBe("");
+    });
+
+    // Finding O: audience-mismatch trust-inflation regression (TS sibling of
+    // the PyO3 `test_evaluate_trust_audience_mismatch_real_ffi`). A token whose
+    // `aud` differs from the evaluated subject must report `signaturesValid:
+    // false` — `evaluateTrust` passes `subjectDid` as the presenting agent so
+    // the step-5 audience check evaluates against the DID under assessment.
+    // `presentingAgentDid` is fail-closed: the bridge REJECTS an absent or empty
+    // value rather than defaulting the presenting agent to the token's OWN `aud`
+    // (which would make `aud == aud` always true, inflating trust for a token
+    // addressed to someone else). This guards a future edit that drops
+    // `subjectDid` from `evaluateTrust` (ADR-059 / §7.2.4).
+    test("evaluateTrust reports signaturesValid:false for an audience-mismatched token", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const bob = await napi.identityCreate("in_memory");
+      const carol = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      // Token audience is Bob.
+      const tokenForBob = await napi.ucanMint(ctx, bob.did, ["messages:read"]);
+
+      // Evaluate trust for Carol (a DIFFERENT subject than the token audience):
+      // the audience check fails, so the structural-checks field is false.
+      const mismatch = await scpInstance.evaluateTrust(ctx, carol.did, [tokenForBob.encoded]);
+      expect(mismatch.capabilityValidation.signaturesValid).toBe(false);
+
+      // Control: evaluating the SAME token for its true audience (Bob) passes
+      // the audience check — proving the false above is the mismatch, not an
+      // unrelated failure.
+      const control = await scpInstance.evaluateTrust(ctx, bob.did, [tokenForBob.encoded]);
+      expect(control.capabilityValidation.signaturesValid).toBe(true);
+    });
+
+    // Finding P: empty/whitespace capability coercion must NOT bypass a failing
+    // stage. The intrinsic-validity coercion (`capability=""` → no challenge) is
+    // a no-CHALLENGE switch, not a no-CHECK switch — a forged-signature token
+    // with an empty capability must still report `signaturesValid: false`. The
+    // existing coercion parity test only covered a VALID token; this pins the
+    // INVALID case so coercion cannot be mistaken for a validity shortcut. PyO3
+    // sibling: test_ucan_evaluate_empty_capability_invalid_token_still_fails.
+    test("ucanEvaluate empty capability on a forged token still reports signaturesValid:false", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+
+      const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      // Forge the signature segment so signature verification fails.
+      const parts = token.encoded.split(".");
+      expect(parts.length).toBe(3);
+      const forged = `${parts[0]}.${parts[1]}.${"A".repeat((parts[2] as string).length)}`;
+
+      // Empty capability == no challenge — but the failing signature stage must
+      // STILL be reported, never bypassed by the coercion.
+      const empty = await napi.ucanEvaluate(ctx, forged, "", member.did);
+      expect(empty.tokensValid).toBe(true);
+      expect(empty.signaturesValid).toBe(false);
+      // Equivalent to omitting the capability entirely: same failing record.
+      const omitted = await napi.ucanEvaluate(ctx, forged, null, member.did);
+      expect(empty).toEqual(omitted);
     });
   });
 
@@ -1229,15 +1826,18 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       const writeCap = writeToken.capabilities[0] as string;
       expect(writeCap).toBeDefined();
 
-      // Validate both capabilities (separate tokens, separate nonces).
-      await napi.ucanValidate(ctx, readToken.encoded, readCap);
-      await napi.ucanValidate(ctx, writeToken.encoded, writeCap);
+      // Validate both capabilities (separate tokens, separate nonces). The
+      // enforcing gate requires the presenting agent (the token's audience).
+      await napi.ucanValidate(ctx, readToken.encoded, readCap, member.did);
+      await napi.ucanValidate(ctx, writeToken.encoded, writeCap, member.did);
 
       // Revoke the read token (revoker is the admin/context creator).
       await napi.ucanRevoke(ctx, readToken.encoded, admin.did);
 
       // Verify the revoked token is rejected.
-      await expect(napi.ucanValidate(ctx, readToken.encoded, readCap)).rejects.toThrow();
+      await expect(
+        napi.ucanValidate(ctx, readToken.encoded, readCap, member.did),
+      ).rejects.toThrow();
 
       // Mint a fresh write token to verify non-revoked capabilities still work.
       // The original writeToken's nonce was already consumed at line 927, so
@@ -1245,31 +1845,32 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // the revocation check is reached.
       const freshWriteToken = await napi.ucanMint(ctx, member.did, ["messages:write"]);
       const freshWriteCap = freshWriteToken.capabilities[0] as string;
-      await napi.ucanValidate(ctx, freshWriteToken.encoded, freshWriteCap);
+      await napi.ucanValidate(ctx, freshWriteToken.encoded, freshWriteCap, member.did);
     });
   });
 
   // ---------------------------------------------------------------------------
-  // 14. E2E: Tools register + invoke + verify
+  // 14. E2E: Outlets register + invoke + verify
   // ---------------------------------------------------------------------------
 
-  describe("E2E tool lifecycle (real NAPI)", () => {
+  describe("E2E outlet lifecycle (real NAPI)", () => {
     test("register -> invoke -> verify", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
-          ceiling: ["tool:register", "tool:invoke:*"],
+          ceiling: ["outlet:register", "outlet:call:*"],
         }),
       );
       // Join member so they have role-based capabilities.
       await napi.contextJoin(ctx, member.did);
 
       // Register.
-      const toolId = await napi.toolRegister(ctx, {
-        name: "e2e-tool",
-        description: "End-to-end test tool",
+      const outletId = await napi.outletRegister(ctx, {
+        name: "e2e-outlet",
+        description: "End-to-end test outlet",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { value: { type: "number" }, mode: { type: "string" } },
@@ -1280,13 +1881,13 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         },
         operator: admin.did,
       });
-      expect(toolId).toBeTruthy();
+      expect(outletId).toBeTruthy();
 
       // Invoke (mint for member, cross-delegation).
-      const ucan = await napi.ucanMint(ctx, member.did, ["tool:invoke:*"]);
-      const resultJson = await napi.toolInvoke(
+      const ucan = await napi.ucanMint(ctx, member.did, ["outlet:call:*"]);
+      const resultJson = await napi.outletInvoke(
         ctx,
-        toolId,
+        outletId,
         JSON.stringify({ value: 21 }),
         member.did,
         ucan.encoded,
@@ -1296,7 +1897,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(result).toBeTruthy();
 
       // Verify.
-      const verification = await napi.toolVerify(ctx, toolId);
+      const verification = await napi.outletVerify(ctx, outletId);
       expect(typeof verification.passed).toBe("boolean");
       expect(Array.isArray(verification.failures)).toBe(true);
     });
@@ -2009,6 +2610,451 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         expect(r).toHaveProperty("etag");
         expect(r).toHaveProperty("deployId");
       }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 18. Cross-context outlet-invocation saga (§6.2.4, ADR-049 §3a)
+  // ---------------------------------------------------------------------------
+  //
+  // The §6.2.4 saga export lives on the native `SCP` class as
+  // `outletInvokeCrossContextSaga`. The SDK wrapper (`SCP.outletInvokeCrossContextSaga`)
+  // now exists too, but these tests deliberately reach the RAW native instance
+  // DIRECTLY — obtained via `__getNativeScp` against the SAME `SCP` that minted
+  // the context handles — so they pin the JS-marshaling boundary (BigInt
+  // narrowing, hex nonce, NapiSagaResult round-trip, typed-SagaError survival)
+  // independently of the SDK wrapper layer. Using the same instance is
+  // mandatory: the per-instance handle-affinity guard rejects a handle minted
+  // by any other instance with SCP-PERM-3030.
+  //
+  // The signature crossing the addon boundary is:
+  //   outletInvokeCrossContextSaga(
+  //     sourceHandle, targetHandle, callerDid, outletRegistrationId,
+  //     inputJson, assertedNonceHex, timestampMs: BigInt, chainDepth: u8,
+  //     ucanProofId?: string,
+  //   ) => Promise<{ sagaId, receipt?, output? }>
+  //
+  // What these cases pin is the JS-marshaling boundary the Rust-side napi
+  // test cannot exercise: the `BigInt` timestamp narrowing, the hex-nonce
+  // string, the `#[napi(object)] NapiSagaResult` (`saga_id`/`receipt`/`output`)
+  // round-trip, and — the load-bearing one — that a typed `SagaError` survives
+  // the collapse to a single `napi::Error` message string with its
+  // `SCP-SAGA-{code}` + parseable structured suffix intact, so the TypeScript
+  // error layer can reverse it.
+  describe("Cross-context outlet-invocation saga (real NAPI)", () => {
+    // A 16-byte freshness nonce as the one canonical 32-char lowercase-hex
+    // wire form (§6.2.4 envelope nonce).
+    const NONCE_HEX = "0123456789abcdef0123456789abcdef";
+
+    // The deterministic, cross-bridge outlet id form (`generate_outlet_id(name)`).
+    const OUTLET_NAME = "xctx_saga_ts_outlet";
+    const OUTLET_ID = `outlet-${OUTLET_NAME}`;
+
+    // A near-now Unix-ms timestamp as a JS `BigInt`. Prepare-B enforces a
+    // §9.14 ±5min skew, so a fixed historical value would abort with a skew
+    // error rather than reaching the terminal under test.
+    function nowMsBigInt(): bigint {
+      return BigInt(Date.now());
+    }
+
+    // Handle types, inferred from the bridge surface so this block needs no
+    // extra import. `napi.contextCreate` returns the raw native context handle
+    // (it carries `.contextId`); `napi.identityCreate` returns the raw native
+    // identity handle (it carries `.did`).
+    type IdentityHandle = Awaited<ReturnType<typeof napi.identityCreate>>;
+    type ContextHandle = Awaited<ReturnType<typeof napi.contextCreate>>;
+
+    // The native `outletInvokeCrossContextSaga` method as it crosses the addon
+    // boundary, read off the raw native SCP that minted every handle below.
+    // Using that exact instance is mandatory — the per-instance handle-affinity
+    // guard rejects a handle minted by any other instance (SCP-PERM-3030).
+    type SagaResult = { sagaId: string; receipt?: Uint8Array; output?: Uint8Array };
+    type SagaFn = (
+      sourceHandle: ContextHandle,
+      targetHandle: ContextHandle,
+      callerDid: string,
+      outletRegistrationId: string,
+      inputJson: string,
+      assertedNonceHex: string,
+      timestampMs: bigint,
+      chainDepth: number,
+      ucanProofId: string | undefined,
+    ) => Promise<SagaResult>;
+    function nativeSaga(): SagaFn {
+      const raw = __getNativeScp(scpInstance) as unknown as {
+        outletInvokeCrossContextSaga: SagaFn;
+      };
+      return raw.outletInvokeCrossContextSaga.bind(raw);
+    }
+
+    // Creates a caller (source) context A owned by `ownerDid`. A's ceiling
+    // carries `governance:propose` (so the admin can propose) and
+    // `outlet:interface` (required by execute_establish_outlet_interface's ceiling
+    // check). `contextCreate` mints a real 64-hex id so the ADR-056 saga
+    // chokepoint round-trips to A's actor.
+    async function createCallerContext(owner: IdentityHandle): Promise<ContextHandle> {
+      return napi.contextCreate(
+        owner,
+        JSON.stringify({
+          ceiling: [
+            "governance:propose",
+            "outlet:interface",
+            "outlet:call:*",
+            "messages:read",
+            "messages:write",
+          ],
+          governance: "single_admin",
+          memoryScope: "ephemeral",
+        }),
+      );
+    }
+
+    // Creates a target (executing) context B owned by `ownerDid`. B's ceiling
+    // carries `governance:propose` + `outlet:register` so the saga outlet can be
+    // registered into B's ACTOR governance state (the saga's Prepare-B reads
+    // the outlet from there).
+    async function createTargetContext(owner: IdentityHandle): Promise<ContextHandle> {
+      return napi.contextCreate(
+        owner,
+        JSON.stringify({
+          ceiling: ["governance:propose", "outlet:register"],
+          governance: "single_admin",
+          memoryScope: "ephemeral",
+        }),
+      );
+    }
+
+    // Externally-tagged `GovernanceAction::RegisterOutlet` for the saga outlet.
+    // Two input + two output properties clear the §9.2.1 specificity floor of
+    // 2. `implementation_hash` is a 32-element JSON number array (serde expects
+    // a fixed `[u8; 32]`). `operator_did` is a required string (not nullable).
+    // Registering this into B's actor state via governance is what the saga's
+    // Prepare-B requires.
+    function registerOutletActionJson(operatorDid: string): string {
+      return JSON.stringify({
+        RegisterOutlet: {
+          registration: {
+            outlet_id: OUTLET_ID,
+            name: OUTLET_NAME,
+            description: `Outlet: ${OUTLET_NAME}`,
+            schema: {
+              input_schema: {
+                type: "object",
+                properties: { a: { type: "string" }, b: { type: "string" } },
+              },
+              output_schema: {
+                type: "object",
+                properties: { sum: { type: "number" }, ok: { type: "number" } },
+              },
+            },
+            implementation_hash: new Array(32).fill(0),
+            test_vectors: [],
+            operator_did: operatorDid,
+            cost: null,
+            registered_at: 0,
+            signature: [],
+          },
+        },
+      });
+    }
+
+    // Externally-tagged `GovernanceAction::EstablishOutletInterface`, source=A,
+    // target=B, BOTH approvals true. The producer's gate 2 queries this
+    // bidirectionally-approved interface against the CALLER context A's actor
+    // governance state, so it is established IN A.
+    function establishInterfaceActionJson(ctxA: string, ctxB: string): string {
+      return JSON.stringify({
+        EstablishOutletInterface: {
+          interface: {
+            source_context: ctxA,
+            target_context: ctxB,
+            outlet_id: OUTLET_ID,
+            rate_limit: null,
+            inbound_rate_limit: null,
+            per_caller_rate_limit: null,
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: null,
+            inbound_policy: null,
+          },
+        },
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. Method exists + argument marshaling.
+    //
+    // Drives the saga from a real authenticated caller (a member of context A)
+    // with a `BigInt` timestamp and a 32-char hex nonce, but WITHOUT an
+    // established interface. The producer's target-axis gate 2 then aborts with
+    // SCP-SAGA-13062 — which is exactly the point: a typed terminal (not a
+    // `TypeError` / native panic) proves the `BigInt`, the hex nonce, the two
+    // raw context handles, and the chain-depth `u8` all marshaled across the
+    // addon and the saga actually ran.
+    // -----------------------------------------------------------------------
+    test("is callable: BigInt timestamp + hex nonce marshal and the saga runs", async () => {
+      const owner = await napi.identityCreate("in_memory");
+      const ctxA = await createCallerContext(owner);
+      const ctxB = await createTargetContext(owner);
+
+      const promise = nativeSaga()(
+        ctxA,
+        ctxB,
+        owner.did,
+        OUTLET_ID,
+        JSON.stringify({ a: "x", b: "y" }),
+        NONCE_HEX,
+        nowMsBigInt(),
+        1,
+        undefined,
+      );
+
+      // No established interface ⇒ the producer's gate 2 rejects. The
+      // rejection is a real `Error` carrying the typed saga code (NOT a
+      // synchronous TypeError from a failed BigInt/handle marshal).
+      let caught: unknown;
+      try {
+        await promise;
+        throw new Error("saga unexpectedly resolved without an established interface");
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      const message = (caught as Error).message;
+      expect(message).not.toMatch(/TypeError/);
+      // Target-axis gate (no interface) ⇒ SCP-SAGA-13062.
+      expect(message).toContain("SCP-SAGA-13062");
+    });
+
+    // -----------------------------------------------------------------------
+    // 2. Error-code surfacing — the key marshaling check.
+    //
+    // A caller_did that is NOT an identity hosted by this bridge instance
+    // trips the FFI-side §6.2.4 Caller-authentication binding BEFORE the saga
+    // runs, mapping to a typed `SagaAborted` with code SCP-SAGA-13050 and a
+    // `retry_after_ms = None` (rendered as the literal `null`). This proves the
+    // typed-SagaError → napi::Error → JS-Error-message mapping survives the
+    // boundary with both the code AND the parseable structured suffix intact.
+    // -----------------------------------------------------------------------
+    test("surfaces SCP-SAGA-13050 with a parseable structured suffix on a caller mismatch", async () => {
+      const owner = await napi.identityCreate("in_memory");
+      const ctxA = await createCallerContext(owner);
+      const ctxB = await createTargetContext(owner);
+
+      // A well-formed did:dht that this bridge instance does NOT host.
+      const foreignCallerDid = "did:dht:z6MkNeverHostedSagaCallerForMarshalTest";
+
+      let caught: unknown;
+      try {
+        await nativeSaga()(
+          ctxA,
+          ctxB,
+          foreignCallerDid,
+          OUTLET_ID,
+          JSON.stringify({ a: "x", b: "y" }),
+          NONCE_HEX,
+          nowMsBigInt(),
+          1,
+          undefined,
+        );
+        throw new Error("saga unexpectedly resolved for a non-hosted caller");
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      const message = (caught as Error).message;
+      // The canonical caller-axis saga code.
+      expect(message).toContain("SCP-SAGA-13050");
+      // The structured back-off suffix is present and parseable: a plain
+      // (non-rate-limit) caller rejection carries no precise back-off, so it
+      // renders as the literal `null` — never coerced to `0`.
+      expect(message).toMatch(/\(retry_after_ms=null\)/);
+    });
+
+    // -----------------------------------------------------------------------
+    // 3. Committed terminal through the addon — result-object marshaling.
+    //
+    // Establishes the full saga precondition entirely through the addon's
+    // governance surface (no Rust-internal handler hook is reachable from JS):
+    //
+    //   - RegisterOutlet into B's ACTOR governance state (Prepare-B reads it).
+    //   - EstablishOutletInterface (bidirectionally approved) into A (gate 2).
+    //
+    // No outlet handler is registered (the only handler-attach path is
+    // Rust-internal `register_outlet_handler`, not a napi export), so the
+    // supervisor-side executor runs the schema-echo fallback the FFI bridge
+    // builds — the producer captures whatever the executor returns as the
+    // signed `output_jcs`. The committed result object therefore marshals to a
+    // non-empty `sagaId`, a `receipt` Buffer, and an `output` Buffer that
+    // decodes to the echoed JSON.
+    // -----------------------------------------------------------------------
+    test("commits via governance-established interface and marshals the result object", async () => {
+      const owner = await napi.identityCreate("in_memory");
+      const ctxA = await createCallerContext(owner);
+      const ctxB = await createTargetContext(owner);
+
+      // Register the saga outlet into B's actor governance state (auto-executes
+      // under single_admin). The outlet's operator is the owner DID.
+      await napi.contextGovernancePropose(ctxB, registerOutletActionJson(owner.did), owner.did);
+
+      // Establish the bidirectionally-approved interface in A (auto-executes
+      // under single_admin). The id-form fields compare on the raw 64-hex
+      // digest the handles carry.
+      await napi.contextGovernancePropose(
+        ctxA,
+        establishInterfaceActionJson(ctxA.contextId, ctxB.contextId),
+        owner.did,
+      );
+
+      const result = await nativeSaga()(
+        ctxA,
+        ctxB,
+        owner.did,
+        OUTLET_ID,
+        JSON.stringify({ a: "x", b: "y" }),
+        NONCE_HEX,
+        nowMsBigInt(),
+        1,
+        undefined,
+      );
+
+      // The `#[napi(object)] NapiSagaResult` round-trips: a non-empty
+      // supervisor-minted saga id and the receipt/output buffers.
+      expect(typeof result.sagaId).toBe("string");
+      expect(result.sagaId.length).toBeGreaterThan(0);
+      expect(result.receipt).toBeInstanceOf(Uint8Array);
+      expect((result.receipt as Uint8Array).length).toBeGreaterThan(0);
+      expect(result.output).toBeInstanceOf(Uint8Array);
+
+      // The committed output decodes to the executor's (echo-fallback) JSON.
+      // Assert the parsed structure, not raw bytes, so a JCS-canonical
+      // encoding still passes: the echo carries the validated input back.
+      const decoded = JSON.parse(new TextDecoder().decode(result.output as Uint8Array));
+      expect(decoded).toBeTruthy();
+      expect(decoded.validated_input).toEqual({ a: "x", b: "y" });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Typed trust-input admission (ADR-058, SCP-1991)
+  //
+  // The SDK `checkCapabilityRequirements` / `verifyParticipationRequirements`
+  // methods take typed inputs and serialize them internally to the serde wire
+  // shape. These e2e tests drive the typed API through the real napi addon so
+  // the encoders are exercised against the actual `serde_json::from_str`
+  // deserializers in crates/scp-ffi/napi/src/trust.rs — a shape mismatch would
+  // surface as a parse error here, not just in the mock unit tests.
+  // ---------------------------------------------------------------------------
+  describe("Typed trust-input admission (real NAPI, ADR-058)", () => {
+    test("checkCapabilityRequirements: SelfAttested requirement met by a declared capability", () => {
+      const requirements: readonly CapabilityRequirement[] = [
+        { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
+      ];
+      // A SelfAttested requirement is satisfied by the declared capability with
+      // no challenge verification — the typed inputs round-trip through the
+      // bridge deserializers and admission succeeds (returns void, no throw).
+      expect(() =>
+        scpInstance.checkCapabilityRequirements(
+          "ctx-admission",
+          "did:dht:zSubject",
+          requirements,
+          ["scp:capability:schema-validation/v1"],
+          [],
+        ),
+      ).not.toThrow();
+    });
+
+    test("checkCapabilityRequirements: missing SelfAttested capability is rejected", () => {
+      const requirements: readonly CapabilityRequirement[] = [
+        { capability: "scp:capability:schema-validation/v1", verificationLevel: "SelfAttested" },
+      ];
+      expect(() =>
+        scpInstance.checkCapabilityRequirements(
+          "ctx-admission",
+          "did:dht:zSubject",
+          requirements,
+          [],
+          [],
+        ),
+      ).toThrow();
+    });
+
+    test("verifyParticipationRequirements: valid profile + empty requirements round-trips", () => {
+      // A structurally-valid profile (real 32/32/64 byte arrays) deserializes
+      // cleanly on the Rust side; with no requirements, verification is a no-op
+      // success — this exercises the full ParticipationProfile encoder path.
+      const profile: ParticipationProfile = {
+        subjectDid: "did:dht:zSubject",
+        participationDurationSecs: 3_600,
+        governanceActionsAgainst: 0,
+        governanceActionsBy: 1,
+        outletInvocationCount: 150,
+        outletInvocationCountAnchored: false,
+        contextCreationCount: 2,
+        roleProgressionCount: 3,
+        attestationCount: 4,
+        updatedAt: 1_700_000_000,
+        eventLogRoot: Array.from({ length: 32 }, (_, i) => i),
+        signerPublicKey: Array.from({ length: 32 }, (_, i) => i + 100),
+        signature: Array.from({ length: 64 }, () => 0),
+      };
+      expect(() =>
+        scpInstance.verifyParticipationRequirements("did:dht:zSubject", [], [profile]),
+      ).not.toThrow();
+    });
+
+    test("verifyParticipationRequirements: wrong-length signature byte array is rejected", () => {
+      // The Rust `signature: [u8; 64]` field rejects a 63-element array at
+      // deserialize time — byte-array length validation is enforced by the
+      // core serde types, surfaced through the typed encoder path.
+      const malformed: ParticipationProfile = {
+        subjectDid: "did:dht:zSubject",
+        participationDurationSecs: 3_600,
+        governanceActionsAgainst: 0,
+        governanceActionsBy: 0,
+        outletInvocationCount: 0,
+        outletInvocationCountAnchored: false,
+        contextCreationCount: 0,
+        roleProgressionCount: 0,
+        attestationCount: 0,
+        updatedAt: 1_700_000_000,
+        eventLogRoot: Array.from({ length: 32 }, () => 0),
+        signerPublicKey: Array.from({ length: 32 }, () => 0),
+        signature: Array.from({ length: 63 }, () => 0),
+      };
+      expect(() =>
+        scpInstance.verifyParticipationRequirements("did:dht:zSubject", [], [malformed]),
+      ).toThrow();
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Economy amounts cross the addon as bigint (ADR-060)
+  // ---------------------------------------------------------------------------
+
+  describe("Economy bigint amounts (real NAPI)", () => {
+    test("grants and reads back a > 2^53 budget exactly", async () => {
+      const ctxId = `econ-bigint-${Date.now()}`;
+      const did = "did:dht:econ-member";
+      // 2^53 + 1 — the first integer a JS `number` cannot hold exactly.
+      const granted = 9_007_199_254_740_993n;
+
+      scpInstance.economyBudgetGrant(ctxId, did, granted);
+      const remaining = scpInstance.economyBudgetRemaining(ctxId, did);
+
+      expect(typeof remaining).toBe("bigint");
+      expect(remaining).toBe(granted);
+
+      // Spend part of it and confirm exact bigint arithmetic survives the
+      // round-trip through the native tracker.
+      scpInstance.economyBudgetRecordSpend(ctxId, did, 1n);
+      expect(scpInstance.economyBudgetRemaining(ctxId, did)).toBe(granted - 1n);
+    });
+
+    test("estimateCost returns a bigint for a free context", () => {
+      const cost = scpInstance.economyEstimateCost("", "MessageSend", "{}");
+      expect(typeof cost).toBe("bigint");
+      expect(cost).toBe(0n);
     });
   });
 }

@@ -20,11 +20,11 @@ use scp_core::context::governance::{
     ProposalStatus, PruningPolicy, SingleAdminEngine, VoteType, actions_conflict, sign_vote,
     verify_vote,
 };
+use scp_core::context::outlets::OutletSchema;
+use scp_core::context::outlets::interface::OutletInterface;
 use scp_core::context::params::{Capability, ContextParams};
-use scp_core::context::tools::ToolSchema;
-use scp_core::context::tools::interface::ToolInterface;
 use scp_core::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
-use scp_identity::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -52,7 +52,7 @@ fn sk_for(seed: u8) -> ed25519_dalek::SigningKey {
 
 /// Mock key resolver: Alice=1, Bob=2, Carol=3, Dave=4.
 fn mock_resolver() -> KeyResolver {
-    Arc::new(|did: &DID, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
         let did_str: &str = did.as_ref();
         match did_str {
             "did:dht:z6MkAlice" => Some(sk_for(1).verifying_key()),
@@ -82,11 +82,11 @@ fn governance_context_for_members(
     }
 }
 
-fn simple_tool_interface() -> ToolInterface {
-    ToolInterface {
+fn simple_outlet_interface() -> OutletInterface {
+    OutletInterface {
         source_context: "ctx-src".to_owned(),
         target_context: "ctx-tgt".to_owned(),
-        tool_id: "tool-1".to_owned(),
+        outlet_id: "outlet-1".to_owned(),
         rate_limit: None,
         inbound_rate_limit: None,
         per_caller_rate_limit: None,
@@ -103,7 +103,7 @@ fn simple_economic_policy() -> EconomicPolicy {
         cost_schedule: CostSchedule {
             currency: CurrencyCode::from("USD"),
             per_message: Some(Amount::new(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -114,19 +114,22 @@ fn simple_economic_policy() -> EconomicPolicy {
     }
 }
 
-fn simple_tool_registration() -> scp_core::context::params::ToolRegistration {
-    scp_core::context::params::ToolRegistration {
-        tool_id: "search".to_owned(),
+fn simple_outlet_registration() -> scp_core::context::params::OutletRegistration {
+    scp_core::context::params::OutletRegistration {
+        outlet_id: "search".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: "search".to_owned(),
-        description: "Search tool".to_owned(),
-        schema: ToolSchema {
+        description: "Search outlet".to_owned(),
+        schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
+            aggregate_schema: None,
         },
         implementation_hash: [0u8; 32],
         test_vectors: vec![],
         operator_did: DID::from("did:dht:z6MkTestOperator"),
         cost: None,
+        message_catalog: Vec::new(),
         registered_at: 0,
         signature: Vec::new(),
     }
@@ -157,11 +160,11 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
             did: bob(),
             new_role: "observer".to_owned(),
         },
-        GovernanceAction::RegisterTool {
-            registration: Box::new(simple_tool_registration()),
+        GovernanceAction::RegisterOutlet {
+            registration: Box::new(simple_outlet_registration()),
         },
-        GovernanceAction::RemoveTool {
-            tool_id: "search".to_owned(),
+        GovernanceAction::RemoveOutlet {
+            outlet_id: "search".to_owned(),
         },
         GovernanceAction::ModifyCeiling {
             new_ceiling: vec![Capability::MessagesRead],
@@ -190,8 +193,8 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::AddSigner { did: carol() },
         GovernanceAction::RemoveSigner { did: carol() },
         GovernanceAction::ModifyThreshold { new_threshold: 2 },
-        GovernanceAction::EstablishToolInterface {
-            interface: simple_tool_interface(),
+        GovernanceAction::EstablishOutletInterface {
+            interface: simple_outlet_interface(),
         },
         GovernanceAction::ResetMember {
             did: bob(),
@@ -230,7 +233,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::ApproveSpend {
             spender: bob(),
             amount: Amount::new(1000),
-            purpose: "tool costs".to_owned(),
+            purpose: "outlet costs".to_owned(),
         },
         GovernanceAction::LockEconomicPolicy,
         GovernanceAction::ProposeContextMigration {

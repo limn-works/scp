@@ -180,8 +180,9 @@ impl NetworkSimulator {
 mod tests {
     use super::*;
     use crate::clock::Clock;
-    use scp_identity::DID;
-    use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+    use scp_did::DID;
+    use scp_platform::in_memory::InMemoryStorage;
+    use scp_platform::testing::InMemoryKeyCustody;
 
     fn make_clock() -> Arc<SimulatedClock> {
         Arc::new(SimulatedClock::new(1_000_000))

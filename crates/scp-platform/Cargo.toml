@@ -17,14 +17,30 @@ software_platform = [
     "dep:rand",
     "dep:hmac",
     "dep:sha2",
-    "dep:hkdf",
+    "dep:scp-crypto",
     "dep:uuid",
 ]
-# In-memory platform adapters for testing and development (ADR-006).
-# Separate from `software_platform` so that crates needing crypto primitives
-# (Ed25519, X25519) can enable `software_platform` without pulling in the
-# insecure in-memory implementations. See GitHub issue #88.
-testing = ["software_platform"]
+# Durability-only in-memory Storage adapter (`InMemoryStorage`, spec §17.6 /
+# §17.17.2). A durability-only affordance (`SCP-CAPSEL-8010`): it loses state
+# on restart but nullifies no security property, so it is shippable and
+# selected explicitly via `StorageConfig` — never a default/fallback
+# (`SCP-CAPSEL-8011`). Pulls no extra deps (uses std + the always-on tokio).
+# Deliberately independent of `testing`: a build may compile the durable dev
+# affordance WITHOUT the test-only nullifier doubles. See ADR-062 §0.
+in-memory-storage = []
+# Durability-only in-memory Push adapter (`InMemoryPush`). Same classification
+# as `in-memory-storage`; mints synthetic UUID push tokens, so it pulls
+# `dep:uuid`. See ADR-062 §0.
+in-memory-push = ["dep:uuid"]
+# Test-only nullifier platform doubles (`InMemoryKeyCustody`,
+# `InMemoryDeviceAttestation`, `InMemoryPreRotationCustody`) — security
+# nullifiers (`SCP-CAPSEL-8012`) gated separately from `software_platform` so
+# crates needing crypto primitives (Ed25519, X25519) can enable
+# `software_platform` without pulling in the insecure in-memory key storage.
+# Also implies the durability-only in-memory adapters so test/dev builds get
+# the full historical `testing::*` surface via `in_memory::*`. See GitHub
+# issue #88 and ADR-062 §0.
+testing = ["software_platform", "in-memory-storage", "in-memory-push"]
 # Apple storage adapter with SQLCipher encryption (spec section 17.6).
 # Same engine as `sqlite` but encryption key provided by caller (Apple Keychain).
 apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
@@ -67,10 +83,14 @@ argon2 = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
 x25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
-hkdf = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
+# Per-context pseudonym derivation (§9.10.4.A) lives in the wasm-safe `scp-crypto`
+# leaf (ADR-057 Option A); every software-custody backend delegates to it. Its
+# HKDF/HMAC/SHA-256 primitives are pulled transitively, so `scp-platform` no
+# longer needs a direct `hkdf` dependency.
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", optional = true }
 
 # sqlite dependencies, gated behind the `sqlite` feature flag.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"], optional = true }

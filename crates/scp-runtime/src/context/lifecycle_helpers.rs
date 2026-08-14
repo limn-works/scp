@@ -6,9 +6,9 @@
 //! This module hosts lifecycle-domain helpers that operate on actor-owned
 //! [`PerContextState`](crate::context::state::PerContextState) and
 //! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
-//! The legacy `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::lifecycle_helpers_legacy`] until Phase 2A
-//! finalization removes the shim fallback.
+//! Phase 2A finalization deleted the legacy `&Supervisor` lock-and-call
+//! bodies (and the shim fallback); every lifecycle command now runs
+//! through these actor-shape helpers.
 //!
 //! # Pipeline shape
 //!
@@ -22,8 +22,8 @@
 //!
 //! Per-context (actor-shape `(&mut PerContextState, &ActorDeps, ...)`):
 //!
-//! 1. [`export_context`] — read-only state borrow + persistence-side
-//!    snapshot construction; produces a signed [`ContextExport`].
+//! 1. [`export_context_blocks`] — read-only state borrow + persistence-side
+//!    snapshot construction; produces a signed [`ContextExport`](crate::context::export_import::ContextExport).
 //! 2. [`leave_context`] — capability check + MLS remove + sender-key
 //!    cleanup + membership removal + close-on-empty.
 //! 3. [`drain_and_deliver_sender_keys`] — drain pending sender-key
@@ -44,41 +44,43 @@
 //! [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle)):
 //!
 //! - [`create_context`] — full create body; builds and registers a fresh `PerContextState`.
-//! - [`finalize_create`] — gauges + governance timeout + persistence + TTL timer post-creation.
+//! - [`finalize_create`] — gauges + persistence + TTL timer post-creation.
 //! - [`import_context`] — full import body (validate, restore crypto, build `PerContextState`, register).
 //! - [`load_persisted_context_state`] — load context snapshot and broadcast state from persistence.
-//! - [`restore_context`] — rebuild `PerContextState` from snapshot + register + start governance timeout + spawn TTL.
+//! - [`restore_context`] — rebuild `PerContextState` from snapshot + register + arm TTL deadline.
 //!
-//! `finalize_create` reaches the designated-legacy
-//! `start_governance_timeout_task_legacy` via the shim escape (see
-//! [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor))
-//! because that helper iterates the contexts `DashMap` and stays
-//! legacy-shape until the per-context governance-timeout actor lands.
+//! Governance timeouts are ACTOR-OWNED (ADR-049 Decision-1 / finding A3):
+//! the freshly-spawned per-context actor's `reconcile_timers` arms a 60 s
+//! interval while the context is `Active`, so the bootstrap paths do NOT
+//! install a governance-timeout task. They still arm the TTL deadline via
+//! `SupervisorHandle::dispatch_start_ttl_timer` (which records
+//! `state.ttl.timer.deadline_unix_secs` for the actor's TTL arm).
 //!
-//! # Designated-legacy supervisor-scoped iteration helpers
+//! # Supervisor-iterating sweep entry points
 //!
-//! These iterate the contexts `DashMap` and inherently cannot move to
-//! actor-owned shape — they live ONLY in
-//! [`crate::context::lifecycle_helpers_legacy`]:
+//! These iterate the actor registry
+//! ([`Supervisor::actor_ids`](crate::context::supervisor::Supervisor::actor_ids),
+//! NOT a legacy `contexts` `DashMap`) and dispatch one typed sweep
+//! command per actor through the per-context mailbox. They live in this
+//! module:
 //!
-//! - `restore_all_contexts_legacy`
-//! - `flush_all_contexts_legacy` / `flush_all_contexts_sync_legacy`
-//! - `shutdown_all_contexts_legacy` / `shutdown_all_contexts_sync_legacy`
+//! - [`restore_all_contexts`] (iterates persistence snapshots — no
+//!   actors exist before restore)
+//! - [`flush_all_contexts`] / [`flush_all_contexts_sync`]
+//! - [`shutdown_all_contexts`] / [`shutdown_all_contexts_sync`]
 
 #![allow(clippy::significant_drop_tightening)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::GovernanceModelConfig;
 use scp_protocol::context::governance::mls_integration::EpochCoordinator;
 use scp_protocol::context::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
-use scp_protocol::context::params::GovernanceModel;
 use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
-use scp_protocol::economy::budget::MemberBudgetTracker;
 
 use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
@@ -87,20 +89,20 @@ use crate::context::actor::state::{
     ContextCryptoState, ContextLifecycleState, ContextModeState, ContextRouting, PerContextState,
     RecvSequenceTracker,
 };
-use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+use crate::context::governance::timeout::DeadlockDetectionState;
 use crate::context::governance_helpers;
 use crate::context::state::{
     self, AccessControlState, CommitOperation, EpochState, GovernanceState, TtlState,
 };
 use crate::context::ttl::{self, CloseResult, TtlTimer};
 
-// ADR-049 Phase 2A finalization keystone (commit 12 phase 2A finalization
+// ADR-049 Phase 2A finalization keystone (ADR-049 §15 phase 2A finalization
 // — type unification, single PerContextState): the prior alias to the
 // legacy struct was deleted alongside the struct itself. Every bootstrap
-// call site now constructs the unified `PerContextState` directly. The
-// contexts DashMap is still the production source of truth — subsequent
-// finalization commits delete the DashMap and route bootstrap through
-// `spawn_actor_with_state`.
+// call site now constructs the unified `PerContextState` directly and
+// hands it to `spawn_actor_with_state`; the spawned actor OWNS the state
+// and registers its handle in the supervisor registry. There is no legacy
+// contexts `DashMap` — the actor registry is the single source of truth.
 
 // ---------------------------------------------------------------------------
 // §9.10.4 routing construction helpers
@@ -169,7 +171,9 @@ pub fn export_context_blocks(
     deps: &ActorDeps,
 ) -> (crate::context::state::ContextSnapshot, Vec<u8>) {
     let context_id = state.handle.context_id();
-    let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    // ADR-056: resolve to the canonical digest (matches `state.context_id` and
+    // the crypto keys the snapshot exports), not a re-hash of the hex id.
+    let ctx_id_bytes = state::context_id_to_bytes(context_id);
 
     let snapshot = crate::context::messaging_helpers::build_snapshot_from_state(state);
 
@@ -200,7 +204,11 @@ pub fn export_context_blocks(
 ///   state is not Active.
 /// - [`ContextError::MemberNotFound`] if `member_did` is not a member.
 /// - Crypto / transport / event-log failures are propagated.
-#[allow(clippy::too_many_lines)]
+// ADR-049 §Decision 12: `state`/`transition_to` are now synchronous lock-free
+// ArcSwap ops. Async is retained as the ContextManager helper API contract —
+// callers await uniformly, and the crypto/transport/event-log provider calls
+// regain await points under ADR-049 Decision 7 (async-provider-trait conversion).
+#[allow(clippy::too_many_lines, clippy::unused_async)]
 pub async fn leave_context(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -213,80 +221,212 @@ pub async fn leave_context(
 
     // ADR-049 §9 Class S: a member leaving removes their own membership (a
     // downward-authorization transition for that member) — STRUCTURAL fail-closed.
-    // The whole removal body (MLS remove + membership/role/access/routing cleanup
-    // + the `MemberLeft` event-log append) runs inside the Class-S `_keep`
-    // combinator's `rest_mut()` view, so the fail-closed persist is performed BY
-    // the combinator (replacing the former inline `persist_state_fail_closed`).
-    // KEEP-direction: a removal that did not durably land is NOT rolled back in
-    // memory — re-admitting a member the caller was told had left is the unsafe
-    // direction; the persist error is surfaced instead so the leave is not
-    // acknowledged as durable. The body is entirely synchronous (the only
-    // `.await`, the close-on-empty transition, runs AFTER the persist), so it
-    // fits the sync `_keep` closure. `check_commit_fault` reads through the whole
-    // `&mut PerContextState` the view hands back; `try_broadcast_commit_or_enqueue`
-    // is passed only the three disjoint Class-C fields it mutates (via
-    // `CommitBroadcastBorrows`), borrowed from that same state.
-    let should_close = cell.commit_class_s_keep(deps, &context_id, |mut view| {
-        let state = view.rest_mut();
+    // The removal body (MLS remove + membership/role/access/routing cleanup) runs
+    // inside the Class-S `_keep` combinator's `rest_mut()` view, so the fail-closed
+    // persist is performed BY the combinator (replacing the former inline
+    // `persist_state_fail_closed`). KEEP-direction: a removal that did not durably
+    // land is NOT rolled back in memory — re-admitting a member the caller was told
+    // had left is the unsafe direction; the persist error is surfaced instead so the
+    // leave is not acknowledged as durable. The closure body is synchronous; the
+    // `MemberLeft` Merkle-leaf append and the close-on-empty transition (both now or
+    // already async — under ADR-049 Decision 7 `EventLogPersistence` is async) run
+    // AFTER the persist, outside the sync `_keep` closure. `check_commit_fault` reads
+    // through the whole `&mut PerContextState` the view hands back. The MLS-Commit
+    // broadcast also runs after this persist (async — Decision 7); on failure its
+    // `commit_fault`/`pending_commits` bookkeeping is applied FAIL-CLOSED via a
+    // second `commit_class_s_keep` (`apply_broadcast_failure`), because `commit_fault`
+    // is a safety gate that must survive a crash before the coalesced persist tick.
+    let (should_close, left_role_name, is_broadcast, mls_commit_bytes) = cell
+        .commit_class_s_keep(deps, &context_id, |mut view| {
+            let state = view.rest_mut();
 
-        // PR #1606 C6: refuse if a commit fault marker is set.
-        governance_helpers::check_commit_fault(state)?;
+            // PR #1606 C6: refuse if a commit fault marker is set.
+            governance_helpers::check_commit_fault(state)?;
 
-        // Authorization: self-removal always allowed; otherwise MemberRemove
-        // required.
-        if caller_did != member_did
-            && !state
-                .role_state
-                .member_has_capability(caller_did, &Capability::MemberRemove)
-        {
-            return Err(ContextError::PermissionDenied(
-                "caller lacks permission to remove this member".into(),
-            ));
-        }
-
-        let is_broadcast = state.broadcast_context.is_some();
-
-        // Crypto operations -- skip for broadcast mode (no MLS).
-        // H9: MLS group removal FIRST (hard security boundary), then sender
-        // key cleanup as best-effort. MLS removal is the cryptographic
-        // enforcement; sender key removal is defense-in-depth (§9.16).
-        if !is_broadcast {
-            let remove_output = deps.crypto.remove_member(&context_id_bytes, member_did)?;
-            if let Err(e) = deps
-                .crypto
-                .remove_member_sender_key(&context_id_bytes, member_did)
+            // Authorization: self-removal always allowed; otherwise MemberRemove
+            // required.
+            if caller_did != member_did
+                && !state
+                    .role_state
+                    .member_has_capability(caller_did, &Capability::MemberRemove)
             {
-                tracing::warn!(
-                    context_id = %context_id,
-                    member = %member_did,
-                    error = %e,
-                    "remove_member_sender_key failed after MLS removal — \
-                     sender key layer may retain stale key"
-                );
+                return Err(ContextError::PermissionDenied(
+                    "caller lacks permission to remove this member".into(),
+                ));
             }
 
-            // Broadcast the MLS Commit to remaining members so they can
-            // advance their group epoch and ratchet key material. PR #1606
-            // C6: on transport failure, the commit is durably enqueued for
-            // retry.
-            governance_helpers::try_broadcast_commit_or_enqueue(
-                governance_helpers::CommitBroadcastBorrows {
-                    pending_commits: &mut state.pending_commits,
-                    commit_fault: &mut state.commit_fault,
-                    receive_buffer: &mut state.receive_buffer,
-                },
+            let is_broadcast = state.broadcast_context.is_some();
+
+            // Crypto operations -- skip for broadcast mode (no MLS).
+            // H9: MLS group removal FIRST (hard security boundary), then sender
+            // key cleanup as best-effort. MLS removal is the cryptographic
+            // enforcement; sender key removal is defense-in-depth (§9.16).
+            //
+            // Capture the removal Commit bytes here; the ASYNC transport ops
+            // (Commit broadcast, sender-key rotation + delivery) run AFTER the
+            // fail-closed persist below, outside this synchronous `_keep` closure
+            // (ADR-049 Decision 7 — `ContextTransportProvider` is now async and
+            // cannot be awaited inside the sync closure). The membership removal
+            // is fail-closed-persisted by the combinator; the Commit-broadcast
+            // enqueue is Class-C (coalesced) and the sender-key rotation/delivery
+            // are best-effort crypto/transport side-effects.
+            let mls_commit_bytes = if is_broadcast {
+                None
+            } else {
+                // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): MLS removal + per-member
+                // sender-key prune run on the actor's OWNED crypto state (the
+                // `rest_mut()` view above), not the provider — this is the last
+                // leave-path caller flipped off the deleted provider steady-state
+                // twins. `local_did` is node-resident identity (retained on the
+                // provider); the actor `remove_member` skips a self-leave.
+                let local_did = deps.crypto.local_did();
+                let remove_output = state.remove_member(local_did, member_did.as_ref())?;
+                if let Err(e) = state.remove_member_sender_key(member_did.as_ref()) {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        member = %member_did,
+                        error = %e,
+                        "remove_member_sender_key failed after MLS removal — \
+                         sender key layer may retain stale key"
+                    );
+                }
+                // ADR-049 PR-6: prune the departed member's Class-M registry
+                // floors (member-granular; siblings + local scalar retained).
+                deps.supervisor
+                    .remove_member_floors(&context_id_bytes, member_did);
+                Some(remove_output.commit_bytes)
+            };
+
+            // State check + membership removal -- the actor owns state for the
+            // duration of this command, so no relock dance is required.
+            state::require_active(&state.handle)?;
+
+            // For broadcast contexts, unsubscribe from the BroadcastContext.
+            // rotate_keys=true for forward secrecy after departure.
+            if let Some(ref mut bc) = state.broadcast_context {
+                // Ignore MemberNotFound -- the member may be an author who was
+                // never a subscriber. Propagate all other errors (e.g.
+                // CryptoFailed from epoch overflow during key rotation).
+                match bc.unsubscribe(member_did, true) {
+                    Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Capture the leaving member's role name BEFORE the membership/role
+            // strip below — the role held at departure, carried into the
+            // subject-bearing MemberLeft leaf (ADR-011 amendment) so the
+            // participation record (§7.3.2) attributes the self-leave to this
+            // member with its role context.
+            let left_role_name = state
+                .membership
+                .get(member_did.as_ref())
+                .map(|info| info.role_name.clone())
+                .unwrap_or_default();
+
+            if !state.membership.remove_member(member_did) {
+                return Err(ContextError::MemberNotFound(member_did.to_string()));
+            }
+
+            // Clean teardown of ALL per-DID role state (spec §5.6.1): members,
+            // assignments, member_capabilities, AND suspended_capabilities. Replaces
+            // the prior strip that left the departing DID's suspension dangling, so a
+            // re-admitted same-DID member no longer inherits a phantom suspension.
+            // `state.membership.remove_member` above already guarded not-found, so the
+            // `-> bool` return is unused here. Inside `commit_class_s_keep`, so the
+            // downward-auth suspension drop persists fail-closed (ADR-049 §9).
+            state.role_state.remove_member(member_did.as_ref());
+
+            // Destroy the departing member's access key (§9.17.2, ADR-038).
+            state
+                .access
+                .access_key_store
+                .remove(&context_id, member_did.as_ref());
+
+            // Drop the departing member's CEK-exclusion entry (spec §5.6.1, §9.17) —
+            // per-DID content-access state outside the role state. Mirrors
+            // `execute_remove_member`, so a re-admitted same-DID member no longer
+            // inherits a phantom read exclusion.
+            state.access.read_exclusion_list.remove(member_did);
+
+            // §9.10.4: remove the departing member's pseudonym routing ID. No-op on
+            // a broadcast context (which carries no peer registry).
+            if let Some(reg) = state.routing.peer_registry_mut() {
+                reg.remove(member_did);
+            }
+
+            // Emit MemberLeft event to receive buffer.
+            let left_event = ContextEvent::MemberLeft {
+                member_did: member_did.clone(),
+            };
+            state::emit_event_into(
+                &mut state.receive_buffer,
+                left_event,
+                &context_id,
+                deps.event_tx.as_ref(),
+            );
+
+            let should_close = state.membership.count() == 0;
+
+            Ok((should_close, left_role_name, is_broadcast, mls_commit_bytes))
+        })
+        .await?;
+
+    // Async transport ops AFTER the Class-S removal persist (ADR-049 Decision 7:
+    // `ContextTransportProvider` is async and cannot be awaited inside the
+    // synchronous `_keep` closure above). The membership removal is already
+    // fail-closed-persisted; the MLS-Commit broadcast's failure bookkeeping is
+    // itself re-persisted FAIL-CLOSED (see below), while the sender-key rotation +
+    // delivery are best-effort crypto/transport side-effects. The captured
+    // `mls_commit_bytes` is the removal Commit already produced under the crypto
+    // `Arc` (Class-M) inside the closure.
+    if !is_broadcast {
+        // Broadcast the MLS Commit to remaining members so they can advance their
+        // group epoch and ratchet key material. Broadcast async (ADR-049 Decision
+        // 7); on transport FAILURE the retry-queue bookkeeping is persisted
+        // FAIL-CLOSED via `keep_broadcast_failure` (member departure is a
+        // safety-gated site — see that helper's doc for why the second persist).
+        if let Some(commit_bytes) = mls_commit_bytes
+            && let Some(failure) = governance_helpers::try_broadcast_commit(
                 deps,
                 &context_id,
-                remove_output.commit_bytes,
+                commit_bytes,
                 &CommitOperation::LeaveContext {
                     member_did: member_did.clone(),
                 },
-            );
+            )
+            .await
+        {
+            governance_helpers::keep_broadcast_failure(cell, deps, &context_id, failure).await?;
+        }
 
-            // Rotate the local sender key and distribute to remaining members
-            // (§9.16.4). M23: Non-fatal — MLS removal above is the hard
-            // security boundary. If rotation fails, log but continue.
-            if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
+        // Rotate the local sender key and distribute to remaining members
+        // (§9.16.4). ADR-049 PR-7: Class-S — the epoch bump is sync-persisted
+        // fail-closed via `commit_class_s_keep` (a bumped-then-crash-lost epoch
+        // would let the departed member's old key keep decrypting); anti-replay
+        // backstop is the never-regressing registry floor (`mirror_forward`,
+        // `?`-propagated). M23: sender-key rotation + distribution stays
+        // best-effort — a rotate/persist failure is logged and the leave continues
+        // (MLS removal above is the hard security boundary).
+        let local_did = deps.crypto.local_did().to_owned();
+        match cell
+            .commit_class_s_keep(deps, &context_id, |mut v| {
+                let s = v.rest_mut();
+                s.rotate_sender_key(&local_did)?;
+                Ok(s.local_sender_key_epoch())
+            })
+            .await
+        {
+            Ok(epoch) => {
+                // ADR-049 PR-6/PR-7: advance the durably-bumped local epoch in the
+                // authoritative floor registry (fail-closed backstop).
+                crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+                    deps,
+                    &context_id_bytes,
+                    epoch,
+                )?;
+            }
+            Err(e) => {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -294,7 +434,14 @@ pub async fn leave_context(
                      remaining members retain old sender key"
                 );
             }
-            if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes) {
+        }
+        {
+            // Drain through the actor's crypto state (same one the rotation just
+            // populated); `&mut` view scoped so `cell` is free afterward.
+            let mut view = cell.class_c_view();
+            if let Err(e) =
+                drain_and_deliver_sender_keys(deps, view.mode_mut().crypto_mut(), &context_id).await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -302,83 +449,42 @@ pub async fn leave_context(
                 );
             }
         }
+    }
 
-        // State check + membership removal -- the actor owns state for the
-        // duration of this command, so no relock dance is required.
-        state::require_active(&state.handle)?;
-
-        // For broadcast contexts, unsubscribe from the BroadcastContext.
-        // rotate_keys=true for forward secrecy after departure.
-        if let Some(ref mut bc) = state.broadcast_context {
-            // Ignore MemberNotFound -- the member may be an author who was
-            // never a subscriber. Propagate all other errors (e.g.
-            // CryptoFailed from epoch overflow during key rotation).
-            match bc.unsubscribe(member_did, true) {
-                Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-
-        if !state.membership.remove_member(member_did) {
-            return Err(ContextError::MemberNotFound(member_did.to_string()));
-        }
-
-        // Remove from role state.
-        state.role_state.members.remove(member_did.as_ref());
-        state.role_state.assignments.remove(member_did.as_ref());
-        state
-            .role_state
-            .member_capabilities
-            .remove(member_did.as_ref());
-
-        // Destroy the departing member's access key (§9.17.2, ADR-038).
-        state
-            .access
-            .access_key_store
-            .remove(&context_id, member_did.as_ref());
-
-        // §9.10.4: remove the departing member's pseudonym routing ID. No-op on
-        // a broadcast context (which carries no peer registry).
-        if let Some(reg) = state.routing.peer_registry_mut() {
-            reg.remove(member_did);
-        }
-
-        // Emit MemberLeft event to receive buffer.
-        let left_event = ContextEvent::MemberLeft {
-            member_did: member_did.clone(),
-        };
-        state::emit_event_into(
-            &mut state.receive_buffer,
-            left_event,
-            &context_id,
-            deps.event_tx.as_ref(),
-        );
-
-        let should_close = state.membership.count() == 0;
-
-        // Append MemberLeft event to event log.
-        deps.event_log.append_context_event(
+    // Append the `MemberLeft` Merkle leaf AFTER the Class-S removal persist.
+    // Under ADR-049 Decision 7 `EventLogPersistence` is async, so this append
+    // cannot run inside the synchronous `_keep` closure above — the membership
+    // removal is already fail-closed-persisted by the combinator; the Merkle
+    // leaf is a separate durable record.
+    //
+    // Subject-bearing leaf (ADR-011 amendment): the payload carries the affected
+    // member (`member_did`, which on a self-leave already equals `actor_did`) and
+    // its role at departure, so the leaf shape is uniform with admin-driven
+    // removals and the SDK reads `subject_did` consistently.
+    //
+    // Committer-assigned: the leaving member's clock — the source of the
+    // `created_at` on its outgoing leave commit. This is the
+    // convergent-by-construction value WHEN cross-member leaf replication lands:
+    // the receive-side append path is currently dormant, so this leaf is
+    // committer-appended-only and is NOT yet replicated to other members.
+    // Cross-member convergence of membership leaves is the forward step under
+    // ADR-051 (§7.3.1, §9.9.3).
+    deps.event_log
+        .append_membership_change_leaf(
             &context_id_bytes,
             scp_event_log::EventType::MemberLeft,
             member_did.as_ref(),
-            // Committer-assigned: the leaving member's clock — the source of the
-            // `created_at` on its outgoing leave commit. This is the
-            // convergent-by-construction value WHEN cross-member leaf replication
-            // lands: the receive-side append path is currently dormant, so this
-            // leaf is committer-appended-only and is NOT yet replicated to other
-            // members. Cross-member convergence of membership leaves is the
-            // forward step under ADR-051 (§7.3.1, §9.9.3).
+            member_did.as_ref(),
+            &left_role_name,
             deps.clock.now_secs(),
-        )?;
-        state.checkpoint_events_since += 1;
-
-        Ok(should_close)
-    })?;
+        )
+        .await?;
+    *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     // If member count reaches zero, transition to Closing. Runs AFTER the
     // fail-closed persist above, matching the prior ordering.
     if should_close {
-        handle.transition_to(&ContextState::Closing).await?;
+        handle.transition_to(&ContextState::Closing)?;
     }
 
     Ok(())
@@ -402,14 +508,25 @@ pub async fn leave_context(
 /// Returns a [`ContextError`] if the underlying drain call fails
 /// catastrophically. Per-recipient send failures are logged but not
 /// propagated (the receiver can recover via `SenderKeyRequest`).
-pub fn drain_and_deliver_sender_keys(
+pub async fn drain_and_deliver_sender_keys(
     deps: &ActorDeps,
+    crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     context_id: &str,
-    context_id_bytes: &[u8; 32],
 ) -> Result<(), ContextError> {
-    let pending = deps
-        .crypto
-        .drain_pending_sender_key_messages(context_id_bytes)?;
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): drain + MLS-wrap the rotated sender-key
+    // distributions through the actor's OWNED field-granular Class-C
+    // `&mut ContextCryptoState` — the SAME crypto state the producer
+    // (`rotate_sender_key` / `add_member`) populated, so producer and consumer
+    // stay coherent. The provider steady-state twins
+    // (`drain_pending_sender_key_messages` / `mls_encrypt_management`) are deleted;
+    // there is no provider queue to fall back to. A broadcast context has no MLS
+    // `ContextCryptoState` (`crypto_mut()` is `None`) and no sender-key
+    // distributions — draining nothing is correct (rotation is skipped for
+    // broadcast, so the queue is always empty here).
+    let Some(crypto_state) = crypto_state else {
+        return Ok(());
+    };
+    let pending = std::mem::take(&mut crypto_state.pending_distributions);
     if !pending.is_empty() {
         let routing_id = scp_protocol::context::context_routing_id(context_id);
         for (target_did, message) in pending {
@@ -419,14 +536,14 @@ pub fn drain_and_deliver_sender_keys(
                 message_len = message.len(),
                 "MLS-encrypting and sending rotated sender key distribution"
             );
-            match deps.crypto.mls_encrypt_management(
-                context_id_bytes,
+            let sealed = crypto_state.mls_encrypt_management(
                 &message,
                 &routing_id,
                 crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
-            ) {
+            );
+            match sealed {
                 Ok(sealed) => {
-                    if let Err(e) = deps.transport.send_message(&routing_id, &sealed) {
+                    if let Err(e) = deps.transport.send_message(&routing_id, &sealed).await {
                         tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "failed to send rotated sender key");
                     }
                 }
@@ -564,8 +681,14 @@ pub async fn close_context_with_key(
             );
         }
 
-        state.ttl.timer.cancel();
-        state.governance.timeout_task.cancel();
+        // TTL + governance timers are actor-owned arms (ADR-049 finding A3):
+        // the actor's `reconcile_timers` clears the governance interval once
+        // this close leaves `Active`, and disarms the one-shot TTL arm on a
+        // non-Active context. Clear the recorded TTL deadline HERE (durably, in
+        // the fail-closed snapshot) so a stale absolute deadline cannot fire
+        // against the closed context on a later restore and despawn it —
+        // re-opening this very close window (BUG-1).
+        state.ttl.timer.deadline_unix_secs = None;
         // Drop broadcast context state -- keys are zeroed by Zeroize.
         state.broadcast_context = None;
 
@@ -634,7 +757,8 @@ pub async fn close_context_with_key(
         });
 
         Ok(())
-    })?;
+    })
+    .await?;
 
     Ok(result)
 }
@@ -694,8 +818,42 @@ pub async fn join_context(
         .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
 
     // Validate key package before any mutations (idempotent, no lock needed).
+    //
+    // ADR-049 §15 / SCP-CRYPTOMOVE-000c: stateless KP validation routes through
+    // the stateless `MlsBackend` (`deps.mls`) — the provider copy is retired from
+    // the production call path (retained only as a test-exercised copy at
+    // `crypto/mls/provider.rs`), and §15 grants it no carve-out
+    // ("`validate_key_package` … becomes a stateless free-fn / `MlsBackend` method
+    // over `&dyn Clock`"). `validate_key_package` runs the full validation
+    // (signature / hardened-clock lifetime / ciphersuite) ONCE and returns the
+    // authenticated `credential_did` extracted from the same validated leaf, so
+    // the load-bearing binding (the KP credential DID MUST equal the envelope's
+    // `owner_did`, formerly enforced inside the provider method) is preserved
+    // here as a single validate-and-bind — no second parse or re-validation.
+    // Under `cfg(test)`/`testing` a `None` KP is accepted (mock fixtures);
+    // production requires real bytes.
     let kp_bytes = key_package.mls_key_package_bytes.as_deref();
-    deps.crypto.validate_key_package(&member_did, kp_bytes)?;
+    match kp_bytes {
+        Some(bytes) => {
+            let validated = deps
+                .mls
+                .validate_key_package(bytes, deps.clock.as_ref())
+                .await
+                .map_err(|e| ContextError::InvalidKeyPackage(e.to_string()))?;
+            if member_did != validated.credential_did {
+                return Err(ContextError::InvalidKeyPackage(
+                    "key package credential DID does not match owner_did".to_string(),
+                ));
+            }
+        }
+        None => {
+            if !cfg!(any(test, feature = "testing")) {
+                return Err(ContextError::InvalidKeyPackage(
+                    "production MlsBackend requires MLS key package bytes".to_string(),
+                ));
+            }
+        }
+    }
 
     // Phase 1: state + sybil + economy enforcement against actor-owned
     // state. This happens BEFORE any crypto mutations so that a rejected
@@ -732,6 +890,8 @@ pub async fn join_context(
             return Err(ContextError::RateLimited {
                 resource: "join".to_owned(),
                 message: "hard rate limit exceeded for joiner".to_owned(),
+                // Token-bucket hard limit: no exact refill instant to surface.
+                retry_after_ms: None,
             });
         }
         // Record the join in the velocity tracker so subsequent §19.7
@@ -834,19 +994,37 @@ pub async fn join_context(
                     deps,
                     &context_id,
                     payment_err,
-                );
+                )
+                .await;
                 rollback_join_economy_ticket(cell, ticket);
                 return Err(err);
             }
         },
     };
 
-    // Phase 3: MLS add_member + sender key distribution (crypto mutations).
-    // On failure: void escrow + rollback ticket. No MLS rollback needed
-    // because add_member itself failed (no state change occurred).
-    let add_output = match deps
-        .crypto
-        .add_member(&context_id_bytes, &member_did, kp_bytes)
+    // Phase 3: MLS add_member + sender-key distribution (crypto mutations).
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) STEP-C C2 JOIN seam: after the CREATE
+    // seam the actor OWNS this context's crypto (`take_crypto_state`), so the
+    // provider's `add_member` / `distribute_sender_key` now fail closed
+    // ("owned by actor"). Route the WHOLE join crypto cluster through the actor's
+    // OWNED `ContextCryptoState` instead (one-way take preserved — no crypto is
+    // ever handed back to the provider). Member ADD advances the MLS epoch, which
+    // is §9 Class-S (consistent with the `advance_epoch` / `rotate_sender_key`
+    // rulings) and is reachable only through `rest_mut()` (the `PerContextState`
+    // crypto methods hold no field-granular Class-C view), so the add + the
+    // sender-key distribution are sync-persisted fail-closed via
+    // `commit_class_s_keep`. `local_did` is node-resident (read off the provider,
+    // which retains it as a birth-seam).
+    let local_did = deps.crypto.local_did().to_owned();
+
+    // add_member — Class-S. On failure NO MLS rollback is needed (the add itself
+    // failed, so no member was added), matching the prior provider disposition.
+    let add_output = match cell
+        .commit_class_s_keep(deps, &context_id, |mut v| {
+            v.rest_mut()
+                .add_member(&member_did, kp_bytes, deps.clock.as_ref())
+        })
+        .await
     {
         Ok(output) => output,
         Err(e) => {
@@ -860,7 +1038,8 @@ pub async fn join_context(
                 deps,
                 &context_id,
                 e,
-            );
+            )
+            .await;
             if let Some(a) = auth {
                 crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
             }
@@ -869,15 +1048,28 @@ pub async fn join_context(
         }
     };
 
-    if let Err(e) = deps
-        .crypto
-        .distribute_sender_key(&context_id_bytes, &member_did)
+    // distribute_sender_key — Class-S. On failure roll back the just-added member
+    // on the ACTOR (best-effort MLS remove + sender-key prune) + the registry
+    // floor, then the nonce/escrow/ticket rollback.
+    if let Err(e) = cell
+        .commit_class_s_keep(deps, &context_id, |mut v| {
+            v.rest_mut().distribute_sender_key(&local_did, &member_did)
+        })
+        .await
     {
-        // Sender key distribution failed after MLS add — rollback MLS state.
-        let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);
-        let _ = deps
-            .crypto
-            .remove_member_sender_key(&context_id_bytes, &member_did);
+        // Sender-key distribution failed after MLS add — roll back the MLS state
+        // on the actor's owned crypto (§9 Class-S, fail-closed persist).
+        let _ = cell
+            .commit_class_s_keep(deps, &context_id, |mut v| {
+                let s = v.rest_mut();
+                let _ = s.remove_member(&local_did, &member_did);
+                s.remove_member_sender_key(&member_did)
+            })
+            .await;
+        // ADR-049 PR-6: prune the departed member's Class-M registry floors
+        // (member-granular; siblings + the local scalar retained).
+        deps.supervisor
+            .remove_member_floors(&context_id_bytes, &member_did);
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before the existing escrow-void + ticket rollback.
         let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
@@ -886,7 +1078,8 @@ pub async fn join_context(
             deps,
             &context_id,
             e,
-        );
+        )
+        .await;
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
@@ -894,16 +1087,31 @@ pub async fn join_context(
         return Err(err);
     }
 
-    // Drain pending HPKE-sealed sender key distribution messages and
-    // deliver them via the MLS management channel (§9.16.2). MLS-wrap
-    // is mandatory — see comment on `drain_and_deliver_sender_keys`.
-    if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes) {
-        // Drain failed catastrophically — roll back MLS state, sender
-        // key, escrow, and economy ticket so the join is fully aborted.
-        let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);
-        let _ = deps
-            .crypto
-            .remove_member_sender_key(&context_id_bytes, &member_did);
+    // Drain pending HPKE-sealed sender-key distribution messages and deliver them
+    // via the MLS management channel (§9.16.2). MLS-wrap is mandatory — see
+    // comment on `drain_and_deliver_sender_keys`. ADR-049 PR-7: the producer is
+    // now the ACTOR `distribute_sender_key` above (actor-owned queue), so drain
+    // the ACTOR queue via the Class-C crypto view (`Some(..)`). The view is scoped
+    // so it drops before any rollback below re-borrows `cell`.
+    let drain_result = {
+        let mut view = cell.class_c_view();
+        drain_and_deliver_sender_keys(deps, view.mode_mut().crypto_mut(), &context_id).await
+    };
+    if let Err(e) = drain_result {
+        // Drain failed catastrophically — roll back the MLS add on the actor,
+        // the sender key, the registry floor, the escrow, and the economy ticket
+        // so the join is fully aborted.
+        let _ = cell
+            .commit_class_s_keep(deps, &context_id, |mut v| {
+                let s = v.rest_mut();
+                let _ = s.remove_member(&local_did, &member_did);
+                s.remove_member_sender_key(&member_did)
+            })
+            .await;
+        // ADR-049 PR-6: prune the departed member's Class-M registry floors
+        // (member-granular; siblings + the local scalar retained).
+        deps.supervisor
+            .remove_member_floors(&context_id_bytes, &member_did);
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before the existing escrow-void + ticket rollback.
         let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
@@ -912,7 +1120,8 @@ pub async fn join_context(
             deps,
             &context_id,
             e,
-        );
+        )
+        .await;
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
@@ -930,10 +1139,18 @@ pub async fn join_context(
         &member_did,
         add_output,
     ) {
-        let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);
-        let _ = deps
-            .crypto
-            .remove_member_sender_key(&context_id_bytes, &member_did);
+        // Roll back the MLS add on the actor's owned crypto (§9 Class-S).
+        let _ = cell
+            .commit_class_s_keep(deps, &context_id, |mut v| {
+                let s = v.rest_mut();
+                let _ = s.remove_member(&local_did, &member_did);
+                s.remove_member_sender_key(&member_did)
+            })
+            .await;
+        // ADR-049 PR-6: prune the departed member's Class-M registry floors
+        // (member-granular; siblings + the local scalar retained).
+        deps.supervisor
+            .remove_member_floors(&context_id_bytes, &member_did);
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before the existing escrow-void + ticket rollback.
         let err = crate::context::messaging_helpers::commit_send_nonce_token_on_abort(
@@ -942,7 +1159,8 @@ pub async fn join_context(
             deps,
             &context_id,
             e,
-        );
+        )
+        .await;
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
@@ -980,19 +1198,34 @@ pub async fn join_context(
     // joiner for an unacknowledged join. VOID the escrow here (gated on
     // `auth.is_some()`) before returning — mirroring the money-ordering rule the
     // persist-failure branch below already follows.
-    if let Err(e) = deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberJoined,
-        member_did.as_ref(),
-        // Committer-assigned: the joining member's clock (captured once above as
-        // `now_secs`) — the source of the `created_at` on its outgoing join
-        // commit. Convergent-by-construction WHEN cross-member leaf replication
-        // lands; the receive-side append path is currently dormant, so this
-        // leaf is committer-appended-only and is NOT yet replicated to other
-        // members. Cross-member convergence is the forward step under ADR-051
-        // (§7.3.1, §9.9.3).
-        now_secs,
-    ) {
+    // Subject-bearing leaf (ADR-011 amendment): carry the joining member
+    // (`member_did`, which on a self-join already equals `actor_did`) and the
+    // default "member" role, so the leaf shape is uniform with admin-driven
+    // adds and the SDK reads `subject_did` consistently. The participation
+    // record (§7.3.2) attributes the join interval to this subject. A payload
+    // encoding failure is folded into the same `ContextError::EventLogFailed`
+    // the append would raise, so the fail-closed nonce/escrow handling below
+    // covers it identically.
+    //
+    // Committer-assigned: the joining member's clock (captured once above as
+    // `now_secs`) — the source of the `created_at` on its outgoing join commit.
+    // Convergent-by-construction WHEN cross-member leaf replication lands; the
+    // receive-side append path is currently dormant, so this leaf is
+    // committer-appended-only and is NOT yet replicated to other members.
+    // Cross-member convergence is the forward step under ADR-051 (§7.3.1,
+    // §9.9.3).
+    if let Err(e) = deps
+        .event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberJoined,
+            member_did.as_ref(),
+            member_did.as_ref(),
+            "member",
+            now_secs,
+        )
+        .await
+    {
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // before voiding the escrow hold (mirrors the money-ordering rule
         // below). The membership / MLS state already applied is NOT reversed.
@@ -1002,7 +1235,8 @@ pub async fn join_context(
             deps,
             &context_id,
             e,
-        );
+        )
+        .await;
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
         }
@@ -1014,7 +1248,7 @@ pub async fn join_context(
     // nonce in Phase 1 (`enforce_join_economy` → `enforce_economy` →
     // `commit_spending_ucan_nonce`, mutating the actor-owned
     // `spending_nonce_tracker`) — the same Class-S monotonic state the
-    // message-send and tool-invoke paths persist fail-closed. A best-effort
+    // message-send and outlet-invoke paths persist fail-closed. A best-effort
     // persist here would let an actor crash in the ≤50ms coalesce window roll
     // the nonce-consume back, freshening the spending UCAN's nonce after the
     // joiner already saw the join succeed (replay / double-spend). Persist
@@ -1050,14 +1284,15 @@ pub async fn join_context(
         // not charged for an unacknowledged join, then surface the error. The
         // consumed nonce stays consumed. `t.commit` + `void_paid_action` take a
         // shared `&PerContextState`, supplied via `&*cell`.
-        if let Err(e) = t.commit(&*cell, deps, &context_id) {
+        if let Err(e) = t.commit(&*cell, deps, &context_id).await {
             if let Some(a) = auth {
                 crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
             }
             return Err(e);
         }
     } else {
-        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, &context_id);
+        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, &context_id)
+            .await;
     }
 
     // Durability has succeeded (or this is a free join): now settle the escrow.
@@ -1195,7 +1430,7 @@ pub fn join_context_membership(
 /// budget (H8 — service was rendered).
 ///
 /// ADR-049 §9 Class-S cell seam: takes the `&mut ClassSCell` so the escrow
-/// capture+verify `.await` ([`capture_and_verify_paid_action`]) runs OUTSIDE any
+/// capture+verify `.await` ([`capture_and_verify_paid_action`](crate::context::economy_helpers::capture_and_verify_paid_action)) runs OUTSIDE any
 /// view borrow, and the Class-C surfacing of the receipt (or the failure event)
 /// is applied afterward through a short-lived `class_c_view()` — no
 /// whole-`&mut PerContextState`, no `state_mut()`.
@@ -1368,7 +1603,7 @@ pub async fn create_context(
     // every member as the base for the TTL expiry deadline
     // (= creation + params.ttl), which IS computed identically on each member.
     let creation_timestamp_secs = deps.clock.now_secs();
-    let handle = crate::context::builder::create_context(
+    let (handle, created_owned_crypto) = crate::context::builder::create_context(
         context_id.clone(),
         params.clone(),
         deps.crypto.as_ref(),
@@ -1402,17 +1637,23 @@ pub async fn create_context(
     let broadcast_context =
         deps.supervisor
             .init_broadcast_context(&context_id, &params, &creator_did)?;
-    let (initial_threshold_signers, initial_threshold_value) = match &params.governance {
-        GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
-        _ => (Vec::new(), 0),
-    };
     let initial_access_key_store = generate_initial_access_key_store(&context_id, &creator_did);
     let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
     // ADR-049 §Decision 1: branch the actor's mode-discriminated union on
     // whether the supervisor returned a broadcast roster — the SCP-227
     // broadcast init path returns `Some(BroadcastContext)` iff
     // `params.mode == ContextMode::Broadcast`.
+    //
+    // ADR-056: `PerContextState.context_id` is the canonical 32-byte DIGEST.
+    // For a real context id (`hex(digest)`) DECODE recovers the digest — it
+    // does NOT re-hash the already-hex-encoded digest. This is what the
+    // §6.2.4 cross-context outlet saga compares `target_context_id` against on
+    // the wire, and the bytes the creation crypto (builder) keys under.
     let context_id_bytes = state::context_id_to_bytes(&context_id);
+    // ADR-049 PR-4 §5: create-seed the supervisor floor registry so a
+    // default-empty entry exists from creation (it then grows via
+    // mirror-forward). Insert-if-absent — never resets an advanced entry.
+    deps.supervisor.seed_context_floors(&context_id_bytes);
     let actor_members: HashSet<DID> = initial_members.clone();
     let create_is_broadcast = broadcast_context.is_some();
     let mode = if create_is_broadcast {
@@ -1425,7 +1666,7 @@ pub async fn create_context(
     // pseudonym" unrepresentable in live state; broadcast contexts ignore the
     // pseudonym entirely. See `build_routing` for the `None`/sentinel rationale.
     let create_routing = build_routing(create_is_broadcast, local_pseudonym);
-    let per_context = PerContextState {
+    let mut per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
         // Convergent creator-assigned creation time — the same value stamped on
@@ -1435,45 +1676,15 @@ pub async fn create_context(
         handle: handle.clone(),
         membership,
         members: actor_members,
-        governance: GovernanceState {
-            engine: governance_engine,
-            approved_proposals: HashMap::new(),
-            // H10: fresh contexts start with a zero monotonic counter.
-            next_proposal_seq: 0,
-            freeze: None,
-            timeout_task: GovernanceTimeoutTask::new(),
-            deadlock: DeadlockDetectionState::default(),
-            pending_ceiling_modification: None,
-            pending_economic_policy_change: None,
-            registered_tools: Vec::new(),
-            tool_interfaces: Vec::new(),
-            pruning_policy: None,
-            message_pricing: crate::context::lifecycle_logic::derive_message_pricing(
-                params.economic_policy.as_ref(),
-            ),
-            hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
-                scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults(),
-            ),
-            economic_policy: params.economic_policy.clone(),
-            budget_tracker: MemberBudgetTracker::new(),
-            last_known_members: initial_members,
-            pending_epoch_resets: Vec::new(),
-            consequence_rules: params.consequence_rules.clone(),
-            velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
-            participation_cache: HashMap::new(),
-            cooldown_until: HashMap::new(),
-            revoked_spending_ucan_cids: HashSet::new(),
-            proposal_timestamps: HashMap::new(),
-            class_s: crate::context::state::GovernanceClassS {
-                executed_proposals: HashMap::new(),
-                threshold_signers: initial_threshold_signers,
-                threshold_value: initial_threshold_value,
-                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
-                    context_id.clone(),
-                    Arc::clone(&deps.clock),
-                ),
-            },
-        },
+        // Shared fresh-context governance bucket (create + spawn-from-Welcome
+        // build the identical set — see `state::fresh_governance_state`).
+        governance: crate::context::state::fresh_governance_state(
+            governance_engine,
+            &params,
+            initial_members,
+            &context_id,
+            Arc::clone(&deps.clock),
+        ),
         role_state,
         receive_buffer: ReceiveBuffer::new(),
         payment_receipts: VecDeque::new(),
@@ -1482,7 +1693,10 @@ pub async fn create_context(
         epoch: EpochState {
             mls_epoch: 0,
             coordinator: EpochCoordinator::new(),
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
+            // Native runtime injects the production SystemClock (ADR-057 §Prereq-2).
+            grace_store: scp_mls::epoch_grace::EpochGraceStore::with_clock(std::sync::Arc::new(
+                scp_clock::SystemClock,
+            )),
             needs_reconnect: false,
         },
         access: AccessControlState {
@@ -1510,21 +1724,22 @@ pub async fn create_context(
         routing: create_routing,
         // ADR-049 commit 8: fresh actor-shape tracker at creation.
         send_tracker: SendSequenceTracker::new(),
-        // ADR-049 Phase 2A finalization keystone (commit 12 phase 2A
+        // ADR-049 Phase 2A finalization keystone (ADR-049 §15 phase 2A
         // finalization — type unification): the actor-owned state fields
         // start in their fresh-instance shapes. `event_log` is `None`
         // until the first event lands; the in-memory RFC-6962 Merkle
         // tree above is the proof-generation surface and is populated
         // lazily by the messaging handler.
         recv_tracker: RecvSequenceTracker::new(),
-        // B-owned cross-context tool-invoke validation state (spec §6.2.4):
-        // fresh on creation/import; repopulated when a gated tool interface is
+        // B-owned cross-context outlet-invoke validation state (spec §6.2.4):
+        // fresh on creation/import; repopulated when a gated outlet interface is
         // established. Not rehydrated from any snapshot — reconstructable
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: crate::context::actor::state::ClassSState {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
+            xctx_committed_stream_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
             // Caller-side cross-context reservation reversal records (spec §6.2.4):
             // fresh on create; cross-node import DROPS them (caller economy is
@@ -1533,6 +1748,10 @@ pub async fn create_context(
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
                 crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
+            // §7.3.8 value-caveat counters: fresh on create.
+            caveat_counters: HashMap::new(),
+            // Fix-D streaming reservation recovery records: fresh on create.
+            stream_reservations: HashMap::new(),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -1540,6 +1759,36 @@ pub async fn create_context(
         event_log: None,
         mode,
     };
+
+    // #2148 (ADR-049 birth-into-actor) CREATE seam: `builder::create_context`
+    // above BIRTHS the MLS group + local sender key as OWNED material (Encrypted
+    // mode only) and RETURNS it — no provider map is touched, so there is no
+    // insert-then-`take_crypto_state` round-trip and no cross-map check-then-insert
+    // to race (#2167 TOCTOU is impossible by construction). Deleting the provider's
+    // `contexts`/`taken_context_ids` maps removes ONE redundant guard; it does NOT
+    // make the registry write-lock insert the sole double-birth authority. The
+    // durable double-birth / divergence authority is the global `bootstrap_spawn_lock`
+    // (serializes all births node-wide) together with the supervisor's Precheck A
+    // (live-actor) + Precheck D (durable first-writer-wins), which run UNDER that
+    // lock; the registry write-lock insert at spawn guards only the in-memory
+    // registry slot. SEED the owned crypto onto the actor's `PerContextState`
+    // BEFORE the actor spawns — structurally
+    // identical to the restore seam, leaving NO window where a live actor holds an
+    // empty group. The send-sequence counter starts fresh at 0 for a newly-born
+    // group (`OwnedMlsCryptoState::send_sequence == 0`), which `from_persisted`
+    // inside `seed_encrypted_crypto_from_owned` installs. Broadcast contexts carry
+    // `None` (the builder births no MLS group; the actor's `BroadcastState`, seeded
+    // by `init_broadcast_context` above, is the authoritative broadcast-key home),
+    // so nothing is seeded and the `Broadcast` mode stands. The two are exactly
+    // anti-correlated (Encrypted ⇔ `Some` ⇔ `!create_is_broadcast`).
+    debug_assert_eq!(
+        created_owned_crypto.is_some(),
+        !create_is_broadcast,
+        "owned crypto is present iff the context is Encrypted (non-broadcast)"
+    );
+    if let Some(owned) = created_owned_crypto {
+        per_context.seed_encrypted_crypto_from_owned(owned);
+    }
 
     // ADR-049 Phase 2A finalization owned-state spawn: the create path
     // no longer writes the legacy contexts DashMap. It hands the freshly
@@ -1572,11 +1821,11 @@ pub async fn create_context(
 /// `create`/`restore` bootstrap paths register through
 /// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state)
 /// (owned-state spawn — no legacy contexts `DashMap` write); `import`
-/// still registers through
-/// [`SupervisorHandle::replace_context`](crate::context::supervisor::handle::SupervisorHandle::replace_context)
-/// +
-/// [`SupervisorHandle::spawn_actor_for_context`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_for_context)
-/// pending its actor-native replaceability primitive. Every surface
+/// registers through the actor-native replacement gate
+/// [`SupervisorHandle::dispatch_prepare_for_replace`](crate::context::supervisor::handle::SupervisorHandle::dispatch_prepare_for_replace)
+/// followed by
+/// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state).
+/// Every surface
 /// `finalize_create` touches is mailbox-based — gauges, the
 /// governance-timeout interval task, persistence/broadcast, and the TTL
 /// timer all reach the freshly-spawned actor through the supervisor
@@ -1588,23 +1837,22 @@ pub async fn finalize_create(
     handle: &ContextHandle,
 ) {
     deps.supervisor.update_context_gauges().await;
-    // Install the governance-timeout interval task on the freshly-spawned
-    // actor via the mailbox (registry + EvaluateTimeouts tick — no
-    // DashMap reach).
-    crate::context::governance_helpers::start_governance_timeout_task(&deps.supervisor, context_id)
-        .await;
+    // The governance-timeout interval is ACTOR-OWNED (ADR-049 Decision-1 /
+    // finding A3): the freshly-spawned actor's `reconcile_timers` arms a
+    // 60 s interval while the context is `Active` — no bootstrap mailbox
+    // install is needed.
     deps.supervisor
         .persist_context_and_broadcast(context_id)
         .await;
-    if let Some(duration) = ttl_duration {
+    if ttl_duration.is_some() {
         // Install the TTL timer by mailboxing StartTtlTimer to the
         // freshly-spawned actor: the actor owns `state.ttl.timer` and
         // installs the timer task on its own state (registry + mailbox
         // tick — no DashMap reach).
         deps.supervisor
-            // Create path: anchor the convergent expiry deadline on the
-            // creator-assigned creation timestamp + params.ttl.
-            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration, true)
+            // Create path: no explicit deadline — the actor handler derives the
+            // convergent `creation_timestamp_secs + params.ttl` deadline.
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), None)
             .await;
     }
 }
@@ -1631,14 +1879,21 @@ fn generate_initial_access_key_store(
 // ---------------------------------------------------------------------------
 
 /// §23.17 Invariant 3/4 — the SINGLE floor-guarded crypto-restore path for
-/// import. Captures per-sender epoch floors BEFORE teardown, tears down the
-/// old crypto, restores the incoming `mls_state` (if any), then validates that
-/// no per-sender floor regresses and merges the local floors back (max-merge).
-/// Rolls the restored crypto back on a regression so no half-restored or
-/// floor-regressed state persists. EVERY import crypto-restore site — the
-/// actor-side `PrepareForReplace` handler AND the supervisor-side fresh /
-/// stale-handle branches of `import_context` — routes through here so the
-/// replay (floor-regression) guard cannot be bypassed by any path.
+/// import / respawn / restore. Tears down the old transient crypto, restores the
+/// incoming `mls_state` (if any) — recovering the Class-M floors it carried —
+/// then merges those floors INTO the authoritative Supervisor-owned Class-M
+/// registry (ADR-049 PR-6). Rolls the restored crypto back on a rejected merge
+/// so no half-restored or floor-regressed state persists. EVERY import
+/// crypto-restore site — the actor-side `PrepareForReplace` handler AND the
+/// supervisor-side fresh / stale-handle branches of `import_context` — routes
+/// through here so the replay (floor-regression) guard cannot be bypassed.
+///
+/// The registry is the authoritative live floor home and is NOT torn down here,
+/// so there is no pre-teardown "capture" step: the snapshot floors are the merge
+/// INPUT (`incoming`) and the live registry floors are the merge target. The
+/// registry merge guards on `incoming.is_empty()` (NOT the live floors), so a
+/// COLD restart (empty live registry, non-empty snapshot) still POPULATES the
+/// registry — closing the cold-restart replay window (D2).
 ///
 /// # Errors
 ///
@@ -1647,55 +1902,193 @@ fn generate_initial_access_key_store(
 /// - `true` — restoring the node's OWN snapshot (Invariant 2): crash recovery,
 ///   actor respawn (`Supervisor::respawn_from_snapshot`), process restart
 ///   (`restore_all_contexts`). A lower restored floor is the expected
-///   coalesce-lag case and is MAX-merged with the live floor; the restore
-///   PROCEEDS (never rejected for a regression). Only an overshoot beyond
-///   `MAX_EPOCH_ADVANCE` (corrupt/garbage snapshot) is rejected.
+///   coalesce-lag case and is MAX-merged with the live registry floor; the
+///   restore PROCEEDS (never rejected for a regression). Only an overshoot
+///   beyond `MAX_EPOCH_ADVANCE` (corrupt/garbage snapshot) is rejected.
 /// - `false` — importing an UNTRUSTED peer snapshot (Invariant 3): any
 ///   per-sender floor regression is rejected (snapshot-mediated replay guard).
 ///
-/// Returns `ContextError::PersistenceFailed` if `restore_crypto_state` fails,
-/// or `ContextError::SnapshotFloorRegression` (the §23.17 replay-protection
-/// rejection — whatever `validate_and_merge_epoch_floors` returns) if a
-/// per-sender floor regresses (import path) or overshoots (both paths); the
-/// restored crypto is rolled back first.
+/// Returns `Ok(Some(owned))` with the rebuilt OWNED crypto material for the
+/// caller to seed onto a `PerContextState` (`import_context`), or `Ok(None)`
+/// when the snapshot carried no MLS group (keyless / needs-reconnect). A
+/// terminating caller (`PrepareForReplace`) drops the returned owned material —
+/// it still runs the floor gate below but seeds nothing (ADR-049 PR-7 C3
+/// seed-vs-terminal resolution).
+///
+/// `trusted_local` selects the spec §23.17.2 merge semantics:
+///
+/// - `true` — restoring the node's OWN snapshot (Invariant 2): crash recovery,
+///   actor respawn, process restart. A lower restored floor is the expected
+///   coalesce-lag case and is MAX-merged; the restore PROCEEDS (never rejected
+///   for a regression). Only an overshoot beyond `MAX_EPOCH_ADVANCE` is rejected.
+/// - `false` — importing an UNTRUSTED peer snapshot (Invariant 3): any per-sender
+///   floor regression is rejected (snapshot-mediated replay guard).
+///
+/// # Errors
+///
+/// Returns `ContextError::PersistenceFailed` if the crypto rebuild fails, or
+/// `ContextError::CryptoFailed` (from `From<FloorAdvanceError>`, the §23.17
+/// replay-protection rejection the registry's `validate_and_merge_*` sink
+/// returns) if a per-sender floor regresses (import path) or overshoots (both
+/// paths); the just-built owned crypto is dropped on rejection (the `SenderKey`
+/// zeroizes; the `ScpMlsGroup` / Ed25519 signer is freed, not zeroized - #82) and
+/// the registry is left unchanged (atomic).
 pub(in crate::context) fn restore_crypto_state_with_floor_guard(
     deps: &ActorDeps,
     ctx_id_bytes: &[u8; 32],
     mls_state: &[u8],
     trusted_local: bool,
-) -> Result<(), ContextError> {
-    // §23.17 Inv 2/3: capture the LIVE floors BEFORE destroying crypto state.
-    // A mailbox/handle despawn does NOT tear down the supervisor-owned crypto
-    // provider, so these live pre-crash floors are still authoritative and are
-    // the max-merge input (Class M, ADR-049 §9).
-    let local_epoch_floors = deps.crypto.export_sender_key_epochs(ctx_id_bytes);
+) -> Result<Option<crate::crypto::mls::provider::OwnedMlsCryptoState>, ContextError> {
+    // ADR-049 PR-6 (read-authority switch): the AUTHORITATIVE Class-M floors
+    // live in the Supervisor-owned registry, which is NOT torn down by a
+    // mailbox/handle despawn or a crypto restore. So there is no pre-teardown
+    // "live capture" to take — the live floors are ALREADY in the registry and
+    // are the max-merge target.
+    //
+    // #2148 (ADR-049 birth-into-actor): the crypto is ACTOR-owned end to end —
+    // the provider holds NO per-context state at all (its `contexts` map and the
+    // `destroy_mls_group` / `destroy_sender_key` teardown methods are DELETED).
+    // This helper builds the restored crypto as OWNED material via
+    // `build_restored_owned` (which touches no provider map) and RETURNS it for
+    // the caller to seed (`import_context`) or drop (`PrepareForReplace`,
+    // terminal). There is no stale provider-resident crypto to tear down first —
+    // by construction no provider residency can exist.
 
-    let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
-    let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
-
-    if !mls_state.is_empty() {
-        deps.crypto
-            .restore_crypto_state(ctx_id_bytes, mls_state)
+    // Build the restored transient crypto as OWNED material (MLS group +
+    // sender-key MATERIAL) and recover the Class-M floors the snapshot carried —
+    // including the legacy back-compat lower bound — as the merge INPUT
+    // (`incoming`). An empty `mls_state` yields no owned crypto and empty floors
+    // (cold path / keyless needs-reconnect snapshot).
+    let (owned, restored) = if mls_state.is_empty() {
+        (
+            None,
+            crate::crypto::mls::provider::RestoredFloors::default(),
+        )
+    } else {
+        let (owned, floors) = deps
+            .crypto
+            .build_restored_owned(ctx_id_bytes, mls_state)
             .map_err(|e| {
                 ContextError::PersistenceFailed(format!("import: crypto state restore failed: {e}"))
             })?;
-    }
+        (Some(owned), floors)
+    };
 
-    // §23.17 Inv 2/3/4: merge the live floors back. `trusted_local=true` max-
-    // merges and proceeds (Inv 2 — respawn of own snapshot); `false` rejects
-    // any regression (Inv 3 — untrusted peer import). Either way the merged
-    // floor is never below the live floor (Inv 4). Roll back on failure.
-    if let Err(e) = deps.crypto.validate_and_merge_epoch_floors(
-        ctx_id_bytes,
-        local_epoch_floors,
-        crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
-        trusted_local,
-    ) {
-        let _ = deps.crypto.destroy_mls_group(ctx_id_bytes);
-        let _ = deps.crypto.destroy_sender_key(ctx_id_bytes);
-        return Err(e);
+    // Map the restore's `trusted_local` bool to the registry merge's §23.17.2
+    // `MergePolicy` (identical mapping to the deleted provider twin): a
+    // trusted-local respawn max-merges and tolerates the coalesce-lag regression
+    // (Inv-2); an untrusted import rejects any regression (Inv-3). BOTH enforce
+    // the epoch-poisoning overshoot ceiling.
+    let policy = if trusted_local {
+        scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal
+    } else {
+        scp_protocol::crypto::sender_keys::MergePolicy::RejectRegression
+    };
+
+    // THE D2 sink: merge the snapshot floors (`incoming`) INTO the authoritative
+    // registry (`local` = the live, non-torn-down registry). ONE cross-axis
+    // validating merge — BOTH the epoch AND the recv-sequence floors are validated
+    // before EITHER is applied, so a rejection on either axis leaves the WHOLE
+    // registry entry UNCHANGED (cross-axis atomicity; a prior sequential
+    // two-merge form could commit the epoch axis then reject the recv axis with no
+    // rollback). The merge guards on `incoming.is_empty()` — NOT on the live
+    // floors — so on a COLD restart (empty live registry, NON-empty snapshot) it
+    // RUNS and POPULATES the registry, closing D2. FAIL-CLOSED via `.map_err(..)?`
+    // (rollback-on-Err), NOT log-and-drop. `From<FloorAdvanceError>` maps a
+    // rejection to `ContextError::CryptoFailed`.
+    //
+    // Rollback: on rejection the just-built `owned` material is dropped at the `?`
+    // return (the `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not
+    // zeroized - #82) so no floor-regressed / half-restored state persists (BUG-1
+    // atomicity). The registry itself is left UNCHANGED (validate-before-apply,
+    // across both axes). Fail-closed by construction: a rejected restore is never
+    // seeded onto an actor and writes no durable snapshot, so it cannot resurrect a
+    // divergent second group for this id (there is no provider `taken_context_ids`
+    // marker; #2148 deleted it, and `build_restored_owned` sets none).
+    deps.supervisor
+        .validate_and_merge_all_floors(
+            ctx_id_bytes,
+            restored.sender_epochs,
+            restored.recv_sequence,
+            scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+            policy,
+        )
+        .map_err(ContextError::from)?;
+
+    Ok(owned)
+}
+
+/// Verifies a joined or rehydrated MLS group's committed `scp_context_params`
+/// (`0xFF02`) group-context extension against the context's declared identity
+/// and parameters (spec §5.13.3, finding FFI-02).
+///
+/// This is the single binding check shared by every point where an SCP context
+/// group enters the live provider from a *caller-supplied* description of its
+/// parameters:
+///
+/// - **join** (`Supervisor::spawn_actor_from_welcome`) — the joiner reads the
+///   just-joined group's extension (before install) and verifies it against the
+///   `WelcomeJoinRequest.params` the (untrusted) inviter supplied;
+/// - **import** (`import_context`) and **restore / respawn** (`restore_context`)
+///   — the layer reads the *rehydrated* group's extension and verifies it
+///   against the snapshot's `context_params`.
+///
+/// It enforces validation **rule 1** (every SCP context group MUST carry the
+/// `0xFF02` extension) plus **rules 2–6** (`context_id`, governance / ceiling
+/// hashes, ceiling policy, mode, parent structure) and **rule 8** (the committed
+/// genesis `creator_did` MUST equal the presented `creator_did`) via
+/// [`ScpContextExtension::verify_against`](scp_protocol::context::ScpContextExtension::verify_against).
+/// The extension is folded into the MLS key schedule at group creation, so it
+/// is the group's cryptographic attestation of its own parameters: a malicious
+/// inviter (or a forged / internally-inconsistent snapshot) that presents
+/// benign `params` while the real group commits divergent
+/// governance / ceiling / mode / `context_id` is refused here, *before* any
+/// authority (governance engine, ceiling, admin set) is built from those
+/// params.
+///
+/// `creator_did` is the genesis creator/admin the caller presents — the
+/// (untrusted) bundle's `creator_did` on a Welcome-based join, or the snapshot's
+/// `role_state.creator_did` on import/restore. Rule 8 refuses the group unless
+/// it equals the `creator_did` the group cryptographically committed at
+/// creation, so no authority is ever built for a substituted admin (the sole
+/// anchor for DID-less governance models such as `SingleAdmin`).
+///
+/// `read` is the group-context-extension read outcome: `Ok(Some(ext))` =
+/// present, `Ok(None)` = absent (a rule-1 violation — not an SCP context),
+/// `Err(msg)` = the group is unreadable / the `0xFF02` payload is malformed.
+/// On rejection the returned reason is prefixed with `site` so each caller can
+/// wrap it in its site-idiomatic [`ContextError`] variant while sharing this
+/// one check. Returns `Ok(())` only when the extension is present AND every
+/// binding rule holds.
+pub(in crate::context) fn verify_scp_context_binding(
+    read: Result<Option<scp_protocol::context::ScpContextExtension>, String>,
+    context_id: &str,
+    creator_did: &str,
+    params: &scp_protocol::context::ContextParams,
+    site: &str,
+) -> Result<(), String> {
+    match read {
+        Ok(Some(ext)) => ext
+            .verify_against(
+                &context_id.to_owned(),
+                &scp_did::DID::from(creator_did.to_owned()),
+                params,
+            )
+            .map_err(|e| {
+                format!(
+                    "{site} refused: scp_context_params (0xFF02) binding mismatch \
+                     (§5.13.3 rules 2-6, 8): {e}"
+                )
+            }),
+        Ok(None) => Err(format!(
+            "{site} refused: the MLS group carries no scp_context_params (0xFF02) \
+             group-context extension — not an SCP context (§5.13.3 rule 1)"
+        )),
+        Err(e) => Err(format!(
+            "{site} refused: scp_context_params (0xFF02) group-context extension \
+             unreadable (§5.13.3): {e}"
+        )),
     }
-    Ok(())
 }
 
 /// Imports a previously exported context.
@@ -1704,7 +2097,9 @@ pub(in crate::context) fn restore_crypto_state_with_floor_guard(
 /// restores crypto state with the epoch-floor regression guard
 /// ([`restore_crypto_state_with_floor_guard`]), builds a fresh
 /// `PerContextState` from the snapshot, and spawns an owned-state actor.
-/// Re-spawns the TTL timer if the export carried `ttl_remaining_secs`.
+/// Re-spawns the TTL timer if the context carries a finite `params.ttl`,
+/// re-arming the absolute convergent `ttl_deadline_secs` (or its
+/// `creation + ttl` fallback).
 ///
 /// # Errors
 ///
@@ -1735,6 +2130,46 @@ pub async fn import_context(
     // `ContextError::SnapshotSignatureInvalid`, distinct from the event-log
     // Merkle failure and from the version gate.
     crate::context::export_import::validate_export_for_import(&export, verifying_key)?;
+
+    // SINGLE-SOURCE TTL-DEADLINE (ADR-049 §9, E3): reject a future-dated
+    // `creation_timestamp_secs` BEFORE any side effect. The create base is the
+    // prune-immune `creation_timestamp_secs + params.ttl` from the creator-signed
+    // snapshot. `creation_timestamp_secs` is authenticated (the export signature +
+    // `exporter_did == creator_did` binding were verified in
+    // `validate_export_for_import` above), but a MALICIOUS creator can still
+    // future-date their OWN creation instant to smuggle a long absolute
+    // key-destruction deadline (`future + ttl`). A future-dated creation is
+    // malformed — REJECT the import fail-closed HERE, at the very top, so the
+    // rejection is genuinely SIDE-EFFECT-FREE: it must run BEFORE
+    // `restore_crypto_state_with_floor_guard` (which installs an MLS group AND
+    // sets the §23.17 replay floor from the future-dated snapshot epoch) and
+    // BEFORE `import_event_log_data` (which persists the foreign log). Rejecting
+    // AFTER those would orphan a resident MLS group + a persisted foreign log with
+    // no teardown, and — worse — the replay floor already pinned from the
+    // future-dated epoch could floor-reject a later LEGITIMATE import/restore of
+    // the same context_id (griefing/DoS). This check only reads the (already
+    // signature-validated) `creation_timestamp_secs` and the local clock, both
+    // available immediately. A small clock-skew tolerance mirrors the anti-spam
+    // snapshot validators below so a benignly-ahead exporter clock is not
+    // rejected. (Forged `TtlExtended` EXTENSION leaves beyond consent remain the
+    // creator-trust boundary cross-member convergence catches — the
+    // import-legibility follow-up, #2102.)
+    {
+        let now_for_future_date_gate = deps.clock.now_secs();
+        if export.snapshot.creation_timestamp_secs
+            > now_for_future_date_gate
+                .saturating_add(scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS)
+        {
+            return Err(ContextError::PersistenceFailed(format!(
+                "import: creation_timestamp_secs {} is future-dated beyond import time {} \
+                 (+{}s skew tolerance) — refusing a malformed export that could smuggle a \
+                 long TTL key-destruction deadline (ADR-049 §9)",
+                export.snapshot.creation_timestamp_secs,
+                now_for_future_date_gate,
+                scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+            )));
+        }
+    }
 
     // `import_context` reconstructs authoritative context state and is only
     // meaningful for a full-scope export. A public-scope export
@@ -1798,7 +2233,7 @@ pub async fn import_context(
     // A broadcast-mode export has no per-member pseudonym (spec §5.14) and
     // cannot be re-homed as encrypted without silently fabricating routing
     // state, so reject it loudly with the canonical SCP-CTX-2092 envelope
-    // rather than accepting it and degrading the routing axis. All four bridges
+    // rather than accepting it and degrading the routing axis. All three bridges
     // therefore fail import on a broadcast export identically (by `.code`).
     if matches!(
         export.snapshot.context_params.mode,
@@ -1813,7 +2248,10 @@ pub async fn import_context(
     }
 
     let context_id = export.snapshot.context_id.clone();
-    let ctx_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
+    // ADR-056: resolve the imported (64-hex) id to its canonical digest so the
+    // import-path crypto cleanup keys under the same bytes the context's live
+    // `PerContextState.context_id` will hold (set below via the same resolver).
+    let ctx_id_bytes = state::context_id_to_bytes(&context_id);
 
     // 2. Existing-context replaceability check + crypto state cleanup,
     // actor-native. If a context actor is already registered for this id,
@@ -1826,18 +2264,23 @@ pub async fn import_context(
     // fresh spawn below.
     if deps.supervisor.lookup(&context_id).is_some() {
         // Crypto state is read from the SIGNED snapshot field (ADR-050: all
-        // importer-restored state lives in the signed preimage), never from
-        // an unsigned envelope blob. Validated by `validate_export_for_import`
-        // above.
+        // importer-restored state lives in the signed preimage), never from an
+        // unsigned envelope blob. Validated by `validate_export_for_import` above.
+        // `PrepareForReplace` runs the §23.17 epoch-floor validate/merge GATE
+        // inside the prior actor (rejecting a floor-regressed replay BEFORE the
+        // actor claims itself terminal — a replayed import must never terminate a
+        // context). ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C3 seed-vs-terminal: that
+        // TERMINATING actor seeds NO crypto onto itself (it is exiting); the
+        // unified owned-crypto restore + seed below is done by THIS import flow
+        // onto the fresh `PerContextState`.
         match deps
             .supervisor
             .dispatch_prepare_for_replace(&context_id, export.snapshot.mls_crypto_state.clone())
             .await
         {
             Ok(()) => {
-                // Prior actor tore down + restored crypto (floor-guarded,
-                // inside the handler) and is exiting. Remove its handle so the
-                // respawn slot is vacant.
+                // Prior actor ran the floor gate and claimed itself terminal;
+                // remove its dead handle so the respawn slot is vacant.
                 let _ = deps.supervisor.despawn_actor(&context_id).await;
             }
             // ONLY a stale/unreachable handle routes to recovery. The prior
@@ -1856,38 +2299,71 @@ pub async fn import_context(
                         "context '{context_id}' import: existing actor unreachable"
                     )));
                 }
-                // Slot vacant — restore crypto through the SAME floor-guarded
-                // path the actor handler uses, so the replay guard still runs.
-                // Read from the SIGNED snapshot field, never an unsigned
-                // envelope blob (ADR-050).
-                // IMPORT path: untrusted peer snapshot → Invariant 3
-                // (reject-on-regression). `trusted_local = false`.
-                restore_crypto_state_with_floor_guard(
-                    deps,
-                    &ctx_id_bytes,
-                    &export.snapshot.mls_crypto_state,
-                    false,
-                )?;
+                // Slot vacant — fall through to the unified restore below.
             }
             Err(other) => return Err(other),
         }
-    } else {
-        // Fresh import (no existing actor): floor-guarded crypto restore (the
-        // empty-crypto-state case is a no-op restore + floor merge inside the
-        // helper). Read from the SIGNED snapshot field (ADR-050). IMPORT path:
-        // untrusted peer snapshot → Invariant 3 (reject-on-regression).
-        restore_crypto_state_with_floor_guard(
-            deps,
-            &ctx_id_bytes,
-            &export.snapshot.mls_crypto_state,
-            false,
-        )?;
+    }
+
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C3 fold: rebuild the imported MLS crypto
+    // as OWNED material (NO provider insert) and run the §23.17 replay-floor gate.
+    // This is the SINGLE import-side restore for every branch above (a fresh
+    // import, or a prior actor that was gated + despawned). IMPORT path: untrusted
+    // peer snapshot → Invariant 3 (reject-on-regression), `trusted_local = false`.
+    // An empty (keyless / needs-reconnect) snapshot yields `None` — no group is
+    // seeded until a reconnect Welcome arrives. The owned group is bound-verified
+    // just below and seeded onto the fresh `PerContextState` at "6b" further down.
+    let imported_owned = restore_crypto_state_with_floor_guard(
+        deps,
+        &ctx_id_bytes,
+        &export.snapshot.mls_crypto_state,
+        false,
+    )?;
+
+    // §5.13.3 rule 1 (FFI-02, load-time binding). A non-empty restored crypto
+    // blob yields OWNED MLS group material (`imported_owned`, ADR-049 PR-7 C3 —
+    // no longer provider-resident). Verify that the group's committed
+    // `scp_context_params` (`0xFF02`) extension binds the SAME context_id +
+    // governance / ceiling / mode the SIGNED snapshot declares, BEFORE the
+    // authoritative `PerContextState` (governance engine, ceiling, membership) is
+    // built from those snapshot params below. The snapshot signature
+    // authenticates the EXPORTER's identity — not the internal consistency of its
+    // `context_params` field against the MLS group embedded in `mls_crypto_state`;
+    // this closes that gap. A group with no `0xFF02` (not an SCP context) or any
+    // rule 2-6 mismatch is rejected as a forged/corrupt import; the owned material
+    // is dropped (the `SenderKey` zeroizes; the group / signer is freed, not
+    // zeroized - #82) so no forged crypto is ever seeded (mirrors the
+    // restore path's own rejection and the Welcome-join pre-install rejection). A
+    // keyless (needs-reconnect) snapshot has `None` owned material and no group to
+    // bind, so it is skipped — its group arrives later via a reconnect Welcome,
+    // which verifies on the join path.
+    if let Some(owned) = &imported_owned
+        && let Err(reason) = verify_scp_context_binding(
+            owned
+                .mls_group
+                .group_context_extension()
+                .map_err(|e| e.to_string()),
+            &context_id,
+            export.snapshot.role_state.creator_did.as_str(),
+            &export.snapshot.context_params,
+            "context import",
+        )
+    {
+        // On rejection the `imported_owned` material is dropped here (the
+        // `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not zeroized -
+        // #82) so no forged crypto is seeded; fail-closed by construction - the
+        // rejected crypto is never seeded onto the actor and no durable snapshot is
+        // written (there is no longer a provider `taken_context_ids` marker; #2148
+        // deleted it). Read the extension from the OWNED group (ADR-049 PR-7 C3 - no
+        // longer provider-resident).
+        return Err(ContextError::ImportRejected { reason });
     }
 
     // 3. Import event log data if present.
     if !export.event_log_data.is_empty() {
         deps.event_log
-            .import_event_log_data(&ctx_id_bytes, &export.event_log_data)?;
+            .import_event_log_data(&ctx_id_bytes, &export.event_log_data)
+            .await?;
     }
 
     // 4. Reconstruct the ContextHandle.
@@ -1896,7 +2372,7 @@ pub async fn import_context(
     // Transition to the state from the snapshot.
     match &export.snapshot.state {
         ContextState::Active => {
-            handle.transition_to(&ContextState::Active).await?;
+            handle.transition_to(&ContextState::Active)?;
         }
         ContextState::Creating => {
             // Already in Creating state, nothing to do.
@@ -1928,6 +2404,13 @@ pub async fn import_context(
     // "pre-consume" future capacity) are rejected; stale entries
     // are clamped. Matches restore_context policy verbatim.
     let now_for_validation = deps.clock.now_secs();
+
+    // NOTE: the future-dated `creation_timestamp_secs` reject (ADR-049 §9, E3) was
+    // hoisted to the TOP of `import_context` (right after
+    // `validate_export_for_import`) so it runs BEFORE any crypto/event-log side
+    // effect — see that block for the full rationale (F2). It is NOT re-checked
+    // here.
+
     let hrl_config = export
         .snapshot
         .hard_rate_limit_config
@@ -1982,7 +2465,7 @@ pub async fn import_context(
     }
 
     // C3: Clamp imported `cooldown_until` to a bounded horizon and drop
-    // entries with out-of-range rule indices, mirroring the WASM bridge
+    // entries with out-of-range rule indices, per the
     // `validate_imported_snapshot` policy.
     let mut sanitized_cooldown_until = export.snapshot.cooldown_until.clone();
     crate::context::lifecycle_logic::sanitize_cooldown_until(
@@ -2037,6 +2520,10 @@ pub async fn import_context(
     // (`broadcast_context: None` below). Derive the actor's `members` set
     // from the imported membership snapshot — `members()` enumerates the
     // current member DIDs in the post-validation `MembershipState`.
+    //
+    // ADR-056: `PerContextState.context_id` is the canonical 32-byte DIGEST —
+    // DECODE the imported (64-hex) id rather than re-hash it, so the restored
+    // crypto keys under the same digest the original creation did.
     let context_id_bytes = state::context_id_to_bytes(&context_id);
     let actor_members: HashSet<DID> = export
         .snapshot
@@ -2051,21 +2538,23 @@ pub async fn import_context(
     // not-yet-announced non-FFI bootstrap path (e.g. a test fixture) and maps to
     // the reserved sentinel via `build_routing` (see its doc comment).
     let import_routing = build_routing(false, local_pseudonym);
-    let per_context = PerContextState {
+    let mut per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
         // Convergent creator-assigned creation time, consumed VERBATIM from the
         // creator-signed export snapshot (§7.3.1, §9.9.3). The signature and the
         // `exporter_did == creator_did` binding were verified in
         // `validate_export_for_import` before we reach this builder, so the value
-        // is authenticated. We do NOT re-pin it to importer-local `now()`
-        // (unlike the `pending_*` `observed_at` timestamps below): its only
-        // consumer is the TTL expiry deadline (`creation + ttl`, an UPPER bound),
-        // where backdating only shortens the lifetime (fail-safe) and
-        // future-dating is bounded by `ttl`. Re-pinning would re-introduce the
-        // import-time divergence this field exists to close. The TTL timer is
-        // armed with `anchor_deadline_to_creation = true` (convergent arming)
-        // below.
+        // is authenticated. Pass-4e (ADR-049 §9, E1/E3): this field IS the TTL
+        // deadline BASE — `convergent_ttl_deadline` derives the arm from
+        // `creation_timestamp_secs + params.ttl` (re-armed below), NOT from the
+        // prunable event-log `ContextCreated` leaf. A malicious creator cannot
+        // smuggle a long absolute key-destruction deadline via a future-dated
+        // base because a future-dated `creation_timestamp_secs` is REJECTED at the
+        // top of `import_context` (the E3 future-date gate) — the durable fix that
+        // replaced pass-4d's in-memory `min(genesis_ts, import_now)` genesis-leaf
+        // clamp (which was reversed on the next restart). There is NO clamp on
+        // this path anymore; the reject is the whole guard.
         creation_timestamp_secs: export.snapshot.creation_timestamp_secs,
         generation: 0, // assigned by SupervisorHandle on insert.
         handle: handle.clone(),
@@ -2085,15 +2574,14 @@ pub async fn import_context(
             next_proposal_seq: 0,
             approved_proposals: HashMap::new(),
             freeze: export.snapshot.governance_freeze,
-            timeout_task: GovernanceTimeoutTask::new(),
             deadlock: DeadlockDetectionState::default(),
             // SECURITY: `observed_at` re-pinned to local import time (see the
             // sanitization above) so a backdated signed export cannot collapse
             // the §5.3.2 / §19.3 notification window on import.
             pending_ceiling_modification: sanitized_pending_ceiling_modification,
             pending_economic_policy_change: sanitized_pending_economic_policy_change,
-            registered_tools: export.snapshot.registered_tools,
-            tool_interfaces: export.snapshot.tool_interfaces,
+            registered_outlets: export.snapshot.registered_outlets,
+            outlet_interfaces: export.snapshot.outlet_interfaces,
             pruning_policy: export.snapshot.pruning_policy,
             message_pricing: validated_message_pricing,
             hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
@@ -2144,7 +2632,10 @@ pub async fn import_context(
                 export.snapshot.epoch_coordination_records,
                 &context_id,
             ),
-            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
+            // Native runtime injects the production SystemClock (ADR-057 §Prereq-2).
+            grace_store: scp_mls::epoch_grace::EpochGraceStore::with_clock(std::sync::Arc::new(
+                scp_clock::SystemClock,
+            )),
             needs_reconnect: false,
         },
         access: AccessControlState {
@@ -2191,14 +2682,15 @@ pub async fn import_context(
         // strips it to empty; a full import deliberately drops it too so a
         // foreign saga cannot drive local Commit/Abort.
         recv_tracker: RecvSequenceTracker::new(),
-        // B-owned cross-context tool-invoke validation state (spec §6.2.4):
-        // fresh on creation/import; repopulated when a gated tool interface is
+        // B-owned cross-context outlet-invoke validation state (spec §6.2.4):
+        // fresh on creation/import; repopulated when a gated outlet interface is
         // established. Not rehydrated from any snapshot — reconstructable
         // interface state, never authorization secrecy.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: crate::context::actor::state::ClassSState {
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
+            xctx_committed_stream_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
             // Caller-side cross-context reservation reversal records (spec §6.2.4):
             // fresh on create; cross-node import DROPS them (caller economy is
@@ -2207,6 +2699,10 @@ pub async fn import_context(
             xctx_nonce_dedup: scp_protocol::crypto::sender_keys::NonceDedup::with_ttl(
                 crate::context::actor::handlers::saga::SAGA_NONCE_DEDUP_TTL_SECS,
             ),
+            // §7.3.8 value-caveat counters: fresh on create.
+            caveat_counters: HashMap::new(),
+            // Fix-D streaming reservation recovery records: fresh on create.
+            stream_reservations: HashMap::new(),
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -2214,6 +2710,21 @@ pub async fn import_context(
         event_log: None,
         mode: ContextModeState::Encrypted(Box::<ContextCryptoState>::default()),
     };
+
+    // 6b. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C3 import seed: SEED the OWNED crypto
+    //     material rebuilt + floor-gated + binding-verified above directly onto
+    //     the imported actor state before spawn — no provider round-trip, no
+    //     `take_crypto_state` (`build_restored_owned` hands the crypto out as
+    //     OWNED material and touches no provider map; the double-birth guard is the
+    //     supervisor registry's atomic first-writer-wins insert, not a provider
+    //     `taken_context_ids` marker - #2148 deleted that map). A keyless /
+    //     needs-reconnect snapshot yielded
+    //     `None` — nothing to seed; the actor keeps its default-empty encrypted
+    //     mode until a reconnect Welcome arrives. (Import is encrypted-only — a
+    //     broadcast export is rejected at the top of this function.)
+    if let Some(owned) = imported_owned {
+        per_context.seed_encrypted_crypto_from_owned(owned);
+    }
 
     // 7. Register the imported context as an owned-state actor.
     //
@@ -2232,33 +2743,49 @@ pub async fn import_context(
 
     deps.supervisor.update_context_gauges().await;
 
-    // Start governance timeout task (ADR-031 §5) via the actor mailbox.
-    crate::context::governance_helpers::start_governance_timeout_task(
-        &deps.supervisor,
-        &context_id,
-    )
-    .await;
+    // Governance timeouts (ADR-031 §5) are ACTOR-OWNED (ADR-049
+    // Decision-1 / finding A3): the spawned actor's `reconcile_timers`
+    // arms the 60 s interval while `Active` — no bootstrap install needed.
 
     // 8. Persist if persistence is configured.
     deps.supervisor
         .persist_context_and_broadcast(&context_id)
         .await;
 
-    // 9. Re-spawn TTL timer if there was remaining TTL. Mailbox
-    // StartTtlTimer to the freshly-spawned actor (registry + mailbox
-    // tick — no DashMap reach).
-    if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
-        let duration = std::time::Duration::from_secs(remaining_secs);
+    // 9. Re-arm the TTL timer through the partitioned single-source deadline
+    // (ADR-049 §9). The create BASE + PROMOTION come from the PRUNE-IMMUNE,
+    // creator-signed snapshot: the base is `export.snapshot.creation_timestamp_secs
+    // + params.ttl`, and a promoted import has `params.ttl == None` ⇒ `None` (no
+    // arm), disarming a promoted import at the source (H1) — no `memory_scope`
+    // gate. `creation_timestamp_secs` is authenticated (the export signature +
+    // `exporter_did == creator_did` binding were verified in
+    // `validate_export_for_import`) AND is REJECTED above if future-dated beyond
+    // import time (E3), so a malicious creator cannot smuggle a long absolute
+    // key-destruction deadline via the base. The prunable log (Merkle-validated
+    // against the creator-signed `snapshot.event_log_merkle_root` before any field
+    // was read — verify-before-restore, ADR-050) is read ONLY for the fail-safe
+    // `TtlExtended` extension term. This DISSOLVES the M3 attack class: a malicious
+    // exporter could sign an over-long `ttl_deadline_secs` scalar (`creation + 1yr`
+    // while `params.ttl = 1h`), but the scalar is never consulted — the base is
+    // `creation + 1h`.
+    //
+    // KNOWN RESIDUAL (import-legibility surface, tracked in #2102 — NOT closed
+    // here): the fail-safe extension term is read from the foreign log WITHOUT
+    // leaf-level authentication, so a forged `TtlExtended` leaf with a far-future
+    // `new_deadline_unix` can LENGTHEN the imported deadline beyond consent. That
+    // is the creator-trust boundary cross-member convergence catches (an honest
+    // member's log carries no such leaf); durable leaf-level authz is deferred
+    // with the rest of the import-legibility surface (#2102). The base-future-
+    // dating + pruning vectors pass-4d listed here are CLOSED (E1/E3).
+    let import_log_entries: Vec<scp_event_log::Event> =
+        rmp_serde::from_slice(&export.event_log_data).unwrap_or_default();
+    if let Some(deadline) = crate::context::ttl_close_helpers::convergent_ttl_deadline(
+        &import_log_entries,
+        export.snapshot.creation_timestamp_secs,
+        handle.params().ttl.map(|t| t.as_secs()),
+    ) {
         deps.supervisor
-            // Import path: arm the CONVERGENT deadline. The signed export
-            // snapshot now carries the creator-assigned `creation_timestamp_secs`
-            // (consumed verbatim above), so the importer reconstructs the
-            // identical `creation + ttl` deadline every member computes (§7.3.1,
-            // §9.9.3). `duration` remains the local sleep interval (= the
-            // persisted `ttl_remaining_secs`); only the recorded leaf deadline is
-            // the convergent value, so a timer-fired `ContextExpired`/
-            // `ContextClosed` leaf no longer diverges by importer-local skew.
-            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), duration, true)
+            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), Some(deadline))
             .await;
     }
 
@@ -2277,7 +2804,7 @@ pub async fn import_context(
 /// provider is configured, no snapshot exists, or the load operation
 /// fails.
 #[allow(dead_code)] // Transitive of `restore_context` — see bootstrap rationale.
-pub fn load_persisted_context_state(
+pub async fn load_persisted_context_state(
     deps: &ActorDeps,
     context_id: &str,
     preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
@@ -2299,6 +2826,7 @@ pub fn load_persisted_context_state(
         None => deps
             .persistence
             .load_context(context_id)
+            .await
             .map_err(|e| {
                 ContextError::PersistenceFailed(format!(
                     "failed to load context state for {context_id}: {e}"
@@ -2311,32 +2839,45 @@ pub fn load_persisted_context_state(
             })?,
     };
 
-    let broadcast_ctx = deps
-        .persistence
-        .load_broadcast(context_id)
-        .map_err(|e| {
-            ContextError::PersistenceFailed(format!(
-                "failed to load broadcast state for {context_id}: {e}"
-            ))
-        })?
+    // Broadcast security + roster state now rides the fail-closed `ContextSnapshot`
+    // (ADR-049 §9 / §5.14.8 block-before-serve). It is no longer loaded through a
+    // separate best-effort row; it deserializes atomically with `read_exclusion_list`
+    // from the one snapshot, so a block / governance ban / key-epoch advance that
+    // persisted fail-closed is present on restore by construction.
+    let mut broadcast_ctx = ctx_snapshot
+        .broadcast
+        .clone()
         .map(scp_protocol::context::broadcast::BroadcastContext::from_snapshot);
+
+    // Restore-path reconciliation (§5.14.8 block-before-serve, defense-in-depth).
+    // Re-apply the durable `read_exclusion_list` (written ONLY by governance-ban
+    // `execute_revoke`, fail-closed) into the restored broadcast block state: for
+    // each excluded DID, drop from the subscriber registry + insert into every
+    // author's block list. This closes any window where the restored per-author
+    // block lists and the exclusion set could disagree (author registered after
+    // the ban; legacy snapshot). A per-author UNILATERAL block does NOT write
+    // `read_exclusion_list`, so this reconciliation cannot rescue that arm — that
+    // is why the per-author block persists fail-closed at block time.
+    if let Some(bc) = broadcast_ctx.as_mut() {
+        bc.apply_read_exclusions(ctx_snapshot.read_exclusion_list.iter());
+    }
 
     Ok((ctx_snapshot, broadcast_ctx))
 }
 
 /// Best-effort event log restore from persistence.
 #[allow(dead_code)] // Transitive of `restore_context` — see bootstrap rationale.
-fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
+async fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
     use crate::context::state::context_id_to_bytes;
     let ctx_id_bytes = context_id_to_bytes(context_id);
-    if let Err(e) = deps.event_log.restore_event_log(&ctx_id_bytes) {
+    if let Err(e) = deps.event_log.restore_event_log(&ctx_id_bytes).await {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
             "failed to restore event log from persistence; \
              context will start with an empty event log"
         );
-        let _ = deps.event_log.init_event_log(&ctx_id_bytes);
+        let _ = deps.event_log.init_event_log(&ctx_id_bytes).await;
     }
 }
 
@@ -2351,7 +2892,8 @@ fn restore_event_log_best_effort(deps: &ActorDeps, context_id: &str) {
 /// [`SupervisorHandle::spawn_actor_with_state`](crate::context::supervisor::handle::SupervisorHandle::spawn_actor_with_state),
 /// which spawns an actor that OWNS the rehydrated state and registers
 /// its handle in the supervisor registry (no legacy contexts `DashMap`
-/// write). Re-spawns the TTL timer if `ttl_remaining_secs` is `Some`.
+/// write). Re-spawns the TTL timer if the context carries a finite
+/// `params.ttl`, re-arming the absolute convergent deadline.
 ///
 /// `preloaded_snapshot` lets the watchdog respawn path
 /// (`Supervisor::respawn_from_snapshot`) hand in the `ContextSnapshot` it
@@ -2373,7 +2915,7 @@ pub async fn restore_context(
     handle: &ContextHandle,
     preloaded_snapshot: Option<crate::context::state::ContextSnapshot>,
 ) -> Result<(), ContextError> {
-    use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+    use crate::context::governance::timeout::DeadlockDetectionState;
     use crate::context::lifecycle_logic::{
         derive_message_pricing, sanitize_cooldown_until, validate_consequence_rules_for_import,
     };
@@ -2385,8 +2927,8 @@ pub async fn restore_context(
     use scp_protocol::context::membership::ReceiveBuffer;
 
     let (mut ctx_snapshot, broadcast_ctx) =
-        load_persisted_context_state(deps, context_id, preloaded_snapshot)?;
-    restore_event_log_best_effort(deps, context_id);
+        load_persisted_context_state(deps, context_id, preloaded_snapshot).await?;
+    restore_event_log_best_effort(deps, context_id).await;
 
     validate_consequence_rules_for_import(
         &ctx_snapshot.consequence_rules,
@@ -2423,44 +2965,128 @@ pub async fn restore_context(
         now_for_cooldown,
         "restore",
     );
-    let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
+    // Resolve the ABSOLUTE convergent TTL re-arm deadline through the partitioned
+    // single-source deadline (§5.10 / §5.10.1, ADR-049 §9). The create BASE and
+    // PROMOTION come from the PRUNE-IMMUNE snapshot (`creation_timestamp_secs` +
+    // `params.ttl`): a finite `params.ttl` ⇒ base `creation + ttl`; a promoted
+    // context has `params.ttl == None` ⇒ `None` (no re-arm), and that promotion
+    // signal survives even a fully-pruned log. The prunable event log (hydrated by
+    // `restore_event_log_best_effort` above) is read ONLY for the fail-safe
+    // `TtlExtended` extension term (losing one only shortens). This REPLACES the
+    // old trio of independent sources: the persisted `ttl_deadline_secs` scalar
+    // (now a runtime cache, re-derived here, not trusted), the `creation + ttl`
+    // `.or_else` fallback, and the `memory_scope != Full` gate at the dispatch
+    // site (H1). `creation_timestamp_secs` is captured here — before the
+    // per-context builder consumes `ctx_snapshot` fields — off the `Copy` field.
+    let restore_ctx_id_bytes = context_id_to_bytes(context_id);
+    let restore_creation_ts = ctx_snapshot.creation_timestamp_secs;
+    let restore_log_entries = deps
+        .event_log
+        .event_log_entries(&restore_ctx_id_bytes)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let restore_ttl_deadline = crate::context::ttl_close_helpers::convergent_ttl_deadline(
+        &restore_log_entries,
+        restore_creation_ts,
+        handle.params().ttl.map(|t| t.as_secs()),
+    );
 
     let governance_engine =
         restore_governance_engine_from_snapshot(&ctx_snapshot, Arc::clone(&deps.key_resolver))?;
     let (grace_store, needs_reconnect) =
         restore_grace_store_from_snapshot(context_id, &ctx_snapshot);
 
+    // #2148 (ADR-049 birth-into-actor) restore/respawn/cold-restart seam:
+    // rehydrate the per-context MLS crypto as OWNED material and SEED it directly
+    // onto the actor's `PerContextState` below (`build_restored_owned` → merge
+    // floors → `seed_encrypted_crypto_from_owned`). This is the RESPAWN
+    // (`Supervisor::respawn_from_snapshot`) AND COLD-RESTART
+    // (`restore_all_contexts`) path — both reach here through `restore_context`.
+    // `build_restored_owned` restores the node-level wrapping keypair as a `&self`
+    // side effect (OBS-2 — NOT side-effect-free) but touches NO provider
+    // per-context state (the provider holds none — its `contexts` map is DELETED).
+    // The actor is the SOLE crypto authority by construction; there is no
+    // provider-resident second home to tear down first.
+    let mut restored_owned: Option<crate::crypto::mls::provider::OwnedMlsCryptoState> = None;
     if !ctx_snapshot.mls_crypto_state.is_empty() {
         let ctx_id_bytes = context_id_to_bytes(context_id);
-        // §23.17 Invariant 3/4 (replay guard): route the crypto restore through
-        // the floor-regression guard, NOT bare `restore_crypto_state`. This
-        // path is shared by process-restart restore AND the watchdog respawn
-        // (`Supervisor::respawn_from_snapshot`). A respawn rehydrates from the
-        // last COALESCED snapshot, which may lag the live per-sender epoch
-        // floors by up to one coalesce interval (ADR-049 §9). Restoring such a
-        // snapshot with a bare `restore_crypto_state` would silently lower a
-        // per-sender replay floor — re-opening a replay window for any sender
-        // whose epoch advanced after the snapshot was written. The guard
-        // captures the LIVE floors (still held by the crypto provider, which a
-        // mailbox despawn does not tear down) before teardown, restores the
-        // snapshot crypto, then MAX-merges the live floors back. This is the
-        // node restoring its OWN snapshot (Invariant 2, `trusted_local = true`):
-        // a coalesce-lagged snapshot whose floor trails the live floor is the
-        // NORMAL case (an epoch advanced in the ≤50ms pre-crash window), so the
-        // restore MUST max-merge and PROCEED — rejecting it (Invariant 3, the
-        // untrusted-import policy) would fail the respawn and poison a healthy
-        // context. Only an overshoot beyond `MAX_EPOCH_ADVANCE` (corrupt
-        // snapshot) is rejected. The merged floor is never below the live
-        // floor, so a stale snapshot still cannot regress the replay floor.
-        restore_crypto_state_with_floor_guard(
-            deps,
-            &ctx_id_bytes,
-            &ctx_snapshot.mls_crypto_state,
-            true,
-        )?;
+
+        // §23.17 Invariant 2 (trusted-local self-respawn / process-restart):
+        // reconstruct the per-context MLS crypto MATERIAL + the Class-M floors the
+        // snapshot carried, returned OWNED (no provider insert). A respawn
+        // rehydrates from the last COALESCED snapshot, which may lag the live
+        // per-sender epoch floors by up to one coalesce interval (ADR-049 §9); the
+        // max-merge below tolerates that lag.
+        let (owned, restored_floors) = deps
+            .crypto
+            .build_restored_owned(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)
+            .map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "restore: crypto state restore failed: {e}"
+                ))
+            })?;
+
+        // THE D2 sink (OBS-1 / CM-005): max-merge the SNAPSHOT floors (`incoming`)
+        // INTO the authoritative Supervisor-owned registry (`local` = the live,
+        // never-torn-down registry). ONE cross-axis validating merge — BOTH the
+        // epoch AND the recv-sequence floors are validated before EITHER is
+        // applied, so a rejection on either axis leaves the WHOLE registry entry
+        // unchanged. This is the node restoring its OWN snapshot
+        // (`MaxMergeTrustedLocal`): a coalesce-lagged floor that trails the live
+        // floor is the NORMAL case, so the merge MAX-merges and PROCEEDS (never
+        // rejected for a lower restored floor); only a corrupt overshoot beyond
+        // `MAX_EPOCH_ADVANCE` is rejected. The merged floor is never below the
+        // live floor, so a stale snapshot cannot regress the replay floor. This
+        // routes the cold-restart (empty-registry) floors through the SAME sink,
+        // closing the D2 replay window on first boot. FAIL-CLOSED via
+        // `.map_err(..)?`. On rejection the just-built `owned` material is dropped
+        // here (the `SenderKey` zeroizes; the `ScpMlsGroup` / signer is freed, not
+        // zeroized - #82); fail-closed by construction - a rejected restore is never
+        // seeded and writes no durable snapshot, so the id cannot resurrect a
+        // divergent second group. #2148 deleted the provider `taken_context_ids`
+        // marker this comment referenced, and `build_restored_owned` sets none.
+        deps.supervisor
+            .validate_and_merge_all_floors(
+                &ctx_id_bytes,
+                restored_floors.sender_epochs,
+                restored_floors.recv_sequence,
+                scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+                scp_protocol::crypto::sender_keys::MergePolicy::MaxMergeTrustedLocal,
+            )
+            .map_err(ContextError::from)?;
+
+        // §5.13.3 rule 1 (FFI-02, load-time binding). Verify the rehydrated
+        // group's committed `scp_context_params` (`0xFF02`) extension binds the
+        // SAME context_id + governance / ceiling / mode the snapshot's
+        // `context_params` declares, BEFORE the authoritative `PerContextState`
+        // is rebuilt from those params below. This is the trusted self-respawn /
+        // process-restart path, so the primary threat is on-disk snapshot
+        // corruption/divergence rather than a hostile peer — but rule 1 still
+        // holds on load: a restored group that is not a `0xFF02`-carrying SCP
+        // context, or whose committed params diverge, is a corrupt snapshot and
+        // is rejected. Read the extension from the OWNED group (it is no longer
+        // provider-resident). On rejection the `owned` material is dropped (the
+        // `SenderKey` zeroizes; the group / signer is freed, not zeroized - #82);
+        // fail-closed by construction - the rejected crypto is never seeded, so no
+        // divergent crypto persists (no provider taken-marker exists post-#2148).
+        if let Err(reason) = verify_scp_context_binding(
+            owned
+                .mls_group
+                .group_context_extension()
+                .map_err(|e| e.to_string()),
+            context_id,
+            ctx_snapshot.role_state.creator_did.as_str(),
+            &ctx_snapshot.context_params,
+            "context restore",
+        ) {
+            return Err(ContextError::PersistenceFailed(reason));
+        }
+
+        restored_owned = Some(owned);
     }
 
-    let last_members: HashSet<scp_identity::DID> = ctx_snapshot
+    let last_members: HashSet<scp_did::DID> = ctx_snapshot
         .membership
         .members()
         .map(|m| m.did.clone())
@@ -2523,6 +3149,10 @@ pub async fn restore_context(
     // snapshot's broadcast state was reloadable (`broadcast_ctx` is
     // `Some(BroadcastContext)` for broadcast contexts, `None` for
     // encrypted). Members come from the membership snapshot.
+    //
+    // ADR-056: `PerContextState.context_id` is the canonical 32-byte DIGEST —
+    // DECODE the (64-hex) id rather than re-hash it, so the rehydrated crypto
+    // keys under the same digest the live context used before the restart.
     let context_id_bytes = state::context_id_to_bytes(context_id);
     let actor_members: HashSet<DID> = ctx_snapshot
         .membership
@@ -2562,7 +3192,7 @@ pub async fn restore_context(
     // precisely why a destructure-and-rebuild is no longer possible here — and
     // why it is no longer needed.
     let restored_routing = ctx_snapshot.routing;
-    let per_context = PerContextState {
+    let mut per_context = PerContextState {
         context_id: context_id_bytes,
         created_at: deps.clock.now_secs(),
         // Convergent creator-assigned creation time, restored VERBATIM from the
@@ -2571,8 +3201,8 @@ pub async fn restore_context(
         // expiry deadline (`creation + ttl`) identical to what the context had
         // before the restart, so the timer-fired `ContextExpired`/`ContextClosed`
         // leaf stays convergent across members (§7.3.1, §9.9.3). The TTL timer is
-        // re-armed with `anchor_deadline_to_creation = true` (convergent arming)
-        // below.
+        // re-armed below on the ABSOLUTE convergent deadline (the persisted
+        // `ttl_deadline_secs`, or the `creation + ttl` fallback).
         creation_timestamp_secs: ctx_snapshot.creation_timestamp_secs,
         // Placeholder — `spawn_actor_with_state` overwrites this
         // unconditionally with a fresh monotonic `spawn_generation`
@@ -2589,12 +3219,11 @@ pub async fn restore_context(
                 .max(ctx_snapshot.approved_proposals.len() as u64),
             approved_proposals: ctx_snapshot.approved_proposals,
             freeze: ctx_snapshot.governance_freeze,
-            timeout_task: GovernanceTimeoutTask::new(),
             deadlock: DeadlockDetectionState::default(),
             pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
             pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
-            registered_tools: ctx_snapshot.registered_tools,
-            tool_interfaces: ctx_snapshot.tool_interfaces,
+            registered_outlets: ctx_snapshot.registered_outlets,
+            outlet_interfaces: ctx_snapshot.outlet_interfaces,
             pruning_policy: ctx_snapshot.pruning_policy,
             message_pricing: validated_message_pricing,
             hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
@@ -2675,7 +3304,7 @@ pub async fn restore_context(
         // scratchpad is genuinely transient and restarts fresh.
         recv_tracker: RecvSequenceTracker::new(),
         // B-owned UCAN proof index (spec §6.2.4) is NOT in the Class-S snapshot:
-        // it is reconstructable interface state, repopulated when the tool
+        // it is reconstructable interface state, repopulated when the outlet
         // interface is (re-)established.
         xctx_ucan_proofs: scp_protocol::crypto::ucan::validate::InMemoryProofResolver::new(),
         class_s: crate::context::actor::state::ClassSState {
@@ -2686,9 +3315,9 @@ pub async fn restore_context(
                 .collect(),
             // ADR-049 §9 Class S: same-node restore REHYDRATES B's anti-replay
             // nonce-dedup cache (spec §6.2.4 "Freshness / anti-replay"). It is the
-            // ONLY gate against a fresh-`SagaId` replay of a `CrossContextToolInvoke`
+            // ONLY gate against a fresh-`SagaId` replay of a `CrossContextOutletInvoke`
             // within the dedup TTL; reinitializing it empty on restore would let
-            // a crash inside the window re-open a charging-tool replay (BLACK-624-01).
+            // a crash inside the window re-open a charging-outlet replay (BLACK-624-01).
             // Per-entry TTL is pruned lazily on the next freshness check. Cross-node
             // import drops it (the snapshot field is empty), so a foreign node starts
             // its own window. Rehydrated with the SAGA dedup TTL (strictly longer
@@ -2702,15 +3331,31 @@ pub async fn restore_context(
             // durable Commit-B output captures (spec §6.2.4 "Exactly-once execution
             // with durable output capture") so a Commit replayed after a crash
             // re-emits the STORED output + the IDENTICAL receipt rather than
-            // re-invoking the tool. The live `CommittedToolInvocation` is public (no
+            // re-invoking the outlet. The live `CommittedOutletInvocation` is public (no
             // §9.4.3 bearer), so the snapshot stores it directly — no mirror.
             xctx_committed_outputs: ctx_snapshot.xctx_committed_outputs,
+            xctx_committed_stream_outputs: ctx_snapshot.xctx_committed_stream_outputs,
             xctx_committed_invocations: ctx_snapshot.xctx_committed_invocations,
             // ADR-049 §9 Class S (spec §6.2.4): same-node restore REHYDRATES the
             // caller-side durable reservation reversal records so a crash-recovery
             // abort can reverse the caller deduction + void the escrow from the
             // record. Dropped on cross-node import (caller economy is local).
             xctx_caller_reservations: ctx_snapshot.xctx_caller_reservations,
+            // §7.3.8 Class S: same-node restore REHYDRATES the value-caveat
+            // counters so a consumed `max_calls` / `amount_max_cumulative` /
+            // `rate_window` cap survives a crash rather than un-consuming (which
+            // would re-open the spend/rate window). Pruning of the rate-window
+            // ring buffer runs lazily on the next consume against the restored
+            // wall clock, so a restart can only ever DROP stale timestamps —
+            // never widen a window. Cross-node public export strips this map.
+            caveat_counters: ctx_snapshot.caveat_counters,
+            // Fix-D Class S: same-node restore REHYDRATES the streaming
+            // reservation recovery records so the post-restore reconcile sweep
+            // can RELEASE the escrow hold + cumulative counter reserve of any
+            // stream whose off-mailbox pump survived the crash (its close-time
+            // settle lands on the respawned generation and is dropped). Cross-
+            // node public export strips this map (invoker economy is local).
+            stream_reservations: ctx_snapshot.stream_reservations,
         },
         pending_broadcast_publishes: HashMap::new(),
         welcome_scratchpad: None,
@@ -2718,6 +3363,21 @@ pub async fn restore_context(
         event_log: None,
         mode,
     };
+
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C2: SEED the rehydrated owned crypto onto
+    // the actor state (the actor is the SOLE crypto authority). This installs the
+    // MLS group + local sender key (wrapping the non-optional owned payload in
+    // `Some`, since a fresh Create actor spawns before its group exists) and
+    // RESUMES the send-sequence counter via `SendSequenceTracker::from_persisted`
+    // — NONCE-SAFETY: the send counter picks up from the persisted high-water
+    // mark, NEVER resets (a reset would make the actor re-issue an already-emitted
+    // (epoch, send_sequence) AAD pairing on the next seal). Floors are NOT seeded
+    // here — the Supervisor-owned Class-M registry is authoritative and was
+    // already merged above. Broadcast contexts carry no MLS crypto
+    // (`restored_owned` is `None`) and keep their reconstructed `Broadcast` mode.
+    if let Some(owned) = restored_owned {
+        per_context.seed_encrypted_crypto_from_owned(owned);
+    }
 
     // ADR-049 Phase 2A finalization owned-state spawn: restore mirrors
     // create — hand the rehydrated `PerContextState` directly to
@@ -2731,24 +3391,60 @@ pub async fn restore_context(
         .await
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-    // Start governance timeout task (ADR-031 §5) via the actor mailbox.
-    crate::context::governance_helpers::start_governance_timeout_task(&deps.supervisor, context_id)
-        .await;
+    // Fix-D — restore-time streaming crash-recovery sweep. The actor is now
+    // resident with its Class-S state rehydrated (including any
+    // `stream_reservations` records). Drive the reconcile ON the freshly-
+    // respawned actor: it RELEASES the durable escrow hold + §7.3.8 cumulative
+    // counter reserve of any stream whose off-mailbox pump survived the crash
+    // (that pump's close-time settle now lands on the bumped generation and is
+    // dropped) and clears the records. This is the streaming analog of the
+    // §6.2.4 saga reconciliation, but scoped to the SAME restored context —
+    // streaming has no cross-context saga journal, and the reservation is this
+    // context's OWN owned state, so it runs regardless of generation. Best-
+    // effort: a dispatch miss (context despawned again) leaves the records for
+    // the next restart's sweep (idempotent) rather than failing the restore.
+    match deps
+        .supervisor
+        .reconcile_stream_reservations_via_actor(context_id)
+        .await
+    {
+        Ok(reconciled) if reconciled > 0 => {
+            tracing::info!(
+                context_id = %context_id,
+                reconciled,
+                "Fix-D: released stranded streaming reservations on restore \
+                 (pump survived a crash — escrow + cumulative counter reserve refunded)"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                context_id = %context_id,
+                "Fix-D: streaming reservation reconcile on restore failed \
+                 (records left for the next restart's sweep): {err}"
+            );
+        }
+    }
 
-    // Re-spawn TTL timer if there was remaining TTL. Mailbox
-    // StartTtlTimer to the freshly-spawned actor (registry + mailbox
-    // tick — no DashMap reach).
-    if let Some(remaining_secs) = ttl_remaining {
-        let duration = std::time::Duration::from_secs(remaining_secs);
+    // Governance timeouts (ADR-031 §5) are ACTOR-OWNED (ADR-049
+    // Decision-1 / finding A3): the spawned actor's `reconcile_timers`
+    // arms the 60 s interval while `Active` — no bootstrap install needed.
+
+    // Re-arm the TTL timer from the single authoritative source. Mailbox
+    // StartTtlTimer to the freshly-spawned actor (registry + mailbox tick — no
+    // DashMap reach) IFF the `convergent_ttl_deadline` computed above
+    // (`restore_ttl_deadline`) is `Some`. A `None` means either no finite TTL or
+    // a PROMOTED context — in both cases the timer stays disarmed. Pass-4e
+    // (ADR-049 §9): the disarm decision reads `params.ttl == None` (the SOLE
+    // prune-immune promotion authority), NOT the `ContextPromoted` event-log leaf
+    // — that leaf is a RECORD only and is not consulted for the arm. This is the
+    // H1 fix at the source: it replaces the fragile `memory_scope != Full` gate
+    // (which mis-classified a created-`Full`+ttl broadcast context as permanent
+    // and left it stuck-open). A past deadline arms a `sleep(0)` idempotent
+    // re-close, which is correct.
+    if let Some(deadline) = restore_ttl_deadline {
         deps.supervisor
-            // Restore path: arm the CONVERGENT deadline. The persisted snapshot
-            // now carries the creator-assigned `creation_timestamp_secs`
-            // (restored verbatim above), so the reloaded timer records the same
-            // `creation + ttl` deadline it had before the restart (§7.3.1,
-            // §9.9.3). `duration` remains the local sleep interval (= the
-            // persisted `ttl_remaining_secs`); only the recorded leaf deadline is
-            // the convergent value.
-            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration, true)
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), Some(deadline))
             .await;
     }
 
@@ -2759,8 +3455,8 @@ pub async fn restore_context(
 // Supervisor-iterating sweep entry points (Phase 2A finalization)
 // ===========================================================================
 //
-// These are the non-legacy replacements for the `_legacy` lifecycle
-// sweep helpers in `lifecycle_helpers_legacy.rs`. Each iterates
+// These replaced the now-deleted legacy lifecycle sweep helpers
+// (the `lifecycle_helpers_legacy` module is gone). Each iterates
 // [`Supervisor::actor_ids`](crate::context::supervisor::Supervisor::actor_ids)
 // (the actor registry — NOT the legacy `Supervisor::contexts` DashMap)
 // and dispatches one typed sweep command per actor via the per-actor
@@ -2772,7 +3468,7 @@ pub async fn restore_context(
 // payload from snapshot and calls `Supervisor::restore_context`,
 // which routes the bootstrap variant through
 // `dispatch_lifecycle_direct` (the only legitimate caller of the
-// bootstrap-shape legacy helpers per ADR-049 §7 allowlist).
+// bootstrap-shape helpers per ADR-049 §7 allowlist).
 //
 // Per-actor sweep bodies live in
 // [`crate::context::actor::handlers::lifecycle`] as `handle_*_actor`
@@ -2807,13 +3503,13 @@ pub async fn restore_all_contexts(
             "no persistence provider configured".into(),
         ));
     };
-    let context_ids = persistence.list_persisted_contexts().map_err(|e| {
+    let context_ids = persistence.list_persisted_contexts().await.map_err(|e| {
         ContextError::PersistenceFailed(format!("failed to list persisted contexts: {e}"))
     })?;
 
     let mut restored = Vec::new();
     for ctx_id in &context_ids {
-        let ctx_snapshot = match persistence.load_context(ctx_id) {
+        let ctx_snapshot = match persistence.load_context(ctx_id).await {
             Ok(Some(snap)) => snap,
             Ok(None) => continue,
             Err(e) => {
@@ -2973,6 +3669,19 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
         // lookup still reports the poison until an operator clears it or the
         // process restarts.
         supervisor.reap_crash_window(ctx_id);
+        // Drop the authoritative Class-M floor registry entry on the same
+        // teardown sweep (ADR-049) — the floor-registry twin of the crash-window
+        // reap above. Harmless-but-tidy here (the whole Supervisor is about to be
+        // dropped), but it keeps the registry floors' lifecycle aligned 1:1 with
+        // crash_windows and leaves no per-context registry entry behind after a
+        // shutdown sweep.
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(ctx_id);
+        supervisor.remove_context_floors(&ctx_id_bytes);
+        // Drop the per-context stream admission-tracker registry entry on the
+        // same teardown sweep (spec §5.4.5) — the streaming twin of the
+        // crash-window / floor-registry reaps above, keeping the admission
+        // registry from leaking past a shutdown.
+        supervisor.reap_stream_admission(ctx_id);
     }
 
     // Supervisor-level state clear. Acquired under the write_lock once
@@ -2991,15 +3700,14 @@ pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supe
 
     supervisor.clear_wrapping_keys();
 
-    if let Some(task_set) = supervisor.task_set_ref() {
-        let mut tasks = task_set.lock().await;
-        tasks.abort_all();
-    }
+    // No supervisor timer JoinSet to abort: TTL / governance timers are
+    // ACTOR-OWNED arms (ADR-049 finding A3). Despawning each actor above
+    // drops its inbox sender, so its `run()` loop exits and its owned timer
+    // arms are dropped with the task — no separate teardown needed.
 
     tracing::info!(
         removed_count = context_ids.len(),
-        "shutdown: removed all contexts via actor mailbox, cleared identity registries, \
-         and aborted background tasks"
+        "shutdown: removed all contexts via actor mailbox and cleared identity registries"
     );
 }
 
@@ -3054,7 +3762,7 @@ mod restore_reconcile_tests {
         clippy::too_many_lines,
         // Test-only capturing persistence: the `Mutex<HashMap>` is never held
         // across `.await` (writes/reads are synchronous trait methods), so a
-        // plain `std::sync::Mutex` is the right tool. The runtime's actor path
+        // plain `std::sync::Mutex` is the right outlet. The runtime's actor path
         // bans it (ADR-049); test fixtures are explicitly exempt. See
         // crates/scp-runtime/clippy.toml.
         clippy::disallowed_types
@@ -3063,8 +3771,8 @@ mod restore_reconcile_tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use scp_identity::DID;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_did::DID;
+    use scp_platform::in_memory::InMemoryStorage;
     use scp_protocol::context::broadcast::BroadcastContextSnapshot;
     use scp_protocol::context::params::{ContextMode, ContextParams};
     use scp_protocol::context::{ContextError, builder::ContextCreationError};
@@ -3080,31 +3788,33 @@ mod restore_reconcile_tests {
 
     /// Connected no-op transport — `create_context` publishes through it.
     struct OkTransport;
+    #[async_trait::async_trait]
     impl ContextTransportProvider for OkTransport {
         fn is_connected(&self) -> bool {
             true
         }
-        fn publish_context(
+        async fn publish_context(
             &self,
             _id: &[u8; 32],
             _params: &ContextParams,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn send_message(&self, _id: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
+        async fn send_message(&self, _id: &[u8; 32], _payload: &[u8]) -> Result<(), ContextError> {
             Ok(())
         }
     }
 
     struct OkEventLog;
+    #[async_trait::async_trait]
     impl ContextEventLogProvider for OkEventLog {
-        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             _event: scp_event_log::EventType,
@@ -3114,7 +3824,7 @@ mod restore_reconcile_tests {
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
     }
@@ -3125,11 +3835,12 @@ mod restore_reconcile_tests {
     /// `append_context_event("MessageSent")` returns `Err` AFTER the caller has
     /// reserved a per-sender sequence — exercising the rollback this gate fixes.
     struct FailingAppendEventLog;
+    #[async_trait::async_trait]
     impl ContextEventLogProvider for FailingAppendEventLog {
-        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             _event: scp_event_log::EventType,
@@ -3141,47 +3852,34 @@ mod restore_reconcile_tests {
                 "fixture: event-log append deliberately fails".to_owned(),
             ))
         }
-        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
     }
 
-    /// Captures every snapshot/broadcast write so a real `create_context` can be
-    /// used to harvest a fully-formed, validation-passing `ContextSnapshot`.
+    /// Captures every snapshot write so a real `create_context` can be used to
+    /// harvest a fully-formed, validation-passing `ContextSnapshot` (broadcast
+    /// state now rides `ContextSnapshot::broadcast`, ADR-049 §9 fold).
     #[derive(Default)]
     struct CapturingPersistence {
         contexts: Mutex<HashMap<String, ContextSnapshot>>,
-        broadcasts: Mutex<HashMap<String, BroadcastContextSnapshot>>,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for CapturingPersistence {
-        fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
+        async fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
             self.contexts
                 .lock()
                 .unwrap()
                 .insert(id.to_owned(), s.clone());
             Ok(())
         }
-        fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+        async fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
             Ok(self.contexts.lock().unwrap().get(id).cloned())
         }
-        fn persist_broadcast(
-            &self,
-            id: &str,
-            s: &BroadcastContextSnapshot,
-        ) -> Result<(), PersistErr> {
-            self.broadcasts
-                .lock()
-                .unwrap()
-                .insert(id.to_owned(), s.clone());
+        async fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
             Ok(())
         }
-        fn load_broadcast(&self, id: &str) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
-            Ok(self.broadcasts.lock().unwrap().get(id).cloned())
-        }
-        fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
-            Ok(())
-        }
-        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+        async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
             Ok(self.contexts.lock().unwrap().keys().cloned().collect())
         }
     }
@@ -3190,28 +3888,19 @@ mod restore_reconcile_tests {
     /// can write through it while the test reads the harvested snapshot from the
     /// same backing store.
     struct SharedCapture(Arc<CapturingPersistence>);
+    #[async_trait::async_trait]
     impl ContextPersistence for SharedCapture {
-        fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
-            self.0.persist_context(id, s)
+        async fn persist_context(&self, id: &str, s: &ContextSnapshot) -> Result<(), PersistErr> {
+            self.0.persist_context(id, s).await
         }
-        fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
-            self.0.load_context(id)
+        async fn load_context(&self, id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+            self.0.load_context(id).await
         }
-        fn persist_broadcast(
-            &self,
-            id: &str,
-            s: &BroadcastContextSnapshot,
-        ) -> Result<(), PersistErr> {
-            self.0.persist_broadcast(id, s)
+        async fn delete_context(&self, id: &str) -> Result<(), PersistErr> {
+            self.0.delete_context(id).await
         }
-        fn load_broadcast(&self, id: &str) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
-            self.0.load_broadcast(id)
-        }
-        fn delete_context(&self, id: &str) -> Result<(), PersistErr> {
-            self.0.delete_context(id)
-        }
-        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
-            self.0.list_persisted_contexts()
+        async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+            self.0.list_persisted_contexts().await
         }
     }
 
@@ -3222,32 +3911,19 @@ mod restore_reconcile_tests {
     /// reconciliation cross-checks.
     struct ServingPersistence {
         snapshot: ContextSnapshot,
-        broadcast: Option<BroadcastContextSnapshot>,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for ServingPersistence {
-        fn persist_context(&self, _id: &str, _s: &ContextSnapshot) -> Result<(), PersistErr> {
+        async fn persist_context(&self, _id: &str, _s: &ContextSnapshot) -> Result<(), PersistErr> {
             Ok(())
         }
-        fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+        async fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
             Ok(Some(self.snapshot.clone()))
         }
-        fn persist_broadcast(
-            &self,
-            _id: &str,
-            _s: &BroadcastContextSnapshot,
-        ) -> Result<(), PersistErr> {
+        async fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
             Ok(())
         }
-        fn load_broadcast(
-            &self,
-            _id: &str,
-        ) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
-            Ok(self.broadcast.clone())
-        }
-        fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
-            Ok(())
-        }
-        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+        async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
             Ok(vec![])
         }
     }
@@ -3261,14 +3937,15 @@ mod restore_reconcile_tests {
     }
 
     fn build_supervisor(persistence: Box<dyn ContextPersistence>) -> Arc<Supervisor> {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkRestoreReconcile".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         Supervisor::with_providers(
             crypto,
             Box::new(OkTransport),
             Box::new(OkEventLog),
-            Arc::new(|_: &DID, _: scp_protocol::identity::SigningKeyId| None),
+            Arc::new(|_: &DID, _: scp_did::SigningKeyId| None),
             Some(persistence),
             None,
             None,
@@ -3277,20 +3954,23 @@ mod restore_reconcile_tests {
         )
     }
 
-    /// Creates a real context of the requested mode and returns the harvested
-    /// snapshot plus its broadcast snapshot (if any).
+    /// Creates a real context of the requested mode under `ctx_id` and returns
+    /// the harvested snapshot plus its broadcast snapshot (if any).
+    ///
+    /// The context is created under the SAME `ctx_id` the caller restores it
+    /// under, so the group's creator-committed `scp_context_params` (`0xFF02`)
+    /// extension binds that exact `context_id` — exactly as a real snapshot
+    /// does. This lets the load-time §5.13.3 binding check pass on the honest
+    /// round-trip (so the test then exercises the routing/mode reconciliation it
+    /// targets) instead of tripping on an unrealistic id/extension divergence.
     async fn harvest_snapshot(
+        ctx_id: &str,
         is_broadcast: bool,
     ) -> (ContextSnapshot, Option<BroadcastContextSnapshot>) {
         let capture = Arc::new(CapturingPersistence::default());
         // Box the same Arc-backed capture so we can both write (via supervisor)
         // and read (via this handle) the harvested snapshot.
         let supervisor = build_supervisor(Box::new(SharedCapture(Arc::clone(&capture))));
-        let ctx_id = if is_broadcast {
-            "harvest-bcast"
-        } else {
-            "harvest-enc"
-        };
         let params = if is_broadcast {
             ContextParams {
                 mode: ContextMode::Broadcast,
@@ -3322,7 +4002,9 @@ mod restore_reconcile_tests {
             .get(ctx_id)
             .cloned()
             .expect("create_context must persist a snapshot");
-        let broadcast = capture.broadcasts.lock().unwrap().get(ctx_id).cloned();
+        // Broadcast state rides the snapshot now (ADR-049 §9 fold) — read it back
+        // from `snapshot.broadcast`, not a separate persisted broadcast row.
+        let broadcast = snapshot.broadcast.clone();
         (snapshot, broadcast)
     }
 
@@ -3337,10 +4019,11 @@ mod restore_reconcile_tests {
     ) -> Result<(), ContextError> {
         snapshot.context_id = restore_ctx_id.to_owned();
         snapshot.routing = routing;
-        let serving = ServingPersistence {
-            snapshot,
-            broadcast: serve_broadcast,
-        };
+        // Broadcast state now rides the snapshot (ADR-049 §9 fold); the
+        // reconstructed mode is driven by `snapshot.broadcast` (Some → Broadcast,
+        // None → Encrypted), exactly the axis the reconciliation cross-checks.
+        snapshot.broadcast = serve_broadcast;
+        let serving = ServingPersistence { snapshot };
         let supervisor = build_supervisor(Box::new(serving));
         let deps = supervisor
             .build_actor_deps(&DID("did:dht:z6MkRestoreReconcile".to_owned()))
@@ -3354,12 +4037,13 @@ mod restore_reconcile_tests {
     /// persisted routing variant is `Broadcast` → fail closed.
     #[tokio::test]
     async fn restore_rejects_broadcast_routing_on_encrypted_reconstruction() {
-        let (enc_snapshot, _) = harvest_snapshot(false).await;
+        let ctx_id = "restore-case-broadcast-routing-encrypted-mode";
+        let (enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
         let err = restore_with(
             enc_snapshot,
             ContextRouting::for_mode(true, [0u8; 32]),
             None,
-            "restore-case-broadcast-routing-encrypted-mode",
+            ctx_id,
         )
         .await
         .expect_err("routing/mode disagreement must fail closed");
@@ -3373,13 +4057,14 @@ mod restore_reconcile_tests {
     /// but the persisted routing variant is `Pseudonymous` → fail closed.
     #[tokio::test]
     async fn restore_rejects_pseudonymous_routing_on_broadcast_reconstruction() {
-        let (bcast_snapshot, bcast_state) = harvest_snapshot(true).await;
+        let ctx_id = "restore-case-pseudonymous-routing-broadcast-mode";
+        let (bcast_snapshot, bcast_state) = harvest_snapshot(ctx_id, true).await;
         let bcast_state = bcast_state.expect("broadcast create must persist broadcast state");
         let err = restore_with(
             bcast_snapshot,
             ContextRouting::for_mode(false, [9u8; 32]),
             Some(bcast_state),
-            "restore-case-pseudonymous-routing-broadcast-mode",
+            ctx_id,
         )
         .await
         .expect_err("routing/mode disagreement must fail closed");
@@ -3394,16 +4079,12 @@ mod restore_reconcile_tests {
     /// broadcast state) → restore succeeds.
     #[tokio::test]
     async fn restore_succeeds_when_routing_agrees_with_mode() {
-        let (enc_snapshot, _) = harvest_snapshot(false).await;
+        let ctx_id = "restore-case-agreeing-encrypted";
+        let (enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
         let routing = enc_snapshot.routing.clone();
-        restore_with(
-            enc_snapshot,
-            routing,
-            None,
-            "restore-case-agreeing-encrypted",
-        )
-        .await
-        .expect("routing agreeing with mode must restore Ok");
+        restore_with(enc_snapshot, routing, None, ctx_id)
+            .await
+            .expect("routing agreeing with mode must restore Ok");
     }
 
     /// Restore must reject a persisted snapshot whose ceiling carries a malformed
@@ -3413,7 +4094,8 @@ mod restore_reconcile_tests {
     /// silently rehydrated.
     #[tokio::test]
     async fn restore_rejects_malformed_ceiling_entry() {
-        let (mut enc_snapshot, _) = harvest_snapshot(false).await;
+        let ctx_id = "restore-case-malformed-ceiling";
+        let (mut enc_snapshot, _) = harvest_snapshot(ctx_id, false).await;
         let routing = enc_snapshot.routing.clone();
         // Inject a malformed (no-colon) custom directly into the backing set via
         // the test-only ceiling accessor, bypassing the construction invariant the
@@ -3425,14 +4107,9 @@ mod restore_reconcile_tests {
             .insert(scp_protocol::context::roles::Capability::Custom(
                 "payments".to_owned(),
             ));
-        let err = restore_with(
-            enc_snapshot,
-            routing,
-            None,
-            "restore-case-malformed-ceiling",
-        )
-        .await
-        .expect_err("a malformed restored ceiling must fail closed");
+        let err = restore_with(enc_snapshot, routing, None, ctx_id)
+            .await
+            .expect_err("a malformed restored ceiling must fail closed");
         assert!(
             matches!(err, ContextError::PersistenceFailed(ref msg) if msg.contains("malformed")),
             "expected a PersistenceFailed citing the malformed ceiling, got {err:?}"
@@ -3450,154 +4127,28 @@ mod restore_reconcile_tests {
     /// paid-join fail-closed persist into its error path.
     #[derive(Default)]
     struct FailingJoinPersistence;
+    #[async_trait::async_trait]
     impl ContextPersistence for FailingJoinPersistence {
-        fn persist_context(&self, _id: &str, _snap: &ContextSnapshot) -> Result<(), PersistErr> {
+        async fn persist_context(
+            &self,
+            _id: &str,
+            _snap: &ContextSnapshot,
+        ) -> Result<(), PersistErr> {
             Err("forced persist failure".into())
         }
-        fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
+        async fn load_context(&self, _id: &str) -> Result<Option<ContextSnapshot>, PersistErr> {
             Ok(None)
         }
-        fn persist_broadcast(
-            &self,
-            _id: &str,
-            _snap: &BroadcastContextSnapshot,
-        ) -> Result<(), PersistErr> {
+        async fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
             Ok(())
         }
-        fn load_broadcast(
-            &self,
-            _id: &str,
-        ) -> Result<Option<BroadcastContextSnapshot>, PersistErr> {
-            Ok(None)
-        }
-        fn delete_context(&self, _id: &str) -> Result<(), PersistErr> {
-            Ok(())
-        }
-        fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
+        async fn list_persisted_contexts(&self) -> Result<Vec<String>, PersistErr> {
             Ok(Vec::new())
         }
     }
 
-    /// A `PaymentAdapter` that records whether `capture` or `void` was invoked,
-    /// so the money-ordering test can assert the escrow was VOIDED (not
-    /// captured) when the fail-closed persist fails. (Implementing the
-    /// non-dyn `PaymentAdapter` trait yields `PaymentAdapterDyn` via the
-    /// blanket impl.)
-    struct RecordingPaymentAdapter {
-        captured: Arc<std::sync::atomic::AtomicUsize>,
-        voided: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl crate::economy::adapter::PaymentAdapter for RecordingPaymentAdapter {
-        fn adapter_id(&self) -> &str {
-            "recording"
-        }
-        fn capabilities(&self) -> crate::economy::adapter::AdapterCapabilities {
-            crate::economy::adapter::AdapterCapabilities {
-                supported_currencies: vec![scp_protocol::economy::types::CurrencyCode::from("USD")],
-                supports_streaming: false,
-                supports_batch_auth: false,
-                supports_single_step: false,
-                min_amount: None,
-                max_amount: None,
-                typical_settlement_ms: 0,
-                requires_facilitator: false,
-            }
-        }
-        async fn authorize(
-            &self,
-            payer: &DID,
-            payee: &DID,
-            amount: scp_protocol::economy::types::Amount,
-            currency: scp_protocol::economy::types::CurrencyCode,
-            _metadata: crate::economy::adapter::PaymentMetadata,
-        ) -> Result<
-            crate::economy::adapter::PaymentAuthorization,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::PaymentAuthorization {
-                auth_id: [7u8; 32],
-                payer: payer.clone(),
-                payee: payee.clone(),
-                amount,
-                currency,
-                adapter_id: "recording".to_owned(),
-                created_at: 1_000_000,
-                expires_at: 2_000_000,
-                adapter_state: vec![],
-            })
-        }
-        async fn capture(
-            &self,
-            auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<crate::economy::adapter::PaymentReceipt, crate::economy::adapter::PaymentError>
-        {
-            self.captured
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(crate::economy::adapter::PaymentReceipt {
-                receipt_id: [9u8; 32],
-                payer: auth.payer.clone(),
-                payee: auth.payee.clone(),
-                amount: auth.amount,
-                currency: auth.currency,
-                action_type: scp_protocol::economy::types::PaidActionType::ContextJoin,
-                context_id: None,
-                adapter_id: "recording".to_owned(),
-                adapter_proof: vec![],
-                timestamp: 1_000_001,
-                anchored: false,
-                signature: vec![],
-            })
-        }
-        async fn void(
-            &self,
-            _auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<(), crate::economy::adapter::PaymentError> {
-            self.voided
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-        async fn verify_authorization(
-            &self,
-            _auth: &crate::economy::adapter::PaymentAuthorization,
-        ) -> Result<(), crate::economy::adapter::PaymentError> {
-            Ok(())
-        }
-        async fn verify(
-            &self,
-            _receipt: &crate::economy::adapter::PaymentReceipt,
-        ) -> Result<
-            crate::economy::adapter::VerificationResult,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::VerificationResult {
-                valid: true,
-                adapter_id: "recording".to_owned(),
-                verified_amount: scp_protocol::economy::types::Amount(0),
-                verified_currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
-                verification_timestamp: 1_000_002,
-            })
-        }
-        async fn refund(
-            &self,
-            _receipt: &crate::economy::adapter::PaymentReceipt,
-            _amount: Option<scp_protocol::economy::types::Amount>,
-        ) -> Result<
-            crate::economy::adapter::RefundConfirmation,
-            crate::economy::adapter::PaymentError,
-        > {
-            Ok(crate::economy::adapter::RefundConfirmation {
-                refund_id: [0u8; 32],
-                original_receipt_id: [9u8; 32],
-                refunded_amount: scp_protocol::economy::types::Amount(0),
-                currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
-                adapter_proof: vec![],
-            })
-        }
-    }
-
     /// Derive a `did:key` DID + matching signing key (the same convention the
-    /// FFI tool-economy harness uses), so a `key_resolver` can resolve the
+    /// FFI outlet-economy harness uses), so a `key_resolver` can resolve the
     /// issuer's verifying key for spending-UCAN signature verification.
     fn join_keypair() -> (DID, ed25519_dalek::SigningKey) {
         use std::fmt::Write;
@@ -3641,20 +4192,21 @@ mod restore_reconcile_tests {
             serde_json::Value::String("#agent".to_owned()),
         );
 
-        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
         let header = UcanHeader::with_kid("#agent".to_owned());
         let payload = UcanPayload {
             iss: joiner.as_ref().to_owned(),
             aud: joiner.as_ref().to_owned(),
             exp: now + 3600,
             nbf: Some(now.saturating_sub(60)),
-            nnc: generate_nonce(&scp_primitives::SystemClock),
+            nnc: generate_nonce(&scp_clock::SystemClock),
             att: vec![Attenuation {
                 with: "scp:spending:*".to_owned(),
                 can: "spend".to_owned(),
             }],
             prf: vec![],
             fct: Some(serde_json::Value::Object(fct)),
+            nb: None,
         };
 
         let header_json = serde_json::to_vec(&header).expect("header serializes");
@@ -3701,14 +4253,15 @@ mod restore_reconcile_tests {
 
         // Real MLS crypto provider so `add_member` succeeds, plus a key_resolver
         // that resolves the joiner's verifying key for the spending-UCAN sig.
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkJoinMoneyOrder".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver = {
             let did = joiner_for_resolver;
             let vk = joiner_vk;
             Arc::new(
-                move |q: &DID, _kid: scp_protocol::identity::SigningKeyId| {
+                move |q: &DID, _kid: scp_did::SigningKeyId| {
                     if *q == did { Some(vk) } else { None }
                 },
             )
@@ -3716,7 +4269,7 @@ mod restore_reconcile_tests {
         let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
-            Arc::new(RecordingPaymentAdapter {
+            Arc::new(crate::economy::adapter::CountingPaymentAdapter {
                 captured: Arc::clone(&captured),
                 voided: Arc::clone(&voided),
             });
@@ -3742,14 +4295,13 @@ mod restore_reconcile_tests {
         let context_id = "ctx-paid-join-money-order".to_owned();
         let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
 
-        // Create the MLS group so the joiner's `add_member` can succeed.
-        deps.crypto
-            .create_mls_group(&context_id_bytes)
-            .expect("create_mls_group");
+        // #2148 (ADR-049 birth-into-actor): no MLS group is birthed — this join
+        // is rejected at the economics auto-accept guard (SCP-ECON-12030) BEFORE
+        // any crypto `add_member` runs, so no group is needed.
 
         // Build per-context state with a per_join cost so a spending UCAN is
         // required and the escrow path runs.
-        let now_secs = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let now_secs = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             context_id_bytes,
             now_secs,
@@ -3768,7 +4320,7 @@ mod restore_reconcile_tests {
             cost_schedule: scp_protocol::economy::types::CostSchedule {
                 currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: Some(scp_protocol::economy::types::Amount(10)),
                 per_period: None,
                 per_byte_stored: None,
@@ -3780,18 +4332,17 @@ mod restore_reconcile_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         // Generate a real MLS KeyPackage for the joiner.
-        let joiner_cred = crate::crypto::mls::credential::ScpCredential::new(
+        let joiner_cred = scp_mls::credential::ScpCredential::new(
             joiner.as_ref().to_owned(),
             None,
-            scp_protocol::identity::SigningKeyId::Active,
+            scp_did::SigningKeyId::Active,
         )
         .expect("joiner credential");
         let (kp_bundle, _signer, _provider) =
-            crate::crypto::mls::group::generate_key_package(&joiner_cred)
+            scp_mls::group::generate_key_package(&joiner_cred, &scp_clock::SystemClock)
                 .expect("generate joiner key package");
         let kp_bytes =
             openmls::prelude::tls_codec::Serialize::tls_serialize_detached(kp_bundle.key_package())
@@ -3802,7 +4353,6 @@ mod restore_reconcile_tests {
         let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
         handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let spending_ucan = signed_join_ucan(&joiner, &joiner_key);
@@ -3915,11 +4465,12 @@ mod restore_reconcile_tests {
     /// (and its former rollback-on-append-failure) is gone.
     #[tokio::test]
     async fn finalize_send_succeeds_without_durable_message_sent_append() {
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkFinalizeSendSeq".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver =
-            Arc::new(|_q: &DID, _kid: scp_protocol::identity::SigningKeyId| None);
+            Arc::new(|_q: &DID, _kid: scp_did::SigningKeyId| None);
 
         // Working persistence (CapturingPersistence) + FAILING event-log append.
         let sup = Supervisor::with_providers(
@@ -3946,7 +4497,7 @@ mod restore_reconcile_tests {
         let sender = DID("did:dht:z6MkFinalizeSendSender".to_owned());
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             context_id_bytes,
-            scp_primitives::Clock::now_secs(&scp_primitives::SystemClock),
+            scp_clock::Clock::now_secs(&scp_clock::SystemClock),
             admin.clone(),
         );
         state
@@ -3955,7 +4506,6 @@ mod restore_reconcile_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         // Reserve a sequence exactly as `send_message` does, capturing it.
@@ -3983,7 +4533,8 @@ mod restore_reconcile_tests {
             None,
             None,  // no spending-nonce token (free send) — keeps best-effort persist
             false, // is_broadcast
-        );
+        )
+        .await;
         let mut state = cell.into_inner();
 
         assert!(
@@ -4080,15 +4631,16 @@ mod restore_reconcile_tests {
     async fn complete_paid_action_buffers_receipt_and_mints_no_durable_leaf() {
         use scp_protocol::context::membership::ContextEvent;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MkPayConverge".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(|_: &DID, _| None);
         let captured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let voided = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let payment_adapter: Arc<dyn crate::economy::adapter::PaymentAdapterDyn> =
-            Arc::new(RecordingPaymentAdapter {
+            Arc::new(crate::economy::adapter::CountingPaymentAdapter {
                 captured: Arc::clone(&captured),
                 voided: Arc::clone(&voided),
             });
@@ -4112,7 +4664,7 @@ mod restore_reconcile_tests {
 
         let context_id = "ctx-pay-converge".to_owned();
         let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
-        let now_secs = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let now_secs = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             context_id_bytes,
             now_secs,
@@ -4124,7 +4676,7 @@ mod restore_reconcile_tests {
             cost_schedule: scp_protocol::economy::types::CostSchedule {
                 currency: scp_protocol::economy::types::CurrencyCode::from("USD"),
                 per_message: Some(scp_protocol::economy::types::Amount(10)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -4321,7 +4873,7 @@ mod restore_reconcile_tests {
 
         let context_id = "ctx-leave-fail-closed".to_owned();
         let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
-        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Broadcast-mode state: leave skips MLS (no crypto group needed), so the
         // whole removal body runs synchronously inside `commit_class_s_keep`.
@@ -4347,13 +4899,11 @@ mod restore_reconcile_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
         handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);
@@ -4389,7 +4939,7 @@ mod restore_reconcile_tests {
 
         let context_id = "ctx-close-fail-closed".to_owned();
         let context_id_bytes = crate::context::state::context_id_to_bytes(&context_id);
-        let now = scp_primitives::Clock::now_secs(&scp_primitives::SystemClock);
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         // Default test governance is SingleAdmin (the close-path model gate).
         let mut state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
@@ -4408,13 +4958,11 @@ mod restore_reconcile_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let handle = ContextHandle::new(context_id.clone(), state.handle.params().clone());
         handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .unwrap();
 
         let mut cell = crate::context::actor::class_s::ClassSCell::new(state);

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 use scp_protocol::discovery::ContextId;
 
@@ -440,7 +440,7 @@ impl AddressResolver {
                     return Ok(results);
                 }
 
-                // Then check all contexts with discovery tools.
+                // Then check all contexts with discovery outlets.
                 for (scope, context_id) in known_contexts {
                     let handle_results =
                         handle_querier.lookup_handle(context_id, &name, None).await;
@@ -500,7 +500,7 @@ impl Default for AddressResolver {
 /// and domain handle resolution.
 #[allow(async_fn_in_trait)]
 pub trait HandleQuerier {
-    /// Looks up a handle in a context with discovery tools.
+    /// Looks up a handle in a context with discovery outlets.
     ///
     /// Returns resolution results from the specified context.
     async fn lookup_handle(
@@ -518,7 +518,7 @@ pub trait HandleQuerier {
     /// Looks up an attestation-backed handle via reverse-lookup.
     ///
     /// Returns resolution results from attestation indexes in known
-    /// contexts with discovery tools.
+    /// contexts with discovery outlets.
     async fn lookup_attestation_handle(
         &self,
         handle: &str,
@@ -624,7 +624,7 @@ fn shortest_ttl_for_results(results: &[AddressResolution]) -> Duration {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use scp_identity::DID;
+    use scp_did::DID;
 
     // -- Address parsing tests -----------------------------------------------
 
@@ -910,7 +910,7 @@ mod tests {
             },
         ];
 
-        let corroborated = corroborate_results(results, &scp_primitives::SystemClock);
+        let corroborated = corroborate_results(results, &scp_clock::SystemClock);
         assert_eq!(corroborated.len(), 1);
         assert!(matches!(
             corroborated[0].trust_level(),
@@ -935,7 +935,7 @@ mod tests {
             },
         }];
 
-        let corroborated = corroborate_results(results, &scp_primitives::SystemClock);
+        let corroborated = corroborate_results(results, &scp_clock::SystemClock);
         assert_eq!(corroborated.len(), 1);
         assert_eq!(
             *corroborated[0].trust_level(),
@@ -1106,7 +1106,7 @@ mod tests {
                 &querier,
                 &known,
                 &[],
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1135,7 +1135,7 @@ mod tests {
                 &querier,
                 &known,
                 &[],
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1165,7 +1165,7 @@ mod tests {
                 &querier,
                 &known,
                 &[],
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1194,7 +1194,7 @@ mod tests {
                 &querier,
                 &known,
                 &[],
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1225,7 +1225,7 @@ mod tests {
                 &querier,
                 &known,
                 &[],
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1262,7 +1262,7 @@ mod tests {
                 &querier,
                 &known,
                 &[],
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1291,7 +1291,7 @@ mod tests {
                 &querier,
                 &known,
                 &["example.com"],
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1318,7 +1318,7 @@ mod tests {
                 &querier,
                 &known,
                 &[],
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await;
 
@@ -1349,7 +1349,7 @@ mod tests {
                 &querier,
                 &known,
                 &[],
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1362,7 +1362,7 @@ mod tests {
                 &querier,
                 &known,
                 &[],
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();

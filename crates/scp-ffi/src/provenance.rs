@@ -68,7 +68,7 @@ pub fn evaluate_provenance_quality(
         counterparties: counterparties
             .unwrap_or_default()
             .into_iter()
-            .map(scp_identity::DID::from)
+            .map(scp_did::DID::from)
             .collect(),
         purpose: None,
         discovery_method: DiscoveryMethod::OutOfBand,
@@ -251,7 +251,7 @@ impl crate::scp::PyScp {
             context_id: source_context_id.clone(),
             source_type: st,
             memory_scope: ms,
-            members: members.into_iter().map(scp_identity::DID::from).collect(),
+            members: members.into_iter().map(scp_did::DID::from).collect(),
             discovery_method: DiscoveryMethod::OutOfBand,
             data_age: std::time::Duration::from_secs(0),
             purpose: None,
@@ -281,13 +281,17 @@ impl crate::scp::PyScp {
             None,
         );
 
-        // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
-        let prov_json_bytes =
-            serde_json::to_vec(&prov).map_err(|e| ScpPyError::ValidationError {
-                message: format!("failed to serialize provenance for hashing: {e}"),
-                code: codes::VALID_7053.to_string(),
-            })?;
-        let prov_hash: [u8; 32] = Sha256::digest(&prov_json_bytes).into();
+        // Compute provenance hash: SHA-256 of the MessagePack-serialized
+        // provenance record (§24.3.3). Uses the same `rmp_serde::to_vec`
+        // encoding as the signed broadcast path
+        // (`scp_protocol::crypto::sender_keys::broadcast::compute_provenance_hash`)
+        // and the event-log leaf, so the logged hash matches the signed-path
+        // hash for identical input.
+        let prov_bytes = rmp_serde::to_vec(&prov).map_err(|e| ScpPyError::ValidationError {
+            message: format!("failed to serialize provenance for hashing: {e}"),
+            code: codes::VALID_7053.to_string(),
+        })?;
+        let prov_hash: [u8; 32] = Sha256::digest(&prov_bytes).into();
 
         // Record ProvenanceAttached in the source context event log.
         // Best-effort: log warning if context not found (provenance_attach
@@ -332,7 +336,7 @@ impl crate::scp::PyScp {
 /// Appends a provenance event (`ProvenanceAttached` or `ProvenanceReceived`)
 /// to the event log for the given context on the given bridge instance.
 ///
-/// Follows the unsigned-event pattern used by `ToolInvoked` in `mcp.rs`.
+/// Follows the unsigned-event pattern used by `OutletInvoked` in `mcp.rs`.
 fn append_provenance_event(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -340,10 +344,7 @@ fn append_provenance_event(
     event_type: scp_event_log::EventType,
     provenance_hash: &[u8; 32],
 ) -> PyResult<()> {
-    #[allow(clippy::cast_possible_truncation)]
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     crate::runtime::with_context(bi, context_id, |rt| {
         let sequence = scp_event_log::tree::event_count(&rt.event_log);
@@ -355,7 +356,7 @@ fn append_provenance_event(
 
         let event = scp_event_log::Event {
             event_type,
-            actor_did: scp_identity::DID::from(actor_did.to_owned()),
+            actor_did: scp_did::DID::from(actor_did.to_owned()),
             timestamp,
             sequence,
             payload: scp_event_log::EventPayload {
@@ -405,6 +406,38 @@ fn provenance_to_dict<'py>(py: Python<'py>, prov: &DataProvenance) -> PyResult<B
     dict.set_item("memory_scope", format!("{:?}", prov.memory_scope))?;
     dict.set_item("chain_path", prov.chain_path.clone())?;
     dict.set_item("purpose", prov.purpose.as_deref())?;
+
+    // Discovery method (§24.2.3). Mirrors the tagged shape the NAPI/UniFFI
+    // bridges surface: the unit variant is a bare `"OutOfBand"` string; the
+    // context-bearing variants are single-key mappings keyed by the variant
+    // name, so the wire shape is identical across every bridge.
+    match &prov.discovery_method {
+        DiscoveryMethod::OutOfBand => dict.set_item("discovery_method", "OutOfBand")?,
+        DiscoveryMethod::SharedContext(ctx_id) => {
+            let dm = PyDict::new(py);
+            dm.set_item("SharedContext", ctx_id)?;
+            dict.set_item("discovery_method", dm)?;
+        }
+        DiscoveryMethod::Registry(ctx_id) => {
+            let dm = PyDict::new(py);
+            dm.set_item("Registry", ctx_id)?;
+            dict.set_item("discovery_method", dm)?;
+        }
+    }
+
+    // Economic provenance (§24.3.4, §19.6). ADR-060: a monetary `Amount`
+    // crosses the boundary as its canonical base-10 decimal string (never a
+    // bare number) so the full `u64` range survives exactly — matching the
+    // NAPI/UniFFI bridges. `None` surfaces as Python `None`.
+    dict.set_item(
+        "payment_amount",
+        prov.payment_amount.map(|a| a.0.to_string()),
+    )?;
+    dict.set_item("payment_adapter", prov.payment_adapter.as_deref())?;
+    dict.set_item(
+        "payment_receipt_id",
+        prov.payment_receipt_id.map(hex::encode),
+    )?;
     Ok(dict)
 }
 
@@ -687,6 +720,112 @@ mod tests {
         assert!(
             provenance_pseudonymize_counterparties(&prov_json.to_string(), "not-hex-zz").is_err()
         );
+    }
+
+    #[test]
+    fn provenance_to_dict_surfaces_payment_fields() {
+        use scp_core::economy::types::Amount;
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let prov = DataProvenance {
+                source_context: "ctx-src".to_string(),
+                source_type: SourceType::Persistent,
+                counterparties: vec!["did:dht:z6MkAlice".into()],
+                purpose: Some("paid data".to_string()),
+                discovery_method: DiscoveryMethod::SharedContext("ctx-shared".to_string()),
+                age: std::time::Duration::from_secs(0),
+                memory_scope: MemoryScope::Full,
+                chain_depth: 0,
+                chain_path: None,
+                // u64::MAX exercises the > 2^53 range that a bare JS number
+                // would lose — the decimal string must survive exactly.
+                payment_amount: Some(Amount::new(u64::MAX)),
+                payment_adapter: Some("lightning".to_string()),
+                payment_receipt_id: Some([0xAB; 32]),
+            };
+
+            let dict = provenance_to_dict(py, &prov).unwrap();
+
+            // Amount crosses as the canonical base-10 decimal string.
+            let amount: String = dict
+                .get_item("payment_amount")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(amount, u64::MAX.to_string());
+
+            let adapter: String = dict
+                .get_item("payment_adapter")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(adapter, "lightning");
+
+            // 32-byte receipt id surfaces hex-encoded (64 hex chars).
+            let receipt: String = dict
+                .get_item("payment_receipt_id")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(receipt, "ab".repeat(32));
+
+            // Discovery method mirrors the tagged wire shape.
+            let dm = dict.get_item("discovery_method").unwrap().unwrap();
+            let dm_dict = dm.downcast::<PyDict>().unwrap();
+            let shared: String = dm_dict
+                .get_item("SharedContext")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(shared, "ctx-shared");
+        });
+    }
+
+    #[test]
+    fn provenance_to_dict_none_payment_is_null() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let prov = DataProvenance {
+                source_context: "ctx-src".to_string(),
+                source_type: SourceType::Persistent,
+                counterparties: vec![],
+                purpose: None,
+                discovery_method: DiscoveryMethod::OutOfBand,
+                age: std::time::Duration::from_secs(0),
+                memory_scope: MemoryScope::Full,
+                chain_depth: 0,
+                chain_path: None,
+                payment_amount: None,
+                payment_adapter: None,
+                payment_receipt_id: None,
+            };
+
+            let dict = provenance_to_dict(py, &prov).unwrap();
+
+            // Absent payment surfaces as Python None for every field.
+            assert!(dict.get_item("payment_amount").unwrap().unwrap().is_none());
+            assert!(dict.get_item("payment_adapter").unwrap().unwrap().is_none());
+            assert!(
+                dict.get_item("payment_receipt_id")
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+
+            // Unit discovery variant surfaces as the bare string.
+            let dm: String = dict
+                .get_item("discovery_method")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(dm, "OutOfBand");
+        });
     }
 
     #[test]

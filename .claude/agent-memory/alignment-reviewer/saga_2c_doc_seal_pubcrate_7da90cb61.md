@@ -1,0 +1,24 @@
+---
+name: saga-2c-doc-seal-pubcrate-7da90cb61
+description: §17.16.4 follow-up — pub(crate) seal of bare restore_all_contexts leg + journal-wiring doc corrections + CoreFields label fix (branch feat/2c-saga-dispatch, HEAD 7da90cb61) ALIGNED zero findings
+metadata:
+  type: project
+---
+
+# Saga 2C restore-then-replay follow-up (HEAD 7da90cb61) — ALIGNED, ZERO findings
+
+Branch `feat/2c-saga-dispatch` (worktree saga-2c). HEAD commit is a 3-part docs+structural follow-up on the §17.16.4 restore-then-replay work (prior round `d0c57bd75`, see [[saga_2c_restore_then_replay_d0c57bd75]]). 4 files +51/-32, all saga/restore-related, ZERO scope creep (broadcast hosting-handshake `b001f49a6` is a SEPARATE earlier commit on the same branch, not this HEAD). All review claims VERIFIED:
+
+**Why:** Alec asked whether (1) the `pub(crate)` narrowing of `restore_all_contexts` is architecturally consistent (compiler-enforce restore-implies-replay) and non-conflicting with Phase 2D/PR-7 durable-journal-at-bridge plan; (2) corrected doc-comments accurately reflect master-plan scope (prod wires NoopSagaJournal until PR-7; `with_providers_and_journal` is the future seam); (3) no scope creep beyond §17.16.4 ordering.
+
+**How to apply:** when re-reviewing this branch or its successors, this round is ALIGNED — don't re-litigate. Verification anchors below.
+
+FIX A (doc, `with_providers_and_journal` rationale rewrite): VERIFIED. `Supervisor::new` is `#[cfg(any(test, feature="testing"))]`-gated + `pub` (supervisor.rs:1219-1220) so the OLD doc citing "already-pub new" as the precedent was FALSE in a prod build (`new` doesn't exist there). NEW doc cites unconditionally-`pub` `with_providers` (supervisor.rs:1354, hardcodes `Arc::new(NoopSagaJournal)` at :1381) as the real precedent — TRUE. Inline `with_providers` comment fixed from "bridge attaches a durable journal separately" → "no durable journal attached at the bridge today" — matches reality.
+
+FIX B (doc, `BridgeInstanceCore::` → `CoreFields::`): VERIFIED. `restore_all_persisted_contexts` is an INHERENT method on `impl CoreFields` (bridge_instance.rs:1695, impl opens :519), NOT a trait method. Reached via `BridgeInstanceCore::resume` DEFAULT body (:2543) → `self.core().restore_all_persisted_contexts()` (:2546) where `core()→&CoreFields`. Old `BridgeInstanceCore::` labels were factually wrong; 3 prose/message sites corrected (saga_bridge_bootstrap module doc + 2 pipeline_wiring assertion MESSAGES). Assertion LOGIC unchanged (logic-line diff filter empty).
+
+FIX C (structural, `pub`→`pub(crate)` on `Supervisor::restore_all_contexts` supervisor.rs:8037): SAFE + correct. The bridge production resume path (`CoreFields::restore_all_persisted_contexts` bridge_instance.rs:1695) ALREADY calls `supervisor.restore_on_startup()` (:1707), NOT the bare leg — so narrowing can't break prod. In-crate `restore_on_startup` (:8088) still calls bare `restore_all_contexts()` then `replay_unresolved_sagas(&restored)` (:8096-8097) — same crate, unaffected. Only cross-crate caller of the SUPERVISOR's method was `persistence_sdk.rs` (test) — redirected to `restore_on_startup()`; semantic-preservation sound (manager built via `with_providers`=NoopSagaJournal → replay is a no-op; test asserts only on restored ctx id). CRITICAL non-issue: `scp-ffi/wasm/src/context.rs:1248` `mgr.restore_all_contexts()` is a WASM-LOCAL method (manager.rs:6579) on a WASM-local manager — WASM crate has NO scp-runtime/scp-core dep (ADR-034), so it's UNRELATED to the supervisor method; `pub(crate)` does not touch it. Build proof: `cargo check -p scp-runtime --features testing` AND `cargo check -p scp-testing --tests` (the cross-crate consumer) both CLEAN.
+
+Pre-existing gates intact (not weakened — only assertion messages touched): `restore_on_startup_runs_restore_before_replay` (type-witness primary + source-order defense-in-depth) + the 3-bridge `bridge_resume_path_routes_through_restore_on_startup` positive gate forbidding bare `.restore_all_contexts()` in PyO3/UniFFI/napi exports (pipeline_wiring.rs:955-970). FIX C complements that source-text gate by adding COMPILER enforcement for cross-crate callers.
+
+LESSON: a `pub→pub(crate)` "seal a leg" change is non-breaking iff (a) every production cross-crate caller already routes through the combined entry — VERIFY by reading the bridge resume body, not just grepping; (b) same-named methods on sibling crates (WASM here) are DIFFERENT types — confirm the crate has no dep on the narrowed symbol's crate before treating a grep hit as a breakage; (c) prove it with `cargo check` on the cross-crate CONSUMER crate, not just the defining crate. OBSERVATION (not a finding): "Phase 2D / PR-7" in-code labels are NOT grounded in any `.docs/` artifact (grep empty), but match an established in-code phase vocabulary tied to ADR-049 used across this branch's earlier commits — informal label, no artifact contradiction.

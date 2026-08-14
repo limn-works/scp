@@ -9,7 +9,7 @@ use scp_core::context::ContextParams;
 use scp_core::context::ContextState;
 use scp_core::context::builder::ContextCreationError;
 use scp_core::context::governance::GovernanceAction;
-use scp_core::context::tools::ToolSchema;
+use scp_core::context::outlets::OutletSchema;
 
 // Crypto split
 use scp_core::crypto::access_keys::AccessKeyError;
@@ -28,7 +28,7 @@ use scp_core::trust::TrustError;
 
 // ─── Runtime types (from scp-runtime) ───
 
-use scp_core::crypto::mls::MlsCryptoProvider;
+use scp_core::crypto::mls::NodeMlsFactory;
 
 #[test]
 fn facade_exposes_protocol_types() {
@@ -38,7 +38,7 @@ fn facade_exposes_protocol_types() {
     let _ = std::any::type_name::<ContextParams>();
     let _ = std::any::type_name::<ContextCreationError>();
     let _ = std::any::type_name::<GovernanceAction>();
-    let _ = std::any::type_name::<ToolSchema>();
+    let _ = std::any::type_name::<OutletSchema>();
 
     // Crypto split
     let _ = std::any::type_name::<SenderKey>();
@@ -58,5 +58,5 @@ fn facade_exposes_protocol_types() {
 
 #[test]
 fn facade_exposes_runtime_types() {
-    let _ = std::any::type_name::<MlsCryptoProvider>();
+    let _ = std::any::type_name::<NodeMlsFactory>();
 }

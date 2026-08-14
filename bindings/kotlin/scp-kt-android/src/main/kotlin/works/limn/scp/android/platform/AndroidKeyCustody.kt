@@ -405,7 +405,7 @@ class AndroidKeyCustody internal constructor(
      * The `"scp-pseudonym-v2"` separator differs from v1's `"scp-pseudonym"`, so a v2
      * pseudonym at any epoch never collides with the v1 [derivePseudonym] output.
      *
-     * Matches the Rust `derive_rotatable_pseudonym()` in `scp-platform/src/pseudonym.rs`
+     * Matches the Rust `derive_rotatable_pseudonym()` in `scp-crypto/src/pseudonym.rs`
      * (and the file/sqlite custody backends) so software-custody pseudonyms are identical
      * across platforms. The hardware (TEE) path is device-local by design.
      *
@@ -472,7 +472,7 @@ class AndroidKeyCustody internal constructor(
      * Derives a 32-byte pseudonym secret from the identity key.
      *
      * For software keys: `HKDF-SHA256(ikm: privateKeyBytes, salt: "scp-pseudonym-secret-v1", info: "", len: 32)`
-     * — matches the Rust `derive_pseudonym_secret()` in `scp-platform/src/pseudonym.rs`.
+     * — matches the Rust `derive_pseudonym_secret()` in `scp-crypto/src/pseudonym.rs`.
      *
      * For hardware keys: `SHA-256(TEE_sign("scp-pseudonym-secret-v1"))` — deterministic
      * because Ed25519 signing is deterministic (RFC 8032). The 64-byte signature is hashed
@@ -503,7 +503,7 @@ class AndroidKeyCustody internal constructor(
      * HKDF-SHA256 (RFC 5869) extract-and-expand.
      *
      * Matches the Rust `hkdf::Hkdf::<Sha256>` used in
-     * `scp-platform/src/pseudonym.rs::derive_pseudonym_secret`.
+     * `scp-crypto/src/pseudonym.rs::derive_pseudonym_secret`.
      */
     private fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int): ByteArray {
         // Extract: PRK = HMAC-SHA256(salt, IKM)

@@ -32,22 +32,23 @@
 
 use std::sync::Arc;
 
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_runtime::context::supervisor::{
     JournalEntry, ProtocolRepositorySagaJournal, RestoredContexts, SagaId, SagaJournal, SagaState,
     Supervisor, SupervisorConfig,
 };
 
 struct NoopPersistence;
+#[async_trait::async_trait]
 impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         _: &str,
         _: &scp_runtime::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
-    fn load_context(
+    async fn load_context(
         &self,
         _: &str,
     ) -> Result<
@@ -56,26 +57,13 @@ impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
     > {
         Ok(None)
     }
-    fn persist_broadcast(
+    async fn delete_context(
         &self,
         _: &str,
-        _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
-    fn load_broadcast(
-        &self,
-        _: &str,
-    ) -> Result<
-        Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        Ok(None)
-    }
-    fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(Vec::new())

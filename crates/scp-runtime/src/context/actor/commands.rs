@@ -22,15 +22,13 @@
 //! vector (drop-the-receiver = discard the outcome without rolling back
 //! committed state — see plan §"Cancel-safety check").
 //!
-//! # Minimal variant surface (this commit)
+//! # Variant surface
 //!
-//! Commit 6 lands the enum SHAPE. Each sub-enum carries one or two
-//! placeholder variants whose handlers return
-//! `ContextError::NotImplemented(..)` via
-//! [`Outcome::err`](crate::context::actor::Outcome::err). Commits 7-11
-//! extend each sub-enum with real variants as the corresponding handler
-//! migrates off the legacy `ContextManager`; the dispatch loop shape is
-//! stable from this commit forward.
+//! Each sub-enum carries its real, domain-specific command variants;
+//! there are no placeholder variants. The actor mailbox has no
+//! `NotImplemented` scaffolding on the live dispatch path — the
+//! state-owning [`ContextActor`](crate::context::actor::ContextActor)
+//! routes every command through `dispatch_state` to its real handler.
 //!
 //! # Naming
 //!
@@ -69,7 +67,7 @@ pub type DeliverIncomingReply = oneshot::Sender<Result<DeliverOutcome, ContextEr
 /// Reply-channel type alias for [`MessagingCommand::DrainEvents`]. The
 /// reply carries the drained `ContextEvent` vector — empty iff the
 /// context is unknown (matches the legacy
-/// [`ContextManager::drain_events`](crate::context::supervisor::Supervisor::drain_events)
+/// [`Supervisor::drain_events`](crate::context::supervisor::Supervisor::drain_events)
 /// "soft-default on unknown context" contract). Factored out to satisfy
 /// `clippy::type_complexity`.
 pub type DrainEventsReply =
@@ -105,12 +103,12 @@ pub enum ContextCommand {
     Standing(StandingCommand),
     /// TTL close — timer-driven close path (spec §5.8).
     TtlClose(TtlCloseCommand),
-    /// Tools — hard-rate-limit consume / refund plus tool-economy
+    /// Outlets — hard-rate-limit consume / refund plus outlet-economy
     /// reserve / settle helpers that FFI bridges call from their
-    /// tool-dispatch paths (spec §19, rate limits §6.2.0.2). NOT a saga
-    /// initiator — the cross-context tool-invocation saga runs
+    /// outlet-dispatch paths (spec §19, rate limits §6.2.0.2). NOT a saga
+    /// initiator — the cross-context outlet-invocation saga runs
     /// supervisor-side, not over this mailbox.
-    Tools(ToolsCommand),
+    Outlets(OutletsCommand),
     /// Read-only queries. Handlers MUST NOT mutate state; the actor
     /// takes `&self.state` when dispatching this variant.
     Queries(QueriesCommand),
@@ -124,7 +122,7 @@ pub enum ContextCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder sub-enums
+// Command sub-enums
 // ---------------------------------------------------------------------------
 
 /// Payload for [`MessagingCommand::SendMessage`]. Boxed inside the
@@ -145,7 +143,7 @@ pub struct SendMessagePayload {
     /// side. Cloned from the caller's handle at dispatch time.
     pub params: scp_protocol::context::params::ContextParams,
     /// Sender DID.
-    pub sender_did: scp_identity::DID,
+    pub sender_did: scp_did::DID,
     /// Plaintext payload to encrypt and send.
     pub payload: Vec<u8>,
     /// Sender's Ed25519 signing key. `None` is rejected by the
@@ -158,7 +156,7 @@ pub struct SendMessagePayload {
     /// envelope's `signing_key_id` so the recipient resolves the
     /// matching public key from the sender's DID document. Must agree
     /// with the key material in `signing_key`.
-    pub signing_key_id: scp_protocol::identity::SigningKeyId,
+    pub signing_key_id: scp_did::SigningKeyId,
     /// Optional cross-context provenance metadata — attaches a
     /// signed `DataProvenance` envelope to the inner message.
     pub source_provenance: Option<scp_protocol::provenance::attach::SourceContextInfo>,
@@ -172,26 +170,18 @@ pub struct SendMessagePayload {
 /// the ADR-049 commit ladder (see `handlers/messaging.rs`). Variants
 /// cover the hot-path send + deliver operations; sender-key rotation,
 /// distribute/remove, sender-key request handling, and sender-key
-/// management messages all stay on the legacy `ContextManager` surface
-/// until commits 10-11 per the plan row-6 scope.
+/// management messages are served directly by the crypto provider —
+/// `crypto/mls/provider.rs` methods (invoked internally by the runtime's
+/// lifecycle/governance/blocking helpers) plus
+/// `crypto/sender_keys/key_protocol.rs` free functions (additionally
+/// re-exported to the FFI boundary via `scp-core`), not command variants
+/// traversing the command-dispatch shim — until they migrate to
+/// `MessagingCommand` variants in commits 10-11 per the plan row-6 scope.
 pub enum MessagingCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used by the actor's
-    /// `run()` skeleton dispatch as a no-op handshake target so the
-    /// mailbox machinery exercises end-to-end without a real
-    /// command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-    /// and returns `Outcome::err`.
-    Placeholder {
-        /// Oneshot reply channel. Handler stub sends
-        /// `Err(ContextError::NotImplemented(..))` back.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Encrypts and transmits a message within an active context.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::send_message`](crate::context::supervisor::Supervisor::send_message)
+    /// [`Supervisor::send_message`](crate::context::supervisor::Supervisor::send_message)
     /// signature exactly: the handler delegates to that method for
     /// byte-identical envelope construction, inner-signature signing,
     /// sender-key sealing, MLS encryption, and transport fan-out.
@@ -228,7 +218,7 @@ pub enum MessagingCommand {
     /// management message.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
+    /// [`messaging_helpers::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
     /// signature. Used by the relay subscription loop; the return type
     /// matches the bridge's per-event dispatch pattern.
     ///
@@ -257,7 +247,7 @@ pub enum MessagingCommand {
     /// Drain the per-context receive buffer.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::drain_events`](crate::context::supervisor::Supervisor::drain_events)
+    /// [`Supervisor::drain_events`](crate::context::supervisor::Supervisor::drain_events)
     /// signature: empties the receive buffer and returns the drained
     /// events. The legacy method returns an empty `Vec` on unknown
     /// context; the dispatch shim preserves that contract by surfacing
@@ -309,7 +299,7 @@ pub enum MessagingCommand {
     /// other members of a context.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::send_pseudonym_announcement`](crate::context::messaging_helpers::send_pseudonym_announcement)
+    /// [`messaging_helpers::send_pseudonym_announcement`](crate::context::messaging_helpers::send_pseudonym_announcement)
     /// signature exactly: the handler delegates to that method which
     /// in turn wraps the announcement payload and routes it through
     /// `send_message`. Best-effort — the legacy method returns no
@@ -343,7 +333,7 @@ pub enum MessagingCommand {
         /// Context identifier.
         context_id: String,
         /// The peer member whose routing ID is being recorded.
-        member_did: scp_identity::DID,
+        member_did: scp_did::DID,
         /// The peer's per-context pseudonym routing ID.
         pseudonym: [u8; 32],
         /// Oneshot reply channel. Replies `Ok(())` once the registry is
@@ -369,12 +359,194 @@ pub enum MessagingCommand {
         /// Context identifier.
         context_id: String,
         /// The member DID to insert.
-        member_did: scp_identity::DID,
+        member_did: scp_did::DID,
         /// The role name to assign (e.g. `"member"`).
         role: String,
         /// Oneshot reply channel. Replies `Ok(())` once role state is updated,
         /// or `Err` if the context is unknown / inactive.
         reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Grant a §7.2.2 Tier-2 capability directly into a member's
+    /// `role_state.member_capabilities` cache, bypassing the governance
+    /// role-assignment round-trip — test-only.
+    ///
+    /// The runtime's outlet-invocation gate
+    /// ([`has_outlet_invocation_capability`](crate::context::outlets::invoke::has_outlet_invocation_capability))
+    /// requires the invoker to hold `OutletCall(outlet_id)` / `OutletCallAll`
+    /// (or the Query stem) in role state as defense-in-depth alongside the
+    /// primary UCAN gate. The default `admin` / `member` roles grant only
+    /// `messages:*`, so a single-node test cannot drive a real outlet
+    /// invocation without granting the capability — and the genuine grant path
+    /// is a governance role-definition change requiring DID-document-published
+    /// identities (which in-memory test identities are not). This seam inserts
+    /// the capability the same way an executed role assignment would populate
+    /// the Tier-2 cache.
+    ///
+    /// Gated behind the dedicated `outlet-capability-test-grant` feature —
+    /// NOT `testing`. The `testing` feature leaks into every bridge test build
+    /// (`scp-ffi/testing → dep:scp-testing → scp-core/testing →
+    /// scp-runtime/testing`), which would compile this authority-escalation
+    /// primitive into a test-harness build; the dedicated feature is
+    /// enabled ONLY by the outlet-stream live-flow test. It has ZERO FFI/SDK
+    /// exports (only that test calls it), but the dedicated gate keeps the
+    /// primitive out of every non-test binary.
+    #[cfg(feature = "outlet-capability-test-grant")]
+    TestGrantMemberCapability {
+        /// Context identifier.
+        context_id: String,
+        /// The member DID to grant the capability to.
+        member_did: scp_did::DID,
+        /// The capability stem (e.g. `"outlet_call:*"`), parsed via
+        /// [`Capability::new`](scp_protocol::context::roles::Capability::new).
+        capability: String,
+        /// Oneshot reply channel. Replies `Ok(())` once the capability is
+        /// cached, or `Err` if the context is unknown / inactive / the stem is
+        /// unrecognized.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Install a specific member's access key directly into the context's
+    /// access key store (§9.17), bypassing the pull-based distribution protocol.
+    ///
+    /// The §9.17 access-key PULL protocol (`crypto::access_keys::wire`) lets a
+    /// member acquire another member's access key via a signed HPKE request the
+    /// key holder answers. A Welcome-joiner's actor spawns with an EMPTY access
+    /// key store (its own random key is minted by the creator and delivered
+    /// out-of-band; incumbents' keys likewise). The PRODUCTION wiring that runs
+    /// that pull in the actor loop and distributes keys on join is deferred and
+    /// tracked (§9.16 actor-loop pull = #2049; §9.17 production distribution =
+    /// #2050; spec↔ADR reconciliation = #2051). This seam lets the full-stack
+    /// test harness land an access key it obtained through the REAL pull
+    /// (`request_access_key` → `handle_access_key_request` → `open_access_key_response`
+    /// over the harness's simulated transport) into the joiner's actor store, so
+    /// the joiner can wrap content CEKs for its peers on send exactly as the
+    /// deferred production distribution eventually will.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production
+    /// builds, never reachable from any FFI bridge.
+    ///
+    /// # Expiry
+    ///
+    /// EXPIRES with #2050. When production §9.17 distribution lands, DELETE this
+    /// variant, its handler
+    /// [`handle_test_install_access_key`](crate::context::actor::handlers::messaging),
+    /// the [`Supervisor::test_install_access_key`](crate::context::supervisor::Supervisor::test_install_access_key)
+    /// mailbox entrypoint, and the harness
+    /// `FullStackNode::pull_access_keys_from_creator` driver — then confirm the
+    /// Python/TS bidirectional tripwires still pass on the *production*
+    /// distribution path. Safe to carry until then: `testing`-gated, no FFI
+    /// wrapper, reachable only by in-process `Arc<Supervisor>` callers (the
+    /// full-stack harness), even in the `testing` build the
+    /// tripwires use.
+    #[cfg(feature = "testing")]
+    TestInstallAccessKey {
+        /// Context identifier (the raw string id the access-key store is keyed by).
+        context_id: String,
+        /// The member whose access key this is (the key's owner).
+        member_did: String,
+        /// The access key, recovered from a real §9.17 pull response.
+        key: scp_protocol::crypto::access_keys::AccessKey,
+        /// Oneshot reply channel. Replies `Ok(())` once the key is stored.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Answer a §9.16.2 sender-key PULL request on the actor's OWNED crypto
+    /// state (ADR-049 PR-7 / SCP-CRYPTOMOVE-001). The steady-state ANSWER half
+    /// moved off the provider onto
+    /// [`ContextCryptoState::handle_sender_key_request`](crate::context::actor::state::ContextCryptoState::handle_sender_key_request);
+    /// a taken (actor-owned) context can no longer answer through the emptied
+    /// provider, so this mailbox entry lets the full-stack harness reach the
+    /// actor answer by `context_id` (the requester side is driven externally with
+    /// the harness's own custody — actor-loop request INITIATION is deferred
+    /// #2049). Mirrors [`BroadcastCommand::HandleBroadcastKeyRequest`].
+    ///
+    /// The answer HPKE-seals to the EPHEMERAL wrapping key carried in the
+    /// request, so it needs NO signing key — a clean receive-side answer. Only
+    /// mutates the Class-C crypto replay cache (`nonce_dedup`), so the handler
+    /// reports `ok_mutated`.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    HandleSenderKeyRequest {
+        /// Context identifier string.
+        context_id: String,
+        /// The serialized [`SenderKeyRequest`](scp_protocol::crypto::sender_keys::SenderKeyRequest).
+        request_bytes: Vec<u8>,
+        /// The requester's Ed25519 verification key (the responder verifies the
+        /// request signature against it). Exactly 32 bytes — an Ed25519 public key
+        /// — encoded in the type so a mis-sized key cannot cross the mailbox.
+        requester_public_key: [u8; 32],
+        /// Oneshot reply channel. `Ok(Some(sealed_response))` for a member
+        /// requester, `Ok(None)` when the requester is blocked.
+        reply: oneshot::Sender<Result<Option<Vec<u8>>, ContextError>>,
+    },
+
+    /// Land a §9.16.2 pull-response sender key onto the actor's OWNED sender-key
+    /// store (ADR-049 PR-7 / SCP-CRYPTOMOVE-001). The requester (harness)
+    /// already HPKE-opened the ephemeral-sealed response with its own wrapping
+    /// secret; this mailbox entry GATES the authenticated `(sender_did, epoch)`
+    /// against the authoritative Class-M floor registry
+    /// (`check_and_advance_sender_epoch`, FAIL-CLOSED) and then installs the key
+    /// onto `cs.sender_key_store` — gate-before-install. The provider store is
+    /// empty on a taken context, so the install MUST land on the actor.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    LandSenderKeyResponse {
+        /// Context identifier string.
+        context_id: String,
+        /// The sender whose key this is (the key's owner / responder).
+        sender_did: String,
+        /// The authenticated sender key recovered by the requester.
+        sender_key: scp_protocol::crypto::sender_keys::SenderKey,
+        /// The key's epoch (gated for monotonicity + the poisoning ceiling).
+        epoch: u64,
+        /// Oneshot reply channel. `Ok(())` once gated + installed.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// READ-ONLY inner-envelope inspection: decrypt a received outer-envelope
+    /// blob on the actor's OWNED crypto state and return the raw decrypted
+    /// [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope)
+    /// (`message_type` / `sequence` / `payload`) WITHOUT unwrapping the §9.17
+    /// access-key content layer — test-only (ADR-049 PR-7 / SCP-CRYPTOMOVE-001).
+    ///
+    /// This is the actor twin of the deleted provider `open` inspection twin: it
+    /// lets the full-stack harness assert on the wire-level inner header (e.g. a
+    /// sent heartbeat is tagged `MessageType::Heartbeat` and carries sequence
+    /// `0`, and that a heartbeat does NOT advance the per-sender application
+    /// sequence — §9.9.2).
+    ///
+    /// # Non-mutating receive-state invariant (§9)
+    ///
+    /// The handler drives ONLY
+    /// [`ContextCryptoState::open`](crate::context::actor::state::ContextCryptoState::open),
+    /// which performs a PURE decrypt + surfaces `env.receive_floor` — it does
+    /// NOT run the authoritative anti-replay gate
+    /// (`check_and_advance_recv_sequence`), touch the Class-M floor registry,
+    /// mutate `nonce_dedup`, or change the epoch. Those live at the messaging
+    /// seam ([`decrypt_and_dispatch`](crate::context::messaging_helpers::decrypt_and_dispatch)),
+    /// which this inspection deliberately skips. The sole state change is the
+    /// unavoidable MLS decryption-ratchet advance inherent to any decrypt (the
+    /// deleted provider inspection twin was likewise non-mutating in exactly this
+    /// sense); the handler reports `ok_mutated` so that ratchet advance persists.
+    ///
+    /// Gated behind the `testing` feature — never compiled into production,
+    /// never reachable from any FFI bridge.
+    #[cfg(feature = "testing")]
+    InspectIncomingInner {
+        /// Context identifier string.
+        context_id: String,
+        /// The serialized [`OuterEnvelope`](scp_protocol::envelope::outer::OuterEnvelope)
+        /// (captured ciphertext) to decrypt for inspection.
+        envelope_bytes: Vec<u8>,
+        /// Oneshot reply channel carrying the raw decrypted inner envelope. Errors
+        /// if the blob decodes to a Control / Management result rather than an
+        /// application envelope, or on any MLS / sender-key / decode failure.
+        reply: oneshot::Sender<Result<scp_protocol::envelope::inner::InnerEnvelope, ContextError>>,
     },
 
     /// Record that a received envelope triggered degraded-mode (spec
@@ -383,7 +555,7 @@ pub enum MessagingCommand {
     /// broadcast channel).
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::report_degraded_mode`](crate::context::supervisor::Supervisor::report_degraded_mode)
+    /// [`Supervisor::report_degraded_mode`](crate::context::supervisor::Supervisor::report_degraded_mode)
     /// signature: a fire-and-forget side-effect on the messaging path's
     /// receive-buffer state. The reply channel carries `Ok(())` once the
     /// emit completes (or no-ops on `Match` / `IncompatibleMajor`
@@ -427,7 +599,7 @@ pub enum MessagingCommand {
         /// Context identifier.
         context_id: String,
         /// Checkpoint author DID (a locally-controlled member).
-        sender_did: scp_identity::DID,
+        sender_did: scp_did::DID,
         /// Author's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
         /// so the private key zeroes on drop (mirrors the
         /// [`SendMessagePayload`] pattern).
@@ -487,7 +659,7 @@ pub enum MessagingCommand {
         /// Context identifier.
         context_id: String,
         /// Heartbeat author DID (a locally-controlled member).
-        sender_did: scp_identity::DID,
+        sender_did: scp_did::DID,
         /// Author's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
         /// the private key zeroes on drop (mirrors the
         /// [`SendMessagePayload`] pattern).
@@ -524,7 +696,7 @@ pub struct SendPseudonymAnnouncementPayload {
     /// side. Cloned from the caller's handle at dispatch time.
     pub params: scp_protocol::context::params::ContextParams,
     /// Sender DID (the announcing member).
-    pub sender_did: scp_identity::DID,
+    pub sender_did: scp_did::DID,
     /// Sender's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
     /// the private key zeroes on drop (mirrors the
     /// [`SendMessagePayload`] pattern).
@@ -538,6 +710,19 @@ pub struct SendPseudonymAnnouncementPayload {
 /// (cancellation path). The handler reconstructs
 /// [`ed25519_dalek::SigningKey`] from the bytes on the receive side.
 pub struct SigningKeyBytes(pub zeroize::Zeroizing<[u8; 32]>);
+
+/// Redacting `Debug` (security def-in-depth): the seed bytes are NEVER formatted
+/// into a log line. `SigningKeyBytes` deliberately does not `derive(Debug)`, but
+/// providing a redacting impl means a FUTURE enclosing enum/struct that DOES
+/// `derive(Debug)` (a command variant carrying this key) prints `<redacted>`
+/// instead of failing to compile OR dumping the key bytes.
+impl std::fmt::Debug for SigningKeyBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SigningKeyBytes")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
 
 impl SigningKeyBytes {
     /// Construct from an [`ed25519_dalek::SigningKey`] borrowed from
@@ -595,16 +780,15 @@ pub type ImportContextReply = oneshot::Sender<Result<crate::context::ContextHand
 /// [`ContextParams`](scp_protocol::context::params::ContextParams)
 /// being ~1KB.
 pub struct CreateContextPayload {
-    /// Context identifier (plain string; the legacy
-    /// `ContextManager::create_context` derives the 32-byte hash
-    /// internally).
+    /// Context identifier (plain string; the `Supervisor::create_context`
+    /// entry point derives the 32-byte hash internally).
     pub context_id: String,
     /// Creation-time parameters — governance model, ceiling, TTL,
     /// economic policy, etc.
     pub params: scp_protocol::context::params::ContextParams,
     /// Creator's DID. Becomes the sole `admin` assignment in the
     /// initial `ContextRoleState`.
-    pub creator_did: scp_identity::DID,
+    pub creator_did: scp_did::DID,
     /// Optional §9.10.4 pseudonym routing ID for the creator's
     /// local member. `None` on broadcast contexts (ignored).
     pub local_pseudonym: Option<[u8; 32]>,
@@ -637,9 +821,9 @@ pub struct LeaveContextPayload {
     /// Context params — used to rebuild an ephemeral handle.
     pub params: scp_protocol::context::params::ContextParams,
     /// Caller DID (the initiator of the leave operation).
-    pub caller_did: scp_identity::DID,
+    pub caller_did: scp_did::DID,
     /// Target DID (the member to remove; may equal `caller_did`).
-    pub member_did: scp_identity::DID,
+    pub member_did: scp_did::DID,
 }
 
 /// Payload for [`LifecycleCommand::CloseContext`]. Boxed inside the
@@ -651,7 +835,7 @@ pub struct CloseContextPayload {
     pub params: scp_protocol::context::params::ContextParams,
     /// Initiator DID. Requires the `ContextClose` capability under
     /// `SingleAdmin` governance.
-    pub initiator_did: scp_identity::DID,
+    pub initiator_did: scp_did::DID,
 }
 
 /// Payload for [`LifecycleCommand::RestoreContext`]. Boxed inside the
@@ -675,34 +859,21 @@ pub struct RestoreContextPayload {
 /// [`Supervisor`](crate::context::supervisor::Supervisor) lifecycle
 /// surface one-to-one: the handler shim delegates to the legacy method
 /// under the hood while the command shape fixes the post-refactor
-/// dispatch envelope. Commit 12 deletes the shim; the handler bodies
+/// dispatch envelope. ADR-049 §15 deletes the shim; the handler bodies
 /// keep their current shape (input types + reply channels) but route
 /// state mutations to the actor's owned
 /// [`PerContextState`](crate::context::actor::state::PerContextState).
 ///
 /// **Create / join.** `CreateContext` / `JoinContext` route directly through
-/// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context)
-/// / [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context).
+/// [`Supervisor::create_context`](crate::context::supervisor::Supervisor::create_context)
+/// / [`Supervisor::join_context`](crate::context::supervisor::Supervisor::join_context).
 /// Neither is a saga entry point: standing-pair creation is single-context
 /// async creation (not a 2-phase saga; spec §5.15.8), and cross-identity
 /// context migration was withdrawn (ADR-049 §4). The sole cross-context saga
-/// is tool invocation (§6.2.4), driven from the supervisor, not this enum.
+/// is outlet invocation (§6.2.4), driven from the supervisor, not this enum.
 pub enum LifecycleCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used by the actor's
-    /// `run()` skeleton dispatch as a no-op handshake target so the
-    /// mailbox machinery exercises end-to-end without a real
-    /// command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-    /// and returns `Outcome::err`.
-    Placeholder {
-        /// Oneshot reply channel. Handler stub sends
-        /// `Err(ContextError::NotImplemented(..))` back.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Creates a new MLS-backed (or broadcast-mode) context. Mirrors
-    /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context).
+    /// [`Supervisor::create_context`](crate::context::supervisor::Supervisor::create_context).
     ///
     /// Standing-pair creation also routes through `create_context` — it is
     /// single-context async creation (not a saga-prepare flow; spec §5.15.8),
@@ -719,7 +890,7 @@ pub enum LifecycleCommand {
     },
 
     /// Joins an existing context. Mirrors
-    /// [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context).
+    /// [`Supervisor::join_context`](crate::context::supervisor::Supervisor::join_context).
     ///
     /// The caller is the MLS `KeyPackage` owner (`key_package.owner_did`).
     /// `spending_ucan` is the optional UCAN for the economy layer's
@@ -735,7 +906,7 @@ pub enum LifecycleCommand {
     },
 
     /// Removes a member from an active context. Mirrors
-    /// [`ContextManager::leave_context`](crate::context::supervisor::Supervisor::leave_context).
+    /// [`Supervisor::leave_context`](crate::context::supervisor::Supervisor::leave_context).
     ///
     /// Self-removal (`caller_did == member_did`) is always permitted;
     /// removing another member requires the `MemberRemove` capability
@@ -748,7 +919,7 @@ pub enum LifecycleCommand {
     },
 
     /// Initiates cooperative context closure. Mirrors
-    /// [`ContextManager::close_context`](crate::context::lifecycle_helpers::close_context)
+    /// [`lifecycle_helpers::close_context`](crate::context::lifecycle_helpers::close_context)
     /// (not `close_context_with_key` — the latter is an internal
     /// optimization for checkpoint generation; commit 9 exposes the
     /// public surface through the command enum).
@@ -773,7 +944,7 @@ pub enum LifecycleCommand {
         /// Context identifier string.
         context_id: String,
         /// Exporter DID — signs the export header.
-        exporter_did: scp_identity::DID,
+        exporter_did: scp_did::DID,
         /// Oneshot reply channel. See [`ExportContextReply`].
         reply: ExportContextReply,
     },
@@ -833,7 +1004,7 @@ pub enum LifecycleCommand {
 
     /// Generate and store a per-member access key for explicit
     /// lifecycle management (§9.17.2 step 1). Mirrors
-    /// [`ContextManager::generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key).
+    /// [`queries_helpers::generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key).
     ///
     /// Requires `ContextClose` capability on the caller. Overwrites any
     /// existing key for the same `(context_id, member_did)` pair.
@@ -850,7 +1021,7 @@ pub enum LifecycleCommand {
 
     /// Revoke (remove) a member's access key from the context's
     /// access key store (§9.17.2 step 3, ADR-038). Mirrors
-    /// [`ContextManager::revoke_context_access_key`](crate::context::queries_helpers::revoke_context_access_key).
+    /// [`queries_helpers::revoke_context_access_key`](crate::context::queries_helpers::revoke_context_access_key).
     ///
     /// Requires `ContextClose` capability on the caller.
     RevokeContextAccessKey {
@@ -896,8 +1067,8 @@ pub enum LifecycleCommand {
     ///
     /// Mirrors the per-context body of the legacy
     /// `flush_all_contexts_legacy` (which iterated the supervisor's
-    /// `contexts` DashMap and took a per-context lock with
-    /// [`FLUSH_LOCK_BUDGET`](crate::context::lifecycle_helpers::FLUSH_LOCK_BUDGET)).
+    /// `contexts` DashMap and took a per-context lock with the
+    /// since-deleted `FLUSH_LOCK_BUDGET`).
     /// The actor path needs no separate lock budget — the actor's own
     /// dispatch loop serializes by construction, so the command sits in
     /// the mailbox until the actor is idle. The handler builds a snapshot
@@ -925,8 +1096,9 @@ pub enum LifecycleCommand {
     ///
     /// Mirrors the per-context body of the legacy
     /// `shutdown_all_contexts_legacy`. Destroys per-context sender keys,
-    /// MLS groups, and event logs in that order (zeroize secrets before
-    /// tearing down structure). Does NOT send leave messages or notify
+    /// MLS groups, and event logs in that order (release secrets before
+    /// tearing down structure; `SenderKey`s zeroize, the MLS group/signer is
+    /// freed — not zeroized, #82). Does NOT send leave messages or notify
     /// remote peers — used by `scp_ffi_common::BridgeInstance::shutdown`
     /// for process exit / test teardown.
     ///
@@ -960,7 +1132,8 @@ pub enum LifecycleCommand {
     /// removal). The actor owns its state, so the handler reads
     /// `state.receive_buffer.len()` directly with no cross-actor lock.
     ///
-    /// Read-only: the handler returns an [`Outcome`] with `mutated =
+    /// Read-only: the handler returns an
+    /// [`Outcome`](crate::context::actor::Outcome) with `mutated =
     /// false`.
     ReportBufferLen {
         /// Oneshot reply channel carrying this actor's receive-buffer
@@ -983,7 +1156,7 @@ pub enum LifecycleCommand {
     /// Issue an MLS Update proposal + self-Commit for post-compromise
     /// security (§9.12 step 2). Mutating — ratchets the group to a new
     /// epoch with fresh key material via
-    /// [`MlsCryptoProvider::advance_epoch`](crate::crypto::mls::provider::MlsCryptoProvider::advance_epoch)
+    /// [`PerContextState::advance_epoch`](crate::context::actor::state::PerContextState::advance_epoch)
     /// (which calls `ratchet::propose_update_with_wrapping_key`,
     /// preserving the `scp_wrapping_key` leaf extension per §9.16.1).
     ///
@@ -1039,18 +1212,28 @@ pub type VoteOnProposalReply = oneshot::Sender<
 /// [`GovernanceCommand::ProposeGovernanceActionChecked`]. Boxed inside
 /// each variant so the enum's variant sizes stay uniform under
 /// `clippy::large_enum_variant` (GovernanceAction may embed large
-/// sub-structs like tool interfaces or ceiling modifications).
+/// sub-structs like outlet interfaces or ceiling modifications).
 pub struct ProposeGovernanceActionPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Proposer DID.
-    pub proposer_did: scp_identity::DID,
+    pub proposer_did: scp_did::DID,
     /// Typed governance action — one of the 28 variants from ADR-031.
     pub action: scp_protocol::context::governance::GovernanceAction,
     /// Proposer's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
     /// so the private key zeroes on drop (mirrors the messaging path's
     /// command-level zeroize contract).
     pub signing_key: SigningKeyBytes,
+    /// The invitee's TLS-serialized MLS `KeyPackage` for an `AddMember`
+    /// auto-execute. Carried here — on the in-process actor command envelope,
+    /// NOT on the signed/logged
+    /// [`GovernanceAction`](scp_protocol::context::governance::GovernanceAction)
+    /// wire type — by [`Supervisor::invite_member`](crate::context::supervisor::Supervisor::invite_member),
+    /// which threads it to `execute_add_member` so the governance add performs a
+    /// REAL MLS add (§5.12.3). `None` for every other proposal (the generic FFI
+    /// governance path). The `KeyPackage` is the invitee's PUBLIC credential (no
+    /// private key material).
+    pub key_package: Option<Vec<u8>>,
 }
 
 /// Payload for [`GovernanceCommand::VoteOnProposal`],
@@ -1066,7 +1249,7 @@ pub struct VoteOnProposalPayload {
     /// Target proposal ID (32 bytes).
     pub proposal_id: scp_protocol::context::governance::ProposalId,
     /// Voter DID.
-    pub voter_did: scp_identity::DID,
+    pub voter_did: scp_did::DID,
     /// Voter's Ed25519 signing key (zeroized on drop via
     /// [`SigningKeyBytes`]).
     pub signing_key: SigningKeyBytes,
@@ -1094,8 +1277,8 @@ pub struct ExecuteGovernanceActionPayload {
     pub proposal_id: scp_protocol::context::governance::ProposalId,
 }
 
-/// See [`ContextCommand::Governance`]. Real variants land in commit 10
-/// of the ADR-049 commit ladder (see `handlers/governance.rs`).
+/// See [`ContextCommand::Governance`]. Real variants land in a later slice of
+/// the ADR-049 actor migration (ADR-049 §15; see `handlers/governance.rs`).
 /// Variants mirror the public surface of
 /// [`crate::context::governance_helpers`] one-to-one: propose, vote,
 /// approve/reject/withdraw, execute, read proposals, apply pending
@@ -1107,18 +1290,9 @@ pub struct ExecuteGovernanceActionPayload {
 /// mirrors the manager methods that accept them, not the actions
 /// themselves.
 pub enum GovernanceCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Submits a governance proposal — unchecked variant. Mirrors
-    /// [`ContextManager::propose_governance_action`](crate::context::supervisor::Supervisor::propose_governance_action).
+    /// `Supervisor::propose_governance_action` (a `testing`-gated convenience
+    /// wrapper over the checked path).
     /// Accepts the proposer DID + action + signing key without a
     /// capability pre-check (the governance engine enforces eligibility
     /// internally). For `SingleAdmin` contexts the proposal is auto-
@@ -1133,7 +1307,7 @@ pub enum GovernanceCommand {
     },
 
     /// Submits a governance proposal — checked variant. Mirrors
-    /// [`ContextManager::propose_governance_action_checked`](crate::context::supervisor::Supervisor::propose_governance_action_checked).
+    /// [`Supervisor::propose_governance_action_checked`](crate::context::supervisor::Supervisor::propose_governance_action_checked).
     /// Validates the proposer's `GovernancePropose` capability inside
     /// the same lock as the proposal submission (no TOCTOU).
     ProposeGovernanceActionChecked {
@@ -1145,7 +1319,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts a vote on a pending proposal. Mirrors
-    /// [`ContextManager::vote_on_proposal`](crate::context::supervisor::Supervisor::vote_on_proposal).
+    /// `Supervisor::vote_on_proposal` (a `testing`-gated helper).
     /// `approve == true` is an approval vote; `false` is rejection.
     VoteOnProposal {
         /// Boxed owned payload.
@@ -1159,7 +1333,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts an approval vote with explicit capability pre-check.
-    /// Mirrors [`ContextManager::approve_governance_proposal`](crate::context::governance_helpers::approve_governance_proposal).
+    /// Mirrors [`governance_helpers::approve_governance_proposal`](crate::context::governance_helpers::approve_governance_proposal).
     /// The reply carries only the resulting status (the legacy method
     /// discards the event list by convention — see its implementation).
     ApproveGovernanceProposal {
@@ -1172,7 +1346,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts a rejection vote with explicit capability pre-check.
-    /// Mirrors [`ContextManager::reject_governance_proposal`](crate::context::governance_helpers::reject_governance_proposal).
+    /// Mirrors [`governance_helpers::reject_governance_proposal`](crate::context::governance_helpers::reject_governance_proposal).
     RejectGovernanceProposal {
         /// Boxed owned payload.
         payload: Box<VoteOnProposalPayload>,
@@ -1183,7 +1357,7 @@ pub enum GovernanceCommand {
     },
 
     /// Withdraws a previously cast vote. Mirrors
-    /// [`ContextManager::withdraw_governance_vote`](crate::context::supervisor::Supervisor::withdraw_governance_vote).
+    /// [`Supervisor::withdraw_governance_vote`](crate::context::supervisor::Supervisor::withdraw_governance_vote).
     /// No signing key — withdrawal is the voter's privileged operation
     /// on their own vote per the governance engine's trait contract.
     WithdrawGovernanceVote {
@@ -1192,7 +1366,7 @@ pub enum GovernanceCommand {
         /// Target proposal ID (32 bytes).
         proposal_id: scp_protocol::context::governance::ProposalId,
         /// Voter DID.
-        voter_did: scp_identity::DID,
+        voter_did: scp_did::DID,
         /// Oneshot reply channel.
         reply: oneshot::Sender<
             Result<scp_protocol::context::governance::ProposalStatus, ContextError>,
@@ -1200,7 +1374,7 @@ pub enum GovernanceCommand {
     },
 
     /// Executes an already-approved governance proposal. Mirrors
-    /// [`ContextManager::execute_governance_action`](crate::context::governance_helpers::execute_governance_action).
+    /// [`governance_helpers::execute_governance_action`](crate::context::governance_helpers::execute_governance_action).
     /// Caller MUST pass a proposal whose status is
     /// [`ProposalStatus::Approved`](scp_protocol::context::governance::ProposalStatus);
     /// the legacy method enforces the gate.
@@ -1213,7 +1387,7 @@ pub enum GovernanceCommand {
     },
 
     /// Reads a single proposal by ID. Mirrors
-    /// [`ContextManager::get_proposal`](crate::context::supervisor::Supervisor::get_proposal).
+    /// [`Supervisor::get_proposal`](crate::context::supervisor::Supervisor::get_proposal).
     GetProposal {
         /// Context identifier string.
         context_id: String,
@@ -1226,7 +1400,7 @@ pub enum GovernanceCommand {
     },
 
     /// Lists all proposals for a context. Mirrors
-    /// [`ContextManager::list_proposals`](crate::context::supervisor::Supervisor::list_proposals).
+    /// [`Supervisor::list_proposals`](crate::context::supervisor::Supervisor::list_proposals).
     ListProposals {
         /// Context identifier string.
         context_id: String,
@@ -1238,7 +1412,7 @@ pub enum GovernanceCommand {
 
     /// Applies a pending ceiling modification whose notification period
     /// has expired. Mirrors
-    /// [`ContextManager::apply_pending_ceiling_modification`](crate::context::governance_helpers::apply_pending_ceiling_modification).
+    /// [`governance_helpers::apply_pending_ceiling_modification`](crate::context::governance_helpers::apply_pending_ceiling_modification).
     /// Returns `true` iff a pending modification was applied.
     ApplyPendingCeilingModification {
         /// Context identifier string.
@@ -1252,7 +1426,7 @@ pub enum GovernanceCommand {
 
     /// Applies a pending economic-policy change whose notification
     /// period has expired. Mirrors
-    /// [`ContextManager::apply_pending_economic_policy_change`](crate::context::governance_helpers::apply_pending_economic_policy_change).
+    /// [`governance_helpers::apply_pending_economic_policy_change`](crate::context::governance_helpers::apply_pending_economic_policy_change).
     /// Returns `true` iff a pending change was applied.
     ApplyPendingEconomicPolicyChange {
         /// Context identifier string.
@@ -1265,7 +1439,7 @@ pub enum GovernanceCommand {
 
     /// Tombstones a migrated context after the grace period expires.
     /// Mirrors
-    /// [`ContextManager::tombstone_migrated_context`](crate::context::governance_helpers::tombstone_migrated_context).
+    /// [`governance_helpers::tombstone_migrated_context`](crate::context::governance_helpers::tombstone_migrated_context).
     TombstoneMigratedContext {
         /// Context identifier string.
         context_id: String,
@@ -1274,7 +1448,7 @@ pub enum GovernanceCommand {
     },
 
     /// Returns the migration state for a context if one exists. Mirrors
-    /// [`ContextManager::migration_state`](crate::context::governance_helpers::migration_state).
+    /// [`governance_helpers::migration_state`](crate::context::governance_helpers::migration_state).
     ///
     /// This is read-only; the handler returns
     /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
@@ -1289,7 +1463,7 @@ pub enum GovernanceCommand {
 
     /// Acknowledges and clears a commit-fault marker for a context
     /// (PR #1606 C6). Mirrors
-    /// [`ContextManager::acknowledge_commit_fault`](crate::context::governance_helpers::acknowledge_commit_fault).
+    /// [`governance_helpers::acknowledge_commit_fault`](crate::context::governance_helpers::acknowledge_commit_fault).
     AcknowledgeCommitFault {
         /// Context identifier string.
         context_id: String,
@@ -1351,49 +1525,11 @@ pub enum GovernanceCommand {
         /// legacy method's no-error contract).
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
-
-    /// Sweep: run one tick of the governance timeout / consequence
-    /// pipeline for THIS actor's context. Mirrors the per-context body of
-    /// `start_governance_timeout_task_legacy` (Phase 1 through Phase 5).
-    ///
-    /// Dispatched per-actor by the supervisor's iterating sweep entry
-    /// point
-    /// [`governance_helpers::start_governance_timeout_task`](crate::context::governance_helpers::start_governance_timeout_task)
-    /// which still owns timer spawn (the per-actor governance-timeout
-    /// task lands in Phase 2B per ADR-049). For now, the spawn-time
-    /// closure dispatches this command on each tick instead of
-    /// reaching into the supervisor's `contexts` DashMap directly.
-    ///
-    /// Reply carries `Ok(continue_loop)` — `true` to keep ticking,
-    /// `false` to stop (context closing or removed). Matches the
-    /// legacy timer closure's `bool` return.
-    EvaluateTimeouts {
-        /// Oneshot reply channel. `Ok(true)` continues the timer loop;
-        /// `Ok(false)` stops it.
-        reply: oneshot::Sender<Result<bool, ContextError>>,
-    },
-
-    /// Install (or reinstall) THIS actor's governance-timeout interval
-    /// task on actor-owned state.
-    ///
-    /// The handler spawns the 60-second interval loop onto the
-    /// supervisor's tracked `task_set` via
-    /// [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn)
-    /// and stores its cancel `Notify` + `AbortHandle` on
-    /// `state.governance.timeout_task`. On each wake the task resolves
-    /// the owning actor through
-    /// [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
-    /// and mailboxes [`Self::EvaluateTimeouts`] — no `&Supervisor` /
-    /// `contexts` DashMap reach, no stale-generation gate.
-    ///
-    /// Dispatched by the lifecycle bootstrap paths (`finalize_create`,
-    /// `restore_context`, `import_context`) after actor spawn, since
-    /// those hold only `&ActorDeps` (no `&mut state`).
-    StartTimeoutTask {
-        /// Oneshot reply channel. `Ok(())` once the interval task is
-        /// installed.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
+    // NOTE (ADR-049 Decision-1 / finding A3): the former `EvaluateTimeouts`
+    // and `StartTimeoutTask` variants were retired. The governance-timeout
+    // sweep is now ACTOR-OWNED — `ContextActor`'s `governance_timeout`
+    // interval arm calls `handlers::governance::evaluate_governance_timeouts`
+    // directly, with no supervisor-driven `task_set` spawn or mailbox hop.
 }
 
 /// Reply-channel type alias for [`BroadcastCommand::SubscribeBroadcast`].
@@ -1448,7 +1584,7 @@ pub struct SubscribeBroadcastPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Subscriber DID.
-    pub subscriber_did: scp_identity::DID,
+    pub subscriber_did: scp_did::DID,
     /// Optional UCAN token — required for gated broadcast contexts.
     pub ucan: Option<scp_protocol::crypto::ucan::UcanToken>,
     /// Timestamp (seconds) at the point of subscription. The caller
@@ -1463,7 +1599,7 @@ pub struct UnsubscribeBroadcastPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Subscriber DID.
-    pub subscriber_did: scp_identity::DID,
+    pub subscriber_did: scp_did::DID,
     /// Rotate per-author keys on unsubscribe so the departed subscriber
     /// cannot decrypt future broadcasts (forward secrecy). `false` is
     /// valid when the subscriber left voluntarily and re-subscribes
@@ -1476,28 +1612,30 @@ pub struct UnsubscribeBroadcastPayload {
 ///
 /// # KeyCustody plumbing
 ///
-/// The legacy
-/// [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast)
-/// takes a `custody: &impl KeyCustody + &KeyHandle` pair; the
-/// [`KeyCustody`](scp_platform::KeyCustody) trait uses RPITIT and is
-/// NOT `dyn`-safe, so it cannot cross the actor mailbox. Instead:
+/// Signing a broadcast envelope needs the caller's
+/// [`KeyCustody`](scp_platform::KeyCustody) backend; the trait uses
+/// RPITIT and is NOT `dyn`-safe, so it cannot cross the actor mailbox.
+/// Instead:
 ///
 /// - The command carries only the
 ///   [`KeyHandle`](scp_platform::KeyHandle) (an opaque reference that
 ///   IS `Send + Sync + Clone`).
-/// - The shim-dispatch entry point
-///   [`Supervisor::dispatch_broadcast_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command)
-///   is generic over the concrete custody type, and the shim extracts
-///   the `KeyHandle` from the command and passes both to
-///   [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast).
-/// - For the post-refactor actor loop (commit 12+), the custody is
-///   available via the actor's bridge-instance reference; the actor
-///   body resolves the custody from the instance and signs inline.
+/// - The custody-generic entry point
+///   [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody)
+///   drives the two-phase publish path: the actor reserves the
+///   sequence via
+///   [`broadcast_helpers::reserve_broadcast_publish`](crate::context::broadcast_helpers::reserve_broadcast_publish)
+///   and returns the signing-payload digest, the supervisor signs with
+///   the caller's custody OUTSIDE the actor, then the actor seals via
+///   [`broadcast_helpers::apply_broadcast_publish`](crate::context::broadcast_helpers::apply_broadcast_publish).
+/// - Dispatching this variant directly on the actor mailbox is
+///   rejected with a typed error pointing at the custody-generic
+///   entry point (see `handlers/broadcast.rs`).
 pub struct PublishBroadcastPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Author DID (registered in the broadcast context).
-    pub author_did: scp_identity::DID,
+    pub author_did: scp_did::DID,
     /// Plaintext payload bytes.
     pub payload: Vec<u8>,
     /// Handle to the author's signing key inside the caller's custody
@@ -1512,7 +1650,7 @@ pub struct PublishBroadcastContentPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Author DID.
-    pub author_did: scp_identity::DID,
+    pub author_did: scp_did::DID,
     /// Structured broadcast content.
     pub content: scp_protocol::context::BroadcastContent,
     /// Handle to the author's signing key inside the caller's custody
@@ -1529,7 +1667,7 @@ pub struct ReserveBroadcastPublishPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Author DID (registered in the broadcast context).
-    pub author_did: scp_identity::DID,
+    pub author_did: scp_did::DID,
 }
 
 /// Payload for [`BroadcastCommand::ApplyBroadcastPublish`] — phase 2 of the
@@ -1566,9 +1704,9 @@ pub struct BroadcastBlockPayload {
     /// Context identifier string.
     pub context_id: String,
     /// Author DID executing the block/unblock.
-    pub author_did: scp_identity::DID,
+    pub author_did: scp_did::DID,
     /// Subscriber DID being blocked/unblocked.
-    pub subscriber_did: scp_identity::DID,
+    pub subscriber_did: scp_did::DID,
 }
 
 /// See [`ContextCommand::Broadcast`]. Real variants cover every public
@@ -1579,30 +1717,28 @@ pub struct BroadcastBlockPayload {
 /// `PublishBroadcast` / `PublishBroadcastContent` each require the
 /// caller's [`KeyCustody`](scp_platform::KeyCustody) backend to sign the
 /// broadcast envelope — the custody trait uses RPITIT and cannot cross
-/// an actor mailbox. For commit 11 the non-saga variants store only the
-/// [`KeyHandle`](scp_platform::KeyHandle); the handler reaches back to
-/// the attached [`Supervisor`](crate::context::supervisor::Supervisor)
-/// for the custody reference, matching the bridge-level wiring the
-/// legacy method uses today.
+/// an actor mailbox. The variants store only the
+/// [`KeyHandle`](scp_platform::KeyHandle) and are dispatched through
+/// the custody-generic
+/// [`Supervisor::dispatch_broadcast_command_with_custody`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command_with_custody),
+/// which drives the custody-free two-phase
+/// `ReserveBroadcastPublish` / `ApplyBroadcastPublish` mailbox commands
+/// and signs with the caller's custody between the two phases, outside
+/// the actor.
 pub enum BroadcastCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Subscribe a DID to a broadcast context. Mirrors
-    /// [`ContextManager::subscribe_broadcast`](crate::context::broadcast_helpers::subscribe_broadcast).
+    /// [`broadcast_helpers::subscribe_broadcast`](crate::context::broadcast_helpers::subscribe_broadcast).
     ///
-    /// The validation-context-generic variant on `ContextManager` carries
-    /// a `ValidationContext<'_, D, N, R, P, S>` parameter; the actor
-    /// command surface passes `None` for that slot to match the default
-    /// unvalidated path. Gated contexts with a UCAN still route through
-    /// the UCAN token's inline validation.
+    /// The validation-context-generic form of that helper carries a
+    /// `ValidationContext<'_, D, N, R, P, S>` parameter. The
+    /// `handle_subscribe_broadcast` handler builds a REAL `ValidationContext`
+    /// from actor-owned state (`KeyResolverDidResolver`,
+    /// `ContextRevocationChecker`, an owned snapshot of the per-context proof
+    /// store, the context ceiling, and creator DID) and passes `Some(&mut ctx)`,
+    /// so a gated context runs the full UCAN validation pipeline on the
+    /// presented `messages:read` token (spec §5.14.4, §07:70). The payload's
+    /// `ucan` field carries that token — `None` is valid only for an OPEN
+    /// context, which the pipeline never invokes.
     SubscribeBroadcast {
         /// Boxed owned payload.
         payload: Box<SubscribeBroadcastPayload>,
@@ -1611,7 +1747,7 @@ pub enum BroadcastCommand {
     },
 
     /// Unsubscribe a DID from a broadcast context. Mirrors
-    /// [`ContextManager::unsubscribe_broadcast`](crate::context::broadcast_helpers::unsubscribe_broadcast).
+    /// [`broadcast_helpers::unsubscribe_broadcast`](crate::context::broadcast_helpers::unsubscribe_broadcast).
     UnsubscribeBroadcast {
         /// Boxed owned payload.
         payload: Box<UnsubscribeBroadcastPayload>,
@@ -1619,8 +1755,11 @@ pub enum BroadcastCommand {
         reply: UnsubscribeBroadcastReply,
     },
 
-    /// Publish raw bytes to a broadcast context. Mirrors
-    /// [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast).
+    /// Publish raw bytes to a broadcast context. Dispatched via the
+    /// custody-generic supervisor path, which drives the two-phase
+    /// [`broadcast_helpers::reserve_broadcast_publish`](crate::context::broadcast_helpers::reserve_broadcast_publish)
+    /// / [`broadcast_helpers::apply_broadcast_publish`](crate::context::broadcast_helpers::apply_broadcast_publish)
+    /// pair — see the enum-level key-custody handoff docs.
     PublishBroadcast {
         /// Boxed owned payload.
         payload: Box<PublishBroadcastPayload>,
@@ -1629,8 +1768,11 @@ pub enum BroadcastCommand {
     },
 
     /// Publish structured [`BroadcastContent`](scp_protocol::context::broadcast_content::BroadcastContent)
-    /// to a broadcast context. Mirrors
-    /// [`ContextManager::publish_broadcast_content`](crate::context::broadcast_helpers::publish_broadcast_content).
+    /// to a broadcast context. Serializes the content, then follows the
+    /// same custody-generic two-phase
+    /// [`broadcast_helpers::reserve_broadcast_publish`](crate::context::broadcast_helpers::reserve_broadcast_publish)
+    /// / [`broadcast_helpers::apply_broadcast_publish`](crate::context::broadcast_helpers::apply_broadcast_publish)
+    /// path as [`Self::PublishBroadcast`].
     PublishBroadcastContent {
         /// Boxed owned payload.
         payload: Box<PublishBroadcastContentPayload>,
@@ -1673,7 +1815,7 @@ pub enum BroadcastCommand {
 
     /// Block a subscriber from receiving future broadcasts from a
     /// specific author. Mirrors
-    /// [`ContextManager::block_broadcast_subscriber`](crate::context::broadcast_helpers::block_broadcast_subscriber).
+    /// [`broadcast_helpers::block_broadcast_subscriber`](crate::context::broadcast_helpers::block_broadcast_subscriber).
     BlockBroadcastSubscriber {
         /// Boxed owned payload.
         payload: Box<BroadcastBlockPayload>,
@@ -1682,7 +1824,7 @@ pub enum BroadcastCommand {
     },
 
     /// Unblock a previously blocked subscriber. Mirrors
-    /// [`ContextManager::unblock_broadcast_subscriber`](crate::context::broadcast_helpers::unblock_broadcast_subscriber).
+    /// [`broadcast_helpers::unblock_broadcast_subscriber`](crate::context::broadcast_helpers::unblock_broadcast_subscriber).
     UnblockBroadcastSubscriber {
         /// Boxed owned payload.
         payload: Box<BroadcastBlockPayload>,
@@ -1691,7 +1833,7 @@ pub enum BroadcastCommand {
     },
 
     /// Evaluate a subscriber's broadcast-key request. Mirrors
-    /// [`ContextManager::handle_broadcast_key_request`](crate::context::broadcast_helpers::handle_broadcast_key_request).
+    /// [`broadcast_helpers::handle_broadcast_key_request`](crate::context::broadcast_helpers::handle_broadcast_key_request).
     ///
     /// Read-mostly (no per-context mutation) — handler reports
     /// `mutated: false`.
@@ -1699,9 +1841,9 @@ pub enum BroadcastCommand {
         /// Context identifier string.
         context_id: String,
         /// Author DID (locally controlled) whose key is being requested.
-        author_did: scp_identity::DID,
+        author_did: scp_did::DID,
         /// Requester DID.
-        requester_did: scp_identity::DID,
+        requester_did: scp_did::DID,
         /// Requester's X25519 wrapping public key. The broadcast key is
         /// HPKE-sealed to this key inside the protocol handler (§5.14.2) — the
         /// raw key never leaves the protocol layer.
@@ -1712,7 +1854,7 @@ pub enum BroadcastCommand {
     },
 
     /// Return the subscriber count for a broadcast context. Mirrors
-    /// [`ContextManager::broadcast_subscriber_count`](crate::context::broadcast_helpers::broadcast_subscriber_count).
+    /// [`broadcast_helpers::broadcast_subscriber_count`](crate::context::broadcast_helpers::broadcast_subscriber_count).
     /// Read-only. `Ok(None)` iff the context is unknown or not broadcast.
     BroadcastSubscriberCount {
         /// Context identifier string.
@@ -1722,7 +1864,7 @@ pub enum BroadcastCommand {
     },
 
     /// Membership predicate — `true` iff `did` is a subscriber. Mirrors
-    /// [`ContextManager::is_broadcast_subscriber`](crate::context::broadcast_helpers::is_broadcast_subscriber).
+    /// [`broadcast_helpers::is_broadcast_subscriber`](crate::context::broadcast_helpers::is_broadcast_subscriber).
     /// Read-only.
     IsBroadcastSubscriber {
         /// Context identifier string.
@@ -1734,7 +1876,7 @@ pub enum BroadcastCommand {
     },
 
     /// Return the broadcast context's admission policy. Mirrors
-    /// [`ContextManager::broadcast_admission`](crate::context::broadcast_helpers::broadcast_admission).
+    /// [`broadcast_helpers::broadcast_admission`](crate::context::broadcast_helpers::broadcast_admission).
     /// Read-only. `Ok(None)` iff the context is unknown or not broadcast.
     BroadcastAdmission {
         /// Context identifier string.
@@ -1756,31 +1898,21 @@ pub type VerifyPaymentReceiptsReply = oneshot::Sender<
     >,
 >;
 
-/// See [`ContextCommand::Economy`]. Real variants land in commit 10 of
-/// the ADR-049 commit ladder (see `handlers/economy.rs`). The public
+/// See [`ContextCommand::Economy`]. Real variants land in a later slice of
+/// the ADR-049 actor migration (ADR-049 §15; see `handlers/economy.rs`). The public
 /// surface of [`crate::context::economy_helpers`] currently consists
 /// of a single method, [`verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts);
 /// all other economy methods (`authorize_paid_action`,
 /// `complete_paid_action`, `void_paid_action`,
 /// `rollback_economy_ticket_inline_view`)
-/// are `pub(super)` helpers invoked by the messaging path. Commit 12
+/// are `pub(super)` helpers invoked by the messaging path. ADR-049 §15
 /// rewires the sender-side pipeline to construct economy commands
-/// internally rather than calling the helpers directly; commit 10
+/// internally rather than calling the helpers directly; ADR-049 §15
 /// lands only the public surface.
 pub enum EconomyCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Verifies a batch of payment receipts against the configured
     /// payment adapter. Mirrors
-    /// [`ContextManager::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts).
+    /// [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts).
     ///
     /// Read-only — the handler returns
     /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
@@ -1816,7 +1948,7 @@ pub struct CreateGovernanceCheckpointPayload {
     /// Hash of the state snapshot accompanying the checkpoint.
     pub state_snapshot_hash: [u8; 32],
     /// Creator DID.
-    pub creator_did: scp_identity::DID,
+    pub creator_did: scp_did::DID,
     /// Creator's Ed25519 signature over the canonical checkpoint
     /// bytes (computed outside the handler — passed through verbatim).
     pub creator_signature: Vec<u8>,
@@ -1863,18 +1995,8 @@ pub struct RecoveryNotifyContactPayload {
 /// checkpoints + cosignatures, compromise-recovery epoch advance, and
 /// recovery notifications (spec §9.12).
 pub enum TrustRecoveryCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Creates a governance-aware checkpoint for a context. Mirrors
-    /// [`ContextManager::create_governance_checkpoint`](crate::context::trust_recovery_helpers::create_governance_checkpoint).
+    /// [`trust_recovery_helpers::create_governance_checkpoint`](crate::context::trust_recovery_helpers::create_governance_checkpoint).
     CreateGovernanceCheckpoint {
         /// Boxed owned payload.
         payload: Box<CreateGovernanceCheckpointPayload>,
@@ -1886,7 +2008,7 @@ pub enum TrustRecoveryCommand {
 
     /// Adds a cosignature to an existing checkpoint and re-evaluates
     /// attestation status. Mirrors
-    /// [`ContextManager::add_checkpoint_cosignature`](crate::context::trust_recovery_helpers::add_checkpoint_cosignature).
+    /// [`trust_recovery_helpers::add_checkpoint_cosignature`](crate::context::trust_recovery_helpers::add_checkpoint_cosignature).
     ///
     /// The caller supplies a mutable checkpoint (by owned value) and
     /// the cosignature; the handler applies the cosignature on success
@@ -1916,7 +2038,7 @@ pub enum TrustRecoveryCommand {
 
     /// Advances the MLS epoch for a context as part of compromise
     /// recovery (spec §9.12 step 2). Mirrors
-    /// [`ContextManager::recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch).
+    /// [`trust_recovery_helpers::recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch).
     RecoveryAdvanceEpoch {
         /// Context identifier string.
         context_id: String,
@@ -1926,7 +2048,7 @@ pub enum TrustRecoveryCommand {
 
     /// Sends a recovery notification directly through a named context
     /// (spec §9.12 step 5 — context already known). Mirrors
-    /// [`ContextManager::recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification).
+    /// [`trust_recovery_helpers::recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification).
     RecoverySendNotification {
         /// Boxed owned payload (carries the signing key bytes).
         payload: Box<RecoverySendNotificationPayload>,
@@ -1936,7 +2058,7 @@ pub enum TrustRecoveryCommand {
 
     /// Sends a recovery notification to a contact DID by finding a
     /// shared context. Mirrors
-    /// [`ContextManager::recovery_notify_contact`](crate::context::trust_recovery_helpers::recovery_notify_contact).
+    /// [`trust_recovery_helpers::recovery_notify_contact`](crate::context::trust_recovery_helpers::recovery_notify_contact).
     RecoveryNotifyContact {
         /// Boxed owned payload (carries the signing key bytes).
         payload: Box<RecoveryNotifyContactPayload>,
@@ -1948,45 +2070,35 @@ pub enum TrustRecoveryCommand {
 /// See [`ContextCommand::Standing`]. Real variants cover the public
 /// methods on [`crate::context::standing_helpers`].
 pub enum StandingCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
     /// Get-or-create a standing bilateral context between two identities
-    /// (spec §5.12.4 — contact graph). Mirrors
-    /// [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context).
+    /// (spec §5.12.6 — contact graph). Mirrors the supervisor's
+    /// `Supervisor::standing_context` get-or-create method.
     ///
-    /// Idempotent at the legacy-method level — a concurrent call
+    /// Idempotent at the underlying-method level — a concurrent call
     /// returning `Active` or `Creating` surfaces the same context ID
     /// without error.
     ///
     /// # Not a saga
     ///
     /// The method internally calls
-    /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context).
+    /// [`Supervisor::create_context`](crate::context::supervisor::Supervisor::create_context).
     /// Standing-pair creation is single-context async creation (create +
     /// add_member + Welcome + consent-on-receipt; spec §5.15.8) routed
     /// directly through that path — NOT a 2-phase-commit saga FSM.
     StandingContext {
         /// Local identity DID.
-        local_did: scp_identity::DID,
+        local_did: scp_did::DID,
         /// Remote peer DID.
-        peer_did: scp_identity::DID,
+        peer_did: scp_did::DID,
         /// Oneshot reply channel. `Ok(String)` carries the
-        /// deterministic standing context ID; the legacy method returns
-        /// the same ID whether the context already existed or was
-        /// freshly created.
+        /// deterministic standing context ID; the underlying method
+        /// returns the same ID whether the context already existed or
+        /// was freshly created.
         reply: oneshot::Sender<Result<String, ContextError>>,
     },
 
     /// Returns the number of tracked standing contexts. Mirrors
-    /// [`ContextManager::standing_context_count`](crate::context::standing_helpers::standing_context_count).
+    /// [`standing_helpers::standing_context_count`](crate::context::standing_helpers::standing_context_count).
     /// Read-only.
     StandingContextCount {
         /// Oneshot reply channel.
@@ -1995,28 +2107,28 @@ pub enum StandingCommand {
 
     /// Returns `true` iff a standing context exists for the given peer.
     /// Mirrors
-    /// [`ContextManager::has_standing_context`](crate::context::standing_helpers::has_standing_context).
+    /// [`standing_helpers::has_standing_context`](crate::context::standing_helpers::has_standing_context).
     /// Read-only.
     HasStandingContext {
         /// Candidate peer DID.
-        peer_did: scp_identity::DID,
+        peer_did: scp_did::DID,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<bool, ContextError>>,
     },
 
     /// Registers an existing context as a standing context. Mirrors
-    /// [`ContextManager::register_standing_context`](crate::context::standing_helpers::register_standing_context).
+    /// [`standing_helpers::register_standing_context`](crate::context::standing_helpers::register_standing_context).
     /// Called during SDK init to restore the contact-graph index from a
     /// persisted snapshot.
     RegisterStandingContext {
         /// Peer DID whose context to register.
-        peer_did: scp_identity::DID,
+        peer_did: scp_did::DID,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
     /// Reconnects transport for every standing context. Mirrors
-    /// [`ContextManager::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing).
+    /// [`standing_helpers::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing).
     /// Returns the number of contexts that were successfully
     /// reconnected.
     ReconnectAllStanding {
@@ -2048,24 +2160,28 @@ pub struct TtlContextPayload {
 pub struct TtlTimerPayload {
     /// Context identifier string.
     pub context_id: String,
-    /// Context params — used to rebuild the ephemeral handle that
-    /// the timer task will pass to `run_ttl_expiry_with_retries`.
+    /// Context params — for `StartTtlTimer` the TTL duration (`params.ttl`)
+    /// supplies the convergent `creation + ttl` expiry deadline the handler
+    /// falls back to when no explicit `deadline_override` is given.
     pub params: scp_protocol::context::params::ContextParams,
-    /// TTL duration. Fires relative to the dispatcher's clock for
-    /// `StartTtlTimer`; the replacement duration for
-    /// `ResetTtlTimer`.
+    /// The replacement/additional TTL duration for `ResetTtlTimer` — the agreed
+    /// extension added to the EXISTING recorded deadline (`old_deadline +
+    /// duration`, §7.3.1 convergent bilateral reset). Ignored by
+    /// `StartTtlTimer`, which records an absolute `deadline_override` instead.
     pub duration: std::time::Duration,
-    /// When `true` (the initial-create `StartTtlTimer` path), the handler
-    /// records a CONVERGENT expiry deadline anchored on the actor's
-    /// `creation_timestamp_secs + params.ttl` — every member computes the
-    /// identical absolute deadline, so the `ContextExpired`/`ContextClosed`
-    /// leaf timestamp is convergent-by-construction (§7.3.1, §9.9.3). When
-    /// `false` (e.g. the restore/import path, whose persisted snapshot does
-    /// not yet carry the convergent creation time — a forward step under
-    /// ADR-051), the deadline is armed relative to the local clock (the prior
-    /// behaviour). Ignored by `ResetTtlTimer`, which never anchors to
-    /// creation.
-    pub anchor_deadline_to_creation: bool,
+    /// Absolute convergent expiry deadline to record for `StartTtlTimer`, as a
+    /// [`ConvergentDeadline`](crate::context::ttl_close_helpers::ConvergentDeadline)
+    /// — the transient arming-seam newtype, carried in-process across this
+    /// (never-serialized) mailbox command, NEVER persisted (B2). `Some(d)`
+    /// installs `d` verbatim — the restore/import paths pass the deadline derived
+    /// from the SINGLE authoritative source (the event log) via
+    /// `convergent_ttl_deadline`, so a prior extension survives and a
+    /// `None`-remaining Active snapshot still re-arms (D1/D2). `None` (the
+    /// initial-create / spawn-from-Welcome path) defers to the handler's
+    /// create-base derivation. Every member computes the identical absolute
+    /// deadline, so the `ContextExpired`/`ContextClosed` leaf timestamp is
+    /// convergent-by-construction (§7.3.1, §9.9.3). Ignored by `ResetTtlTimer`.
+    pub deadline_override: Option<crate::context::ttl_close_helpers::ConvergentDeadline>,
 }
 
 /// See [`ContextCommand::TtlClose`]. Real variants land in commit 9 of
@@ -2075,58 +2191,28 @@ pub struct TtlTimerPayload {
 /// surface one-to-one. The handler shim delegates to the legacy method
 /// under the hood.
 ///
-/// **TTL timer specifics (commit 9 scope).** The post-refactor
-/// architecture turns the TTL timer into a `select!` arm in
-/// [`ContextActor::run`](crate::context::actor::ContextActor). Commit 9
-/// keeps the timer spawned from the legacy
-/// [`Supervisor`](crate::context::supervisor::Supervisor) internals
-/// (`spawn_ttl_timer`); the handler variants here respond to
-/// caller-initiated TTL commands (extend, finalize, explicit expiry)
-/// synchronously. Full timer-owning actor logic migrates with plan row
-/// 11.
+/// **TTL timer specifics (ADR-049 finding A3).** The TTL timer is an
+/// ACTOR-OWNED `select!` arm in
+/// [`ContextActor::run`](crate::context::actor::ContextActor): the arming
+/// variants here (`StartTtlTimer` / `ResetTtlTimer` / `ExtendTtl`) record the
+/// convergent `state.ttl.timer.deadline_unix_secs`, and the actor's
+/// `reconcile_timers` derives a one-shot `sleep` from it and runs the expiry
+/// pipeline on wake — no supervisor-spawned timer task.
 pub enum TtlCloseCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used by the actor's
-    /// `run()` skeleton dispatch as a no-op handshake target so the
-    /// mailbox machinery exercises end-to-end without a real
-    /// command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-    /// and returns `Outcome::err`.
-    Placeholder {
-        /// Oneshot reply channel. Handler stub sends
-        /// `Err(ContextError::NotImplemented(..))` back.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
-    /// Fires a single TTL tick on THIS actor: evaluate whether the
-    /// context's TTL has elapsed and, if so, run the close pipeline on the
-    /// actor-owned state.
+    // NOTE (ADR-049 Decision-1 / finding A3): the former `FireTimer`
+    // variant was retired. TTL expiry is now driven by an ACTOR-OWNED
+    // one-shot timer arm — `ContextActor::reconcile_timers` arms a `sleep`
+    // against `state.ttl.timer.deadline_unix_secs` and `on_ttl_tick` runs
+    // `ttl_close_helpers::handle_ttl_expiry` directly, with no
+    // supervisor-driven `task_set` spawn or mailbox tick. The arming
+    // variants below (`StartTtlTimer` / `ResetTtlTimer` / `ExtendTtl`)
+    // still record the deadline the actor arm reconciles against.
+    /// Records the TTL expiry deadline for the given context on actor-owned
+    /// state via `ttl_close_helpers::start_ttl_timer` at `create_context` /
+    /// `restore_context` time. The actor's `reconcile_timers` re-derives the
+    /// one-shot expiry sleep from it.
     ///
-    /// Sent by the per-context TTL timer task (spawned at
-    /// `create_context` / `restore_context` time) on each wake. The task
-    /// holds no `&Supervisor` and reads no DashMap; it resolves the actor
-    /// via [`Supervisor::lookup`](crate::context::supervisor::Supervisor::lookup)
-    /// (lock-free registry) and mailboxes this command. A `lookup → None`
-    /// (actor gone) replaces the legacy stale-generation gate: the timer
-    /// task stops when the context's actor no longer exists.
-    ///
-    /// Replaces the legacy `spawn_ttl_timer_legacy` task that probed
-    /// `contexts_arc.get(ctx).generation` for the stale-gen gate and held
-    /// the supervisor's `task_set` (ADR-049 Phase 2A finalization — DashMap
-    /// removal). The handler operates on the actor's owned `&mut state`.
-    FireTimer {
-        /// Oneshot reply channel. `Ok(true)` iff the timer should keep
-        /// running (context still open); `Ok(false)` once the close
-        /// pipeline has fired so the task can exit.
-        reply: oneshot::Sender<Result<bool, ContextError>>,
-    },
-
-    /// Spawns (or respawns) the TTL timer for the given context with a
-    /// caller-supplied duration. Installed on actor-owned state by
-    /// `ttl_close_helpers::spawn_ttl_timer` at `create_context` /
-    /// `restore_context` time.
-    ///
-    /// `Ok(())` once the timer has been successfully installed.
+    /// `Ok(())` once the deadline has been recorded.
     StartTtlTimer {
         /// Boxed owned payload — see [`TtlTimerPayload`].
         payload: Box<TtlTimerPayload>,
@@ -2148,7 +2234,7 @@ pub enum TtlCloseCommand {
         /// Context identifier string.
         context_id: String,
         /// Consenting member DID.
-        member_did: scp_identity::DID,
+        member_did: scp_did::DID,
         /// Proposed TTL duration.
         proposed_duration: std::time::Duration,
         /// Oneshot reply channel. `Ok(true)` iff unanimous consent was
@@ -2169,10 +2255,13 @@ pub enum TtlCloseCommand {
     /// Executes a caller-initiated TTL expiry. Mirrors
     /// [`handle_ttl_expiry`](crate::context::ttl_close_helpers::handle_ttl_expiry).
     ///
-    /// In commit 9 this is the explicit-expiry entry point; the timer
-    /// task spawned by `StartTtlTimer` still runs the automatic path
-    /// internally. Commit 11 converges both paths onto the actor's
-    /// `select!` arm.
+    /// This is the EXPLICIT-expiry entry point (an FFI
+    /// `context_handle_ttl_expiry` request); the AUTOMATIC path is driven
+    /// off the actor-owned TTL timer arm in `ContextActor::run()`
+    /// (`on_ttl_tick`), which reconciles a one-shot sleep against the
+    /// deadline `StartTtlTimer` records — no supervisor-spawned timer task.
+    /// Both paths run the same actor-owned expiry pipeline against the
+    /// actor's real state.
     ExecuteTtlClose {
         /// Boxed owned payload — see [`TtlContextPayload`].
         payload: Box<TtlContextPayload>,
@@ -2191,14 +2280,14 @@ pub enum TtlCloseCommand {
     },
 }
 
-/// See [`ContextCommand::Tools`]. Real variants cover every public
-/// method on [`crate::context::tools_helpers`] EXCEPT
-/// [`ContextManager::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
-/// — that method is the cross-context tool-invocation entry and carries
+/// See [`ContextCommand::Outlets`]. Real variants cover every public
+/// method on [`crate::context::outlets_helpers`] EXCEPT
+/// [`Supervisor::invoke_outlet_with_economy`](crate::context::supervisor::Supervisor::invoke_outlet_with_economy)
+/// — that method is the cross-context outlet-invocation entry and carries
 /// a generic executor closure `F: FnOnce(Value) -> Fut` which cannot
 /// cross the actor mailbox. The cross-context saga itself is wired (§6.2.4,
 /// reached via
-/// [`Supervisor::start_cross_context_tool_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_tool_invocation_saga), whose
+/// [`Supervisor::start_cross_context_outlet_invocation_saga`](crate::context::supervisor::Supervisor::start_cross_context_outlet_invocation_saga), whose
 /// borrowed (non-`'static`) [`SagaSigningKeys`](crate::context::supervisor::SagaSigningKeys)
 /// keep it off the `'static` mailbox); what remains
 /// deferred is its FFI export, pending per-participant-set saga gating
@@ -2206,23 +2295,13 @@ pub enum TtlCloseCommand {
 ///
 /// The migrated variants are the hard-rate-limit consume / refund
 /// helpers (async + sync + runtime-agnostic) that FFI bridges call from
-/// their own tool-dispatch paths. All 6 methods on
-/// [`crate::context::tools_helpers`] migrate here because they are the
-/// supervisor-observable tool surface.
-pub enum ToolsCommand {
-    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
-    /// ADR-049 (post-review-round-1 plan). Used as a no-op
-    /// handshake target by mailbox tests so the end-to-end dispatch
-    /// pipe is exercised without a real command. Handler replies
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
-    Placeholder {
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
-    },
-
+/// their own outlet-dispatch paths. All 6 methods on
+/// [`crate::context::outlets_helpers`] migrate here because they are the
+/// supervisor-observable outlet surface.
+pub enum OutletsCommand {
     /// Try to consume one hard-rate-limit token for the given
     /// `(context_id, did)` pair (async variant). Mirrors
-    /// [`ContextManager::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit).
+    /// [`outlets_helpers::try_consume_hard_rate_limit`](crate::context::outlets_helpers::try_consume_hard_rate_limit).
     ///
     /// Reply carries `Ok(true)` iff a token was consumed or the context
     /// is unknown (pass-through contract on unknown contexts — matches
@@ -2231,7 +2310,7 @@ pub enum ToolsCommand {
         /// Context identifier string.
         context_id: String,
         /// Sender DID.
-        did: scp_identity::DID,
+        did: scp_did::DID,
         /// Current Unix time in seconds — caller supplies to keep the
         /// handler pure / deterministic.
         now_secs: u64,
@@ -2240,62 +2319,363 @@ pub enum ToolsCommand {
     },
 
     /// Refund one hard-rate-limit token (async variant). Mirrors
-    /// [`ContextManager::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit).
+    /// [`outlets_helpers::refund_hard_rate_limit`](crate::context::outlets_helpers::refund_hard_rate_limit).
     /// No-op on unknown context.
     RefundHardRateLimit {
         /// Context identifier string.
         context_id: String,
         /// Sender DID.
-        did: scp_identity::DID,
+        did: scp_did::DID,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
 
-    /// Phase 1 of the tool economy pipeline — economy reserve on
+    /// Phase 1 of the outlet economy pipeline — economy reserve on
     /// actor-owned state. Mirrors the first lock phase of the legacy
-    /// `invoke_tool_with_economy`: consume the hard rate limit, record
+    /// `invoke_outlet_with_economy`: consume the hard rate limit, record
     /// the velocity entry, run the economy pre-check, deduct budget,
     /// authorize the payment escrow. Replies with a `Send`
-    /// [`ToolEconomyReservation`](crate::context::tools_helpers::ToolEconomyReservation)
+    /// [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)
     /// that the supervisor carries across the non-`Send` executor.
     ///
-    /// See [`crate::context::tools_helpers::reserve_tool_economy`].
-    ReserveToolEconomy {
+    /// See [`crate::context::outlets_helpers::reserve_outlet_economy`].
+    ReserveOutletEconomy {
         /// Context identifier string.
         context_id: String,
         /// Invoker DID.
-        invoker_did: scp_identity::DID,
+        invoker_did: scp_did::DID,
         /// Optional spending UCAN for paid actions (§19.5). Boxed so the
         /// variant payload stays pointer-sized.
         spending_ucan: Option<Box<scp_protocol::crypto::ucan::UcanToken>>,
+        /// §7.3.8 validated-narrowed effective invocation caveats bundled with
+        /// the revocation CID (the owned Class-S counter key) of the delegation
+        /// that carried them, resolved by the FFI bridge (via
+        /// `TokenNbCaveatResolver` + `compute_revocation_cid`) from the ONE
+        /// VALIDATED INVOCATION UCAN — the token granting the `outlet_call:*` /
+        /// `outlet_query:*` capability, captured at the bridge's
+        /// `validate_outlet_invocation_ucan` site. NOT sourced from
+        /// `spending_ucan` (a separate §19.5 economy token whose `nb` carries
+        /// no invocation caveats). `narrow()` folds every parent's value-caveats
+        /// into the leaf, so the leaf `nb` IS the effective narrowed set. The
+        /// caveats and CID are bundled into one
+        /// [`InvocationCaveatBinding`](crate::context::outlets_helpers::InvocationCaveatBinding)
+        /// so "caveats present ⟹ cid present" holds by construction — a
+        /// counter-bearing caveat can never reach the gate without its counter
+        /// key. The bundle is an internal runtime-API param: the SDK-facing FFI
+        /// export signature is unchanged, so an external caller cannot widen the
+        /// caveat set without forging the invocation UCAN. `None` when the
+        /// invocation UCAN carried no caveats. Boxed to keep the variant payload
+        /// pointer-sized.
+        caveat_binding: Option<Box<crate::context::outlets_helpers::InvocationCaveatBinding>>,
+        /// The invocation input, checked against the caveat's `input_schema`
+        /// by the §7.3.8 synchronous local gate. Boxed to keep the variant
+        /// payload pointer-sized.
+        input: Box<serde_json::Value>,
         /// Current Unix time in seconds — caller supplies to keep the
         /// handler deterministic.
         now_secs: u64,
         /// Oneshot reply channel carrying the Phase-1 reservation.
         reply: oneshot::Sender<
-            Result<Box<crate::context::tools_helpers::ToolEconomyReservation>, ContextError>,
+            Result<Box<crate::context::outlets_helpers::OutletEconomyReservation>, ContextError>,
         >,
     },
 
-    /// Phase 3 of the tool economy pipeline — settle on actor-owned
+    /// Phase 3 of the outlet economy pipeline — settle on actor-owned
     /// state. On executor success runs post-invocation bookkeeping +
     /// consequence enforcement + payment capture; on executor failure
     /// voids the escrow and reverses budget / velocity / rate-limit.
     ///
-    /// See [`crate::context::tools_helpers::settle_tool_economy_capture`]
-    /// and [`crate::context::tools_helpers::rollback_tool_economy`].
-    SettleToolEconomy {
+    /// See [`crate::context::outlets_helpers::settle_outlet_economy_capture`]
+    /// and [`crate::context::outlets_helpers::rollback_outlet_economy`].
+    SettleOutletEconomy {
         /// Context identifier string.
         context_id: String,
         /// Invoker DID.
-        invoker_did: scp_identity::DID,
+        invoker_did: scp_did::DID,
         /// Capture-or-rollback request carrying the in-flight ticket.
         /// Boxed so the variant payload stays pointer-sized.
-        request: Box<crate::context::tools_helpers::ToolSettleRequest>,
+        request: Box<crate::context::outlets_helpers::OutletSettleRequest>,
         /// Oneshot reply channel carrying the Phase-3 settle outcome
         /// (consequences + receipt + committed cost).
-        reply:
-            oneshot::Sender<Result<crate::context::tools_helpers::ToolSettleOutcome, ContextError>>,
+        reply: oneshot::Sender<
+            Result<crate::context::outlets_helpers::OutletSettleOutcome, ContextError>,
+        >,
+    },
+
+    /// Streaming open-time economy reserve on actor-owned state — the
+    /// streaming-native counterpart of [`Self::ReserveOutletEconomy`].
+    /// Consumes the hard rate limit, records the velocity entry, snapshots the
+    /// economic policy, gates on membership, and DEBITS the §5.4.5 open-time
+    /// escrow hold (`cost_per_chunk × estimated_chunk_count`) under a
+    /// fail-closed persist. This reserve carries no send-sequence; A's re-seal
+    /// draws A's own persistent per-sender counter at the §9.16/§5.15.7 encrypt
+    /// seam (SCP-OUT-047) — no bridge-local counter is minted.
+    /// Replies with a `Send`
+    /// [`StreamEconomyReservation`](crate::context::outlets_helpers::StreamEconomyReservation)
+    /// the supervisor carries across the off-mailbox stream pump.
+    ///
+    /// See [`crate::context::outlets_helpers::reserve_outlet_stream_economy`].
+    ReserveOutletStreamEconomy {
+        /// Context identifier string.
+        context_id: String,
+        /// Invoker DID.
+        invoker_did: scp_did::DID,
+        /// Per-Data-chunk cost. `Amount::new(0)` for Query / zero-cost outlets
+        /// (short-circuits the escrow debit to a zero hold).
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        /// Declared estimated Data-chunk count — the escrow hold multiplier.
+        estimated_chunk_count: u32,
+        /// Optional §19.5 per-action ceiling AND-folded into the effective
+        /// spendable balance when a spending UCAN caps per-action spend.
+        max_per_action: Option<scp_protocol::economy::types::Amount>,
+        /// Current Unix time in seconds — caller supplies to keep the handler
+        /// deterministic.
+        now_secs: u64,
+        /// Oneshot reply channel carrying the streaming open reservation.
+        reply: oneshot::Sender<
+            Result<Box<crate::context::outlets_helpers::StreamEconomyReservation>, ContextError>,
+        >,
+    },
+
+    /// Streaming GRANT-time escrow top-up reserve on actor-owned state — the
+    /// mid-stream counterpart of [`Self::ReserveOutletStreamEconomy`] for a
+    /// §5.4.5 credit grant. DEBITS `cost_per_chunk × grant` from the invoker's
+    /// `MemberBudgetTracker` under a fail-closed persist so the operator can
+    /// bill the newly-granted billable chunks against a real held escrow —
+    /// closing the budget-cap under-enforcement where a grant extended the
+    /// credit window with NO corresponding debit (§5.4.5 "Credit-grant escrow
+    /// top-up"). Unlike the open reserve it runs NO hard-rate / velocity /
+    /// membership gate (those are admission-time concerns already paid at open);
+    /// it is purely the incremental escrow debit, paired ATOMICALLY with a bump
+    /// of the durable crash-recovery record (keyed by `request_id`) so a hard
+    /// crash after a grant refunds `open + Σgrants`, not just the open hold.
+    /// Replies with the reserved `Amount` the FFI bridge threads into
+    /// [`StreamSessionHandle::apply_credit_grant`](crate::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant)
+    /// as `reserved_top_up`, and reverses via [`Self::ReverseStreamGrantEscrow`]
+    /// if the grant apply then rejects (signature / replay / stream-closed).
+    ///
+    /// See [`crate::context::outlets_helpers::reserve_stream_grant_escrow`].
+    ReserveStreamGrantEscrow {
+        /// Context identifier string.
+        context_id: String,
+        /// The invoker (== the pinned stream invoker) whose budget is debited.
+        member_did: scp_did::DID,
+        /// The stream's `request_id` — keys the durable crash-recovery record
+        /// whose `reserved_escrow` is bumped atomically with the debit.
+        request_id: scp_protocol::context::outlets::stream::RequestId,
+        /// Per-Data-chunk cost. `Amount::new(0)` (Query / zero-cost) short-
+        /// circuits to a zero hold with no balance consultation (spec: "For
+        /// Query outlets and zero-cost outlets no top-up is performed").
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        /// Number of additional billable chunks the grant authorizes — the
+        /// escrow-hold multiplier.
+        grant: u32,
+        /// Oneshot reply carrying the reserved (DEBITED) hold amount, or a
+        /// `SCP-OUTLET-6120`/`6089`-class escrow rejection
+        /// (`EscrowOverflow` / `InsufficientFunds`).
+        reply: oneshot::Sender<Result<scp_protocol::economy::types::Amount, ContextError>>,
+    },
+
+    /// Reverse of [`Self::ReserveStreamGrantEscrow`] — CREDIT the grant hold back
+    /// AND un-bump the durable crash-recovery record, atomically, when a grant
+    /// apply is rejected after the reserve debited. Both legs move together so a
+    /// crash between them cannot make [`crate::context::outlets_helpers::reconcile_stream_reservations`]
+    /// double-refund the reversed hold. Both operations are saturating, so a
+    /// double-reverse is a safe no-op.
+    ///
+    /// See [`crate::context::outlets_helpers::reverse_stream_grant_escrow`].
+    ReverseStreamGrantEscrow {
+        /// Context identifier string.
+        context_id: String,
+        /// The invoker whose budget hold is being credited back.
+        member_did: scp_did::DID,
+        /// The stream's `request_id` — keys the durable crash-recovery record
+        /// whose `reserved_escrow` is un-bumped atomically with the credit.
+        request_id: scp_protocol::context::outlets::stream::RequestId,
+        /// The grant hold amount to return (saturating at `0`).
+        amount: scp_protocol::economy::types::Amount,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Off-mailbox streaming §7.3.8 value-caveat counter reservation on
+    /// actor-owned Class-S state — the streaming-pump counterpart of the
+    /// unary `consume_caveat_counters` gate. The stream pump runs
+    /// supervisor-side (it holds no `&mut` to actor-owned state) and routes
+    /// its open-time per-kind `check_and_increment` back through this command
+    /// via [`crate::context::outlets::stream_counter_adapter::ActorClassSCaveatCounterAdapter`].
+    ///
+    /// The handler runs [`crate::trust::CaveatCounters::try_consume`] against
+    /// the owned `ClassSState.caveat_counters` record keyed by `ucan_cid`. An
+    /// ADMITTED consume rides a fail-closed `commit_class_s_keep` (durable via
+    /// the ADR-049 §9 snapshot); an EXHAUSTED consume mutates nothing and does
+    /// NOT persist. The reply's outer `Result` carries the persist / transport
+    /// infrastructure outcome; the inner `Result` carries the structured
+    /// [`crate::trust::CounterExhausted`] so the pump maps the precise §7.3.8
+    /// slug (`maxCalls` / `amountMaxCumulative` / `rateWindow`).
+    ReserveStreamCaveatCounter {
+        /// Context identifier string.
+        context_id: String,
+        /// The delegation CID keying the per-UCAN counter record.
+        ucan_cid: String,
+        /// Which §7.3.8 counter kind to consume.
+        kind: scp_protocol::trust::CaveatKind,
+        /// Amount to consume (per-kind semantics — ignored for `MaxCalls` /
+        /// `RateWindow`, added to the cumulative used for `AmountCumulative`).
+        amount: u64,
+        /// The counter's cap.
+        cap: u64,
+        /// Sliding-window length in seconds (`RateWindow` only; `0` otherwise).
+        window_secs: u32,
+        /// Current Unix time in seconds — the supervisor-side adapter sources
+        /// this from the injected clock, keeping the handler deterministic.
+        now_secs: u64,
+        /// Oneshot reply: outer `Result` = persist/transport infra outcome;
+        /// inner `Result` = the structured admission decision.
+        reply: oneshot::Sender<Result<Result<(), crate::trust::CounterExhausted>, ContextError>>,
+    },
+
+    /// Off-mailbox streaming §7.3.8 value-caveat counter RELEASE on actor-owned
+    /// Class-S state — returns the unspent portion of a stream's open-time
+    /// reservation to the counter at close-time settlement (SCP R4 HIGH-1), or
+    /// rolls back an earlier-kind increment when a later kind rejects the open.
+    ///
+    /// The handler runs [`crate::trust::CaveatCounters::release`] (infallible /
+    /// saturating at `0`) against the owned record keyed by `ucan_cid` under a
+    /// fail-closed `commit_class_s_keep`. The reply carries only the persist /
+    /// transport infrastructure outcome — release itself never rejects.
+    ReleaseStreamCaveatCounter {
+        /// Context identifier string.
+        context_id: String,
+        /// The delegation CID keying the per-UCAN counter record.
+        ucan_cid: String,
+        /// Which §7.3.8 counter kind to release.
+        kind: scp_protocol::trust::CaveatKind,
+        /// Amount to return to the counter (saturating at `0`).
+        amount: u64,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Off-mailbox streaming §5.4.5 open-time escrow REVERSAL on actor-owned
+    /// state — the actor-mailbox port of the reference
+    /// `ContextManager::outlet_stream_reverse_spend`. Fired by
+    /// [`crate::context::outlets::stream_settlement_adapter::ActorEscrowRefundSink`]
+    /// from the [`StreamEscrowTicket`](crate::context::outlets::dispatch::StreamEscrowTicket)
+    /// Drop-guard when an open-time escrow HOLD was debited against the
+    /// invoker's `MemberBudgetTracker` but the pump never spawned (an
+    /// early-return between the reserve debit and the spawn).
+    ///
+    /// The handler runs
+    /// [`MemberBudgetTracker::reverse_spend`](scp_protocol::economy::budget::MemberBudgetTracker::reverse_spend)
+    /// (infallible / saturating at `0`, so a double-refund — a Drop after an
+    /// explicit settlement — is a safe no-op) against the owned budget tracker
+    /// under a fail-closed `commit_class_s_keep`. The reply carries only the
+    /// persist / transport infrastructure outcome; the refund itself never
+    /// rejects.
+    ReverseStreamEscrow {
+        /// Context identifier string.
+        context_id: String,
+        /// The invoker whose budget hold is being refunded.
+        member_did: scp_did::DID,
+        /// The debited hold amount to return (saturating at `0`).
+        amount: scp_protocol::economy::types::Amount,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Off-mailbox streaming §5.4.5 close-time economic SETTLEMENT on
+    /// actor-owned state — the actor-mailbox port of the reference
+    /// `ContextManager::outlet_stream_settle`. Fired by
+    /// [`crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink`]
+    /// at stream close (terminal chunk delivered).
+    ///
+    /// The handler is generation-guarded (confused-deputy protection): if the
+    /// reservation's `generation` no longer matches the live actor's
+    /// `PerContextState::generation` — the original instance was despawned and a
+    /// new one respawned for the same `context_id` between reserve and settle —
+    /// it DROPS the settlement silently (touching no state; there is no external
+    /// payment escrow to void, unlike the unary settle). On a match it (1)
+    /// RELEASES the unspent R4 HIGH-1 cumulative-counter reserve, (2) REFUNDS
+    /// the unspent escrow to the invoker's budget tracker, both under one
+    /// fail-closed `commit_class_s_keep`, then (3) captures the §19.15.5
+    /// `PaymentReceipt` for the exact billed amount off-persist. The no-actor
+    /// fallback (context torn down mid-stream) is handled supervisor-side in
+    /// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)
+    /// BEFORE this command is dispatched.
+    SettleOutletStream {
+        /// The close-time settlement inputs (boxed — the largest
+        /// [`OutletsCommand`] payload).
+        settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
+        /// Spawn-generation the reservation was made against. Compared to the
+        /// live actor's `PerContextState::generation`; a mismatch DROPS.
+        generation: u64,
+        /// SCP-OUT-046 CRITICAL — the streaming-saga witness key. `Some` for the
+        /// cross-context streaming saga (the seal task + crash recovery): on a
+        /// clean matching-instance settle the handler READS
+        /// `xctx_committed_stream_outputs[saga_id].settled` FIRST (in the
+        /// commit closure, actor-serialized ⇒ authoritative) and skips the whole
+        /// money move if already `true`; otherwise it moves the money AND flips the
+        /// flag `= true` in the SAME Class-S persist, making money+flag atomic. The
+        /// flag is thus the authoritative double-refund guard closing the
+        /// concurrent-double-settle race (the xctx path has no `stream_reservations`
+        /// reconcile net). `None` for the same-context streaming pump (whose double
+        /// -release guard is the `stream_reservations` record).
+        witness_saga_id: Option<crate::context::supervisor::saga_journal::SagaId>,
+        /// Oneshot reply carrying the captured receipt (`None` when nothing was
+        /// billed / no adapter / capture failed / deferred on generation mismatch)
+        /// plus `applied` — whether the owned-state settlement (refund + release +
+        /// witness-settled flag) actually landed on the matching live instance, or
+        /// was DEFERRED (gen-mismatch / no-actor) for crash recovery to complete.
+        reply: oneshot::Sender<Result<StreamSettleApplication, ContextError>>,
+    },
+
+    /// Fix-D — durably persist the streaming crash-recovery
+    /// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+    /// on actor-owned Class-S state at pump open, AFTER both open-time
+    /// reservations (the §5.4.5 escrow hold + the §7.3.8 cumulative counter
+    /// reserve) are durable. Fired by
+    /// [`ActorStreamSettlementSink::persist_reservation`](crate::context::outlets::stream_settlement_adapter::ActorStreamSettlementSink)
+    /// from the off-mailbox open path.
+    ///
+    /// The handler inserts the record (keyed by the hex `request_id`) into
+    /// `ClassSState.stream_reservations` under a fail-closed `commit_class_s_keep`
+    /// (durable via the ADR-049 §9 snapshot), stamping the record's `generation`
+    /// with the live cell generation. The reply carries only the persist /
+    /// transport infrastructure outcome.
+    PersistStreamReservation {
+        /// Context identifier string.
+        context_id: String,
+        /// The stream `request_id` — the recovery record's key.
+        request_id: scp_protocol::context::outlets::stream::RequestId,
+        /// The crash-recovery record (boxed — a large economy payload).
+        record: Box<crate::context::outlets::invoke::StreamReservationRecord>,
+        /// Oneshot reply carrying the persist / transport infra outcome.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Fix-D — restore-time crash-recovery sweep: reconcile every unresolved
+    /// streaming reservation recovery record on actor-owned Class-S state. Fired
+    /// once per context from the restore path
+    /// ([`restore_context`](crate::context::lifecycle_helpers)) after the actor
+    /// is respawned, mirroring the §6.2.4 saga-recovery reconciliation but
+    /// scoped to the SAME restored context (streaming has no cross-context saga
+    /// journal — the reservation is this context's own owned state).
+    ///
+    /// The handler drains `ClassSState.stream_reservations` under ONE fail-closed
+    /// `commit_class_s_keep`, and for each record REFUNDS the full `reserved_escrow`
+    /// to the invoker's budget tracker + RELEASES the full `amount_cumulative_reserved`
+    /// back to the §7.3.8 `AmountCumulative` counter (the billed count is unknown
+    /// once the pump is gone — full release is conservative, never over-charging),
+    /// then clears the map. Runs REGARDLESS of generation (a restore overwrites
+    /// `PerContextState::generation` with a fresh spawn generation; the reserves
+    /// are this restored context's OWN state). The reply carries the number of
+    /// records reconciled, or the persist / transport infra error.
+    ReconcileStreamReservations {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply carrying the reconciled-record count, or the infra error.
+        reply: oneshot::Sender<Result<usize, ContextError>>,
     },
 }
 
@@ -2305,14 +2685,16 @@ pub enum ToolsCommand {
 /// the dispatch function sends the reply and returns
 /// `Outcome { mutated: false }`.
 ///
-/// Commit 7 lands the real read variants. Commit 12c.7 deletes the
-/// transitional `QueryStateView` borrow adapter and routes the
-/// `&PerContextState` + shared event-log provider directly into the
-/// query handler. Variants that mutate state (even if they live in
-/// `manager/queries.rs` today — `drain_events`, access-key management,
-/// `compare_remote_checkpoint`, `prove_event_*`, etc.) are NOT migrated
-/// here and continue to route through the legacy `ContextManager` until
-/// their respective handler commits (8-11).
+/// Commit 7 lands the real read variants. The query handler takes the
+/// `&PerContextState` + shared event-log provider directly, with no
+/// intervening borrow adapter. Variants that mutate state (`drain_events`, access-key
+/// management, `compare_remote_checkpoint`, etc.) are NOT migrated here —
+/// they are carried by their own command families
+/// (`MessagingCommand::DrainEvents` / `::CompareRemoteCheckpoint`, the
+/// `LifecycleCommand` access-key variants) and reach the runtime through
+/// the command-dispatch shim. Read-only Merkle proofs (`prove_event_*`)
+/// are NOT commands at all: they are served directly by free functions in
+/// `queries_helpers` (provider-backed), with no command variant.
 pub enum QueriesCommand {
     /// Current lifecycle [`ContextState`](scp_protocol::context::ContextState)
     /// for this actor's context. Read-only — the handler reads the
@@ -2367,7 +2749,7 @@ pub enum QueriesCommand {
         /// Context identifier string.
         context_id: String,
         /// Oneshot reply channel. `Ok(None)` iff the context is unknown
-        /// (matches the legacy `ContextManager::member_count` contract).
+        /// (matches the `Supervisor::member_count` contract).
         reply: oneshot::Sender<Result<Option<usize>, ContextError>>,
     },
     /// Membership predicate — `true` iff `did` is currently a member.
@@ -2420,16 +2802,16 @@ pub enum QueriesCommand {
     },
     /// Established-interface predicate (spec §6.2.0.1 / §6.2.4 target-side
     /// authorize-before-reserve). `true` iff this actor's context holds a
-    /// bidirectionally-approved [`ToolInterface`](scp_protocol::context::tools::interface::ToolInterface)
+    /// bidirectionally-approved [`OutletInterface`](scp_protocol::context::outlets::interface::OutletInterface)
     /// whose `source_context` equals `source_context_hex`, `target_context`
-    /// equals `target_context_hex`, and `tool_id` equals `tool_registration_id`.
+    /// equals `target_context_hex`, and `outlet_id` equals `outlet_registration_id`.
     ///
     /// The supervisor consults the CALLER context's actor BEFORE reserving the
     /// `{caller, target}` participant-context set, so a caller cannot name a
     /// victim `target_context_id` it has no established interface with and
     /// thereby wedge the victim's saga slot (spec §6.2.4 "Target-context
     /// binding" rides the §6.2.0.1 standing consent — it does NOT create it).
-    HasEstablishedToolInterface {
+    HasEstablishedOutletInterface {
         /// Context identifier string (routing; the actor owns exactly one
         /// context).
         context_id: String,
@@ -2438,8 +2820,8 @@ pub enum QueriesCommand {
         source_context_hex: String,
         /// Target context id, lowercase 64-hex of the raw 32-byte digest.
         target_context_hex: String,
-        /// Context-local tool registration id (indexes the source registry).
-        tool_registration_id: String,
+        /// Context-local outlet registration id (indexes the source registry).
+        outlet_registration_id: String,
         /// Oneshot reply channel. `Ok(false)` iff the context is unknown or no
         /// matching both-approved interface exists.
         reply: oneshot::Sender<Result<bool, ContextError>>,
@@ -2554,7 +2936,7 @@ pub enum QueriesCommand {
         /// Context identifier string.
         context_id: String,
         /// Member DID.
-        member_did: scp_identity::DID,
+        member_did: scp_did::DID,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<scp_protocol::economy::types::Amount, ContextError>>,
     },
@@ -2565,7 +2947,7 @@ pub enum QueriesCommand {
         /// Context identifier string.
         context_id: String,
         /// Member DID.
-        member_did: scp_identity::DID,
+        member_did: scp_did::DID,
         /// Current Unix time (seconds) — caller supplies to keep the
         /// handler pure / deterministic.
         now_secs: u64,
@@ -2582,21 +2964,22 @@ pub enum QueriesCommand {
 ///
 /// Carries the `Send` reservation handles the caller-context actor staged but
 /// did NOT apply: the escrow + outbound rate-limit reservation rolled into the
-/// existing [`ToolEconomyReservation`]. The supervisor FSM (slice 5) holds this
-/// across the saga; the [`ToolEconomyReservation`]'s
+/// existing [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation).
+/// The supervisor FSM (slice 5) holds this across the saga; the
+/// [`OutletEconomyReservation`](crate::context::outlets_helpers::OutletEconomyReservation)'s
 /// `#[must_use]` drop guard releases the held escrow/rate-limit on every
 /// terminal non-commit path (abort, timeout, panic — spec §6.2.4 "Reservation
 /// release on every terminal path"). On Commit-A the FSM settles it.
 ///
 /// **Not `Clone` / not `Serialize`.** The reservation is a single-owner RAII
 /// carrier — duplicating it would double-release the held ticket.
-#[must_use = "a PreparedAFields carries a ToolEconomyReservation that must be settled or released"]
+#[must_use = "a PreparedAFields carries a OutletEconomyReservation that must be settled or released"]
 pub struct PreparedAFields {
     /// The staged escrow + outbound rate-limit reservation (RAII release on
     /// not-commit). Produced via the existing
-    /// [`reserve_tool_economy`](crate::context::tools_helpers::reserve_tool_economy)
+    /// [`reserve_outlet_economy`](crate::context::outlets_helpers::reserve_outlet_economy)
     /// mechanism so Prepare-A reuses the single-context reserve/settle split.
-    pub reservation: crate::context::tools_helpers::ToolEconomyReservation,
+    pub reservation: crate::context::outlets_helpers::OutletEconomyReservation,
 }
 
 impl std::fmt::Debug for PreparedAFields {
@@ -2610,9 +2993,9 @@ impl std::fmt::Debug for PreparedAFields {
 /// Output of the Prepare-B handler (spec §6.2.4 "Prepare", target side).
 ///
 /// Confirms that the target-context actor staged the eight-field
-/// [`CrossContextToolInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextToolInvocationPrepared)
+/// [`CrossContextOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextOutletInvocationPrepared)
 /// into `saga_pending` (with B-recorded `recorded_timestamp_ms` /
-/// `recorded_nonce` / `recorded_chain_depth`) and reserved the tool session,
+/// `recorded_nonce` / `recorded_chain_depth`) and reserved the outlet session,
 /// and surfaces the B-captured provenance values the supervisor needs to drive
 /// the Commit phase (slice 4) — so the FSM does not have to re-read B's staged
 /// slot to learn what B recorded.
@@ -2628,9 +3011,146 @@ pub struct PreparedBFields {
     pub recorded_chain_depth: u8,
 }
 
+/// Carrier for a §6.2.4 saga POLICY rejection that rides the Prepare-phase
+/// SUCCESS channel as typed data.
+///
+/// The §6.2.4 saga FSM produces canonical `SCP-SAGA-13xxx` reject discriminants.
+/// 17 of the 20 Prepare-axis reject sites are raised inside a participant actor
+/// and must cross the mailbox; the mailbox `send` reply channel hardcodes
+/// `Result<T, ContextError>`, and the boundary lift cannot recover a numeric
+/// code from a bare `ContextError` without parsing its message string. To carry
+/// the code STRUCTURALLY (the agent-first API tenet — no string parse), a saga
+/// POLICY reject is replied as `Ok(PrepareAOutcome::Rejected(SagaReject))` (NOT
+/// `Err`), with the canonical discriminant on [`Self::code`].
+///
+/// The `Err(ContextError)` channel is reserved for codeless mailbox / transport
+/// / Class-S-persist failures (a dropped receiver, a Prepare timeout, a journal
+/// I/O fault). Those lift to the generic saga-abort code `13067`. Construct a
+/// `SagaReject` via the
+/// [`saga_reject!`](crate::context::actor::commands::saga_reject) macro so the
+/// structural `code` and the `SCP-SAGA-{code}:` message prefix derive from ONE
+/// code literal and cannot diverge.
+#[derive(Debug)]
+pub struct SagaReject {
+    /// The canonical `SCP-SAGA-13xxx` discriminant of this reject, set
+    /// STRUCTURALLY at the reject site (never parsed from the message). `None`
+    /// for a reject that carries no saga code — it lifts to the generic
+    /// saga-abort code `13067`.
+    pub code: Option<u16>,
+    /// The typed [`ContextError`] the reject carries (its `Display` still bears
+    /// the canonical `SCP-SAGA-{code}:` prefix so existing message assertions
+    /// and flattened log lines continue to disambiguate the terminal).
+    pub error: ContextError,
+}
+
+/// A bare [`ContextError`] reaching the [`SagaReject`] boundary (a mailbox /
+/// commit / journal `?`) carries NO saga code — it is a codeless infrastructure
+/// failure, not a §6.2.4 policy reject. It lifts to the generic saga-abort code
+/// `13067`. ONLY the `?`-propagated infrastructure paths route through this
+/// conversion; every Prepare-axis POLICY reject is built via the
+/// [`saga_reject!`](crate::context::actor::commands::saga_reject) macro with an
+/// explicit `code`, so a real discriminant is never silently dropped to `None`.
+impl From<ContextError> for SagaReject {
+    fn from(error: ContextError) -> Self {
+        Self { code: None, error }
+    }
+}
+
+/// Outcome of the Prepare-A handler ([`SagaPhaseMessage::PrepareA`]). Carried on
+/// the mailbox SUCCESS channel so a §6.2.4 saga POLICY reject can ride a typed
+/// [`SagaReject`] (with its structural `SCP-SAGA-13xxx` code) rather than a bare
+/// `Err(ContextError)` whose code would be recoverable only by parsing the
+/// message. The `Err(ContextError)` channel carries ONLY codeless mailbox /
+/// transport / Class-S-persist failures.
+///
+/// **Not `Clone`.** [`Self::Prepared`] carries the `#[must_use]`
+/// [`PreparedAFields`] RAII reservation carrier.
+///
+/// The `Prepared` variant is large (it embeds the `OutletEconomyReservation`
+/// carrier) while `Rejected` is small — but boxing `Prepared` is the WRONG
+/// trade here: the value is created, sent over a `oneshot`, and immediately
+/// destructured by the FSM (never stored in a collection or moved in bulk), so
+/// the size asymmetry never materializes as a real cost; boxing would instead
+/// add a pointless heap allocation + indirection on the hot success path and
+/// complicate the `#[must_use]` carrier's move-by-value recovery destructure
+/// (the lost-receiver balance path in `prepare_a`). The carrier MUST move by
+/// value end-to-end to preserve its single-owner RAII drop-guard contract.
+///
+/// This is the MAILBOX REPLY PAYLOAD for the Prepare-A handler — distinct from
+/// [`outcome::Outcome`](super::outcome::Outcome), the handler's Class-S
+/// persistence accounting. Do not conflate the two.
+#[allow(clippy::large_enum_variant)]
+#[must_use = "a PrepareAOutcome::Prepared carries a OutletEconomyReservation that must be settled or released"]
+#[derive(Debug)]
+pub enum PrepareAOutcome {
+    /// Prepare-A passed: the staged outbound reservation handles.
+    Prepared(PreparedAFields),
+    /// Prepare-A rejected by a §6.2.4 policy gate (capability, outbound caller,
+    /// outbound §6.2.0.2 rate). Carries the structural `SCP-SAGA-13xxx` code.
+    Rejected(SagaReject),
+}
+
+/// Outcome of the Prepare-B handler ([`SagaPhaseMessage::PrepareB`]). The target
+/// side of [`PrepareAOutcome`]: a §6.2.4 policy reject rides a typed
+/// [`SagaReject`] on the SUCCESS channel; the `Err(ContextError)` channel
+/// carries only codeless mailbox / Class-S-persist failures.
+///
+/// Like [`PrepareAOutcome`], this is a MAILBOX REPLY PAYLOAD — not
+/// [`outcome::Outcome`](super::outcome::Outcome), the handler's Class-S
+/// persistence accounting.
+#[derive(Debug)]
+pub enum PrepareBOutcome {
+    /// Prepare-B passed: B's captured provenance the FSM drives Commit with.
+    Prepared(PreparedBFields),
+    /// Prepare-B rejected by a §6.2.4 policy gate (confused-deputy, inbound
+    /// policy, schema, freshness, chain-depth, inbound rate, target binding).
+    /// Carries the structural `SCP-SAGA-13xxx` code.
+    Rejected(SagaReject),
+}
+
+/// Build a [`SagaReject`] for a §6.2.4 Prepare-axis policy rejection from ONE
+/// numeric `SCP-SAGA-13xxx` code literal.
+///
+/// The macro synthesizes BOTH the structural `code: Some($code)` field AND the
+/// `SCP-SAGA-{code}: ` message prefix from the SAME `$code`, so a reject site
+/// names its discriminant EXACTLY ONCE and the typed field and the formatted
+/// string cannot drift apart. The chosen [`ContextError`] variant (per the
+/// §6.2.4 reject inventory) is named explicitly so existing message-substring
+/// and variant assertions still hold.
+///
+/// Forms (`$arg`s are positional `{}` substitutions in `$fmt`, exactly as the
+/// original `format!` used):
+/// - single-`String` tuple variant — the `$variant:ident` arm, used for any
+///   `ContextError` variant whose payload is one `String` (`PermissionDenied`,
+///   `InvalidState`, `ContextNotRegistered`, …):
+///   `saga_reject!(13010, PermissionDenied, "… {}", arg)`
+/// - `RateLimited` struct variant (distinct shape — its own arm):
+///   `saga_reject!(13023, RateLimited { resource: r, retry_after_ms: ms }, "… {}", arg)`
+macro_rules! saga_reject {
+    ($code:literal, $variant:ident, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::context::actor::commands::SagaReject {
+            code: ::core::option::Option::Some($code),
+            error: ::scp_protocol::context::ContextError::$variant(
+                ::std::format!(::core::concat!("SCP-SAGA-{}: ", $fmt), $code $(, $arg)*),
+            ),
+        }
+    };
+    ($code:literal, RateLimited { resource: $res:expr, retry_after_ms: $rms:expr }, $fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::context::actor::commands::SagaReject {
+            code: ::core::option::Option::Some($code),
+            error: ::scp_protocol::context::ContextError::RateLimited {
+                resource: $res,
+                message: ::std::format!(::core::concat!("SCP-SAGA-{}: ", $fmt), $code $(, $arg)*),
+                retry_after_ms: $rms,
+            },
+        }
+    };
+}
+pub(crate) use saga_reject;
+
 /// Reply payload for [`SagaPhaseMessage::CommitBReserve`] (spec §6.2.4
 /// "Commit", split-execution model). The Commit-B phase is two actor
-/// round-trips with the non-`Send` tool executor running supervisor-side in
+/// round-trips with the non-`Send` outlet executor running supervisor-side in
 /// between (the executor cannot cross the mailbox per ADR-049 §3). This is the
 /// first round-trip's reply: it tells the supervisor FSM whether to run the
 /// executor or short-circuit to the stored output.
@@ -2640,22 +3160,23 @@ pub struct PreparedBFields {
 #[derive(Debug)]
 pub enum CommitBReserveOutcome {
     /// The staged prepared + session reservation are present and this
-    /// `SagaId`'s `ToolInvoked` has NOT yet been appended. The FSM MUST now run
-    /// the tool executor supervisor-side, capture the output, and call
+    /// `SagaId`'s `OutletInvoked` has NOT yet been appended. The FSM MUST now run
+    /// the outlet executor supervisor-side, capture the output, and call
     /// [`SagaPhaseMessage::CommitBSettle`].
     ReadyToExecute,
     /// Idempotent replay (spec §6.2.4 "Crash recovery §17.16.4"): this
-    /// `SagaId`'s `ToolInvoked` was already appended on a prior Commit-B. The
-    /// tool MUST NOT be re-invoked — the stored output + the original signed
+    /// `SagaId`'s `OutletInvoked` was already appended on a prior Commit-B. The
+    /// outlet MUST NOT be re-invoked — the stored output + the original signed
     /// receipt are re-emitted verbatim. The FSM skips the executor and treats
     /// this as a Commit-B success.
     AlreadyCommitted {
-        /// The original signed receipt bytes (JCS of [`CrossContextToolReceipt`]).
+        /// The original signed receipt bytes (JCS of
+        /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::CrossContextOutletReceipt)).
         receipt: Vec<u8>,
-        /// The captured tool output bytes (the receipt's `output_jcs`).
+        /// The captured outlet output bytes (the receipt's `output_jcs`).
         output_bytes: Vec<u8>,
-        /// The `SagaId`-stable `ToolInvoked` event-log entry id.
-        tool_invoked_event_id: String,
+        /// The `SagaId`-stable `OutletInvoked` event-log entry id.
+        outlet_invoked_event_id: String,
     },
 }
 
@@ -2665,15 +3186,16 @@ pub enum CommitBReserveOutcome {
 ///
 /// On a replayed `CommitBSettle` (output already captured for this `SagaId`)
 /// the SAME stored bytes are returned — byte-for-byte identical receipt and
-/// `tool_invoked_event_id` — and the tool is NOT re-invoked.
+/// `outlet_invoked_event_id` — and the outlet is NOT re-invoked.
 #[derive(Debug)]
 pub struct CommitBSettleOutcome {
-    /// The target's signed receipt bytes (JCS of [`CrossContextToolReceipt`]).
+    /// The target's signed receipt bytes (JCS of
+    /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::CrossContextOutletReceipt)).
     pub receipt: Vec<u8>,
-    /// The captured tool output bytes the FSM forwards to Commit-A.
+    /// The captured outlet output bytes the FSM forwards to Commit-A.
     pub output_bytes: Vec<u8>,
-    /// The `SagaId`-stable `ToolInvoked` event-log entry id.
-    pub tool_invoked_event_id: String,
+    /// The `SagaId`-stable `OutletInvoked` event-log entry id.
+    pub outlet_invoked_event_id: String,
 }
 
 /// Reply-channel type alias for [`SagaPhaseMessage::CommitBReserve`].
@@ -2682,25 +3204,194 @@ pub type CommitBReserveReply = oneshot::Sender<Result<CommitBReserveOutcome, Con
 /// Reply-channel type alias for [`SagaPhaseMessage::CommitBSettle`].
 pub type CommitBSettleReply = oneshot::Sender<Result<CommitBSettleOutcome, ContextError>>;
 
+/// Reply payload for [`SagaPhaseMessage::CommitBStreamSettle`] (ADR-061 seal
+/// phase; spec §6.2.5 streaming saga). The seal-close over the durable
+/// `SagaId`-keyed Merkle frontier: the signed streaming receipt + the sealed
+/// manifest root + the billing/chunk counters + the escrow settlement (billed +
+/// refund from the durable ledger) + the `OutletInvoked` event id the FSM's
+/// off-mailbox seal task forwards to Commit-A.
+///
+/// On a replayed `CommitBStreamSettle` (this `SagaId` already sealed) the SAME
+/// stored bytes are returned — byte-for-byte identical receipt, root, settlement,
+/// and `outlet_invoked_event_id` — and the outlet is NOT re-invoked (the manifest
+/// re-derives from the durable frontier prefix, never from re-execution).
+#[derive(Debug)]
+pub struct CommitBStreamSettleOutcome {
+    /// The target's signed streaming receipt bytes (JCS of
+    /// [`CrossContextOutletStreamReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt)).
+    pub receipt: Vec<u8>,
+    /// The sealed RFC-6962 Merkle root (`frontier.root()`) — the
+    /// `stream_manifest_hash` (`[0u8; 32]` for an honest empty/zero-chunk prefix).
+    pub stream_manifest_hash: [u8; 32],
+    /// Credit billed at seal-close, settled from the DURABLE ledger
+    /// (`cost_per_chunk × billed_count` via `StreamEscrow::settle_at_close`) —
+    /// ADR-061 seal step 3, NOT the in-memory `PumpEscrowGuard`. The FSM applies
+    /// the refund against the invoker's escrow reservation.
+    pub billed: scp_protocol::economy::types::Amount,
+    /// Escrow refund at seal-close = `reserved − billed` (`settle_at_close`).
+    /// Decoupled-release semantics (ADR-049 §3a(b)): the concurrency slot
+    /// released at the Commit-transition; the escrow settles here.
+    pub refund: scp_protocol::economy::types::Amount,
+    /// The §5.4.5 billable-`Data`-chunk count sealed at close.
+    pub billed_count: u32,
+    /// Total chunks in the sealed manifest (`frontier.leaf_count()`).
+    pub stream_chunk_count: u64,
+    /// The `SagaId`-stable `OutletInvoked` event-log entry id.
+    pub outlet_invoked_event_id: String,
+    /// The complete close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+    /// built by the handler from the DURABLE ledger (SCP-OUT-046): the escrow
+    /// refund + billed capture + §7.3.8 cumulative-counter release. `Some` on the
+    /// FIRST seal — the off-mailbox seal task applies it via
+    /// [`Supervisor::settle_outlet_stream_via_actor`](crate::context::supervisor::Supervisor::settle_outlet_stream_via_actor)
+    /// (the actor handler CANNOT dispatch to its own mailbox — re-entrant
+    /// deadlock — so the money movement runs off-mailbox). `None` on a REPLAY
+    /// (the money already moved on the first settle; the seal task must NOT
+    /// re-apply it). Boxed to keep the outcome small.
+    pub settlement: Option<Box<crate::context::outlets::invoke::StreamSettlement>>,
+    /// B's CURRENT spawn-generation at seal time (SCP-OUT-046). BOTH the normal
+    /// seal task AND crash recovery settle against THIS seal-time generation (not
+    /// the reserve-time generation): the seal just ran on this instance, so its
+    /// generation is the one the off-mailbox settle must target to APPLY against
+    /// the live hold. Using the reserve-time generation instead would falsely
+    /// mismatch after a mid-stream respawn and strand the refund + counter release
+    /// (the confused-deputy guard would drop a settlement meant for THIS instance).
+    pub generation: u64,
+}
+
+/// Reply-channel type alias for [`SagaPhaseMessage::CommitBStreamSettle`].
+pub type CommitBStreamSettleReply =
+    oneshot::Sender<Result<CommitBStreamSettleOutcome, ContextError>>;
+
+/// Reply payload for [`OutletsCommand::SettleOutletStream`] (SCP-OUT-046
+/// CRITICAL settlement-atomicity). Carries the captured `PaymentReceipt` (if
+/// any) plus whether the owned-state settlement actually LANDED.
+#[derive(Debug)]
+pub struct StreamSettleApplication {
+    /// The §19.15.5 `PaymentReceipt` captured for the billed amount, or `None`
+    /// (nothing billed / no adapter / capture failed / deferred).
+    pub receipt: Option<crate::economy::adapter::PaymentReceipt>,
+    /// `true` iff the matching-live-instance settlement applied — the escrow
+    /// refund + §7.3.8 counter release landed AND (for a witness-bearing xctx
+    /// settlement) `xctx_committed_stream_outputs[saga_id].settled` was flipped to
+    /// `true` in the same Class-S persist. `false` means the settle was DEFERRED
+    /// (generation mismatch / no resident actor): no owned state was touched and,
+    /// for a witness-bearing settlement, NO capture ran either — the durable
+    /// witness stays unsettled for crash recovery to complete exactly once.
+    pub applied: bool,
+}
+
+/// Reply payload for [`SagaPhaseMessage::StreamSettleCheckWitness`] (SCP-OUT-046
+/// CRITICAL; §17.16.4 crash recovery). READ-ONLY snapshot of the durable
+/// streaming seal witness the keyless recovery sweep needs to decide how to
+/// resolve a `Committing` streaming saga.
+///
+/// Modeled as an ENUM so illegal states are unrepresentable: only the
+/// [`Unsettled`](Self::Unsettled) case carries the money settlement + generation +
+/// A-leaf (they are meaningless when the witness is absent or already settled), so
+/// there is no "present-but-no-generation" or "settled-with-a-pending-settlement"
+/// combination to guard against, and no synthetic sentinel `generation: 0` on the
+/// absent path.
+#[derive(Debug)]
+pub enum StreamWitnessRecoveryStatus {
+    /// The `SagaId` is NOT durably captured in `xctx_committed_stream_outputs` —
+    /// the seal-close never landed, OR the witness could not be read (send failure
+    /// / non-resident target). Recovery treats this as unsealed → `NeedsRepair`
+    /// with the escrow HELD for the key-bearing truncated close.
+    Absent,
+    /// The witness is durably captured AND its `settled` flag is set — the money
+    /// move (escrow refund + §7.3.8 counter release) already landed on the first
+    /// settle. Recovery resolves the journal `Committed` idempotently, moving no
+    /// money.
+    Settled,
+    /// The witness is durably captured but NOT settled — B sealed, then crashed /
+    /// was evicted in the seal→settle window, so the money move never ran.
+    /// Recovery completes it KEYLESSLY (money ops need no signing key).
+    Unsettled {
+        /// B's CURRENT spawn-generation — the generation the recovery settlement
+        /// must target so the confused-deputy guard admits it against the restored
+        /// hold.
+        generation: u64,
+        /// The close-time [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+        /// rebuilt from the witness's durable fields — the money to move.
+        settlement: Box<crate::context::outlets::invoke::StreamSettlement>,
+        /// The A-side dual-log leaf reconstruction inputs (JCS receipt bytes +
+        /// sealed root + counts + event id) — `Some` iff the stored receipt parses.
+        /// Recovery records the `CrossContextOutletInvoked` leaf from this so the
+        /// dual-log is completed even if the seal task crashed before recording it
+        /// (SCP-OUT-046 #135; best-effort, convergent leaf).
+        a_event: Option<Box<CommitBStreamSettleOutcome>>,
+    },
+}
+
+/// Boxed field set for [`SagaPhaseMessage::PrepareBStreaming`] (ADR-061 seal
+/// phase; spec §6.2.5). The unary §6.2.4 Prepare-B field set + the streaming
+/// escrow-ledger inputs (`reserved` / `cost_per_chunk`), boxed into the message
+/// variant so `ContextCommand` / the actor dispatch future stay under the
+/// `clippy::large_enum_variant` / `clippy::large_futures` thresholds. The handler
+/// destructures this to build a `PrepareBRequest` and stage the streaming slot.
+#[derive(Debug)]
+pub struct PrepareBStreamingFields {
+    /// Caller context id (raw 32-byte digest).
+    pub caller_context_id: [u8; 32],
+    /// Target context id (raw 32-byte digest) — MUST equal B's own context.
+    pub target_context_id: [u8; 32],
+    /// Channel-authenticated caller DID (the confused-deputy re-bind audience).
+    pub caller_did: scp_did::DID,
+    /// Context-local outlet registration id (indexes B's own registry).
+    pub outlet_registration_id: String,
+    /// UCAN proof reference — an INDEX into B's own UCAN store, never the proof
+    /// bytes. `None` for an ungated outlet.
+    pub ucan_proof_id: Option<String>,
+    /// The invocation input — validated against the outlet's registered schema
+    /// specificity floor (spec §9.2.1); never journaled.
+    pub input: serde_json::Value,
+    /// Caller-asserted chain depth — advisory; the `+1` base for B's re-derived
+    /// `recorded_chain_depth`.
+    pub asserted_chain_depth: u8,
+    /// Caller-asserted 16-byte envelope nonce — checked against B's TTL dedup
+    /// cache, then staged on accept.
+    pub asserted_nonce: [u8; 16],
+    /// Caller-asserted send-time (ms) — used ONLY for the §9.14 skew check.
+    pub asserted_timestamp_ms: u64,
+    /// The channel-authenticated caller's ROLE in the caller context, resolved
+    /// supervisor-side at initiation (NOT envelope-asserted).
+    pub caller_source_role: Option<String>,
+    /// Total escrow reserved at the Commit-transition (the debited hold cap);
+    /// staged onto the durable ledger so the seal settles `reserved − billed`.
+    pub reserved: scp_protocol::economy::types::Amount,
+    /// The per-billable-`Data`-chunk price pinned at reservation; staged so the
+    /// seal reconstructs the escrow from `(cost_per_chunk, reserved)`.
+    pub cost_per_chunk: scp_protocol::economy::types::Amount,
+    /// The stream `request_id` (SCP-OUT-046 settlement ledger) — staged so the
+    /// seal's [`StreamSettlement`](crate::context::outlets::invoke::StreamSettlement)
+    /// receipt + event provenance anchor to the id the pump billed.
+    pub request_id: [u8; 16],
+    /// The acceptance-time economic policy (raw, `Serialize`; the
+    /// `EconomicPolicySnapshot` wrapper is not) — `None` for zero-cost / Query
+    /// streams. Staged so the seal captures the billed `PaymentReceipt` for
+    /// service rendered even if B is torn down mid-stream (SCP-OUT-046).
+    pub economic_policy: Option<scp_protocol::economy::types::EconomicPolicy>,
+}
+
 /// See [`ContextCommand::SagaPhase`]. The per-phase messages the supervisor
-/// FSM dispatches to a participant actor for a cross-context tool-invocation
+/// FSM dispatches to a participant actor for a cross-context outlet-invocation
 /// saga (spec §6.2.4). Each variant carries a typed `oneshot` reply.
 ///
 /// Every arm has a real handler body AND is driven end-to-end by the supervisor
 /// FSM: Prepare-A / Prepare-B, the split Commit
 /// ([`Self::CommitBReserve`] / [`Self::CommitBSettle`] / [`Self::CommitA`]),
 /// [`Self::Abort`], and [`Self::EmitDivergenceMarker`] are all dispatched by
-/// `start_cross_context_tool_invocation_saga`'s FSM over the two co-resident
+/// `start_cross_context_outlet_invocation_saga`'s FSM over the two co-resident
 /// participant actors. The dispatch `match` stays exhaustive so adding a phase
 /// is a compile error.
 #[non_exhaustive]
 pub enum SagaPhaseMessage {
     /// Prepare-A — runs on the LOCAL caller-context actor. Validates the
-    /// caller holds `tool:interface` and is in `OutboundPolicy.allowed_callers`,
+    /// caller holds `outlet:interface` and is in `OutboundPolicy.allowed_callers`,
     /// stages (not applies) the outbound rate-limit decrement + escrow
-    /// reservation of the tool's REGISTERED per-invocation cost (resolved from
-    /// the caller's economy policy / tool registry by
-    /// [`reserve_tool_economy`](crate::context::tools_helpers::reserve_tool_economy),
+    /// reservation of the outlet's REGISTERED per-invocation cost (resolved from
+    /// the caller's economy policy / outlet registry by
+    /// [`reserve_outlet_economy`](crate::context::outlets_helpers::reserve_outlet_economy),
     /// NOT any caller-asserted value), persists Class-S fail-closed, and replies
     /// the `Send` reservation handles.
     PrepareA {
@@ -2715,15 +3406,18 @@ pub enum SagaPhaseMessage {
         /// Caller DID — the channel-authenticated initiator (spec §6.2.4
         /// "Caller authentication"; the supervisor binds this, not the
         /// envelope).
-        caller_did: scp_identity::DID,
-        /// Context-local tool registration id being invoked at the target.
-        tool_registration_id: String,
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<PreparedAFields, ContextError>>,
+        caller_did: scp_did::DID,
+        /// Context-local outlet registration id being invoked at the target.
+        outlet_registration_id: String,
+        /// Oneshot reply channel. A §6.2.4 policy reject rides
+        /// `Ok(PrepareAOutcome::Rejected(SagaReject))` (carrying the structural
+        /// `SCP-SAGA-13xxx` code); the `Err(ContextError)` channel carries only
+        /// codeless mailbox / Class-S-persist failures.
+        reply: oneshot::Sender<Result<PrepareAOutcome, ContextError>>,
     },
     /// Prepare-B — runs on the LOCAL target-context actor. Resolves the UCAN
     /// proof and re-runs §7 validation re-bound to `caller_did` +
-    /// `tool_registration_id` (confused-deputy defense), validates inbound
+    /// `outlet_registration_id` (confused-deputy defense), validates inbound
     /// policy / schema-specificity floor / target-context binding / freshness /
     /// chain-depth, captures B-controlled provenance, stages the eight-field
     /// prepared into `saga_pending`, persists Class-S fail-closed, and replies.
@@ -2737,13 +3431,13 @@ pub enum SagaPhaseMessage {
         target_context_id: [u8; 32],
         /// Channel-authenticated caller DID (spec §6.2.4 "Caller
         /// authentication"). The confused-deputy re-bind audience.
-        caller_did: scp_identity::DID,
-        /// Context-local tool registration id (indexes B's own registry).
-        tool_registration_id: String,
+        caller_did: scp_did::DID,
+        /// Context-local outlet registration id (indexes B's own registry).
+        outlet_registration_id: String,
         /// UCAN proof reference — an INDEX into B's own UCAN store, never the
-        /// proof bytes (spec §6.2.4 normative (1)). `None` for an ungated tool.
+        /// proof bytes (spec §6.2.4 normative (1)). `None` for an ungated outlet.
         ucan_proof_id: Option<String>,
-        /// The invocation input — validated against the tool's registered
+        /// The invocation input — validated against the outlet's registered
         /// schema specificity floor (spec §9.2.1); never journaled.
         input: serde_json::Value,
         /// Caller-asserted chain depth — advisory/untrusted; used only for the
@@ -2762,8 +3456,11 @@ pub enum SagaPhaseMessage {
         /// (spec §6.2.4 "Caller authentication" + InboundPolicy "source role").
         /// `None` ⇒ no explicit role assignment.
         caller_source_role: Option<String>,
-        /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<PreparedBFields, ContextError>>,
+        /// Oneshot reply channel. A §6.2.4 policy reject rides
+        /// `Ok(PrepareBOutcome::Rejected(SagaReject))` (carrying the structural
+        /// `SCP-SAGA-13xxx` code); the `Err(ContextError)` channel carries only
+        /// codeless mailbox / Class-S-persist failures.
+        reply: oneshot::Sender<Result<PrepareBOutcome, ContextError>>,
     },
     /// Commit-B (reserve half) — runs on the LOCAL target-context actor. The
     /// FIRST of the two Commit-B round-trips (spec §6.2.4 "Commit", split per
@@ -2774,7 +3471,7 @@ pub enum SagaPhaseMessage {
     /// `SagaId`. Idempotency (§6.2.4 / §17.16.4): if this `SagaId`'s output was
     /// already captured (a replayed Commit), it replies
     /// [`CommitBReserveOutcome::AlreadyCommitted`] with the STORED output +
-    /// receipt + event id and the FSM skips the executor — the tool is NEVER
+    /// receipt + event id and the FSM skips the executor — the outlet is NEVER
     /// re-invoked. Otherwise it replies [`CommitBReserveOutcome::ReadyToExecute`]
     /// and the FSM runs the executor, then calls [`Self::CommitBSettle`].
     ///
@@ -2790,8 +3487,10 @@ pub enum SagaPhaseMessage {
     /// side), called by the FSM with the executor's captured output.
     ///
     /// Durably captures the output keyed by `SagaId` (so a later replay
-    /// re-emits it), `SagaId`-idempotently appends `ToolInvoked` → a stable
-    /// `tool_invoked_event_id`, signs the [`CrossContextToolReceipt`] over the
+    /// re-emits it), `SagaId`-idempotently appends `OutletInvoked` → a stable
+    /// `outlet_invoked_event_id`, signs the
+    /// [`CrossContextOutletReceipt`](scp_protocol::context::outlets::CrossContextOutletReceipt)
+    /// over the
     /// staged `recorded_nonce` / `recorded_chain_depth` / `recorded_timestamp_ms`
     /// plus `output_hash` plus the event id using `target_signing_key`, Class-S
     /// sync-persists fail-closed, and replies the receipt + output bytes. A
@@ -2800,7 +3499,7 @@ pub enum SagaPhaseMessage {
     CommitBSettle {
         /// Durable saga identifier.
         saga_id: crate::context::supervisor::saga_journal::SagaId,
-        /// The tool executor's captured output bytes (the FSM ran the executor
+        /// The outlet executor's captured output bytes (the FSM ran the executor
         /// supervisor-side between reserve and settle). Hashed into the
         /// receipt's `output_hash` and carried as the receipt's JCS output.
         output_bytes: Vec<u8>,
@@ -2815,7 +3514,7 @@ pub enum SagaPhaseMessage {
     },
     /// Commit-A — runs on the LOCAL caller-context actor. Settles the escrow
     /// reservation (§19.2.2), applies the staged outbound rate-limit decrement,
-    /// and records `CrossContextToolInvoked` referencing the target ctx id + the
+    /// and records `CrossContextOutletInvoked` referencing the target ctx id + the
     /// same `nonce` (spec §6.2.4 "Commit", caller side / "Dual event-log
     /// recording"). Class-S sync-persists fail-closed. Idempotent by `SagaId`:
     /// a replay re-acks without re-settling or re-appending.
@@ -2829,20 +3528,20 @@ pub enum SagaPhaseMessage {
         /// releases on every terminal non-commit path; Commit-A consumes it.
         reservation: Box<PreparedAFields>,
         /// Caller context id (raw 32-byte digest) — the actor's own context;
-        /// the `CrossContextToolInvoked` actor field.
+        /// the `CrossContextOutletInvoked` actor field.
         caller_context_id: [u8; 32],
         /// Caller DID — the channel-authenticated initiator (the event actor).
-        caller_did: scp_identity::DID,
+        caller_did: scp_did::DID,
         /// Target context id (raw 32-byte digest) — referenced by the
-        /// `CrossContextToolInvoked` record so an auditor can join it to B's log.
+        /// `CrossContextOutletInvoked` record so an auditor can join it to B's log.
         target_context_id: [u8; 32],
         /// The 16-byte correlation nonce — the SAME nonce B staged into
-        /// `ToolInvoked`; the join key between the two records (§6.2.4 "Dual
+        /// `OutletInvoked`; the join key between the two records (§6.2.4 "Dual
         /// event-log recording").
         nonce: [u8; 16],
         /// The target's signed receipt bytes captured at Commit-B.
         receipt: Vec<u8>,
-        /// The target's captured tool output bytes.
+        /// The target's captured outlet output bytes.
         output_bytes: Vec<u8>,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
@@ -2855,7 +3554,7 @@ pub enum SagaPhaseMessage {
     /// command was delivered, the actor consumed the ticket), so a retry cannot
     /// re-send `CommitA` — but the witness lets the FSM resolve the saga to
     /// `Committed` instead of a spurious `NeedsRepair` (spec §17.16.4 "A re-acks
-    /// its `CrossContextToolInvoked` … as a no-op"; the witness IS that re-ack).
+    /// its `CrossContextOutletInvoked` … as a no-op"; the witness IS that re-ack).
     CommitACheckWitness {
         /// Durable saga identifier (the `xctx_committed_invocations` key).
         saga_id: crate::context::supervisor::saga_journal::SagaId,
@@ -2864,7 +3563,7 @@ pub enum SagaPhaseMessage {
     },
     /// Abort — runs on EITHER side's local actor. RAII-releases the staged
     /// reservations (escrow / outbound-RL on A — carried back via
-    /// `reservation`; tool-session on B — the staged `saga_pending` slot), clears
+    /// `reservation`; outlet-session on B — the staged `saga_pending` slot), clears
     /// the saga slot, Class-S sync-persists fail-closed, and acks. Idempotent
     /// no-op if the saga is already terminal (slot absent and no reservation).
     Abort {
@@ -2873,8 +3572,8 @@ pub enum SagaPhaseMessage {
         /// On the CALLER (A) side, the staged escrow + outbound-RL reservation
         /// the FSM holds, handed back so Abort can RAII-release it (rollback
         /// path). `None` on the TARGET (B) side, whose staged reservation lives
-        /// in `saga_pending` (the tool-session reservation is released by
-        /// clearing the slot — B stages no `ToolEconomyTicket` at Prepare-B).
+        /// in `saga_pending` (the outlet-session reservation is released by
+        /// clearing the slot — B stages no `OutletEconomyTicket` at Prepare-B).
         /// Boxed under `clippy::large_enum_variant`.
         reservation: Option<Box<PreparedAFields>>,
         /// Oneshot reply channel.
@@ -2891,12 +3590,12 @@ pub enum SagaPhaseMessage {
         /// The 16-byte correlation nonce joining the two event-log records.
         nonce: [u8; 16],
         /// Which side committed (caller or target).
-        committed_side: scp_protocol::context::tools::cross_context_saga::CommittedSide,
+        committed_side: scp_protocol::context::outlets::cross_context_saga::CommittedSide,
         /// The committed-side event id.
         committed_event_id: String,
         /// CONVERGENT committer-assigned leaf timestamp (seconds) for the
         /// divergence-marker leaf: B's staged `recorded_timestamp_ms / 1000` —
-        /// the same convergent instant the committed-side `ToolInvoked` leaf
+        /// the same convergent instant the committed-side `OutletInvoked` leaf
         /// carries (spec §6.2.4 *Recorded timestamp*). Passed per-call so the
         /// marker leaf is byte-identical across honest members (§9.9.3), never a
         /// per-member actor-local clock read.
@@ -2908,11 +3607,152 @@ pub enum SagaPhaseMessage {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+    /// Append one emitted stream chunk to the durable `SagaId`-keyed Merkle
+    /// frontier (ADR-061 seal phase; spec §6.2.5 streaming saga). Runs on the
+    /// LOCAL target (B) actor. Sent by the FSM's off-mailbox seal task per
+    /// forwarded chunk (coalesced batching permitted) so the durable capture is
+    /// a **replay snapshot** the seal at stream-close reads to finalize
+    /// `stream_manifest_hash` — an O(log n) frontier, NEVER the payload set.
+    ///
+    /// Folds `chunk` into the staged
+    /// [`CrossContextStreamingOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextStreamingOutletInvocationPrepared)
+    /// `frontier` and advances the billable-chunk counter + durable credit
+    /// ledger, then Class-S sync-persists **KEEP** (ADR-061: the per-chunk credit
+    /// is Class-S monotonic — a durably-recorded chunk must never un-record on a
+    /// coalesce crash). It NEVER two-phase-commits (AC8): no Prepare/Commit per
+    /// chunk. Idempotent no-op if the saga already sealed (its slot is gone and
+    /// the committed witness is present) or was aborted (slot absent).
+    StreamCaptureAppend {
+        /// Durable saga identifier (the `saga_pending` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The emitted operator-signed chunk to fold into the durable frontier.
+        /// The seal task pushes exactly what B's pump emitted (already dropping
+        /// above-cancel-ack `Data` chunks), so the unbounded-ceiling frontier
+        /// yields the correct §5.4.5 billable count. BOXED to keep this variant
+        /// small (`OutletStreamChunk` embeds a `serde_json::Value` payload) so
+        /// `ContextCommand` / the actor dispatch future stay under the
+        /// `clippy::large_enum_variant` / `large_futures` thresholds.
+        chunk: Box<scp_protocol::context::outlets::stream::OutletStreamChunk>,
+        /// Oneshot reply channel — `Ok(())` once the chunk is durably folded (or
+        /// on the idempotent no-op paths).
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+    /// Seal the streaming saga at stream-close (ADR-061 seal phase; spec §6.2.5
+    /// streaming saga). Runs on the LOCAL target (B) actor. Sent ONCE by the
+    /// FSM's off-mailbox seal task at the terminal chunk.
+    ///
+    /// Finalizes `stream_manifest_hash = frontier.root()` (the REAL 32-byte root,
+    /// never `[0u8; 32]`) from the durable `SagaId`-keyed frontier, settles the
+    /// escrow from the durable ledger (`settle_at_close` → refund = reserved −
+    /// billed), signs the
+    /// [`CrossContextOutletStreamReceipt`](scp_protocol::context::outlets::cross_context_saga::CrossContextOutletStreamReceipt)
+    /// (`SCP-XCTX-STREAM-RECEIPT-V1`, SCP-OUT-043) over the staged
+    /// `recorded_nonce` / `recorded_chain_depth` / `recorded_timestamp_ms` + the
+    /// root + the `SagaId`-stable event id, appends the B-side `OutletInvoked`
+    /// (real root, `chunks_billed = frontier.billed_count()`,
+    /// `stream_chunk_count = frontier.leaf_count()`), durably captures the
+    /// [`CommittedStreamingOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation)
+    /// witness keyed by `SagaId` (AC7 replay witness), clears the staged slot, and
+    /// Class-S sync-persists fail-closed. A replay (this `SagaId` already sealed)
+    /// re-emits the stored receipt + root + settlement verbatim and does NOT
+    /// re-append or re-sign. This is the ONLY commit — commit ONCE over the
+    /// bounded root (AC8).
+    CommitBStreamSettle {
+        /// Durable saga identifier.
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The stream's §5.4.5 terminal status, recorded into the B-side
+        /// `OutletInvoked` event (Ok / Error / Cancelled).
+        terminal_status: scp_protocol::context::outlets::stream::StreamTerminalStatus,
+        /// The pinned cancel-ack sequence if an `OutletCancel` closed the stream,
+        /// else `None`. Recorded for audit; the durable frontier already reflects
+        /// the cancel-ack billing boundary because the seal task never pushes an
+        /// above-ceiling chunk (the pump drops them before emission).
+        cancel_ack_seq: Option<u64>,
+        /// The target context's Active Signing Key (§6.2.5 receipt signing). The
+        /// actor holds NO signing key (ADR-049): the FSM resolves the key
+        /// authorized for `target_context_id` and passes it per-call. Zeroizes on
+        /// drop.
+        target_signing_key: SigningKeyBytes,
+        /// Oneshot reply channel. See [`CommitBStreamSettleReply`].
+        reply: CommitBStreamSettleReply,
+    },
+    /// Prepare-B (streaming) — the streaming-saga sibling of [`Self::PrepareB`]
+    /// (ADR-061 seal phase; spec §6.2.5 streaming saga). Runs on the LOCAL
+    /// target (B) actor. Re-runs the IDENTICAL §6.2.4 Prepare-B validation gate
+    /// (`run_prepare_b_checks` + the inbound §6.2.0.2 rate consume), captures the
+    /// same B-controlled provenance (`recorded_timestamp_ms` / `recorded_nonce` /
+    /// `recorded_chain_depth`), but STAGES a
+    /// [`SagaPreparedState::CrossContextStreamingOutletInvocation`](crate::context::supervisor::saga_prepared_state::SagaPreparedState::CrossContextStreamingOutletInvocation)
+    /// slot (empty `MerkleFrontier::new()` + the pinned escrow ledger
+    /// `reserved`/`cost_per_chunk`, zeroed `billed`/`billed_count`, unbounded
+    /// cancel-ack ceiling) instead of the unary eight-field projection. Persists
+    /// Class-S fail-closed via the SAME keep-nonce/restore-slot split as
+    /// [`Self::PrepareB`] and replies [`PrepareBOutcome`]. The staged frontier is
+    /// the durable, `SagaId`-keyed capture the off-mailbox seal task folds chunks
+    /// into ([`Self::StreamCaptureAppend`]) and seals at close
+    /// ([`Self::CommitBStreamSettle`]).
+    PrepareBStreaming {
+        /// Durable saga identifier (the `saga_pending` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The boxed §6.2.4 Prepare-B field set + the streaming escrow ledger
+        /// inputs. BOXED to keep this variant small so `ContextCommand` and the
+        /// actor dispatch future stay under the `clippy::large_enum_variant` /
+        /// `clippy::large_futures` thresholds (same discipline as the other large
+        /// saga payloads in this enum).
+        fields: Box<PrepareBStreamingFields>,
+        /// Oneshot reply channel. A §6.2.4 policy reject rides
+        /// `Ok(PrepareBOutcome::Rejected(SagaReject))`; the `Err(ContextError)`
+        /// channel carries only codeless mailbox / Class-S-persist failures.
+        reply: oneshot::Sender<Result<PrepareBOutcome, ContextError>>,
+    },
+    /// Streaming-saga seal witness check (ADR-061 seal phase; §17.16.4 crash
+    /// recovery). Runs on the LOCAL target (B) actor. READ-ONLY (no mutation, no
+    /// Class-S persist): reports whether this `SagaId` is already recorded in
+    /// `xctx_committed_stream_outputs` (the durable seal-close idempotency
+    /// witness). The streaming sibling of [`Self::CommitACheckWitness`]: the
+    /// autonomous, key-less crash-recovery sweep
+    /// ([`Supervisor::recover_committing_entry`](crate::context::supervisor::Supervisor))
+    /// uses it to distinguish an already-sealed streaming saga (witness present ⇒
+    /// resolve `Committed` without a signing key) from one that only has a
+    /// durable prefix (witness absent ⇒ the truncated close needs the target's
+    /// Active Signing Key, supplied at the key-bearing recovery surface).
+    StreamSettleCheckWitness {
+        /// Durable saga identifier (the `xctx_committed_stream_outputs` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// Oneshot reply: the durable witness recovery status (present / settled /
+        /// rebuilt settlement / A-side leaf inputs), READ-ONLY.
+        reply: oneshot::Sender<Result<StreamWitnessRecoveryStatus, ContextError>>,
+    },
+    /// Stage the §7.3.8 cumulative-counter reserve into the durable streaming
+    /// prepared slot (ADR-061 seal phase; SCP-OUT-046). Runs on the LOCAL target
+    /// (B) actor. Sent by the streaming-saga driver at the Commit-transition,
+    /// AFTER `open_stream_session` commits the counter CAS (the reserved amount is
+    /// computed inside the open's final gate, so it is not known at Prepare-B).
+    ///
+    /// Folds `amount_cumulative_reserved` / `reserved_chunks` / `ucan_cid` into
+    /// the staged
+    /// [`CrossContextStreamingOutletInvocationPrepared`](crate::context::supervisor::saga_prepared_state::CrossContextStreamingOutletInvocationPrepared)
+    /// slot, then Class-S sync-persists **KEEP** (the counter release is a
+    /// durable settlement input the seal + crash recovery read). Idempotent no-op
+    /// if the saga already sealed / aborted (slot gone).
+    StreamStageCounterReserve {
+        /// Durable saga identifier (the `saga_pending` key).
+        saga_id: crate::context::supervisor::saga_journal::SagaId,
+        /// The §7.3.8 worst-case cumulative amount reserved at open.
+        amount_cumulative_reserved: u64,
+        /// The invoker-declared `estimated_chunk_count` (diagnostics only).
+        reserved_chunks: u32,
+        /// The opening UCAN CID — the cumulative counter's key.
+        ucan_cid: String,
+        /// Oneshot reply — `Ok(())` once durably folded (or on the idempotent
+        /// no-op path).
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
 }
 
 /// See [`ContextCommand::LifecycleControl`]. The supervisor's suspend /
 /// resume / shutdown path sends these; real variants land with the
-/// BridgeInstance integration in commit 11. Commit 6 only carries the
+/// BridgeInstance integration in ADR-049 §15. Commit 6 only carries the
 /// two Pause / PersistSync variants that the
 /// `BridgeInstanceCore` (in `scp_ffi_common::bridge_instance`)'s
 /// default `suspend()` body calls, plus the terminal `Shutdown`.
@@ -2990,11 +3830,6 @@ pub enum LifecycleControlCommand {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the oneshot reply sender for a command, consuming the command.
-/// Used by the test-only `send_not_implemented` helper on
-/// [`crate::context::actor::ContextActorHandle`] to close out a stub
-/// dispatch. Not part of the public API — the field is pattern-matched
-/// directly by the handler stubs once they migrate.
 impl ContextCommand {
     /// Internal: whether this variant is the terminal
     /// [`LifecycleControlCommand::Shutdown`]. Used by the actor's
@@ -3031,16 +3866,10 @@ mod tests {
         assert!(!cmd.is_shutdown());
 
         let (tx, _rx) = oneshot::channel();
-        let cmd = ContextCommand::Messaging(MessagingCommand::Placeholder { reply: tx });
+        let cmd = ContextCommand::Queries(QueriesCommand::MemberCount {
+            context_id: "ctx".to_owned(),
+            reply: tx,
+        });
         assert!(!cmd.is_shutdown());
-    }
-
-    #[test]
-    fn sub_enum_placeholders_carry_reply_channels() {
-        // Compile-time witness: every placeholder variant carries a
-        // oneshot reply channel with the expected type.
-        let (tx, rx) = oneshot::channel::<Result<(), ContextError>>();
-        let _ = ContextCommand::Messaging(MessagingCommand::Placeholder { reply: tx });
-        drop(rx);
     }
 }

@@ -1,7 +1,7 @@
 //! `#[napi] Scp` class — the caller-owned SCP instance exposed to TypeScript.
 //!
 //! `SCP` (exposed to TS as `SCP`) is the top-level SDK-facing handle that
-//! owns a `NapiBridgeInstance` — which in turn owns the `ContextManager`,
+//! owns a `NapiBridgeInstance` — which in turn owns the `Supervisor`,
 //! transport, and bridge-specific registries.
 //!
 //! Phase 4 PR 4 (#1549, ADR-048) completed the migration: the
@@ -20,20 +20,22 @@ use std::time::Duration;
 use napi::Env;
 use napi::Error as NapiError;
 use napi_derive::napi;
+use scp_clock::Clock as _;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
 use scp_ffi_common::error_codes as codes;
 use scp_identity::DidMethod as _;
-use scp_primitives::Clock as _;
 
-// `Buffer` is referenced only by the in-memory-custody-gated full-stack test
-// methods (`fullstackSendMessage` / `fullstackDecryptMessage`); production
-// `identity_create` uses the fully-qualified path for its `testing_seed` arg.
-#[cfg(feature = "allow_in_memory_custody")]
+// `Buffer` is used unconditionally by the §5.4.5 streaming-outlet pure-wrapper
+// methods (`outletStreamVerifyChunkSignature` /
+// `outletStreamComputeCaveatsBinding` / `outletStreamPollNext`) as well as the
+// in-memory-custody-gated full-stack test methods; production `identity_create`
+// uses the fully-qualified path for its `testing_seed` arg.
 use napi::bindgen_prelude::Buffer;
 
 use crate::context::{
-    NapiAssetEntry, NapiBatchPublishResult, NapiContextHandle, NapiEvaluationResult, NapiMessage,
-    NapiPublishResult,
+    NapiAssetEntry, NapiBatchPublishResult, NapiContextHandle, NapiEvaluationResult,
+    NapiInviteMemberOutcome, NapiKeyPackageReservation, NapiMessage, NapiPublishResult,
+    NapiSealedInvitation,
 };
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::event_log::{NapiCheckpoint, NapiEvent, NapiProof};
@@ -42,13 +44,13 @@ use crate::mcp::{
     NapiAllowlistState, NapiMcpClientHandle, NapiMcpInvokeResult, NapiMcpServerConfig,
     NapiMcpServerHandle, NapiMcpToolInfo,
 };
+use crate::outlets::{NapiOutletDefinition, NapiOutletVerificationResult};
 use crate::runtime::{NapiBridgeInstance, SqliteKeyMaterial, StorageConfig};
 #[cfg(feature = "server")]
 use crate::server::{NapiNodeHandle, NapiRelayHandle};
 use crate::sync::NapiSyncPolicy;
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 use crate::testing::NapiFullStackNode;
-use crate::tools::{NapiToolDefinition, NapiToolVerificationResult};
 use crate::transport::{NapiReliabilityScore, NapiTransportManager, NapiTransportStatus};
 use crate::trust::{NapiAttestationVerificationResult, NapiChallengeResult, NapiTrustScoreResult};
 use crate::ucan::NapiUcanToken;
@@ -381,13 +383,13 @@ impl Scp {
     // napi-rs requires `async` for the Promise return type. Without the
     // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
     // compiled out, so the bare build sees an await-free async fn.
-    #[cfg_attr(not(feature = "allow_in_memory_custody"), allow(clippy::unused_async))]
+    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn identity_create(
         &self,
         custody: String,
         testing_seed: Option<napi::bindgen_prelude::Buffer>,
     ) -> napi::Result<crate::identity::NapiIdentity> {
-        #[cfg(feature = "allow_in_memory_custody")]
+        #[cfg(feature = "testing")]
         use crate::identity::NapiIdentityInner;
         use crate::identity::ensure_did_resolver_initialized_on;
 
@@ -429,12 +431,11 @@ impl Scp {
         };
 
         let bi = &*self.inner;
-        ensure_did_resolver_initialized_on(bi);
+        ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
 
         match custody.as_str() {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             "in_memory" => {
-                use scp_identity::DidDht;
                 use scp_platform::testing::InMemoryKeyCustody;
 
                 // Deref through `Zeroizing<[u8; 32]>` so the wrapper
@@ -452,7 +453,7 @@ impl Scp {
                 ));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let dht = DidDht::new();
+                let dht = crate::identity::shared_did_method()?;
                 let (scp_identity, document, pre_rotation_handle) = dht
                     .create(&*key_custody, pre_rotation_custody.as_ref())
                     .await
@@ -496,26 +497,24 @@ impl Scp {
                 crate::increment_handle_count();
                 Ok(handle)
             }
-            #[cfg(not(feature = "allow_in_memory_custody"))]
+            #[cfg(not(feature = "testing"))]
             "in_memory" => {
                 // Mirrors PyO3 `parse_custody_with_seed`
-                // (cfg(not(allow_in_memory_custody))): a `testing_seed` is
+                // (cfg(not(testing))): a `testing_seed` is
                 // a parity-harness affordance gated on the
-                // `allow_in_memory_custody` feature, so surface it as
+                // `testing` feature, so surface it as
                 // SCP-VALID-7008 ("testing-only feature requires feature
                 // flag") ahead of the generic custody-unavailable error.
                 if testing_seed_bytes.is_some() {
                     return Err(NapiError::from(ScpNapiError::Validation {
-                        message:
-                            "`testing_seed` parameter requires the allow_in_memory_custody feature"
-                                .to_owned(),
+                        message: "`testing_seed` parameter requires the testing feature".to_owned(),
                         code: codes::VALID_7008.to_owned(),
                     }));
                 }
                 Err(ScpNapiError::Identity {
-                    message:
-                        "in_memory custody is not available in this build -- enable allow_in_memory_custody"
-                            .to_owned(),
+                    message: "in_memory custody is not available in this build -- use \
+                              \"software\" or \"platform\" custody for production key storage"
+                        .to_owned(),
                     code: codes::IDENT_1008.to_owned(),
                 }
                 .into())
@@ -558,32 +557,31 @@ impl Scp {
     // napi-rs requires `async` for the Promise return type. Without the
     // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
     // compiled out, so the bare build sees an await-free async fn.
-    #[cfg_attr(not(feature = "allow_in_memory_custody"), allow(clippy::unused_async))]
+    #[cfg_attr(not(feature = "testing"), allow(clippy::unused_async))]
     pub async fn identity_create_with_agent_key(
         &self,
         custody: String,
     ) -> napi::Result<crate::identity::NapiIdentity> {
-        #[cfg(feature = "allow_in_memory_custody")]
+        #[cfg(feature = "testing")]
         use crate::identity::NapiIdentityInner;
         use crate::identity::ensure_did_resolver_initialized_on;
 
         validate_custody_type(&custody).map_err(NapiError::from)?;
 
         let bi = &*self.inner;
-        ensure_did_resolver_initialized_on(bi);
+        ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
 
         match custody.as_str() {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             "in_memory" => {
                 use scp_platform::testing::InMemoryKeyCustody;
-                use scp_identity::DidDht;
 
                 let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
                     crate::identity::OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
                 ));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let dht = DidDht::new();
+                let dht = crate::identity::shared_did_method()?;
                 let (scp_identity, document, pre_rotation_handle) = dht
                     .create_with_agent_key(&*key_custody, pre_rotation_custody.as_ref())
                     .await
@@ -627,11 +625,11 @@ impl Scp {
                 crate::increment_handle_count();
                 Ok(handle)
             }
-            #[cfg(not(feature = "allow_in_memory_custody"))]
+            #[cfg(not(feature = "testing"))]
             "in_memory" => Err(ScpNapiError::Identity {
-                message:
-                    "in_memory custody is not available in this build -- enable allow_in_memory_custody"
-                        .to_owned(),
+                message: "in_memory custody is not available in this build -- use \
+                          \"software\" or \"platform\" custody for production key storage"
+                    .to_owned(),
                 code: codes::IDENT_1008.to_owned(),
             }
             .into()),
@@ -708,12 +706,16 @@ impl Scp {
         // join-time pseudonym announcement) are the exception — they export the
         // raw seed into Rust (held in `Zeroizing`, wiped on drop), a surface
         // tracked for migration to `KeyCustody::sign`.
-        use scp_identity::DidDht;
 
-        use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
+        // `NapiIdentityInner` is only named in the `testing`-gated success arm
+        // below; the shipped build fails closed before minting a handle
+        // (ADR-062 §Decision 6).
+        #[cfg(feature = "testing")]
+        use crate::identity::NapiIdentityInner;
+        use crate::identity::ensure_did_resolver_initialized_on;
 
         let bi_arc = Arc::clone(&self.inner);
-        ensure_did_resolver_initialized_on(&bi_arc);
+        ensure_did_resolver_initialized_on(&bi_arc).map_err(NapiError::from)?;
 
         // Promote the JS callbacks to threadsafe functions on the JS
         // thread (consuming the non-Send `Function`s). A malformed
@@ -722,52 +724,68 @@ impl Scp {
         let key_custody = Arc::new(crate::custody::NapiKeyCustody::Callback(callback));
 
         env.spawn_future(async move {
-            let bi = &*bi_arc;
-            let pre_rotation_custody =
-                Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-            let dht = DidDht::new();
-            let (scp_identity, document, pre_rotation_handle) = dht
-                .create(&*key_custody, pre_rotation_custody.as_ref())
-                .await
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+            // FAIL CLOSED on a shipped (no-`testing`) build (ADR-062 §Decision
+            // 6, IDENT_1059). This callback-custody path funnels through the
+            // same mandatory pre-rotation commitment as every other create path
+            // (spec §9.7.4.1 §3); the only `PreRotationCustody` backend is the
+            // severed in-memory nullifier, so production returns a typed error
+            // rather than minting it. Mirrors the `PyO3` reference bridge.
+            #[cfg(not(feature = "testing"))]
+            {
+                let _ = (&bi_arc, &key_custody);
+                Err::<crate::identity::NapiIdentity, NapiError>(NapiError::from(
+                    crate::identity::no_pre_rotation_backend(),
+                ))
+            }
+            #[cfg(feature = "testing")]
+            {
+                let bi = &*bi_arc;
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                let dht = crate::identity::shared_did_method()?;
+                let (scp_identity, document, pre_rotation_handle) = dht
+                    .create(&*key_custody, pre_rotation_custody.as_ref())
+                    .await
+                    .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
-            let verifying_key_hex = crate::identity::identity_verifying_key_hex(
-                &key_custody,
-                &scp_identity.identity_key,
-            )
-            .await;
-
-            crate::runtime::register_identity(
-                bi,
-                &scp_identity.did,
-                crate::runtime::NapiIdentityEntry {
-                    identity: scp_identity.clone(),
-                    custody: Arc::clone(&key_custody),
-                    document: document.clone(),
-                    identity_link_attestations: Vec::new(),
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                },
-            );
-
-            crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
+                let verifying_key_hex = crate::identity::identity_verifying_key_hex(
+                    &key_custody,
+                    &scp_identity.identity_key,
+                )
                 .await;
 
-            let handle = crate::identity::NapiIdentity {
-                inner: Arc::new(NapiIdentityInner {
-                    did: scp_identity.did.clone(),
-                    custody_type: "callback".to_owned(),
-                    scp_identity: Some(scp_identity),
-                    in_memory_custody: Some(key_custody),
-                    document: Some(document),
-                    bi: Arc::clone(&bi_arc),
-                    verifying_key_hex,
-                    instance_id: bi.instance_id(),
-                    rotation_event_json: None,
-                }),
-            };
-            crate::increment_handle_count();
-            Ok(handle)
+                crate::runtime::register_identity(
+                    bi,
+                    &scp_identity.did,
+                    crate::runtime::NapiIdentityEntry {
+                        identity: scp_identity.clone(),
+                        custody: Arc::clone(&key_custody),
+                        document: document.clone(),
+                        identity_link_attestations: Vec::new(),
+                        pre_rotation_handle,
+                        pre_rotation_custody,
+                    },
+                );
+
+                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
+                    .await;
+
+                let handle = crate::identity::NapiIdentity {
+                    inner: Arc::new(NapiIdentityInner {
+                        did: scp_identity.did.clone(),
+                        custody_type: "callback".to_owned(),
+                        scp_identity: Some(scp_identity),
+                        in_memory_custody: Some(key_custody),
+                        document: Some(document),
+                        bi: Arc::clone(&bi_arc),
+                        verifying_key_hex,
+                        instance_id: bi.instance_id(),
+                        rotation_event_json: None,
+                    }),
+                };
+                crate::increment_handle_count();
+                Ok(handle)
+            }
         })
     }
 
@@ -778,7 +796,6 @@ impl Scp {
     #[napi(js_name = "identityLoad")]
     pub async fn identity_load(&self, did: String) -> napi::Result<crate::identity::NapiIdentity> {
         use crate::identity::NapiIdentityInner;
-        use scp_identity::DidDht;
 
         if !did.starts_with("did:dht:") {
             return Err(ScpNapiError::Identity {
@@ -822,7 +839,7 @@ impl Scp {
             return Ok(handle);
         }
 
-        let dht = DidDht::new();
+        let dht = crate::identity::shared_did_method()?;
         let document = dht
             .resolve(&did)
             .await
@@ -852,7 +869,6 @@ impl Scp {
         did: String,
     ) -> napi::Result<crate::identity::NapiDIDDocument> {
         use crate::identity::NapiVerificationMethod;
-        use scp_identity::DidDht;
 
         if !did.starts_with("did:dht:") {
             return Err(ScpNapiError::Identity {
@@ -870,7 +886,7 @@ impl Scp {
         let document = if let Some(doc) = local_doc {
             doc
         } else {
-            let dht = DidDht::new();
+            let dht = crate::identity::shared_did_method()?;
             dht.resolve(&did)
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?
@@ -1080,8 +1096,8 @@ impl Scp {
             RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
             agent_key_rotation_outcome,
         };
+        use scp_did::DID;
         use scp_ffi_common::validate::validate_did;
-        use scp_identity::DID;
 
         validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -1156,7 +1172,7 @@ impl Scp {
             }
         };
 
-        let now_ms = scp_primitives::SystemClock.now_millis();
+        let now_ms = scp_clock::SystemClock.now_millis();
         let key_rotation = match compromise_tier {
             CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
             CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
@@ -1170,29 +1186,30 @@ impl Scp {
         };
 
         struct NapiRecoveryBackend;
+        #[async_trait::async_trait(?Send)]
         impl RecoveryBackend for NapiRecoveryBackend {
-            fn mls_update(
+            async fn mls_update(
                 &self,
                 _context_id: &str,
                 _key_rotation: &KeyRotationOutcome,
             ) -> Result<(), RecoveryStepError> {
                 Ok(())
             }
-            fn revoke_ucans(
+            async fn revoke_ucans(
                 &self,
                 _context_id: &str,
                 _key_rotation: &KeyRotationOutcome,
             ) -> Result<(), RecoveryStepError> {
                 Ok(())
             }
-            fn rotate_key_packages(
+            async fn rotate_key_packages(
                 &self,
                 _context_id: &str,
                 _key_rotation: &KeyRotationOutcome,
             ) -> Result<(), RecoveryStepError> {
                 Ok(())
             }
-            fn notify_contacts(
+            async fn notify_contacts(
                 &self,
                 _did: &DID,
                 _tier: CompromiseTier,
@@ -1201,7 +1218,7 @@ impl Scp {
             ) -> bool {
                 true
             }
-            fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+            async fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
                 true
             }
         }
@@ -1221,7 +1238,7 @@ impl Scp {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             ))
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Identity {
@@ -1260,8 +1277,8 @@ impl Scp {
             CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
             CustodyMigrationTarget,
         };
+        use scp_did::DID;
         use scp_ffi_common::validate::validate_did;
-        use scp_identity::DID;
 
         validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -1384,7 +1401,7 @@ impl Scp {
         // the napi-rs worker thread has no tokio context (round-2
         // bug-catcher finding).
         let result = crate::runtime()
-            .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
+            .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Identity {
                     message: format!("custody migration failed: {e}"),
@@ -1418,7 +1435,7 @@ impl Scp {
         target_did: String,
         name: String,
     ) -> napi::Result<()> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_did(&owner_did)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1442,7 +1459,7 @@ impl Scp {
     /// Per-instance equivalent of `petname_remove`.
     #[napi(js_name = "petnameRemove")]
     pub fn petname_remove(&self, owner_did: String, target_did: String) -> napi::Result<()> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_did(&owner_did)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1564,7 +1581,7 @@ impl Scp {
         owner_did: String,
         target_did: String,
     ) -> napi::Result<Option<String>> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_did(&owner_did)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1689,7 +1706,7 @@ impl Scp {
         tags: Option<Vec<String>>,
     ) -> napi::Result<String> {
         use scp_core::discovery::handles::{HandleMetadata, HandleRegisterParams, HandleRegistry};
-        use scp_identity::DID;
+        use scp_did::DID;
 
         let target =
             scp_ffi_common::petname_helpers::parse_handle_target(&target_json).map_err(|e| {
@@ -1715,7 +1732,7 @@ impl Scp {
         let result = registry.register(
             &params,
             &DID::from(registrant_did.as_str()),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         serde_json::to_string(&result).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
@@ -1782,7 +1799,7 @@ impl Scp {
         did: String,
     ) -> napi::Result<String> {
         use scp_core::discovery::handles::HandleDeregisterParams;
-        use scp_identity::DID;
+        use scp_did::DID;
 
         let mut guard = self.inner.core.handle_registries().lock().map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
@@ -1820,7 +1837,7 @@ impl Scp {
         description: Option<String>,
         tags: Option<Vec<String>>,
     ) -> napi::Result<String> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_context_id(&scope_context_id)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -1865,7 +1882,7 @@ impl Scp {
             .register(
                 &params,
                 &DID::from(registrant_did.as_str()),
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Validation {
@@ -1925,7 +1942,7 @@ impl Scp {
         name: String,
         did: String,
     ) -> napi::Result<String> {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         scp_ffi_common::validate::validate_context_id(&scope_context_id)
             .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
@@ -2022,7 +2039,7 @@ impl Scp {
                 &querier,
                 &known_contexts,
                 &known_domains,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .map_err(|e| {
@@ -2045,7 +2062,7 @@ impl Scp {
     // #1549 Phase 4 PR 4 — sub-slice C: context operations on SCP.
     //
     // Each method delegates to the per-bridge-instance `_on` helpers in
-    // [`crate::context`] / [`crate::tools`], routing through `&*self.inner`
+    // [`crate::context`] / [`crate::outlets`], routing through `&*self.inner`
     // so operations are scoped to this `SCP`'s bridge instance. The
     // free-function façade that predated this migration was deleted in
     // the Phase 4 PR 4 demolition slice (ADR-048).
@@ -2060,6 +2077,81 @@ impl Scp {
     ) -> napi::Result<NapiContextHandle> {
         crate::napi_check_handle!(&self.inner.core, identity);
         crate::context::context_create_on(&self.inner, identity, params_json).await
+    }
+
+    /// Reserves a pooled MLS `KeyPackage` under the owning identity for a
+    /// spawn-from-Welcome join (ADR-049 Phase 2J).
+    ///
+    /// Returns the opaque `{ reservationId, keyPackagePublic }` pair: the PUBLIC
+    /// bytes are handed (out of band) to the context creator, who mints a
+    /// Welcome addressed to this reservation; the `reservationId` is passed back
+    /// to `contextJoinFromWelcome`. The joiner's private signer state never
+    /// leaves the node. `owningDid` MUST be a locally-custodied identity.
+    #[napi(js_name = "reserveKeyPackage")]
+    pub async fn reserve_key_package(
+        &self,
+        owning_did: String,
+    ) -> napi::Result<NapiKeyPackageReservation> {
+        crate::context::reserve_key_package_on(&self.inner, owning_did).await
+    }
+
+    /// Joins an existing SCP context by opening a received sealed, signed
+    /// invitation bundle, standing the local (joiner) identity up as a
+    /// send-capable participant (ADR-049 Phase 2J; FFI-02 Option A).
+    ///
+    /// Completes the reserve → invite → join handshake begun by
+    /// `reserveKeyPackage`. The authoritative params + MLS Welcome travel INSIDE
+    /// the `sealed` bundle (produced by the creator's `inviteMember`), which the
+    /// runtime opens and authenticates — the joiner supplies no loose params. The
+    /// joiner's §9.10.4 routing pseudonym is DERIVED from its locally-custodied
+    /// identity (never caller-supplied); a non-custodied joiner hard-fails before
+    /// the single-use `KeyPackage` is consumed. Returns an active
+    /// [`NapiContextHandle`] rebuilt from the AUTHENTICATED bundle params.
+    #[napi(js_name = "contextJoinFromWelcome")]
+    pub async fn context_join_from_welcome(
+        &self,
+        owning_did: String,
+        sealed: NapiSealedInvitation,
+        reservation_id: String,
+    ) -> napi::Result<NapiContextHandle> {
+        crate::context::context_join_from_welcome_on(
+            &self.inner,
+            owning_did,
+            sealed,
+            reservation_id,
+        )
+        .await
+    }
+
+    /// Invites a member to an existing context, producing a sealed, signed
+    /// invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+    ///
+    /// The creator (or admin) seals the context's genesis params + Welcome for
+    /// the invitee under RFC 9180 HPKE, binding them to the invitee's
+    /// `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+    /// is unilateral and returns a [`NapiInviteMemberOutcome`] whose `bundle` is
+    /// the sealed `NapiSealedInvitation` — pass it directly to
+    /// `contextJoinFromWelcome`. A voting-governed context throws (governed-
+    /// context invitations are not yet implemented). `creatorDid` MUST be a
+    /// locally-custodied identity; the invite is signed under its `#active` key.
+    #[napi(js_name = "inviteMember")]
+    pub async fn invite_member(
+        &self,
+        context_id: String,
+        creator_did: String,
+        invitee_did: String,
+        invitee_key_package: Vec<u8>,
+        relay_urls: Vec<String>,
+    ) -> napi::Result<NapiInviteMemberOutcome> {
+        crate::context::invite_member_on(
+            &self.inner,
+            context_id,
+            creator_did,
+            invitee_did,
+            invitee_key_package,
+            relay_urls,
+        )
+        .await
     }
 
     /// Per-instance equivalent of the free-function `context_join`.
@@ -2277,14 +2369,25 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `broadcast_subscribe`.
+    ///
+    /// For a GATED broadcast context, `messagesReadUcanJwt` MUST carry the
+    /// `messages:read` JWT issued to `subscriberDid` by the context admin/creator
+    /// (spec §5.14.4).
     #[napi(js_name = "broadcastSubscribe")]
     pub async fn broadcast_subscribe(
         &self,
         handle: &NapiContextHandle,
         subscriber_did: String,
+        messages_read_ucan_jwt: Option<String>,
     ) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::context::broadcast_subscribe_on(&self.inner, handle, subscriber_did).await
+        crate::context::broadcast_subscribe_on(
+            &self.inner,
+            handle,
+            subscriber_did,
+            messages_read_ucan_jwt,
+        )
+        .await
     }
 
     /// Per-instance equivalent of the free-function `broadcast_unsubscribe`.
@@ -2727,6 +2830,42 @@ impl Scp {
     // `SCP.checkScopedCapability` routes through `nativeFreeFn(...)` to
     // reach the module-level export.
 
+    /// Binds an app to a context and appends an `AppBound` event to the
+    /// durable event log (spec §8.4).
+    ///
+    /// Returns a camelCase JSON summary on success.
+    #[napi(js_name = "appBind")]
+    pub fn app_bind(
+        &self,
+        context_id: String,
+        declaration_json: String,
+        actor_did: String,
+        timestamp_secs: f64,
+    ) -> napi::Result<String> {
+        // `timestamp_secs` arrives as a JS `number` (f64). Unix timestamps fit
+        // exactly in f64 (≤ 2^31 seconds until 2038; < 2^53 until year 4000+).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ts = timestamp_secs as u64;
+        crate::context::app_bind_on(&self.inner, context_id, declaration_json, actor_did, ts)
+    }
+
+    /// Unbinds an app from a context and appends an `AppUnbound` event to
+    /// the durable event log (spec §8.4).
+    #[napi(js_name = "appUnbind")]
+    pub fn app_unbind(
+        &self,
+        context_id: String,
+        app_did: String,
+        actor_did: String,
+        timestamp_secs: f64,
+    ) -> napi::Result<()> {
+        // `timestamp_secs` arrives as a JS `number` (f64). Unix timestamps fit
+        // exactly in f64 (≤ 2^31 seconds until 2038; < 2^53 until year 4000+).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let ts = timestamp_secs as u64;
+        crate::context::app_unbind_on(&self.inner, context_id, app_did, actor_did, ts)
+    }
+
     /// Per-instance equivalent of the free-function `evaluate_invitation`.
     #[napi(js_name = "evaluateInvitation")]
     pub fn evaluate_invitation(
@@ -2772,26 +2911,26 @@ impl Scp {
         )
     }
 
-    // ===== sub-slice C: tools =====
+    // ===== sub-slice C: outlets =====
 
-    /// Per-instance equivalent of the free-function `tool_register`.
-    #[napi(js_name = "toolRegister")]
-    pub async fn tool_register(
+    /// Per-instance equivalent of the free-function `outlet_register`.
+    #[napi(js_name = "outletRegister")]
+    pub async fn outlet_register(
         &self,
         handle: &NapiContextHandle,
-        definition: NapiToolDefinition,
+        definition: NapiOutletDefinition,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_register_on(&self.inner, handle, definition).await
+        crate::outlets::outlet_register_on(&self.inner, handle, definition).await
     }
 
-    /// Per-instance equivalent of the free-function `tool_invoke`.
-    #[napi(js_name = "toolInvoke")]
+    /// Per-instance equivalent of the free-function `outlet_invoke`.
+    #[napi(js_name = "outletInvoke")]
     #[allow(clippy::too_many_arguments)]
-    pub async fn tool_invoke(
+    pub async fn outlet_invoke(
         &self,
         handle: &NapiContextHandle,
-        tool_id: String,
+        outlet_id: String,
         input_json: String,
         identity_did: String,
         ucan_token: String,
@@ -2799,10 +2938,10 @@ impl Scp {
         spending_ucan_jwt: Option<String>,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_invoke_on(
+        crate::outlets::outlet_invoke_on(
             &self.inner,
             handle,
-            tool_id,
+            outlet_id,
             input_json,
             identity_did,
             ucan_token,
@@ -2812,25 +2951,292 @@ impl Scp {
         .await
     }
 
-    /// Per-instance equivalent of the free-function `tool_verify`.
-    #[napi(js_name = "toolVerify")]
-    pub async fn tool_verify(
+    /// Per-instance equivalent of the free-function `outlet_verify`.
+    #[napi(js_name = "outletVerify")]
+    pub async fn outlet_verify(
         &self,
         handle: &NapiContextHandle,
-        tool_id: String,
-    ) -> napi::Result<NapiToolVerificationResult> {
+        outlet_id: String,
+    ) -> napi::Result<NapiOutletVerificationResult> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_verify_on(&self.inner, handle, tool_id).await
+        crate::outlets::outlet_verify_on(&self.inner, handle, outlet_id).await
     }
 
-    /// Per-instance equivalent of the free-function `tool_invoke_cross_context`.
-    #[napi(js_name = "toolInvokeCrossContext")]
+    // ===== §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C8a) =====
+
+    /// Opens a §5.4.5 streaming outlet invocation, returning a `StreamHandleId`
+    /// PROMPTLY (Commit transition — never block-until-terminal).
+    ///
+    /// The UCAN is validated ONCE at open via the full 11-step ADR-016 pipeline;
+    /// the invoker is pinned for the stream's lifetime. Drive the stream via
+    /// `outletStreamPollNext` / `_grantCredit` / `_cancel` / `_terminate` with
+    /// the SAME `caller_did`.
+    #[napi(js_name = "outletStreamOpen")]
     #[allow(clippy::too_many_arguments)]
-    pub async fn tool_invoke_cross_context(
+    pub async fn outlet_stream_open(
+        &self,
+        handle: &NapiContextHandle,
+        outlet_id: String,
+        input_json: String,
+        caller_did: String,
+        ucan_token: String,
+        proof_tokens: Option<Vec<String>>,
+        spending_ucan: Option<String>,
+        timeout_ms: Option<u32>,
+        estimated_chunk_count: Option<u32>,
+    ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
+        crate::outlet_stream::outlet_stream_open_on(
+            &self.inner,
+            handle,
+            outlet_id,
+            input_json,
+            caller_did,
+            ucan_token,
+            proof_tokens,
+            spending_ucan,
+            timeout_ms,
+            estimated_chunk_count,
+        )
+        .await
+    }
+
+    /// Drains one chunk from a live stream, awaiting the pump until a chunk
+    /// arrives or the stream closes. Returns the JSON-serialized
+    /// `OutletStreamChunk` bytes, or `None` at the terminal (which evicts the
+    /// stream). An unknown/evicted handle is a DISTINCT error, never `None`.
+    #[napi(js_name = "outletStreamPollNext")]
+    pub async fn outlet_stream_poll_next(&self, handle_id: String) -> napi::Result<Option<Buffer>> {
+        crate::outlet_stream::outlet_stream_poll_next_on(&self.inner, &handle_id)
+            .await
+            .map(|opt| opt.map(Buffer::from))
+    }
+
+    /// Grants `grant` additional billable chunks of credit to a live stream. The
+    /// bridge signs the `OutletStreamCredit` internally under the pinned
+    /// invoker's custody key and auto-assigns the monotonic sequence, so the
+    /// caller supplies only a `u32` — no key access, no replay-counter tracking.
+    #[napi(js_name = "outletStreamGrantCredit")]
+    pub async fn outlet_stream_grant_credit(
+        &self,
+        handle_id: String,
+        caller_did: String,
+        grant: u32,
+    ) -> napi::Result<()> {
+        crate::outlet_stream::outlet_stream_grant_credit_on(
+            &self.inner,
+            &handle_id,
+            &caller_did,
+            grant,
+        )
+        .await
+    }
+
+    /// Signs and applies a stream cancel at the runtime-derived cursor
+    /// (CRITICAL #3 — the bridge never supplies a `next_seq`).
+    #[napi(js_name = "outletStreamCancel")]
+    pub async fn outlet_stream_cancel(
+        &self,
+        handle_id: String,
+        caller_did: String,
+    ) -> napi::Result<()> {
+        crate::outlet_stream::outlet_stream_cancel_on(&self.inner, &handle_id, &caller_did).await
+    }
+
+    /// Forces a framework terminal chunk. `slug` selects a closed-set terminal
+    /// reason; the canonical code is derived internally from the reason;
+    /// `message` is a human suffix.
+    #[napi(js_name = "outletStreamTerminate")]
+    pub async fn outlet_stream_terminate(
+        &self,
+        handle_id: String,
+        caller_did: String,
+        slug: String,
+        message: String,
+    ) -> napi::Result<()> {
+        crate::outlet_stream::outlet_stream_terminate_on(
+            &self.inner,
+            &handle_id,
+            &caller_did,
+            &slug,
+            &message,
+        )
+        .await
+    }
+
+    /// Pure wrapper: verifies a chunk's operator signature (§5.4.5).
+    #[napi(js_name = "outletStreamVerifyChunkSignature")]
+    pub fn outlet_stream_verify_chunk_signature(
+        &self,
+        chunk_bytes: Buffer,
+        operator_pk: Buffer,
+        context_id: String,
+        outlet_id: String,
+        caveats_binding: Buffer,
+    ) -> napi::Result<bool> {
+        crate::outlet_stream::outlet_stream_verify_chunk_signature_impl(
+            chunk_bytes.as_ref(),
+            operator_pk.as_ref(),
+            &context_id,
+            &outlet_id,
+            caveats_binding.as_ref(),
+        )
+        .map_err(napi::Error::from)
+    }
+
+    /// Pure wrapper: computes the §5.4.5 `caveats_binding` (32 bytes).
+    #[napi(js_name = "outletStreamComputeCaveatsBinding")]
+    pub fn outlet_stream_compute_caveats_binding(
+        &self,
+        ucan_cid: Buffer,
+        request_id: Buffer,
+        invoker_did: String,
+        estimated_chunk_count: u32,
+        effective_caveats_jcs: Buffer,
+    ) -> napi::Result<Buffer> {
+        crate::outlet_stream::outlet_stream_compute_caveats_binding_impl(
+            ucan_cid.as_ref(),
+            request_id.as_ref(),
+            &invoker_did,
+            estimated_chunk_count,
+            effective_caveats_jcs.as_ref(),
+        )
+        .map(Buffer::from)
+        .map_err(napi::Error::from)
+    }
+
+    // ===== §5.4.5 / §6.2.4 cross-context streaming saga (SCP-OUT-047) =====
+
+    /// Opens a §5.4.5 / §6.2.4 CROSS-CONTEXT streaming outlet invocation as a
+    /// saga (SCP-OUT-047), returning the durable `saga_id` PROMPTLY (the
+    /// Commit-transition — NOT a block-until-terminal; the seal pumps
+    /// off-mailbox). Drive the stream via `outletStreamingSagaPollNext` with the
+    /// returned `saga_id`.
+    ///
+    /// The invocation UCAN is validated ONCE at open via the full 11-step
+    /// ADR-016 pipeline against the TARGET context B. `caller_did` is bound to
+    /// this bridge instance's channel-authenticated principal (§6.2.4) and must
+    /// be a member of `source_handle`'s context — a mismatch rejects with a typed
+    /// `SagaAborted` (SCP-SAGA-13050) BEFORE the saga runs, so the receiver is
+    /// never handed out.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_handle` — The initiating (caller) context handle.
+    /// * `target_handle` — The executing (target) context handle hosting the outlet.
+    /// * `caller_did` — The initiator DID (bound to the bridge principal).
+    /// * `outlet_registration_id` — The outlet to invoke across the interface.
+    /// * `input_json` — Outlet input as a JSON string (schema-checked target-side).
+    /// * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce (32-char hex).
+    /// * `timestamp_ms` — Caller-asserted send time (Unix ms), passed as a JS `BigInt`.
+    /// * `chain_depth` — Caller-asserted inbound provenance depth (advisory).
+    /// * `ucan_token` — The invocation UCAN authorizing the outlet call.
+    /// * `proof_tokens` — Optional delegation-chain proof tokens.
+    /// * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
+    ///   target-side at Prepare-B.
+    /// * `timeout_ms` / `estimated_chunk_count` — Optional stream policy hints.
+    #[napi(js_name = "outletStreamingSagaOpen")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn outlet_streaming_saga_open(
         &self,
         source_handle: &NapiContextHandle,
         target_handle: &NapiContextHandle,
-        tool_id: String,
+        caller_did: String,
+        outlet_registration_id: String,
+        input_json: String,
+        asserted_nonce_hex: String,
+        timestamp_ms: napi::bindgen_prelude::BigInt,
+        chain_depth: u8,
+        ucan_token: String,
+        proof_tokens: Option<Vec<String>>,
+        ucan_proof_id: Option<String>,
+        timeout_ms: Option<u32>,
+        estimated_chunk_count: Option<u32>,
+    ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, source_handle, target_handle);
+
+        // `timestamp_ms` crosses as a JS `BigInt`. Reject a negative or
+        // non-lossless input so a malformed freshness field fails closed at the
+        // boundary rather than wrapping into a bogus skew (parity with the unary
+        // saga export).
+        let (signed, timestamp_ms_u64, lossless) = timestamp_ms.get_u64();
+        if signed || !lossless {
+            return Err(napi::Error::from(ScpNapiError::Validation {
+                message:
+                    "timestamp_ms must fit in an unsigned 64-bit integer (non-negative, no loss)"
+                        .to_owned(),
+                code: codes::VALID_7001.to_owned(),
+            }));
+        }
+
+        Box::pin(crate::outlet_stream::outlet_streaming_saga_open_on(
+            &self.inner,
+            source_handle,
+            target_handle,
+            caller_did,
+            outlet_registration_id,
+            input_json,
+            asserted_nonce_hex,
+            timestamp_ms_u64,
+            chain_depth,
+            ucan_token,
+            proof_tokens,
+            ucan_proof_id,
+            timeout_ms,
+            estimated_chunk_count,
+        ))
+        .await
+    }
+
+    /// Drains one chunk from a live cross-context streaming saga, awaiting until
+    /// a chunk arrives or the stream closes. Returns the JSON-serialized
+    /// `OutletStreamChunk` bytes (A's plaintext operator-signed frame), or `None`
+    /// at the terminal (which evicts the saga stream). An unknown/evicted
+    /// `saga_id` is a DISTINCT error, never `None`.
+    #[napi(js_name = "outletStreamingSagaPollNext")]
+    pub async fn outlet_streaming_saga_poll_next(
+        &self,
+        saga_id: String,
+    ) -> napi::Result<Option<Buffer>> {
+        crate::outlet_stream::outlet_streaming_saga_poll_next_on(&self.inner, &saga_id)
+            .await
+            .map(|opt| opt.map(Buffer::from))
+    }
+
+    /// Key-bearing in-session reconnect/repair truncated-close for a cross-context
+    /// streaming saga (SCP-OUT-046 #136 AC7): seals the durable prefix with the
+    /// TARGET context's Active Signing Key (resolved per-call from custody) and
+    /// resolves the saga `Committed` WITHOUT re-opening the stream or re-invoking
+    /// the executor. Recovers a seal that stalled / went `NeedsRepair` while THIS
+    /// bridge process is still alive; the saga registry is per-instance and
+    /// in-memory, so it does NOT survive a process/node restart (cross-restart
+    /// recovery is a separate durable-journal operator path, §17.16).
+    /// `caller_did` must be an identity hosted by this bridge instance (§6.2.4
+    /// channel-auth) AND the invoker pinned at open (CRITICAL #1 — recovery is
+    /// money-moving; rejects `SCP-PERM-3001` otherwise). On success the saga
+    /// registry entry is evicted.
+    #[napi(js_name = "outletStreamingSagaRecoverTruncatedClose")]
+    pub async fn outlet_streaming_saga_recover_truncated_close(
+        &self,
+        saga_id: String,
+        caller_did: String,
+    ) -> napi::Result<()> {
+        crate::outlet_stream::outlet_streaming_saga_recover_truncated_close_on(
+            &self.inner,
+            &saga_id,
+            &caller_did,
+        )
+        .await
+    }
+
+    /// Per-instance equivalent of the free-function `outlet_invoke_cross_context`.
+    #[napi(js_name = "outletInvokeCrossContext")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn outlet_invoke_cross_context(
+        &self,
+        source_handle: &NapiContextHandle,
+        target_handle: &NapiContextHandle,
+        outlet_id: String,
         input_json: String,
         invoker_did: String,
         ucan_token: String,
@@ -2838,11 +3244,11 @@ impl Scp {
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, source_handle, target_handle);
-        crate::tools::tool_invoke_cross_context_on(
+        crate::outlets::outlet_invoke_cross_context_on(
             &self.inner,
             source_handle,
             target_handle,
-            tool_id,
+            outlet_id,
             input_json,
             invoker_did,
             ucan_token,
@@ -2852,29 +3258,156 @@ impl Scp {
         .await
     }
 
-    /// Per-instance equivalent of the free-function `tool_session_create`.
-    #[napi(js_name = "toolSessionCreate")]
-    pub async fn tool_session_create(
+    /// Invokes an outlet across context boundaries as an atomic two-phase saga
+    /// (spec §6.2.4, ADR-049 §3a).
+    ///
+    /// Unlike [`Self::outlet_invoke_cross_context`] (the synchronous,
+    /// single-context-side path), this drives the full §6.2.4 cross-context
+    /// outlet-invocation saga over the two CO-RESIDENT participant contexts
+    /// (caller = `source_handle`, target = `target_handle`): Prepare-A /
+    /// Prepare-B authorize and stage both sides, the outlet executes EXACTLY ONCE
+    /// supervisor-side at Commit-B, and each side records its own event-log
+    /// entry. Both contexts MUST be co-resident in this bridge instance.
+    ///
+    /// # Caller authentication (normative — §6.2.4, ADR-049 §3a)
+    ///
+    /// `caller_did` is bound to the bridge-authenticated principal: it MUST be
+    /// an identity THIS bridge instance hosts (created here via identity
+    /// creation) AND a member of the caller (`source_handle`) context. A
+    /// mismatch rejects the Promise with a `SagaAborted` error BEFORE the saga
+    /// runs — the saga never observes an unauthenticated caller. The
+    /// `asserted_nonce_hex` / `timestamp_ms` / `chain_depth` REMAIN
+    /// caller-supplied freshness fields (the target validates them).
+    ///
+    /// # Trust boundary (co-resident single-tenant only)
+    ///
+    /// The caller-principal binding (`enforce_caller_principal_binding`) treats
+    /// "hosted in this bridge instance's identity registry" as the
+    /// channel-authenticated principal. That equivalence holds ONLY for a
+    /// single-tenant, co-resident SDK process. This surface MUST NOT be exposed
+    /// across a trust boundary within one process: a multi-tenant host loading
+    /// multiple users' identities into one bridge instance could assert any
+    /// hosted `caller_did`, since the registry cannot distinguish which tenant
+    /// is making the call. The future cross-node leg needs real channel auth
+    /// (ADR-049 §3a forward obligation) — it cannot reuse "is hosted here" as
+    /// the authenticated-principal proof.
+    ///
+    /// The caller/target context-id axes are bound by the instance-affine
+    /// handle pre-check: `source_handle` / `target_handle` must have been minted
+    /// by THIS bridge instance (a foreign handle is rejected with
+    /// `SCP-PERM-3030`) before the supervisor membership / outlet-interface gates
+    /// run.
+    ///
+    /// The receipt's signer-authorization — that the target key is
+    /// governance-authorized to act for the target context (§6.2.4 "Signer
+    /// authorization") — is a DOWNSTREAM receipt-consumer obligation verified
+    /// when the receipt is consumed, NOT enforced at this export.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_handle` — The initiating (caller) context handle.
+    /// * `target_handle` — The executing (target) context handle.
+    /// * `caller_did` — The initiator DID (bound to the bridge principal).
+    /// * `outlet_registration_id` — The outlet to invoke across the interface.
+    /// * `input_json` — Outlet input as a JSON string (schema-checked target-side).
+    /// * `asserted_nonce_hex` — The 16-byte §6.2.4 envelope nonce as a 32-char
+    ///   hex string (the freshness/dedup token).
+    /// * `timestamp_ms` — Caller-asserted send time (Unix ms; freshness check),
+    ///   passed as a JS `BigInt`.
+    /// * `chain_depth` — Caller-asserted inbound provenance depth (advisory).
+    /// * `ucan_proof_id` — Optional id of the spending UCAN proof, resolved
+    ///   target-side at Prepare-B. `null` for an ungated outlet.
+    ///
+    /// # Returns
+    ///
+    /// A [`NapiSagaResult`](crate::outlets::NapiSagaResult) on the committed
+    /// terminal, carrying the supervisor-minted `saga_id`, the target's signed
+    /// receipt bytes, and the captured outlet-output bytes. The `saga_id` is
+    /// supervisor-minted — it is never an input.
+    ///
+    /// # Errors
+    ///
+    /// Rejects with a typed saga error — `SagaAborted` (a Prepare-phase abort
+    /// that may be a permanent rejection — authorization, freshness, rate limit,
+    /// or co-residency — OR a retryable transient: a rate limit, or a
+    /// participant actor unavailable to complete the Prepare exchange; carries
+    /// `retry_after_ms`), `SagaNeedsRepair` (Commit-retry exhausted —
+    /// carries the durable `saga_id`), or `SagaBusy` (the participant context
+    /// set overlapped an in-flight saga — §5.15.4). Rejects with a validation
+    /// error if an id/DID/outlet-id is malformed or `asserted_nonce_hex` does not
+    /// decode to 16 bytes.
+    ///
+    /// See spec §6.2.4 and ADR-049 §3a.
+    #[napi(js_name = "outletInvokeCrossContextSaga")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn outlet_invoke_cross_context_saga(
+        &self,
+        source_handle: &NapiContextHandle,
+        target_handle: &NapiContextHandle,
+        caller_did: String,
+        outlet_registration_id: String,
+        input_json: String,
+        asserted_nonce_hex: String,
+        timestamp_ms: napi::bindgen_prelude::BigInt,
+        chain_depth: u8,
+        ucan_proof_id: Option<String>,
+    ) -> napi::Result<crate::outlets::NapiSagaResult> {
+        crate::napi_check_handle!(&self.inner.core, source_handle, target_handle);
+
+        // `timestamp_ms` crosses as a JS `BigInt`. `BigInt::get_u64` returns
+        // `(signed, value, lossless)` — reject a negative or non-lossless
+        // input so a malformed freshness field fails closed at the boundary
+        // rather than wrapping into a bogus skew.
+        let (signed, timestamp_ms_u64, lossless) = timestamp_ms.get_u64();
+        if signed || !lossless {
+            return Err(napi::Error::from(ScpNapiError::Validation {
+                message:
+                    "timestamp_ms must fit in an unsigned 64-bit integer (non-negative, no loss)"
+                        .to_owned(),
+                code: codes::VALID_7001.to_owned(),
+            }));
+        }
+
+        // Box the impl future: the multi-phase saga it drives is large enough
+        // to trip `clippy::large_futures` when inlined into this method.
+        Box::pin(crate::outlets::outlet_invoke_cross_context_saga_on(
+            &self.inner,
+            source_handle,
+            target_handle,
+            caller_did,
+            outlet_registration_id,
+            input_json,
+            asserted_nonce_hex,
+            timestamp_ms_u64,
+            chain_depth,
+            ucan_proof_id,
+        ))
+        .await
+    }
+
+    /// Per-instance equivalent of the free-function `outlet_session_create`.
+    #[napi(js_name = "outletSessionCreate")]
+    pub async fn outlet_session_create(
         &self,
         handle: &NapiContextHandle,
-        tool_id: String,
+        outlet_id: String,
         source_context_id: String,
         ttl_seconds: Option<u32>,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_session_create_on(
+        crate::outlets::outlet_session_create_on(
             &self.inner,
             handle,
-            tool_id,
+            outlet_id,
             source_context_id,
             ttl_seconds,
         )
         .await
     }
 
-    /// Per-instance equivalent of the free-function `tool_session_invoke`.
-    #[napi(js_name = "toolSessionInvoke")]
-    pub async fn tool_session_invoke(
+    /// Per-instance equivalent of the free-function `outlet_session_invoke`.
+    #[napi(js_name = "outletSessionInvoke")]
+    pub async fn outlet_session_invoke(
         &self,
         handle: &NapiContextHandle,
         session_id: String,
@@ -2884,7 +3417,7 @@ impl Scp {
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_session_invoke_on(
+        crate::outlets::outlet_session_invoke_on(
             &self.inner,
             handle,
             session_id,
@@ -2896,57 +3429,57 @@ impl Scp {
         .await
     }
 
-    /// Per-instance equivalent of the free-function `tool_session_close`.
-    #[napi(js_name = "toolSessionClose")]
-    pub async fn tool_session_close(
+    /// Per-instance equivalent of the free-function `outlet_session_close`.
+    #[napi(js_name = "outletSessionClose")]
+    pub async fn outlet_session_close(
         &self,
         handle: &NapiContextHandle,
         session_id: String,
     ) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_session_close_on(&self.inner, handle, session_id).await
+        crate::outlets::outlet_session_close_on(&self.inner, handle, session_id).await
     }
 
-    /// Per-instance equivalent of the free-function `tool_interface_expose`.
-    #[napi(js_name = "toolInterfaceExpose")]
-    pub async fn tool_interface_expose(
+    /// Per-instance equivalent of the free-function `outlet_interface_expose`.
+    #[napi(js_name = "outletInterfaceExpose")]
+    pub async fn outlet_interface_expose(
         &self,
         handle: &NapiContextHandle,
-        tool_id: String,
+        outlet_id: String,
         target_context_id: String,
         rate_limit_json: Option<String>,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_interface_expose_on(
+        crate::outlets::outlet_interface_expose_on(
             &self.inner,
             handle,
-            tool_id,
+            outlet_id,
             target_context_id,
             rate_limit_json,
         )
         .await
     }
 
-    /// Per-instance equivalent of the free-function `tool_interface_accept`.
-    #[napi(js_name = "toolInterfaceAccept")]
-    pub async fn tool_interface_accept(
+    /// Per-instance equivalent of the free-function `outlet_interface_accept`.
+    #[napi(js_name = "outletInterfaceAccept")]
+    pub async fn outlet_interface_accept(
         &self,
         handle: &NapiContextHandle,
         interface_json: String,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_interface_accept_on(&self.inner, handle, interface_json).await
+        crate::outlets::outlet_interface_accept_on(&self.inner, handle, interface_json).await
     }
 
-    /// Per-instance equivalent of the free-function `tool_interface_revoke`.
-    #[napi(js_name = "toolInterfaceRevoke")]
-    pub async fn tool_interface_revoke(
+    /// Per-instance equivalent of the free-function `outlet_interface_revoke`.
+    #[napi(js_name = "outletInterfaceRevoke")]
+    pub async fn outlet_interface_revoke(
         &self,
         handle: &NapiContextHandle,
         interface_id_hex: String,
     ) -> napi::Result<String> {
         crate::napi_check_handle!(&self.inner.core, handle);
-        crate::tools::tool_interface_revoke_on(&self.inner, handle, interface_id_hex).await
+        crate::outlets::outlet_interface_revoke_on(&self.inner, handle, interface_id_hex).await
     }
 
     // ====================================================================
@@ -2973,7 +3506,7 @@ impl Scp {
         handle: &NapiContextHandle,
         token: String,
         capability: String,
-        presenting_agent_did: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<()> {
         crate::napi_check_handle!(&self.inner.core, handle);
@@ -2994,13 +3527,19 @@ impl Scp {
     /// but returns a structured `NapiCapabilityValidation` (six booleans,
     /// camelCased for JS) instead of throwing, and never records the token's
     /// nonce.
+    ///
+    /// `capability` is OPTIONAL: omit it (or pass `null`/empty) to evaluate the
+    /// token's intrinsic validity with no invoked-capability grant-match
+    /// challenge — the mode the SDK trust signal uses. Pass a capability to
+    /// additionally require the token grants it. (The enforcing `ucanValidate`
+    /// gate keeps a mandatory capability.)
     #[napi(js_name = "ucanEvaluate")]
     pub async fn ucan_evaluate(
         &self,
         handle: &NapiContextHandle,
         token: String,
-        capability: String,
-        presenting_agent_did: Option<String>,
+        capability: Option<String>,
+        presenting_agent_did: String,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<crate::ucan::NapiCapabilityValidation> {
         crate::napi_check_handle!(&self.inner.core, handle);
@@ -3125,7 +3664,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `transport_status`.
     ///
     /// Accepts an optional transport manager handle. When `null`/`undefined`,
-    /// returns the bridge-scoped handleless probe (mirrors PyO3/WASM).
+    /// returns the bridge-scoped handleless probe (mirrors `PyO3`).
     #[napi(js_name = "transportStatus")]
     pub async fn transport_status(
         &self,
@@ -3195,7 +3734,7 @@ impl Scp {
         policy_json: String,
         action_type: String,
         metrics_json: String,
-    ) -> napi::Result<i64> {
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_estimate_cost_on(
             &self.inner,
             policy_json,
@@ -3242,34 +3781,44 @@ impl Scp {
         &self,
         formula_json: String,
         metrics_json: String,
-    ) -> napi::Result<i64> {
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_evaluate_formula_on(&self.inner, formula_json, metrics_json)
     }
 
     /// Per-instance equivalent of the free-function `economy_budget_remaining`.
     #[napi(js_name = "economyBudgetRemaining")]
-    pub fn economy_budget_remaining(&self, context_id: String, did: String) -> napi::Result<i64> {
+    pub fn economy_budget_remaining(
+        &self,
+        context_id: String,
+        did: String,
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_budget_remaining_on(&self.inner, context_id, did)
     }
 
     /// Per-instance equivalent of the free-function `economy_budget_grant`.
+    ///
+    /// `amount` is a JS `bigint` so a full `u64` monetary amount round-trips
+    /// exactly (ADR-060 SDK-surface rule).
     #[napi(js_name = "economyBudgetGrant")]
     pub fn economy_budget_grant(
         &self,
         context_id: String,
         did: String,
-        amount: i64,
+        amount: napi::bindgen_prelude::BigInt,
     ) -> napi::Result<()> {
         crate::economy::economy_budget_grant_on(&self.inner, context_id, did, amount)
     }
 
     /// Per-instance equivalent of the free-function `economy_budget_record_spend`.
+    ///
+    /// `amount` is a JS `bigint` so a full `u64` monetary amount round-trips
+    /// exactly (ADR-060 SDK-surface rule).
     #[napi(js_name = "economyBudgetRecordSpend")]
     pub fn economy_budget_record_spend(
         &self,
         context_id: String,
         did: String,
-        amount: i64,
+        amount: napi::bindgen_prelude::BigInt,
     ) -> napi::Result<()> {
         crate::economy::economy_budget_record_spend_on(&self.inner, context_id, did, amount)
     }
@@ -3297,6 +3846,11 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `economy_antispam_escalated_cost`.
+    ///
+    /// Monetary amounts (`base_cost`, `floor`, `cap`, and the returned cost) are
+    /// JS `bigint` so a full `u64` round-trips exactly (ADR-060 SDK-surface
+    /// rule). `now` is a millisecond timestamp, not a monetary amount, and stays
+    /// a JS `number`.
     #[napi(js_name = "economyAntispamEscalatedCost")]
     #[allow(clippy::too_many_arguments)]
     pub fn economy_antispam_escalated_cost(
@@ -3304,11 +3858,11 @@ impl Scp {
         context_id: String,
         sender_did: String,
         now: i64,
-        base_cost: i64,
+        base_cost: napi::bindgen_prelude::BigInt,
         thresholds_json: String,
-        floor: Option<i64>,
-        cap: Option<i64>,
-    ) -> napi::Result<i64> {
+        floor: Option<napi::bindgen_prelude::BigInt>,
+        cap: Option<napi::bindgen_prelude::BigInt>,
+    ) -> napi::Result<napi::bindgen_prelude::BigInt> {
         crate::economy::economy_antispam_escalated_cost_on(
             &self.inner,
             context_id,
@@ -3375,13 +3929,41 @@ impl Scp {
     #[napi(js_name = "verifyParticipationRequirements")]
     pub fn verify_participation_requirements(
         &self,
-        profile_json: String,
+        expected_subject: String,
         requirements_json: String,
-    ) -> napi::Result<bool> {
+        profile_json: String,
+    ) -> napi::Result<()> {
         crate::trust::verify_participation_requirements_on(
             &self.inner,
-            profile_json,
+            expected_subject,
             requirements_json,
+            profile_json,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `check_capability_requirements`.
+    ///
+    /// Verifies that an agent meets a context's capability requirements for
+    /// admission (spec §7.3.4.4). `subjectDid`/`contextId` bind challenge
+    /// verifications to the agent and context being admitted. Returns normally
+    /// when all requirements are satisfied; throws on any unmet requirement or
+    /// malformed JSON.
+    #[napi(js_name = "checkCapabilityRequirements")]
+    pub fn check_capability_requirements(
+        &self,
+        context_id: String,
+        subject_did: String,
+        requirements_json: String,
+        agent_capabilities_json: String,
+        challenge_verifications_json: String,
+    ) -> napi::Result<()> {
+        crate::trust::check_capability_requirements_on(
+            &self.inner,
+            context_id,
+            subject_did,
+            requirements_json,
+            agent_capabilities_json,
+            challenge_verifications_json,
         )
     }
 
@@ -3411,6 +3993,30 @@ impl Scp {
             attestor_sets_json,
             cached_attestations_json,
             challenge_results_json,
+        )
+    }
+
+    /// Computes the structured participation record (§7.3.2) for `subjectDid`
+    /// in `contextId`.
+    ///
+    /// The bridge sources the subject's accessible, currently-valid attestations
+    /// from this instance's persistent trust store (populating any
+    /// caller-supplied `cachedAttestationsJson` first), and the shared
+    /// Supervisor gathers the FULL event log to derive every other fact. Returns
+    /// a typed `NapiParticipationRecord` — the SDK receives the flattened facts
+    /// and never re-aggregates event-log collections. See ADR-017, spec §7.3.2.
+    #[napi(js_name = "participationRecord")]
+    pub fn participation_record(
+        &self,
+        context_id: String,
+        subject_did: String,
+        cached_attestations_json: String,
+    ) -> napi::Result<crate::trust::NapiParticipationRecord> {
+        crate::trust::participation_record_on(
+            &self.inner,
+            context_id,
+            subject_did,
+            cached_attestations_json,
         )
     }
 
@@ -3483,7 +4089,7 @@ impl Scp {
     pub async fn mcp_client_invoke(
         &self,
         handle: &NapiMcpClientHandle,
-        tool_name: String,
+        outlet_name: String,
         input_json: String,
         context_id: String,
         invoker_did: String,
@@ -3492,7 +4098,7 @@ impl Scp {
         crate::mcp::mcp_client_invoke_on(
             &self.inner,
             handle,
-            tool_name,
+            outlet_name,
             input_json,
             context_id,
             invoker_did,
@@ -3820,8 +4426,9 @@ impl Scp {
     //
     // Per-instance equivalents of the PyO3 `bridge_credential_*` methods.
     // Each routes through `&*self.inner` — credentials live in THIS
-    // instance's `InMemoryCredentialStore`, isolated from every other `Scp`
-    // in the process (ADR-048 §1).
+    // instance's durable `FfiCredentialStore`, selected from its chosen
+    // storage backend and isolated from every other `Scp` in the process
+    // (ADR-048 §1; ADR-062 §Decision 5, SCP-CAPINJECT-009).
     // -------------------------------------------------------------------
 
     /// Provisions (stores) an encrypted credential for a bridge instance.
@@ -4003,7 +4610,7 @@ impl Scp {
     /// selects in-memory storage. This wraps
     /// [`NapiBridgeInstance::new_napi`] (the internal in-memory builder) —
     /// an explicit dev/test selection, NOT a silent default.
-    #[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_in_memory_for_test() -> Self {
         Self {
@@ -4056,9 +4663,90 @@ impl Scp {
 }
 
 // ---------------------------------------------------------------------------
+// Fail-closed device-attestation methods on shipped (no-`testing`) builds.
+//
+// Spec §9:187 — device attestation (Apple App Attest / Google Play Integrity) is
+// an optional SDK-level trust signal whose absence is expected and
+// non-penalizing. No production device-attestation backend is wired yet: App
+// Attest / Play Integrity are hardware/platform-backed and are intentionally
+// deferred (with hardware keychain custody) until an e2e-driven integration
+// lands (ADR-062 §Decision 3 severs the test-harness `InMemoryDeviceAttestation`
+// nullifier — always-attest / always-valid — from every production dependency
+// line). So a shipped build returns a typed honest-absent error rather than a
+// silently-valid attestation. See ADR-025 and #2171 for the real backend.
+//
+// These live in a SEPARATE `#[cfg(not(feature = "testing"))] #[napi] impl`
+// block (mirroring the `testing` block below) so napi-rs emits the
+// `_c_callback` registration in BOTH build configs — the TS surface is
+// identical across builds; only the body differs. Mirrors the PyO3 reference
+// bridge's not(testing) `identity_attest_device` /
+// `identity_verify_device_attestation`.
+// ---------------------------------------------------------------------------
+#[cfg(not(feature = "testing"))]
+#[napi]
+impl Scp {
+    /// Fail-closed [`Self::identity_attest_device`] on a shipped build.
+    ///
+    /// Returns [`codes::IDENT_1015`] (device attestation unavailable — no
+    /// production backend wired yet; spec §9:187 / ADR-062 §Decision 3) rather
+    /// than reaching for the severed `InMemoryDeviceAttestation` nullifier.
+    #[napi(js_name = "identityAttestDevice")]
+    // napi requires `async` for the `Promise` return type; the fail-closed body
+    // has no `.await`. It DOES dereference `self`: the identity is resolved
+    // against THIS instance's registry first, so an unregistered DID surfaces
+    // the standard not-found identity error while a registered DID fails closed
+    // with the typed honest-absent IDENT_1015.
+    #[allow(clippy::unused_async)]
+    pub async fn identity_attest_device(&self, did: String) -> napi::Result<String> {
+        crate::runtime::with_identity(&self.inner, &did, |_entry| {
+            Err(ScpNapiError::Identity {
+                message: "device attestation unavailable: no production \
+                          device-attestation backend is wired yet — Apple App Attest / \
+                          Google Play Integrity are hardware/platform-backed and are \
+                          intentionally deferred (with hardware keychain custody) until \
+                          an e2e-driven integration lands (spec §9:187). See #2171."
+                    .to_owned(),
+                code: codes::IDENT_1015.to_owned(),
+            })
+        })
+        .map_err(NapiError::from)
+    }
+
+    /// Fail-closed [`Self::identity_verify_device_attestation`] on a shipped
+    /// build.
+    ///
+    /// Returns [`codes::IDENT_1016`] (device attestation unavailable — no
+    /// production backend wired yet; spec §9:187 / ADR-062 §Decision 3) rather
+    /// than a silently-valid result.
+    #[napi(js_name = "identityVerifyDeviceAttestation")]
+    // Fail-closed body has no `.await`; it DOES dereference `self` by resolving
+    // the identity against THIS instance's registry before the typed decline.
+    #[allow(clippy::unused_async)]
+    pub async fn identity_verify_device_attestation(
+        &self,
+        did: String,
+        token_base64: String,
+    ) -> napi::Result<bool> {
+        let _ = token_base64;
+        crate::runtime::with_identity(&self.inner, &did, |_entry| {
+            Err(ScpNapiError::Identity {
+                message: "device attestation verification unavailable: no production \
+                          device-attestation backend is wired yet — Apple App Attest / \
+                          Google Play Integrity are hardware/platform-backed and are \
+                          intentionally deferred (with hardware keychain custody) until \
+                          an e2e-driven integration lands (spec §9:187). See #2171."
+                    .to_owned(),
+                code: codes::IDENT_1016.to_owned(),
+            })
+        })
+        .map_err(NapiError::from)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // In-memory-custody-only `Scp` methods.
 //
-// These methods are gated behind `allow_in_memory_custody` because they
+// These methods are gated behind `testing` because they
 // depend on an in-memory *backend* — the `InMemoryDeviceAttestation` software
 // attestation backend (production hardware attestation per ADR-025 is not yet
 // wired) or the full-stack in-memory test network. They live in a SEPARATE
@@ -4071,7 +4759,7 @@ impl Scp {
 // signing, link attestations) lives in the main `impl Scp` block above and is
 // NOT gated, mirroring the PyO3 reference bridge.
 // ---------------------------------------------------------------------------
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 #[napi]
 impl Scp {
     /// Per-instance equivalent of `identity_attest_device`.
@@ -4259,7 +4947,7 @@ impl Scp {
     /// Test-only: seed a peer's per-context pseudonym routing ID (§9.10.4) into
     /// this bridge's `Supervisor`, simulating a delivered `PseudonymAnnouncement`
     /// so multi-member encrypted sends do not fail closed with `SCP-CTX-2095`.
-    /// Lives in this `allow_in_memory_custody`-gated `#[napi] impl Scp` block
+    /// Lives in this `testing`-gated `#[napi] impl Scp` block
     /// (never shipped in production) so napi-rs does not emit a dangling
     /// `_c_callback` registration reference in bare builds.
     #[napi(js_name = "contextSeedPeerPseudonym")]
@@ -4293,7 +4981,7 @@ impl Scp {
 // rejected-upstream callers never consume a permit") and the busy-error
 // shape are both validated without depending on orchestrator timing.
 // ---------------------------------------------------------------------------
-#[cfg(all(test, feature = "allow_in_memory_custody"))]
+#[cfg(all(test, feature = "testing"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod concurrency_cap_tests {
     use super::*;
@@ -4322,7 +5010,7 @@ mod concurrency_cap_tests {
         ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-        let dht = scp_identity::DidDht::new();
+        let dht = scp_identity::DidDht::with_client(Arc::new(scp_dht::InMemoryDhtClient::new()));
         let (identity, document, pre_rotation_handle) = rt
             .block_on(dht.create(&*custody, pre_rotation_custody.as_ref()))
             .unwrap();
@@ -4527,8 +5215,7 @@ mod petname_validation_tests {
 
     /// Non-empty but syntactically invalid owner DIDs must be rejected by the
     /// pre-existing petname ops, matching the strict `validate_did` gate the
-    /// WASM bridge and the §4.7 ops already enforce. Without this the native
-    /// bridges would be looser than WASM on the same operation.
+    /// §4.7 ops already enforce.
     #[test]
     fn petname_malformed_owner_rejected() {
         let scp = Scp::new_in_memory_for_test();
@@ -4645,7 +5332,7 @@ mod storage_mandatory_tests {
     }
 }
 
-#[cfg(all(test, feature = "allow_in_memory_custody"))]
+#[cfg(all(test, feature = "testing"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod identity_remove_validation_tests {
     use super::*;
@@ -4653,8 +5340,8 @@ mod identity_remove_validation_tests {
     /// `identity_remove` and `identity_remove_if_present` must reject a
     /// non-empty but syntactically invalid DID via the shared `validate_did`
     /// gate — matching the `PyO3` reference bridge — before touching the
-    /// registry. Without this the NAPI bridge would be looser than `PyO3` and
-    /// WASM on the same operation. Mirrors `petname_malformed_owner_rejected`.
+    /// registry. Without this the NAPI bridge would be looser than `PyO3`
+    /// on the same operation. Mirrors `petname_malformed_owner_rejected`.
     #[test]
     fn identity_remove_malformed_did_rejected() {
         let scp = Scp::new_in_memory_for_test();

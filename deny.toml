@@ -106,6 +106,28 @@ ignore = [
     # Sync) and `Vec<u8>` — so the missing-bound exploit condition cannot be
     # met by our usage. Awaiting a feasible pyo3 0.29 migration.
     "RUSTSEC-2026-0177",
+    # libcrux-aesgcm: AES-GCM did not enforce AAD length limits; transitive via
+    # openmls -> openmls_libcrux_crypto -> libcrux-aead. SCP never supplies AAD to
+    # this path. Same libcrux/openmls chain as the advisories above; awaiting upstream.
+    "RUSTSEC-2026-0209",
+    # libcrux-aesgcm renamed to libcrux-aes (unmaintained). Same transitive chain;
+    # awaiting openmls/libcrux upstream migration. No runtime exposure.
+    "RUSTSEC-2026-0210",
+    # libcrux-sha3: incorrect output of the incremental portable SHAKE API across
+    # multiple squeeze calls. Transitive via openmls -> openmls_libcrux_crypto.
+    # OpenMLS uses SHA-2/HKDF for its KDF, not the incremental SHAKE squeeze path;
+    # same libcrux/openmls chain as above, awaiting upstream.
+    "RUSTSEC-2026-0207",
+    # libcrux: potential panic in the AVX2 SHAKE-256 implementation. Same transitive
+    # openmls/libcrux chain; OpenMLS does not drive this SHAKE code path. Awaiting upstream.
+    "RUSTSEC-2026-0208",
+    # libcrux-aesgcm: non-constant-time authentication-tag check in AES-GCM decryption.
+    # Same transitive openmls/libcrux chain as 0209/0210; MLS ciphersuite selection does
+    # not route AES-GCM through this path in SCP. Awaiting openmls/libcrux upstream.
+    "RUSTSEC-2026-0211",
+    # libcrux: potentially incorrect output of constant-time swap/select on aarch64.
+    # Same transitive openmls/libcrux chain; awaiting upstream migration. No runtime exposure.
+    "RUSTSEC-2026-0212",
 ]
 
 # ── Bans ────────────────────────────────────────────────────────────────────

@@ -35,38 +35,42 @@
 
 #![forbid(unsafe_code)]
 
-pub mod encrypted;
-#[cfg(feature = "encrypting")]
-pub mod encrypting_adapter;
-pub mod error;
-// In-memory platform adapters — gated by the `testing` feature, NOT by
-// `software_platform`. This ensures production mobile builds can enable
-// `software_platform` (for crypto primitives) without compiling in insecure
-// in-memory key storage. See GitHub issue #88 and ADR-006.
-#[cfg(feature = "testing")]
-pub mod testing;
-// `software` is an alias for `testing` that matches the historical path. New
-// code should prefer `scp_platform::testing::*`; `software::*` paths remain
-// valid for backwards compatibility.
-#[cfg(feature = "testing")]
-pub use testing as software;
 #[cfg(target_os = "android")]
 pub mod android;
 #[cfg(feature = "apple")]
 pub mod apple;
+pub mod encrypted;
+#[cfg(feature = "encrypting")]
+pub mod encrypting_adapter;
+pub mod error;
 #[cfg(feature = "file")]
 pub mod file;
 #[cfg(feature = "filesystem")]
 pub mod filesystem;
+// Durability-only in-memory adapters (`InMemoryStorage`, `InMemoryPush`) —
+// each gated behind its own durability-only feature (`in-memory-storage` /
+// `in-memory-push`), NOT `testing`. These arms lose state but nullify no
+// security property (spec §17.17.2 durability-only-vs-nullifier
+// classification), so they are shippable and selected explicitly (e.g. via
+// `StorageConfig`), never a default or fallback (spec §17.17 selection
+// mandatory / never-default / never-fallback). Kept separate from the
+// `testing`-gated nullifier doubles so a build can compile the durable dev
+// affordance without pulling in `InMemoryKeyCustody`. See ADR-062 §0.
+#[cfg(any(feature = "in-memory-storage", feature = "in-memory-push"))]
+pub mod in_memory;
+// Test-only nullifier doubles (`InMemoryKeyCustody`,
+// `InMemoryDeviceAttestation`, `InMemoryPreRotationCustody`) — gated by the
+// `testing` feature, NOT by `software_platform`. This ensures production
+// mobile builds can enable `software_platform` (for crypto primitives)
+// without compiling in insecure in-memory key storage. See GitHub issue #88,
+// ADR-006, and the honest-module-structure split in ADR-062 §0.
+#[cfg(feature = "testing")]
+pub mod testing;
 // Shared Argon2id passphrase→key derivation (spec §17.6 / §17.8). Single
 // source of the Argon2id parameterization; used by FileKeyCustody (`file`)
 // and the SqliteStorage passphrase constructor (`sqlite`).
 #[cfg(any(feature = "file", feature = "sqlite"))]
 pub mod kdf;
-// Shared pseudonym secret derivation — used by all KeyCustody backends.
-// Gated behind `software_platform` because it depends on ed25519-dalek, hkdf, sha2.
-#[cfg(feature = "software_platform")]
-pub(crate) mod pseudonym;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 // Versioned storage envelope + spec §17.3 key conventions. The single source of

@@ -20,14 +20,15 @@
 
 pub mod access_keys;
 pub mod context;
+pub mod credentials;
 pub mod economy;
 pub mod event_log;
 pub mod identity;
 pub mod nonce;
+pub mod outlets;
 pub mod queue;
 pub mod tls;
 pub mod tofu;
-pub mod tools;
 pub mod transport;
 pub mod trust;
 pub mod ucan;
@@ -494,10 +495,11 @@ mod tests {
     #[test]
     fn serialize_deserialize_roundtrip() {
         let value = vec![1u32, 2, 3, 4, 5];
-        let bytes = ProtocolRepository::<scp_platform::testing::InMemoryStorage>::serialize(&value)
-            .unwrap();
+        let bytes =
+            ProtocolRepository::<scp_platform::in_memory::InMemoryStorage>::serialize(&value)
+                .unwrap();
         let decoded: Vec<u32> =
-            ProtocolRepository::<scp_platform::testing::InMemoryStorage>::deserialize(&bytes)
+            ProtocolRepository::<scp_platform::in_memory::InMemoryStorage>::deserialize(&bytes)
                 .unwrap();
         assert_eq!(decoded, value);
     }
@@ -509,7 +511,7 @@ mod tests {
             data: "future",
         };
         let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
-        let result = ProtocolRepository::<scp_platform::testing::InMemoryStorage>::deserialize::<
+        let result = ProtocolRepository::<scp_platform::in_memory::InMemoryStorage>::deserialize::<
             String,
         >(&bytes);
         assert!(matches!(
@@ -521,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn store_value_and_load_value_roundtrip() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
         let value = vec![42u64, 100, 999];
         store.store_value("test/key", &value).await.unwrap();
         let loaded: Option<Vec<u64>> = store.load_value("test/key").await.unwrap();
@@ -531,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn load_value_returns_none_for_missing_key() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
         let loaded: Option<String> = store.load_value("nonexistent").await.unwrap();
         assert!(loaded.is_none());
     }
@@ -582,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn migratable_current_version_roundtrip() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
         let original = TestMigratable {
             value: "hello".to_owned(),
             extra: 42,
@@ -600,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn migratable_migration_from_v1() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
 
         // Manually store a v1 value (just a String).
         let v1_data = "migrated-value".to_owned();
@@ -631,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn migratable_rejects_future_version() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
 
         // Manually store a future version.
         let envelope = StoredValue {
@@ -654,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn migratable_returns_none_for_missing() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
         let loaded: Option<TestMigratable> = store.load_migratable("nonexistent").await.unwrap();
         assert!(loaded.is_none());
     }
@@ -662,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn migratable_migration_from_v2() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
 
         // Manually store a v2 value: (String, u32) tuple.
         let v2_data = ("from-v2".to_owned(), 77u32);
@@ -701,7 +703,7 @@ mod tests {
         // The v1 migrate step produces a TestMigratable (at v2 semantics),
         // which is then re-serialized at v2 and fed into the v2 migrate step.
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
 
         // Store a v1 value.
         let v1_data = "chain-test".to_owned();
@@ -734,7 +736,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_writes_version_on_fresh_store() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
         store.initialize().await.unwrap();
 
         let version: Option<u16> = store.load_value("_meta/schema_version").await.unwrap();
@@ -744,7 +746,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_proceeds_on_matching_version() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
 
         // Pre-set the version.
         store
@@ -759,7 +761,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_errors_on_future_version() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
 
         let future_version: u16 = CURRENT_SCHEMA_VERSION + 5;
         store
@@ -777,7 +779,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_triggers_migration_for_old_version() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
 
         // Set a behind version. Currently no migrations exist, but the
         // hook should still execute and update to current.
@@ -837,7 +839,7 @@ mod tests {
     #[tokio::test]
     async fn context_store_rejects_traversal_context_id() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
         let result = store
             .store_context_state("../identity/victim", b"bad")
             .await;
@@ -847,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn context_store_rejects_null_byte_context_id() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
         let result = store.store_context_state("evil\0ctx", b"bad").await;
         assert!(result.is_err());
     }
@@ -855,8 +857,8 @@ mod tests {
     #[tokio::test]
     async fn identity_store_rejects_traversal_did() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
-        let malicious_did = scp_identity::DID::from("../context/victim");
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
+        let malicious_did = scp_did::DID::from("../context/victim");
         let result = store.store_identity_document(&malicious_did, b"bad").await;
         assert!(result.is_err());
     }
@@ -864,35 +866,37 @@ mod tests {
     #[tokio::test]
     async fn identity_store_rejects_backslash_did() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
-        let malicious_did = scp_identity::DID::from("evil\\did");
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
+        let malicious_did = scp_did::DID::from("evil\\did");
         let result = store.store_identity_document(&malicious_did, b"bad").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn tool_store_rejects_traversal_tool_id() {
+    async fn outlet_store_rejects_traversal_outlet_id() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
         let result = store
-            .store_tool("ctx-1", "../ucan_token/steal", b"bad")
+            .store_outlet("ctx-1", "../ucan_token/steal", b"bad")
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn tool_store_rejects_null_byte_session_id() {
+    async fn outlet_store_rejects_null_byte_session_id() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
-        let result = store.store_tool_session("ctx-1", "sess\0ion", b"bad").await;
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
+        let result = store
+            .store_outlet_session("ctx-1", "sess\0ion", b"bad")
+            .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn economy_store_rejects_traversal_adapter_id() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
-        let did = scp_identity::DID::from("did:dht:z6MkTest");
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
+        let did = scp_did::DID::from("did:dht:z6MkTest");
         let result = store
             .store_adapter_credentials(&did, "../document", b"bad")
             .await;
@@ -902,7 +906,7 @@ mod tests {
     #[tokio::test]
     async fn ucan_store_rejects_traversal_context_id() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
         let result = store
             .store_ucan_token("../identity/victim", "tok-1", b"bad")
             .await;
@@ -912,8 +916,8 @@ mod tests {
     #[tokio::test]
     async fn well_formed_identifiers_succeed_across_all_domains() {
         let store =
-            ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
-        let did = scp_identity::DID::from("did:dht:z6MkTest");
+            ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new());
+        let did = scp_did::DID::from("did:dht:z6MkTest");
 
         // Context domain
         store
@@ -924,9 +928,9 @@ mod tests {
         // Identity domain
         store.store_identity_document(&did, b"doc").await.unwrap();
 
-        // Tools domain
+        // Outlets domain
         store
-            .store_tool("ctx-valid", "tool-ok", b"reg")
+            .store_outlet("ctx-valid", "outlet-ok", b"reg")
             .await
             .unwrap();
 

@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::{Capability, ContextMode, ContextParams, ContextState};
 use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Build a Supervisor with mock providers.
     //    In production, these would be real MLS crypto, relay transport,
     //    and Merkle event log implementations.
-    let key_resolver: KeyResolver = Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| None);
+    let key_resolver: KeyResolver = Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None);
     let manager = Supervisor::with_providers(
         support::example_crypto("did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"),
         Box::new(support::MockTransport),
@@ -49,8 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,
-            Capability::ToolRegister,
-            Capability::ToolInvokeAll,
+            Capability::OutletRegister,
+            Capability::OutletCallAll,
         ],
         ..ContextParams::default()
     };
@@ -70,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Context created:");
     println!("  ID: {}", handle.context_id());
-    println!("  State: {:?}", handle.state().await);
-    assert_eq!(handle.state().await, ContextState::Active);
+    println!("  State: {:?}", handle.state());
+    assert_eq!(handle.state(), ContextState::Active);
 
     // 5. Send a message (mock transport captures it).
     let alice_sk = support::signing_key_for(&alice);

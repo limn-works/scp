@@ -23,11 +23,45 @@
 use sha2::{Digest, Sha256};
 
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
+use scp_event_log::payload::{
+    GovernanceActionExecutedPayload, MembershipChangePayload, RoleAssignedPayload, encode_payload,
+};
 use scp_event_log::pruning::{PruningConfig, prune_before_checkpoint};
 use scp_event_log::test_helpers::{TestSigner, did_from_pubkey, sign_event, test_keypair};
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventType};
 use scp_protocol::trust::compute_participation_record;
+
+/// Encodes a canonical `MembershipChangePayload` (subject-bearing leaf) for a
+/// `MemberJoined`/`MemberLeft` event.
+fn membership_payload(subject_did: &str, role_name: &str) -> Vec<u8> {
+    encode_payload(&MembershipChangePayload {
+        subject_did: subject_did.to_owned(),
+        role_name: role_name.to_owned(),
+    })
+    .expect("membership payload encodes")
+    .data
+}
+
+/// Encodes a canonical `RoleAssignedPayload` (subject-bearing leaf).
+fn role_payload(subject_did: &str, role: &str) -> Vec<u8> {
+    encode_payload(&RoleAssignedPayload {
+        subject_did: subject_did.to_owned(),
+        role: role.to_owned(),
+    })
+    .expect("role payload encodes")
+    .data
+}
+
+/// Encodes a canonical `GovernanceActionExecutedPayload` (target-bearing leaf).
+fn gov_payload(target_did: &str, action_type: &str) -> Vec<u8> {
+    encode_payload(&GovernanceActionExecutedPayload {
+        target_did: target_did.to_owned(),
+        action_type: action_type.to_owned(),
+    })
+    .expect("governance payload encodes")
+    .data
+}
 
 // ---------------------------------------------------------------------------
 // Local test helpers
@@ -72,8 +106,8 @@ fn merkle_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
 
 /// Builds an event log with `n` events and returns the log, events, and leaf
 /// hashes. All events come from a single actor. The first event is
-/// `ContextCreated`, every 5th is `GovernanceAction`, and the rest are
-/// `MessageSent`.
+/// `ChildContextCreated`, every 5th is `GovernanceActionExecuted`, and the rest
+/// are `MessageSent` (canonical `EventType` variants; §7.3.2).
 fn build_log_with_events(n: u64, start_timestamp: u64) -> (EventLog, Vec<Event>, Vec<[u8; 32]>) {
     let (verifying_key, signing_key) = test_keypair();
     let did = did_from_pubkey(&verifying_key);
@@ -84,9 +118,9 @@ fn build_log_with_events(n: u64, start_timestamp: u64) -> (EventLog, Vec<Event>,
 
     for i in 0..n {
         let event_type = if i == 0 {
-            EventType::ContextCreated
+            EventType::ChildContextCreated
         } else if i % 5 == 0 {
-            EventType::GovernanceAction
+            EventType::GovernanceActionExecuted
         } else {
             EventType::MessageSent
         };
@@ -145,7 +179,7 @@ fn make_checkpoint(
 
 /// Exercises participation record computation against a checkpoint Merkle root
 /// with 2 participants and 12 events covering `ContextCreated`, `MemberJoined`,
-/// `RoleAssigned`, `MessageSent`, `ToolInvoked`, `GovernanceAction`, `ToolVerified`.
+/// `RoleAssigned`, `MessageSent`, `OutletInvoked`, `GovernanceAction`, `OutletVerified`.
 ///
 /// This is the core assertion of SCP-125 AC6.
 #[tokio::test]
@@ -190,11 +224,11 @@ async fn participation_validation_works_with_checkpointed_log() {
         leaf_hash
     };
 
-    // Event 0: Alice creates context.
+    // Event 0: Alice creates a child context.
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ContextCreated,
+        EventType::ChildContextCreated,
         &did_alice,
         1_000_000,
         0,
@@ -203,7 +237,7 @@ async fn participation_validation_works_with_checkpointed_log() {
         prev_hash,
     );
 
-    // Event 1: Alice joins.
+    // Event 1: Alice joins (subject-bearing membership leaf).
     prev_hash = append(
         &mut log,
         &mut all_events,
@@ -211,12 +245,12 @@ async fn participation_validation_works_with_checkpointed_log() {
         &did_alice,
         1_000_001,
         1,
-        vec![],
+        membership_payload(&did_alice, "admin"),
         &sk_alice,
         prev_hash,
     );
 
-    // Event 2: Bob joins.
+    // Event 2: Bob joins (subject-bearing membership leaf).
     prev_hash = append(
         &mut log,
         &mut all_events,
@@ -224,12 +258,13 @@ async fn participation_validation_works_with_checkpointed_log() {
         &did_bob,
         1_000_002,
         2,
-        vec![],
+        membership_payload(&did_bob, "member"),
         &sk_bob,
         prev_hash,
     );
 
-    // Event 3: Alice assigns role to Bob.
+    // Event 3: Alice assigns a role to Bob (subject-bearing role leaf; subject
+    // is Bob, the affected member).
     prev_hash = append(
         &mut log,
         &mut all_events,
@@ -237,7 +272,7 @@ async fn participation_validation_works_with_checkpointed_log() {
         &did_alice,
         1_000_003,
         3,
-        did_bob.as_bytes().to_vec(),
+        role_payload(&did_bob, "moderator"),
         &sk_alice,
         prev_hash,
     );
@@ -268,63 +303,67 @@ async fn participation_validation_works_with_checkpointed_log() {
         prev_hash,
     );
 
-    // Event 6: Alice invokes a tool.
+    // Event 6: Alice invokes a outlet.
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolInvoked,
+        EventType::OutletInvoked,
         &did_alice,
         1_000_006,
         6,
-        b"search-tool".to_vec(),
+        b"search-outlet".to_vec(),
         &sk_alice,
         prev_hash,
     );
 
-    // Event 7: Alice invokes the same tool again.
+    // Event 7: Alice invokes the same outlet again.
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolInvoked,
+        EventType::OutletInvoked,
         &did_alice,
         1_000_007,
         7,
-        b"search-tool".to_vec(),
+        b"search-outlet".to_vec(),
         &sk_alice,
         prev_hash,
     );
 
-    // Event 8: Bob invokes a different tool.
+    // Event 8: Bob invokes a different outlet.
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolInvoked,
+        EventType::OutletInvoked,
         &did_bob,
         1_000_008,
         8,
-        b"execute-tool".to_vec(),
+        b"execute-outlet".to_vec(),
         &sk_bob,
         prev_hash,
     );
 
-    // Event 9: Alice performs a governance action targeting Bob.
+    // Event 9: Alice performs an adverse governance action targeting Bob
+    // (target-bearing leaf; RemoveMember is adverse, so it counts against Bob).
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::GovernanceAction,
+        EventType::GovernanceActionExecuted,
         &did_alice,
         1_000_009,
         9,
-        did_bob.as_bytes().to_vec(),
+        gov_payload(&did_bob, "RemoveMember"),
         &sk_alice,
         prev_hash,
     );
 
-    // Event 10: Alice verifies a tool (attestation-adjacent).
+    // Event 10: Alice verifies a outlet. OutletVerified no longer feeds
+    // attestation_history (that is a credential-layer fact, §7.4) — this event
+    // exists only to advance the log; attestation_count is sourced from the
+    // accessible-attestation arg (empty here ⇒ 0).
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolVerified,
+        EventType::OutletVerified,
         &did_alice,
         1_000_010,
         10,
@@ -360,31 +399,36 @@ async fn participation_validation_works_with_checkpointed_log() {
     // Compute participation record for Alice using the checkpoint's Merkle root.
     // This is the core assertion of SCP-125 AC6: participation validation
     // continues to work with checkpointed logs.
+    // No attestation-cache access in this test ⇒ empty accessible-attestation set
+    // (attestation_count is a credential-layer, verifier-relative fact, §7.3.2).
     let record = compute_participation_record(
         &all_events,
         &did_alice,
         "ctx-participation-checkpoint",
         checkpoint.merkle_root,
         2_000_000,
+        &[],
     )
     .expect("participation record computation should succeed");
 
     // Alice participated in events 0,1,3,4,6,7,9,10 = 8 events.
     assert_eq!(record.participation_count, 8);
-    // Duration: 1_000_010 - 1_000_000 = 10 seconds.
+    // Membership-interval duration: Alice's MemberJoined (1_000_001) is still
+    // open at the end ⇒ latest event ts (1_000_011) - 1_000_001 = 10 seconds.
     assert_eq!(record.participation_duration_seconds, 10);
-    // Tool invocations: search-tool x2.
-    assert_eq!(record.tool_invocations.len(), 1);
-    assert_eq!(record.tool_invocations.get("search-tool"), Some(&2));
+    // Outlet invocations: search-outlet x2.
+    assert_eq!(record.outlet_invocations.len(), 1);
+    assert_eq!(record.outlet_invocations.get("search-outlet"), Some(&2));
     // Governance actions by Alice: 1 (targeting Bob).
     assert_eq!(record.governance_actions_by.len(), 1);
     // Governance actions against Alice: 0.
     assert_eq!(record.governance_actions_against.len(), 0);
-    // Role history for Alice: 0 (Alice assigned Bob, not herself).
+    // Role history for Alice: 0 (Alice assigned Bob, Bob is the subject).
     assert_eq!(record.role_history.len(), 0);
-    // Attestation history: 1 (ToolVerified event).
-    assert_eq!(record.attestation_history.len(), 1);
-    // Context creation: 1.
+    // Attestation history: 0 — sourced from the (empty) credential-layer arg,
+    // NOT the event log.
+    assert_eq!(record.attestation_history.len(), 0);
+    // Context creation: 1 (ChildContextCreated by Alice).
     assert_eq!(record.context_creation_count, 1);
     // Merkle root matches checkpoint.
     assert_eq!(record.event_log_root, checkpoint.merkle_root);
@@ -396,19 +440,24 @@ async fn participation_validation_works_with_checkpointed_log() {
         "ctx-participation-checkpoint",
         checkpoint.merkle_root,
         2_000_000,
+        &[],
     )
     .expect("Bob's participation record computation should succeed");
 
     // Bob participated in events 2,5,8,11 = 4 events.
     assert_eq!(bob_record.participation_count, 4);
-    // Duration: 1_000_011 - 1_000_002 = 9 seconds.
+    // Membership-interval duration: Bob's MemberJoined (1_000_002) is still open
+    // at the end ⇒ latest event ts (1_000_011) - 1_000_002 = 9 seconds.
     assert_eq!(bob_record.participation_duration_seconds, 9);
-    // Bob's tool invocations: execute-tool x1.
-    assert_eq!(bob_record.tool_invocations.len(), 1);
-    assert_eq!(bob_record.tool_invocations.get("execute-tool"), Some(&1));
-    // Bob is the target of Alice's governance action.
+    // Bob's outlet invocations: execute-outlet x1.
+    assert_eq!(bob_record.outlet_invocations.len(), 1);
+    assert_eq!(
+        bob_record.outlet_invocations.get("execute-outlet"),
+        Some(&1)
+    );
+    // Bob is the projected target of Alice's adverse governance action.
     assert_eq!(bob_record.governance_actions_against.len(), 1);
-    // Bob was assigned a role.
+    // Bob is the projected subject of the role assignment.
     assert_eq!(bob_record.role_history.len(), 1);
     assert_eq!(bob_record.event_log_root, checkpoint.merkle_root);
 }
@@ -457,7 +506,10 @@ fn participation_validation_works_after_pruning() {
         all_events.push(event);
     }
 
-    // Post-checkpoint events (retained).
+    // Post-checkpoint events (retained). Event 10 is a subject-bearing
+    // MemberJoined for `did` so the post-checkpoint slice has an attributable
+    // membership interval (duration is membership-interval based, §7.3.2); the
+    // rest are MessageSent.
     for i in 10..20u64 {
         let (actor_did, skey): (&str, &ed25519_dalek::SigningKey) = if i % 2 == 0 {
             (&did, &signing_key)
@@ -465,12 +517,21 @@ fn participation_validation_works_after_pruning() {
             (&did2, &signing_key2)
         };
 
+        let (event_type, payload) = if i == 10 {
+            (EventType::MemberJoined, membership_payload(&did, "member"))
+        } else {
+            (
+                EventType::MessageSent,
+                format!("post-checkpoint-{i}").into_bytes(),
+            )
+        };
+
         let event = sign_event(
-            EventType::MessageSent,
+            event_type,
             actor_did,
             1_000_000 + i * 100,
             i,
-            format!("post-checkpoint-{i}").into_bytes(),
+            payload,
             prev_hash,
             skey,
         );
@@ -508,11 +569,14 @@ fn participation_validation_works_after_pruning() {
         "ctx-behavior-test",
         tail_root,
         2_000_000,
+        &[],
     )
     .expect("participation record computation should succeed");
 
     // Subject participated in events 10, 12, 14, 16, 18 (even indices).
     assert_eq!(record.participation_count, 5);
+    // Membership-interval duration: MemberJoined (event 10) is still open at the
+    // end of the slice ⇒ latest event ts - join ts > 0.
     assert!(record.participation_duration_seconds > 0);
 }
 
@@ -528,9 +592,15 @@ fn participation_validation_with_full_event_set() {
     let merkle_root = tree::root(&log);
 
     let actor_did = &events[0].actor_did;
-    let record =
-        compute_participation_record(&events, actor_did, "ctx-prune-test", merkle_root, 2_000_000)
-            .expect("participation record computation should succeed");
+    let record = compute_participation_record(
+        &events,
+        actor_did,
+        "ctx-prune-test",
+        merkle_root,
+        2_000_000,
+        &[],
+    )
+    .expect("participation record computation should succeed");
 
     assert_eq!(record.participation_count, 10);
 }

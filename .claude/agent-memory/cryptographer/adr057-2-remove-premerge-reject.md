@@ -1,0 +1,21 @@
+---
+name: adr057-2-remove-premerge-reject
+description: ADR-057 Slice 2 fix b4c1db87e — remove-Commit rejected pre-merge (no MLS-vs-SCP skew) + redacting Debug; crypto-SOUND, APPROVE
+metadata:
+  type: project
+---
+
+# ADR-057 Slice 2 — pre-merge remove rejection + Debug redaction (commit b4c1db87e)
+
+Confirming-review fix on branch feat/adr057-2-scp-client (delta d8b4e4c82->b4c1db87e). Prior tree d8b4e4c82 already APPROVED. **VERDICT: SOUND, NO REGRESSION, APPROVE.** Fix commit is TIGHT — 4 files (encrypt.rs, crypto_state.rs, client.rs, multi_party_convergence.rs test). 118/118 scp-mls + 10/10 scp-client pass; wasm32 check clean.
+
+**Why:** the fix reorders `scp_mls::encrypt::decrypt_with_membership_changes` so a Remove-bearing Commit is rejected BEFORE `merge_staged_commit` (was: merge-then-driver-errors = MLS epoch advanced + leaf evicted while SCP membership/log stayed put = internal MLS-vs-SCP skew).
+
+**How to apply / what was verified:**
+- **Ordering (encrypt.rs:603-675):** process_message → recover removed_dids from `group.group.as_ref()` PRE-MERGE tree (line 616, correct attribution, removed leaf still present) → `if !removed_dids.is_empty() return UnsupportedMembershipChange` (line 640, StagedCommit dropped, NEVER passed to merge_staged_commit) → else add-only: recover added_dids from VALIDATED Add-proposal KP leaf creds (process_message already rejects invalid Add) → merge (line 666). NOT merging on remove leaves openmls group on old epoch, clean, no partial mutation, no key-state corruption. Add-only merge+recovery byte-identical to pre-fix.
+- **Variant split, NO dropped check:** old `InboundChange::Commit{sender_did,added_dids,removed_dids}` → `Commit{sender_did,added_dids}` + new `UnsupportedMembershipChange{sender_did,removed_dids}`. Mapping chain clean: InboundChange::Unsupported → Inbound::Unsupported (crypto_state.rs:308) → ClientError::UnsupportedMembershipChange (client.rs:488). The ONLY logic removed from client.rs Commit arm was the `if !removed_dids.is_empty() return Err` guard — which MIGRATED down into scp-mls + the new variant arm. Add-path body (append MemberJoined leaf per added_did + add_member_record, client.rs:506-514) byte-identical to pre-fix. grep confirms removed_dids ONLY on Unsupported variant now.
+- **Point 2 (process_message consumes message generation even w/o merge):** openmls 0.8.1 — process_message advances the message-secret/ratchet state independent of merge_staged_commit, so re-receiving a rejected remove-Commit fails (forward-secrecy err). This is FAIL-CLOSED LIVENESS, not a security issue: the member can't advance but is NOT desynced into accepting forged state — matches MLS FS semantics (message secret consumed on process). Consistent, not exploitable.
+- **No-skew test `remove_commit_is_rejected_fail_closed_without_skew` (multi_party_convergence.rs):** drives Alice as RAW scp-mls (the adversary wire bytes an out-of-scope committer could send) + Bob as real ScpClient; asserts receive_message → UnsupportedMembershipChange naming Carol AND Bob's mls_epoch / member_dids / event_log_leaf_count / event_log_root ALL unchanged. New `mls_epoch` accessor (client.rs) = state.crypto.mls_group.epoch() (ScpMlsGroup::epoch group.rs:193). Correct adversary shape.
+- **Debug redaction (Fix 4):** manual Debug on BOTH InboundChange (encrypt.rs:445) and Inbound (crypto_state.rs:104) Application variants prints `<redacted N bytes>` not plaintext; derive(Debug) removed from both enums so no auto-Debug leak path; control variants forward non-secret fields (sender_did/added/removed DIDs are non-secret). 2 unit tests prove no cleartext via {:?}. No other Debug/Display path prints plaintext (plaintext field only on Application, both wrappers redact). SOUND.
+- **Fix 2 (timestamp SECURITY note, client.rs:417 receive_message):** honest documentation — committer_timestamp_secs is UNAUTHENTICATED (not in §9.16 AEAD AAD, stamped on unsigned leaves); hostile relay could forge → diverge Merkle root. MUST bind into signed leaf/envelope before real transport. Correct deferral to leaf-signing/custody slice; doc-only, no code change, accurate.
+- scp-runtime UNAFFECTED (uses its own decrypt_with_sender_did path, untouched).

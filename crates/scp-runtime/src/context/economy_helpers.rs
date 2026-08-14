@@ -9,18 +9,17 @@
 //! per-context policy, velocity, and checkpoint state flow through
 //! [`PerContextState`](crate::context::actor::state::PerContextState).
 //!
-//! # Legacy fallback
+//! # Migration status
 //!
-//! The pre-migration `&Supervisor` bodies live in
-//! [`crate::context::economy_helpers_legacy`]. Still-legacy domains
-//! such as messaging and lifecycle call that module until their own
-//! Phase 2A migrations move them to actor-owned state.
+//! The pre-migration `&Supervisor` bodies have been removed (Phase 2A
+//! finalization); all economy-domain callers now operate on actor-owned
+//! state.
 
 #![allow(clippy::needless_pass_by_ref_mut)]
 
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::economy::policy::ObservableMetrics;
@@ -385,7 +384,7 @@ const fn paid_action_label(action_type: &PaidActionType) -> &'static str {
     match action_type {
         PaidActionType::MessageSend => "send_message",
         PaidActionType::ContextJoin => "join_context",
-        PaidActionType::ToolInvoke => "tool_invoke",
+        PaidActionType::OutletCall => "outlet_call",
         PaidActionType::SubscriptionPeriod => "subscription_period",
         PaidActionType::ByteStored => "byte_stored",
     }

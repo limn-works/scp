@@ -9,7 +9,7 @@
  * `node:crypto` and asserts the resulting bytes equal the spec literals — both
  * the static (v1) and rotatable (v2, epoch 1) keys.
  *
- * Canonical recipe (spec §25.19, matching `crates/scp-platform/src/pseudonym.rs`):
+ * Canonical recipe (spec §25.19, matching `crates/scp-crypto/src/pseudonym.rs`):
  *   pseudonym_secret  = HKDF-SHA256(ikm = ed25519_seed, salt = "scp-pseudonym-secret-v1",
  *                                   info = "", len = 32)
  *   context_seed_v1   = HMAC-SHA256(secret, context_id || "scp-pseudonym")

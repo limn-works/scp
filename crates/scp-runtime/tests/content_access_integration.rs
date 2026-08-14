@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use scp_identity::DID;
+use scp_did::{DID, SigningKeyId};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::ContextError;
@@ -34,7 +34,6 @@ use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_protocol::crypto::access_keys::wrapping::{Recipient, unwrap_content, wrap_content};
 use scp_protocol::crypto::access_keys::{AccessKeyStore, ContentAccessState, generate_access_key};
 use scp_protocol::crypto::sender_keys::{BlockNotification, SenderKeyStore, generate_sender_key};
-use scp_protocol::identity::SigningKeyId;
 use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
@@ -44,7 +43,7 @@ use scp_runtime::crypto::access_keys::lifecycle::{
     handle_block_as_blocked_party, handle_block_as_blocker, restore_access_key, revoke_access_key,
     revoke_read_access, revoke_write_access,
 };
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 use scp_runtime::crypto::sender_keys::key_protocol::send_block_notification;
 use scp_runtime::identity::blocking::{
     BlockInContextParams, GlobalBlockParams, block_did_global, block_did_in_context,
@@ -107,21 +106,26 @@ impl MockTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for MockTransport {
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn send_message(&self, _id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        _id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
         Ok(())
     }
 }
@@ -129,11 +133,12 @@ impl ContextTransportProvider for MockTransport {
 #[derive(Default)]
 struct MockEventLog;
 
+#[async_trait::async_trait]
 impl ContextEventLogProvider for MockEventLog {
-    fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(
+    async fn append_event(
         &self,
         _id: &[u8; 32],
         _event: scp_event_log::EventType,
@@ -143,7 +148,7 @@ impl ContextEventLogProvider for MockEventLog {
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 }
@@ -162,7 +167,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|did, _kid: scp_did::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -180,8 +185,9 @@ fn new_manager() -> std::sync::Arc<scp_runtime::context::supervisor::Supervisor>
     // ADR-049 commit 12 — `ContextManager` is gone; tests construct a
     // `Supervisor` directly via `test_supervisor`.
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
@@ -191,12 +197,12 @@ fn new_manager() -> std::sync::Arc<scp_runtime::context::supervisor::Supervisor>
 
 fn governance_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
         Capability::MemberBan,
     ]
 }
@@ -316,7 +322,7 @@ async fn tier1_in_context_block_unblock_lifecycle() {
         current_epoch: 0,
         signer_key_ref: SigningKeyId::Active,
     };
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let block_result = block_did_in_context(
         &custody,
         &signing_key,
@@ -570,7 +576,7 @@ async fn tier2_global_block_propagation() {
         shared_context_ids: &shared_contexts,
         signer_key_ref: SigningKeyId::Active,
     };
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let global_result = block_did_global(
         &custody,
         &signing_key,
@@ -881,7 +887,7 @@ async fn three_layer_enforcement_after_full_revocation() {
         current_epoch: 0,
         signer_key_ref: SigningKeyId::Active,
     };
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let _block_result = block_did_in_context(
         &custody,
         &signing_key,
@@ -1234,7 +1240,7 @@ async fn invalid_block_notification_no_destruction() {
     let (custody, signing_key) = make_custody_and_key().await;
 
     // Create a valid notification.
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let notification_bytes = send_block_notification(
         &custody,
         &signing_key,

@@ -38,22 +38,25 @@
 
 use async_trait::async_trait;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::credentials::FfiCredentialStore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so bridge.rs
 // and server.rs can name it in impl blocks without pulling in the full
 // path.
 pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::error_codes as codes;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use scp_core::context::app_sandbox::ScopedHandle;
+
 use dashmap::DashMap;
+use scp_clock::SystemClock;
 use scp_core::context::builder::ContextEventLogProvider;
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
+use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
-use scp_identity::cache::SystemClock;
 
 // ---------------------------------------------------------------------------
 // UniffiBridgeInstance — per-bridge concrete bridge instance (#1549 Phase 4 PR 1)
@@ -240,13 +243,13 @@ pub struct UniffiBridgeInstance {
     /// default that the earlier `OnceLock` path backed).
     ///
     /// Typed to [`UniffiKeyCustody`](crate::bridge::UniffiKeyCustody) — an
-    /// enum over the callback (production) and in-memory (`allow_in_memory_custody`,
+    /// enum over the callback (production) and in-memory (`testing`,
     /// dev/desktop) backends — so the registry, the accessor, and the
     /// `scpid_sign` / `identity_create_link_attestation` / `identity_remove*`
     /// ops that read it exist in BARE production builds (matching the `PyO3` and
     /// napi bridges, whose registries are likewise custody-enum-typed). The
     /// previous in-memory-typed field forced those production ops behind the
-    /// `allow_in_memory_custody` gate, silently dropping them from the released
+    /// `testing` gate, silently dropping them from the released
     /// Swift/Kotlin SDKs.
     ///
     /// Cleared on shutdown — dropping the `Arc<UniffiKeyCustody>` values
@@ -319,7 +322,7 @@ pub struct UniffiBridgeInstance {
     /// [`DurableProviders::from_handle`](scp_core::context::supervisor::DurableProviders::from_handle)
     /// over the SAME backend the bridge chose for persistence + event log:
     /// - in-memory path: the un-swallowed
-    ///   [`scp_ffi_common::bridge_runtime::BridgeInMemoryStorageHandle`]
+    ///   [`scp_ffi_common::bridge_runtime::EventLogInMemoryStorageHandle`]
     ///   returned by `build_event_log_provider`;
     /// - `SQLCipher` path: the `Arc<SqliteStorage>` that also backs
     ///   `CoreFields::persistence` and the event-log repository.
@@ -339,17 +342,60 @@ pub struct UniffiBridgeInstance {
 
     /// Per-instance bridge credential store (spec §12.11).
     ///
-    /// Mirrors `PyBridgeInstance::credential_store` and
-    /// `NapiBridgeInstance::credential_store` — each `Scp` instance owns its
-    /// own `InMemoryCredentialStore` so OAuth tokens, API keys, and bridge
-    /// credential keys provisioned through one instance are isolated from
-    /// every other instance in the same process (ADR-048 §1 multi-instance
-    /// neutrality). Thread-safe via the store's internal
-    /// `tokio::sync::RwLock`. Production deployments should replace this with
-    /// a `Storage`-backed implementation when it lands (spec §12.11.2).
-    /// Dropping the `Arc` on shutdown zeroizes any retained bridge
-    /// credential keys via the store's `Zeroizing` fields.
-    pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
+    /// The **durable** [`FfiCredentialStore`] selected at construction from the
+    /// SAME storage handle that backs `mls_storage` and the saga journal (spec
+    /// §17.6) — a Sqlite selection persists bridge tokens across restart; an
+    /// encrypted-in-memory selection keeps them encrypted at rest. Per-instance,
+    /// so credentials are isolated from every other instance in the same process
+    /// (ADR-048 §1 multi-instance neutrality). There is no in-memory arm on this
+    /// shipped path — the in-memory store's `Default` impl that made it a
+    /// default selection was deleted (ADR-062 §Decision 5, SCP-CAPINJECT-009).
+    pub(crate) credential_store: FfiCredentialStore,
+
+    /// Per-instance §5.4.5 streaming-outlet registry, keyed by the stream's
+    /// `request_id` hex (`StreamHandleId`). Mirrors the `PyO3` reference bridge's
+    /// `PyBridgeInstance::outlet_stream_registry` and the NAPI bridge's
+    /// `NapiBridgeInstance::outlet_stream_registry` — a per-instance field, NOT a
+    /// `static` (`check-no-bridge-globals.sh` / `check-handle-affinity.sh` forbid
+    /// the alternative). A stream opened on one instance is invisible to another;
+    /// instance shutdown drops every live stream (and its billing pump `Arc`) via
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+
+    /// Per-instance §5.4.5 / §6.2.4 cross-context STREAMING-saga registry
+    /// (SCP-OUT-047, pass 3a), keyed by the durable `saga_id` string. Each
+    /// [`StreamingSagaEntry`](scp_ffi_common::streaming_saga::StreamingSagaEntry)
+    /// holds the runtime's promptly-returned plaintext operator-signed chunk
+    /// receiver plus the pinned `saga_id`, operating (target) context id, invoker
+    /// DID, and `request_id`. Mirrors the `PyO3` reference bridge's
+    /// `PyBridgeInstance::outlet_streaming_saga_registry` and the NAPI bridge's
+    /// `NapiBridgeInstance::outlet_streaming_saga_registry` — a per-instance
+    /// field, NOT a `static` (`check-no-bridge-globals.sh` /
+    /// `check-handle-affinity.sh` forbid the alternative). A saga opened on one
+    /// instance is invisible to another; instance shutdown drops every live saga
+    /// stream via [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) outlet_streaming_saga_registry:
+        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+
+    /// Per-instance app binding registry (spec §8.4).
+    ///
+    /// Outer key: `context_id`. Inner key: `app_did`. Value: `ScopedHandle`
+    /// retaining the granted capability set for enforcement. Populated by
+    /// `Scp::sandbox_app_bind` and cleared by `Scp::sandbox_app_unbind`.
+    pub(crate) bound_apps_registry: Arc<DashMap<String, HashMap<String, ScopedHandle>>>,
+}
+
+impl std::fmt::Debug for UniffiBridgeInstance {
+    /// Redacted `Debug` — surfaces only the `instance_id` so the many
+    /// interior registries (custody, resolver, DHT client, protocol
+    /// repository) never leak into log output. Required because
+    /// [`crate::bridge::Identity`] derives `Debug` and now retains an
+    /// `Arc<UniffiBridgeInstance>` in its `bi` field.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UniffiBridgeInstance")
+            .field("instance_id", &self.core.instance_id())
+            .finish_non_exhaustive()
+    }
 }
 
 impl UniffiBridgeInstance {
@@ -369,6 +415,9 @@ impl UniffiBridgeInstance {
         // durable saga journal and the `mls_storage` view are bound into one
         // `DurableProviders` derived from the SAME `Arc`, so they cannot diverge
         // by construction (§17.6 / §17.16).
+        // Durable credential store over the SAME chosen handle (§17.6),
+        // selected before the handle is moved into the durable providers.
+        let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
         Self {
             core: CoreFields::new(),
@@ -380,9 +429,10 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
-            credential_store: Arc::new(
-                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-            ),
+            credential_store,
+            outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            bound_apps_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -401,6 +451,9 @@ impl UniffiBridgeInstance {
             scp_ffi_common::bridge_runtime::build_event_log_provider();
         // Saga journal + `mls_storage` bound into one `DurableProviders` derived
         // from one handle (§17.6 / §17.16).
+        // Durable credential store over the SAME chosen handle (§17.6),
+        // selected before the handle is moved into the durable providers.
+        let credential_store = FfiCredentialStore::durable_from_handle(Arc::clone(&storage_handle));
         let durable_providers = durable_providers_from_handle(storage_handle);
         Self {
             core: CoreFields::with_persistence(persistence),
@@ -412,9 +465,10 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
-            credential_store: Arc::new(
-                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-            ),
+            credential_store,
+            outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            bound_apps_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -511,6 +565,10 @@ impl UniffiBridgeInstance {
                 // and the journal is built over the SAME handle, so saga replay
                 // reads and writes the one `SQLCipher` connection (§17.6 /
                 // §17.16). They cannot diverge by construction.
+                // Durable credential store over the SAME `Arc<SqliteStorage>`
+                // (§17.6) — bridge tokens persist across restart with the DB.
+                let credential_store =
+                    FfiCredentialStore::durable_from_handle(Arc::clone(&arc_storage));
                 let durable_providers = durable_providers_from_handle(Arc::clone(&arc_storage));
                 drop(arc_storage);
 
@@ -518,6 +576,7 @@ impl UniffiBridgeInstance {
                     persistence,
                     ProtocolRepoVariant::Sqlite(event_log_repo),
                     durable_providers,
+                    credential_store,
                 ))
             }
         }
@@ -543,6 +602,7 @@ impl UniffiBridgeInstance {
         persistence: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
         protocol_repository: ProtocolRepoVariant,
         durable_providers: scp_core::context::supervisor::DurableProviders,
+        credential_store: FfiCredentialStore,
     ) -> Self {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
@@ -554,9 +614,10 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             durable_providers: Some(durable_providers),
-            credential_store: Arc::new(
-                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-            ),
+            credential_store,
+            outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            bound_apps_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -585,17 +646,11 @@ impl UniffiBridgeInstance {
         self.core.instance_id()
     }
 
-    /// Returns a reference to this instance's bridge credential store.
-    ///
-    /// Mirrors `PyBridgeInstance::credential_store` /
-    /// `NapiBridgeInstance::credential_store`. The returned
-    /// `Arc<InMemoryCredentialStore>` is the same instance the
-    /// `UniffiBridgeInstance` holds — thread-safe via internal
-    /// `tokio::sync::RwLock`.
+    /// Returns a reference to this instance's **durable** bridge credential
+    /// store, selected at construction from the chosen storage backend
+    /// (ADR-062 §Decision 5, SCP-CAPINJECT-009).
     #[must_use]
-    pub const fn credential_store(
-        &self,
-    ) -> &Arc<scp_core::bridge::credentials::InMemoryCredentialStore> {
+    pub const fn credential_store(&self) -> &FfiCredentialStore {
         &self.credential_store
     }
 
@@ -785,7 +840,7 @@ impl UniffiBridgeInstance {
     /// Per-instance equivalent of the module-level
     /// `init_context_manager_with_did` free function.
     ///
-    /// Installs an `MlsCryptoProvider(local_did)` and
+    /// Installs a `NodeMlsFactory(local_did)` and
     /// `NotConfiguredTransportProvider` on this instance. No-op if a
     /// `ContextManager` is already attached.
     #[allow(dead_code)]
@@ -798,7 +853,10 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
+            did,
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
         // Storage-before-supervisor precondition (spec §17.6): the chosen
@@ -830,7 +888,7 @@ impl UniffiBridgeInstance {
     /// Per-instance equivalent of the module-level
     /// `init_context_manager_with_relay_transport` free function.
     ///
-    /// Installs an `MlsCryptoProvider(local_did)` and a
+    /// Installs a `NodeMlsFactory(local_did)` and a
     /// `RelayTransportProvider` wrapping the supplied `NativeRelayAdapter` on
     /// this instance. No-op if a `ContextManager` is already attached.
     #[allow(dead_code)]
@@ -847,7 +905,10 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
+            did,
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
@@ -872,7 +933,7 @@ impl UniffiBridgeInstance {
         self.core.set_supervisor(supervisor_arc);
     }
 
-    /// Per-instance initializer that installs an `MlsCryptoProvider(local_did)`
+    /// Per-instance initializer that installs a `NodeMlsFactory(local_did)`
     /// and an in-process loopback `LocalTransportProvider` on this instance.
     ///
     /// Mirrors [`UniffiBridgeInstance::init_context_manager_with_relay_transport`]
@@ -891,7 +952,10 @@ impl UniffiBridgeInstance {
             return;
         }
         let did = local_did.to_owned();
-        let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
+            did,
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let transport = Box::new(scp_core::context::LocalTransportProvider);
         let event_log = self.protocol_repository.event_log_provider();
         let persistence = self.core.persistence_arc_clone();
@@ -1001,6 +1065,75 @@ impl UniffiBridgeInstance {
             return;
         }
 
+        self.ucan_registry.insert(
+            context_id.to_owned(),
+            Self::build_ucan_context_state(context_id, creator_did, ceiling),
+        );
+    }
+
+    /// Atomically registers per-context UCAN validation state for a
+    /// Welcome-join, failing CLOSED on a pre-existing entry.
+    ///
+    /// The Welcome-join analog of the `PyO3`/napi reference bridges'
+    /// `register_ffi_state`: [`crate::Scp::context_join_from_welcome`] calls
+    /// this as a single ATOMIC gate BEFORE the irreversible
+    /// `Supervisor::spawn_actor_from_welcome`. Unlike the idempotent
+    /// [`Self::ensure_ucan_registered`] (the lazy UCAN-op path), a
+    /// pre-existing entry is a HARD error here.
+    ///
+    /// The `DashMap` `Entry::Occupied`/`Vacant` decision is what makes the
+    /// gate atomic — the collision test and the state insert are one
+    /// indivisible step, so exactly one caller can occupy the vacant slot for
+    /// a given `context_id`. A losing concurrent same-id caller errors HERE —
+    /// before the single-use `KeyPackage` is consumed — and never runs the
+    /// join's rollback, so it can never delete the winner's shared UCAN state.
+    /// The pre-existing entry is left untouched (the bridge must never roll
+    /// back state it did not create).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (`SCP-CTX-2014`) if the context's UCAN
+    /// state is already registered on this instance.
+    #[allow(dead_code)]
+    pub fn register_ucan_occupied(
+        &self,
+        context_id: &str,
+        creator_did: &str,
+        ceiling: &[String],
+    ) -> Result<(), crate::ScpError> {
+        use dashmap::mapref::entry::Entry;
+
+        match self.ucan_registry.entry(context_id.to_owned()) {
+            Entry::Occupied(_) => Err(crate::ScpError::Context {
+                msg: format!("context {context_id} is already registered on this instance"),
+                code: codes::CTX_2014.to_owned(),
+            }),
+            Entry::Vacant(vacant) => {
+                // `build_ucan_context_state` never touches `ucan_registry`, so
+                // building it while holding this shard's `Entry` write guard
+                // cannot deadlock (mirrors the napi reference's Vacant arm).
+                vacant.insert(Self::build_ucan_context_state(
+                    context_id,
+                    creator_did,
+                    ceiling,
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    /// Builds the per-context UCAN validation state (revocation list, nonce
+    /// tracker, event log, normalized capability ceiling) for a context.
+    ///
+    /// Shared by [`Self::ensure_ucan_registered`] (idempotent lazy path) and
+    /// [`Self::register_ucan_occupied`] (atomic Welcome-join gate) so both
+    /// construct byte-identical state. Does NOT insert into `ucan_registry` —
+    /// the caller decides the insert semantics.
+    fn build_ucan_context_state(
+        context_id: &str,
+        creator_did: &str,
+        ceiling: &[String],
+    ) -> UcanContextState {
         let ceiling_strings = if ceiling.is_empty() {
             scp_core::context::roles::default_ceiling()
                 .iter()
@@ -1030,27 +1163,21 @@ impl UniffiBridgeInstance {
                 .iter()
                 .filter(|s| {
                     scp_core::context::roles::Capability::new(s)
-                        .validate_as_ceiling_entry()
-                        .is_ok()
+                        .is_some_and(|c| c.validate_as_ceiling_entry().is_ok())
                 })
-                .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+                .filter_map(|s| {
+                    scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
+                })
                 .collect::<HashSet<String>>()
         };
 
-        let event_log = EventLog::new(context_id.to_owned());
-        let revocation_list = RevocationList::new(context_id.to_owned());
-        let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
-
-        self.ucan_registry.insert(
-            context_id.to_owned(),
-            UcanContextState {
-                revocation_list,
-                nonce_tracker,
-                ceiling_strings,
-                creator_did: creator_did.to_owned(),
-                event_log,
-            },
-        );
+        UcanContextState {
+            revocation_list: RevocationList::new(context_id.to_owned()),
+            nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
+            ceiling_strings,
+            creator_did: creator_did.to_owned(),
+            event_log: EventLog::new(context_id.to_owned()),
+        }
     }
 
     /// Per-instance equivalent of the module-level `with_ucan_state` free
@@ -1118,6 +1245,13 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        // Drop every live streaming-outlet session (and its billing pump `Arc`)
+        // on shutdown, matching the PyO3 / NAPI bridges.
+        self.outlet_stream_registry.clear();
+        // Drop every live cross-context streaming saga (releasing each saga's
+        // chunk receiver `Arc`) on shutdown, matching the PyO3 / NAPI bridges
+        // (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
         // Clear identity-link-attestation and context-handle registries.
         // Migrated off module-level `OnceLock` statics in bridge.rs in
         // #1549 Phase 4 PR 2 commit 6. Dropping `Arc<ContextHandle>`
@@ -1190,7 +1324,7 @@ impl Drop for UniffiBridgeInstance {
 /// crash-recovery replay. Binding the pair into one newtype whose only non-test
 /// constructor derives both halves from one handle makes that divergence a
 /// compile error.) The single chosen backend
-/// (`Arc<EncryptingAdapter<BridgeInMemoryStorage>>` for the dev/in-memory path,
+/// (`Arc<EncryptingAdapter<InMemoryStorage>>` for the dev/in-memory path,
 /// or `Arc<SqliteStorage>` for the durable path) feeds both halves.
 fn durable_providers_from_handle<S>(
     handle: Arc<S>,
@@ -1257,54 +1391,37 @@ impl ArcContextPersistence {
     }
 }
 
+#[async_trait::async_trait]
 impl scp_core::context::persistence::ContextPersistence for ArcContextPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &scp_core::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.persist_context(context_id, snapshot)
+        self.inner.persist_context(context_id, snapshot).await
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<
         Option<scp_core::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        self.inner.load_context(context_id)
+        self.inner.load_context(context_id).await
     }
 
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.persist_broadcast(context_id, snapshot)
-    }
-
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<
-        Option<scp_core::context::broadcast::BroadcastContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        self.inner.load_broadcast(context_id)
-    }
-
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.delete_context(context_id)
+        self.inner.delete_context(context_id).await
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.list_persisted_contexts()
+        self.inner.list_persisted_contexts().await
     }
 }
 
@@ -1343,7 +1460,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// retained sender has no receivers, so `send` returns `Err` and the event is
 /// simply dropped without blocking context operations.
 fn build_supervisor(
-    crypto: Arc<MlsCryptoProvider>,
+    crypto: Arc<NodeMlsFactory>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>>,
@@ -1359,6 +1476,11 @@ fn build_supervisor(
     // receiver for the node webhook dispatcher (§12.10.5). The unused receiver
     // is dropped immediately; the retained sender keeps the channel open.
     let (event_tx, _rx) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
+    // Share the provider's exact hardened `Clock` Arc with the supervisor so the
+    // "one hardened clock per node" invariant (see the `NodeMlsFactory::clock`
+    // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
+    // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
+    let clock = crypto.clock();
     // `durable` is REQUIRED (non-Option): the runtime never defaults storage;
     // the bridge supplies it (spec §17.6 / ADR-049). It bundles the single
     // chosen Storage erased once into the `OpenMLS` view AND the durable saga
@@ -1373,7 +1495,7 @@ fn build_supervisor(
         persistence_box,
         None,
         Some(event_tx),
-        None,
+        Some(clock),
         durable,
     )
 }
@@ -1410,8 +1532,8 @@ fn key_resolver_for_core(core: &CoreFields) -> scp_core::context::governance::Ke
 #[must_use]
 pub fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
-    Arc<scp_ffi_common::bridge_runtime::BridgeInMemoryRepo>,
-    scp_ffi_common::bridge_runtime::BridgeInMemoryStorageHandle,
+    Arc<scp_ffi_common::bridge_runtime::EventLogInMemoryRepo>,
+    scp_ffi_common::bridge_runtime::EventLogInMemoryStorageHandle,
 ) {
     scp_ffi_common::bridge_runtime::build_event_log_provider()
 }

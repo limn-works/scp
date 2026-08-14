@@ -1,0 +1,18 @@
+---
+name: adr053-substrate-isolation-and-trust-parity-ae3a4238f
+description: Round-26 alignment review — ADR-053 substrate-isolation honesty correction + Python/TS trust.py/trust.ts fail-closed lockstep on fix/sdk-coverage-fail-closed-and-parity
+metadata:
+  type: project
+---
+
+# ADR-053 substrate-isolation correction + trust.py/trust.ts parity @ ae3a4238f (fix/sdk-coverage-fail-closed-and-parity, 2026-07-15) — APPROVED
+
+Round 26 (2nd full-roster pass). Only delta since R25 = docs-only 2-line ADR-053 correction.
+
+**ADR-053** (`.docs/adrs/ADR-053-pre-rotation-custody-substrate-isolation.md`, Status: Proposed) — closes callback-custody gap for pre-rotation key (spec §9.7.4.1 §3-§6). Correction ACCURATE + resolves internal overclaim:
+- Consequences was "two-substrate model is enforced by the type system (separate provider), not by documentation" → now "structurally encouraged by the type system (separate provider type prevents the SAME object serving both roles), but hardware/OS-level substrate + auth-flow isolation remains a foreign-implementation obligation — Rust type sig cannot verify two distinct callback objects aren't backed by the same Keychain access group / biometric prompt. Conformance test (pre-rotation key NOT recoverable from operational provider) is primary observable enforcement."
+- **Why correct:** spec §9.7.4.1 §3 is a SUBSTRATE requirement ("stored separately", "MUST NOT be accessible through same custody provider or authentication flow"). Type separation only blocks one-object-both-roles; two foreign objects sharing a substrate is undetectable by the type system. Old claim contradicted ADR's OWN Context (line 10 "substrate requirements, not merely type requirements" + line 21 UniFFI comment "Substrate isolation is NOT yet satisfied"). Consistent w/ spec's own stance that some custody props are non-mechanically-verifiable (§9.7.4.1 item 7 "protocol cannot verify offline backup still exists").
+- Migration-reveal transit note added to Risk: `consume → import_ed25519_signing_key` (canonical flow, ADR line 51) necessarily transits 32-byte seed through shared bridge process memory; Zeroizing narrows not eliminates; substrate isolation holds AT REST, transiently observable to process-memory attacker during migration. ACCURATE — reveal is inherent to ADR-003 §4b / §9.12; not prohibited by spec; Alternative #3 (line 108) only mandates in-substrate GENERATION for HSM/SE, migration reveal is a distinct op that inherently exposes bytes.
+- Artifact-flow CLEAN: ADR made honest about enforcement limits, not code-informing-spec. No normative requirement weakened (obligation still stands, enforcement honestly reattributed).
+
+**trust.py / trust.ts LOCKSTEP verified** (files unchanged this round but re-confirmed): all 6 UCAN error-prefix lists byte-identical (TOKEN_PARSE 4, SIGNATURE_CHAIN 19, CAPABILITY_CEILING 3, NONCE 5, REVOCATION 1 = only "token revoked:" — operational "revocation unauthorized:/failed:" intentionally excluded → unknown/fail-closed, EXPIRY 4); _PASSED_BEFORE / __PASSED_BEFORE identical stage→passed-fields map; classification order identical (signatures→ceiling→token_parse→nonce→revoked→expiry). Fail-closed parity: null capUri → all-false no-bridge (both); [SCP-VALID-*] → all-false (py `_set_all_false` / ts `ALL_LAYER1_FIELDS_FALSE`); [SCP-PERM-3001] absorbed→narrowed; [SCP-PERM-3030] handle-affinity propagates (py re-raises inside UcanError handler via startswith guard; ts closed-allowlist regex absorbs ONLY 3001). Empty/absent tokens → all-false both. Behavioral layer catches only context errors (py ContextError / ts [SCP-CTX-] prefix), tool_invocations-only, other fields honest-0 not fabricated. VERDICT: APPROVED.

@@ -55,13 +55,13 @@ use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::params::{Capability, ContextParams, ToolRegistration};
-use super::roles::ToolId;
-use super::tools::interface::ToolInterface;
+use super::outlets::OutletId;
+use super::outlets::interface::OutletInterface;
+use super::params::{Capability, ContextParams, OutletRegistration};
 use crate::economy::antispam::HardRateLimitConfig;
 use crate::economy::types::{Amount, EconomicPolicy};
+use scp_did::{DID, SigningKeyId};
 use scp_event_log::{ContextId, Ed25519Signature};
-use scp_primitives::{DID, SigningKeyId};
 
 // ---------------------------------------------------------------------------
 // KeyResolver
@@ -114,7 +114,7 @@ pub type ProposalId = [u8; 32];
 /// serialized form must be deterministic across all SDK implementations
 /// (Rust, Python, TypeScript, Kotlin, Swift). `MessagePack` has no canonical
 /// form standard. This is consistent with all other cross-implementation
-/// canonical hashing in the protocol: handle tool signing (§22), app
+/// canonical hashing in the protocol: handle outlet signing (§22), app
 /// declarations (§8), DID documents (§18), and
 /// `ParentGovernanceConfig::content_hash()` in nesting.rs. See §9.5.2.
 #[must_use]
@@ -359,7 +359,7 @@ pub struct SizeBasedPolicy {
 /// Event-type retention multipliers (ADR-030 §2c).
 ///
 /// Structural events (governance, membership) are retained longer than
-/// operational events (messages, tool invocations).
+/// operational events (messages, outlet invocations).
 ///
 /// Multipliers are expressed in basis points where 10000 = 1.0x multiplier.
 /// E.g. 30000 = 3.0x.
@@ -537,7 +537,7 @@ pub struct DeadlockJustification {
 /// these variants.
 ///
 /// The governance engine evaluates proposals containing these actions. This
-/// covers: membership, roles, settings, ceiling, content access, tool
+/// covers: membership, roles, settings, ceiling, content access, outlet
 /// interfaces, pruning, conflict resolution, and deadlock recovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GovernanceAction {
@@ -565,15 +565,15 @@ pub enum GovernanceAction {
         /// The new role to assign.
         new_role: String,
     },
-    /// Register a new tool in the context.
-    RegisterTool {
-        /// The full tool registration descriptor.
-        registration: Box<ToolRegistration>,
+    /// Register a new outlet in the context.
+    RegisterOutlet {
+        /// The full outlet registration descriptor.
+        registration: Box<OutletRegistration>,
     },
-    /// Remove a tool from the context.
-    RemoveTool {
-        /// The identifier of the tool to remove.
-        tool_id: ToolId,
+    /// Remove a outlet from the context.
+    RemoveOutlet {
+        /// The identifier of the outlet to remove.
+        outlet_id: OutletId,
     },
     /// Modify the capability ceiling (only if `ceiling_policy` is `Governed`).
     ModifyCeiling {
@@ -658,10 +658,10 @@ pub enum GovernanceAction {
         /// The new threshold value.
         new_threshold: u32,
     },
-    /// Establish a tool interface with another context (§6.2).
-    EstablishToolInterface {
-        /// The tool interface to establish.
-        interface: ToolInterface,
+    /// Establish a outlet interface with another context (§6.2).
+    EstablishOutletInterface {
+        /// The outlet interface to establish.
+        interface: OutletInterface,
     },
     /// Governance-triggered member reset (ADR-029, Tier 3).
     ///
@@ -763,7 +763,7 @@ pub enum GovernanceAction {
     ///
     /// The hard rate limit is a token bucket layered on top of the
     /// per-DID economic escalation, enforced on messaging, join, and
-    /// tool invocation paths. Allows governance to tighten or loosen
+    /// outlet invocation paths. Allows governance to tighten or loosen
     /// the cap in response to observed abuse patterns without having
     /// to close and recreate the context.
     ///
@@ -791,8 +791,8 @@ impl GovernanceAction {
             Self::AddMember { .. } => "AddMember",
             Self::RemoveMember { .. } => "RemoveMember",
             Self::ChangeRole { .. } => "ChangeRole",
-            Self::RegisterTool { .. } => "RegisterTool",
-            Self::RemoveTool { .. } => "RemoveTool",
+            Self::RegisterOutlet { .. } => "RegisterOutlet",
+            Self::RemoveOutlet { .. } => "RemoveOutlet",
             Self::ModifyCeiling { .. } => "ModifyCeiling",
             Self::CloseContext { .. } => "CloseContext",
             Self::ExtendTtl { .. } => "ExtendTtl",
@@ -806,7 +806,7 @@ impl GovernanceAction {
             Self::AddSigner { .. } => "AddSigner",
             Self::RemoveSigner { .. } => "RemoveSigner",
             Self::ModifyThreshold { .. } => "ModifyThreshold",
-            Self::EstablishToolInterface { .. } => "EstablishToolInterface",
+            Self::EstablishOutletInterface { .. } => "EstablishOutletInterface",
             Self::ResetMember { .. } => "ResetMember",
             Self::ResolveConflict { .. } => "ResolveConflict",
             Self::PromoteContext => "PromoteContext",
@@ -819,6 +819,112 @@ impl GovernanceAction {
             Self::CancelContextMigration => "CancelContextMigration",
             Self::ModifyHardRateLimit { .. } => "ModifyHardRateLimit",
         }
+    }
+
+    /// Returns `true` if this action is unambiguously **adverse** toward its
+    /// target — i.e., a punitive/capability-reducing action that should be
+    /// counted in `governance_actions_against` for the H18 standing-deflation
+    /// defense (`trust::participation`).
+    ///
+    /// This is the **single, compile-enforced source of truth** for
+    /// adverseness. The `match` has **no wildcard arm on purpose**: adding a
+    /// new [`GovernanceAction`] variant fails to compile until it is explicitly
+    /// classified here, so a new punitive variant can never silently fall
+    /// through as "not adverse" (the exact drift #2000 guards against).
+    ///
+    /// Only actions whose adverseness is determinable **from the action type
+    /// alone** return `true`. Actions whose adverseness depends on a role delta
+    /// — `ChangeRole` (a demotion is adverse, a promotion is not) and
+    /// `RemoveSigner` — return `false`, so `governance_actions_against` stays a
+    /// conservative LOWER BOUND that undercounts rather than over-counts (never
+    /// mis-scoring a promotion or beneficial action as adverse). Beneficial
+    /// actions (`RestoreAccess`, `AddMember`, …) are likewise `false`.
+    #[must_use]
+    pub const fn is_adverse(&self) -> bool {
+        match self {
+            // Punitive / capability-reducing — adverse toward the target.
+            Self::RemoveMember { .. }
+            | Self::SuspendCapability { .. }
+            | Self::SuspendAccess { .. }
+            | Self::RevokeAccess { .. }
+            | Self::ResetMember { .. } => true,
+
+            // Not adverse from the action type alone (beneficial, neutral, or
+            // role-delta-dependent → conservatively excluded).
+            Self::AddMember { .. }
+            | Self::ChangeRole { .. }
+            | Self::RegisterOutlet { .. }
+            | Self::RemoveOutlet { .. }
+            | Self::ModifyCeiling { .. }
+            | Self::CloseContext { .. }
+            | Self::ExtendTtl { .. }
+            | Self::TransferAdmin { .. }
+            | Self::CreateChildContext { .. }
+            | Self::RestoreAccess { .. }
+            | Self::ModifyPruningPolicy { .. }
+            | Self::AddSigner { .. }
+            | Self::RemoveSigner { .. }
+            | Self::ModifyThreshold { .. }
+            | Self::EstablishOutletInterface { .. }
+            | Self::ResolveConflict { .. }
+            | Self::PromoteContext
+            | Self::RotateContentKeys { .. }
+            | Self::ReconfigureGovernance { .. }
+            | Self::SetEconomicPolicy { .. }
+            | Self::ApproveSpend { .. }
+            | Self::LockEconomicPolicy
+            | Self::ProposeContextMigration { .. }
+            | Self::CancelContextMigration
+            | Self::ModifyHardRateLimit { .. } => false,
+        }
+    }
+
+    /// Classifies a governance action by its [`Self::variant_name`] string,
+    /// routing through the exhaustive [`Self::is_adverse`] classification.
+    ///
+    /// The participation read path (`trust::participation`) only has the
+    /// `action_type` **string** from the decoded event payload, not the typed
+    /// action. This maps that string back through the typed classifier: it
+    /// builds a representative instance for the name and calls
+    /// [`Self::is_adverse`], so [`Self::is_adverse`] remains the sole authority
+    /// for the decision. A name matching no known adverse variant resolves to
+    /// `false` (non-adverse), the documented lower-bound direction.
+    #[must_use]
+    pub fn is_adverse_variant_name(action_type: &str) -> bool {
+        Self::adverse_representative(action_type).is_some_and(|a| a.is_adverse())
+    }
+
+    /// Builds a representative (dummy-data) instance for an action-type name so
+    /// [`Self::is_adverse_variant_name`] can route a string through the typed
+    /// [`Self::is_adverse`] classifier. Only the adverse variants need an arm:
+    /// every other name resolves to `None` → non-adverse, which is what
+    /// [`Self::is_adverse`] returns for them anyway. When you add a new
+    /// **adverse** variant, [`Self::is_adverse`] (no wildcard) forces you to
+    /// return `true` there; add its arm here too so the string-keyed event path
+    /// counts it. The `is_adverse_variant_name_matches_is_adverse` test
+    /// constructs every variant and fails until the two agree.
+    fn adverse_representative(action_type: &str) -> Option<Self> {
+        let did = || DID::from("did:scp:adverse-representative");
+        Some(match action_type {
+            "RemoveMember" => Self::RemoveMember {
+                did: did(),
+                reason: None,
+            },
+            "SuspendCapability" => Self::SuspendCapability {
+                did: did(),
+                capabilities: Vec::new(),
+            },
+            "SuspendAccess" => Self::SuspendAccess { did: did() },
+            "RevokeAccess" => Self::RevokeAccess {
+                did: did(),
+                access: AccessScope::Both,
+            },
+            "ResetMember" => Self::ResetMember {
+                did: did(),
+                reason: String::new(),
+            },
+            _ => return None,
+        })
     }
 
     /// Returns the target DID for actions that operate on a specific member.
@@ -842,15 +948,15 @@ impl GovernanceAction {
             | Self::RemoveSigner { did } => Some(did),
             Self::TransferAdmin { new_admin } => Some(new_admin),
             Self::ApproveSpend { spender, .. } => Some(spender),
-            Self::RegisterTool { .. }
-            | Self::RemoveTool { .. }
+            Self::RegisterOutlet { .. }
+            | Self::RemoveOutlet { .. }
             | Self::ModifyCeiling { .. }
             | Self::CloseContext { .. }
             | Self::ExtendTtl { .. }
             | Self::CreateChildContext { .. }
             | Self::ModifyPruningPolicy { .. }
             | Self::ModifyThreshold { .. }
-            | Self::EstablishToolInterface { .. }
+            | Self::EstablishOutletInterface { .. }
             | Self::ResolveConflict { .. }
             | Self::PromoteContext
             | Self::RotateContentKeys { .. }
@@ -891,6 +997,27 @@ pub struct SignedVote {
     pub timestamp: u64,
     /// Ed25519 signature over the vote content.
     pub signature: Ed25519Signature,
+}
+
+/// Outcome of an engine's pre-vote guard checks (`precheck_vote`).
+///
+/// The guard checks (eligibility, proposal existence, pending state, deadline,
+/// single-vote dedup) run **before** any signing or signature verification, so
+/// that a double vote is caught as `AlreadyVoted` regardless of which key signed
+/// it. Most engines only ever return [`Proceed`](PrecheckOutcome::Proceed) from
+/// a successful precheck. The majority engine additionally short-circuits a
+/// past-deadline vote by auto-resolving the proposal **without recording a vote
+/// and without signing** — that case is carried by
+/// [`Resolved`](PrecheckOutcome::Resolved) so the caller returns the resolution
+/// directly.
+pub(super) enum PrecheckOutcome {
+    /// Guards passed; the caller should build, sign, and verify the vote,
+    /// then call `push_and_resolve`.
+    Proceed,
+    /// The proposal was auto-resolved during precheck (majority past-deadline).
+    /// The caller returns this status and its events directly, recording no
+    /// vote and performing no signing or verification.
+    Resolved((ProposalStatus, Vec<GovernanceEvent>)),
 }
 
 // ---------------------------------------------------------------------------
@@ -2108,7 +2235,7 @@ mod tests {
         actions
     }
 
-    /// Core governance actions (membership, tools, settings, access control).
+    /// Core governance actions (membership, outlets, settings, access control).
     fn governance_actions_core() -> Vec<GovernanceAction> {
         vec![
             GovernanceAction::AddMember {
@@ -2123,25 +2250,28 @@ mod tests {
                 did: bob(),
                 new_role: "observer".to_owned(),
             },
-            GovernanceAction::RegisterTool {
-                registration: Box::new(ToolRegistration {
-                    tool_id: "search".to_owned(),
+            GovernanceAction::RegisterOutlet {
+                registration: Box::new(OutletRegistration {
+                    outlet_id: "search".to_owned(),
+                    kind: crate::context::outlets::OutletKind::Action,
                     name: "search".to_owned(),
-                    description: "Search tool".to_owned(),
-                    schema: crate::context::tools::ToolSchema {
+                    description: "Search outlet".to_owned(),
+                    schema: crate::context::outlets::OutletSchema {
                         input_schema: serde_json::json!({"type": "object"}),
                         output_schema: serde_json::json!({"type": "object"}),
+                        aggregate_schema: None,
                     },
                     implementation_hash: [0u8; 32],
                     test_vectors: vec![],
+                    message_catalog: Vec::new(),
                     operator_did: "did:dht:z6MkTestOperator".into(),
                     cost: None,
                     registered_at: 0,
                     signature: Vec::new(),
                 }),
             },
-            GovernanceAction::RemoveTool {
-                tool_id: "search".to_owned(),
+            GovernanceAction::RemoveOutlet {
+                outlet_id: "search".to_owned(),
             },
             GovernanceAction::ModifyCeiling {
                 new_ceiling: vec![Capability::MessagesRead],
@@ -2177,17 +2307,17 @@ mod tests {
     /// Extended governance actions (signers, interfaces, structural,
     /// content access, economic).
     fn governance_actions_extended() -> Vec<GovernanceAction> {
-        use crate::context::tools::interface::ToolInterface;
+        use crate::context::outlets::interface::OutletInterface;
 
         vec![
             GovernanceAction::AddSigner { did: carol() },
             GovernanceAction::RemoveSigner { did: carol() },
             GovernanceAction::ModifyThreshold { new_threshold: 2 },
-            GovernanceAction::EstablishToolInterface {
-                interface: ToolInterface {
+            GovernanceAction::EstablishOutletInterface {
+                interface: OutletInterface {
                     source_context: "ctx-src".to_owned(),
                     target_context: "ctx-tgt".to_owned(),
-                    tool_id: "tool-1".to_owned(),
+                    outlet_id: "outlet-1".to_owned(),
                     rate_limit: None,
                     inbound_rate_limit: None,
                     per_caller_rate_limit: None,
@@ -2229,7 +2359,7 @@ mod tests {
                     cost_schedule: crate::economy::types::CostSchedule {
                         currency: crate::economy::types::CurrencyCode::from("USD"),
                         per_message: Some(Amount::new(1)),
-                        per_tool_invoke: None,
+                        per_outlet_call: None,
                         per_join: None,
                         per_period: None,
                         per_byte_stored: None,
@@ -2242,7 +2372,7 @@ mod tests {
             GovernanceAction::ApproveSpend {
                 spender: bob(),
                 amount: Amount::new(1000),
-                purpose: "tool costs".to_owned(),
+                purpose: "outlet costs".to_owned(),
             },
             GovernanceAction::LockEconomicPolicy,
             GovernanceAction::ProposeContextMigration {
@@ -2688,25 +2818,28 @@ mod tests {
                 did: bob(),
                 new_role: "observer".to_owned(),
             },
-            GovernanceAction::RegisterTool {
-                registration: Box::new(ToolRegistration {
-                    tool_id: "calc".to_owned(),
+            GovernanceAction::RegisterOutlet {
+                registration: Box::new(OutletRegistration {
+                    outlet_id: "calc".to_owned(),
+                    kind: crate::context::outlets::OutletKind::Action,
                     name: "calc".to_owned(),
-                    description: "Calculator tool".to_owned(),
-                    schema: crate::context::tools::ToolSchema {
+                    description: "Calculator outlet".to_owned(),
+                    schema: crate::context::outlets::OutletSchema {
                         input_schema: serde_json::json!({"type": "object"}),
                         output_schema: serde_json::json!({"type": "object"}),
+                        aggregate_schema: None,
                     },
                     implementation_hash: [0u8; 32],
                     test_vectors: vec![],
+                    message_catalog: Vec::new(),
                     operator_did: "did:dht:z6MkTestOperator".into(),
                     cost: None,
                     registered_at: 0,
                     signature: Vec::new(),
                 }),
             },
-            GovernanceAction::RemoveTool {
-                tool_id: "calc".to_owned(),
+            GovernanceAction::RemoveOutlet {
+                outlet_id: "calc".to_owned(),
             },
             GovernanceAction::ModifyCeiling {
                 new_ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
@@ -2727,7 +2860,7 @@ mod tests {
                     cost_schedule: crate::economy::types::CostSchedule {
                         currency: crate::economy::types::CurrencyCode::from("USD"),
                         per_message: Some(crate::economy::types::Amount::new(1)),
-                        per_tool_invoke: None,
+                        per_outlet_call: None,
                         per_join: None,
                         per_period: None,
                         per_byte_stored: None,
@@ -2740,7 +2873,7 @@ mod tests {
             GovernanceAction::ApproveSpend {
                 spender: bob(),
                 amount: Amount::new(1000),
-                purpose: "tool costs".to_owned(),
+                purpose: "outlet costs".to_owned(),
             },
             GovernanceAction::LockEconomicPolicy,
         ];
@@ -3329,7 +3462,7 @@ mod tests {
             cost_schedule: crate::economy::types::CostSchedule {
                 currency: crate::economy::types::CurrencyCode::from("USD"),
                 per_message: Some(Amount::new(10)),
-                per_tool_invoke: Some(Amount::new(50)),
+                per_outlet_call: Some(Amount::new(50)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -3366,7 +3499,7 @@ mod tests {
         let action = GovernanceAction::ApproveSpend {
             spender: bob(),
             amount: Amount::new(5000),
-            purpose: "tool invocation budget".to_owned(),
+            purpose: "outlet invocation budget".to_owned(),
         };
 
         let (proposal, events) = engine.propose(&admin, action, &ctx, &sk).unwrap();

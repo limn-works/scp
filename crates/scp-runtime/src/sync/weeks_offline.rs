@@ -37,7 +37,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_protocol::sync::{ContextId, Ed25519Signature, SyncError, SyncOutcome};
 
@@ -699,7 +699,7 @@ pub struct ReJoinPlan {
 /// - Their DID and identity
 /// - Their role in the context (re-assigned by admin during re-add)
 /// - Their event log history up to the last known epoch
-/// - Context metadata (params, tools, ceiling)
+/// - Context metadata (params, outlets, ceiling)
 ///
 /// The reset member loses:
 /// - Access to messages encrypted in skipped epochs (forward secrecy)
@@ -715,8 +715,8 @@ pub struct StatePreservation {
     pub local_merkle_root: [u8; 32],
     /// Context metadata (params hash) to verify continuity.
     pub params_hash: [u8; 32],
-    /// Tool names active at reset time.
-    pub active_tools: Vec<String>,
+    /// Outlet names active at reset time.
+    pub active_outlets: Vec<String>,
     /// Membership roster at reset time (DID -> role name).
     pub membership_roster: BTreeMap<String, String>,
     /// Number of governance proposals invalidated by the reset.
@@ -1522,7 +1522,7 @@ mod tests {
                 local_event_count: 1000,
                 local_merkle_root: [1u8; 32],
                 params_hash: [2u8; 32],
-                active_tools: vec!["tool-a".to_owned()],
+                active_outlets: vec!["outlet-a".to_owned()],
                 membership_roster: BTreeMap::from([
                     ("did:alice".to_owned(), "admin".to_owned()),
                     ("did:bob".to_owned(), "member".to_owned()),
@@ -1537,7 +1537,7 @@ mod tests {
         assert_eq!(plan.last_known_epoch, 50);
         assert_eq!(plan.state_preservation.role_to_restore, "member");
         assert_eq!(plan.state_preservation.local_event_count, 1000);
-        assert_eq!(plan.state_preservation.active_tools, vec!["tool-a"]);
+        assert_eq!(plan.state_preservation.active_outlets, vec!["outlet-a"]);
         assert_eq!(plan.state_preservation.membership_roster.len(), 2);
         assert!(matches!(
             plan.inflight_handling,
@@ -1563,7 +1563,7 @@ mod tests {
                 local_event_count: 500,
                 local_merkle_root: [0u8; 32],
                 params_hash: [0u8; 32],
-                active_tools: vec![],
+                active_outlets: vec![],
                 membership_roster: BTreeMap::new(),
                 invalidated_proposals: 0,
             },
@@ -1597,7 +1597,7 @@ mod tests {
                 local_event_count: 2000,
                 local_merkle_root: [0u8; 32],
                 params_hash: [0u8; 32],
-                active_tools: vec![],
+                active_outlets: vec![],
                 membership_roster: BTreeMap::new(),
                 invalidated_proposals: 0,
             },
@@ -1848,13 +1848,13 @@ mod tests {
             local_event_count: 5000,
             local_merkle_root: [42u8; 32],
             params_hash: [7u8; 32],
-            active_tools: vec!["search".to_owned(), "translate".to_owned()],
+            active_outlets: vec!["search".to_owned(), "translate".to_owned()],
             membership_roster: roster,
             invalidated_proposals: 2,
         };
         assert_eq!(preservation.membership_roster.len(), 3);
         assert_eq!(preservation.invalidated_proposals, 2);
-        assert_eq!(preservation.active_tools.len(), 2);
+        assert_eq!(preservation.active_outlets.len(), 2);
     }
 
     // -----------------------------------------------------------------------
@@ -2022,7 +2022,7 @@ mod tests {
                 local_event_count: 50_000,
                 local_merkle_root: [99u8; 32],
                 params_hash: [88u8; 32],
-                active_tools: (0..20).map(|i| format!("tool-{i}")).collect(),
+                active_outlets: (0..20).map(|i| format!("outlet-{i}")).collect(),
                 membership_roster: roster,
                 invalidated_proposals: 0,
             },
@@ -2030,7 +2030,7 @@ mod tests {
         });
 
         assert_eq!(plan.state_preservation.membership_roster.len(), 101);
-        assert_eq!(plan.state_preservation.active_tools.len(), 20);
+        assert_eq!(plan.state_preservation.active_outlets.len(), 20);
         assert_eq!(plan.state_preservation.local_event_count, 50_000);
         assert!(matches!(
             plan.inflight_handling,

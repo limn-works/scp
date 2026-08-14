@@ -23,7 +23,7 @@
 // Python SDK files
 const PY_IDENTITY: &str = include_str!("../../../../bindings/python/scp_sdk/identity.py");
 const PY_CONTEXT: &str = include_str!("../../../../bindings/python/scp_sdk/context.py");
-const PY_TOOLS: &str = include_str!("../../../../bindings/python/scp_sdk/tools.py");
+const PY_OUTLETS: &str = include_str!("../../../../bindings/python/scp_sdk/outlets.py");
 const PY_UCAN: &str = include_str!("../../../../bindings/python/scp_sdk/ucan.py");
 const PY_EVENT_LOG: &str = include_str!("../../../../bindings/python/scp_sdk/event_log.py");
 const PY_TRANSPORT: &str = include_str!("../../../../bindings/python/scp_sdk/transport.py");
@@ -41,7 +41,7 @@ const PY_SCP: &str = include_str!("../../../../bindings/python/scp_sdk/scp.py");
 // TypeScript SDK files
 const TS_IDENTITY: &str = include_str!("../../../../bindings/typescript/src/identity.ts");
 const TS_CONTEXT: &str = include_str!("../../../../bindings/typescript/src/context.ts");
-const TS_TOOLS: &str = include_str!("../../../../bindings/typescript/src/tools.ts");
+const TS_OUTLETS: &str = include_str!("../../../../bindings/typescript/src/outlets.ts");
 // ucan.ts, event-log.ts, transport.ts — DELETED in #1549 Phase 4 PR 5.
 // Namespace classes collapsed to handle-only types (kept in context.ts /
 // identity.ts / scp.ts); every operation on those domains is now a method
@@ -53,7 +53,7 @@ const TS_TRUST: &str = include_str!("../../../../bindings/typescript/src/trust.t
 const TS_SYNC: &str = include_str!("../../../../bindings/typescript/src/sync.ts");
 const TS_BRIDGE: &str = include_str!("../../../../bindings/typescript/src/bridge.ts");
 // The TypeScript `Bridge` interface — the low-level adapter contract that
-// the SDK's native + WASM backends implement and that SCP class methods
+// the SDK's native backend implements and that SCP class methods
 // delegate to. Analogous to Swift's `ScpBindings.swift` (UniFFI-generated)
 // and Kotlin's `CoroutineBridge.kt`. Some NAPI-exposed operations
 // (`identityAddAgentKey`, `identityRotateAgentKey`,
@@ -66,7 +66,7 @@ const TS_BRIDGE_INTERNAL: &str =
 // Swift SDK files
 const SWIFT_IDENTITY: &str = include_str!("../../../../bindings/swift/Sources/SCP/Identity.swift");
 const SWIFT_CONTEXT: &str = include_str!("../../../../bindings/swift/Sources/SCP/Context.swift");
-const SWIFT_TOOLS: &str = include_str!("../../../../bindings/swift/Sources/SCP/Tools.swift");
+const SWIFT_OUTLETS: &str = include_str!("../../../../bindings/swift/Sources/SCP/Outlets.swift");
 const SWIFT_UCAN: &str = include_str!("../../../../bindings/swift/Sources/SCP/Ucan.swift");
 const SWIFT_EVENT_LOG: &str = include_str!("../../../../bindings/swift/Sources/SCP/EventLog.swift");
 const SWIFT_TRANSPORT: &str =
@@ -133,7 +133,7 @@ fn py_all() -> String {
     [
         PY_IDENTITY,
         PY_CONTEXT,
-        PY_TOOLS,
+        PY_OUTLETS,
         PY_UCAN,
         PY_EVENT_LOG,
         PY_TRANSPORT,
@@ -152,7 +152,7 @@ fn ts_all() -> String {
     [
         TS_IDENTITY,
         TS_CONTEXT,
-        TS_TOOLS,
+        TS_OUTLETS,
         TS_SCP,
         TS_DISCOVERY,
         TS_PROVENANCE,
@@ -168,7 +168,7 @@ fn swift_all() -> String {
     [
         SWIFT_IDENTITY,
         SWIFT_CONTEXT,
-        SWIFT_TOOLS,
+        SWIFT_OUTLETS,
         SWIFT_UCAN,
         SWIFT_EVENT_LOG,
         SWIFT_TRANSPORT,
@@ -397,30 +397,30 @@ fn expected_operations() -> Vec<ExpectedOp> {
             swift_patterns: &["SubscribeFn", "subscribe"],
             kt_patterns: &["fun contextSubscribe(", "subscribe"],
         },
-        // --- Tools ---
+        // --- Outlets ---
         ExpectedOp {
-            category: "Tools",
+            category: "Outlets",
             name: "register",
-            py_patterns: &["ToolDefinition", "class ToolDefinition"],
-            ts_patterns: &["registerTool(", "defineToolDefinition"],
-            swift_patterns: &["ToolDefinition", "toolRegister", "InvokeFn"],
-            kt_patterns: &["fun toolRegister("],
+            py_patterns: &["OutletDefinition", "class OutletDefinition"],
+            ts_patterns: &["registerOutlet(", "defineOutletDefinition"],
+            swift_patterns: &["OutletDefinition", "outletRegister"],
+            kt_patterns: &["fun outletRegister("],
         },
         ExpectedOp {
-            category: "Tools",
+            category: "Outlets",
             name: "invoke",
-            py_patterns: &["async def invoke(", "tool_invoke"],
-            ts_patterns: &["async invokeTool(", "toolInvoke"],
-            swift_patterns: &["ToolInvocationResult", "toolInvoke", "InvokeFn"],
-            kt_patterns: &["fun toolInvoke("],
+            py_patterns: &["async def invoke(", "outlet_invoke"],
+            ts_patterns: &["async invokeOutlet(", "outletInvoke"],
+            swift_patterns: &["OutletInvocationResult", "outletInvoke"],
+            kt_patterns: &["fun outletInvoke("],
         },
         ExpectedOp {
-            category: "Tools",
+            category: "Outlets",
             name: "verify",
             py_patterns: &["TestVector", "class TestVector"],
-            ts_patterns: &["verifyTool(", "toolVerify"],
-            swift_patterns: &["ToolVerificationResult", "verifyInclusion"],
-            kt_patterns: &["fun toolVerify("],
+            ts_patterns: &["verifyOutlet(", "outletVerify"],
+            swift_patterns: &["OutletVerificationResult", "verifyInclusion"],
+            kt_patterns: &["fun outletVerify("],
         },
         // --- UCAN ---
         // Phase 4 PR 4 moved the UCAN wrappers from free-function form
@@ -1417,7 +1417,7 @@ fn all_sdk_source_files_are_non_empty() {
     let files: &[(&str, &str)] = &[
         ("Python identity.py", PY_IDENTITY),
         ("Python context.py", PY_CONTEXT),
-        ("Python tools.py", PY_TOOLS),
+        ("Python outlets.py", PY_OUTLETS),
         ("Python ucan.py", PY_UCAN),
         ("Python event_log.py", PY_EVENT_LOG),
         ("Python transport.py", PY_TRANSPORT),
@@ -1429,7 +1429,7 @@ fn all_sdk_source_files_are_non_empty() {
         ("Python governance.py", PY_GOVERNANCE),
         ("TypeScript identity.ts", TS_IDENTITY),
         ("TypeScript context.ts", TS_CONTEXT),
-        ("TypeScript tools.ts", TS_TOOLS),
+        ("TypeScript outlets.ts", TS_OUTLETS),
         ("TypeScript scp.ts", TS_SCP),
         ("TypeScript discovery.ts", TS_DISCOVERY),
         ("TypeScript provenance.ts", TS_PROVENANCE),
@@ -1438,7 +1438,7 @@ fn all_sdk_source_files_are_non_empty() {
         ("TypeScript bridge.ts", TS_BRIDGE),
         ("Swift Identity.swift", SWIFT_IDENTITY),
         ("Swift Context.swift", SWIFT_CONTEXT),
-        ("Swift Tools.swift", SWIFT_TOOLS),
+        ("Swift Outlets.swift", SWIFT_OUTLETS),
         ("Swift Ucan.swift", SWIFT_UCAN),
         ("Swift EventLog.swift", SWIFT_EVENT_LOG),
         ("Swift Transport.swift", SWIFT_TRANSPORT),

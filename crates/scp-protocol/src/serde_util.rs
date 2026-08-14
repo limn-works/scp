@@ -8,6 +8,7 @@
 //!
 //! - [`serde_signature_64`] — Ed25519 signatures (exactly 64 bytes)
 //! - [`serde_hash_32`] — SHA-256 hashes (exactly 32 bytes)
+//! - [`serde_id_16`] — 128-bit opaque identifiers (exactly 16 bytes)
 //! - [`serde_pubkey_32`] — X25519 / Ed25519 public keys (exactly 32 bytes)
 //! - [`serde_hpke_sealed_48`] — HPKE-sealed sender key (exactly 48 bytes)
 //!
@@ -25,10 +26,11 @@
 //!   produces a non-deterministic digest. Sorting the elements before
 //!   serialization makes the canonical JSON — and therefore the export
 //!   signature digest — byte-identical across runs **within a single
-//!   serializer/bridge-family** (ADR-050, the `BTreeSet` convention named in
-//!   §23.16.8). This is NOT a cross-family byte-equivalence claim: native
-//!   (`MessagePack`) and WASM (JSON) serialize structurally different snapshot
-//!   value types, so only the *construction* converges, not the digest bytes.
+//!   serializer family** (ADR-050, the `BTreeSet` convention named in
+//!   §23.16.8). This is NOT a cross-serializer byte-equivalence claim: the
+//!   `MessagePack` wire format and the JSON (JCS) signing format serialize
+//!   structurally different snapshot value types, so only the *construction*
+//!   converges, not the digest bytes across serializers.
 //!   Deserialization
 //!   is order-independent for a set, so sorted serialization is always safe:
 //!   nothing correct can depend on a `HashSet`'s incidental iteration order.
@@ -115,6 +117,33 @@ pub mod serde_hash_32 {
         let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
         v.try_into().map_err(|v: Vec<u8>| {
             serde::de::Error::custom(format!("expected 32-byte hash, got {} bytes", v.len()))
+        })
+    }
+}
+
+/// Serde module for `[u8; 16]` fields (128-bit opaque identifiers).
+///
+/// Same pattern as [`serde_hash_32`] but for 16-byte values.
+#[allow(clippy::missing_errors_doc)] // Serde trait impls — error semantics are self-evident.
+pub mod serde_id_16 {
+    use serde::{self, Deserializer, Serializer};
+
+    /// Serializes a 16-byte array as compact binary via `serde_bytes`.
+    pub fn serialize<S>(bytes: &[u8; 16], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_bytes::serialize(bytes.as_slice(), serializer)
+    }
+
+    /// Deserializes exactly 16 bytes, rejecting any other length.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 16], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 16-byte id, got {} bytes", v.len()))
         })
     }
 }
@@ -474,8 +503,8 @@ pub mod serde_sorted_set {
         //
         // Amplification note: this performs one extra JCS serialization per set
         // element (O(n) in the number of elements), bounded by the export size
-        // cap enforced upstream before signing runs (native 64 MiB / WASM
-        // 16 MiB). Element types here are flat (no nested set-of-sets), so the
+        // cap enforced upstream before signing runs (64 MiB). Element types
+        // here are flat (no nested set-of-sets), so the
         // per-element JCS work is proportional to total export size, not
         // quadratic. If a nested set-of-sets element type is ever added,
         // re-evaluate the amplification factor before relying on this bound.

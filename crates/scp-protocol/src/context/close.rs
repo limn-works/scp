@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use super::memory_scope::{BlobId, ContextId, KeyDestructionLevel, KeyDestructionResult};
 use super::{ContextError, MemoryScope};
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // IncompleteVerificationPolicy
@@ -487,7 +487,7 @@ pub struct CloseRequest<'r> {
 //
 // After ADR-049 commit 12c.9e, `CloseOrchestrator` lives in
 // `scp_runtime::context::key_destruction` because it operates on the
-// concrete `MlsCryptoProvider`, which is defined in scp-runtime (forward
+// concrete `NodeMlsFactory`, which is defined in scp-runtime (forward
 // dep of scp-protocol). The pure-data close types (`CloseEvent`,
 // `CloseAction`, `ContextCloseReason`, `CloseRequest`,
 // `SummaryVerificationWindow`, …) remain here because they have no
@@ -551,7 +551,7 @@ mod tests {
     // Note: `MockCryptoProvider` and all `CloseOrchestrator` integration
     // tests moved to `scp_runtime::context::key_destruction` in ADR-049
     // commit 12c.9e — the orchestrator now binds to the concrete
-    // `MlsCryptoProvider` which lives in scp-runtime.
+    // `NodeMlsFactory` which lives in scp-runtime.
 
     // -----------------------------------------------------------------------
     // ContextCloseReason tests

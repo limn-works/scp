@@ -14,7 +14,7 @@
  * | `SCP-PERM-`     | 3000-3999   | Permission errors   |
  * | `SCP-CRYPTO-`   | 4000-4999   | Crypto errors       |
  * | `SCP-TRANS-`    | 5000-5999   | Transport errors    |
- * | `SCP-TOOL-`     | 6000-6999   | Tool errors         |
+ * | `SCP-OUTLET-`     | 6000-6999   | Outlet errors         |
  * | `SCP-VALID-`    | 7000-7999   | Validation errors   |
  * | `SCP-STORAGE-`  | 8000-8999   | Storage errors      |
  * | `SCP-ATTEST-`   | 9000-9999   | Attestation errors  |
@@ -107,11 +107,89 @@ export class TransportError extends ScpError {
   }
 }
 
-/** Tool registration, invocation, verification failures. */
-export class ToolError extends ScpError {
+/** Outlet registration, invocation, verification failures. */
+export class OutletError extends ScpError {
   constructor(message: string, code: string) {
     super(message, code);
-    this.name = "ToolError";
+    this.name = "OutletError";
+  }
+}
+
+/**
+ * Protocol-class outlet failure (`OutletErrorClass::Protocol`, §5.4.4).
+ *
+ * The common parent for every protocol-class condition — stream-lifecycle
+ * violations, stream-already-open, unknown-session — so a single `catch`
+ * branch can handle all protocol-class errors. A DIRECT subclass of
+ * {@link OutletError}; its protocol-class siblings ({@link InvalidGrant},
+ * {@link StreamAlreadyClosed}) sit at this same inheritance depth (the
+ * round-5 cross-SDK symmetry rule of SCP-OUT-038: lifecycle errors sit at
+ * the same depth as their semantic-class siblings).
+ *
+ * On the wire the class renders as the lowercase variant `"protocol"` and
+ * carries a code in the `SCP-OUTLET-6100..6101` Protocol sub-range.
+ */
+export class ProtocolError extends OutletError {
+  constructor(message: string, code = "SCP-OUTLET-6100") {
+    super(message, code);
+    this.name = "ProtocolError";
+  }
+}
+
+/**
+ * A stream-credit grant value outside the valid `u32` range (§5.4.5).
+ *
+ * Thrown at {@link Credit} construction — `new Credit(0)`, `new Credit(-1)`,
+ * `new Credit(2 ** 32)`, and non-integer / non-number values all throw this
+ * UNIFORMLY (never a bare `RangeError` / `TypeError`), matching the
+ * SCP-OUT-031 round-6 uniform `InvalidGrant` rule across all four SDKs. The
+ * valid range is the non-zero `u32` interval `[1, 2**32)`.
+ */
+export class InvalidGrant extends ProtocolError {
+  constructor(message: string, code = "SCP-OUTLET-6100") {
+    super(message, code);
+    this.name = "InvalidGrant";
+  }
+}
+
+/**
+ * A control-plane call on a handle whose stream already reached a terminal.
+ *
+ * Thrown by `InvocationHandle.grantCredit` and `InvocationHandle.cancel`
+ * when the handle's stream has already delivered a terminal chunk (an `End`
+ * or a terminal `Error`) — the §5.4.5 InvocationHandle lifecycle guard
+ * (SCP-OUT-038, API MAJOR 24). Sits at the same inheritance depth as its
+ * protocol-class siblings under {@link ProtocolError}.
+ */
+export class StreamAlreadyClosed extends ProtocolError {
+  constructor(message: string, code = "SCP-OUTLET-6100") {
+    super(message, code);
+    this.name = "StreamAlreadyClosed";
+  }
+}
+
+/**
+ * A gap (missing sequence) in an outlet stream's chunk sequence (§5.4.5).
+ *
+ * Sequence values are strictly monotonic per `request_id`; a receiver that
+ * observes a gap (a missing or regressed sequence) MUST cancel the stream and
+ * surface this error (spec §5.4.5 "Ordering and gaps",
+ * `OutletErrorClass::Execution::StreamGap`). The SDK {@link InvocationHandle}
+ * drain is that receiver: it tracks the expected next sequence and, on any
+ * non-contiguous chunk, signs an `OutletCancel` through the bridge and throws
+ * this error. A same-context stream flows over a lossless ordered channel so a
+ * gap never occurs in production — this is a defense-in-depth monotonicity
+ * check mirroring the §5.4.5 receiver-side recheck posture.
+ *
+ * Sits at the same inheritance depth as its protocol-class siblings
+ * ({@link InvalidGrant}, {@link StreamAlreadyClosed}) under
+ * {@link ProtocolError}. Carries the execution-class code `SCP-OUTLET-6131`
+ * (`execution.stream-gap`).
+ */
+export class StreamGap extends ProtocolError {
+  constructor(message: string, code = "SCP-OUTLET-6131") {
+    super(message, code);
+    this.name = "StreamGap";
   }
 }
 
@@ -163,43 +241,68 @@ export class EconomyError extends ScpError {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Cross-context outlet-invocation saga (§6.2.4 / ADR-049 §3a) terminal errors
+// ---------------------------------------------------------------------------
+//
+// These three subclasses surface the typed terminal space of the §6.2.4
+// cross-context outlet-invocation saga. They extend `OutletError` (the saga is a
+// outlet operation) and each carries the structured terminal datum the contract
+// makes load-bearing as a NAMED, read-only field. The napi bridge collapses the
+// typed `SagaError` into a single `Error` whose only payload is the
+// `ScpNapiError` Display string; `mapSagaError` reverses that string back into
+// the matching class below, preserving the datum.
+
 /**
- * The browser (WASM) bridge cannot enforce a paid context's economic policy
- * because `scp-runtime`'s `enforce_economy` pipeline (payment adapter, budget
- * tracker, velocity tracker, hard rate limit token bucket) does not compile
- * to `wasm32` per ADR-034. Creating a paid context — or running a
- * `SetEconomicPolicy` governance action with a paid policy — from the WASM
- * bridge is rejected fail-closed with `SCP-ECON-12095`.
+ * A §6.2.4 saga aborted at a Prepare phase (authorization, freshness, rate
+ * limit, co-residency, or a transiently-unavailable participant actor).
  *
- * To create paid contexts, use a native (Python / Node.js / Swift / Kotlin)
- * client whose bridge does run `enforce_economy`.
- *
- * Subclass of [`EconomyError`].
+ * An `Aborted` terminal may be a PERMANENT rejection the caller must not
+ * blindly retry, OR a RETRYABLE transient (rate limit / participant-actor
+ * unavailable); the two are distinguished by the `SCP-SAGA-*` code.
  */
-export class EconomicPolicyUnsupportedOnWasm extends EconomyError {
-  constructor(message: string, code: string) {
+export class SagaAbortedError extends OutletError {
+  /**
+   * Rate-limit back-off hint in milliseconds when the tripped limiter can
+   * compute one, or `null` when no precise back-off instant exists. NEVER `0`
+   * — a `0` would read as "retry immediately" and re-trip the same hard limit.
+   */
+  readonly retryAfterMs: number | null;
+
+  constructor(message: string, code = "SCP-SAGA-13067", retryAfterMs: number | null = null) {
     super(message, code);
-    this.name = "EconomicPolicyUnsupportedOnWasm";
+    this.name = "SagaAbortedError";
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
 /**
- * The browser (WASM) bridge cannot cryptographically validate a spending
- * UCAN against a payment adapter, budget tracker, velocity tracker, or hard
- * rate limit token bucket because `scp-runtime`'s `enforce_economy` pipeline
- * does not compile to `wasm32` per ADR-034. Joining or sending into a paid
- * context from the WASM bridge is rejected fail-closed with
- * `SCP-ECON-12096`, regardless of whether `spending_ucan_jwt` is supplied.
- *
- * To join or send messages in paid contexts, use a native (Python / Node.js
- * / Swift / Kotlin) client whose bridge does run `enforce_economy`.
- *
- * Subclass of [`EconomyError`].
+ * A §6.2.4 saga exhausted its Commit retries and may have diverged (a partial
+ * commit requiring operator repair).
  */
-export class WasmCannotValidateSpendingUcan extends EconomyError {
-  constructor(message: string, code: string) {
+export class SagaNeedsRepairError extends OutletError {
+  /** The durable operator-repair handle for the diverged saga. */
+  readonly sagaId: string;
+
+  constructor(message: string, code = "SCP-SAGA-13065", sagaId = "") {
     super(message, code);
-    this.name = "WasmCannotValidateSpendingUcan";
+    this.name = "SagaNeedsRepairError";
+    this.sagaId = sagaId;
+  }
+}
+
+/**
+ * A §6.2.4 saga's participant context set overlapped an in-flight saga
+ * (per-participant-context-set gating, §5.15.4).
+ */
+export class SagaBusyError extends OutletError {
+  /** The shared context id that overlapped an in-flight saga. */
+  readonly contendedContext: string;
+
+  constructor(message: string, code = "SCP-SAGA-13066", contendedContext = "") {
+    super(message, code);
+    this.name = "SagaBusyError";
+    this.contendedContext = contendedContext;
   }
 }
 
@@ -210,9 +313,8 @@ export class WasmCannotValidateSpendingUcan extends EconomyError {
 /**
  * Error code prefix to ScpError subclass mapping.
  *
- * The napi-rs bridge encodes errors as `"[{code}] {category} error: {message}"`.
- * The WASM bridge encodes errors as `"[{code}] {message}"`.
- * Both include a bracketed code prefix that this function parses.
+ * The napi-rs bridge encodes errors as `"[{code}] {category} error: {message}"`,
+ * which includes a bracketed code prefix that this function parses.
  */
 type ScpErrorConstructor = new (message: string, code: string) => ScpError;
 
@@ -222,7 +324,7 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
   ["SCP-PERM-", UcanPermissionError],
   ["SCP-CRYPTO-", CryptoError],
   ["SCP-TRANS-", TransportError],
-  ["SCP-TOOL-", ToolError],
+  ["SCP-OUTLET-", OutletError],
   ["SCP-VALID-", ValidationError],
   ["SCP-STORAGE-", StorageError],
   ["SCP-ATTEST-", AttestationError],
@@ -232,48 +334,36 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
 ];
 
 /**
- * Per-code overrides used when a specific error code maps to a more
- * specific subclass than its category prefix would suggest. The map is
- * checked BEFORE the prefix walk so a single ECON code can resolve to
- * `EconomicPolicyUnsupportedOnWasm` rather than the generic
- * `EconomyError`.
- *
- * Today this only carries the C2 fail-closed gate codes (SCP-ECON-12095
- * and SCP-ECON-12096). Add new entries when a code needs an inheritance-
- * specific subclass that the bracketed prefix alone cannot select.
- */
-const ERROR_CODE_OVERRIDES: ReadonlyMap<string, ScpErrorConstructor> = new Map<
-  string,
-  ScpErrorConstructor
->([
-  ["SCP-ECON-12095", EconomicPolicyUnsupportedOnWasm],
-  ["SCP-ECON-12096", WasmCannotValidateSpendingUcan],
-]);
-
-/**
  * Parses a bridge error message and constructs the appropriate `ScpError`
  * subclass.
  *
  * Bridge errors follow the format `"[SCP-CATEGORY-NUMBER] description"`.
  * If the error message does not match any known prefix, a generic `ScpError`
- * is returned. Specific error codes may be promoted to a finer-grained
- * subclass via [`ERROR_CODE_OVERRIDES`].
+ * is returned.
  *
  * @param error - The raw error from the bridge layer (Error, string, or unknown).
  * @returns A typed `ScpError` subclass instance.
  */
 export function mapBridgeError(error: unknown): ScpError {
+  // Pass already-typed SDK errors through untouched. SDK guard layers throw
+  // fully-formed `ScpError` subclasses whose stable `.code` is the constructor
+  // argument, not embedded in the message text. Re-deriving the code from the
+  // message via the
+  // bracket regex below cannot find a `[SCP-CAT-NNNN]` token in those messages,
+  // so it would fall back to `SCP-UNKNOWN-0000` and downgrade a precise typed
+  // error (e.g. `TransportError` → generic `ScpError`). An already-typed error
+  // already carries the structured truth; re-mapping can only lose information.
+  if (error instanceof ScpError) {
+    return error;
+  }
+
   const message = error instanceof Error ? error.message : String(error);
 
-  // Try to extract the bracketed error code: "[SCP-IDENT-1001]"
-  const codeMatch = /\[([A-Z]+-[A-Z]+-\d+)\]/.exec(message);
+  // Try to extract the bracketed error code: "[SCP-IDENT-1001]".
+  // Anchored at ^ so a code embedded mid-message (e.g. in advice text) is
+  // not mistakenly extracted as the primary code (Fix 4).
+  const codeMatch = /^\[([A-Z]+-[A-Z]+-\d+)\]/.exec(message);
   const code = codeMatch?.[1] ?? "SCP-UNKNOWN-0000";
-
-  // Code-specific override (e.g. C2 fail-closed gate).
-  const Override = ERROR_CODE_OVERRIDES.get(code);
-  if (Override !== undefined) {
-    return new Override(message, code);
-  }
 
   for (const [prefix, ErrorClass] of ERROR_PREFIX_MAP) {
     if (code.startsWith(prefix)) {
@@ -282,4 +372,69 @@ export function mapBridgeError(error: unknown): ScpError {
   }
 
   return new ScpError(message, code);
+}
+
+/**
+ * Maps a §6.2.4 cross-context outlet-invocation saga terminal error onto its SDK
+ * exception class.
+ *
+ * The napi bridge collapses the typed `SagaError` terminal into a single
+ * `Error` whose only payload is the `ScpNapiError` Display string:
+ *
+ *   - `[{code}] saga aborted: {message} (retry_after_ms={null|<u64>})`
+ *   - `[{code}] saga needs repair: {message} (saga_id={saga_id})`
+ *   - `[{code}] saga busy: {message} (contended_context={contended_context})`
+ *
+ * where `{code}` is a `SCP-SAGA-#####` code. This function reverses the
+ * structured terminal datum out of that suffix. The Display suffix is ALWAYS
+ * terminal, so the datum regexes are end-anchored (`\s*$`); end-anchored is
+ * therefore last-anchored — a decoy `(retry_after_ms=…)` embedded inside
+ * `{message}` is non-terminal and cannot match, so only the genuine trailing
+ * datum is read.
+ *
+ * Errors that do not carry a `SCP-SAGA-` code are not saga terminals; they
+ * delegate to {@link mapBridgeError} unchanged.
+ *
+ * @param error - The raw error from the bridge layer (Error, string, or unknown).
+ * @returns A typed saga `ScpError` subclass, or whatever `mapBridgeError` yields.
+ */
+export function mapSagaError(error: unknown): ScpError {
+  const message = error instanceof Error ? error.message : String(error);
+
+  // Saga codes are `SCP-SAGA-#####`. Anchor at the start so a `SCP-SAGA-`
+  // appearing only inside `{message}` text cannot masquerade as the code.
+  const codeMatch = /^\s*\[(SCP-SAGA-\d+)\]/.exec(message);
+  const code = codeMatch?.[1];
+  if (code === undefined) {
+    // Not a saga terminal — defer to the generic bridge error mapping.
+    return mapBridgeError(error);
+  }
+
+  // Dispatch on the phrase ANCHORED immediately after the `[{code}] ` prefix.
+  // The NAPI Display format (crates/scp-ffi/napi/src/error.rs:127-170) fixes the
+  // phrase there; a phrase substring appearing only inside {message} is
+  // non-terminal and must not win — same anchoring discipline as the
+  // start-anchored code and end-anchored datum extraction.
+  const phraseMatch = /^\s*\[SCP-SAGA-\d+\] saga (aborted|needs repair|busy):/.exec(message);
+  switch (phraseMatch?.[1]) {
+    case "aborted": {
+      const m = /\(retry_after_ms=(null|\d+)\)\s*$/.exec(message);
+      const datum = m?.[1];
+      // null / absent ⇒ null, NEVER 0 (a `0` would read as "retry immediately").
+      const retryAfterMs = datum === undefined || datum === "null" ? null : Number(datum);
+      return new SagaAbortedError(message, code, retryAfterMs);
+    }
+    case "needs repair": {
+      const m = /\(saga_id=([^()]*)\)\s*$/.exec(message);
+      return new SagaNeedsRepairError(message, code, m?.[1] ?? "");
+    }
+    case "busy": {
+      const m = /\(contended_context=([^()]*)\)\s*$/.exec(message);
+      return new SagaBusyError(message, code, m?.[1] ?? "");
+    }
+    default:
+      // An SCP-SAGA code with an unrecognized phrase → preserve classification
+      // as OutletError rather than silently dropping it.
+      return new OutletError(message, code);
+  }
 }

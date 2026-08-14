@@ -14,7 +14,7 @@
 use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 
 use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
 
@@ -440,7 +440,7 @@ impl<S: Storage> ProtocolRepository<S> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
 

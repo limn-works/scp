@@ -2,7 +2,7 @@
 
 > `scp-python` -- Shared Context Protocol for Python
 
-Cryptographic identity, encrypted contexts, capability-based auth, and tool invocation for AI agents. Built on Rust via PyO3.
+Cryptographic identity, encrypted contexts, capability-based auth, and outlet invocation for AI agents. Built on Rust via PyO3.
 
 ## Install
 
@@ -15,6 +15,7 @@ pip install scp-python
 ```python
 import asyncio
 from scp_sdk import Identity, Context
+
 
 async def main():
     # Create a cryptographic identity (DID)
@@ -36,6 +37,7 @@ async def main():
         break
 
     await ctx.close()
+
 
 asyncio.run(main())
 ```
@@ -71,8 +73,8 @@ See [`examples/`](./examples/) for runnable scripts:
 | File | Description |
 |------|-------------|
 | `basic_messaging.py` | Create identity, context, send/receive messages |
-| `tool_invocation.py` | Register and invoke a tool with test vectors |
-| `mcp_integration.py` | Expose SCP tools via MCP JSON-RPC server |
+| `outlet_invocation.py` | Register and invoke a outlet with test vectors |
+| `mcp_integration.py` | Expose SCP outlets via MCP JSON-RPC server |
 | `multi_agent.py` | Coordinate multiple agents in a shared context |
 
 ## Error Handling

@@ -1,5 +1,7 @@
 # Cryptographic Invariants Must Be Asserted On Every Bridge, Not Just Named in the Matrix
 
+> **ADR-055 (2026-06-29):** the WASM bridge was removed; the SCP-1717 incident narrative below references a fourth WASM/wasm-bindgen bridge (which happened to be the reference that re-asserted the invariant) as historical fact. There are now three bridges (PyO3, NAPI, UniFFI); the browser is a remote thin client. The rule — every cryptographic invariant must be re-asserted, in bytes, on every bridge that emits the artifact — remains evergreen across the three remaining bridges.
+
 **Date:** 2026-04-27
 **Source:** SCP-1717 — three native bridges (PyO3, NAPI, UniFFI) silently emitted invalid pre-rotation proofs because only the WASM bridge re-asserted the spec §3.7 `SHA-256(revealed_key) == commitment` invariant.
 

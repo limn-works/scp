@@ -35,20 +35,24 @@ import uniffi.scp.ContextParams
 import uniffi.scp.DidDocument
 import uniffi.scp.Event
 import uniffi.scp.Identity
+import uniffi.scp.InviteMemberOutcome
 import uniffi.scp.KeyCustodyProvider
 import uniffi.scp.McpAllowlistState
 import uniffi.scp.McpInvokeResult
 import uniffi.scp.McpServerConfig
-import uniffi.scp.McpToolInfo
+import uniffi.scp.McpOutletInfo
 import uniffi.scp.MessageListener
 import uniffi.scp.Proof
 import uniffi.scp.PublishResult
 import uniffi.scp.ReconnectReport
+import uniffi.scp.ReservedKeyPackage
+import uniffi.scp.SagaResult
+import uniffi.scp.SealedInvitation
 import uniffi.scp.SqliteKeyMaterial
 import uniffi.scp.StorageConfig
 import uniffi.scp.SyncPolicyResult
-import uniffi.scp.ToolDefinition
-import uniffi.scp.ToolVerificationResult
+import uniffi.scp.OutletDefinition
+import uniffi.scp.OutletVerificationResult
 import uniffi.scp.TransportManager
 import uniffi.scp.TransportStatus
 import uniffi.scp.TrustScoreResult
@@ -365,29 +369,53 @@ class SCP internal constructor(
             knownContextsJson = knownContextsJson,
         )
 
-    /** Forwards to [NativeScp.aggregateTrustInput] on [inner]. */
+    /**
+     * Aggregates all trust engine layers into a single `TrustInput` (§7.3).
+     *
+     * Every structured input is typed; the SDK serializes to the serde wire
+     * shapes internally (ADR-058) via the TrustAggregate.kt encoders and
+     * forwards to [NativeScp.aggregateTrustInput] on [inner] unchanged. An
+     * empty collection is a real value ("no rules apply"), never a request
+     * for defaults — the bridge receives `[]` / `{}` exactly as passed.
+     *
+     * @param contextId The context to aggregate trust inputs for.
+     * @param subjectDid The DID of the subject to evaluate.
+     * @param events Full signed event-log entries ([EventLogEntry]).
+     * @param merkleRoot 32-byte Merkle root.
+     * @param consequenceRules Typed [ConsequenceRule] values.
+     * @param thresholdRequirements Typed [ThresholdRequirement] values keyed
+     *   by [AttestationType].
+     * @param attestorSets Typed [AttestorInfo] lists keyed by
+     *   [AttestationType].
+     * @param cachedAttestations Typed [CachedAttestation] values to seed the
+     *   bridge's trust store.
+     * @param challengeResults Typed [ChallengeVerification] records.
+     * @return The aggregated `TrustInput` as a JSON string.
+     * @throws IllegalArgumentException on a wrong-length byte array (before
+     *   any bridge call).
+     */
     @Suppress("LongParameterList")
     fun aggregateTrustInput(
         contextId: String,
         subjectDid: String,
-        eventsJson: String,
-        merkleRootJson: String,
-        consequenceRulesJson: String,
-        thresholdRequirementsJson: String,
-        attestorSetsJson: String,
-        cachedAttestationsJson: String,
-        challengeResultsJson: String,
+        events: List<EventLogEntry>,
+        merkleRoot: List<UByte>,
+        consequenceRules: List<ConsequenceRule> = emptyList(),
+        thresholdRequirements: Map<AttestationType, ThresholdRequirement> = emptyMap(),
+        attestorSets: Map<AttestationType, List<AttestorInfo>> = emptyMap(),
+        cachedAttestations: List<CachedAttestation> = emptyList(),
+        challengeResults: List<ChallengeVerification> = emptyList(),
     ): String =
         inner.aggregateTrustInput(
             contextId = contextId,
             subjectDid = subjectDid,
-            eventsJson = eventsJson,
-            merkleRootJson = merkleRootJson,
-            consequenceRulesJson = consequenceRulesJson,
-            thresholdRequirementsJson = thresholdRequirementsJson,
-            attestorSetsJson = attestorSetsJson,
-            cachedAttestationsJson = cachedAttestationsJson,
-            challengeResultsJson = challengeResultsJson,
+            eventsJson = encodeEventLogEntriesJson(events),
+            merkleRootJson = encodeMerkleRootJson(merkleRoot),
+            consequenceRulesJson = encodeConsequenceRulesJson(consequenceRules),
+            thresholdRequirementsJson = encodeThresholdRequirementsJson(thresholdRequirements),
+            attestorSetsJson = encodeAttestorSetsJson(attestorSets),
+            cachedAttestationsJson = encodeCachedAttestationsJson(cachedAttestations),
+            challengeResultsJson = encodeChallengeVerificationsJson(challengeResults),
         )
 
     /** Forwards to [NativeScp.applyPendingCeilingModification] on [inner]. */
@@ -507,13 +535,21 @@ class SCP internal constructor(
             deployId = deployId,
         )
 
-    /** Forwards to [NativeScp.broadcastSubscribe] on [inner]. */
+    /**
+     * Forwards to [NativeScp.broadcastSubscribe] on [inner].
+     *
+     * For a GATED broadcast context, [messagesReadUcanJwt] must carry the
+     * `messages:read` UCAN JWT issued to [subscriberDid] by the context
+     * admin/creator (spec §5.14.4). It is unused for an OPEN context.
+     */
     suspend fun broadcastSubscribe(
         handle: ContextHandle,
         subscriberDid: String,
+        messagesReadUcanJwt: String? = null,
     ) = inner.broadcastSubscribe(
         handle = handle,
         subscriberDid = subscriberDid,
+        messagesReadUcanJwt = messagesReadUcanJwt,
     )
 
     /** Forwards to [NativeScp.broadcastSubscriberCount] on [inner]. */
@@ -615,6 +651,60 @@ class SCP internal constructor(
         spendingUcanJwt = spendingUcanJwt,
     )
 
+    /**
+     * Joins an existing SCP context by processing a received MLS Welcome,
+     * standing the local (joiner) identity up as a send-capable participant.
+     *
+     * Completes the reserve -> Welcome -> join handshake begun by
+     * [reserveKeyPackage]: given the Welcome the context creator minted for a
+     * previously-reserved `KeyPackage`, this installs the joined MLS group,
+     * derives the joiner's routing pseudonym (spec §9.10.4), persists the
+     * initial keyed snapshot fail-closed, registers a context handle, and
+     * records the joined context in the known-contexts discovery registry.
+     * Without it a Welcome-joined node can DECRYPT but cannot SEND (no
+     * handle-backed context).
+     *
+     * Local-identity custody of the JOINER ([identity]) is enforced exactly as
+     * [contextCreate] enforces it for the creator: the joiner's routing
+     * pseudonym is DERIVED from its locally-custodied identity (never
+     * caller-supplied), so a non-custodied joiner (for example a DID-only
+     * handle from [identityLoad]) hard-fails with `SCP-IDENT-1054` at the
+     * derivation seam BEFORE the single-use `KeyPackage` is consumed.
+     *
+     * See [reserveKeyPackage] for the full reserve -> Welcome -> join example.
+     *
+     * The joiner supplies NO loose params or Welcome bytes (FFI-02 Option A):
+     * the authoritative context id, creator DID, and the encrypted genesis
+     * params + MLS Welcome all travel INSIDE the creator-signed, HPKE-sealed
+     * [SealedInvitation] bundle ([SealedInvitation.enc] / [ciphertext]). The
+     * runtime opens the bundle, verifies the creator signature, and derives all
+     * authority from it — the bundle's `contextId` / `creatorDid` are untrusted
+     * binding hints only. Build the [SealedInvitation] from the named fields the
+     * inviter delivered (the `(enc, ciphertext)` produced by
+     * [inviteMember]).
+     *
+     * @param identity The LOCAL (joiner) identity. Its custody derives the
+     *   routing pseudonym AND opens the sealed bundle (split custody); passed
+     *   separately from [SealedInvitation.creatorDid] so the two cannot be
+     *   transposed.
+     * @param sealed The creator-signed, HPKE-sealed [SealedInvitation] bundle
+     *   produced by [inviteMember] on the creator side.
+     * @param reservationId The opaque reservation id returned by
+     *   [reserveKeyPackage] for the `KeyPackage` this Welcome addresses.
+     *
+     * Forwards to [NativeScp.contextJoinFromWelcome] on [inner].
+     */
+    suspend fun contextJoinFromWelcome(
+        identity: Identity,
+        sealed: SealedInvitation,
+        reservationId: String,
+    ): ContextHandle =
+        inner.contextJoinFromWelcome(
+            identity = identity,
+            sealed = sealed,
+            reservationId = reservationId,
+        )
+
     /** Forwards to [NativeScp.contextLeave] on [inner]. */
     suspend fun contextLeave(
         handle: ContextHandle,
@@ -659,6 +749,32 @@ class SCP internal constructor(
     ) = inner.contextResetTtlTimer(
         handle = handle,
         newSeconds = newSeconds,
+    )
+
+    /** Forwards to [NativeScp.appBind] on [inner]. */
+    suspend fun contextAppBind(
+        handle: ContextHandle,
+        declarationJson: String,
+        actorDid: String,
+        timestampSecs: ULong,
+    ): String = inner.appBind(
+        handle = handle,
+        declarationJson = declarationJson,
+        actorDid = actorDid,
+        timestampSecs = timestampSecs,
+    )
+
+    /** Forwards to [NativeScp.appUnbind] on [inner]. */
+    suspend fun contextAppUnbind(
+        handle: ContextHandle,
+        appDid: String,
+        actorDid: String,
+        timestampSecs: ULong,
+    ) = inner.appUnbind(
+        handle = handle,
+        appDid = appDid,
+        actorDid = actorDid,
+        timestampSecs = timestampSecs,
     )
 
     /**
@@ -713,6 +829,100 @@ class SCP internal constructor(
             identity = identity,
             contextIds = contextIds,
             lastRelayContacts = lastRelayContacts,
+        )
+
+    /**
+     * Reserves a single-use MLS `KeyPackage` under [identity] — the first step
+     * of the reserve -> Welcome -> join handshake for spawning into a context
+     * from a creator-minted Welcome (ADR-049 Phase 2J).
+     *
+     * Only the PUBLIC `KeyPackage` bytes cross the FFI boundary
+     * ([ReservedKeyPackage.keyPackagePublic]); the private signer state never
+     * leaves the node. Hand `keyPackagePublic` to the context creator out of
+     * band — the creator adds it to the MLS group and returns a Welcome — then
+     * pass [ReservedKeyPackage.reservationId] back to [contextJoinFromWelcome]
+     * so the fused consume matches this reservation. The `reservationId` is a
+     * lookup key, not a capability: a bogus id simply fails the consume match.
+     *
+     * Local-identity custody is enforced (the same trust model as
+     * [contextCreate]): [identity] MUST be a locally-custodied identity that
+     * holds retained key material. A DID-only handle from [identityLoad] is
+     * rejected with `SCP-IDENT-1054`.
+     *
+     * ```kotlin
+     * // Step 1 (joiner): reserve a single-use KeyPackage under the joiner's
+     * // own locally-custodied identity.
+     * val joiner = scp.identityCreate(custody = "in_memory")
+     * val reservation = scp.reserveKeyPackage(joiner)
+     *
+     * // Hand reservation.keyPackagePublic to the creator out of band. The
+     * // creator calls inviteMember(...), then destructures the sealed outcome
+     * // to recover the SealedInvitation and hands it back:
+     * val bundle = when (outcome) {
+     *     is InviteMemberOutcome.Sealed -> outcome.bundle
+     * }
+     *
+     * // Step 2 (joiner): open the sealed bundle and stand up as a send-capable
+     * // participant under the joiner's own derived routing pseudonym.
+     * val ctx = scp.contextJoinFromWelcome(
+     *     identity = joiner,
+     *     sealed = bundle,
+     *     reservationId = reservation.reservationId,
+     * )
+     * ```
+     *
+     * Forwards to [NativeScp.reserveKeyPackage] on [inner].
+     */
+    suspend fun reserveKeyPackage(identity: Identity): ReservedKeyPackage =
+        inner.reserveKeyPackage(identity = identity)
+
+    /**
+     * Invites a member to an existing context, producing a sealed, signed
+     * invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+     *
+     * The creator (or admin) seals the context's genesis params + Welcome for
+     * the invitee under RFC 9180 HPKE, binding them to the invitee's
+     * `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+     * is unilateral and returns [InviteMemberOutcome.Sealed] whose
+     * [InviteMemberOutcome.Sealed.bundle] is the sealed [SealedInvitation] —
+     * pass it straight to [contextJoinFromWelcome] (no re-assembly). A
+     * voting-governed context THROWS (governed-context invitations are not yet
+     * implemented) rather than returning an outcome.
+     *
+     * The invite routes through the actor's capability-checked governance gate,
+     * which requires the inviter to hold the `governance:propose` capability
+     * (that is the ONLY capability the invite gate enforces). A normally-created
+     * `SingleAdmin` context grants its admin `governance:propose` at genesis, so
+     * it works out of the box; a context with a custom ceiling must grant
+     * `governance:propose` to the inviter. The inviter's `#active` signing key
+     * is resolved from its retained local custody (never crossing the FFI as raw
+     * bytes) and wiped immediately after the invite is produced.
+     *
+     * @param identity The LOCAL inviting identity (creator / admin). Must be
+     *   locally custodied; the invite is signed under its `#active` key. The
+     *   inviter DID is taken from this handle, never a caller-supplied string,
+     *   so it cannot be transposed with [inviteeDid].
+     * @param contextId The context to invite into.
+     * @param inviteeDid The DID being invited.
+     * @param inviteeKeyPackage The invitee's TLS-serialized MLS `KeyPackage`
+     *   (its [ReservedKeyPackage.keyPackagePublic] from [reserveKeyPackage]).
+     * @param relayUrls Relay URLs to include for the invitee's first contact.
+     *
+     * Forwards to [NativeScp.inviteMember] on [inner].
+     */
+    suspend fun inviteMember(
+        identity: Identity,
+        contextId: String,
+        inviteeDid: String,
+        inviteeKeyPackage: ByteArray,
+        relayUrls: List<String>,
+    ): InviteMemberOutcome =
+        inner.inviteMember(
+            identity = identity,
+            contextId = contextId,
+            inviteeDid = inviteeDid,
+            inviteeKeyPackage = inviteeKeyPackage,
+            relayUrls = relayUrls,
         )
 
     /** Forwards to [NativeScp.contextSubscribe] on [inner]. */
@@ -1201,21 +1411,21 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.mcpClientInvoke] on [inner]. */
     suspend fun mcpClientInvoke(
         handle: String,
-        toolName: String,
+        outletName: String,
         inputJson: String,
         contextId: String,
         invokerDid: String,
     ): McpInvokeResult =
         inner.mcpClientInvoke(
             handle = handle,
-            toolName = toolName,
+            outletName = outletName,
             inputJson = inputJson,
             contextId = contextId,
             invokerDid = invokerDid,
         )
 
     /** Forwards to [NativeScp.mcpClientListTools] on [inner]. */
-    suspend fun mcpClientListTools(handle: String): List<McpToolInfo> = inner.mcpClientListTools(handle = handle)
+    suspend fun mcpClientListTools(handle: String): List<McpOutletInfo> = inner.mcpClientListTools(handle = handle)
 
     /** Forwards to [NativeScp.mcpConfigureStdioAllowlist] on [inner]. */
     fun mcpConfigureStdioAllowlist(additionalBinaries: List<String>) =
@@ -1476,54 +1686,54 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.tombstoneMigratedContext] on [inner]. */
     suspend fun tombstoneMigratedContext(handle: ContextHandle) = inner.tombstoneMigratedContext(handle = handle)
 
-    /** Forwards to [NativeScp.toolInterfaceAccept] on [inner]. */
-    suspend fun toolInterfaceAccept(
+    /** Forwards to [NativeScp.outletInterfaceAccept] on [inner]. */
+    suspend fun outletInterfaceAccept(
         handle: ContextHandle,
         interfaceJson: String,
     ): String =
-        inner.toolInterfaceAccept(
+        inner.outletInterfaceAccept(
             handle = handle,
             interfaceJson = interfaceJson,
         )
 
-    /** Forwards to [NativeScp.toolInterfaceExpose] on [inner]. */
-    suspend fun toolInterfaceExpose(
+    /** Forwards to [NativeScp.outletInterfaceExpose] on [inner]. */
+    suspend fun outletInterfaceExpose(
         handle: ContextHandle,
-        toolId: String,
+        outletId: String,
         targetContextId: String,
         rateLimitJson: String?,
     ): String =
-        inner.toolInterfaceExpose(
+        inner.outletInterfaceExpose(
             handle = handle,
-            toolId = toolId,
+            outletId = outletId,
             targetContextId = targetContextId,
             rateLimitJson = rateLimitJson,
         )
 
-    /** Forwards to [NativeScp.toolInterfaceRevoke] on [inner]. */
-    suspend fun toolInterfaceRevoke(
+    /** Forwards to [NativeScp.outletInterfaceRevoke] on [inner]. */
+    suspend fun outletInterfaceRevoke(
         handle: ContextHandle,
         interfaceIdHex: String,
     ): String =
-        inner.toolInterfaceRevoke(
+        inner.outletInterfaceRevoke(
             handle = handle,
             interfaceIdHex = interfaceIdHex,
         )
 
-    /** Forwards to [NativeScp.toolInvoke] on [inner]. */
+    /** Forwards to [NativeScp.outletInvoke] on [inner]. */
     @Suppress("LongParameterList")
-    suspend fun toolInvoke(
+    suspend fun outletInvoke(
         handle: ContextHandle,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identity: Identity,
         ucanToken: String?,
         proofTokens: List<String>?,
         spendingUcanJwt: String?,
     ): String =
-        inner.toolInvoke(
+        inner.outletInvoke(
             handle = handle,
-            toolId = toolId,
+            outletId = outletId,
             inputJson = inputJson,
             identity = identity,
             ucanToken = ucanToken,
@@ -1531,22 +1741,22 @@ class SCP internal constructor(
             spendingUcanJwt = spendingUcanJwt,
         )
 
-    /** Forwards to [NativeScp.toolInvokeCrossContext] on [inner]. */
+    /** Forwards to [NativeScp.outletInvokeCrossContext] on [inner]. */
     @Suppress("LongParameterList")
-    suspend fun toolInvokeCrossContext(
+    suspend fun outletInvokeCrossContext(
         sourceHandle: ContextHandle,
         targetHandle: ContextHandle,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identity: Identity,
         ucanToken: String,
         chainDepth: UByte,
         proofTokens: List<String>?,
     ): String =
-        inner.toolInvokeCrossContext(
+        inner.outletInvokeCrossContext(
             sourceHandle = sourceHandle,
             targetHandle = targetHandle,
-            toolId = toolId,
+            outletId = outletId,
             inputJson = inputJson,
             identity = identity,
             ucanToken = ucanToken,
@@ -1554,42 +1764,208 @@ class SCP internal constructor(
             proofTokens = proofTokens,
         )
 
-    /** Forwards to [NativeScp.toolRegister] on [inner]. */
-    suspend fun toolRegister(
+    /**
+     * Runs the §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a).
+     *
+     * Forwards 1:1 to [NativeScp.outletInvokeCrossContextSaga] on [inner]. The
+     * call blocks until the saga reaches a terminal state: it returns a
+     * [SagaResult] on commit (carrying the supervisor-minted `sagaId` plus the
+     * target's signed receipt and captured output, each `null` when absent and
+     * never synthesized), or throws a typed [uniffi.scp.ScpException] for a
+     * non-committed terminal — `ScpException.SagaAborted` (a Prepare-phase
+     * abort: a PERMANENT rejection OR a RETRYABLE transient — rate limit or
+     * participant actor unavailable — distinguished by the `SCP-SAGA-*` code;
+     * carries an optional `retryAfterMs` back-off hint),
+     * `ScpException.SagaNeedsRepair` (commit retries exhausted; carries
+     * the durable `sagaId` operator-repair handle), or `ScpException.SagaBusy`
+     * (the participant context set is contended; carries the
+     * `contendedContext` id). Bridge-surfaced `ScpException.Validation` and
+     * `ScpException.Permission` errors also propagate unchanged.
+     *
+     * This is a flat 1:1 forward: the caller principal is bound to the
+     * authenticated FFI identity inside the bridge, and all argument
+     * validation (including the asserted-nonce hex and the u64/u8 numeric
+     * bounds enforced by [ULong]/[UByte]) is performed by the Rust core. The
+     * 9-argument arity is dictated by the bridge op.
+     *
+     * @param sourceHandle The calling (source) context handle.
+     * @param targetHandle The context holding the outlet to invoke.
+     * @param callerDid The invoking principal's DID.
+     * @param outletRegistrationId The target outlet's cross-context registration id.
+     * @param inputJson JSON-encoded outlet input.
+     * @param assertedNonceHex The asserted replay-protection nonce as hex.
+     * @param timestampMs The invocation timestamp in milliseconds.
+     * @param chainDepth Current cross-context chain depth (0 for first hop).
+     * @param ucanProofId Optional UCAN proof id for delegation-chain traversal.
+     */
+    @Suppress("LongParameterList")
+    suspend fun outletInvokeCrossContextSaga(
+        sourceHandle: ContextHandle,
+        targetHandle: ContextHandle,
+        callerDid: String,
+        outletRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: ULong,
+        chainDepth: UByte,
+        ucanProofId: String?,
+    ): SagaResult =
+        inner.outletInvokeCrossContextSaga(
+            sourceHandle = sourceHandle,
+            targetHandle = targetHandle,
+            callerDid = callerDid,
+            outletRegistrationId = outletRegistrationId,
+            inputJson = inputJson,
+            assertedNonceHex = assertedNonceHex,
+            timestampMs = timestampMs,
+            chainDepth = chainDepth,
+            ucanProofId = ucanProofId,
+        )
+
+    /**
+     * Opens the §5.4.5 / §6.2.4 cross-context STREAMING outlet-invocation saga
+     * (SCP-OUT-047) and returns its [StreamingSagaHandle].
+     *
+     * The STREAMING sibling of [outletInvokeCrossContextSaga]. Where the unary
+     * saga BLOCKS until `Committed` and returns the result inline, this returns
+     * its chunk receiver PROMPTLY at the Commit-transition and reaches `Committed`
+     * ASYNCHRONOUSLY at seal-close (the ADR-049 §3a streaming wait-model
+     * amendment) — an LLM stream can exceed the unary bound, so the credit ceiling
+     * bounds chunk COUNT, not wall-clock.
+     *
+     * The returned handle exposes `suspend fun aggregate(): Aggregate` (the
+     * primary drain) and `fun asFlow(): Flow<OutletStreamChunk>` (the same shared
+     * drain); the streaming FFI ops are wrapped BEHIND it. This method performs no
+     * I/O and does not block — the saga opens LAZILY on the first
+     * [StreamingSagaHandle.aggregate] / [StreamingSagaHandle.asFlow] collection,
+     * where an open rejection (the §6.2.4 caller-principal binding, a typed
+     * [ScpException] `Saga*` terminal, or an input/UCAN rejection) surfaces, and
+     * the receiver is never handed out.
+     *
+     * There is NO live control plane (grantCredit / cancel) for the cross-context
+     * saga stream — per §6.2.5 / SCP-OUT-046 the credit window is fixed at open via
+     * [estimatedChunkCount] (cancel_ack_ceiling = u64::MAX). The `u64`/`u8` numeric
+     * bounds are enforced by [ULong]/[UByte] by construction, so all argument
+     * validation lives in the Rust core (mirroring the unary sibling).
+     *
+     * @param sourceHandle The calling (source) context handle.
+     * @param targetHandle The context holding the outlet to invoke.
+     * @param callerDid The invoking principal's DID (bound to the bridge principal).
+     * @param outletRegistrationId The target outlet's cross-context registration id.
+     * @param inputJson JSON-encoded outlet input.
+     * @param assertedNonceHex The asserted replay-protection nonce as hex.
+     * @param timestampMs The invocation timestamp in milliseconds.
+     * @param chainDepth Current cross-context chain depth (0 for first hop).
+     * @param ucanToken The invocation UCAN authorizing the outlet call.
+     * @param proofTokens Optional UCAN delegation-chain proof tokens.
+     * @param ucanProofId Optional id of the spending UCAN proof.
+     * @param timeoutMs Optional per-stream timeout in milliseconds.
+     * @param estimatedChunkCount Optional invoker-declared billable-chunk ceiling.
+     */
+    @Suppress("LongParameterList")
+    fun outletInvokeCrossContextStreamingSaga(
+        sourceHandle: ContextHandle,
+        targetHandle: ContextHandle,
+        callerDid: String,
+        outletRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: ULong,
+        chainDepth: UByte,
+        ucanToken: String,
+        proofTokens: List<String>? = null,
+        ucanProofId: String? = null,
+        timeoutMs: UInt? = null,
+        estimatedChunkCount: UInt? = null,
+    ): StreamingSagaHandle =
+        StreamingSagaHandle(
+            native = ScpStreamingSagaNative(inner, sourceHandle, targetHandle),
+            params =
+                StreamingSagaOpenParams(
+                    callerDid = callerDid,
+                    outletRegistrationId = outletRegistrationId,
+                    inputJson = inputJson,
+                    assertedNonceHex = assertedNonceHex,
+                    timestampMs = timestampMs,
+                    chainDepth = chainDepth,
+                    ucanToken = ucanToken,
+                    proofTokens = proofTokens,
+                    ucanProofId = ucanProofId,
+                    timeoutMs = timeoutMs,
+                    estimatedChunkCount = estimatedChunkCount,
+                ),
+        )
+
+    /**
+     * Drives the key-bearing in-session reconnect/repair truncated-close for a
+     * cross-context streaming saga (SCP-OUT-046 #136 AC7, SCP-OUT-047).
+     *
+     * This is IN-SESSION reconnect/repair of a seal that stalled or went
+     * `NeedsRepair` while THIS bridge process is still alive (e.g. a client
+     * reconnects to the same live node). The saga registry is per-instance and
+     * in-memory, so this does NOT survive a process/node restart — cross-restart
+     * recovery replays the durable saga journal via a separate operator path, not
+     * this surface.
+     *
+     * Forwards 1:1 to [NativeScp.outletStreamingSagaRecoverTruncatedClose] on
+     * [inner]. On FFI reconnect this authenticates the caller, surfaces the target
+     * context's Active Signing Key (resolved per-call from custody), and seals a
+     * witness-absent durable prefix to resolve the saga `Committed` — WITHOUT
+     * re-opening the stream or re-invoking the outlet executor.
+     *
+     * [callerDid] MUST be an identity hosted by this bridge instance (the §6.2.4
+     * channel-authenticated principal) AND the invoker pinned at open — recovery is
+     * money-moving, so a hosted-but-non-invoker caller is rejected with a typed
+     * `ScpException.Permission` (`SCP-PERM-3001`, the SAME invoker gate the
+     * same-context grant/cancel/terminate siblings enforce) BEFORE the signing key
+     * is resolved. An unknown [sagaId] or non-hosted [callerDid] surfaces
+     * `ScpException.Context`; a seal that cannot complete surfaces
+     * `ScpException.SagaNeedsRepair`.
+     *
+     * @param sagaId The durable supervisor-minted saga id to recover.
+     * @param callerDid The invoker DID (channel-authenticated, invoker-pinned).
+     */
+    suspend fun recoverStreamingSagaTruncatedClose(
+        sagaId: String,
+        callerDid: String,
+    ) = inner.outletStreamingSagaRecoverTruncatedClose(sagaId = sagaId, callerDid = callerDid)
+
+    /** Forwards to [NativeScp.outletRegister] on [inner]. */
+    suspend fun outletRegister(
         handle: ContextHandle,
-        definition: ToolDefinition,
+        definition: OutletDefinition,
     ): String =
-        inner.toolRegister(
+        inner.outletRegister(
             handle = handle,
             definition = definition,
         )
 
-    /** Forwards to [NativeScp.toolSessionClose] on [inner]. */
-    suspend fun toolSessionClose(
+    /** Forwards to [NativeScp.outletSessionClose] on [inner]. */
+    suspend fun outletSessionClose(
         handle: ContextHandle,
         sessionId: String,
-    ) = inner.toolSessionClose(
+    ) = inner.outletSessionClose(
         handle = handle,
         sessionId = sessionId,
     )
 
-    /** Forwards to [NativeScp.toolSessionCreate] on [inner]. */
-    suspend fun toolSessionCreate(
+    /** Forwards to [NativeScp.outletSessionCreate] on [inner]. */
+    suspend fun outletSessionCreate(
         handle: ContextHandle,
-        toolId: String,
+        outletId: String,
         sourceContextId: String,
         ttlSeconds: ULong?,
     ): String =
-        inner.toolSessionCreate(
+        inner.outletSessionCreate(
             handle = handle,
-            toolId = toolId,
+            outletId = outletId,
             sourceContextId = sourceContextId,
             ttlSeconds = ttlSeconds,
         )
 
-    /** Forwards to [NativeScp.toolSessionInvoke] on [inner]. */
+    /** Forwards to [NativeScp.outletSessionInvoke] on [inner]. */
     @Suppress("LongParameterList")
-    suspend fun toolSessionInvoke(
+    suspend fun outletSessionInvoke(
         handle: ContextHandle,
         sessionId: String,
         inputJson: String,
@@ -1597,7 +1973,7 @@ class SCP internal constructor(
         ucanToken: String,
         proofTokens: List<String>?,
     ): String =
-        inner.toolSessionInvoke(
+        inner.outletSessionInvoke(
             handle = handle,
             sessionId = sessionId,
             inputJson = inputJson,
@@ -1606,14 +1982,14 @@ class SCP internal constructor(
             proofTokens = proofTokens,
         )
 
-    /** Forwards to [NativeScp.toolVerify] on [inner]. */
-    suspend fun toolVerify(
+    /** Forwards to [NativeScp.outletVerify] on [inner]. */
+    suspend fun outletVerify(
         handle: ContextHandle,
-        toolId: String,
-    ): ToolVerificationResult =
-        inner.toolVerify(
+        outletId: String,
+    ): OutletVerificationResult =
+        inner.outletVerify(
             handle = handle,
-            toolId = toolId,
+            outletId = outletId,
         )
 
     /** Forwards to [NativeScp.transportConnect] on [inner]. */
@@ -1642,24 +2018,214 @@ class SCP internal constructor(
         )
 
     /**
-     * Routes through the UniFFI-generated free function
-     * [uniffi.scp.trustVerifyAttestation]. ADR-048 §1 + §7 Kotlin
-     * bullet.
+     * Verifies an attestation's Ed25519 signature, evidence, expiry, and
+     * revocation status (ADR-017, §7.4). Takes the typed attestation envelope
+     * ([CachedAttestationEnvelope]) and serializes it to the serde wire shape
+     * internally (ADR-058), then routes through the UniFFI-generated free
+     * function [uniffi.scp.trustVerifyAttestation] unchanged. ADR-048 §1 + §7
+     * Kotlin bullet.
      */
-    fun trustVerifyAttestation(attestationJson: String): AttestationVerificationResult =
+    fun trustVerifyAttestation(attestation: CachedAttestationEnvelope): AttestationVerificationResult =
         uniffi.scp.trustVerifyAttestation(
-            attestationJson = attestationJson,
+            attestationJson = encodeAttestationJson(attestation),
         )
 
-    /** Forwards to [NativeScp.trustVerifyResponse] on [inner]. */
+    /**
+     * Verifies a challenge response against its original challenge request
+     * (ADR-017, §7.3.4). Takes the typed [ChallengeRequest] /
+     * [ChallengeResponse] and serializes them to the serde wire shapes
+     * internally (ADR-058), then forwards to [NativeScp.trustVerifyResponse]
+     * on [inner] unchanged. Returns `true` if the response is valid (correct
+     * responder, within timeout, valid signature), `false` otherwise.
+     *
+     * @throws IllegalArgumentException on a wrong-length signature (before
+     *   any bridge call).
+     */
     fun trustVerifyResponse(
-        challengeJson: String,
-        responseJson: String,
+        challenge: ChallengeRequest,
+        response: ChallengeResponse,
     ): Boolean =
         inner.trustVerifyResponse(
-            challengeJson = challengeJson,
-            responseJson = responseJson,
+            challengeJson = encodeChallengeRequestJson(challenge),
+            responseJson = encodeChallengeResponseJson(response),
         )
+
+    /**
+     * Read-only, structured counterpart to [ucanValidate].
+     *
+     * Runs the same 11-step ADR-016 validation pipeline but, instead of throwing
+     * at the first failing stage, returns a [CapabilityValidation] of six
+     * per-stage booleans (spec §7.2.4, ADR-059). The probe never records the
+     * token's nonce, so calling it does not consume the token.
+     * Capability/signature/expiry outcomes are reported via the booleans; only
+     * malformed FFI inputs (bad handle / token / capability) throw.
+     *
+     * NOT AN AUTHORIZATION DECISION: this is a diagnostic, never a gate. A
+     * no-capability (intrinsic-validity) result skips the invoked-capability
+     * grant-match, so [CapabilityValidation.allValid] returning `true` does NOT
+     * establish the token grants any particular capability.
+     *
+     * FAIL CLOSED: [presentingAgentDid] is required by the bridge (no silent
+     * security default). Omitting it makes the bridge reject the call rather than
+     * defaulting the presenting agent to the token's own `aud` — which would make
+     * the step-5 audience check the tautology `aud == aud` and inflate trust. It
+     * precedes [capability] because it is mandatory while [capability] is optional.
+     *
+     * @param capability Optional challenge capability URI. Omit it (or pass
+     *   `null`) to evaluate the token's INTRINSIC validity with no
+     *   invoked-capability grant-match challenge — the mode [evaluateTrust] uses.
+     */
+    suspend fun ucanEvaluate(
+        handle: ContextHandle,
+        token: String,
+        presentingAgentDid: String,
+        capability: String? = null,
+        proofTokens: List<String>? = null,
+    ): CapabilityValidation =
+        CapabilityValidation.fromRecord(
+            inner.ucanEvaluate(
+                handle = handle,
+                token = token,
+                capability = capability,
+                presentingAgentDid = presentingAgentDid,
+                proofTokens = proofTokens,
+            ),
+        )
+
+    /**
+     * Computes the participation record (§7.3.2) for a subject in a context.
+     *
+     * The shared Rust core gathers the FULL context event log and flattens the
+     * participation facts ONCE (`Supervisor::participation_record`), and the
+     * UniFFI bridge sources the subject's accessible, currently-valid
+     * attestations from its own persistent trust store (seeded by
+     * [cachedAttestations]). The SDK RECEIVES the flattened [BehavioralRecord] —
+     * it never re-aggregates event-log collections, so every binding observes
+     * identical facts for the same context/subject.
+     *
+     * `attestationCount` is a credential-layer fact (§7.4): NOT a context-event
+     * count, NOT Merkle-anchored, and verifier-relative. Pass the subject's
+     * accessible attestations as [cachedAttestations] to populate it; the default
+     * (empty) honestly reports only what the bridge's trust store already holds.
+     *
+     * SECURITY: `attestationCount` is authentic-but-self-mintable — an issuer is
+     * self-certifying, so a subject can mint endorsements from DIDs it controls.
+     * It MUST NOT be a sole trust or admission factor; use the
+     * threshold/independence path (§7.3.5) for Sybil resistance.
+     *
+     * An empty event log surfaces as [uniffi.scp.ScpException.Context] carrying
+     * [NO_PARTICIPATION_FACTS_CODE]; callers wanting the empty-log case as a
+     * zeroed record (rather than an exception) should use [evaluateTrust].
+     */
+    fun participationRecord(
+        contextId: String,
+        subjectDid: String,
+        cachedAttestations: List<CachedAttestation> = emptyList(),
+    ): BehavioralRecord =
+        BehavioralRecord.fromView(
+            inner.participationRecord(
+                contextId = contextId,
+                subjectDid = subjectDid,
+                cachedAttestationsJson = encodeCachedAttestationsJson(cachedAttestations),
+            ),
+        )
+
+    /**
+     * Evaluate the trustworthiness of a participant within a context
+     * (spec §7.2.4, ADR-059). The protocol provides the data, not the verdict.
+     *
+     * - Layer 1 — protocol enforcement: each supplied capability token is run
+     *   through the read-only [ucanEvaluate] diagnostic, yielding six per-stage
+     *   booleans AND-combined across the token set (one token failing a stage
+     *   makes that aggregate field `false`). This never inspects error prose. The
+     *   subject is passed as the presenting agent (audience check against the DID
+     *   under assessment) with no challenge capability (intrinsic-validity mode).
+     *   With no tokens supplied, every field stays `false`.
+     * - Layer 2 — behavioral validation: RECEIVES the subject's participation
+     *   facts (§7.3.2) from the shared Rust core via [participationRecord]. A
+     *   context with no convergent events yet (an empty event log) is folded into
+     *   a zeroed [BehavioralRecord], branching on the STRUCTURED
+     *   [NO_PARTICIPATION_FACTS_CODE] — never on error prose. Any other error
+     *   propagates.
+     *
+     * The evaluation is labeled with the context the layers were computed against
+     * — the handle's resolved [ContextHandle.contextId] — so it is never silently
+     * mislabeled.
+     *
+     * SECURITY: the behavioral record's `attestationCount` (and any challenge
+     * results, where consumed) are authentic-but-self-mintable signals — an
+     * issuer/verifier is self-certifying, so a subject can mint them from DIDs it
+     * controls. They MUST NOT be a sole trust or admission factor; use the
+     * threshold/independence path (§7.3.5) for Sybil resistance.
+     */
+    suspend fun evaluateTrust(
+        handle: ContextHandle,
+        subjectDid: String,
+        capabilityTokens: List<String> = emptyList(),
+    ): TrustEvaluation {
+        // Layer 1: AND-combine the structured per-stage booleans across tokens.
+        // With no tokens every field stays false (no stage was observed to pass).
+        var capabilityValidation =
+            CapabilityValidation(
+                tokensValid = false,
+                signaturesValid = false,
+                withinCeiling = false,
+                nonceValid = false,
+                notRevoked = false,
+                timeBoundsValid = false,
+            )
+        if (capabilityTokens.isNotEmpty()) {
+            var tokensValid = true
+            var signaturesValid = true
+            var withinCeiling = true
+            var nonceValid = true
+            var notRevoked = true
+            var timeBoundsValid = true
+            for (token in capabilityTokens) {
+                val perToken = ucanEvaluate(handle = handle, token = token, presentingAgentDid = subjectDid)
+                tokensValid = tokensValid && perToken.tokensValid
+                signaturesValid = signaturesValid && perToken.signaturesValid
+                withinCeiling = withinCeiling && perToken.withinCeiling
+                nonceValid = nonceValid && perToken.nonceValid
+                notRevoked = notRevoked && perToken.notRevoked
+                timeBoundsValid = timeBoundsValid && perToken.timeBoundsValid
+            }
+            capabilityValidation =
+                CapabilityValidation(
+                    tokensValid = tokensValid,
+                    signaturesValid = signaturesValid,
+                    withinCeiling = withinCeiling,
+                    nonceValid = nonceValid,
+                    notRevoked = notRevoked,
+                    timeBoundsValid = timeBoundsValid,
+                )
+        }
+
+        // Label the evaluation with the SAME context the layers were computed
+        // against (the handle's canonical id), and key the participation-record
+        // lookup off it too.
+        val resolvedContextId = handle.contextId()
+
+        // Layer 2: behavioral record RECEIVED from the shared Rust core. An empty
+        // event log (SCP-CTX-2076) is folded into a zeroed record — branching on
+        // the STRUCTURED code, never error prose. No cached attestations are
+        // supplied, so attestationCount reflects only the bridge's own trust
+        // store (verifier-relative, §7.4).
+        val behavioralRecord =
+            try {
+                participationRecord(contextId = resolvedContextId, subjectDid = subjectDid)
+            } catch (e: uniffi.scp.ScpException.Context) {
+                if (e.code != NO_PARTICIPATION_FACTS_CODE) throw e
+                BehavioralRecord.zeroed(subjectDid = subjectDid)
+            }
+
+        return TrustEvaluation(
+            subjectDid = subjectDid,
+            contextId = resolvedContextId,
+            capabilityValidation = capabilityValidation,
+            behavioralRecord = behavioralRecord,
+        )
+    }
 
     /** Forwards to [NativeScp.ucanDelegate] on [inner]. */
     suspend fun ucanDelegate(
@@ -1702,12 +2268,18 @@ class SCP internal constructor(
         revokerDid = revokerDid,
     )
 
-    /** Forwards to [NativeScp.ucanValidate] on [inner]. */
+    /**
+     * Forwards to [NativeScp.ucanValidate] on [inner].
+     *
+     * [presentingAgentDid] is REQUIRED: the bridge fails closed on an absent
+     * presenter rather than defaulting to the token's own `aud` (which would
+     * make the audience check the tautology `aud == aud` and inflate trust).
+     */
     suspend fun ucanValidate(
         handle: ContextHandle,
         token: String,
         capability: String,
-        presentingAgentDid: String?,
+        presentingAgentDid: String,
         proofTokens: List<String>?,
     ) = inner.ucanValidate(
         handle = handle,
@@ -1718,18 +2290,80 @@ class SCP internal constructor(
     )
 
     /**
-     * Routes through the UniFFI-generated free function
-     * [uniffi.scp.verifyParticipationRequirements]. ADR-048 §1 + §7
+     * Verify participation profiles against admission requirements
+     * (spec §7.3.2.1). Serializes the typed [RequireParticipation] /
+     * [ParticipationProfile] values to the serde wire shape (ADR-058) and
+     * routes through the UniFFI-generated free function
+     * [uniffi.scp.verifyParticipationRequirements] unchanged. ADR-048 §1 + §7
      * Kotlin bullet.
+     *
+     * [expectedSubject] is the DID of the agent being admitted: only
+     * profiles whose signed `subject_did` equals it contribute to any
+     * threshold, freshness, or distinct-signer accounting, closing
+     * cross-subject participation-profile replay.
+     *
+     * Returns normally when all requirements are satisfied; the bridge
+     * throws on any failed requirement or malformed input.
+     *
+     * Security caveat — authenticity is not authorization: this verifies
+     * signatures over the subject binding, not signer *legitimacy*. Because
+     * `signer_public_key` is self-certifying, a subject can present
+     * genuinely-signed profiles from signers it controls (inflating
+     * `min_contexts`). Callers MUST establish signer legitimacy separately
+     * (trusted-signer set, context-membership proof, or the §7.3.5
+     * threshold/independence path) and MUST NOT treat success as authorization.
      */
     fun verifyParticipationRequirements(
-        profileJson: String,
-        requirementsJson: String,
-    ): Boolean =
+        expectedSubject: String,
+        requirements: List<RequireParticipation>,
+        profiles: List<ParticipationProfile>,
+    ) {
         uniffi.scp.verifyParticipationRequirements(
-            profileJson = profileJson,
-            requirementsJson = requirementsJson,
+            expectedSubject = expectedSubject,
+            requirementsJson = encodeRequireParticipationJson(requirements),
+            profileJson = encodeParticipationProfileJson(profiles),
         )
+    }
+
+    /**
+     * Verifies that an agent meets a context's capability requirements for
+     * admission (spec §7.3.4.4, SCP-ACR-008). Serializes the typed
+     * [CapabilityRequirement] / [ChallengeVerification] values (and the agent
+     * capability URIs) to the serde wire shape (ADR-058) and routes through
+     * the UniFFI-generated free function
+     * [uniffi.scp.checkCapabilityRequirements] unchanged. ADR-048 §1 + §7
+     * Kotlin bullet.
+     *
+     * [subjectDid]/[contextId] bind challenge verifications to the agent and
+     * context being admitted: a [ChallengeVerification] only satisfies a
+     * requirement when its signed `subject_did`/`context_id` equal these
+     * values, closing cross-subject and cross-context attribution.
+     *
+     * Returns normally when all requirements are satisfied; the bridge throws
+     * on any unmet requirement or malformed input.
+     *
+     * Security caveat — authenticity is not authorization: a passing
+     * `ChallengeVerified` check proves the verifier's signature is authentic
+     * and bound to this subject/context, NOT that the verifier is *trusted*.
+     * Because `verifier_did` is self-certifying, a subject can present a
+     * genuinely-signed result from a verifier it controls. Establish verifier
+     * legitimacy separately and MUST NOT treat success as authorization.
+     */
+    fun checkCapabilityRequirements(
+        contextId: String,
+        subjectDid: String,
+        requirements: List<CapabilityRequirement>,
+        agentCapabilities: List<String>,
+        challengeVerifications: List<ChallengeVerification>,
+    ) {
+        uniffi.scp.checkCapabilityRequirements(
+            contextId = contextId,
+            subjectDid = subjectDid,
+            requirementsJson = encodeCapabilityRequirementsJson(requirements),
+            agentCapabilitiesJson = encodeAgentCapabilitiesJson(agentCapabilities),
+            challengeVerificationsJson = encodeChallengeVerificationsJson(challengeVerifications),
+        )
+    }
 
     companion object {
         /**

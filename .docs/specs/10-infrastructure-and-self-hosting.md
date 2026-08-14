@@ -45,7 +45,7 @@ Deployment spectrum:
   All of the above simultaneously ← the expected state for many users.
 ```
 
-The **agent workstation** tier is a critical addition to the deployment model. As builder agents (LLMs that generate and manage software) become mainstream, non-technical users are acquiring dedicated always-on hardware to run them. These machines are already always-on, capable, and user-controlled. SCP infrastructure — relays, context hosting, bridge connectors — is marginal additional load on hardware that's already running 24/7. The builder agent that generates an SCP app can also provision the infrastructure: spin up a relay, configure contexts, register tools — developer and ops in one.
+The **agent workstation** tier is a critical addition to the deployment model. As builder agents (LLMs that generate and manage software) become mainstream, non-technical users are acquiring dedicated always-on hardware to run them. These machines are already always-on, capable, and user-controlled. SCP infrastructure — relays, context hosting, bridge connectors — is marginal additional load on hardware that's already running 24/7. The builder agent that generates an SCP app can also provision the infrastructure: spin up a relay, configure contexts, register outlets — developer and ops in one.
 
 This changes relay economics fundamentally. The question is not "who pays for relay infrastructure" but "you already have the hardware, the relay is just another process." Self-hosting stops being an aspirational option for technical users and becomes the natural default for anyone with a builder agent workstation. The gravitational pull toward centralized relays weakens when most users have their own always-on node.
 
@@ -55,7 +55,7 @@ The critical difference from Matrix: in Matrix, your homeserver owns your identi
 
 ## 10.3 Minimal Protocol State
 
-The protocol's state footprint per context is deliberately minimal: membership list, role assignments, capability tokens, tool registrations, governance model, and content hashes. Not content itself. Not media. Not application state.
+The protocol's state footprint per context is deliberately minimal: membership list, role assignments, capability tokens, outlet registrations, governance model, and content hashes. Not content itself. Not media. Not application state.
 
 This is load-bearing. If protocol state is small, devices can be nodes. If protocol state includes all content, only servers can play. Matrix learned this the hard way — room state accumulates unboundedly and Synapse instances consume gigabytes of RAM for large rooms.
 
@@ -438,7 +438,7 @@ While client-level coordination (read markers, notification dedup) is a client-s
 **Per-device MLS leaf nodes:**
 
 1. **Each device has its own MLS leaf.** A DID with N devices appears as N leaf nodes in every MLS group the DID participates in. Each device generates its own MLS leaf key (X25519) and maintains independent MLS epoch state.
-2. **Per-device KeyPackages.** Each device generates its own KeyPackages, signed by the DID's Active Signing Key (`#active`). The KeyPackage's credential contains the DID (shared across devices) plus a `device_id` field (a random 16-byte identifier, stable per device) in the LeafNode extensions. This enables other members to distinguish leaf nodes belonging to the same DID.
+2. **Per-device KeyPackages.** Each device generates its own KeyPackages using an **ephemeral, context-scoped MLS leaf key**; each carries a **per-device KeyPackage attestation** (LeafNode extension `scp_keypackage_attestation`, §9.7.1) binding that leaf key to the DID, signed by the DID's Active Signing Key (`#active`). The KeyPackage's credential contains the DID (shared across devices) plus a `device_id` field (a random 16-byte identifier, stable per device) in the LeafNode extensions. This enables other members to distinguish leaf nodes belonging to the same DID.
 3. **Governance counting.** For governance purposes (voting, quorum, role assignment), a DID with N devices counts as ONE participant, not N. The governance engine deduplicates by DID — it does not matter how many leaf nodes a DID has. This prevents multi-device users from gaining disproportionate governance weight.
 4. **Sender key and access key sharing.** Sender keys (§9.16) and access keys (§9.17) are per-DID, not per-device. All devices for a DID share the same sender key and access key. When a device requests a sender key (§9.16.2), the key holder responds to the DID — any of the DID's devices can decrypt the response using the DID's wrapping key (which is also per-DID, stored in KeyCustody and synchronized across devices via identity private state, §3.7).
 
@@ -455,7 +455,7 @@ The protocol supports both real-time and asynchronous interaction. This is not a
 
 - **Async:** Messages are encrypted, delivered to relays, fetched when the recipient's agent comes online. This is the baseline that works for all participants regardless of connectivity.
 - **Real-time:** When both parties are online simultaneously, the transport layer can deliver envelopes immediately. WebSocket connections to relays, direct peer-to-peer via libp2p, or any transport binding that supports streaming delivery. Latency depends on the transport binding, not the protocol.
-- **Presence, typing indicators, live collaboration:** These are tool-level or context-level capabilities, not protocol primitives. A context that needs presence registers a presence tool. A context that needs typing indicators includes them as ephemeral events. The protocol carries them through the same encrypted envelope system — the content is up to the context.
+- **Presence, typing indicators, live collaboration:** These are outlet-level or context-level capabilities, not protocol primitives. A context that needs presence registers a presence outlet. A context that needs typing indicators includes them as ephemeral events. The protocol carries them through the same encrypted envelope system — the content is up to the context.
 
 The SDK provides the transport abstraction and envelope delivery. Whether that delivery is batched-async or streaming-realtime depends on the transport binding and what the client needs. Both are first-class.
 
@@ -985,7 +985,7 @@ All relay HTTP endpoints benefit from HTTP/3:
 
 WebTransport is the browser-facing equivalent of §10.14 (QUIC), using the WebTransport API over HTTP/3.
 
-**Distinction from QUIC.** WebTransport is mediated by the browser's network stack. The SCP WASM binding uses the `WebTransport` API. Non-browser clients use QUIC directly (§10.14). Server-side, the relay handles both — QUIC connections and WebTransport sessions are both QUIC underneath, sharing the same subscription registry and blob storage.
+**Distinction from QUIC.** WebTransport is mediated by the browser's network stack. The SCP browser client transport uses the `WebTransport` API. Non-browser clients use QUIC directly (§10.14). Server-side, the relay handles both — QUIC connections and WebTransport sessions are both QUIC underneath, sharing the same subscription registry and blob storage.
 
 **Connection model:**
 1. Browser opens `new WebTransport("https://<host>/scp/v1")` — establishes HTTP/3 + WebTransport session.
@@ -1006,7 +1006,7 @@ Browser clients follow this transport selection order:
 2. **WebSocket** — fall back to `new WebSocket("wss://<host>/scp/v1")`. This is the mandatory baseline that all relays support.
 3. **Error** — if WebSocket also fails, report connection failure.
 
-The fallback is transparent to `TransportAdapter` callers. The WASM binding wraps both transports behind the same adapter interface. The WASM binding MAY switch from WebSocket to WebTransport mid-session if the relay advertises WebTransport support via `Alt-Svc`. This involves establishing a new WebTransport session and re-opening subscription streams (same gap-fill strategy as reconnection), not an in-place protocol upgrade.
+The fallback is transparent to `TransportAdapter` callers. The browser client transport wraps both transports behind the same adapter interface. The browser client transport MAY switch from WebSocket to WebTransport mid-session if the relay advertises WebTransport support via `Alt-Svc`. This involves establishing a new WebTransport session and re-opening subscription streams (same gap-fill strategy as reconnection), not an in-place protocol upgrade.
 
 ## 10.16 Constrained Device Transport
 

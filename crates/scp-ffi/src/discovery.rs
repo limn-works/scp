@@ -20,9 +20,9 @@
 //! - `PyScp::petname_get_for_context` -- Get the petname assigned to a context.
 //! - `PyScp::petname_set_context` -- Set a petname for a context.
 //! - `PyScp::petname_remove_context` -- Remove a petname from a context.
-//! - `PyScp::handle_register` -- Register a handle in a context with discovery tools.
-//! - `PyScp::handle_lookup` -- Look up a handle in a context with discovery tools.
-//! - `PyScp::handle_deregister` -- Deregister a handle from a context with discovery tools.
+//! - `PyScp::handle_register` -- Register a handle in a context with discovery outlets.
+//! - `PyScp::handle_lookup` -- Look up a handle in a context with discovery outlets.
+//! - `PyScp::handle_deregister` -- Deregister a handle from a context with discovery outlets.
 //! - `PyScp::scope_register` -- Register a scope name (§22.3.5, ADR-043).
 //! - `PyScp::scope_lookup` -- Look up a scope name (§22.3.5, ADR-043).
 //! - `PyScp::scope_deregister` -- Deregister a scope name (§22.3.5, ADR-043).
@@ -46,7 +46,7 @@ use scp_core::discovery::handles::{
 };
 use scp_core::discovery::petnames::PetnameEvent;
 use scp_core::discovery::{DiscoveryQuery, normalize_address, parse_address};
-use scp_identity::DID;
+use scp_did::DID;
 
 use scp_ffi_common::petname_helpers::{self, LocalHandleQuerier, address_resolution_to_json};
 
@@ -300,7 +300,14 @@ pub fn py_context_discover<'py>(py: Python<'py>, query: &str) -> PyResult<Bound<
 
         let results: Vec<scp_core::discovery::ContextDiscoveryResult> = py.allow_threads(|| {
             rt.block_on(async {
-                let did_dht = scp_identity::DidDht::new();
+                // No bridge instance is in scope for this free-function
+                // discovery entrypoint, so build the shipped DHT client
+                // fail-closed (real Mainline Pkarr in a shipped build; the
+                // in-memory test seam only under `testing`). Never a silent
+                // in-memory nullifier on a production path (ADR-062 §Decision 1).
+                let did_dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
+                    crate::identity::build_ffi_dht_client()?,
+                ));
                 scp_core::discovery::resolve_contexts_from_did(&query_owned, &did_dht)
                     .await
                     .map_err(ScpPyError::from)
@@ -735,7 +742,7 @@ impl crate::scp::PyScp {
     // Handle registry methods (§22.3.1)
     // -----------------------------------------------------------------------
 
-    /// Registers a handle in a context with discovery tools.
+    /// Registers a handle in a context with discovery outlets.
     ///
     /// # Arguments
     ///
@@ -789,11 +796,8 @@ impl crate::scp::PyScp {
             .entry(discovery_context_id.to_owned())
             .or_insert_with(|| HandleRegistry::new(discovery_context_id.to_owned()));
 
-        let result = registry.register(
-            &params,
-            &DID::from(registrant_did),
-            &scp_primitives::SystemClock,
-        );
+        let result =
+            registry.register(&params, &DID::from(registrant_did), &scp_clock::SystemClock);
 
         serde_json::to_string(&result).map_err(|e| {
             ScpPyError::ValidationError {
@@ -804,7 +808,7 @@ impl crate::scp::PyScp {
         })
     }
 
-    /// Looks up a handle in a context with discovery tools.
+    /// Looks up a handle in a context with discovery outlets.
     ///
     /// # Arguments
     ///
@@ -873,7 +877,7 @@ impl crate::scp::PyScp {
         })
     }
 
-    /// Deregisters a handle from a context with discovery tools.
+    /// Deregisters a handle from a context with discovery outlets.
     ///
     /// Only succeeds if the provided DID matches the handle owner.
     ///
@@ -946,7 +950,7 @@ fn parse_handle_target(json: &str) -> PyResult<HandleTarget> {
 impl crate::scp::PyScp {
     /// Registers a scope name in a scope registry.
     ///
-    /// Scope tools use independent structs and separate storage from handle tools.
+    /// Scope outlets use independent structs and separate storage from handle outlets.
     /// `ScopeTarget` is context-only by construction — no identity variant.
     ///
     /// # Arguments
@@ -1018,11 +1022,7 @@ impl crate::scp::PyScp {
         });
 
         let result = registry
-            .register(
-                &params,
-                &DID::from(registrant_did),
-                &scp_primitives::SystemClock,
-            )
+            .register(&params, &DID::from(registrant_did), &scp_clock::SystemClock)
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("scope registration failed: {e}"),
                 code: codes::VALID_7131.to_owned(),
@@ -1236,7 +1236,7 @@ impl crate::scp::PyScp {
                     &querier,
                     &known_contexts,
                     &known_domains,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .await
                 .map_err(|e| ScpPyError::ValidationError {
@@ -1565,7 +1565,7 @@ mod tests {
     fn petname_malformed_owner_rejected() {
         // A non-empty owner that is not a syntactically valid DID must be
         // rejected by the pre-existing petname ops, matching the strict
-        // `validate_did` gate the WASM bridge and the §4.7 ops already enforce.
+        // `validate_did` gate the §4.7 ops already enforce.
         let scp = default_scp();
         let bad = "not-a-did";
         assert!(scp.petname_set(bad, "did:dht:z1", "test").is_err());

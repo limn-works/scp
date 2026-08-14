@@ -28,10 +28,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::ed25519::verify_ed25519_signature;
+use scp_clock::Clock;
+use scp_crypto::verify_ed25519_signature;
+use scp_did::DID;
 use scp_event_log::Ed25519Signature;
-use scp_primitives::Clock;
-use scp_primitives::DID;
 
 use super::TrustError;
 use super::attestation::DidPublicKeyResolver;
@@ -115,15 +115,15 @@ impl ChallengeType {
         })
     }
 
-    /// Convenience constructor for tool integrity verification challenges.
+    /// Convenience constructor for outlet integrity verification challenges.
     ///
-    /// Used by [`verify_tool_integrity`](crate::context::tools::integrity::verify_tool_integrity)
-    /// to produce [`ChallengeVerification`] results with a tool-integrity
+    /// Used by [`verify_outlet_integrity`](crate::context::outlets::integrity::verify_outlet_integrity)
+    /// to produce [`ChallengeVerification`] results with a outlet-integrity
     /// challenge type.
     #[must_use]
-    pub fn tool_integrity() -> Self {
+    pub fn outlet_integrity() -> Self {
         Self::Uri(CapabilityUri::Protocol {
-            name: "tool-integrity".to_owned(),
+            name: "outlet-integrity".to_owned(),
             version: 1,
         })
     }
@@ -288,6 +288,18 @@ pub enum VerificationMethod {
 /// a capability and the agent passed — the verifier's signature prevents
 /// forgery (spec §7.3.4.2).
 ///
+/// # Authenticated fields
+///
+/// ONLY the fields covered by [`canonical_challenge_verification_bytes`] are
+/// authenticated by the `verifier_signature`: `verification_id`, `verifier_did`,
+/// `subject_did`, `capability_uri`, `challenge_type`, `passed`, `score`,
+/// `test_count`, `pass_count`, `verified_at`, `expires_at`, and `context_id`.
+/// The `result`, `completed_at`, and `verification_method` fields are NOT signed
+/// and can be altered after minting without invalidating the signature.
+/// Consumers (including SDKs) MUST NOT key trust decisions on those unsigned
+/// fields — use the signed `passed`/`score`/`expires_at` and the top-level
+/// signed `challenge_type` instead.
+///
 /// See ADR-017 acceptance criterion 5, spec §7.3.4.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChallengeVerification {
@@ -384,6 +396,23 @@ const DOMAIN_CHALLENGE_VERIFY_V1: &[u8] = b"SCP-CHALLENGE-VERIFY-V1:";
 /// verification should be re-issued.
 const DEFAULT_VERIFICATION_TTL_SECS: u64 = 90 * 24 * 3600;
 
+/// Maximum tolerated clock skew (in seconds) for a challenge response's
+/// `completed_at` timestamp relative to the verifier's clock.
+///
+/// A response claiming to have been completed meaningfully in the FUTURE is
+/// implausible (the verifier cannot have observed a response that has not
+/// happened yet) and is rejected — without this bound, the lower freshness
+/// bound (`completed_at >= now - timeout`) could be evaded by stamping an
+/// arbitrarily far-future `completed_at`. Set to 5 minutes to match the
+/// protocol-wide clock-skew tolerance (spec §9.14).
+///
+/// Independent knob: shares the §9.14 5-minute default with
+/// `crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS`,
+/// `envelope::validation::DEFAULT_CLOCK_SKEW_TOLERANCE_MS`, and
+/// `trust::participation::MAX_PARTICIPATION_FUTURE_SKEW_SECS`, but is
+/// deliberately a distinct constant, not unified.
+const MAX_COMPLETION_FUTURE_SKEW_SECS: u64 = 5 * 60;
+
 // ---------------------------------------------------------------------------
 // Canonical byte construction
 // ---------------------------------------------------------------------------
@@ -399,7 +428,15 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Result<Vec<u
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
     let type_tag = challenge_type_tag(&request.challenge_type);
-    let params_bytes = crate::jcs::to_vec(&request.parameters).unwrap_or_default();
+    // Propagate a canonicalization failure rather than substituting empty bytes:
+    // an `unwrap_or_default()` here would silently drop `parameters` from the
+    // signed digest (fail-open), mirroring the error handling on the hash below
+    // and in the sibling `canonical_challenge_verification_bytes`.
+    let params_bytes = crate::jcs::to_vec(&request.parameters).map_err(|e| {
+        TrustError::ChallengeSigningFailed {
+            reason: format!("canonical parameters serialization failed: {e}"),
+        }
+    })?;
 
     canonical_hash_bytes(
         DOMAIN_CHALLENGE_REQ_V1,
@@ -427,7 +464,14 @@ fn canonical_challenge_request_bytes(request: &ChallengeRequest) -> Result<Vec<u
 fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
 
-    let result_bytes = crate::jcs::to_vec(&response.result).unwrap_or_default();
+    // Propagate a canonicalization failure rather than substituting empty bytes:
+    // an `unwrap_or_default()` here would silently drop `result` from the signed
+    // digest (fail-open), mirroring the error handling on the hash below and in
+    // the sibling `canonical_challenge_verification_bytes`.
+    let result_bytes =
+        crate::jcs::to_vec(&response.result).map_err(|e| TrustError::ChallengeSigningFailed {
+            reason: format!("canonical result serialization failed: {e}"),
+        })?;
 
     canonical_hash_bytes(
         DOMAIN_CHALLENGE_RESP_V1,
@@ -452,7 +496,17 @@ fn canonical_challenge_response_bytes(response: &ChallengeResponse) -> Result<Ve
 /// The domain separator prevents cross-protocol signature confusion.
 /// All fields including `score` and `context_id` are bound into the
 /// signature to prevent post-signing modification.
-fn canonical_challenge_verification_bytes(
+///
+/// Public (mirroring [`canonical_attestation_bytes`](super::canonical_attestation_bytes))
+/// so verifiers can compute the exact bytes a `verifier_signature` covers — both
+/// to mint a record (sign these bytes with the verifier key) and to independently
+/// re-derive them when auditing one.
+///
+/// # Errors
+///
+/// Returns [`TrustError::CanonicalizationFailed`] if the canonical hash cannot be
+/// constructed.
+pub fn canonical_challenge_verification_bytes(
     verification: &ChallengeVerification,
 ) -> Result<Vec<u8>, TrustError> {
     use crate::crypto::canonical::{CanonicalField, canonical_hash_bytes};
@@ -486,7 +540,7 @@ fn canonical_challenge_verification_bytes(
     }
 
     canonical_hash_bytes(DOMAIN_CHALLENGE_VERIFY_V1, &fields).map_err(|e| {
-        TrustError::ChallengeSigningFailed {
+        TrustError::CanonicalizationFailed {
             reason: format!("canonical hash failed: {e}"),
         }
     })
@@ -622,9 +676,11 @@ pub fn issue_challenge(
 /// 2. **Responder identity:** The response's `responder_did` must match the
 ///    request's `subject_did` (the challenged entity must be the one
 ///    responding).
-/// 3. **Timeout:** The response's `completed_at` must be within the
-///    challenge's timeout window (relative to the current clock time minus
-///    the timeout duration).
+/// 3. **Freshness window:** The response's `completed_at` must be within the
+///    challenge's timeout window (not older than `now - timeout`) AND not
+///    implausibly in the future (not newer than `now + clock-skew tolerance`).
+///    A far-future `completed_at` is rejected so it cannot evade the lower
+///    staleness bound.
 /// 4. **Signature:** Verifies the Ed25519 signature against the responder's
 ///    public key, resolved via the provided [`DidPublicKeyResolver`].
 ///
@@ -675,13 +731,20 @@ pub fn verify_challenge_response(
     verify_ed25519_signature(&challenger_pk, &request_canonical, &request.signature)
         .map_err(|reason| TrustError::ChallengeRequestSignatureInvalid { reason })?;
 
-    // 3. Check timeout: response must not have been completed after the
-    //    deadline. We define the deadline as now (verification time).
-    //    The completed_at must be within the timeout window relative to the
-    //    current time, i.e., completed_at >= (now - timeout_secs).
+    // 3. Check the freshness window: `completed_at` must fall within the
+    //    acceptable band around the verifier's clock.
+    //    - Lower bound: not older than the timeout, i.e.
+    //      `completed_at >= now - timeout_secs`.
+    //    - Upper bound: not implausibly in the future, i.e.
+    //      `completed_at <= now + MAX_COMPLETION_FUTURE_SKEW_SECS`. Without this,
+    //      a far-future `completed_at` trivially satisfies the lower bound and a
+    //      stale/forged response could be replayed forever.
     let now = clock.now_secs();
     let timeout_secs = request.timeout.as_secs();
-    if now > timeout_secs && response.completed_at < (now - timeout_secs) {
+    let too_old = now > timeout_secs && response.completed_at < (now - timeout_secs);
+    let too_far_future =
+        response.completed_at > now.saturating_add(MAX_COMPLETION_FUTURE_SKEW_SECS);
+    if too_old || too_far_future {
         return Err(TrustError::ChallengeTimeout {
             challenge_id: request.challenge_id.clone(),
             timeout_secs,
@@ -759,6 +822,110 @@ pub fn verify_challenge_response(
 }
 
 // ---------------------------------------------------------------------------
+// verify_challenge_verification
+// ---------------------------------------------------------------------------
+
+/// Verifies the verifier's Ed25519 signature over a [`ChallengeVerification`]
+/// record AND binds it to the target context and the current time.
+///
+/// A `ChallengeVerification` carries a caller-controlled `passed`/`score` trust
+/// signal that is only trustworthy because the verifier signs it (spec
+/// §7.3.4.2). The signature, produced by [`verify_challenge_response`], binds
+/// every consumed field (`passed`, `score`, `expires_at`, `subject_did`,
+/// `verifier_did`, `capability_uri`, `challenge_type`, `verified_at`,
+/// `test_count`, `pass_count`, `context_id`) via
+/// [`canonical_challenge_verification_bytes`], so a valid signature proves the
+/// record was not forged or post-signing modified. This is the verify-on-ingest
+/// gate for caller-supplied challenge results crossing the FFI boundary.
+///
+/// Beyond signature authenticity, this gate enforces the two bindings a
+/// signature alone does NOT provide for a context-scoped store — a genuinely
+/// verifier-signed result is still authentic when replayed into another context
+/// or after it expires, so the signature does not stop replay:
+///
+/// 1. **Context binding.** The record's signed `context_id` must equal
+///    `target_context_id`. A `None` (context-agnostic) result is REJECTED for a
+///    context-scoped store, and a genuine result minted for context A cannot be
+///    replayed into context B's aggregation
+///    ([`TrustError::ChallengeContextMismatch`]).
+/// 2. **Expiry.** Challenges are repeatable (spec §7.3.4); a record whose signed
+///    `expires_at <= now` is REJECTED
+///    ([`TrustError::ChallengeVerificationExpired`]) so a stale verification is
+///    never consumed as a current trust signal. `now` is read from the injected
+///    `clock`, matching the attestation ingest path.
+/// 3. **Subject binding.** The record's signed `subject_did` must equal
+///    `expected_subject`. `subject_did` is part of the canonical preimage, so the
+///    binding is authentic; a genuine result minted for subject A is REJECTED
+///    ([`TrustError::ChallengeSubjectMismatch`]) when consumed for subject B.
+///    This closes cross-subject attribution by construction at the verify site,
+///    rather than relying on the caller's store key to segregate records.
+///
+/// # Errors
+///
+/// - [`TrustError`] from the resolver if the verifier's public key cannot be
+///   resolved from `verifier_did`.
+/// - [`TrustError::ChallengeVerificationSignatureInvalid`] if the signature does
+///   not verify against the resolved verifier key.
+/// - [`TrustError::ChallengeContextMismatch`] if the record's `context_id` is
+///   not `Some(target_context_id)`.
+/// - [`TrustError::ChallengeVerificationExpired`] if `expires_at <= now`.
+/// - [`TrustError::ChallengeSubjectMismatch`] if the record's signed
+///   `subject_did` is not `expected_subject`.
+pub fn verify_challenge_verification(
+    verification: &ChallengeVerification,
+    resolver: &(impl DidPublicKeyResolver + ?Sized),
+    target_context_id: &str,
+    expected_subject: &str,
+    clock: &(impl Clock + ?Sized),
+) -> Result<(), TrustError> {
+    let verifier_pk = resolver.resolve_public_key(&verification.verifier_did)?;
+    let canonical = canonical_challenge_verification_bytes(verification)?;
+    verify_ed25519_signature(&verifier_pk, &canonical, &verification.verifier_signature).map_err(
+        |reason| TrustError::ChallengeVerificationSignatureInvalid {
+            verification_id: verification.verification_id.clone(),
+            reason,
+        },
+    )?;
+
+    // Subject binding: reject a genuine, verifier-signed result minted for a
+    // different subject. `subject_did` is a signed field, so this comparison is
+    // over authenticated data — the binding is explicit here at the verify site,
+    // not reliant on the caller keying its store by subject.
+    if verification.subject_did != expected_subject {
+        return Err(TrustError::ChallengeSubjectMismatch {
+            verification_id: verification.verification_id.clone(),
+            record_subject: verification.subject_did.to_string(),
+            expected_subject: expected_subject.to_owned(),
+        });
+    }
+
+    // Context binding: reject a `None` (context-agnostic) result for a
+    // context-scoped store, and reject a genuine result minted for another
+    // context. `context_id` is a signed field, so this comparison is over
+    // authenticated data.
+    if verification.context_id.as_deref() != Some(target_context_id) {
+        return Err(TrustError::ChallengeContextMismatch {
+            verification_id: verification.verification_id.clone(),
+            record_context: verification.context_id.clone(),
+            expected_context: target_context_id.to_owned(),
+        });
+    }
+
+    // Expiry: challenges are repeatable; an expired verification is not a
+    // current trust signal.
+    let now = clock.now_secs();
+    if verification.expires_at <= now {
+        return Err(TrustError::ChallengeVerificationExpired {
+            verification_id: verification.verification_id.clone(),
+            expires_at: verification.expires_at,
+            now,
+        });
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -771,7 +938,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
 
     use super::*;
-    use scp_primitives::TestClock;
+    use scp_clock::TestClock;
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -1345,6 +1512,90 @@ mod tests {
             Err(TrustError::ChallengeTimeout { .. }) => {}
             other => panic!("expected ChallengeTimeout, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn verify_challenge_response_rejects_far_future_completed_at() {
+        let (challenger_key, challenger_pubkey) = test_keypair();
+        let (subject_key, subject_pubkey) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let clock = TestClock::new(1000);
+
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
+        resolver.add_key("did:key:subject", subject_pubkey);
+
+        let request = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::schema_validation(),
+            TEST_CAPABILITY_URI.to_owned(),
+            serde_json::json!({}),
+            Duration::from_mins(1),
+            &signer,
+        )
+        .unwrap();
+
+        // completed_at is far in the future (now = 1000, skew bound = 300s).
+        // 1000 + 300 = 1300; completed_at = 100_000 is well past that, so the
+        // upper freshness bound rejects it even though it trivially satisfies the
+        // lower (staleness) bound.
+        let response = make_signed_response(
+            &subject_key,
+            &request.challenge_id,
+            "did:key:subject",
+            serde_json::json!({}),
+            100_000,
+        );
+
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
+        match result {
+            Err(TrustError::ChallengeTimeout { completed_at, .. }) => {
+                assert_eq!(completed_at, 100_000);
+            }
+            other => panic!("expected ChallengeTimeout for far-future completed_at, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_challenge_response_accepts_completed_at_within_future_skew() {
+        let (challenger_key, challenger_pubkey) = test_keypair();
+        let (subject_key, subject_pubkey) = test_keypair();
+        let signer = TestSigner::new(challenger_key);
+        let clock = TestClock::new(1000);
+
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:challenger", challenger_pubkey);
+        resolver.add_key("did:key:subject", subject_pubkey);
+
+        let request = issue_challenge(
+            "did:key:challenger".into(),
+            "did:key:subject".into(),
+            ChallengeType::schema_validation(),
+            TEST_CAPABILITY_URI.to_owned(),
+            serde_json::json!({}),
+            Duration::from_mins(5),
+            &signer,
+        )
+        .unwrap();
+
+        // completed_at slightly ahead of `now` (within the 300s skew tolerance):
+        // 1000 + 60 = 1060 <= 1000 + 300, so a small benign skew is accepted.
+        let response = make_signed_response(
+            &subject_key,
+            &request.challenge_id,
+            "did:key:subject",
+            serde_json::json!({}),
+            1060,
+        );
+
+        let result =
+            verify_challenge_response(&request, &response, &resolver, &clock, &signer, None);
+        assert!(
+            result.is_ok(),
+            "expected Ok within skew tolerance, got {result:?}"
+        );
     }
 
     #[test]
@@ -1953,6 +2204,99 @@ mod tests {
                 }
                 other => panic!("expected NotChallengeable for {system_uri}, got {other:?}"),
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_challenge_verification — subject binding (Fix 6)
+    // -----------------------------------------------------------------------
+
+    /// Builds a GENUINELY verifier-signed [`ChallengeVerification`] bound to
+    /// `subject` and `context`, signed with `signing_key`.
+    fn make_signed_verification(
+        signing_key: &SigningKey,
+        verifier_did: &str,
+        subject: &str,
+        context: &str,
+        expires_at: u64,
+    ) -> ChallengeVerification {
+        let mut cv = ChallengeVerification {
+            verification_id: "vid-subject-binding".to_owned(),
+            verifier_did: verifier_did.into(),
+            subject_did: subject.into(),
+            capability_uri: TEST_CAPABILITY_URI.to_owned(),
+            challenge_type: ChallengeType::schema_validation(),
+            verification_method: VerificationMethod::ChallengeVerified {
+                challenge_type: ChallengeType::schema_validation(),
+            },
+            passed: true,
+            score: None,
+            test_count: 1,
+            pass_count: 1,
+            result: serde_json::json!({"passed": true}),
+            completed_at: 900,
+            verified_at: 900,
+            expires_at,
+            context_id: Some(context.to_owned()),
+            verifier_signature: vec![],
+        };
+        let canonical = canonical_challenge_verification_bytes(&cv).unwrap();
+        cv.verifier_signature = signing_key.sign(&canonical).to_bytes().to_vec();
+        cv
+    }
+
+    #[test]
+    fn verify_challenge_verification_accepts_matching_subject() {
+        let (verifier_key, verifier_pub) = test_keypair();
+        let clock = TestClock::new(1000);
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:verifier", verifier_pub);
+
+        let cv = make_signed_verification(
+            &verifier_key,
+            "did:key:verifier",
+            "did:key:subject-a",
+            "ctx-1",
+            u64::MAX,
+        );
+
+        // Verifying for the matching subject succeeds.
+        assert!(
+            verify_challenge_verification(&cv, &resolver, "ctx-1", "did:key:subject-a", &clock)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn verify_challenge_verification_rejects_mismatched_subject() {
+        let (verifier_key, verifier_pub) = test_keypair();
+        let clock = TestClock::new(1000);
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:verifier", verifier_pub);
+
+        // A genuine, in-context, unexpired, properly-signed result for subject A.
+        let cv = make_signed_verification(
+            &verifier_key,
+            "did:key:verifier",
+            "did:key:subject-a",
+            "ctx-1",
+            u64::MAX,
+        );
+
+        // Consuming it for a DIFFERENT subject B is rejected, even though the
+        // signature, context, and expiry are all valid.
+        let result =
+            verify_challenge_verification(&cv, &resolver, "ctx-1", "did:key:subject-b", &clock);
+        match result {
+            Err(TrustError::ChallengeSubjectMismatch {
+                record_subject,
+                expected_subject,
+                ..
+            }) => {
+                assert_eq!(record_subject, "did:key:subject-a");
+                assert_eq!(expected_subject, "did:key:subject-b");
+            }
+            other => panic!("expected ChallengeSubjectMismatch, got {other:?}"),
         }
     }
 }

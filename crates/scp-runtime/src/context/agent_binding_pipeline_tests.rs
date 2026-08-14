@@ -4,18 +4,19 @@
 //! *live* scp-runtime message pipeline end to end — both halves of the wiring
 //! this story makes real:
 //!
-//! - **Send side (Part 2).** [`messaging_helpers::build_encrypted_envelope`] —
-//!   the exact function the live `Supervisor::send_message` →
+//! - **Send side (Part 2).** [`messaging_helpers::build_encrypted_envelope_actor`]
+//!   — the production actor app-data seal the live `Supervisor::send_message` →
 //!   `messaging_helpers::send_message` → `encrypt_and_send` chain bottoms out in
-//!   — now stamps the caller's chosen [`SigningKeyId`] into
+//!   — stamps the caller's chosen [`SigningKeyId`] into
 //!   `InnerEnvelope.signing_key_id` instead of hardcoding `#active`. The send
-//!   half here drives that helper directly with `SigningKeyId::Agent` /
-//!   `SigningKeyId::Active`.
+//!   half here drives that seam directly (against Alice's actor-owned
+//!   `ContextCryptoState`) with `SigningKeyId::Agent` / `SigningKeyId::Active`.
+//!   (ADR-049 PR-7 deleted the provider `build_encrypted_envelope` twin.)
 //! - **Receive side (Part 1).** [`messaging_helpers::verify_and_unwrap`] reads
 //!   `inner.signing_key_id` and resolves the matching verification method
 //!   (`#active` vs `#agent`) from the sender's DID document via the VM-aware
 //!   [`KeyResolver`]. The receive half is exercised by MLS-opening the produced
-//!   blob on the recipient's crypto provider and driving the *live*
+//!   blob on the recipient's actor-owned crypto state and driving the *live*
 //!   [`messaging_helpers::verify_and_unwrap`] receive helper — the exact code
 //!   path the actor's `deliver_incoming` invokes.
 //!
@@ -24,8 +25,8 @@
 //! [`crate::crypto::agent_binding_tests`] is a *component-level* test: it
 //! hand-calls `create_inner_envelope` / `verify_inner_signature` /
 //! governance-engine internals in isolation. This module instead drives the two
-//! live messaging helpers this story wires (`build_encrypted_envelope` and
-//! `verify_and_unwrap`) over a real two-party MLS group, with a
+//! live messaging helpers this story wires (`build_encrypted_envelope_actor`
+//! and `verify_and_unwrap`) over a real two-party MLS group, with a
 //! **document-derived** resolver built from a real
 //! [`DidDocument::new_with_agent_key`] — so an `#agent`-signed message is
 //! produced through the real seal path AND verified through the real receive
@@ -47,17 +48,18 @@
 //!    `deliver_commit_blob` cannot decrypt a peer's application blob. This
 //!    module drives the very same receive helper (`verify_and_unwrap`) the
 //!    actor's `deliver_incoming` calls, after a real MLS `open()` on the
-//!    recipient provider — exercising the identical VM-aware resolution logic.
+//!    recipient's actor-owned `ContextCryptoState` (taken from the provider-
+//!    resident fixture group) — exercising the identical VM-aware resolution.
 //! 2. **Send: peer fan-out needs the full add-member flow.**
 //!    `Supervisor::send_message` only fans out to members the actor added (and
 //!    whose access keys it distributed) through the governance add-member path;
 //!    there is no public `Supervisor` API to seed a peer's membership + access
 //!    key. That bootstrap exists only in the `scp-testing` `FullStackNode`
 //!    harness, which cannot reach the `pub(crate)` `verify_and_unwrap`. This
-//!    module therefore drives `build_encrypted_envelope` directly — the exact
-//!    function the Supervisor send path delegates the `signing_key_id` stamp to
-//!    (verified by reading the `send_message → encrypt_and_send →
-//!    build_encrypted_envelope` chain).
+//!    module therefore drives `build_encrypted_envelope_actor` directly — the
+//!    exact production seam the Supervisor send path delegates the
+//!    `signing_key_id` stamp to (verified by reading the `send_message →
+//!    encrypt_and_send → build_encrypted_envelope_actor` chain).
 //!
 //! Both helpers are `pub(crate)`, so this test must live in-crate rather than in
 //! `crates/scp-runtime/tests/`.
@@ -69,16 +71,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use scp_identity::{DID, DidDocument, SigningKeyId};
-use scp_primitives::{Clock, SystemClock};
+use scp_clock::{Clock, SystemClock};
+use scp_did::{DID, DidDocument, SigningKeyId};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::crypto::access_keys::{AccessKey, generate_access_key};
 use scp_protocol::envelope::inner::{InnerEnvelope, MessageType};
 
-use crate::context::messaging_helpers::{build_encrypted_envelope, verify_and_unwrap};
+use crate::context::actor::state::PerContextState;
+use crate::context::messaging_helpers::{build_encrypted_envelope_actor, verify_and_unwrap};
 use crate::context::supervisor::MessageSigner;
-use crate::crypto::mls::provider::MlsCryptoProvider;
 
 const ALICE_DID: &str = "did:dht:z6MkAgentBindingPipelineAliceAliceAliceA";
 const BOB_DID: &str = "did:dht:z6MkAgentBindingPipelineBobBobBobBobBobBo";
@@ -89,10 +91,10 @@ const BOB_DID: &str = "did:dht:z6MkAgentBindingPipelineBobBobBobBobBobBo";
 
 /// Decodes a `z`-prefixed base58btc multibase public key (as stored in a
 /// [`DidDocument`] verification method) into an Ed25519 [`VerifyingKey`], using
-/// the canonical `scp_identity::decode_multibase_key` decoder (which performs
+/// the canonical `scp_did::decode_multibase_key` decoder (which performs
 /// the same curve-point validation production DID resolution does).
 fn verifying_key_from_vm_multibase(multibase: &str) -> VerifyingKey {
-    let bytes = scp_identity::decode_multibase_key(multibase)
+    let bytes = scp_did::decode_multibase_key(multibase)
         .expect("verification-method multibase must decode to a valid Ed25519 key");
     VerifyingKey::from_bytes(&bytes).expect("decoded bytes must be a valid Ed25519 key")
 }
@@ -134,37 +136,26 @@ fn document_backed_resolver(
 // ---------------------------------------------------------------------------
 
 /// Sets up a real two-party MLS group keyed by `context_id_bytes(ctx_str)` —
-/// the same key `build_encrypted_envelope` derives from the context-id string —
-/// returning Alice's provider (the sender) and Bob's provider (used to MLS-open
-/// the produced blob on the receive side).
-fn setup_two_party(ctx_str: &str) -> (Arc<MlsCryptoProvider>, Arc<MlsCryptoProvider>, [u8; 32]) {
-    let context_id = scp_protocol::context::context_id_bytes(ctx_str);
-
-    let alice = MlsCryptoProvider::new(ALICE_DID.to_owned());
-    alice.create_mls_group(&context_id).unwrap();
-    alice.generate_sender_key(&context_id).unwrap();
-
-    let bob = MlsCryptoProvider::new(BOB_DID.to_owned());
-    let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
-    let add_output = alice
-        .add_member(&context_id, BOB_DID, Some(&bob_kp_bytes))
-        .unwrap();
-    bob.join_from_welcome(&context_id, &add_output.welcome_bytes)
-        .unwrap();
-    bob.generate_sender_key(&context_id).unwrap();
-
-    // Distribute Alice's sender key to Bob so Bob can sender-key-decrypt
-    // Alice's application sends.
-    alice.distribute_sender_key(&context_id, BOB_DID).unwrap();
-    for (_target, msg) in alice
-        .drain_pending_sender_key_messages(&context_id)
-        .unwrap()
-    {
-        bob.process_incoming_sender_key(&context_id, ALICE_DID, &msg)
-            .unwrap();
-    }
-
-    (Arc::new(alice), Arc::new(bob), context_id)
+/// the same key `build_encrypted_envelope_actor` derives from the context-id
+/// string — returning Alice's provider (the sender) and Bob's provider (each
+/// moved onto an actor to seal/open the produced blob on the receive side).
+fn setup_two_party(ctx_str: &str) -> (PerContextState, PerContextState, [u8; 32]) {
+    // Stand up the joined pair over the REAL reserve → creator-add → sign →
+    // HPKE-seal → join path, born DIRECTLY onto actor-owned state via the #2148
+    // owned-return constructors (no provider `take_crypto_state` round-trip). The
+    // helper keys the group by `context_id_bytes(ctx_str)` and pulls Alice's
+    // sender key to Bob so Bob can sender-key-decrypt Alice's application sends.
+    // The bootstrap's internal resolver only verifies the joiner's creator
+    // signature and seals to Bob's #active — the send / receive half below builds
+    // its own document-derived `#agent`-aware resolver. The returned providers
+    // are unused here, so they are discarded.
+    let crate::crypto::mls::two_party_test_support::TwoPartyPair {
+        alice_state,
+        bob_state,
+        ctx_bytes,
+        ..
+    } = crate::crypto::mls::two_party_test_support::stand_up_two_party(ctx_str, ALICE_DID, BOB_DID);
+    (alice_state, bob_state, ctx_bytes)
 }
 
 /// Generates Alice's identity-key, active-key, and agent-key keypairs and the
@@ -197,7 +188,7 @@ fn alice_identity() -> (SigningKey, SigningKey, DidDocument) {
 /// with `signing_key_id`. The recipient wrap addresses both Alice and Bob (so
 /// Bob can unwrap with `bob_access_key`). Returns the sealed wire blob.
 fn build_send_blob(
-    alice_provider: &Arc<MlsCryptoProvider>,
+    alice_state: &mut PerContextState,
     ctx_str: &str,
     signing_key: &SigningKey,
     signing_key_id: SigningKeyId,
@@ -222,9 +213,20 @@ fn build_send_blob(
         SigningKeyId::Agent => MessageSigner::Agent(signing_key),
     };
 
-    build_encrypted_envelope(
+    // Drive the PRODUCTION actor app-data seal `build_encrypted_envelope_actor`
+    // (the exact seam `encrypt_and_send` bottoms out in) directly on Alice's
+    // owned actor state.
+    // Extract the encrypted-mode crypto sub-state via the `crypto_mut()` method
+    // accessor (not a `panic!`/`unreachable!` macro): the actor send-path tests
+    // always drive an encrypted context, so the broadcast case is unreachable.
+    let crypto_state = alice_state
+        .mode
+        .crypto_mut()
+        .expect("agent-binding pipeline test uses encrypted mode");
+    build_encrypted_envelope_actor(
         &clock,
-        alice_provider,
+        crypto_state,
+        ALICE_DID,
         ctx_str,
         &sender,
         payload,
@@ -234,20 +236,21 @@ fn build_send_blob(
         None,
         MessageType::Content,
     )
-    .expect("build_encrypted_envelope")
+    .expect("build_encrypted_envelope_actor")
 }
 
-/// Receive half: MLS-open the captured blob on Bob's provider, then drive the
-/// *live* `verify_and_unwrap` receive helper with `resolver`.
+/// Receive half: MLS-open the captured blob on Bob's owned actor state, then
+/// drive the *live* `verify_and_unwrap` receive helper with `resolver`. Bob's
+/// seeded state carries Alice's pulled sender key so the application open
+/// resolves it.
 fn receive_via_verify_and_unwrap(
-    bob_provider: &MlsCryptoProvider,
+    bob_state: &mut PerContextState,
     ctx_str: &str,
-    ctx_bytes: &[u8; 32],
     blob: &[u8],
     resolver: &KeyResolver,
     bob_access_key: &AccessKey,
 ) -> Result<Vec<u8>, ContextError> {
-    let opened = match bob_provider.open(ctx_bytes, blob)? {
+    let opened = match bob_state.open(&SystemClock, ctx_str, blob)? {
         scp_protocol::context::builder::OpenResult::Application(env) => *env,
         other => {
             return Err(ContextError::CryptoFailed(format!(
@@ -275,13 +278,13 @@ fn receive_via_verify_and_unwrap(
 #[test]
 fn agent_signed_message_verifies_through_live_pipeline() {
     let ctx_str = "ctx-agent-binding-pipeline-agent";
-    let (alice_provider, bob_provider, ctx_bytes) = setup_two_party(ctx_str);
+    let (mut alice_state, mut bob_state, _ctx_bytes) = setup_two_party(ctx_str);
     let (_active_sk, agent_sk, alice_doc) = alice_identity();
     let bob_access_key = generate_access_key(ctx_str, BOB_DID);
 
     let resolver = document_backed_resolver(&alice_doc, None);
     let blob = build_send_blob(
-        &alice_provider,
+        &mut alice_state,
         ctx_str,
         &agent_sk,
         SigningKeyId::Agent,
@@ -289,15 +292,9 @@ fn agent_signed_message_verifies_through_live_pipeline() {
         b"hello from the agent persona",
     );
 
-    let plaintext = receive_via_verify_and_unwrap(
-        &bob_provider,
-        ctx_str,
-        &ctx_bytes,
-        &blob,
-        &resolver,
-        &bob_access_key,
-    )
-    .expect("agent-signed message must verify through the live pipeline");
+    let plaintext =
+        receive_via_verify_and_unwrap(&mut bob_state, ctx_str, &blob, &resolver, &bob_access_key)
+            .expect("agent-signed message must verify through the live pipeline");
 
     assert_eq!(
         plaintext.as_slice(),
@@ -313,7 +310,7 @@ fn agent_signed_message_verifies_through_live_pipeline() {
 #[test]
 fn agent_signed_message_rejected_when_resolver_returns_wrong_agent_key() {
     let ctx_str = "ctx-agent-binding-pipeline-wrongkey";
-    let (alice_provider, bob_provider, ctx_bytes) = setup_two_party(ctx_str);
+    let (mut alice_state, mut bob_state, _ctx_bytes) = setup_two_party(ctx_str);
     let (_active_sk, agent_sk, alice_doc) = alice_identity();
     let bob_access_key = generate_access_key(ctx_str, BOB_DID);
 
@@ -321,7 +318,7 @@ fn agent_signed_message_rejected_when_resolver_returns_wrong_agent_key() {
     // WRONG key for #agent, so the live `verify_and_unwrap` signature check must
     // fail.
     let blob = build_send_blob(
-        &alice_provider,
+        &mut alice_state,
         ctx_str,
         &agent_sk,
         SigningKeyId::Agent,
@@ -333,9 +330,8 @@ fn agent_signed_message_rejected_when_resolver_returns_wrong_agent_key() {
     let bad_resolver = document_backed_resolver(&alice_doc, Some(wrong_agent_key));
 
     let result = receive_via_verify_and_unwrap(
-        &bob_provider,
+        &mut bob_state,
         ctx_str,
-        &ctx_bytes,
         &blob,
         &bad_resolver,
         &bob_access_key,
@@ -359,13 +355,13 @@ fn agent_signed_message_rejected_when_resolver_returns_wrong_agent_key() {
 #[test]
 fn active_signed_message_still_verifies_through_live_pipeline() {
     let ctx_str = "ctx-agent-binding-pipeline-active";
-    let (alice_provider, bob_provider, ctx_bytes) = setup_two_party(ctx_str);
+    let (mut alice_state, mut bob_state, _ctx_bytes) = setup_two_party(ctx_str);
     let (active_sk, _agent_sk, alice_doc) = alice_identity();
     let bob_access_key = generate_access_key(ctx_str, BOB_DID);
 
     let resolver = document_backed_resolver(&alice_doc, None);
     let blob = build_send_blob(
-        &alice_provider,
+        &mut alice_state,
         ctx_str,
         &active_sk,
         SigningKeyId::Active,
@@ -373,15 +369,9 @@ fn active_signed_message_still_verifies_through_live_pipeline() {
         b"hello from the human persona",
     );
 
-    let plaintext = receive_via_verify_and_unwrap(
-        &bob_provider,
-        ctx_str,
-        &ctx_bytes,
-        &blob,
-        &resolver,
-        &bob_access_key,
-    )
-    .expect("active-signed message must still verify through the live pipeline");
+    let plaintext =
+        receive_via_verify_and_unwrap(&mut bob_state, ctx_str, &blob, &resolver, &bob_access_key)
+            .expect("active-signed message must still verify through the live pipeline");
 
     assert_eq!(
         plaintext.as_slice(),
@@ -435,7 +425,7 @@ mod live_supervisor_send {
     // Test-only recording transport: the `Mutex<Vec<...>>` capture buffer is
     // written/read exclusively from the synchronous `ContextTransportProvider`
     // trait methods (and the test body), never held across an `.await`, so a
-    // plain `std::sync::Mutex` is the correct tool. The runtime's actor path
+    // plain `std::sync::Mutex` is the correct outlet. The runtime's actor path
     // bans it (ADR-049); test fixtures are explicitly exempt — same exemption
     // the `CapturingPersistence` fixture takes. See crates/scp-runtime/clippy.toml.
     #![allow(clippy::disallowed_types)]
@@ -443,18 +433,24 @@ mod live_supervisor_send {
     use std::sync::{Arc, Mutex};
 
     use ed25519_dalek::SigningKey;
-    use scp_identity::{DID, SigningKeyId};
+    use scp_did::{DID, SigningKeyId};
+
     use scp_protocol::context::builder::{ContextCreationError, OpenResult};
+    use scp_protocol::context::governance::KeyResolver;
     use scp_protocol::context::membership::{ContextEvent, KeyPackage};
     use scp_protocol::context::params::{ContextMode, ContextParams};
     use scp_protocol::context::roles::Capability;
     use scp_protocol::context::{ContextError, context_id_bytes};
+    use zeroize::Zeroizing;
 
     use super::{ALICE_DID, BOB_DID, alice_identity, document_backed_resolver};
     use crate::context::ContextHandle;
+    use crate::context::actor::state::PerContextState;
     use crate::context::builder::ContextTransportProvider;
+    use crate::context::supervisor::key_package_actor::KeyPackageCommand;
     use crate::context::supervisor::{MessageSigner, Supervisor};
-    use crate::crypto::mls::provider::MlsCryptoProvider;
+    use crate::crypto::mls::provider::NodeMlsFactory;
+    use scp_clock::SystemClock;
 
     /// Shared buffer of `(routing_id, payload)` pairs the recording transport
     /// captures. Mirrors the `scp-testing` `CapturingTransport` (which lives in
@@ -476,12 +472,13 @@ mod live_supervisor_send {
         }
     }
 
+    #[async_trait::async_trait]
     impl ContextTransportProvider for CapturingTransport {
         fn is_connected(&self) -> bool {
             true
         }
 
-        fn publish_context(
+        async fn publish_context(
             &self,
             _context_id: &[u8; 32],
             _params: &ContextParams,
@@ -489,11 +486,14 @@ mod live_supervisor_send {
             Ok(())
         }
 
-        fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn delete_published(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
-        fn send_message(
+        async fn send_message(
             &self,
             context_id: &[u8; 32],
             encrypted_payload: &[u8],
@@ -541,7 +541,10 @@ mod live_supervisor_send {
     /// in-memory event log / MLS storage via `test_supervisor`) and returns it
     /// alongside the shared capture buffer.
     fn alice_supervisor(sent: SentBuffer) -> Arc<Supervisor> {
-        let crypto = Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned()));
+        let crypto = Arc::new(NodeMlsFactory::new(
+            ALICE_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        ));
         let (_active_sk, _agent_sk, alice_doc) = alice_identity();
         let resolver = document_backed_resolver(&alice_doc, None);
         let transport: Box<dyn ContextTransportProvider> = Box::new(CapturingTransport::new(sent));
@@ -589,21 +592,48 @@ mod live_supervisor_send {
         ctx_id: &str,
         sent: &SentBuffer,
     ) -> (
-        Arc<MlsCryptoProvider>,
+        PerContextState,
         [u8; 32],
         scp_protocol::crypto::access_keys::AccessKey,
     ) {
         let ctx_bytes = context_id_bytes(ctx_id);
 
-        // Bob mints a real MLS key package (his provider keeps the matching
-        // signer state for the later Welcome join).
-        let bob = Arc::new(MlsCryptoProvider::new(BOB_DID.to_owned()));
-        let bob_kp_bytes = bob
-            .prepare_key_package_for_join()
-            .expect("bob prepares key package");
+        // Bob's joiner supervisor + a clone of his provider (holds the installed
+        // group after the join, even after the supervisor is dropped). Its
+        // resolver resolves the bundle creator (ALICE) so Bob can verify the
+        // creator-signed §5.12.3 invitation. The bundle-signing key is
+        // independent of Alice's send-signing identity: SingleAdmin `0xFF02`
+        // commits only the creator DID, so any key the resolver maps to
+        // `ALICE_DID` validly signs the bundle.
+        let alice_bundle_key = SigningKey::from_bytes(&[0xA1; 32]);
+        let _bob_active_key = SigningKey::from_bytes(&[0xB0; 32]);
+        let resolver: KeyResolver = {
+            let alice = DID::from(ALICE_DID);
+            let alice_vk = alice_bundle_key.verifying_key();
+            Arc::new(move |did: &DID, _| (did == &alice).then_some(alice_vk))
+        };
+        let (bob_sup, bob) =
+            crate::crypto::mls::two_party_test_support::bob_supervisor(BOB_DID, resolver);
 
-        // Real add-member through the actor: real MLS add → real Welcome → real
-        // HPKE sender-key distribution → minted access keys.
+        // Publish Bob's OWN provider wrapping keypair BEFORE reserving so the
+        // pooled KP's `0xFF01` leaf and the secret Bob opens sender keys with stay
+        // the same keypair; then reserve his real KeyPackage from his own store.
+        let (bob_wrap_public, bob_wrap_secret) = bob.wrapping_keypair_snapshot();
+        bob_sup
+            .set_wrapping_keys(
+                DID::from(BOB_DID),
+                bob_wrap_public.to_vec(),
+                Zeroizing::new(bob_wrap_secret.to_vec()),
+            )
+            .await
+            .expect("publish bob's wrapping key");
+        let (reservation_id, bob_kp_bytes) = bob_sup
+            .reserve_key_package(DID::from(BOB_DID))
+            .await
+            .expect("bob reserves a real KeyPackage from his own store");
+
+        // Real add-member through Alice's LIVE actor: real MLS add → real Welcome
+        // → real HPKE sender-key distribution → minted access keys.
         sup.join_context(
             handle,
             KeyPackage {
@@ -623,7 +653,7 @@ mod live_supervisor_send {
         // buffer clean for the application ciphertext the test sends later.
         let bootstrap_blobs = drain_sent(sent);
 
-        // Bob forms his group from the Welcome the actor emitted.
+        // Extract the Welcome the actor emitted for Bob.
         let welcome_bytes = {
             let mut welcome = None;
             for event in sup.drain_events(ctx_id).await {
@@ -633,26 +663,58 @@ mod live_supervisor_send {
             }
             welcome.expect("actor emitted a WelcomeGenerated event for Bob")
         };
-        bob.join_from_welcome(&ctx_bytes, &welcome_bytes)
-            .expect("bob joins from Welcome");
-        bob.generate_sender_key(&ctx_bytes)
-            .expect("bob generates his sender key");
+
+        // Bob confirms the join at the PROVIDER level (the real fused
+        // `ConfirmConsume` join → the joined `ScpMlsGroup`), then BIRTHS the
+        // joined crypto DIRECTLY onto owned actor state via the #2148
+        // `install_joined_group` constructor + the production seed
+        // primitive (no provider-resident insert, no `take_crypto_state`
+        // round-trip). The owned constructor mints Bob's own sender key locally.
+        let bob_pseudonym = [0x42u8; 32];
+        let bob_deps = bob_sup
+            .build_actor_deps(&DID::from(BOB_DID))
+            .await
+            .expect("build bob's actor deps");
+        let joined_group = bob_deps
+            .key_package_store
+            .send(|reply| KeyPackageCommand::ConfirmConsume {
+                reservation_id,
+                welcome_bytes,
+                reply,
+            })
+            .await
+            .expect("bob confirms the join and receives the joined MLS group");
+        let bob_owned = bob.install_joined_group(joined_group);
+        drop(bob_sup);
+
+        // Bob's node-resident wrapping secret (the actor HPKE-open key), captured
+        // for opening Alice's sender-key distributions, then seed his owned actor
+        // state directly from the join constructor.
+        let (_bob_wpub, bob_wsec) = bob.wrapping_keypair_snapshot();
+        let bob_wsec: [u8; 32] = *bob_wsec;
+        let mut bob_actor =
+            PerContextState::new_for_test_encrypted(ctx_bytes, 0, DID::from(BOB_DID));
+        bob_actor.seed_encrypted_crypto_from_owned(bob_owned);
 
         // Process the captured sender-key distribution: each blob is a sealed
         // management OuterEnvelope — open it, then feed the inner MLS payload to
         // `process_incoming_sender_key` (exactly the `Management` arm of
         // `FullStackNode::decrypt_message`).
         for (_routing_id, blob) in bootstrap_blobs {
-            match bob
-                .open(&ctx_bytes, &blob)
+            match bob_actor
+                .open(&SystemClock, ctx_id, &blob)
                 .expect("bob opens bootstrap blob")
             {
                 OpenResult::Management {
                     sender_did,
                     payload,
                 } => {
-                    bob.process_incoming_sender_key(&ctx_bytes, &sender_did, &payload)
+                    // ADR-049 PR-6: process returns (key, epoch) without
+                    // installing; install unchecked (trusted bootstrap path).
+                    let (key, _epoch) = bob_actor
+                        .process_incoming_sender_key(&bob_wsec, &sender_did, &payload)
                         .expect("bob processes Alice's sender key");
+                    bob_actor.set_sender_key_unchecked(&sender_did, key);
                 }
                 OpenResult::Control => {}
                 OpenResult::Application(_) => {
@@ -661,17 +723,17 @@ mod live_supervisor_send {
             }
         }
 
-        // Seed Bob's per-member pseudonym (§9.10.4): the encrypted send fans out
-        // to known peer pseudonyms only, so without this seed the send fails
-        // closed with `PseudonymRegistryEmpty`.
-        let bob_pseudonym = [0x42u8; 32];
+        // Seed Bob's per-member pseudonym (§9.10.4) into Alice's actor: the
+        // encrypted send fans out to known peer pseudonyms only, so without this
+        // seed the send fails closed with `PseudonymRegistryEmpty`. Uses the SAME
+        // `bob_pseudonym` Bob registered at spawn above.
         sup.seed_peer_pseudonym(ctx_id, DID::from(BOB_DID), bob_pseudonym)
             .await
             .expect("seed Bob's per-context pseudonym");
 
         let bob_access_key = bob_access_key_from_actor(sup, ctx_id).await;
 
-        (bob, bob_pseudonym, bob_access_key)
+        (bob_actor, bob_pseudonym, bob_access_key)
     }
 
     /// Drives the public `Supervisor::send_message` for `ctx_id` under
@@ -696,7 +758,7 @@ mod live_supervisor_send {
             SigningKeyId::Agent => "ctx-live-supervisor-send-agent",
             SigningKeyId::Active => "ctx-live-supervisor-send-active",
         };
-        let ctx_bytes = context_id_bytes(ctx_id);
+        let _ctx_bytes = context_id_bytes(ctx_id);
         let sent: SentBuffer = Arc::new(Mutex::new(Vec::new()));
         let sup = alice_supervisor(Arc::clone(&sent));
 
@@ -710,7 +772,7 @@ mod live_supervisor_send {
             .await
             .expect("create encrypted context");
 
-        let (bob, bob_pseudonym, bob_access_key) =
+        let (mut bob, bob_pseudonym, bob_access_key) =
             add_and_bootstrap_bob(&sup, &handle, ctx_id, &sent).await;
 
         // THE PUBLIC SEND. Persona chosen by `signing_key_id`; the signing key
@@ -743,10 +805,10 @@ mod live_supervisor_send {
             "ciphertext must differ from plaintext"
         );
 
-        // Open the captured wire blob on Bob's provider and read the persona
+        // Open the captured wire blob on Bob's actor and read the persona
         // straight off the recovered inner envelope.
         match bob
-            .open(&ctx_bytes, ciphertext)
+            .open(&SystemClock, ctx_id, ciphertext)
             .expect("bob opens the app blob")
         {
             OpenResult::Application(env) => {

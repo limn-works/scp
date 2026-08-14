@@ -106,7 +106,7 @@ Properties of identity attestations:
 - **User-initiated.** Only the human creates attestations for their own identities. No third party can assert a link on someone's behalf.
 - **Independently verifiable.** Any participant can verify the attestation without relying on a central authority. Verification methods vary by platform (OAuth proof, signed message, DNS record, etc.).
 - **Revocable.** Users can revoke attestations at any time, severing the link.
-- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Attestations are discoverable through contexts with discovery tools (§6.2.2B) and DID document service entries (§3.5.3). Reverse-lookup (external handle → DID) is provided by the `attestation_lookup` tool in contexts with discovery tools (§22.5).
+- **Discoverable.** Other SCP participants can look up whether a given external identity maps to a known DID. Attestations are discoverable through contexts with discovery outlets (§6.2.2B) and DID document service entries (§3.5.3). Reverse-lookup (external handle → DID) is provided by the `attestation_lookup` outlet in contexts with discovery outlets (§22.5).
 
 Identity attestations enable three critical flows:
 
@@ -811,7 +811,7 @@ The `"scp:did:"` domain separator prevents collision with other routing ID deriv
 PUBLISH {
     routing_id: did_routing_id,
     blob_ttl: 604800,
-    blob: <BEP44-signed DID document>
+    blob: <SCPR kind-1 DID-record frame (§9.10.12), carrying (value, signature, seq)>
 }
 ```
 
@@ -827,7 +827,8 @@ QUERY {
 
 **Properties:**
 
-- **No protocol changes.** PUBLISH and QUERY are existing relay operations. DID documents are stored and retrieved like any other blob. Relays require no awareness that a blob contains a DID document.
+- **No relay protocol changes; one SDK-side addition.** PUBLISH and QUERY are existing relay operations, and the relay stores and retrieves a DID document like any other opaque blob — it needs no awareness that a blob contains a DID document. What Model A adds is entirely client-side: the SDK transport adapter gains a **public-record raw-blob path** (`publish_raw` / `query_raw`, §9.10.12) distinct from its `OuterEnvelope` message path, because a raw SCPR blob is not an `OuterEnvelope` and cannot ride the `OuterEnvelope`-typed `send` / `query` path. SCPR framing (§9.10.12) is a client-side payload convention, not a relay behavior — the relay stores the frame bytes opaquely.
+- **Self-verifying blob payload.** The DID relay blob is an SCPR kind-1 frame (§9.10.12) carrying the BEP44 `(value, signature, seq)` triple, not the bare document bytes. Because the signature and sequence travel inside the blob, a resolver verifies the record from the blob alone — no DHT round-trip is required to obtain the signature.
 - **Relay-agnostic.** A resolver can QUERY any relay that stores the target DID document. Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for suppression resistance.
 - **Size budget.** DID documents range from 2-30KB depending on attestation count and service endpoint list. The relay blob size limit is 256KB (ADR-004). Well within bounds.
 - **TTL and republishing.** The maximum relay blob TTL is 604800 seconds (7 days). Identity owners MUST republish to relays at least every 6 days (1-day safety margin). The RepublishManager already handles periodic DHT republishing on a 2-hour cycle; relay republishing adds a separate 6-day cycle for relay-stored DID documents.
@@ -851,12 +852,20 @@ The full resolution sequence:
 1. Compute did_routing_id = SHA-256("scp:did:" || did_string)
 2. Extract public_key from DID string (z-base-32 decode per did:dht spec)
 3. In parallel:
-   a. QUERY did_routing_id on known SCP relays
+   a. QUERY did_routing_id on known SCP relays via the SDK public-record
+      raw-blob path (query_raw, §9.10.12 — the relay returns raw SCPR
+      blobs, not OuterEnvelopes)
       (identity's published relays if known, else bootstrap relays from §18.5.1)
    b. DhtClient.resolve(public_key) on Mainline DHT
-4. For each response:
-   a. Verify BEP44 signature against public_key
-   b. Verify seq >= last_known_seq for this DID
+4. For each response, obtain the (value, signature, seq) triple:
+   a. Relay response: decode the SCPR kind-1 frame (§9.10.12) into
+      (value, signature, seq). DHT response: the triple is native.
+      Framing bytes are unsigned and MUST NOT be trusted — only the
+      triple is used.
+   b. Verify the BEP44 signature over the BEP44-canonical bencoded buffer
+      bencode(salt?, seq, value) — seq before value, per BEP44 (BitTorrent
+      BEP 44 is authoritative for this ordering) — against public_key
+   c. Verify seq >= last_known_seq for this DID
 5. Accept the valid response with highest sequence number
 6. Cache result per §9.10.7 caching policy
    (24h refresh for active contacts, 7d for inactive)
@@ -874,6 +883,7 @@ The parallel query model (step 3) requires clear rules for when queries are canc
 - **One layer fails, one succeeds.** The successful response is accepted. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
 - **Both layers fail.** If a cached document exists and is less than 7 days old, the cached document is returned with a `resolution_source: "cache"` indicator. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
 - **One layer returns invalid signature.** The response is discarded as if the layer had failed. An invalid signature is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the invalid document under any circumstances.
+- **Relay blob fails SCPR decoding.** A relay blob that does not decode as a valid SCPR kind-1 frame (§9.10.12) — truncated, carrying trailing bytes, wrong magic, unrecognized version, wrong/unrecognized kind, or a `value_len` that fails the exact-length check (`total_frame_len == 82 + value_len`) — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver falls through to the other layer exactly as for an invalid signature.
 - **Timeout.** Each layer query has a 5-second timeout. If a layer does not respond within 5 seconds, it is treated as a failure for that resolution attempt.
 
 ### 3.10.5 Publishing Protocol
@@ -883,17 +893,24 @@ Identity owners publish to both layers on every DID document create or update:
 ```
 On DID document create or update:
 1. Serialize DID document
-2. Sign via BEP44 (Ed25519 signature over bencoded value concatenated with
-   sequence number, per BEP44 spec)
+2. Sign via BEP44 (Ed25519 signature over the BEP44-canonical bencoded buffer
+   bencode(salt?, seq, value) — the sequence number precedes the value,
+   `3:seqi<seq>e1:v<value>`, per the BEP44 spec, which is authoritative for
+   this ordering; did:dht uses no salt)
 3. In parallel:
-   a. PUBLISH to SCP relays (own relays + bootstrap relays), blob_ttl: 604800
+   a. Wrap (value, signature, seq) in an SCPR kind-1 frame (§9.10.12) and
+      PUBLISH the frame bytes to SCP relays (own relays + bootstrap relays)
+      via the SDK public-record raw-blob path (publish_raw, §9.10.12 — a raw
+      blob, NOT wrapped in an OuterEnvelope), blob_ttl: 604800. The SCPR
+      wrapper is around `value` for transport only — it is NEVER part of the
+      bencoded signed bytes.
    b. DhtClient.publish(public_key, signature, doc_bytes, seq) to Mainline DHT
 4. RepublishManager schedules:
    - Relay republishing: every 6 days (blob_ttl is 7 days, 1-day margin)
    - DHT republishing: every 2 hours (existing cycle, unchanged)
 ```
 
-Both layers receive identical document bytes and identical BEP44 signatures. The signed payload is the same regardless of storage backend — this is a direct consequence of the self-certification property. A document retrieved from a relay and a document retrieved from the DHT are byte-identical and verify identically.
+Both layers receive identical document bytes and identical BEP44 signatures. The signed payload is the same regardless of storage backend — this is a direct consequence of the self-certification property. A document retrieved from a relay and a document retrieved from the DHT are byte-identical and verify identically. SCPR wraps `value` for transport but does not enter the signed bytes; the `(value, signature, seq)` triple carried to both layers is byte-identical (§9.10.12).
 
 ### 3.10.6 Anti-Segmentation Invariant
 
@@ -902,6 +919,8 @@ Both layers receive identical document bytes and identical BEP44 signatures. The
 The risk: if the DHT layer works well enough and relay-based resolution is "just faster," developers may skip DHT publishing as unnecessary overhead. If this becomes widespread, identity resolution fragments — some DIDs resolvable only on relays, others only on DHT. A resolver that checks only one layer misses identities published only on the other. The network splits into two resolution namespaces without anyone intending it.
 
 The SDK prevents this by default. RepublishManager publishes to both layers on every cycle. Disabling either layer requires explicit opt-out (`RepublishConfig::disable_dht()` or `RepublishConfig::disable_relay()`) and the SDK MUST log a warning when either is disabled. The warning states: "DID resolution layer disabled. This identity may not be resolvable by all peers."
+
+**The DHT *backend* is a selected provider capability (§17.17).** The rule above governs whether the DHT *layer* is published to; the choice of which DHT *backend implementation* serves that layer is a further instance of the general capability-selection principle in §17.17. In particular, an in-memory DHT backend is a **security nullifier**, not a durability-only development affordance (§17.17.3, SCP-CAPSEL-8013): it silently empties the DHT resolution namespace — the extreme case of the segmentation this invariant forbids — so a rotation or revocation never propagates (§3.9, §3.10.7). It MUST therefore be provably absent from shipped production artifacts (SCP-CAPSEL-8012), and the DHT backend selection MUST be explicit and fail closed (SCP-CAPSEL-8000/8001), never silently defaulted to the in-memory arm.
 
 ### 3.10.7 Version Resolution
 
@@ -985,6 +1004,7 @@ The dual-layer architecture is designed to be self-reinforcing as the SCP networ
 | DID document QUERY from relays | Phase 2 | `scp-core` | Extends existing DID resolution path with relay QUERY before/parallel to DHT. |
 | `DidResolver` trait | Phase 2 | `scp-core` | Unified interface composing relay + DHT resolution. |
 | Parallel dual-layer resolution | Phase 2 | `scp-core` | Orchestration of parallel queries with first-valid-wins semantics. |
+| SCPR DID-record frame (§9.10.12) | Phase 2 | `scp-protocol` | Deterministic binary encode/decode of the relay public-record frame kind 1. Pure sync wasm-compatible type; consumed by the relay publisher + DID resolver in `scp-identity`. |
 
 ## 3.11 DID Authentication for External Services (SCPID)
 
@@ -992,7 +1012,7 @@ SCP identities can authenticate to services outside the protocol. A relying part
 
 This is analogous to "Sign in with Ethereum" (EIP-4361) but simpler: no blockchain state, no gas, no wallet abstraction. The DID document is the identity provider, self-certified via BEP44 signatures on the DHT.
 
-**Relationship to existing DID-auth patterns.** SCP already uses DID-signed requests internally for context reader authentication (§6.2.2B) and handle tool requests (§22.3.1). SCPID extracts and generalizes this pattern into a standalone protocol that external services can implement without SCP SDK dependencies.
+**Relationship to existing DID-auth patterns.** SCP already uses DID-signed requests internally for context reader authentication (§6.2.2B) and handle outlet requests (§22.3.1). SCPID extracts and generalizes this pattern into a standalone protocol that external services can implement without SCP SDK dependencies.
 
 ### 3.11.1 Protocol Overview
 
@@ -1203,7 +1223,7 @@ SCPID and context membership are independent authentication mechanisms for diffe
 | **Requires SCP SDK** | No (only DID resolution + Ed25519) | Yes (MLS, key packages, group state) |
 | **Session state** | None (relying party's concern) | MLS epoch (protocol-managed) |
 
-An SCP-native app will typically use **context membership** for protocol operations (messaging, governance, tool invocation) and **SCPID** for HTTP API endpoints (REST APIs, webhooks, OAuth callbacks) that need to authenticate requests from DID holders outside the MLS channel.
+An SCP-native app will typically use **context membership** for protocol operations (messaging, governance, outlet invocation) and **SCPID** for HTTP API endpoints (REST APIs, webhooks, OAuth callbacks) that need to authenticate requests from DID holders outside the MLS channel.
 
 ### 3.11.8 SDK API Surface
 

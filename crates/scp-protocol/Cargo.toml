@@ -8,7 +8,9 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,6 +23,7 @@ sha2 = { workspace = true }
 ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
 hkdf = { workspace = true }
+hmac = { workspace = true }
 aes = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
@@ -40,8 +43,8 @@ lru = { workspace = true }
 [features]
 default = []
 # Makes InMemoryNonceTracker public for cross-crate test use.
-# Forwards to scp-primitives/testing and scp-event-log/testing for did:key: support.
-testing = ["scp-primitives/testing", "scp-event-log/testing"]
+# Forwards to scp-did/testing and scp-event-log/testing for did:key: support.
+testing = ["scp-did/testing", "scp-event-log/testing"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
@@ -52,7 +55,7 @@ uuid = { version = "1", features = ["v4", "js"] }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 proptest = "1"
-scp-primitives = { path = "../scp-primitives" }
+scp-did = { path = "../scp-did", features = ["testing"] }
 scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 # RFC 9180 reference implementation — used ONLY as a cross-validation oracle
 # for the hand-implemented `crypto::hpke` core. Already present in Cargo.lock

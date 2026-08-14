@@ -590,12 +590,12 @@ pub trait RevocationEventLogger {
 /// # Why this is the single source
 ///
 /// A `TokenRevoked` leaf is minted by the FFI bridge layer
-/// (`scp-ffi-common`'s `BridgeRevocationEventLogger`) on the native/PyO3/UniFFI/
-/// NAPI bridges and by the WASM bridge's `ucan_revoke`. The leaf preimage is
+/// (`scp-ffi-common`'s `BridgeRevocationEventLogger`) on the PyO3/UniFFI/NAPI
+/// bridges. The leaf preimage is
 /// `SHA-256(0x00 ‖ rmp_serde(Event))` with `Event.payload = EventPayload { data }`
 /// — so the `data` bytes MUST be byte-identical across platforms, or §9.9.3
-/// equivocation detection produces false positives when a native member and a
-/// WASM member revoke the same token. This function is the shared producer.
+/// equivocation detection produces false positives when two members revoke the
+/// same token. This function is the shared producer.
 ///
 /// # Encoding — JSON
 ///
@@ -607,22 +607,35 @@ pub trait RevocationEventLogger {
 /// {"context_id":"…","revoker_did":"did:…","token_cid":"…"}
 /// ```
 ///
-/// That sorted order is deterministic and identical across the native/PyO3/
-/// UniFFI/NAPI bridge path and the WASM bridge (same `serde_json`, same default
-/// features), which is what makes the leaf converge.
+/// That sorted order is deterministic and identical across the PyO3/UniFFI/NAPI
+/// bridge path (same `serde_json`, same default features), which is what makes
+/// the leaf converge.
 ///
-/// Exposed `pub` (not `pub(crate)`) as an internal cross-crate helper: the WASM
-/// FFI bridge (`crates/scp-ffi/wasm`) and `crates/scp-ffi/common` build the
-/// token-revocation leaf via this shared function across the crate boundary. It
-/// is not part of the SDK surface (see the cross-layer exemption registry).
-#[must_use]
-pub fn token_revoked_payload(context_id: &str, token_cid: &str, revoker_did: &str) -> Vec<u8> {
+/// Exposed `pub` (not `pub(crate)`) as an internal cross-crate helper:
+/// `crates/scp-ffi/common` builds the token-revocation leaf via this shared
+/// function across the crate boundary. It is not part of the SDK surface (see
+/// the cross-layer exemption registry).
+///
+/// # Errors
+///
+/// Returns [`UcanError::RevocationFailed`] if the payload cannot be serialized.
+/// The error is surfaced rather than silently substituting empty bytes, so the
+/// `TokenRevoked` convergent leaf preimage is never computed over a
+/// defaulted-empty payload. Unreachable for the string-only JSON object built
+/// here (which always serializes).
+pub fn token_revoked_payload(
+    context_id: &str,
+    token_cid: &str,
+    revoker_did: &str,
+) -> Result<Vec<u8>, UcanError> {
     let value = serde_json::json!({
         "token_cid": token_cid,
         "revoker_did": revoker_did,
         "context_id": context_id,
     });
-    serde_json::to_vec(&value).unwrap_or_default()
+    serde_json::to_vec(&value).map_err(|e| {
+        UcanError::RevocationFailed(format!("TokenRevoked payload serialization failed: {e}"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1563,16 +1576,13 @@ mod tests {
     /// stable CID for a fixed encoded JWT string. This value serves as the
     /// canonical reference for cross-bridge consistency tests.
     ///
-    /// All bridge implementations (`PyO3`, NAPI, WASM) must produce this exact
-    /// CID when computing the revocation CID for the same encoded token. The
-    /// WASM bridge re-implements this function locally (cannot depend on
-    /// scp-core due to tokio incompatibility), so the golden value guards
-    /// against silent divergence.
+    /// All bridge implementations (`PyO3`, NAPI, `UniFFI`) compute the
+    /// revocation CID through this shared `scp-protocol` function, so this
+    /// golden value pins the algorithm for every bridge.
     ///
     /// **If this test fails**, the CID computation algorithm has changed.
-    /// Update the golden value here AND in the WASM conformance test
-    /// (`wasm_conformance::wasm_and_core_revocation_cid_match_golden_value`),
-    /// then verify all bridge-specific tests still pass.
+    /// Update the golden value here, then verify all bridge-specific tests
+    /// still pass.
     #[test]
     fn revocation_cid_golden_value() {
         // Golden encoded token: a stable fake JWT string.
@@ -1583,9 +1593,8 @@ mod tests {
         //
         // To recompute: echo -n '<GOLDEN_TOKEN>' | sha256sum
         //
-        // This value MUST match:
-        //   - wasm_conformance::wasm_and_core_revocation_cid_match_golden_value
-        //   - Any future bridge-specific revocation CID tests
+        // This value MUST match any future bridge-specific revocation CID
+        // tests.
         let cid = compute_revocation_cid(GOLDEN_TOKEN);
 
         // Verify format: 64 hex chars.
@@ -1603,7 +1612,6 @@ mod tests {
         );
 
         // Store the computed golden value for cross-bridge comparison.
-        // If this assertion changes, update wasm_conformance.rs too.
         let expected = compute_revocation_cid(GOLDEN_TOKEN);
         assert_eq!(cid, expected);
     }

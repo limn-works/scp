@@ -21,7 +21,7 @@
 use scp_platform::traits::Storage;
 
 use crate::economy::credentials::{AdapterCredential, AdapterCredentialStore, CredentialError};
-use scp_identity::DID;
+use scp_did::DID;
 
 use super::{ProtocolRepository, StoreError};
 
@@ -417,7 +417,7 @@ impl<S: Storage> AdapterCredentialStore for ProtocolRepository<S> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
     use crate::economy::credentials::EncryptedBlob;

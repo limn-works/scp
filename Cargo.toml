@@ -1,11 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/scp-primitives",
+    "crates/scp-clock",
+    "crates/scp-crypto",
+    "crates/scp-did",
+    "crates/scp-dht",
     "crates/scp-platform",
     "crates/scp-identity",
     "crates/scp-event-log",
     "crates/scp-protocol",
+    "crates/scp-relay-client",
+    "crates/scp-mls",
+    "crates/scp-client",
+    "crates/scp-client-wasm",
+    "crates/scp-relay-mock",
     "crates/scp-runtime",
     "crates/scp-core",
     "crates/scp-transport",
@@ -17,7 +25,6 @@ members = [
     "crates/scp-ffi",
     "crates/scp-ffi/common",
     "crates/scp-ffi/uniffi",
-    "crates/scp-ffi/wasm",
     "crates/scp-ffi/napi",
     "crates/scp-ffi/napi-test-stubs",
 ]
@@ -39,7 +46,7 @@ rand = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 openmls = { version = "0.8", features = ["libcrux-provider"] }
 openmls_traits = "0.5"
 openmls_basic_credential = "0.5"
@@ -76,6 +83,15 @@ futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 redb = "2"
 static_assertions = "1.1"
+# wasm-bindgen stack for the browser participant surface (ADR-057 Slice 3).
+# Only the wasm32-targeted crate (scp-client-wasm) consumes these; they are
+# declared at the workspace level so the version pins stay single-sourced.
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+wasm-bindgen-test = "0.3"
+js-sys = "0.3"
+web-sys = "0.3"
+serde-wasm-bindgen = "0.6"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
@@ -101,3 +117,27 @@ too_many_arguments = "deny"
 # denied here. See scripts/check-block-in-place.py for the complementary
 # sync-bridge enforcement.
 await_holding_lock = "deny"
+
+# ── Release profile ─────────────────────────────────────────────────────────
+# `debug-assertions = false` is the cargo release DEFAULT — this line changes no
+# behavior; it makes an otherwise-implicit invariant EXPLICIT and greppable.
+#
+# LOAD-BEARING (ADR-057 §Prereq-4, in-browser client untrusted-relay guarantee):
+# the one known attacker-reachable panic on the openmls 0.8.1 MLS decrypt path is
+# a `debug_assert!` ("Ciphertext decryption failed",
+# openmls-0.8.1/src/framing/private_message_in.rs) that is compiled OUT of release
+# builds — a construction guarantee. No OTHER release-mode panic has been FOUND on
+# that path (evidenced by the `fuzz_mls_decrypt` decrypt-path fuzz target, pinned
+# to openmls 0.8.1; a future version bump could add one, caught by the nightly
+# fuzz job). With debug-assertions off, a tampered/malformed ciphertext from an
+# untrusted relay makes `process_message` return a typed `Err`
+# (→ MlsError::DecryptionFailed → [SCP-CRYPTO-4010]) instead of panicking — so a
+# hostile relay cannot abort a browser tab (or a native process). Keeping this
+# anchor explicit guards against a future `debug-assertions = true` override
+# silently re-arming that panic. The shipped browser wasm MUST be a `--release`
+# build for the same reason (a `wasm-pack build --dev` would re-arm it); the
+# decrypt-path fuzz target `fuzz/fuzz_targets/fuzz_mls_decrypt.rs` (run with
+# debug-assertions off) is the standing evidence that no found tampered input
+# panics the release decrypt path.
+[profile.release]
+debug-assertions = false

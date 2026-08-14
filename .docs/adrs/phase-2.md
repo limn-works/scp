@@ -1,8 +1,8 @@
 # Phase 2 Architecture Decision Records — Context + Transport
 
 **Date:** February 22, 2026
-**Phase goal:** Full context lifecycle over real transport. Two devices create contexts, exchange messages, invoke tools, verify event logs, and route across multiple relays.
-**Deliverable:** Context state machine, UCAN-enforced roles, tool registration/invocation, verifiable event logs, multi-transport routing.
+**Phase goal:** Full context lifecycle over real transport. Two devices create contexts, exchange messages, invoke outlets, verify event logs, and route across multiple relays.
+**Deliverable:** Context state machine, UCAN-enforced roles, outlet registration/invocation, verifiable event logs, multi-transport routing.
 **Timeline:** Weeks 5-8
 **Dependencies between ADRs:**
 
@@ -18,7 +18,7 @@ ADR-001 (MLS)      ADR-002 (Envelope)     ADR-005 (Transport Trait)
       ADR-009 (Roles/UCAN)              ADR-012 (Multi-Transport)
            |
            v
-      ADR-010 (Tools)
+      ADR-010 (Outlets)
 ```
 
 Build order: ADR-008 + ADR-011 (parallel, both depend on Phase 1) --> ADR-009 --> ADR-010 --> ADR-012 (independent of context internals, depends only on Phase 1 transport)
@@ -31,9 +31,9 @@ Build order: ADR-008 + ADR-011 (parallel, both depend on Phase 1) --> ADR-009 --
 
 ### Context
 
-The context is the fundamental interaction primitive in SCP. All communication, tool invocation, role assignment, and governance happens within a context. A context is backed by exactly one MLS group (spec section 9.7.1: MLS Group = SCP Context). The Context Manager is the central coordinator of the protocol engine (architecture.md section 2.2): it owns the state machine, membership tracking, role enforcement, tool routing, TTL management, and memory scope enforcement.
+The context is the fundamental interaction primitive in SCP. All communication, outlet invocation, role assignment, and governance happens within a context. A context is backed by exactly one MLS group (spec section 9.7.1: MLS Group = SCP Context). The Context Manager is the central coordinator of the protocol engine (architecture.md section 2.2): it owns the state machine, membership tracking, role enforcement, outlet routing, TTL management, and memory scope enforcement.
 
-Phase 1 proved the crypto stack works (MLS groups, envelopes, transport). Phase 2 wraps that crypto in the context abstraction — the user-facing unit of interaction that carries governance, roles, tools, and lifecycle semantics on top of the raw encryption.
+Phase 1 proved the crypto stack works (MLS groups, envelopes, transport). Phase 2 wraps that crypto in the context abstraction — the user-facing unit of interaction that carries governance, roles, outlets, and lifecycle semantics on top of the raw encryption.
 
 ### Decision
 
@@ -41,8 +41,8 @@ Implement the context lifecycle as a five-state finite state machine in `scp-cor
 
 ### Rationale
 
-- **Explicit state machine over implicit flags:** A context's lifecycle has well-defined phases with different permitted operations. An explicit state machine makes illegal state transitions unrepresentable. You cannot invoke a tool in a `Closed` context or add members to an `Expired` context — the state machine rejects the operation before it reaches the crypto layer.
-- **Creating state:** Context creation is not atomic. The creator must: (1) define the context parameters (ceiling, roles, tools, TTL, memory scope, governance model), (2) create the MLS group, (3) generate the initial sender key (ADR-007), (4) publish to transport. The `Creating` state holds the context while these steps complete. If any step fails, the context never reaches `Active`.
+- **Explicit state machine over implicit flags:** A context's lifecycle has well-defined phases with different permitted operations. An explicit state machine makes illegal state transitions unrepresentable. You cannot invoke an outlet in a `Closed` context or add members to an `Expired` context — the state machine rejects the operation before it reaches the crypto layer.
+- **Creating state:** Context creation is not atomic. The creator must: (1) define the context parameters (ceiling, roles, outlets, TTL, memory scope, governance model), (2) create the MLS group, (3) generate the initial sender key (ADR-007), (4) publish to transport. The `Creating` state holds the context while these steps complete. If any step fails, the context never reaches `Active`.
 - **Closing vs Closed:** Context closure is a multi-step process: (1) notify all members, (2) process final events, (3) generate summary if memory scope is `Summary`, (4) destroy MLS group state and sender keys. The `Closing` state gives members a window to process final events and verify the summary before keys are destroyed. Once `Closed`, key material is gone and content is physically unreadable (for ephemeral/summary scopes).
 - **Expired as separate terminal state:** TTL expiry is distinct from intentional close. An expired context skips the cooperative closing window — TTL is a hard deadline (spec section 5.10). The governance model cannot override it. Extension requires unanimous consent from all members.
 - **Every transition logged:** State transitions are protocol events recorded in the Merkle event log. This makes context lifecycle history verifiable — any member can prove when the context was created, when it closed, and who initiated each transition.
@@ -94,7 +94,7 @@ Invalid transitions (must return error):
    Context creation uses a **two-phase commit** pattern: validate all preconditions, then execute with rollback on failure.
 
    **Phase 1 — Validate (no side effects):**
-   - Validates `ContextParams`: ceiling, roles, tools, TTL, memory scope, governance model.
+   - Validates `ContextParams`: ceiling, roles, outlets, TTL, memory scope, governance model.
    - If `template_id` is present, validates all params match the template definition exactly.
    - Validates the creator's identity is valid and the signing key is accessible.
    - Validates transport is connected and at least one relay is reachable.
@@ -190,7 +190,7 @@ pub struct ContextParams {
     pub ceiling_policy: CeilingPolicy,   // Whether the ceiling is immutable or governed (§5.3)
     pub promotion_policy: PromotionPolicy, // Whether context promotion is allowed (§5.10)
     pub roles: Vec<RoleDefinition>,      // Role definitions with permission sets
-    pub tools: Vec<ToolRegistration>,    // Initial tool registrations
+    pub outlets: Vec<OutletRegistration>,    // Initial outlet registrations
     pub ttl: Option<Duration>,           // Optional TTL
     pub memory_scope: MemoryScope,       // Ephemeral, Summary, or Full
     pub governance: GovernanceModel,     // Single-admin for Phase 2
@@ -258,7 +258,7 @@ pub enum ContextMode {
 pub enum TemplateId {
     BilateralEphemeral,   // Messaging-only, ephemeral, TTL required
     BilateralPersistent,  // Messaging-only, full memory, no TTL
-    Coordination,         // Messaging + tools, summary memory, TTL required
+    Coordination,         // Messaging + outlets, summary memory, TTL required
     GroupDiscussion,      // Messaging + invites, full memory, optional TTL
     PublicBroadcast,      // Broadcast mode, open subscriber registration (§5.14)
     GatedBroadcast,       // Broadcast mode, UCAN-gated subscriber access (§5.14)
@@ -304,7 +304,7 @@ UCAN (User Controlled Authorization Networks) tokens provide the mechanism: per-
 
 ### Decision
 
-Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core/crypto/`. Every context operation — message send, tool invocation, member management, role change, governance action — requires a valid UCAN token. Tokens are issued at role assignment, scoped to the context and the role's permission set, and validated on every call. The ceiling is set at context creation; its mutability is determined by the `CeilingPolicy` declared at creation (ADR-008): `Immutable` (default, cannot change) or `Governed` (modifiable through governance). The ceiling policy itself is immutable.
+Implement UCAN-based capability enforcement in `scp-core/context/` and `scp-core/crypto/`. Every context operation — message send, outlet invocation, member management, role change, governance action — requires a valid UCAN token. Tokens are issued at role assignment, scoped to the context and the role's permission set, and validated on every call. The ceiling is set at context creation; its mutability is determined by the `CeilingPolicy` declared at creation (ADR-008): `Immutable` (default, cannot change) or `Governed` (modifiable through governance). The ceiling policy itself is immutable.
 
 ### Rationale
 
@@ -342,9 +342,12 @@ pub struct CapabilityCeiling {
 pub enum Capability {
     MessagesRead,
     MessagesWrite,
-    ToolInvoke(ToolId),           // Invoke a specific tool
-    ToolInvokeAll,                // Invoke any registered tool
-    ToolRegister,                 // Register new tools
+    OutletQuery(OutletId),        // Invoke a specific Query outlet (read-only, §5.4.2)
+    OutletQueryAll,               // Invoke any registered Query outlet
+    OutletCall(OutletId),         // Invoke a specific Action outlet (§5.4.2)
+    OutletCallAll,                // Invoke any registered Action outlet
+    OutletRegister,               // Register new outlets
+    OutletInterface,              // Expose a cross-context outlet interface (§6.2)
     MemberInvite,                 // Invite new members
     MemberRemove,                 // Remove members
     RoleAssign,                   // Assign roles to members
@@ -376,12 +379,12 @@ pub struct RoleDefinition {
 
    Built-in roles (always available):
    - `admin` — all capabilities in the ceiling.
-   - `member` — `MessagesRead`, `MessagesWrite`, `ToolInvokeAll`.
+   - `member` — `MessagesRead`, `MessagesWrite`, `OutletQueryAll`, `OutletCallAll`.
    - `observer` — `MessagesRead` only.
    Custom roles are defined at context creation with arbitrary capability subsets of the ceiling.
 
    **Broadcast-specific roles.** Broadcast contexts (§5.14) add two roles that reuse existing primitives:
-   - `author` — `MessagesWrite`, `MessagesRead`, `ToolInvokeAll`. Authors are bounded. Added via `RoleAssigned` event.
+   - `author` — `MessagesWrite`, `MessagesRead`, `OutletQueryAll`, `OutletCallAll`. Authors are bounded. Added via `RoleAssigned` event.
    - `subscriber` — `MessagesRead` only. In open broadcast contexts (`public-broadcast` template), `MessagesRead` is auto-granted on DID-authenticated registration, following the context reader-tier pattern (§6.2.2B). In gated broadcast contexts (`gated-broadcast` template), `MessagesRead` requires an explicit admin-issued UCAN.
 
    The auto-grant subscriber pattern extends the context two-tier model — it is not a new primitive.
@@ -464,27 +467,27 @@ pub struct RoleDefinition {
 
 ---
 
-## ADR-010: Tool Registration and Invocation
+## ADR-010: Outlet Registration and Invocation
 
 **Status:** Decided
 
 ### Context
 
-Tools are stateless functions scoped to a context (spec section 5.4). They are the protocol's answer to "bots" — tools cannot initiate, only respond. All agency flows through accountable agents. Tools have MCP-compatible JSON Schema interfaces (spec section 8.5), making them interoperable with existing MCP tooling. Every tool registration includes schema, implementation hash, test vectors, and operator DID — providing verifiable integrity (spec section 7.3.3).
+Outlets are stateless functions scoped to a context (spec section 5.4). They are the protocol's answer to "bots" — outlets cannot initiate, only respond. All agency flows through accountable agents. Outlets have MCP-compatible JSON Schema interfaces (spec section 8.5), making them interoperable with existing MCP tooling. Every outlet registration includes schema, implementation hash, test vectors, and operator DID — providing verifiable integrity (spec section 7.3.3).
 
-Cross-context tool interfaces (spec section 6.2) allow structured interaction across context boundaries with bidirectional consent. The context governs the tool call, not the agent. Stateful tool sessions (spec section 6.2.1) enable multi-turn workflows via session IDs, TTLs, and per-call governance.
+Cross-context outlet interfaces (spec section 6.2) allow structured interaction across context boundaries with bidirectional consent. The context governs the outlet call, not the agent. Stateful outlet sessions (spec section 6.2.1) enable multi-turn workflows via session IDs, TTLs, and per-call governance.
 
 ### Decision
 
-Implement tool registration, invocation, and cross-context interfaces in `scp-core/context/tools/`. Tools are registered with full metadata (schema, hash, test vectors, operator DID), invoked through UCAN-enforced capability checks, and logged in the event log. Cross-context tool interfaces require explicit bidirectional opt-in at the context level. Stateful sessions are tracked by the tool's context with per-session TTLs.
+Implement outlet registration, invocation, and cross-context interfaces in `scp-core/context/outlets/`. Outlets are registered with full metadata (schema, hash, test vectors, operator DID), invoked through UCAN-enforced capability checks, and logged in the event log. Cross-context outlet interfaces require explicit bidirectional opt-in at the context level. Stateful sessions are tracked by the outlet's context with per-session TTLs.
 
 ### Rationale
 
-- **MCP-compatible schema:** Tools use JSON Schema for input/output definitions (spec section 8.5). This means any MCP-compatible model can invoke SCP tools through the MCP adapter (architecture.md section 1.4) without modification. Schema compatibility is a requirement, not a nice-to-have.
-- **Implementation hash for integrity:** The content-addressable hash of a tool's implementation is recorded at registration. Any change to the implementation produces a new hash, which is recorded as a mutation event in the event log. Silent tool modification is impossible — all members see the change (spec section 5.4).
-- **Test vectors for continuous verification:** Any agent can call a tool with test vector inputs and verify outputs match (spec section 7.3.3). This enables threshold confidence: if N agents independently verify, the tool is almost certainly behaving correctly.
-- **Context governs, not agent (spec section 6.2):** Cross-context tool calls are mediated by both contexts. An agent in Context A requests a tool call to Context B. Context A's governance decides whether to permit the outbound call. Context B's governance decides whether to permit the inbound call. The agent never directly touches the other context.
-- **Stateful sessions (spec section 6.2.1):** Multi-turn workflows (scheduling, negotiation) need state across calls. Session state lives in the tool's context, not the caller's. Each call in a session is individually governed. Sessions have TTLs to prevent resource leaks.
+- **MCP-compatible schema:** Outlets use JSON Schema for input/output definitions (spec section 8.5). This means any MCP-compatible model can invoke SCP outlets through the MCP adapter (architecture.md section 1.4) without modification. Schema compatibility is a requirement, not a nice-to-have.
+- **Implementation hash for integrity:** The content-addressable hash of an outlet's implementation is recorded at registration. Any change to the implementation produces a new hash, which is recorded as a mutation event in the event log. Silent outlet modification is impossible — all members see the change (spec section 5.4).
+- **Test vectors for continuous verification:** Any agent can call an outlet with test vector inputs and verify outputs match (spec section 7.3.3). This enables threshold confidence: if N agents independently verify, the outlet is almost certainly behaving correctly.
+- **Context governs, not agent (spec section 6.2):** Cross-context outlet calls are mediated by both contexts. An agent in Context A requests an outlet call to Context B. Context A's governance decides whether to permit the outbound call. Context B's governance decides whether to permit the inbound call. The agent never directly touches the other context.
+- **Stateful sessions (spec section 6.2.1):** Multi-turn workflows (scheduling, negotiation) need state across calls. Session state lives in the outlet's context, not the caller's. Each call in a session is individually governed. Sessions have TTLs to prevent resource leaks.
 
 ### Implementation
 
@@ -492,31 +495,31 @@ Implement tool registration, invocation, and cross-context interfaces in `scp-co
 - **Schema validation:** `jsonschema` crate for JSON Schema validation
 - **Hashing:** SHA-256 via `sha2` crate for implementation hashes
 - **Crate:** `scp-core`
-- **Module:** `scp-core/context/tools/`
+- **Module:** `scp-core/context/outlets/`
 - **Session storage:** In-memory HashMap with TTL-based cleanup, keyed by session ID.
 
 ### Dependencies
 
-- **ADR-008 (Context):** Tools are scoped to contexts. Tool registration is a context operation. Tool invocation requires an active context.
-- **ADR-009 (Roles/UCAN):** Tool invocation requires `ToolInvoke(tool_id)` or `ToolInvokeAll` capability. Tool registration requires `ToolRegister` capability. Both are UCAN-validated.
-- **ADR-011 (Event Log):** Tool registrations, mutations, and invocations are recorded in the event log.
+- **ADR-008 (Context):** Outlets are scoped to contexts. Outlet registration is a context operation. Outlet invocation requires an active context.
+- **ADR-009 (Roles/UCAN):** Query outlet invocation requires `OutletQuery(outlet_id)` or `OutletQueryAll`; Action outlet invocation requires `OutletCall(outlet_id)` or `OutletCallAll` capability. Outlet registration requires `OutletRegister` capability. All are UCAN-validated.
+- **ADR-011 (Event Log):** Outlet registrations, mutations, and invocations are recorded in the event log.
 
 ### Acceptance Criteria
 
-1. **`ToolRegistration` struct:**
+1. **`OutletRegistration` struct:**
 
 ```rust
-pub struct ToolRegistration {
-    pub tool_id: ToolId,
+pub struct OutletRegistration {
+    pub outlet_id: OutletId,
     pub name: String,
     pub description: String,
-    pub schema: ToolSchema,              // MCP-compatible JSON Schema
+    pub schema: OutletSchema,              // MCP-compatible JSON Schema
     pub implementation_hash: [u8; 32],   // SHA-256 of implementation
     pub test_vectors: Vec<TestVector>,   // Known input-output pairs
     pub operator_did: DID,               // Accountable identity
 }
 
-pub struct ToolSchema {
+pub struct OutletSchema {
     pub input_schema: serde_json::Value,   // JSON Schema for input
     pub output_schema: serde_json::Value,  // JSON Schema for output
 }
@@ -528,33 +531,33 @@ pub struct TestVector {
 }
 ```
 
-2. **`register_tool(context: &ContextHandle, registration: ToolRegistration, registrant_did: &DID) -> Result<ToolId, ToolError>`**
-   - Validates registrant has `ToolRegister` capability via UCAN (ADR-009).
+2. **`register_outlet(context: &ContextHandle, registration: OutletRegistration, registrant_did: &DID) -> Result<OutletId, OutletError>`**
+   - Validates registrant has `OutletRegister` capability via UCAN (ADR-009).
    - Validates input and output schemas are valid JSON Schema.
    - Validates implementation hash is 32 bytes.
    - Validates operator DID is resolvable.
-   - Stores the tool registration in the context's tool registry.
-   - Appends `ToolRegistered` event to event log with full registration metadata.
-   - Returns the tool ID.
+   - Stores the outlet registration in the context's outlet registry.
+   - Appends `OutletRegistered` event to event log with full registration metadata.
+   - Returns the outlet ID.
 
-3. **`invoke_tool(context: &ContextHandle, tool_id: &ToolId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, ToolError>`**
+3. **`invoke_outlet(context: &ContextHandle, outlet_id: &OutletId, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**
    - Validates context state is `Active`.
-   - Validates invoker has `ToolInvoke(tool_id)` or `ToolInvokeAll` capability via UCAN.
-   - Validates input against the tool's input schema.
-   - Calls the tool implementation.
-   - Validates output against the tool's output schema.
-   - Appends `ToolInvoked` event to event log (includes tool_id, invoker_did, input hash, output hash).
-   - Returns the tool output.
+   - Validates invoker has `OutletQuery(outlet_id)`/`OutletQueryAll` (Query) or `OutletCall(outlet_id)`/`OutletCallAll` (Action) capability via UCAN.
+   - Validates input against the outlet's input schema.
+   - Calls the outlet implementation.
+   - Validates output against the outlet's output schema.
+   - Appends `OutletInvoked` event to event log (includes outlet_id, invoker_did, input hash, output hash).
+   - Returns the outlet output.
 
-**Tool execution lifecycle:**
+**Outlet execution lifecycle:**
 
-Every tool invocation follows a defined lifecycle with explicit states, timeouts, and error handling.
+Every outlet invocation follows a defined lifecycle with explicit states, timeouts, and error handling.
 
 ```rust
-/// A tool invocation request, sent as an MLS application message.
-pub struct ToolRequest {
+/// An outlet invocation request, sent as an MLS application message.
+pub struct OutletRequest {
     pub request_id: String,          // UUID v4, unique per invocation
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     pub invoker_did: DID,
     pub input: serde_json::Value,
     pub timeout_ms: u32,             // Caller-specified timeout (max: context ceiling, default: 30_000)
@@ -563,86 +566,86 @@ pub struct ToolRequest {
     pub timestamp: u64,
 }
 
-/// A tool invocation response, sent as an MLS application message.
-pub struct ToolResponse {
+/// An outlet invocation response, sent as an MLS application message.
+pub struct OutletResponse {
     pub request_id: String,          // Matches the request
-    pub status: ToolStatus,
+    pub status: OutletStatus,
     pub output: Option<serde_json::Value>,
-    pub error: Option<ToolExecutionError>,
+    pub error: Option<OutletExecutionError>,
     pub execution_time_ms: u64,
     pub provenance: Provenance,
 }
 
-pub enum ToolStatus { Success, Error, Timeout, Cancelled }
+pub enum OutletStatus { Success, Error, Timeout, Cancelled }
 
-pub struct ToolExecutionError {
-    pub code: ToolErrorCode,
+pub struct OutletExecutionError {
+    pub code: OutletErrorCode,
     pub message: String,
     pub retryable: bool,
 }
 
-pub enum ToolErrorCode {
+pub enum OutletErrorCode {
     InputValidationFailed, OutputValidationFailed, ExecutionFailed,
-    Timeout, Cancelled, RateLimited, ToolNotFound, PermissionDenied, InternalError,
+    Timeout, Cancelled, RateLimited, OutletNotFound, PermissionDenied, InternalError,
 }
 ```
 
 **Timeout handling:**
-- Every tool invocation has a timeout. Callers specify `timeout_ms` in the request (default: 30,000ms, maximum: configurable per-context, hard protocol maximum: 300,000ms / 5 minutes).
-- The invoking SDK starts a timer on request submission. If no `ToolResponse` arrives before the timer fires, the SDK synthesizes a `ToolResponse` with `status: Timeout` and delivers it to the caller.
+- Every outlet invocation has a timeout. Callers specify `timeout_ms` in the request (default: 30,000ms, maximum: configurable per-context, hard protocol maximum: 300,000ms / 5 minutes).
+- The invoking SDK starts a timer on request submission. If no `OutletResponse` arrives before the timer fires, the SDK synthesizes a `OutletResponse` with `status: Timeout` and delivers it to the caller.
 - Timeout is a client-side contract, not a server-side enforcement.
 
 **Cancellation protocol:**
-- The invoker MAY send a `ToolCancel { request_id, invoker_did, timestamp }` message referencing the `request_id`.
-- On receiving `ToolCancel`, the tool's execution environment SHOULD terminate the invocation and respond with `status: Cancelled`.
-- Cancellation is best-effort. If the tool responds with `Success` before the cancel is processed, the success response takes precedence.
+- The invoker MAY send a `OutletCancel { request_id, invoker_did, timestamp }` message referencing the `request_id`.
+- On receiving `OutletCancel`, the outlet's execution environment SHOULD terminate the invocation and respond with `status: Cancelled`.
+- Cancellation is best-effort. If the outlet responds with `Success` before the cancel is processed, the success response takes precedence.
 
 **Error propagation:**
-- Tool execution errors are returned in `ToolResponse.error`, not as protocol-level errors.
-- Schema validation failures are caught by the SDK, not the tool. The SDK rejects invalid input before invoking the tool and rejects invalid output before delivering the response.
+- Outlet execution errors are returned in `OutletResponse.error`, not as protocol-level errors.
+- Schema validation failures are caught by the SDK, not the outlet. The SDK rejects invalid input before invoking the outlet and rejects invalid output before delivering the response.
 - The `retryable` field indicates whether the caller should attempt the invocation again.
 
 **Event log recording:**
-- `ToolRequest` and `ToolResponse` are both recorded as events in the context's event log (ADR-011).
-- The event includes: `request_id`, `tool_id`, `invoker_did`, `status`, `execution_time_ms`, `SHA256(input)`, `SHA256(output)`. Full input/output is NOT recorded (may be large); only content hashes are stored.
+- `OutletRequest` and `OutletResponse` are both recorded as events in the context's event log (ADR-011).
+- The event includes: `request_id`, `outlet_id`, `invoker_did`, `status`, `execution_time_ms`, `SHA256(input)`, `SHA256(output)`. Full input/output is NOT recorded (may be large); only content hashes are stored.
 
-4. **`update_tool(context: &ContextHandle, tool_id: &ToolId, new_registration: ToolRegistration, updater_did: &DID) -> Result<(), ToolError>`**
-   - Validates updater is the tool's operator DID or has admin role.
+4. **`update_outlet(context: &ContextHandle, outlet_id: &OutletId, new_registration: OutletRegistration, updater_did: &DID) -> Result<(), OutletError>`**
+   - Validates updater is the outlet's operator DID or has admin role.
    - Records old and new implementation hashes.
-   - Updates the tool registration.
-   - Appends `ToolUpdated` event to event log (includes old hash, new hash, all changed fields).
-   - Tool mutations are visible to all context members.
+   - Updates the outlet registration.
+   - Appends `OutletUpdated` event to event log (includes old hash, new hash, all changed fields).
+   - Outlet mutations are visible to all context members.
 
-5. **`verify_tool(context: &ContextHandle, tool_id: &ToolId) -> Result<ToolVerificationResult, ToolError>`**
-   - Runs all test vectors against the tool.
-   - For each test vector: invoke tool with test input, compare output to expected output.
+5. **`verify_outlet(context: &ContextHandle, outlet_id: &OutletId) -> Result<OutletVerificationResult, OutletError>`**
+   - Runs all test vectors against the outlet.
+   - For each test vector: invoke outlet with test input, compare output to expected output.
    - Returns a result with per-vector pass/fail status and overall integrity assessment.
-   - Appends `ToolVerified` event to event log.
+   - Appends `OutletVerified` event to event log.
 
-6. **Cross-context tool interfaces:**
+6. **Cross-context outlet interfaces:**
 
 ```rust
-pub struct ToolInterface {
-    pub source_context: ContextId,      // Context exposing the tool
-    pub target_context: ContextId,      // Context consuming the tool
-    pub tool_id: ToolId,                // Which tool is exposed
+pub struct OutletInterface {
+    pub source_context: ContextId,      // Context exposing the outlet
+    pub target_context: ContextId,      // Context consuming the outlet
+    pub outlet_id: OutletId,                // Which outlet is exposed
     pub rate_limit: Option<RateLimit>,  // Calls per time window
     pub approved_by_source: bool,       // Source context opted in
     pub approved_by_target: bool,       // Target context opted in
 }
 ```
 
-   - **`expose_tool(context: &ContextHandle, tool_id: &ToolId, to_context: &ContextId) -> Result<ToolInterface, ToolError>`**: Initiates a tool interface proposal from the source context. Requires admin capability.
-   - **`accept_tool_interface(context: &ContextHandle, interface: &ToolInterface) -> Result<(), ToolError>`**: Target context accepts the interface. Requires admin capability. Both `approved_by_source` and `approved_by_target` must be true before calls are permitted.
-   - **`invoke_cross_context(source_context: &ContextHandle, interface: &ToolInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, ToolError>`**: Invokes a tool across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
+   - **`expose_outlet(context: &ContextHandle, outlet_id: &OutletId, to_context: &ContextId) -> Result<OutletInterface, OutletError>`**: Initiates an outlet interface proposal from the source context. Requires admin capability.
+   - **`accept_outlet_interface(context: &ContextHandle, interface: &OutletInterface) -> Result<(), OutletError>`**: Target context accepts the interface. Requires admin capability. Both `approved_by_source` and `approved_by_target` must be true before calls are permitted.
+   - **`invoke_cross_context(source_context: &ContextHandle, interface: &OutletInterface, input: serde_json::Value, invoker_did: &DID) -> Result<serde_json::Value, OutletError>`**: Invokes an outlet across context boundaries. Source context governance checks outbound. Target context governance checks inbound. Both event logs record the call with provenance.
    - Rate limiting enforced per interface.
 
-7. **Stateful tool sessions (spec section 6.2.1):**
+7. **Stateful outlet sessions (spec section 6.2.1):**
 
 ```rust
-pub struct ToolSession {
+pub struct OutletSession {
     pub session_id: String,
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     pub source_context: ContextId,
     pub state: serde_json::Value,       // Opaque session state
     pub created_at: u64,
@@ -651,9 +654,9 @@ pub struct ToolSession {
 }
 ```
 
-   - **`create_session(context: &ContextHandle, tool_id: &ToolId, source_context: &ContextId, ttl: Duration) -> Result<String, ToolError>`**: Creates a new session. Returns session ID.
-   - **`invoke_session(context: &ContextHandle, session_id: &str, input: serde_json::Value) -> Result<serde_json::Value, ToolError>`**: Invokes a tool within an active session. Each call is individually governed. Session state is updated by the tool.
-   - **Session cleanup:** Background task removes sessions past their TTL. Session state is internal to the tool's context.
+   - **`create_session(context: &ContextHandle, outlet_id: &OutletId, source_context: &ContextId, ttl: Duration) -> Result<String, OutletError>`**: Creates a new session. Returns session ID.
+   - **`invoke_session(context: &ContextHandle, session_id: &str, input: serde_json::Value) -> Result<serde_json::Value, OutletError>`**: Invokes an outlet within an active session. Each call is individually governed. Session state is updated by the outlet.
+   - **Session cleanup:** Background task removes sessions past their TTL. Session state is internal to the outlet's context.
 
 ### Scope
 
@@ -661,13 +664,13 @@ pub struct ToolSession {
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | Module root, `ToolId` type, re-exports |
-| `registry.rs` | `ToolRegistration`, tool storage per context, `register_tool`, `update_tool`, `verify_tool` |
-| `invoke.rs` | `invoke_tool`, input/output schema validation, tool dispatch |
-| `interface.rs` | `ToolInterface`, `expose_tool`, `accept_tool_interface`, `invoke_cross_context`, rate limiting |
-| `session.rs` | `ToolSession`, `create_session`, `invoke_session`, TTL cleanup task |
+| `mod.rs` | Module root, `OutletId` type, re-exports |
+| `registry.rs` | `OutletRegistration`, outlet storage per context, `register_outlet`, `update_outlet`, `verify_outlet` |
+| `invoke.rs` | `invoke_outlet`, input/output schema validation, outlet dispatch |
+| `interface.rs` | `OutletInterface`, `expose_outlet`, `accept_outlet_interface`, `invoke_cross_context`, rate limiting |
+| `session.rs` | `OutletSession`, `create_session`, `invoke_session`, TTL cleanup task |
 | `schema.rs` | JSON Schema validation helpers, MCP compatibility utilities |
-| `lifecycle.rs` | `ToolRequest`, `ToolResponse`, `ToolCancel`, `ToolStatus`, timeout management, cancellation handling |
+| `lifecycle.rs` | `OutletRequest`, `OutletResponse`, `OutletCancel`, `OutletStatus`, timeout management, cancellation handling |
 
 **Estimated functions:** ~18-22 public functions, ~12-15 internal helpers.
 
@@ -777,11 +780,11 @@ pub enum EventType {
     RoleAssigned,
     TokenRevoked,
     MessageSent,                  // per-author application activity; convergent canonical leaf in the ADR-051 end state, local ContextEvent until then
-    ToolRegistered,
-    ToolUpdated,
-    ToolInvoked,                  // per-author application activity; see MessageSent (ADR-051 causal-DAG ordering)
-    ToolVerified,
-    ToolInterfaceEstablished,
+    OutletRegistered,
+    OutletUpdated,
+    OutletInvoked,                  // per-author application activity; see MessageSent (ADR-051 causal-DAG ordering)
+    OutletVerified,
+    OutletInterfaceEstablished,
     GovernanceAction,
     ConsistencyCheckpoint,
     AbsenceProofRequested,
@@ -828,7 +831,7 @@ pub enum EventType {
     HardRateLimitModified,        // ModifyHardRateLimit §19.7 D4
     EconomicPolicyLocked,         // LockEconomicPolicy §19.3
     ContextMigrationStarted,      // ProposeContextMigration §5.11A grace start
-    ToolRemoved,                  // RemoveTool; pairs with ToolRegistered
+    OutletRemoved,                  // RemoveOutlet; pairs with OutletRegistered
     PruningPolicyModified,        // ModifyPruningPolicy ADR-030 §6
     CommitBroadcasted,            // MLS commit broadcast record §9.9 reconciliation
     CommitBroadcastPending,       // deferred-commit queue record
@@ -888,6 +891,28 @@ pub enum EventType {
    events; per-member-observed emissions are kept out of it (see the convergence
    model and exclusion taxonomy below).
 
+   **Subject-bearing leaf payloads (participation-fact attribution).** The
+   participation facts derived from convergent events (§7.3.2) attribute role
+   progression and participation duration to the *affected member*, not to the
+   governance actor who executed the change. The affected member is therefore
+   carried in the leaf `EventPayload`, not inferred from `actor_did` (which, for
+   admin-driven joins/removals/assignments, is the admin):
+
+   - `RoleAssigned` carries `RoleAssignedPayload { subject_did: DID, role: RoleName }`.
+   - `MemberJoined` / `MemberLeft` carry a membership-change payload
+     `{ subject_did: DID, role_name: RoleName }`.
+
+   These three leaves were previously empty-payload leaves. Adding the payload
+   changes their leaf preimage (`SHA-256(0x00 ‖ rmp_serde(Event))`) and therefore
+   their leaf hash and the resulting Merkle root. This is a **one-way pre-release
+   protocol bump** — SCP has no deployed data, so there is no migration: the
+   correct end state (subject-bearing payloads) is the only state. The
+   `project_payload` projection (in `scp-event-log`) is extended to surface
+   `subject_did` from these payloads; any historical empty-payload leaf projects
+   `subject_did = None`. No `EventType` variant is added or removed by this change —
+   the variant count is unchanged; only the payload contents of three existing
+   variants gain a subject DID.
+
    > **Amendment (native↔WASM event-log unification).** `EventType` is the single
    > canonical event taxonomy across all implementations. The `scp-runtime`
    > provider MUST construct `scp_event_log::Event` values with a typed
@@ -904,9 +929,12 @@ pub enum EventType {
    > DAG-ordered application leaves, per ADR-051 §5). The log therefore
    > MUST contain **only convergent events** — those every honest member appends
    > identically and in the same order, i.e. the MLS-commit-ordered stream
-   > (governance, membership, lifecycle, role, access, attestation, provenance,
+   > (governance, membership, lifecycle, role, access, provenance,
    > economic *governance actions* — policy changes, spending-UCAN grants/revocations,
-   > compromise recovery, app-binding). Per-member-observed
+   > compromise recovery, app-binding). Attestations are NOT in this stream — they
+   > are credential-layer artifacts (§7.4), not context-log leaves, and there is no
+   > `AttestationPublished`/`AttestationRevoked` `EventType` variant.
+   > Per-member-observed
    > emissions do not converge and are excluded. The governing rule for the whole
    > trust subsystem: **a derived record is automatic *and* convergent iff its
    > trigger input is convergent.**
@@ -929,7 +957,7 @@ pub enum EventType {
    >    unification removes those append sites.
    >
    > 2. **Per-author application activity (interim — canonical in the ADR-051 end
-   >    state).** `MessageSent`, `ToolInvoked`, and the payment receipts
+   >    state).** `MessageSent`, `OutletInvoked`, and the payment receipts
    >    `PaymentReceived` / `PaymentCaptureFailed` (appended by the payee on
    >    `adapter.capture()`) are appended only by their author/payee, keyed by a
    >    *per-author* sequence, with no global order: each member's log holds only
@@ -941,13 +969,13 @@ pub enum EventType {
    >    frontier), and every member linearizes the same DAG identically — at which
    >    point they re-enter the canonical log as convergent leaves. Until ADR-051
    >    lands they are local. (The §25 KAT vectors already carry no `MessageSent` /
-   >    `ToolInvoked` / `PaymentReceived` leaf, consistent with this.)
+   >    `OutletInvoked` / `PaymentReceived` leaf, consistent with this.)
    >
-   >    *Scope:* this covers the **intra-context, per-author** `ToolInvoked`
-   >    emission. The **cross-context tool-call saga** (§6) records its `ToolInvoked`
-   >    / `CrossContextToolInvoked` within the saga's MLS-Commit phase — commit-
-   >    ordered and *convergent*, canonical by design (its `tool_invoked_event_id`
-   >    is a signed `CrossContextToolReceipt` field) — and is **not** in this
+   >    *Scope:* this covers the **intra-context, per-author** `OutletInvoked`
+   >    emission. The **cross-context outlet-call saga** (§6) records its `OutletInvoked`
+   >    / `CrossContextOutletInvoked` within the saga's MLS-Commit phase — commit-
+   >    ordered and *convergent*, canonical by design (its `outlet_invoked_event_id`
+   >    is a signed `CrossContextOutletReceipt` field) — and is **not** in this
    >    per-author exclusion.
    >
    > 3. **Per-committer broadcast-retry bookkeeping (permanent — kept as an
@@ -995,7 +1023,7 @@ pub enum EventType {
    > commits per the context's *declared* governance model (mechanical, not an ad-hoc
    > vote — §7.3.7's "automatic, not governance-discretion" preserved). See ADR-051 §6.
    >
-   > **Other derived per-author facts.** `tool_invocation_count` (§7.3.2) is a
+   > **Other derived per-author facts.** `outlet_invocation_count` (§7.3.2) is a
    > convergent *count* over the causal DAG (ADR-051) — no clock; interim-local
    > (`anchored=false`) until that DAG lands. Economic `SenderVelocity` /
    > `ContextMessageRate` pricing (§19.7) is enforced at `authorize()` by the payer's
@@ -1262,19 +1290,19 @@ pub struct ReliabilityScore {
 The ultimate acceptance criterion for Phase 2 exercises all 5 ADRs together with the Phase 1 crypto stack:
 
 ```
-1. Alice creates an identity (ADR-003) and a context with ceiling [messaging, tool_invoke],
-   roles [admin, member], one tool "calculator", TTL 5 minutes, memory scope ephemeral (ADR-008)
+1. Alice creates an identity (ADR-003) and a context with ceiling [messaging, outlet_call],
+   roles [admin, member], one outlet "calculator", TTL 5 minutes, memory scope ephemeral (ADR-008)
 2. The context is assigned to 3 relays via TransportManager (ADR-012)
 3. Bob creates an identity, discovers the context, and joins (ADR-008)
 4. Bob is assigned the "member" role with UCAN tokens for messages:read, messages:write,
-   tool_invoke_all (ADR-009)
+   outlet_query_all, outlet_call_all (ADR-009)
 5. Alice sends a message. UCAN is validated. Envelope is created, multi-relay published (ADR-012).
    Event is logged in the Merkle tree (ADR-011).
 6. Bob receives the message via merged subscription stream (ADR-012).
    Bob's SDK deduplicates across relays.
-7. Bob invokes the "calculator" tool with input {"operation": "add", "a": 1, "b": 2} (ADR-010).
-   UCAN validates Bob has tool_invoke capability.
-   Tool returns {"result": 3}. Invocation is logged (ADR-011).
+7. Bob invokes the "calculator" outlet with input {"operation": "add", "a": 1, "b": 2} (ADR-010).
+   UCAN validates Bob has outlet_call capability.
+   Outlet returns {"result": 3}. Invocation is logged (ADR-011).
 8. Bob attempts to assign a role (he's a member, not admin). UCAN validation rejects —
    Bob lacks RoleAssign capability (ADR-009). Action is denied.
 9. Both Alice and Bob generate consistency checkpoints (ADR-011). Merkle roots match.
@@ -1286,7 +1314,7 @@ The ultimate acceptance criterion for Phase 2 exercises all 5 ADRs together with
     is tracked, and relay sets are partitioned across contexts.
 ```
 
-This test proves: context lifecycle works, roles enforce, tools invoke, event logs verify, multi-transport routes, TTL enforces, metadata privacy measures are active, and everything composes cleanly on top of Phase 1's crypto stack.
+This test proves: context lifecycle works, roles enforce, outlets invoke, event logs verify, multi-transport routes, TTL enforces, metadata privacy measures are active, and everything composes cleanly on top of Phase 1's crypto stack.
 
 ---
 
@@ -1593,9 +1621,9 @@ Relay advertises QUIC via `.well-known/scp` `relay_config.transports` array. Cli
 
 #### WebTransport Binding (§10.15)
 
-WebTransport is the browser-facing equivalent of QUIC. The WASM binding uses the browser's `WebTransport` API over HTTP/3. Server-side, relay handles both QUIC and WebTransport sessions — they're both QUIC underneath.
+WebTransport is the browser-facing equivalent of QUIC. The browser client transport uses the browser's `WebTransport` API over HTTP/3. Server-side, relay handles both QUIC and WebTransport sessions — they're both QUIC underneath.
 
-Fallback chain: WebTransport → WebSocket → error. The WASM binding attempts WebTransport first, falls back to WebSocket when the `WebTransport` API is unavailable or connection fails.
+Fallback chain: WebTransport → WebSocket → error. The browser client transport attempts WebTransport first, falls back to WebSocket when the `WebTransport` API is unavailable or connection fails.
 
 HTTP/3 is also the relay's HTTP upgrade path for all endpoints (`.well-known/scp`, dev API, broadcast projection), advertised via `Alt-Svc` header and ALPN negotiation.
 
@@ -1654,7 +1682,7 @@ Both options: no persistent subscriptions (poll via QUERY), no cover traffic, si
 | `crates/scp-transport/src/quic/listener.rs` | Relay-side QUIC listener |
 | `crates/scp-transport/src/webtransport/mod.rs` | WebTransport adapter module |
 | `crates/scp-transport/src/webtransport/session.rs` | Server-side WebTransport session handling |
-| `crates/scp-transport/src/webtransport/adapter.rs` | Client-side WebTransport adapter (WASM) |
+| `crates/scp-transport/src/webtransport/client.rs` | Client-side WebTransport adapter (browser client transport) |
 | `crates/scp-transport/src/udp/mod.rs` | UDP/DTLS adapter module |
 | `crates/scp-transport/src/udp/adapter.rs` | `UdpDtlsAdapter` implementing `TransportAdapter` |
 | `crates/scp-transport/src/udp/coap.rs` | CoAP-over-DTLS framing |
@@ -1669,7 +1697,6 @@ Both options: no persistent subscriptions (poll via QUERY), no cover traffic, si
 | `crates/scp-transport/src/native/server.rs` | Multi-transport listener (WebSocket + QUIC + WebTransport + UDP/DTLS) |
 | `crates/scp-node/src/well_known.rs` | `transports` field in `.well-known/scp` response |
 | `crates/scp-node/src/http.rs` | HTTP/3 via ALPN, `Alt-Svc` header |
-| `crates/scp-ffi/wasm/src/transport.rs` | WebTransport API usage with WebSocket fallback |
 
 **Estimated functions:** ~40-50 public functions, ~30-40 internal helpers across all new and modified files.
 
@@ -1797,7 +1824,6 @@ Key design choices:
 | `crates/scp-ffi/src/context.rs` | PyO3 bridge exports for `broadcastPublishAsset`, `broadcastPublishAssets` |
 | `crates/scp-ffi/napi/src/context.rs` | NAPI bridge exports |
 | `crates/scp-ffi/uniffi/src/bridge.rs` | UniFFI bridge exports |
-| `crates/scp-ffi/wasm/src/context.rs` | WASM bridge exports (`ContentPath`/`MimeType` validation reimplemented locally per ADR-034) |
 | `bindings/typescript/src/context.ts` | `broadcastPublishAsset`, `broadcastPublishAssets` |
 | `bindings/python/scp_sdk/context.py` | `broadcast_publish_asset`, `broadcast_publish_assets` |
 
@@ -1818,7 +1844,7 @@ SCP's thesis is the agentic Internet, and a direct corollary governs the SDK: **
 Today the construction surface is **three different patterns**:
 
 1. **Typestate builder** — `ApplicationNodeBuilder` (`crates/scp-node/src/lib.rs`): generic markers `<K, D, S, Dom, Id>`, `HasDomain`/`HasNoDomain`/`HasIdentity` `PhantomData` states, ~25 `.with_*` methods, and a `build()`/`build_for_testing()` split. This is the LLM-hostile outlier: phantom required-ordering the model loses track of (→ compile-retry loops), required steps invisible because they are encoded in types rather than fields, and a shape that does not translate to four of five languages (Python, TypeScript, Swift, Kotlin have no typestate).
-2. **Flat config objects** — `RelayConfig` (`crates/scp-transport/src/native/server.rs`), `HostSiteOptions` (`crates/scp-node/src/self_host.rs`), and the cross-FFI `StorageConfig` enum. Already the target shape, already mapped identically across all four bridges.
+2. **Flat config objects** — `RelayConfig` (`crates/scp-transport/src/native/server.rs`), `HostSiteOptions` (`crates/scp-node/src/self_host.rs`), and the cross-FFI `StorageConfig` enum. Already the target shape, already mapped identically across all three bridges.
 3. **Options-objects in SDK wrappers** — Context and Identity already use them in Python/TypeScript/Swift, while Rust uses a fluent builder (the `sdk-common.md` Context-creation divergence). The same operation has two different shapes depending on language.
 
 ADR-032 §AC-6 mandated the typestate builder. Eliminating it follows directly from the Agent-first API design tenet (CLAUDE.md): typestate the LLM author cannot track is a defect, not a safety feature.
@@ -1862,7 +1888,7 @@ The two guarantees the typestate markers previously enforced collapse into **req
 2. **CLAUDE.md** carries the **Agent-first API design** builder tenet, and the "APIs: self-evident, one happy path" architecture rule references it.
 3. **`NodeConfig`** replaces `ApplicationNodeBuilder`: required fields `reach: Reach`, `identity: IdentitySource`, and a required storage slot (no whole-struct `Default`); enum fields `tls`, `dht`; defaulted optionals for the remainder. The Rust-core `NodeConfig` stays generic over the storage type `S` (the `<K, D, S>` generics survive, carried by the config and its selectors) and carries the injected provider as a typed core slot — it does **not** carry the FFI `StorageConfig` enum (scp-core does not depend on scp-ffi). Each FFI bridge mirrors `NodeConfig` as its own per-bridge config, lowering the storage slot to that bridge's `StorageConfig` enum. Entry: `Node::start(NodeConfig)` (production, `where S: EncryptedStorage`) and `Node::start_for_testing(NodeConfig)` (feature-gated, any `Storage`). The `Dom`/`Id` typestate markers are deleted.
 4. **`RelayConfig`** replaces `supports_bridge: bool` with a `BridgeRole` enum (`Default = Disabled`, the fail-safe). `BridgeRole::Enabled` is **payload-free**: brokering authenticates each `BRIDGE_REGISTER` by an Ed25519 signature over the DID-to-routing-ID mapping (SCP-247, §10.12.4), so enabling the broker role needs no shared secret. The relay's `bridge_secret: Option<[u8;32]>` is a **separate, orthogonal** field — the internal-relay WebSocket connection-admission secret (`Authorization: Bearer`), set independently of the broker role (a Node sets `bridge_secret` on a relay that brokers nothing) — and is therefore **not** folded into `BridgeRole` and not part of the construction-pattern surface. `RelayConfig` may keep its whole-struct `Default` under M4 precisely because `BridgeRole::default() == Disabled` makes its sole security-consequential field fail-safe. Entry: `Relay::start(RelayConfig, storage)` (the SDK-facing entry, which wraps the internal low-level `RelayServer::new(config, storage)` — `RelayServer::new` is not the public pattern surface; see the entry-verb rule in construction.md).
-5. **`HostSiteConfig`** folds `HostSiteOptions`: `reach: Reach` (required), `tls: TlsMode` (the same enum as `NodeConfig.tls`; folds the `plaintext` bool), `dht: DhtMode`, plus deployment fields. The host config takes the name `HostSiteConfig`, **not** the bare `SiteConfig`, because `crates/scp-node/src/projection.rs` already exports an FFI-surfaced `SiteConfig` (virtual-host deploy limits) that the four bridges and the SDK capability matrix track — renaming it is an out-of-scope bridge-parity hazard, so the construction host config takes the distinct name (a compiler-level constraint, the one legitimate naming deviation). `host_site` (today `host_site(opts: HostSiteOptions)`) remains the fail-safe sugar tier, constructing a full `HostSiteConfig` and delegating. `Reach` is a new enum (built in P1) that folds the existing `PublicSurface`, `ReachabilityTier`, and `skip_nat`/`no_domain` machinery in `crates/scp-node/src`; `DhtMode` (currently in `crates/scp-node/src/self_host.rs`) is promoted to a shared location so Node and Site share one definition.
+5. **`HostSiteConfig`** folds `HostSiteOptions`: `reach: Reach` (required), `tls: TlsMode` (the same enum as `NodeConfig.tls`; folds the `plaintext` bool), `dht: DhtMode`, plus deployment fields. The host config takes the name `HostSiteConfig`, **not** the bare `SiteConfig`, because `crates/scp-node/src/projection.rs` already exports an FFI-surfaced `SiteConfig` (virtual-host deploy limits) that the three bridges and the SDK capability matrix track — renaming it is an out-of-scope bridge-parity hazard, so the construction host config takes the distinct name (a compiler-level constraint, the one legitimate naming deviation). `host_site` (today `host_site(opts: HostSiteOptions)`) remains the fail-safe sugar tier, constructing a full `HostSiteConfig` and delegating. `Reach` is a new enum (built in P1) that folds the existing `PublicSurface`, `ReachabilityTier`, and `skip_nat`/`no_domain` machinery in `crates/scp-node/src`; `DhtMode` (currently in `crates/scp-node/src/self_host.rs`) is promoted to a shared location so Node and Site share one definition.
 6. **`ContextConfig { creation: ContextCreation }`** with `<manager>.create(ContextConfig)` replaces the Rust `create_context().template().build()` builder, where `ContextCreation = Template { template, peer } | Explicit { ceiling, roles, governance, memory_scope }`. This eliminates the `sdk-common.md` Rust/options-object divergence — all five languages now use the same options-object shape. **Receiver:** the verb is `create`, but unlike `Identity::create` (a manager-free top-level constructor) a context is created **within an existing manager runtime** — the Rust-core `Supervisor` (which absorbed the former `ContextManager`, ADR-049) that owns the MLS group creation, actor spawn, and event-log init a context create performs, and that the FFI bridges already drive via `create_context`. The entry is therefore the verb-`create` method on the live manager (`<manager>.create(ContextConfig)`), surfaced by the language SDKs as a method on their SDK handle (`sdk.create_context` / `sdk.createContext`); see the Context receiver carve-out in construction.md. **Bilateral peer:** `Template`'s optional `peer` is for the invitation step; invitation/Welcome-delivery is a higher SDK layer, so until it is wired the core `create` entry rejects a supplied `peer` with a loud typed `ContextCreationError::BilateralPeerNotSupported` rather than silently dropping it (CLAUDE.md "no silent" tenet). `peer: None` is the supported form at this layer.
 7. **`IdentityConfig { method, custody, persistence }`** with `Identity::create(IdentityConfig)`; `method` and `custody` required. `persistence: None` is the fail-safe default (ephemeral identity, no key material at rest); when `Some(StorageSlot)`, the production `Identity::create` path binds the slot to `EncryptedStorage` exactly as `Node::start` does — identity key material persists only to an encrypted slot, including via `StorageSlot::Custom` (the `Custom(concrete)` it carries must be an `EncryptedStorage` type). A Node's persisted identity is the same model sourced differently: it reuses the Node's own `NodeConfig.storage` slot rather than a separate identity slot.
 8. **Five-language equivalence:** each config object and its enums map identically across Rust, Python, TypeScript, Swift, and Kotlin, per the canonical five-language equivalence table in `.docs/standards/construction.md` (the existing per-bridge `StorageConfig` mirror is the worked precedent). The Rust-core-only `Custom(concrete)` advanced-injection variant and its FFI-named/`parse_custody` asymmetry are likewise stated canonically in construction.md (§Five-language equivalence) — a Rust trait object cannot cross the FFI boundary, so the bridge mirror enums omit it. This Rust-core-only/FFI-named split is correct, not a coverage gap.
@@ -1932,4 +1958,73 @@ The relay's `/scp/v1` route is served on the node's existing TLS-terminated **Fu
 - **ADR-049 (actor-per-context / `Supervisor`):** the one participant engine. The co-located and external clients are both `Supervisor` instances.
 - **ADR-042 (Broadcast Content Delivery):** the publish path the BUNDLED participant drives.
 - **ADR-052 (Unified Construction Pattern):** the participant and node are both constructed via flat config; a node config never carries "participate as self" — participation is always a separate `Supervisor` construction.
+
+## ADR-059: Structured Capability/Trust Validation Across the FFI; SDKs Consume Typed Results, Not Prose
+
+> **Note (renumbering):** This ADR was originally accepted as ADR-057 (PR #1995) and was renumbered to ADR-059 after a number collision with the in-browser-client ADR (`ADR-057-in-browser-client-over-shared-mls.md`, the first claimant of the number). Historic PR/commit references to "ADR-057" from that era (#1995 and follow-ups) refer to this ADR.
+>
+> **Note:** ADR-059 lives in the Phase 2 document by *subject*, not by number (like ADR-032/035/042/052/053): it governs the capability/trust-validation surface (§7.2, Phase 2 — Context + Transport) as it crosses the FFI bridges into the language SDKs. Its scope is cross-cutting — it constrains every bridge that returns a validation outcome and every SDK that consumes one.
+
+**Status:** Decided
+
+### Context
+
+UCAN capability validation has two distinct consumers with two distinct needs (§7.2.1):
+
+- An **enforcement gate** that must fail closed at a token-presentation boundary (cross-context outlet invocation, broadcast admission, role assignment). This is `validate_ucan` (`crates/scp-protocol/src/crypto/ucan/validate.rs`): the 11-step Tier-1 pipeline that returns `Ok(())` or a specific `UcanError`, and — critically — **records the nonce** (step 9, `NonceTracker::check_and_record`) as a side effect, consuming it for replay defense.
+- A **diagnostic** that must report *which* checks passed without enforcing anything and without mutating state — for a trust signal an SDK surfaces to a caller deciding whether to proceed. This is `evaluate_ucan` (same file): it runs the identical sub-checks but returns a structured `CapabilityValidation` record of six per-stage booleans (`tokens_valid`, `signatures_valid`, `within_ceiling`, `nonce_valid`, `not_revoked`, `time_bounds_valid`), never throws, and probes the nonce **read-only** (`NonceTracker::check_replay`, never `record`), so it is safe to call repeatedly on the same token without burning its nonce.
+
+The Rust core plus all three FFI bridges already expose `evaluate_ucan` as the structured op `ucan_evaluate` returning `CapabilityValidation` (PyO3 `crates/scp-ffi/src/ucan.rs`; NAPI `crates/scp-ffi/napi/src/ucan.rs` + `scp.rs`; UniFFI `CapabilityValidationRecord`; the WASM bridge was removed per ADR-055 (`.docs/adrs/phase-4.md`)). The structured substrate exists at every layer below the SDK wrapper. At the time this ADR was written, the capability matrix (`.docs/standards/sdk-capability-matrix.json`, `UCAN.evaluate`) recorded this as bridge-present, SDK-wrapper-pending, with exemptions explicitly naming "the C3c SDK-parity follow-up."
+
+What is **wrong** today is how the SDKs consume validation outcomes. A first-principles audit of the trust/capability SDK surface found the Python SDK reverse-engineering the per-check breakdown by **string-matching the human-readable error prose** the throwing gate emits — parsing strings like `[SCP-PERM-3001] permission error: …` in `trust.py` to reconstruct *which* of the six checks failed. This is an antipattern on two independent grounds:
+
+1. **It is brittle by construction.** It couples the SDK to the exact wording of error messages — a denylist of prose spellings that grows every time the core rephrases a message, and silently mis-classifies the moment the wording drifts. The structured truth (`CapabilityValidation`) was discarded and then guessed back from a lossy projection (a flattened error string).
+2. **It masked a real security defect.** Because the test mocks emitted prose without modeling nonce *state*, a multi-attestation nonce bug went undetected: the prose-reconstruction reported `nonce_valid` from a string that the mock produced unconditionally, so the suite never exercised the path where the nonce check actually consumes/observes state across multiple attestations. A typed result whose mocks must model nonce state would have surfaced it.
+
+The structured op was built precisely to retire this antipattern. This ADR records the decision the C3c SDK rebuild rests on.
+
+### Decision
+
+1. **Capability/trust validation results cross the FFI as typed, structured records — never as prose to be parsed back.** The canonical structured result is `CapabilityValidation`: the six explicit per-stage booleans defined in `validate.rs`. The record has an **identical shape across every binding** (per the Agent-first API design tenet): snake_case fields in Rust and PyO3, camelCase under the NAPI serde projection, and a UniFFI `Record` (`CapabilityValidationRecord`) for Swift/Kotlin. The field *set* and *meaning* are identical everywhere; only the per-language casing differs.
+
+2. **The throwing gate and the diagnostic are two distinct operations and stay distinct.** `ucan_validate` is the enforcement GATE: fail-closed, side-effecting (records the nonce), the only thing permitted at a token-presentation boundary. `ucan_evaluate` is the read-only DIAGNOSTIC: returns the structured `CapabilityValidation` without throwing and **without recording nonce state** (read-only `check_replay`). The diagnostic is a point-in-time snapshot, not a pre-flight guarantee that a subsequent `ucan_validate` will accept the token (the nonce may be recorded, or the token revoked, between the two calls). Neither operation is reconstructable from the other's output: a caller wanting the per-check breakdown calls `ucan_evaluate`; a caller enforcing at a boundary calls `ucan_validate`.
+
+   2a. **The diagnostic's challenge capability is OPTIONAL; the gate's is MANDATORY.** `ucan_validate` always requires a concrete `required_capability` — enforcement at a presentation boundary is always *for* a specific invoked capability. `ucan_evaluate` makes the challenge capability optional: with **no challenge** it evaluates the token's INTRINSIC validity (signature/chain/issuer/audience/key-scope/Category-A/attenuation, all-attestation ceiling over the token's own `att`, nonce, revocation, time bounds) and SKIPS the invoked-capability grant-match entirely; with a challenge supplied it additionally requires the token grants that capability. Omitting the challenge never flips any `CapabilityValidation` field to `true` that another check would set `false` — every other stage still runs and `within_ceiling` still enforces the all-attestation ceiling — so the diagnostic stays fail-closed in both modes. The intrinsic mode is the one a trust signal uses: a participant's tokens are assessed for general validity when there is no specific capability to challenge. (Passing a bare `*` "match anything" sentinel is NOT this — the gate rejects it as a malformed capability URI; the absence of a challenge is expressed by *omitting* the capability, not by a wildcard string.)
+
+3. **SDKs MUST consume the structured result and MUST NOT parse prose error strings to infer validation outcomes.** Reconstructing *which check failed* by matching error message text is forbidden. The per-check breakdown comes from `CapabilityValidation`; nothing else.
+
+4. **SDK error *typing* derives from the bridge error-code taxonomy, surfaced through a single mapping chokepoint — not per-call string classification.** Where an SDK must classify a thrown error (e.g. mapping a gate rejection to a typed SDK exception), it maps on the structured `[SCP-CAT-NNNN]` error *code* the bridge attaches (where `CAT` is a placeholder for the relevant allocated category prefix — `IDENT`/`CTX`/`PERM`/`CRYPTO`/… per `scripts/check-error-codes.sh` — not a literal `CAT` prefix), at **one** mapping site, not with a try/catch ladder of `if message.contains(...)` at each call site. One chokepoint (e.g. a Proxy/wrapper that maps code → typed error) keeps the mapping closed and auditable; scattered string classification is the same brittle denylist this ADR is retiring, in a second location.
+
+5. **Every binding exposes an idiomatic wrapper; only the idiom differs.** All four SDKs (Python, TypeScript, Swift, Kotlin) MUST expose the structured result through a public wrapper — the wrapper's *existence* is non-optional in every binding, per the Agent-first API design tenet's identical-shape requirement. What this decision does NOT dictate is that the wrapper be identically-*named* or identically-*shaped* across languages: each SDK exposes the structured result through its own idiomatic surface (language-native types, naming, async style), and one binding's wrapper shape is not propagated onto another (per the per-SDK-idiom lesson, `.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md`). The per-SDK-idiom lesson governs HOW each binding exposes the op, never WHETHER it does — omitting the wrapper in any binding violates the identical-shape tenet and the project's completeness baseline.
+
+### Rationale
+
+- **Eliminates phantom provenance at the SDK boundary.** Prose-parsing makes the SDK's notion of "which check failed" a *guess* about the core's behavior, decoupled from the core's actual result. Consuming the typed record makes the SDK's view exactly the core's view — the structured truth flows down unaltered (artifact-flow / CLAUDE.md "code does not inform specs").
+- **Closed, not open.** A typed six-field record is closed by construction: a new failure mode either maps to an existing stage boundary or forces an explicit, reviewed change to the record. A prose denylist is open-ended — it chases "one more spelling" forever (CLAUDE.md "Guard against … non-convergent enforcement").
+- **Gate vs. diagnostic separation is a security property, not ergonomics.** Folding structure into the throwing gate would either make the gate non-throwing (defeating fail-closed enforcement) or make the diagnostic side-effecting (consuming the nonce on every trust-signal probe — a nonce-burn DoS and a correctness hazard). Keeping them separate keeps each sound.
+- **Mocks that must model nonce state catch nonce bugs.** Consuming the typed result forces test doubles to populate real per-stage outcomes — including nonce state — rather than emitting unconditional prose. The masked multi-attestation nonce bug is exactly the class this surfaces.
+
+### Consequences
+
+- **The C3c SDK rebuild** (downstream code work, governed by this ADR and §7.2.4): delete the Python prose-parser in `trust.py`; add the TypeScript public wrapper(s) over `ucanEvaluate`/the trust-signal consumer; route SDK error typing through a single mapping chokepoint keyed on `[SCP-CAT-NNNN]` codes; and rebuild the test mocks to model nonce state rather than emit prose.
+- **All four bindings expose idiomatic wrappers.** Per the Agent-first API design tenet's identical-shape requirement, the structured op is surfaced in every SDK — Python (`ucan_evaluate`/`evaluate_trust`), TypeScript (`ucanEvaluate`/`evaluateTrust`), Kotlin (`SCP.ucanEvaluate`/`evaluateTrust`, types in `Trust.kt`), and Swift (`SCP.ucanEvaluate`/`evaluateTrust`, `Trust.swift`). The structured record SHAPE is identical across bindings (Decision 1); per Decision 5 only the per-SDK *wrapper* idiom (naming, language-native types) differs — the wrapper's existence is NOT optional in any binding.
+- **Capability-matrix cells flip true** as each SDK's idiomatic wrapper lands: the `UCAN.evaluate` row's per-SDK `false` entries are cleared SDK-by-SDK. The Python and TypeScript wrappers landed in the C3c rebuild; the Kotlin and Swift idiomatic wrappers land alongside them (the UniFFI bridge already exports `CapabilityValidationRecord` and `ParticipationRecordView`; the idiomatic SDK sugar is written on top), so every `UCAN.evaluate` cell is `true` with no exemption.
+- **One narrow core change: the diagnostic's challenge capability becomes optional (Decision 2a).** `validate_ucan`/`evaluate_ucan`/`CapabilityValidation` and the three bridge exports already exist; this ADR records the consumption contract and does NOT add a new protocol operation. The only signature change is `evaluate_ucan`'s `required_capability` going from mandatory to optional (`Option`), with the corresponding bridge `ucan_evaluate` capability argument becoming optional. The enforcing gate `ucan_validate` is UNCHANGED — its `required_capability` stays mandatory. This was driven by the C3c trust-signal consumer, which has no specific capability to challenge and previously passed a `*` sentinel the real bridge rejected (see Decision 2a and §7.2.4).
+- **Freshness enforcement fails closed on a broken host clock, and that relies on unwind semantics.** The three `verify_participation_requirements` bridge exports read the current time via `scp_primitives::SystemClock`, which panics — rather than silently reading time `0` — on a pre-epoch/unavailable clock (a `0` would make every participation statement read as maximally fresh and bypass `max_age_secs`). The panic is *caught at the FFI boundary* (PyO3 `PanicException`, napi-rs thrown `Error`, UniFFI internal error), so it surfaces as a language exception rather than a process abort — which holds ONLY under `panic = "unwind"`. The FFI cdylib crates MUST NOT be built with `panic = "abort"`, or a pre-epoch clock would escalate from "this one trust check throws" to "the host process aborts."
+
+### Rejected Alternatives
+
+1. **Keep parsing prose error strings (the status quo, rejected).** Reconstruct the per-check breakdown by string-matching `[SCP-PERM-3001] …`-style messages. **Rejected:** this is the audit's root cause. It is brittle (a prose denylist that breaks on rewording), lossy (a structured truth flattened to a string and guessed back), and it actively masked a nonce bug because the mocks emitted prose without modeling state. A structured record already exists at every layer; discarding it to re-parse a string is negative value.
+2. **Overload the throwing `ucan_validate` to also return structure (rejected).** Make the single gate return both an outcome and the per-stage breakdown. **Rejected:** it conflates the enforcement gate with the diagnostic. To return structure on the failure path the gate would have to stop throwing (losing fail-closed enforcement at presentation boundaries), and to produce the breakdown it would have to run all stages — including recording the nonce — turning every diagnostic probe into a nonce-consuming side effect (nonce-burn DoS). The gate must stay fail-closed and side-effecting; the diagnostic must stay non-throwing and read-only. Two operations, two contracts.
+3. **Per-call try/catch classification in the SDK (rejected).** Instead of one chokepoint, classify each thrown error at each call site with a local `catch` that inspects the error. **Rejected:** it scatters the (already-rejected) string/denylist logic across every call site and re-creates the unbounded-denylist problem in N places. A single mapping chokepoint keyed on the structured `[SCP-CAT-NNNN]` code is closed and auditable; per-call classification is neither.
+
+### Dependencies
+
+- **Spec §7.2 (Layer 1: Protocol Enforcement), §7.2.1 (Tier 1 full UCAN validation), and §7.2.4 (Structured capability evaluation):** the normative prose this ADR enacts. §7.2.4 defines the structured-evaluation result and the gate-vs-diagnostic distinction at protocol level.
+- **ADR-016 (11-step UCAN validation pipeline, `.docs/adrs/phase-3.md`):** the gate `ucan_validate` enacts; `evaluate_ucan` mirrors its stage boundaries exactly.
+- **ADR-009 (Role Assignment and Capability Ceiling Enforcement):** the `NonceTracker` foundation — its acceptance criteria define the `NonceTracker` struct and the `check_and_record` (gate) / `check_replay` (diagnostic) operations whose differing nonce side effect distinguishes the gate (records) from the diagnostic (read-only probe). ADR-016 (cited above) is the normative nonce-validation pipeline (format, freshness, replay window).
+- **ADR-039 (shared-DID key scope, Category-A enforcement):** sub-checks inside the `signatures_valid` stage of `CapabilityValidation`.
+- **Agent-first API design tenet (CLAUDE.md) + per-SDK idiom lesson (`.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md`):** identical record *shape* across bindings, but per-SDK idiomatic wrappers — not a single shape forced onto every language.
+- **Lesson `.docs/lessons/sdk-consume-structured-ffi-results-not-error-prose.md`:** why prose-parsing of FFI error strings is a recurring failure mode (it masked the multi-attestation nonce defect), and the structural prevention this ADR rests on — SDKs consume the typed `CapabilityValidation`/structured result, never reconstruct per-check outcomes from message text.
+- **Bridge error-code taxonomy (`[SCP-CAT-NNNN]` codes, `scripts/check-error-codes.sh`):** the source of SDK error typing, surfaced via one mapping chokepoint.
 

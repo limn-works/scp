@@ -16,17 +16,18 @@ use std::collections::HashSet;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+use scp_clock::Clock;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
-use scp_primitives::Clock;
 
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::nonce;
 use scp_protocol::crypto::ucan::revoke::compute_revocation_cid;
 use scp_protocol::crypto::ucan::validate::{
     CapabilityValidation, DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver,
-    InMemoryNonceTracker, InMemoryProofResolver, InMemoryRevocationChecker, NonceTracker,
-    ProofResolver, ValidationContext, evaluate_ucan, parse_ucan, validate_ucan,
+    InMemoryNonceTracker, InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver,
+    NonceTracker, ProofResolver, TokenNbCaveatResolver, ValidationContext, evaluate_ucan,
+    parse_ucan, validate_ucan,
 };
 use scp_protocol::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload, UcanToken};
 
@@ -53,7 +54,11 @@ async fn setup_identity() -> (
 }
 
 /// Production system clock for tests that validate against real time.
-static SYSTEM_CLOCK: scp_primitives::SystemClock = scp_primitives::SystemClock;
+static SYSTEM_CLOCK: scp_clock::SystemClock = scp_clock::SystemClock;
+
+/// No-op caveat resolver for tests: no token carries §7.3.8 invocation
+/// caveats, so `resolve_caveats` is a constant `None`.
+static NO_CAVEAT_RESOLVER: NoCaveatResolver = NoCaveatResolver;
 
 /// Build a [`ValidationContext`] with in-memory implementations.
 fn build_context<'a, S: std::hash::BuildHasher>(
@@ -77,6 +82,7 @@ fn build_context<'a, S: std::hash::BuildHasher>(
         nonce_tracker,
         revocation_checker,
         proof_resolver,
+        caveat_resolver: &NO_CAVEAT_RESOLVER,
         ceiling,
         context_creator_did,
         presenting_agent_did,
@@ -89,7 +95,7 @@ fn default_ceiling() -> HashSet<String> {
     [
         "messages:read".to_owned(),
         "messages:write".to_owned(),
-        "tool_invoke:assistant".to_owned(),
+        "outlet_call:assistant".to_owned(),
         "member:invite".to_owned(),
         "role:assign".to_owned(),
         "context:close".to_owned(),
@@ -144,7 +150,7 @@ async fn validate_ucan_accepts_valid_token() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -193,7 +199,7 @@ async fn validate_ucan_rejects_tampered_signature() {
         ceiling: None,
     };
 
-    let mut token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let mut token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -264,7 +270,7 @@ async fn validate_ucan_accepts_delegated_token() {
             ceiling: None,
         },
         &custody_creator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -289,7 +295,7 @@ async fn validate_ucan_accepts_delegated_token() {
             ceiling: None,
         },
         &custody_delegator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -357,7 +363,7 @@ async fn validate_ucan_rejects_broken_chain_aud_iss_mismatch() {
             ceiling: None,
         },
         &custody_creator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -382,7 +388,7 @@ async fn validate_ucan_rejects_broken_chain_aud_iss_mismatch() {
             ceiling: None,
         },
         &custody_b,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -442,7 +448,7 @@ async fn validate_ucan_rejects_unresolvable_proof() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -500,7 +506,7 @@ async fn validate_ucan_rejects_wrong_issuer() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -560,7 +566,7 @@ async fn validate_ucan_rejects_wrong_root_issuer_in_chain() {
             ceiling: None,
         },
         &custody_non_creator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -585,7 +591,7 @@ async fn validate_ucan_rejects_wrong_root_issuer_in_chain() {
             ceiling: None,
         },
         &custody_delegator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -651,7 +657,7 @@ async fn validate_ucan_rejects_audience_mismatch() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -708,7 +714,7 @@ async fn validate_ucan_rejects_missing_capability() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -762,7 +768,7 @@ async fn validate_ucan_accepts_wildcard_capability_grant() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -828,7 +834,7 @@ async fn validate_ucan_rejects_widened_capabilities_in_delegation() {
             ceiling: None,
         },
         &custody_creator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -853,7 +859,7 @@ async fn validate_ucan_rejects_widened_capabilities_in_delegation() {
             ceiling: None,
         },
         &custody_delegator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -918,7 +924,7 @@ async fn validate_ucan_rejects_capability_outside_ceiling() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -978,7 +984,7 @@ async fn validate_ucan_rejects_nonce_replay() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1046,7 +1052,7 @@ async fn validate_ucan_rejects_revoked_token() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1104,7 +1110,7 @@ async fn validate_ucan_revocation_uses_content_hash_cid() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
     let revocation_cid = compute_revocation_cid(&token.encoded);
@@ -1164,7 +1170,7 @@ async fn validate_ucan_rejects_expired_token() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1208,10 +1214,10 @@ async fn validate_ucan_rejects_expired_token() {
 #[test]
 fn nonce_tracker_rejects_reused_nonce() {
     let mut tracker = InMemoryNonceTracker::new();
-    let now_millis = scp_primitives::SystemClock.now_millis();
+    let now_millis = scp_clock::SystemClock.now_millis();
 
     let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
-    let expiry = scp_primitives::SystemClock.now_secs() + 3600;
+    let expiry = scp_clock::SystemClock.now_secs() + 3600;
 
     assert!(tracker.check_and_record(&nonce, expiry).is_ok());
     let result = tracker.check_and_record(&nonce, expiry);
@@ -1224,7 +1230,7 @@ fn nonce_tracker_rejects_reused_nonce() {
 #[test]
 fn nonce_tracker_rejects_malformed_nonce() {
     let mut tracker = InMemoryNonceTracker::new();
-    let expiry = scp_primitives::SystemClock.now_secs() + 3600;
+    let expiry = scp_clock::SystemClock.now_secs() + 3600;
 
     // No separator.
     let result = tracker.check_and_record("nohyphen", expiry);
@@ -1235,7 +1241,7 @@ fn nonce_tracker_rejects_malformed_nonce() {
     assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
 
     // Hex suffix too short.
-    let now_millis = scp_primitives::SystemClock.now_millis();
+    let now_millis = scp_clock::SystemClock.now_millis();
     let result = tracker.check_and_record(&format!("{now_millis}-aabb"), expiry);
     assert!(matches!(result, Err(UcanError::NonceFormatInvalid(_))));
 }
@@ -1264,7 +1270,7 @@ async fn parse_and_validate_roundtrip() {
         ceiling: None,
     };
 
-    let minted = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let minted = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1311,7 +1317,7 @@ async fn full_pipeline_mint_delegate_parse_validate() {
     let caps = vec![
         "messages:write".to_owned(),
         "messages:read".to_owned(),
-        "tool_invoke:assistant".to_owned(),
+        "outlet_call:assistant".to_owned(),
     ];
 
     // Creator mints root.
@@ -1331,7 +1337,7 @@ async fn full_pipeline_mint_delegate_parse_validate() {
             ceiling: None,
         },
         &custody_creator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -1362,7 +1368,7 @@ async fn full_pipeline_mint_delegate_parse_validate() {
             ceiling: None,
         },
         &custody_delegator,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .unwrap();
@@ -1434,6 +1440,7 @@ fn in_memory_proof_resolver_returns_stored_token() {
             att: vec![],
             prf: vec![],
             fct: None,
+            nb: None,
         },
         signature: vec![0u8; 64],
         encoded: "test.encoded.token".to_owned(),
@@ -1459,20 +1466,21 @@ async fn validate_ucan_rejects_self_delegation_without_key_scope() {
     // invalid token manually to verify the validation layer independently.
     let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
 
-    let now = scp_primitives::SystemClock.now_secs();
+    let now = scp_clock::SystemClock.now_secs();
     let header = UcanHeader::new();
     let payload = UcanPayload {
         iss: issuer_did.clone(),
         aud: issuer_did.clone(),
         exp: now + 3600,
         nbf: None,
-        nnc: nonce::generate_nonce(&scp_primitives::SystemClock),
+        nnc: nonce::generate_nonce(&scp_clock::SystemClock),
         att: vec![Attenuation {
             with: "scp:ctx:ctx-self/messages:write".to_owned(),
             can: "write".to_owned(),
         }],
         prf: vec![],
         fct: None,
+        nb: None,
     };
     let header_json = serde_json::to_vec(&header).unwrap();
     let payload_json = serde_json::to_vec(&payload).unwrap();
@@ -1542,7 +1550,7 @@ async fn validate_ucan_accepts_self_delegation_with_key_scope() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1608,7 +1616,7 @@ async fn validate_ucan_accepts_matching_key_scope() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1671,7 +1679,7 @@ async fn validate_ucan_rejects_mismatched_key_scope() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1730,7 +1738,7 @@ async fn validate_ucan_skips_key_scope_check_when_absent() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1789,7 +1797,7 @@ async fn validate_ucan_scoped_ucan_cannot_be_exercised_by_wrong_key() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1865,7 +1873,7 @@ async fn validate_ucan_step8_rejects_smuggled_out_of_ceiling_attestation() {
         ceiling: Some(mint_ceiling),
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1906,7 +1914,7 @@ async fn validate_ucan_step8_accepts_multi_attestation_all_in_ceiling() {
     let caps = vec![
         "messages:read".to_owned(),
         "messages:write".to_owned(),
-        "tool_invoke:assistant".to_owned(),
+        "outlet_call:assistant".to_owned(),
     ];
 
     let params = MintParams {
@@ -1924,7 +1932,7 @@ async fn validate_ucan_step8_accepts_multi_attestation_all_in_ceiling() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -1984,7 +1992,7 @@ async fn validate_ucan_ceiling_violation_does_not_consume_nonce() {
         ceiling: Some(mint_ceiling),
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2055,7 +2063,7 @@ async fn evaluate_ucan_does_not_consume_nonce_but_validate_does() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2080,8 +2088,8 @@ async fn evaluate_ucan_does_not_consume_nonce_but_validate_does() {
             &issuer_did,
             "did:dht:z6MkMember",
         );
-        let first = evaluate_ucan(&token, &required_cap, &ctx);
-        let second = evaluate_ucan(&token, &required_cap, &ctx);
+        let first = evaluate_ucan(&token, Some(&required_cap), &ctx);
+        let second = evaluate_ucan(&token, Some(&required_cap), &ctx);
         assert!(
             first.nonce_valid && second.nonce_valid,
             "evaluate_ucan must not consume the nonce: {first:?} {second:?}"
@@ -2159,7 +2167,7 @@ async fn evaluate_ucan_reports_bad_signature() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2186,7 +2194,7 @@ async fn evaluate_ucan_reports_bad_signature() {
         "did:dht:z6MkMember",
     );
 
-    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    let result = evaluate_ucan(&token, Some(&required_cap), &ctx);
     assert_eq!(
         result,
         CapabilityValidation {
@@ -2227,7 +2235,7 @@ async fn evaluate_ucan_reports_out_of_ceiling_attestation() {
         ceiling: Some(mint_ceiling),
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2251,7 +2259,7 @@ async fn evaluate_ucan_reports_out_of_ceiling_attestation() {
         "did:dht:z6MkMember",
     );
 
-    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    let result = evaluate_ucan(&token, Some(&required_cap), &ctx);
     assert_eq!(
         result,
         CapabilityValidation {
@@ -2292,7 +2300,7 @@ async fn evaluate_ucan_reports_revoked_token() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2320,7 +2328,7 @@ async fn evaluate_ucan_reports_revoked_token() {
         "did:dht:z6MkMember",
     );
 
-    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    let result = evaluate_ucan(&token, Some(&required_cap), &ctx);
     assert_eq!(
         result,
         CapabilityValidation {
@@ -2360,7 +2368,7 @@ async fn evaluate_ucan_reports_expired_token() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2389,7 +2397,7 @@ async fn evaluate_ucan_reports_expired_token() {
     // Use zero tolerance so the 2-second expiry is detected.
     ctx.clock_skew_tolerance_secs = 0;
 
-    let result = evaluate_ucan(&token, &required_cap, &ctx);
+    let result = evaluate_ucan(&token, Some(&required_cap), &ctx);
     assert_eq!(
         result,
         CapabilityValidation {
@@ -2446,7 +2454,7 @@ async fn evaluate_ucan_partial_struct_for_ungranted_capability_is_stable() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .unwrap();
 
@@ -2485,8 +2493,8 @@ async fn evaluate_ucan_partial_struct_for_ungranted_capability_is_stable() {
         time_bounds_valid: false,
     };
 
-    let first = evaluate_ucan(&token, &required_cap, &ctx);
-    let second = evaluate_ucan(&token, &required_cap, &ctx);
+    let first = evaluate_ucan(&token, Some(&required_cap), &ctx);
+    let second = evaluate_ucan(&token, Some(&required_cap), &ctx);
 
     assert_eq!(
         first, expected,
@@ -2497,5 +2505,511 @@ async fn evaluate_ucan_partial_struct_for_ungranted_capability_is_stable() {
         first, second,
         "evaluate_ucan must be deterministic / side-effect-free across repeated \
          calls on a mid-pipeline failure: {first:?} {second:?}"
+    );
+}
+
+/// `evaluate_ucan` with `None` (intrinsic-validity diagnostic) on a fully valid
+/// token reports all six fields `true` — identical to the `Some(granted-cap)`
+/// path. `None` simply omits the invoked-capability grant-match; it must NEVER
+/// flip a field that another check would have set.
+#[tokio::test]
+async fn evaluate_ucan_none_capability_valid_token_all_true() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+    let caps = vec!["messages:write".to_owned()];
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-none-valid",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    let ceiling = default_ceiling();
+
+    let ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    // No challenge capability — intrinsic-validity mode.
+    let result = evaluate_ucan(&token, None, &ctx);
+    assert_eq!(
+        result,
+        CapabilityValidation {
+            tokens_valid: true,
+            signatures_valid: true,
+            within_ceiling: true,
+            nonce_valid: true,
+            not_revoked: true,
+            time_bounds_valid: true,
+        },
+        "None (intrinsic) on a valid token must be all-true: {result:?}"
+    );
+}
+
+/// `evaluate_ucan` with `None` still enforces the all-attestation ceiling
+/// (step 8) over the token's OWN `att` set — that check is independent of any
+/// challenge capability. A token whose granted caps exceed the context ceiling
+/// reports `within_ceiling: false` even in intrinsic-validity mode, proving
+/// `None` is fail-closed and does not disable ceiling enforcement.
+#[tokio::test]
+async fn evaluate_ucan_none_capability_out_of_ceiling_reports_false() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+
+    let caps = vec!["messages:write".to_owned(), "role:assign".to_owned()];
+    let mint_ceiling: HashSet<String> = ["messages:write".to_owned(), "role:assign".to_owned()]
+        .into_iter()
+        .collect();
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-none-ceiling",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: Some(mint_ceiling),
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    // Context ceiling permits only messages:write, so the token's role:assign
+    // attestation exceeds it.
+    let ceiling: HashSet<String> = std::iter::once("messages:write".to_owned()).collect();
+
+    let ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    let result = evaluate_ucan(&token, None, &ctx);
+    assert_eq!(
+        result,
+        CapabilityValidation {
+            tokens_valid: true,
+            // signatures_valid is true: grant-match is skipped in None mode, and
+            // every structural check (sig/chain/issuer/aud/key-scope/cat-A/atten)
+            // passes; the divergence is purely the all-att ceiling (step 8).
+            signatures_valid: true,
+            within_ceiling: false,
+            nonce_valid: false,
+            not_revoked: false,
+            time_bounds_valid: false,
+        },
+        "None must still enforce the all-attestation ceiling: {result:?}"
+    );
+}
+
+/// The defining contrast that proves `None` omits the grant-match concern
+/// WITHOUT falsely failing a bool: a token that grants ONLY `messages:read`,
+/// evaluated against a `messages:write` challenge.
+///
+/// - With `Some(messages:write)`: the step-6 invoked-capability grant-match
+///   fails, so `signatures_valid: false` (and every later field false) — the
+///   historical mandatory-capability behavior, UNCHANGED.
+/// - With `None`: grant-match is skipped, so the token's intrinsic validity is
+///   assessed and `signatures_valid: true` (plus all later checks pass) — the
+///   read-only general-validity signal the SDK `evaluate_trust` consumes.
+///
+/// Both calls are on the SAME token and context; only the challenge differs.
+#[tokio::test]
+async fn evaluate_ucan_none_vs_some_for_ungranted_invoked_capability() {
+    let (custody, key_handle, issuer_did, pk_bytes) = setup_identity().await;
+    // Token grants ONLY messages:read.
+    let caps = vec!["messages:read".to_owned()];
+
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_handle,
+        audience_did: "did:dht:z6MkMember",
+        context_id: "ctx-eval-none-vs-some",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: None,
+        signing_key_id: None,
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
+        .await
+        .unwrap();
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    // Ceiling permits messages:read so the ONLY divergence is the ungranted
+    // INVOKED capability under Some, not the ceiling check.
+    let ceiling: HashSet<String> = std::iter::once("messages:read".to_owned()).collect();
+    // Challenge a capability the token does NOT grant.
+    let required_cap = CapabilityUri::new("ctx-eval-none-vs-some", "messages", "write");
+
+    let ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        "did:dht:z6MkMember",
+    );
+
+    // Some(ungranted cap): grant-match fails -> signatures_valid false.
+    let with_some = evaluate_ucan(&token, Some(&required_cap), &ctx);
+    assert_eq!(
+        with_some,
+        CapabilityValidation {
+            tokens_valid: true,
+            signatures_valid: false,
+            within_ceiling: false,
+            nonce_valid: false,
+            not_revoked: false,
+            time_bounds_valid: false,
+        },
+        "Some(ungranted) must fail grant-match (unchanged behavior): {with_some:?}"
+    );
+
+    // None: grant-match skipped -> intrinsic validity all-true.
+    let with_none = evaluate_ucan(&token, None, &ctx);
+    assert_eq!(
+        with_none,
+        CapabilityValidation {
+            tokens_valid: true,
+            signatures_valid: true,
+            within_ceiling: true,
+            nonce_valid: true,
+            not_revoked: true,
+            time_bounds_valid: true,
+        },
+        "None must skip grant-match and report intrinsic validity: {with_none:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §7.3.8 origin_kind materialization — mint -> delegate -> validate round-trips
+//
+// REGRESSION COVERAGE for the reachable authorization defect where the mint
+// set `nb = None` unconditionally on delegated outlet capabilities, producing
+// a token the shipped validator rejects (`OriginKindUnspecified`, rule-4).
+// `build_delegated_caveats` now materializes an explicit `origin_kind` on a
+// delegated OUTLET child (inherited/inferred from the delegated stem family).
+//
+// These sites are OUTLET-INVOCATION gates, so they resolve caveats from each
+// token's own `nb` via `TokenNbCaveatResolver` (matching the FFI outlet-open
+// paths and the cross-context saga re-validation) — the module `build_context`
+// helper uses `NoCaveatResolver`, which would not surface the materialized
+// caveats, so these tests construct the context inline.
+// ---------------------------------------------------------------------------
+
+/// Ceiling admitting both outlet families used by the round-trip tests.
+fn outlet_ceiling() -> HashSet<String> {
+    [
+        "outlet_call:assistant".to_owned(),
+        "outlet_query:reader".to_owned(),
+    ]
+    .into_iter()
+    .collect()
+}
+
+static TOKEN_NB_RESOLVER: TokenNbCaveatResolver = TokenNbCaveatResolver;
+
+/// Mint a single-family outlet ROOT, delegate the same outlet capability to a
+/// subordinate, and validate the delegated token against that outlet cap using
+/// the outlet-invocation caveat resolver. Returns the validation result plus
+/// the materialized `origin_kind` on the delegated token's `nb`.
+async fn mint_delegate_validate_outlet(
+    cap_name: &str,
+    resource: &str,
+    action: &str,
+) -> (
+    Result<(), UcanError>,
+    Option<scp_protocol::context::outlets::OutletKind>,
+) {
+    let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+    let (custody_delegator, key_delegator, delegator_did, pk_delegator) = setup_identity().await;
+    let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+    let ctx_id = "ctx-outlet";
+    let caps = vec![cap_name.to_owned()];
+
+    // Creator mints a single-family outlet root to the delegator.
+    let root_token = mint_ucan(
+        &MintParams {
+            issuer_did: &creator_did,
+            issuer_key: &key_creator,
+            audience_did: &delegator_did,
+            context_id: ctx_id,
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(outlet_ceiling()),
+        },
+        &custody_creator,
+        &scp_clock::SystemClock,
+    )
+    .await
+    .unwrap();
+
+    // A single-family outlet root legitimately carries nb = None (rule 3).
+    assert!(
+        root_token.payload.nb.is_none(),
+        "single-family outlet root must carry nb = None"
+    );
+
+    let root_cid = compute_cid(&root_token);
+
+    // Delegator delegates the SAME outlet capability to the agent.
+    let delegated_token = scp_runtime::crypto::ucan::mint::delegate_ucan(
+        &DelegateParams {
+            parent_token: &root_token,
+            delegator_did: &delegator_did,
+            delegator_key: &key_delegator,
+            delegatee_did: &agent_did,
+            attenuated_capabilities: &[Attenuation {
+                with: format!("scp:ctx:{ctx_id}/{resource}:{action}"),
+                can: action.to_owned(),
+            }],
+            lifetime_secs: 1800,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(outlet_ceiling()),
+        },
+        &custody_delegator,
+        &scp_clock::SystemClock,
+    )
+    .await
+    .unwrap();
+
+    let materialized_kind = delegated_token
+        .payload
+        .nb
+        .as_ref()
+        .and_then(|nb| nb.origin_kind);
+
+    let resolver = InMemoryDidResolver {
+        keys: [
+            (creator_did.clone(), pk_creator),
+            (delegator_did.clone(), pk_delegator),
+        ]
+        .into_iter()
+        .collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let proof_resolver = InMemoryProofResolver {
+        proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let ceiling = outlet_ceiling();
+    let required_cap = CapabilityUri::new(ctx_id, resource, action);
+
+    let mut ctx = ValidationContext {
+        did_resolver: &resolver,
+        nonce_tracker: &mut nonce_tracker,
+        revocation_checker: &revocation_checker,
+        proof_resolver: &proof_resolver,
+        caveat_resolver: &TOKEN_NB_RESOLVER,
+        ceiling: &ceiling,
+        context_creator_did: &creator_did,
+        presenting_agent_did: &agent_did,
+        clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        clock: &SYSTEM_CLOCK,
+    };
+
+    let result = validate_ucan(&delegated_token, &required_cap, &mut ctx);
+    (result, materialized_kind)
+}
+
+#[tokio::test]
+async fn delegated_outlet_call_materializes_action_origin_kind_and_validates() {
+    let (result, kind) =
+        mint_delegate_validate_outlet("outlet_call:assistant", "outlet_call", "assistant").await;
+
+    assert_eq!(
+        kind,
+        Some(scp_protocol::context::outlets::OutletKind::Action),
+        "delegated outlet_call child must materialize origin_kind = Action"
+    );
+    assert!(
+        result.is_ok(),
+        "delegated outlet_call token must PASS validation (was previously \
+         rejected with OriginKindUnspecified): {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn delegated_outlet_query_materializes_query_origin_kind_and_validates() {
+    let (result, kind) =
+        mint_delegate_validate_outlet("outlet_query:reader", "outlet_query", "reader").await;
+
+    assert_eq!(
+        kind,
+        Some(scp_protocol::context::outlets::OutletKind::Query),
+        "delegated outlet_query child must materialize origin_kind = Query"
+    );
+    assert!(
+        result.is_ok(),
+        "delegated outlet_query token must PASS validation: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn hand_built_delegated_outlet_token_with_nb_none_is_still_rejected() {
+    // NEGATIVE: rule-4 is unchanged — an outlet delegation whose child `nb` is
+    // None must still be rejected. We reconstruct the delegated token WITHOUT
+    // the materialized `nb` (simulating the pre-fix mint / a forged token) and
+    // re-sign it so the signature is valid but `nb` is absent.
+    let (custody_creator, key_creator, creator_did, pk_creator) = setup_identity().await;
+    let (custody_delegator, key_delegator, delegator_did, pk_delegator) = setup_identity().await;
+    let (_custody_agent, _key_agent, agent_did, _pk_agent) = setup_identity().await;
+
+    let ctx_id = "ctx-outlet";
+    let caps = vec!["outlet_call:assistant".to_owned()];
+
+    let root_token = mint_ucan(
+        &MintParams {
+            issuer_did: &creator_did,
+            issuer_key: &key_creator,
+            audience_did: &delegator_did,
+            context_id: ctx_id,
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(outlet_ceiling()),
+        },
+        &custody_creator,
+        &scp_clock::SystemClock,
+    )
+    .await
+    .unwrap();
+    let root_cid = compute_cid(&root_token);
+
+    // Build the delegated payload BY HAND with nb = None (the defect shape).
+    let mut proofs = root_token.payload.prf.clone();
+    proofs.push(root_cid.clone());
+    let payload = UcanPayload {
+        iss: delegator_did.clone(),
+        aud: agent_did.clone(),
+        exp: scp_clock::SystemClock.now_secs() + 1800,
+        nbf: None,
+        nnc: nonce::generate_nonce(&scp_clock::SystemClock),
+        att: vec![Attenuation {
+            with: format!("scp:ctx:{ctx_id}/outlet_call:assistant"),
+            can: "assistant".to_owned(),
+        }],
+        prf: proofs,
+        fct: None,
+        nb: None,
+    };
+    let header = UcanHeader::new();
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let sig = custody_delegator
+        .sign(&key_delegator, signing_input.as_bytes())
+        .await
+        .unwrap();
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_bytes());
+    let encoded = format!("{signing_input}.{sig_b64}");
+    let hand_built = UcanToken {
+        header,
+        payload,
+        signature: sig.into_bytes(),
+        encoded,
+    };
+
+    let resolver = InMemoryDidResolver {
+        keys: [
+            (creator_did.clone(), pk_creator),
+            (delegator_did.clone(), pk_delegator),
+        ]
+        .into_iter()
+        .collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+    let proof_resolver = InMemoryProofResolver {
+        proofs: std::collections::HashMap::from([(root_cid, root_token)]),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let ceiling = outlet_ceiling();
+    let required_cap = CapabilityUri::new(ctx_id, "outlet_call", "assistant");
+
+    let mut ctx = ValidationContext {
+        did_resolver: &resolver,
+        nonce_tracker: &mut nonce_tracker,
+        revocation_checker: &revocation_checker,
+        proof_resolver: &proof_resolver,
+        caveat_resolver: &TOKEN_NB_RESOLVER,
+        ceiling: &ceiling,
+        context_creator_did: &creator_did,
+        presenting_agent_did: &agent_did,
+        clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        clock: &SYSTEM_CLOCK,
+    };
+
+    let result = validate_ucan(&hand_built, &required_cap, &mut ctx);
+    assert!(
+        matches!(result, Err(UcanError::CaveatAttenuationViolation(_))),
+        "a delegated outlet token with nb = None must STILL be rejected \
+         (rule-4 unchanged): {result:?}"
     );
 }

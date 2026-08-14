@@ -24,8 +24,8 @@ use scp_core::discovery::{
     ScopeDeregisterParams, ScopeLookupParams, ScopeRegisterParams, ScopeRegisterStatus,
     ScopeRegistry, ScopeTarget, validate_scope_name,
 };
-use scp_identity::document::DidDocument;
-use scp_identity::{DID, DidDht, DidMethod};
+use scp_did::{DID, DidDocument};
+use scp_identity::{DidDht, DidMethod};
 use scp_platform::testing::InMemoryKeyCustody;
 
 // ---------------------------------------------------------------------------
@@ -34,7 +34,7 @@ use scp_platform::testing::InMemoryKeyCustody;
 
 /// Creates an identity via `DidDht::create` and returns the DID document.
 async fn create_test_document(custody: &InMemoryKeyCustody) -> DidDocument {
-    let did_dht = DidDht::new();
+    let did_dht = DidDht::with_client(std::sync::Arc::new(scp_dht::InMemoryDhtClient::new()));
     let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
     let (_identity, doc, _pre_rotation_handle) = did_dht
         .create(custody, &pre_rotation_custody)
@@ -226,7 +226,7 @@ async fn handle_registry_crud() {
         },
         metadata: None,
     };
-    let result = registry.register(&params, &alice_did, &scp_primitives::SystemClock);
+    let result = registry.register(&params, &alice_did, &scp_clock::SystemClock);
     assert_eq!(
         result.status,
         scp_core::discovery::HandleRegisterStatus::Registered
@@ -268,7 +268,7 @@ async fn handle_registry_conflict() {
         },
         metadata: None,
     };
-    registry.register(&params_alice, &alice_did, &scp_primitives::SystemClock);
+    registry.register(&params_alice, &alice_did, &scp_clock::SystemClock);
 
     // Bob tries to register the same handle.
     let params_bob = HandleRegisterParams {
@@ -278,7 +278,7 @@ async fn handle_registry_conflict() {
         },
         metadata: None,
     };
-    let result = registry.register(&params_bob, &bob_did, &scp_primitives::SystemClock);
+    let result = registry.register(&params_bob, &bob_did, &scp_clock::SystemClock);
     assert_eq!(
         result.status,
         scp_core::discovery::HandleRegisterStatus::Conflict
@@ -569,7 +569,7 @@ fn scope_registry_crud() {
         metadata: None,
     };
     let result = registry
-        .register(&params, &admin_did, &scp_primitives::SystemClock)
+        .register(&params, &admin_did, &scp_clock::SystemClock)
         .unwrap();
     assert_eq!(result.status, ScopeRegisterStatus::Registered);
     assert!(result.entry_id.is_some());
@@ -625,7 +625,7 @@ fn scope_registry_isolation_from_handle_registry() {
                 metadata: None,
             },
             &admin_did,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -638,7 +638,7 @@ fn scope_registry_isolation_from_handle_registry() {
             metadata: None,
         },
         &admin_did,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     );
 
     // Both registries have one entry — independent
@@ -683,7 +683,7 @@ fn scope_same_owner_update_is_atomic() {
                 metadata: None,
             },
             &admin_did,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
     assert_eq!(r1.status, ScopeRegisterStatus::Registered);
@@ -700,7 +700,7 @@ fn scope_same_owner_update_is_atomic() {
                 metadata: None,
             },
             &admin_did,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
     assert_eq!(r2.status, ScopeRegisterStatus::Updated);
@@ -731,7 +731,7 @@ fn scope_different_owner_conflict() {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -746,7 +746,7 @@ fn scope_different_owner_conflict() {
                 metadata: None,
             },
             &DID::from("did:dht:zEve"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
     assert_eq!(conflict.status, ScopeRegisterStatus::Conflict);

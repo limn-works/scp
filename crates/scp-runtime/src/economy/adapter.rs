@@ -14,7 +14,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 
 use scp_protocol::economy::types::{Amount, CurrencyCode, PaidActionType};
 
@@ -51,6 +51,27 @@ pub trait PaymentAdapter: Send + Sync {
     /// Returns a [`PaymentAuthorization`] that can later be captured or
     /// voided. The authorization may have an expiry after which it is
     /// automatically voided by the payment rail.
+    ///
+    /// # Idempotency (MUST honor)
+    ///
+    /// A conforming adapter MUST honor [`PaymentMetadata::idempotency_key`]: two
+    /// `authorize` calls carrying the SAME key MUST be deduplicated to a single
+    /// reservation (returning the SAME [`PaymentAuthorization`], not a second
+    /// hold). Exactly-once billing ACROSS A CRASH depends on this — the runtime
+    /// replays a settlement with the identical key after a crash and relies on the
+    /// adapter to collapse the duplicate. An adapter that ignores the key will
+    /// double-authorize (and, after [`capture`](Self::capture), double-bill) on
+    /// the crash-recovery path, which the runtime cannot detect or prevent.
+    ///
+    /// The dedup MUST persist for **at least as long as a crashed node may take
+    /// to recover and re-settle** — recovery timing is unbounded (a node may be
+    /// down arbitrarily long). An adapter with a bounded idempotency-key TTL
+    /// (e.g. a 24h expiry, common on real rails) does NOT satisfy this: a
+    /// recovery re-settle delayed past the TTL is treated as a fresh `authorize`
+    /// and double-bills. Such adapters require the runtime-enforced
+    /// capture-dedup ledger tracked in
+    /// <https://github.com/limn-works/scp/issues/2156>, which makes the runtime
+    /// authoritative (the idempotency key downgraded to defense-in-depth).
     fn authorize(
         &self,
         payer: &DID,
@@ -64,6 +85,18 @@ pub trait PaymentAdapter: Send + Sync {
     ///
     /// Moves funds from payer to payee. Returns a [`PaymentReceipt`] that
     /// serves as a provenance record in the context event log.
+    ///
+    /// # Idempotency (MUST honor)
+    ///
+    /// `capture` carries no idempotency key of its own — capture idempotency
+    /// rides the AUTHORIZATION IDENTITY. A conforming adapter MUST be idempotent
+    /// per authorization: capturing an already-captured [`PaymentAuthorization`]
+    /// MUST NOT move funds a second time — it either returns the same
+    /// [`PaymentReceipt`] or [`PaymentError::AlreadyCaptured`], never a fresh
+    /// charge. Combined with idempotency-key dedup on
+    /// [`authorize`](Self::authorize) (which yields the SAME authorization for a
+    /// replayed key), this is what makes a crash-recovery re-settlement bill
+    /// exactly once. Exactly-once billing across a crash depends on it.
     fn capture(
         &self,
         auth: &PaymentAuthorization,
@@ -671,6 +704,148 @@ impl PaymentAdapter for NoOpPaymentAdapter {
         Ok(RefundConfirmation {
             refund_id: [0u8; 32],
             original_receipt_id: [0u8; 32],
+            refunded_amount: Amount(0),
+            currency: CurrencyCode(*b"USD\0"),
+            adapter_proof: Vec::new(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CountingPaymentAdapter — test-only counting implementation.
+// ---------------------------------------------------------------------------
+
+/// A [`PaymentAdapter`] that counts `capture` and `void` invocations.
+///
+/// Uses shared [`AtomicUsize`](std::sync::atomic::AtomicUsize) counters so
+/// money-ordering and escrow-drain tests can assert whether an escrow was
+/// CAPTURED, VOIDED, or merely HELD. Every other method is an inert success
+/// returning a synthetic value.
+///
+/// Construct with the two counters cloned in, then read the originals after
+/// exercising the code under test:
+///
+/// ```ignore
+/// let captured = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+/// let voided = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+/// let adapter = CountingPaymentAdapter {
+///     captured: std::sync::Arc::clone(&captured),
+///     voided: std::sync::Arc::clone(&voided),
+/// };
+/// // ... drive the escrow path over `adapter` ...
+/// assert_eq!(voided.load(std::sync::atomic::Ordering::SeqCst), 1);
+/// ```
+///
+/// Consumers that only observe one branch can leave the other counter at its
+/// default via `..Default::default()`.
+///
+/// `capture` returns `Ok` (incrementing `captured`); the drain/void path never
+/// calls it, so callers that only exercise voids are unaffected. Selection of
+/// this adapter is by injected reference (`payment_adapter_ref()`), never by
+/// [`adapter_id`](PaymentAdapter::adapter_id) string match, so the id is fixed.
+///
+/// Gated behind `#[cfg(any(test, feature = "testing"))]` to prevent accidental
+/// use in production code.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+pub struct CountingPaymentAdapter {
+    /// Incremented once per [`PaymentAdapter::capture`] call.
+    pub captured: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Incremented once per [`PaymentAdapter::void`] call.
+    pub voided: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+#[allow(clippy::unnecessary_literal_bound, clippy::similar_names)]
+impl PaymentAdapter for CountingPaymentAdapter {
+    fn adapter_id(&self) -> &str {
+        "counting"
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            supported_currencies: vec![CurrencyCode(*b"USD\0")],
+            supports_streaming: false,
+            supports_batch_auth: false,
+            supports_single_step: false,
+            min_amount: None,
+            max_amount: None,
+            typical_settlement_ms: 0,
+            requires_facilitator: false,
+        }
+    }
+
+    async fn authorize(
+        &self,
+        payer: &DID,
+        payee: &DID,
+        amount: Amount,
+        currency: CurrencyCode,
+        _metadata: PaymentMetadata,
+    ) -> Result<PaymentAuthorization, PaymentError> {
+        Ok(PaymentAuthorization {
+            auth_id: [7u8; 32],
+            payer: payer.clone(),
+            payee: payee.clone(),
+            amount,
+            currency,
+            adapter_id: "counting".to_owned(),
+            created_at: 1_000_000,
+            expires_at: 2_000_000,
+            adapter_state: Vec::new(),
+        })
+    }
+
+    async fn capture(&self, auth: &PaymentAuthorization) -> Result<PaymentReceipt, PaymentError> {
+        self.captured
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(PaymentReceipt {
+            receipt_id: [9u8; 32],
+            payer: auth.payer.clone(),
+            payee: auth.payee.clone(),
+            amount: auth.amount,
+            currency: auth.currency,
+            action_type: PaidActionType::OutletCall,
+            context_id: None,
+            adapter_id: "counting".to_owned(),
+            adapter_proof: Vec::new(),
+            timestamp: 1_000_001,
+            // Synthetic test receipt: never appended to the canonical Merkle
+            // log, so it is not anchored (matches `PaymentReceipt`'s unanchored
+            // default; the field lies outside the signed payload).
+            anchored: false,
+            signature: Vec::new(),
+        })
+    }
+
+    async fn void(&self, _auth: &PaymentAuthorization) -> Result<(), PaymentError> {
+        self.voided
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn verify_authorization(&self, _auth: &PaymentAuthorization) -> Result<(), PaymentError> {
+        Ok(())
+    }
+
+    async fn verify(&self, _receipt: &PaymentReceipt) -> Result<VerificationResult, PaymentError> {
+        Ok(VerificationResult {
+            valid: true,
+            adapter_id: "counting".to_owned(),
+            verified_amount: Amount(0),
+            verified_currency: CurrencyCode(*b"USD\0"),
+            verification_timestamp: 1_000_002,
+        })
+    }
+
+    async fn refund(
+        &self,
+        _receipt: &PaymentReceipt,
+        _amount: Option<Amount>,
+    ) -> Result<RefundConfirmation, PaymentError> {
+        Ok(RefundConfirmation {
+            refund_id: [0u8; 32],
+            original_receipt_id: [9u8; 32],
             refunded_amount: Amount(0),
             currency: CurrencyCode(*b"USD\0"),
             adapter_proof: Vec::new(),

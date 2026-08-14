@@ -1,0 +1,21 @@
+---
+name: wasm-1877-roles-verbatim-import-f319ca863
+description: WASM context export/import adopts verbatim ContextRoleState restore (BLACK-CEIL-01 un-suspension fix); signature-gate trust model audit — CLEAN
+metadata:
+  type: project
+---
+
+# WASM #1877 verbatim ContextRoleState import (f319ca863, wasm/1877-slice1-adopt-context-role-state) -- 2026-06-24 -- CLEAN / no findings
+
+Single-file commit (crates/scp-ffi/wasm/src/manager.rs, +420/-239). Carries the shared typed `ContextRoleState` VERBATIM in `WasmContextExportSnapshot` (plus `member_sequence_numbers` sidecar for WASM-local MLS counters); import restores it as-is, byte-matching native `lifecycle_helpers::import_context` (`role_state: export.snapshot.role_state`). Closes BLACK-CEIL-01: old recompute via `system_assign_role` per-member against imported ceiling re-granted a SuspendAccess'd-before-widen member the widened cap (member_has_capability false→true across round-trip).
+
+**Why clean across all 5 audit axes:**
+- **Signature gate upstream of all role_state use.** `import_context` (manager.rs:6744) first line calls `Self::deserialize_and_verify_envelope(data)?` (6745). That fn (6540) does: length-bound → `serde_json::from_slice` → strict version gate (==WASM_EXPORT_VERSION, rejects both newer AND pre-signed older as CTX_2094) → JCS re-canonicalize (6611) → exporter_did==role_state.creator_did (6627, CTX_2093) → empty-sig reject (6643) → `verify_snapshot_signature` `verify_strict` (6651) → optional HMAC. Returns Ok ONLY after verify. Verifying key resolved from creator_did via `resolve_verification_method_key(#active→#agent)` NEVER from envelope (6703). No TOCTOU: snap consumed (6747) and role_state cloned (6823) strictly after. `import_context` is the SOLE production deserialization entry; no path consumes role_state pre-verify.
+- **§5.3.1.1 grammar preserved at TWO layers.** `CapabilityCeiling` has `#[serde(try_from = "CapabilityCeilingRaw")]` (scp-protocol roles.rs:478) → `try_from` (514) runs `validate_entries()` on EVERY deserialize-from-bytes; rejection fails `from_slice` before signature check. PLUS explicit belt `role_state.ceiling().validate_entries()` (manager.rs:6831). Custom("a:b:c") → name()="a:b:c" → validate_custom_ceiling_entry split_once → action="b:c" contains ':' → REJECTED. Test `test_wasm_import_rejects_malformed_ceiling_on_deserialize` splices `{"Custom":"a:b:c"}` into serialized envelope, asserts deserialize-reject CTX_2032 (real boundary test, externally-tagged enum repr correct). `validate_imported_ceiling_strings` deletion is sound — typed path is strictly stronger.
+- **Verbatim-trust matches native, correct boundary.** Recompute was THE bug; signature binds snapshot to creator (exporter==creator + Ed25519). No member_capabilities∩ceiling intersection added (native does none; adding = new divergence). No non-creator-signed path into import.
+- **Un-suspension fix verified live.** Test `import_does_not_un_suspend_capability_widened_after_suspension` exercises full SuspendAccess→ModifyCeiling-widen (set_ceiling-only, eb276450e convergence)→export→import-into-fresh-mgr→assert member still lacks widened cap. Mutation-verified RED with old loop.
+- **Digest sorting drop is safe.** `canonicalize_snapshot_sets` no longer sorts ceiling/members/suspended arrays — embedded role_state self-canonicalizes via `serde_sorted_set`/`serde_sorted_set_map` codecs (serde_util.rs:499 sorts by per-element RFC8785 JCS key on SERIALIZE). Producer & verifier emit byte-identical role_state subtree. No collision (serialization injective over full struct); tampered role_state → different JCS → verify_strict fails. Test `snapshot_digest_changes_when_suspended_capabilities_tampered` (now mutates role_state.restore_capabilities) green.
+
+**Verification:** `cargo test -p scp-ffi-wasm` (host) = 401 passed 0 failed; all 5 load-bearing tests green. `cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown` clean. wasm32 `--target` LIB-TEST compile errors (proptest/zbase32/JsError Display/arg-count) are PRE-EXISTING dev-dep-linkage env issue (conformance runs via `cargo test -p scp-core --test wasm_conformance`), NOT introduced here.
+
+GOTCHA: harness Read serves STALE manager.rs in this worktree — use `git show HEAD:<file>`.

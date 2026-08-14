@@ -341,8 +341,21 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/broadcastSubscribe`` on ``inner``.
-    func broadcastSubscribe(handle: ContextHandle, subscriberDid: String) async throws {
-        try await inner.broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
+    ///
+    /// For a GATED broadcast context, `messagesReadUcanJwt` must carry the
+    /// `messages:read` UCAN JWT issued to `subscriberDid` by the context
+    /// admin/creator (spec §5.14.4); the full UCAN validation pipeline runs on it.
+    /// It is unused for an OPEN context.
+    func broadcastSubscribe(
+        handle: ContextHandle,
+        subscriberDid: String,
+        messagesReadUcanJwt: String? = nil
+    ) async throws {
+        try await inner.broadcastSubscribe(
+            handle: handle,
+            subscriberDid: subscriberDid,
+            messagesReadUcanJwt: messagesReadUcanJwt
+        )
     }
 
     /// Forwards to ``Scp/broadcastSubscriberCount`` on ``inner``.
@@ -414,6 +427,100 @@ public extension SCP {
         try await inner.contextJoin(handle: handle, identity: identity, spendingUcanJwt: spendingUcanJwt)
     }
 
+    /// Forwards to ``Scp/contextJoinFromWelcome`` on ``inner``.
+    ///
+    /// Low-level forwarder returning the raw ``ContextHandle``. Prefer
+    /// ``Context/joinFromWelcome(scp:identity:sealed:reservationId:)``,
+    /// which wraps the handle in a live ``Context`` (mirroring how
+    /// ``Context/create(scp:identity:params:)`` relates to ``contextCreate(identity:params:)``).
+    ///
+    /// The joiner supplies NO loose `params`/`welcomeBytes` (FFI-02 Option A):
+    /// the authoritative genesis params + MLS Welcome travel INSIDE the signed,
+    /// HPKE-sealed ``SealedInvitation`` bundle, which the native core opens and
+    /// authenticates. `sealed.contextId` / `sealed.creatorDid` are UNTRUSTED
+    /// binding hints only — authority derives from the signed bundle.
+    func contextJoinFromWelcome(
+        identity: Identity,
+        sealed: SealedInvitation,
+        reservationId: String
+    ) async throws -> ContextHandle {
+        try await inner.contextJoinFromWelcome(
+            identity: identity,
+            sealed: sealed,
+            reservationId: reservationId
+        )
+    }
+
+    /// Invites a member to an existing context, producing a sealed, signed
+    /// invitation bundle (ADR-049 Phase 2J; FFI-02 Option A). Forwards to
+    /// ``Scp/inviteMember`` on ``inner``.
+    ///
+    /// The creator (or admin) seals the context's genesis params + MLS Welcome
+    /// for the invitee under RFC 9180 HPKE, binding them to the invitee's
+    /// `KeyPackage`. Only a `SingleAdmin` context is supported today: the invite
+    /// is unilateral and returns the native ``InviteMemberOutcome`` enum's
+    /// ``InviteMemberOutcome/sealed(bundle:delivered:)`` case, whose `bundle` is
+    /// the sealed ``SealedInvitation`` — pass it straight to
+    /// ``Context/joinFromWelcome(scp:identity:sealed:reservationId:)`` (no
+    /// re-assembly). A voting-governed context THROWS ``ScpError/Context(msg:code:)``
+    /// (governed-context invitations are not yet implemented).
+    ///
+    /// The invite routes through the actor governance gate, which requires the
+    /// inviter to hold the `governance:propose` capability. A normally-created
+    /// `SingleAdmin` context grants its admin that capability at genesis, so it
+    /// works out of the box; a context with a custom ceiling must grant
+    /// `governance:propose` to the inviter.
+    ///
+    /// ```swift
+    /// let outcome = try await scp.inviteMember(
+    ///     identity: creator,
+    ///     contextId: ctx.contextId,
+    ///     inviteeDid: invitee.did(),
+    ///     inviteeKeyPackage: reservation.keyPackagePublic,
+    ///     relayUrls: []
+    /// )
+    /// // Destructure the native `.sealed` case; `bundle` is directly usable as
+    /// // the join input — no manual re-assembly:
+    /// guard case let .sealed(bundle, _) = outcome else { return }
+    /// let joined = try await joinerScp.contextJoinFromWelcome(
+    ///     identity: invitee,
+    ///     sealed: bundle,
+    ///     reservationId: reservationId
+    /// )
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - identity: The LOCAL inviting ``Identity`` (creator / admin). MUST be
+    ///     locally custodied — the invite is signed under its `#active` key; a
+    ///     DID-only handle fails closed with `"SCP-IDENT-1054"`.
+    ///   - contextId: The context to invite the member into.
+    ///   - inviteeDid: The DID of the member being invited.
+    ///   - inviteeKeyPackage: The invitee's PUBLIC MLS `KeyPackage` bytes (from
+    ///     the invitee's ``reserveKeyPackage(identity:)``).
+    ///   - relayUrls: Relay URLs the runtime may publish the sealed bundle to.
+    /// - Returns: The native ``InviteMemberOutcome`` — the `.sealed` case
+    ///   carrying the sealed `bundle` and the `delivered` flag.
+    /// - Throws: ``ScpError/Identity(msg:code:)`` if the inviter is not locally
+    ///   custodied, or ``ScpError/Context(msg:code:)`` if the supervisor is not
+    ///   initialized, the context is voting-governed (governed-context
+    ///   invitations are not yet implemented), or the runtime invite fails (no
+    ///   live context, unauthorized inviter, invalid `KeyPackage`).
+    func inviteMember(
+        identity: Identity,
+        contextId: String,
+        inviteeDid: String,
+        inviteeKeyPackage: Data,
+        relayUrls: [String]
+    ) async throws -> InviteMemberOutcome {
+        try await inner.inviteMember(
+            identity: identity,
+            contextId: contextId,
+            inviteeDid: inviteeDid,
+            inviteeKeyPackage: inviteeKeyPackage,
+            relayUrls: relayUrls
+        )
+    }
+
     /// Forwards to ``Scp/contextLeave`` on ``inner``.
     func contextLeave(handle: ContextHandle, identity: Identity) async throws {
         try await inner.contextLeave(handle: handle, identity: identity)
@@ -447,6 +554,25 @@ public extension SCP {
     /// Forwards to ``Scp/contextSend`` on ``inner``.
     func contextSend(handle: ContextHandle, identity: Identity, payload: Data, spendingUcanJwt: String?) async throws {
         try await inner.contextSend(handle: handle, identity: identity, payload: payload, spendingUcanJwt: spendingUcanJwt)
+    }
+
+    /// Forwards to ``Scp/appBind`` on ``inner``.
+    ///
+    /// Validates the capability declaration against the context ceiling and
+    /// the actor's role capabilities, then appends a durable `AppBound` event
+    /// (tag 74) to the event log (spec §8.4.1).
+    ///
+    /// - Returns: A JSON summary string with `app_did` and `granted_capabilities`.
+    func contextAppBind(handle: ContextHandle, declarationJson: String, actorDid: String, timestampSecs: UInt64) async throws -> String {
+        try await inner.appBind(handle: handle, declarationJson: declarationJson, actorDid: actorDid, timestampSecs: timestampSecs)
+    }
+
+    /// Forwards to ``Scp/appUnbind`` on ``inner``.
+    ///
+    /// Removes the app binding and appends a durable `AppUnbound` event
+    /// (tag 75) to the event log (spec §8.4.2).
+    func contextAppUnbind(handle: ContextHandle, appDid: String, actorDid: String, timestampSecs: UInt64) async throws {
+        try await inner.appUnbind(handle: handle, appDid: appDid, actorDid: actorDid, timestampSecs: timestampSecs)
     }
 
     /// Reconnects `identity`'s contexts after an offline period, running the
@@ -626,7 +752,7 @@ public extension SCP {
     ///
     /// `testingSeed` is a testing-only parameter for the ADR-046
     /// cross-bridge parity harness; pass `nil` from production callers
-    /// (the `allow_in_memory_custody` in-memory path uses OS RNG when
+    /// (the `testing` in-memory path uses OS RNG when
     /// `testingSeed` is `nil`). A non-`nil` `testingSeed` is only valid
     /// for `custody == "in_memory"`; other custody types reject it with
     /// `SCP-VALID-7009`.
@@ -737,12 +863,12 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/mcpClientInvoke`` on ``inner``.
-    func mcpClientInvoke(handle: String, toolName: String, inputJson: String, contextId: String, invokerDid: String) async throws -> McpInvokeResult {
-        try await inner.mcpClientInvoke(handle: handle, toolName: toolName, inputJson: inputJson, contextId: contextId, invokerDid: invokerDid)
+    func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String) async throws -> McpInvokeResult {
+        try await inner.mcpClientInvoke(handle: handle, outletName: outletName, inputJson: inputJson, contextId: contextId, invokerDid: invokerDid)
     }
 
     /// Forwards to ``Scp/mcpClientListTools`` on ``inner``.
-    func mcpClientListTools(handle: String) async throws -> [McpToolInfo] {
+    func mcpClientListTools(handle: String) async throws -> [McpOutletInfo] {
         try await inner.mcpClientListTools(handle: handle)
     }
 
@@ -877,6 +1003,56 @@ public extension SCP {
     /// Forwards to ``Scp/relayStartLocal`` on ``inner``.
     func relayStartLocal(dataDir: String) async throws -> RelayHandle {
         try await inner.relayStartLocal(dataDir: dataDir)
+    }
+
+    /// Reserves a pooled MLS `KeyPackage` under the joiner's own identity for a
+    /// spawn-from-Welcome join (ADR-049 Phase 2J).
+    ///
+    /// The join-side peer of ``Context/create(scp:identity:params:)``: a node
+    /// that intends to JOIN by receiving a Welcome first reserves a single-use
+    /// `KeyPackage` under its OWN identity. Only the PUBLIC
+    /// ``ReservedKeyPackage/keyPackagePublic`` bytes cross the FFI boundary —
+    /// the joiner's private signer state never leaves the native core. Hand
+    /// those public bytes to the context creator (out of band); the creator
+    /// seals a signed invitation bundle addressed to this reservation via
+    /// ``inviteMember(identity:contextId:inviteeDid:inviteeKeyPackage:relayUrls:)``,
+    /// then you pass ``ReservedKeyPackage/reservationId`` and the
+    /// ``SealedInvitation`` to
+    /// ``Context/joinFromWelcome(scp:identity:sealed:reservationId:)``.
+    ///
+    /// The canonical reserve → invite → join happy path:
+    ///
+    /// ```swift
+    /// // Joiner reserves a single-use KeyPackage under its own identity.
+    /// let reservation = try await scp.reserveKeyPackage(identity: joiner)
+    ///
+    /// // Hand `reservation.keyPackagePublic` to the creator out of band. The
+    /// // creator seals a signed invitation bundle for it via `inviteMember`,
+    /// // then destructures the native `.sealed` outcome to recover the
+    /// // `SealedInvitation` and hands it back:
+    /// guard case let .sealed(bundle, _) = outcome else { return }
+    ///
+    /// // Joiner opens the sealed bundle and stands up a send-capable context.
+    /// let ctx = try await Context.joinFromWelcome(
+    ///     scp: scp,
+    ///     identity: joiner,
+    ///     sealed: bundle,
+    ///     reservationId: reservation.reservationId
+    /// )
+    /// ```
+    ///
+    /// - Parameter identity: The joiner's own ``Identity``. MUST be a
+    ///   locally-custodied identity holding retained key material (the same
+    ///   trust model as ``Context/create(scp:identity:params:)``); a DID-only
+    ///   handle from ``identityLoad(did:)`` fails closed with
+    ///   ``ScpError/Identity(msg:code:)`` code `"SCP-IDENT-1054"`. Rejected with
+    ///   `"SCP-PERM-3030"` if it was not minted by this ``SCP`` instance.
+    /// - Returns: The opaque ``ReservedKeyPackage`` — the `reservationId` lookup
+    ///   key plus the PUBLIC `keyPackagePublic` MLS `KeyPackage` bytes.
+    /// - Throws: ``ScpError/Identity(msg:code:)`` if the identity is not locally
+    ///   custodied, or ``ScpError/Context(msg:code:)`` if the reservation fails.
+    func reserveKeyPackage(identity: Identity) async throws -> ReservedKeyPackage {
+        try await inner.reserveKeyPackage(identity: identity)
     }
 
     /// Forwards to ``Scp/restoreAllContexts`` on ``inner``.
@@ -1019,54 +1195,112 @@ public extension SCP {
         try await inner.tombstoneMigratedContext(handle: handle)
     }
 
-    /// Forwards to ``Scp/toolInterfaceAccept`` on ``inner``.
-    func toolInterfaceAccept(handle: ContextHandle, interfaceJson: String) async throws -> String {
-        try await inner.toolInterfaceAccept(handle: handle, interfaceJson: interfaceJson)
+    /// Forwards to ``Scp/outletInterfaceAccept`` on ``inner``.
+    func outletInterfaceAccept(handle: ContextHandle, interfaceJson: String) async throws -> String {
+        try await inner.outletInterfaceAccept(handle: handle, interfaceJson: interfaceJson)
     }
 
-    /// Forwards to ``Scp/toolInterfaceExpose`` on ``inner``.
-    func toolInterfaceExpose(handle: ContextHandle, toolId: String, targetContextId: String, rateLimitJson: String?) async throws -> String {
-        try await inner.toolInterfaceExpose(handle: handle, toolId: toolId, targetContextId: targetContextId, rateLimitJson: rateLimitJson)
+    /// Forwards to ``Scp/outletInterfaceExpose`` on ``inner``.
+    func outletInterfaceExpose(handle: ContextHandle, outletId: String, targetContextId: String, rateLimitJson: String?) async throws -> String {
+        try await inner.outletInterfaceExpose(handle: handle, outletId: outletId, targetContextId: targetContextId, rateLimitJson: rateLimitJson)
     }
 
-    /// Forwards to ``Scp/toolInterfaceRevoke`` on ``inner``.
-    func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws -> String {
-        try await inner.toolInterfaceRevoke(handle: handle, interfaceIdHex: interfaceIdHex)
+    /// Forwards to ``Scp/outletInterfaceRevoke`` on ``inner``.
+    func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws -> String {
+        try await inner.outletInterfaceRevoke(handle: handle, interfaceIdHex: interfaceIdHex)
     }
 
-    /// Forwards to ``Scp/toolInvoke`` on ``inner``.
-    func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?) async throws -> String {
-        try await inner.toolInvoke(handle: handle, toolId: toolId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens, spendingUcanJwt: spendingUcanJwt)
+    /// Forwards to ``Scp/outletInvoke`` on ``inner``.
+    func outletInvoke(handle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?) async throws -> String {
+        try await inner.outletInvoke(handle: handle, outletId: outletId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens, spendingUcanJwt: spendingUcanJwt)
     }
 
-    /// Forwards to ``Scp/toolInvokeCrossContext`` on ``inner``.
-    func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?) async throws -> String {
-        try await inner.toolInvokeCrossContext(sourceHandle: sourceHandle, targetHandle: targetHandle, toolId: toolId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, chainDepth: chainDepth, proofTokens: proofTokens)
+    /// Forwards to ``Scp/outletInvokeCrossContext`` on ``inner``.
+    func outletInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?) async throws -> String {
+        try await inner.outletInvokeCrossContext(sourceHandle: sourceHandle, targetHandle: targetHandle, outletId: outletId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, chainDepth: chainDepth, proofTokens: proofTokens)
     }
 
-    /// Forwards to ``Scp/toolRegister`` on ``inner``.
-    func toolRegister(handle: ContextHandle, definition: ToolDefinition) async throws -> String {
-        try await inner.toolRegister(handle: handle, definition: definition)
+    // swiftlint:disable function_parameter_count
+    /// Forwards to ``Scp/outletInvokeCrossContextSaga`` on ``inner``.
+    func outletInvokeCrossContextSaga(sourceHandle: ContextHandle, targetHandle: ContextHandle, callerDid: String, outletRegistrationId: String, inputJson: String, assertedNonceHex: String, timestampMs: UInt64, chainDepth: UInt8, ucanProofId: String?) async throws -> SagaResult {
+        try await inner.outletInvokeCrossContextSaga(sourceHandle: sourceHandle, targetHandle: targetHandle, callerDid: callerDid, outletRegistrationId: outletRegistrationId, inputJson: inputJson, assertedNonceHex: assertedNonceHex, timestampMs: timestampMs, chainDepth: chainDepth, ucanProofId: ucanProofId)
     }
 
-    /// Forwards to ``Scp/toolSessionClose`` on ``inner``.
-    func toolSessionClose(handle: ContextHandle, sessionId: String) async throws {
-        try await inner.toolSessionClose(handle: handle, sessionId: sessionId)
+    // swiftlint:enable function_parameter_count
+
+    // swiftlint:disable function_parameter_count
+    /// Forwards to ``Scp/outletStreamingSagaOpen`` on ``inner`` (§6.2.4 / §5.4.5
+    /// cross-context streaming saga, SCP-OUT-047). Returns the durable `sagaId`
+    /// promptly at the Commit-transition.
+    func outletStreamingSagaOpen(
+        sourceHandle: ContextHandle,
+        targetHandle: ContextHandle,
+        callerDid: String,
+        outletRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: UInt64,
+        chainDepth: UInt8,
+        ucanToken: String,
+        proofTokens: [String]?,
+        ucanProofId: String?,
+        timeoutMs: UInt32?,
+        estimatedChunkCount: UInt32?
+    ) async throws -> String {
+        try await inner.outletStreamingSagaOpen(
+            sourceHandle: sourceHandle,
+            targetHandle: targetHandle,
+            callerDid: callerDid,
+            outletRegistrationId: outletRegistrationId,
+            inputJson: inputJson,
+            assertedNonceHex: assertedNonceHex,
+            timestampMs: timestampMs,
+            chainDepth: chainDepth,
+            ucanToken: ucanToken,
+            proofTokens: proofTokens,
+            ucanProofId: ucanProofId,
+            timeoutMs: timeoutMs,
+            estimatedChunkCount: estimatedChunkCount
+        )
     }
 
-    /// Forwards to ``Scp/toolSessionCreate`` on ``inner``.
-    func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64?) async throws -> String {
-        try await inner.toolSessionCreate(handle: handle, toolId: toolId, sourceContextId: sourceContextId, ttlSeconds: ttlSeconds)
+    // swiftlint:enable function_parameter_count
+
+    /// Forwards to ``Scp/outletStreamingSagaPollNext`` on ``inner``. Returns the
+    /// JSON-serialized `OutletStreamChunk` bytes, or `nil` at the terminal.
+    func outletStreamingSagaPollNext(sagaId: String) async throws -> Data? {
+        try await inner.outletStreamingSagaPollNext(sagaId: sagaId)
     }
 
-    /// Forwards to ``Scp/toolSessionInvoke`` on ``inner``.
-    func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?) async throws -> String {
-        try await inner.toolSessionInvoke(handle: handle, sessionId: sessionId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens)
+    /// Forwards to ``Scp/outletStreamingSagaRecoverTruncatedClose`` on ``inner``.
+    /// Seals a witness-absent durable prefix and resolves the saga `Committed`.
+    func outletStreamingSagaRecoverTruncatedClose(sagaId: String, callerDid: String) async throws {
+        try await inner.outletStreamingSagaRecoverTruncatedClose(sagaId: sagaId, callerDid: callerDid)
     }
 
-    /// Forwards to ``Scp/toolVerify`` on ``inner``.
-    func toolVerify(handle: ContextHandle, toolId: String) async throws -> ToolVerificationResult {
-        try await inner.toolVerify(handle: handle, toolId: toolId)
+    /// Forwards to ``Scp/outletRegister`` on ``inner``.
+    func outletRegister(handle: ContextHandle, definition: OutletDefinition) async throws -> String {
+        try await inner.outletRegister(handle: handle, definition: definition)
+    }
+
+    /// Forwards to ``Scp/outletSessionClose`` on ``inner``.
+    func outletSessionClose(handle: ContextHandle, sessionId: String) async throws {
+        try await inner.outletSessionClose(handle: handle, sessionId: sessionId)
+    }
+
+    /// Forwards to ``Scp/outletSessionCreate`` on ``inner``.
+    func outletSessionCreate(handle: ContextHandle, outletId: String, sourceContextId: String, ttlSeconds: UInt64?) async throws -> String {
+        try await inner.outletSessionCreate(handle: handle, outletId: outletId, sourceContextId: sourceContextId, ttlSeconds: ttlSeconds)
+    }
+
+    /// Forwards to ``Scp/outletSessionInvoke`` on ``inner``.
+    func outletSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?) async throws -> String {
+        try await inner.outletSessionInvoke(handle: handle, sessionId: sessionId, inputJson: inputJson, identity: identity, ucanToken: ucanToken, proofTokens: proofTokens)
+    }
+
+    /// Forwards to ``Scp/outletVerify`` on ``inner``.
+    func outletVerify(handle: ContextHandle, outletId: String) async throws -> OutletVerificationResult {
+        try await inner.outletVerify(handle: handle, outletId: outletId)
     }
 
     /// Forwards to ``Scp/transportConnect`` on ``inner``.
@@ -1116,12 +1350,25 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/ucanValidate`` on ``inner``.
-    func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?) async throws {
+    ///
+    /// `presentingAgentDid` is REQUIRED: the bridge fails closed on an absent
+    /// presenter rather than defaulting to the token's own `aud` (which would
+    /// make the audience check the tautology `aud == aud` and inflate trust).
+    func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String, proofTokens: [String]?) async throws {
         try await inner.ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 
-    // `verifyParticipationRequirements` moved to a UniFFI-generated free
-    // top-level function under ADR-048 §1 + §7 Swift bullet. Call it
-    // directly:
-    //   `try verifyParticipationRequirements(profileJson:requirementsJson:)`
+    // `verifyParticipationRequirements` and `checkCapabilityRequirements` are
+    // UniFFI-generated free top-level functions (ADR-048 §1 + §7 Swift bullet,
+    // §7.3.2.1 / §7.3.4.4, SCP-ACR-008). The SDK also exposes typed free-function
+    // overloads in `Trust.swift` (ADR-058) that take typed `RequireParticipation`
+    // / `ParticipationProfile` / `CapabilityRequirement` / `ChallengeVerification`
+    // values and serialize them to the serde wire shape internally — prefer those
+    // over hand-rolled JSON:
+    //   `try verifyParticipationRequirements(expectedSubject:requirements:profiles:)`
+    //   `try checkCapabilityRequirements(contextId:subjectDid:requirements:agentCapabilities:challengeVerifications:)`
+    // (`expectedSubject` — and `subjectDid`/`contextId` — bind the accounting to
+    // the agent/context being admitted; a genuine profile/result minted for
+    // another subject/context cannot admit this agent). See those wrappers'
+    // doc-comments for the full authenticity-is-not-authorization caveat.
 }

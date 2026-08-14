@@ -29,7 +29,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::{
@@ -39,7 +39,7 @@ use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
 use scp_runtime::context::supervisor::{MessageSigner, Supervisor};
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 // ---------------------------------------------------------------------------
 // Mock providers (same pattern as governance_integration.rs)
@@ -58,21 +58,26 @@ impl MockTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for MockTransport {
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn send_message(&self, _id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        _id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
         Ok(())
     }
 }
@@ -80,11 +85,12 @@ impl ContextTransportProvider for MockTransport {
 #[derive(Default)]
 struct MockEventLog;
 
+#[async_trait::async_trait]
 impl ContextEventLogProvider for MockEventLog {
-    fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(
+    async fn append_event(
         &self,
         _id: &[u8; 32],
         _event: scp_event_log::EventType,
@@ -94,7 +100,7 @@ impl ContextEventLogProvider for MockEventLog {
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 }
@@ -113,7 +119,7 @@ fn did_to_seed(did: &DID) -> [u8; 32] {
 }
 
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|did, _kid: scp_did::SigningKeyId| {
         let seed = did_to_seed(did);
         Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
     })
@@ -148,8 +154,9 @@ fn new_manager() -> std::sync::Arc<Supervisor> {
     // ADR-049 commit 12 — `ContextManager` is gone; tests construct a
     // `Supervisor` directly via `test_supervisor`.
     scp_runtime::context::test_supervisor(
-        Arc::new(MlsCryptoProvider::new(
+        Arc::new(NodeMlsFactory::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
@@ -161,12 +168,12 @@ fn new_manager() -> std::sync::Arc<Supervisor> {
 /// plus `MemberBan` which is required for content access revocation.
 fn governance_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
         Capability::MemberBan,
     ]
 }

@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
 use scp_protocol::sync::{
     ContextId, Ed25519Signature, EquivocationAlert, SyncError, SyncEvent, SyncOutcome, SyncPolicy,
@@ -133,8 +133,8 @@ pub struct ContextSnapshot {
     /// copy and fetch the full params only if they differ.
     pub params_hash: [u8; 32],
 
-    /// Tool registrations active at snapshot time.
-    pub tool_names: Vec<String>,
+    /// Outlet registrations active at snapshot time.
+    pub outlet_names: Vec<String>,
 
     /// DID of the snapshot creator (for verification).
     pub creator_did: DID,
@@ -152,10 +152,10 @@ impl ContextSnapshot {
     ///
     /// Field order per §23.16.4: `context_id`, `timestamp`, `mls_epoch` (with
     /// presence flag), `event_log_merkle_root`, `event_count`, `members_hash`,
-    /// `role_definitions_hash`, `params_hash`, `tool_names_hash`, `creator_did`,
+    /// `role_definitions_hash`, `params_hash`, `outlet_names_hash`, `creator_did`,
     /// `sequence`.
     ///
-    /// Composite fields (`members`, `role_definitions`, `tool_names`) are first
+    /// Composite fields (`members`, `role_definitions`, `outlet_names`) are first
     /// hashed deterministically, then included as `Fixed32` fields.
     /// Domain separator: `"SCP-CONTEXT-SNAPSHOT-V1:"`.
     ///
@@ -168,7 +168,7 @@ impl ContextSnapshot {
     ) -> Result<[u8; 32], scp_protocol::crypto::canonical::CanonicalError> {
         let members_hash = self.hash_members();
         let role_defs_hash = self.hash_role_definitions();
-        let tool_names_hash = self.hash_tool_names();
+        let outlet_names_hash = self.hash_outlet_names();
 
         let mut fields: Vec<CanonicalField<'_>> = Vec::with_capacity(12);
         fields.push(CanonicalField::VarBytes(self.context_id.as_bytes()));
@@ -188,7 +188,7 @@ impl ContextSnapshot {
         fields.push(CanonicalField::Fixed32(&members_hash));
         fields.push(CanonicalField::Fixed32(&role_defs_hash));
         fields.push(CanonicalField::Fixed32(&self.params_hash));
-        fields.push(CanonicalField::Fixed32(&tool_names_hash));
+        fields.push(CanonicalField::Fixed32(&outlet_names_hash));
         fields.push(CanonicalField::VarBytes(self.creator_did.as_bytes()));
         fields.push(CanonicalField::U64(self.sequence));
 
@@ -239,15 +239,15 @@ impl ContextSnapshot {
         hasher.finalize().into()
     }
 
-    /// Deterministic hash of `tool_names` array.
+    /// Deterministic hash of `outlet_names` array.
     ///
     /// `BE32(count) || [BE32(len(name)) || name ...]`
-    fn hash_tool_names(&self) -> [u8; 32] {
+    fn hash_outlet_names(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
         #[allow(clippy::cast_possible_truncation)]
-        let count = self.tool_names.len() as u32;
+        let count = self.outlet_names.len() as u32;
         hasher.update(count.to_be_bytes());
-        for name in &self.tool_names {
+        for name in &self.outlet_names {
             #[allow(clippy::cast_possible_truncation)]
             let name_len = name.len() as u32;
             hasher.update(name_len.to_be_bytes());
@@ -319,11 +319,11 @@ pub struct SnapshotDelta {
     /// Role definitions that were removed.
     pub removed_role_definitions: Vec<String>,
 
-    /// Tools that were added.
-    pub added_tools: Vec<String>,
+    /// Outlets that were added.
+    pub added_outlets: Vec<String>,
 
-    /// Tools that were removed.
-    pub removed_tools: Vec<String>,
+    /// Outlets that were removed.
+    pub removed_outlets: Vec<String>,
 
     /// Whether context parameters changed (params hash differs).
     pub params_changed: bool,
@@ -636,16 +636,16 @@ pub fn compute_delta(
         }
     }
 
-    // Tool changes
-    let old_tools: HashSet<&str> = old.tool_names.iter().map(String::as_str).collect();
-    let new_tools: HashSet<&str> = new.tool_names.iter().map(String::as_str).collect();
+    // Outlet changes
+    let old_outlets: HashSet<&str> = old.outlet_names.iter().map(String::as_str).collect();
+    let new_outlets: HashSet<&str> = new.outlet_names.iter().map(String::as_str).collect();
 
-    let added_tools: Vec<String> = new_tools
-        .difference(&old_tools)
+    let added_outlets: Vec<String> = new_outlets
+        .difference(&old_outlets)
         .map(|s| (*s).to_owned())
         .collect();
-    let removed_tools: Vec<String> = old_tools
-        .difference(&new_tools)
+    let removed_outlets: Vec<String> = old_outlets
+        .difference(&new_outlets)
         .map(|s| (*s).to_owned())
         .collect();
 
@@ -664,8 +664,8 @@ pub fn compute_delta(
         membership_changes,
         role_definition_changes,
         removed_role_definitions,
-        added_tools,
-        removed_tools,
+        added_outlets,
+        removed_outlets,
         params_changed,
         events_added,
         old_merkle_root: old.event_log_merkle_root,
@@ -681,7 +681,7 @@ pub fn compute_delta(
 /// updated state.
 ///
 /// This function mutates the local snapshot in-place, applying membership
-/// changes, role definition updates, tool changes, and advancing the event
+/// changes, role definition updates, outlet changes, and advancing the event
 /// log state. MLS epoch is advanced but actual MLS group rebuild is the
 /// caller's responsibility (see [`determine_mls_recovery`]).
 ///
@@ -739,16 +739,16 @@ pub fn apply_delta(
         local_state.role_definitions.remove(name);
     }
 
-    // Apply tool changes
-    let mut tools: HashSet<String> = local_state.tool_names.drain(..).collect();
-    for name in &delta.added_tools {
-        tools.insert(name.clone());
+    // Apply outlet changes
+    let mut outlets: HashSet<String> = local_state.outlet_names.drain(..).collect();
+    for name in &delta.added_outlets {
+        outlets.insert(name.clone());
     }
-    for name in &delta.removed_tools {
-        tools.remove(name);
+    for name in &delta.removed_outlets {
+        outlets.remove(name);
     }
-    local_state.tool_names = tools.into_iter().collect();
-    local_state.tool_names.sort();
+    local_state.outlet_names = outlets.into_iter().collect();
+    local_state.outlet_names.sort();
 
     // Advance event log state
     local_state.event_count = local_state.event_count.saturating_add(delta.events_added);
@@ -1110,7 +1110,7 @@ mod tests {
             members: members_map,
             role_definitions: BTreeMap::new(),
             params_hash: [0u8; 32],
-            tool_names: Vec::new(),
+            outlet_names: Vec::new(),
             creator_did: DID::from("did:dht:z6MkCreator"),
             signature: vec![0u8; 64],
             sequence,
@@ -1154,8 +1154,8 @@ mod tests {
         assert!(delta.membership_changes.is_empty());
         assert!(delta.role_definition_changes.is_empty());
         assert!(delta.removed_role_definitions.is_empty());
-        assert!(delta.added_tools.is_empty());
-        assert!(delta.removed_tools.is_empty());
+        assert!(delta.added_outlets.is_empty());
+        assert!(delta.removed_outlets.is_empty());
         assert!(!delta.params_changed);
         assert_eq!(delta.events_added, 0);
         assert_eq!(delta.from_sequence, 1);
@@ -1276,17 +1276,17 @@ mod tests {
     }
 
     #[test]
-    fn compute_delta_tool_changes() {
+    fn compute_delta_outlet_changes() {
         let mut old = make_snapshot("ctx-1", 1, Some(10), 100, [1u8; 32], vec![]);
-        old.tool_names = vec!["search".to_owned(), "translate".to_owned()];
+        old.outlet_names = vec!["search".to_owned(), "translate".to_owned()];
 
         let mut new = make_snapshot("ctx-1", 2, Some(15), 150, [2u8; 32], vec![]);
-        new.tool_names = vec!["search".to_owned(), "summarize".to_owned()];
+        new.outlet_names = vec!["search".to_owned(), "summarize".to_owned()];
 
         let delta = compute_delta(&old, &new).unwrap();
 
-        assert_eq!(delta.added_tools, vec!["summarize"]);
-        assert_eq!(delta.removed_tools, vec!["translate"]);
+        assert_eq!(delta.added_outlets, vec!["summarize"]);
+        assert_eq!(delta.removed_outlets, vec!["translate"]);
     }
 
     #[test]
@@ -1316,7 +1316,7 @@ mod tests {
             vec![
                 "messages:read".to_owned(),
                 "messages:write".to_owned(),
-                "tool:invoke".to_owned(),
+                "outlet:call".to_owned(),
             ],
         );
         // "viewer" removed, "moderator" added
@@ -1380,8 +1380,8 @@ mod tests {
             membership_changes: vec![],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec![],
-            removed_tools: vec![],
+            added_outlets: vec![],
+            removed_outlets: vec![],
             params_changed: false,
             events_added: 50,
             old_merkle_root: [1u8; 32],
@@ -1405,8 +1405,8 @@ mod tests {
             membership_changes: vec![],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec![],
-            removed_tools: vec![],
+            added_outlets: vec![],
+            removed_outlets: vec![],
             params_changed: false,
             events_added: 50,
             old_merkle_root: [1u8; 32],
@@ -1421,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_delta_removes_member_and_tools() {
+    fn apply_delta_removes_member_and_outlets() {
         let mut local = make_snapshot(
             "ctx-1",
             1,
@@ -1430,7 +1430,7 @@ mod tests {
             [1u8; 32],
             vec![("did:alice", "admin"), ("did:bob", "member")],
         );
-        local.tool_names = vec!["search".to_owned(), "translate".to_owned()];
+        local.outlet_names = vec!["search".to_owned(), "translate".to_owned()];
 
         let delta = SnapshotDelta {
             context_id: "ctx-1".to_owned(),
@@ -1443,8 +1443,8 @@ mod tests {
             }],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec!["summarize".to_owned()],
-            removed_tools: vec!["translate".to_owned()],
+            added_outlets: vec!["summarize".to_owned()],
+            removed_outlets: vec!["translate".to_owned()],
             params_changed: false,
             events_added: 50,
             old_merkle_root: [1u8; 32],
@@ -1455,9 +1455,9 @@ mod tests {
 
         assert_eq!(local.members.len(), 1);
         assert!(!local.members.contains_key("did:bob"));
-        assert!(local.tool_names.contains(&"search".to_owned()));
-        assert!(local.tool_names.contains(&"summarize".to_owned()));
-        assert!(!local.tool_names.contains(&"translate".to_owned()));
+        assert!(local.outlet_names.contains(&"search".to_owned()));
+        assert!(local.outlet_names.contains(&"summarize".to_owned()));
+        assert!(!local.outlet_names.contains(&"translate".to_owned()));
     }
 
     // -----------------------------------------------------------------------
@@ -1475,8 +1475,8 @@ mod tests {
             membership_changes: vec![],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec![],
-            removed_tools: vec![],
+            added_outlets: vec![],
+            removed_outlets: vec![],
             params_changed: false,
             events_added: 0,
             old_merkle_root: [0u8; 32],
@@ -1500,8 +1500,8 @@ mod tests {
             membership_changes: vec![],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec![],
-            removed_tools: vec![],
+            added_outlets: vec![],
+            removed_outlets: vec![],
             params_changed: false,
             events_added: 50,
             old_merkle_root: [0u8; 32],
@@ -1525,8 +1525,8 @@ mod tests {
             membership_changes: vec![],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec![],
-            removed_tools: vec![],
+            added_outlets: vec![],
+            removed_outlets: vec![],
             params_changed: false,
             events_added: 500,
             old_merkle_root: [0u8; 32],
@@ -1553,8 +1553,8 @@ mod tests {
             membership_changes: vec![],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec![],
-            removed_tools: vec![],
+            added_outlets: vec![],
+            removed_outlets: vec![],
             params_changed: false,
             events_added: 1000,
             old_merkle_root: [0u8; 32],
@@ -1581,8 +1581,8 @@ mod tests {
             membership_changes: vec![],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec![],
-            removed_tools: vec![],
+            added_outlets: vec![],
+            removed_outlets: vec![],
             params_changed: false,
             events_added: 2000,
             old_merkle_root: [0u8; 32],
@@ -1680,8 +1680,8 @@ mod tests {
             ],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec!["new-tool".to_owned()],
-            removed_tools: vec![],
+            added_outlets: vec!["new-outlet".to_owned()],
+            removed_outlets: vec![],
             params_changed: true,
             events_added: 400,
             old_merkle_root: [1u8; 32],
@@ -1865,7 +1865,7 @@ mod tests {
     #[test]
     fn stress_multi_day_epoch_gap_with_role_changes() {
         // Simulate a 5-day offline period: 300 epoch advances, role changes,
-        // tools added/removed, params changed.
+        // outlets added/removed, params changed.
         let mut old = make_snapshot(
             "ctx-days",
             1,
@@ -1878,7 +1878,7 @@ mod tests {
                 ("did:carol", "member"),
             ],
         );
-        old.tool_names = vec!["search".to_owned(), "translate".to_owned()];
+        old.outlet_names = vec!["search".to_owned(), "translate".to_owned()];
         old.role_definitions.insert(
             "moderator".to_owned(),
             vec!["messages:read".to_owned(), "member:block".to_owned()],
@@ -1896,7 +1896,7 @@ mod tests {
                 ("did:dave", "member"), // new
             ],
         );
-        new.tool_names = vec![
+        new.outlet_names = vec![
             "search".to_owned(),
             "summarize".to_owned(),
             "code-review".to_owned(),
@@ -1913,9 +1913,9 @@ mod tests {
         assert!(delta.params_changed);
         assert_eq!(delta.events_added, 6000);
 
-        // Tools: +summarize, +code-review, -translate
-        assert_eq!(delta.added_tools.len(), 2);
-        assert_eq!(delta.removed_tools.len(), 1);
+        // Outlets: +summarize, +code-review, -translate
+        assert_eq!(delta.added_outlets.len(), 2);
+        assert_eq!(delta.removed_outlets.len(), 1);
 
         // Roles: "moderator" removed, "reviewer" added
         assert!(
@@ -1948,8 +1948,8 @@ mod tests {
         );
         assert_eq!(local.event_count, 8000);
         assert_eq!(local.mls_epoch, Some(400));
-        assert!(local.tool_names.contains(&"summarize".to_owned()));
-        assert!(!local.tool_names.contains(&"translate".to_owned()));
+        assert!(local.outlet_names.contains(&"summarize".to_owned()));
+        assert!(!local.outlet_names.contains(&"translate".to_owned()));
         assert!(!local.role_definitions.contains_key("moderator"));
         assert!(local.role_definitions.contains_key("reviewer"));
     }
@@ -2025,8 +2025,8 @@ mod tests {
             })],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec![],
-            removed_tools: vec![],
+            added_outlets: vec![],
+            removed_outlets: vec![],
             params_changed: false,
             events_added: 50,
             old_merkle_root: [1u8; 32],
@@ -2059,8 +2059,8 @@ mod tests {
             ],
             role_definition_changes: BTreeMap::new(),
             removed_role_definitions: vec![],
-            added_tools: vec!["search".to_owned()],
-            removed_tools: vec![],
+            added_outlets: vec!["search".to_owned()],
+            removed_outlets: vec![],
             params_changed: false,
             events_added: 100,
             old_merkle_root: [2u8; 32],
@@ -2076,7 +2076,7 @@ mod tests {
             local.members.get("did:bob").map(|m| m.role_name.as_str()),
             Some("admin"),
         );
-        assert!(local.tool_names.contains(&"search".to_owned()));
+        assert!(local.outlet_names.contains(&"search".to_owned()));
     }
 
     #[test]

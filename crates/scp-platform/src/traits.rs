@@ -402,7 +402,7 @@ pub trait KeyCustody: Send + Sync {
     /// `pseudonym_secret` is a device-local value computed inside the boundary;
     /// hardware pseudonyms are therefore device-local BY DESIGN, not cross-platform
     /// identical. The Rust software backends share this derivation via
-    /// [`crate::pseudonym::derive_pseudonym_keypair`].
+    /// [`scp_crypto::pseudonym::derive_pseudonym_keypair`].
     ///
     /// The returned [`PseudonymKeypair`] is always software-managed (derived
     /// output).
@@ -605,7 +605,7 @@ pub enum PreRotationCustodyError {
 }
 
 /// Discriminator for the six approved §9.7.4.1 §4 custody methods, plus the
-/// bridge-callback and WASM-local variants that route to one of the six.
+/// bridge-callback variant that routes to one of the six.
 ///
 /// Used for diagnostics and SDK UX (e.g., "Your pre-rotation key is on a
 /// hardware token — please tap your `YubiKey`"). MUST NOT be used for security
@@ -639,11 +639,6 @@ pub enum PreRotationCustodyKind {
     /// operational custody, Android Keystore alias with separate
     /// authentication flow, FIDO2/PRF, encrypted backup, etc.).
     Callback,
-    /// WASM in-process retention. **DOCUMENTED degraded mode** — the
-    /// pre-rotation key co-resides in WASM linear memory with operational
-    /// keys (acknowledged in `crates/scp-ffi/wasm/src/identity.rs`). Pending
-    /// passkey-PRF cold storage as a follow-up workstream.
-    WasmLocalRetention,
 }
 
 /// Cold-custody interface for pre-rotation keys (spec §9.7.4.1).

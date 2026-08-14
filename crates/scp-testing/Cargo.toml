@@ -16,10 +16,18 @@ sync = ["scp-platform/sync"]
 combined = ["scp-transport/combined"]
 
 [dependencies]
+async-trait = { workspace = true }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage", "testing"] }
 scp-identity = { path = "../scp-identity", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
-scp-primitives = { path = "../scp-primitives" }
+# NORMAL testing edge (not dev-dep): `helpers.rs` uses `InMemoryDhtClient` /
+# `TestDidDht` at LIB level (this whole crate is a test harness), mirroring its
+# existing normal `scp-platform/testing` edge. `scp-dht/testing` gates the
+# in-memory DHT nullifier; it never appears in a non-testing feature list
+# (ADR-062 §Decision 1).
+scp-dht = { path = "../scp-dht", features = ["testing"] }
+scp-clock = { path = "../scp-clock" }
+scp-did = { path = "../scp-did" }
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }
 scp-transport = { path = "../scp-transport" }
 scp-event-log = { path = "../scp-event-log" }
@@ -39,13 +47,29 @@ rmp-serde = { workspace = true }
 tls_codec = "0.4"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core", features = ["testing"] }
+# The SDK-usability integration test builds relay wire messages directly; the
+# types live in the wasm-safe scp-relay-client leaf (ADR-057 Slice 3, D5).
+scp-relay-client = { path = "../scp-relay-client" }
+# SCP-OUT-039 (C12) — the outlet-streaming conformance tests drive the RAW
+# runtime `open_stream_session` dispatch + `Supervisor::open_outlet_stream`
+# directly (the streaming trackers, `InProcessStreamSigner`, and the dispatch
+# entry are NOT re-exported through the `scp-core` facade — only the bridge
+# control surface is). scp-testing is a publish=false test crate, so a direct
+# dev-dep on the runtime is layering-clean.
+scp-runtime = { path = "../scp-runtime", features = ["testing"] }
+scp-protocol = { path = "../scp-protocol" }
+scp-clock = { path = "../scp-clock" }
 scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-transport = { path = "../scp-transport" }
 scp-ffi-common = { path = "../scp-ffi/common", features = ["resolvers"] }
+# async-trait: the compromise-recovery integration test implements the async
+# `RecoveryBackend` trait (ADR-049 Decision 7) with a mock backend.
+async-trait = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
@@ -80,6 +104,23 @@ axum = { workspace = true, features = ["ws"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 hyper = "1"
+
+[[test]]
+name = "outlet_stream_conformance"
+path = "tests/integration/outlet_stream_conformance.rs"
+
+[[test]]
+name = "outlet_stream_vectors_through_open_path"
+path = "tests/integration/outlet_stream_vectors_through_open_path.rs"
+
+[[test]]
+name = "outlet_caveats_binding_conformance"
+path = "tests/integration/outlet_caveats_binding_conformance.rs"
+
+# SCP-OUT-049 (W10) — cross-context streaming-saga conformance vectors.
+[[test]]
+name = "outlet_streaming_saga_conformance"
+path = "tests/integration/outlet_streaming_saga_conformance.rs"
 
 [[test]]
 name = "harness_meta"
@@ -218,8 +259,8 @@ name = "pipeline_wiring"
 path = "tests/integration/pipeline_wiring.rs"
 
 [[test]]
-name = "tool_economy_wiring"
-path = "tests/integration/tool_economy_wiring.rs"
+name = "outlet_economy_wiring"
+path = "tests/integration/outlet_economy_wiring.rs"
 
 [[test]]
 name = "reconnect_sync"

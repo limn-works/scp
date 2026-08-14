@@ -19,8 +19,9 @@ use std::sync::Arc;
 
 use axum::response::IntoResponse;
 use axum::routing::get;
-use scp_identity::cache::SystemClock;
-use scp_identity::{DidDht, IdentityError, PkarrDhtClient, SequenceStore};
+use scp_clock::SystemClock;
+use scp_dht::PkarrDhtClient;
+use scp_identity::{DidDht, IdentityError, SequenceStore};
 use scp_node::{ApplicationNodeBuilder, TlsProvider};
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;

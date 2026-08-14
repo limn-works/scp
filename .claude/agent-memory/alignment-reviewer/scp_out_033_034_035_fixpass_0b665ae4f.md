@@ -1,0 +1,30 @@
+---
+name: scp-out-033-034-035-fixpass-0b665ae4f
+description: RE-REVIEW of the 033/034/035 fix-pass @ 0b665ae4f (feat/outlet-xctx-streaming-saga, scp-wt-slice3). Prior MEDIUM (unwired wire-rejection) RESOLVED; both prior LOWs closed. Verdict ALIGNED, 1 LOW doc-nit + 1 OBS.
+metadata:
+  type: project
+---
+
+# SCP-OUT-033/034/035 fix-pass @ 0b665ae4f (feat/outlet-xctx-streaming-saga, scp-wt-slice3, 2026-07-14) — ALIGNED; prior MED RESOLVED, both prior LOWs CLOSED; 1 LOW doc-nit + 1 OBS
+
+Round-9 fix-pass on f96079706 (see [scp_out_033_034_035_streaming_runtime_f96079706.md]). Verified each fix spec-faithful vs §5.4.5.
+
+**PRIOR MEDIUM (unwired §5.4.5:566 wire-rejection) — RESOLVED (as to wiring+persistence).** FIX 2: `append_outlet_invoked_verified` moved from MerkleEventLogProvider inherent method → **default method on ContextEventLogProvider trait** (builder.rs:293). Production caller now REAL: `Supervisor::open_outlet_stream` (supervisor.rs:11373-11381) internally wires `ActorOutletInvokedEventSink` (`invoked_event_sink.or(Some(durable_invoked_sink))`) — FFI bridges pass None, internal sink fills it, mirroring ActorStreamSettlementSink. Sink.record → `append_streaming_outlet_invoked_event` (supervisor.rs:2145) → trait `append_outlet_invoked_verified` with Frontier source. Durable §5.4.5 event now PERSISTED in prod (was never persisted before — all 3 bridges None). Prod persistence test `open_outlet_stream_persists_one_invoked_event_035` (supervisor.rs:28563, invoked_event_sink=None like bridges). Prior primary complaint (appender zero prod callers / event unpersisted / commit overclaims) gone.
+
+**RESIDUAL (downgraded MED→LOW, doc-nit):** Frontier-source equality is TAUTOLOGICAL in same-context prod. dispatch.rs:3298-3327: event.chunks_billed=manifest_reference, root=summary.manifest_root, chunk_count=summary.stream_chunk_count; manifest{root:same, billed_count:same manifest_reference, leaf_count:same} — verify_outlet_invoked_event_manifest Frontier arm (stream.rs:1671) compares each event field vs the SAME summary value that populated it → cannot reject in prod. Genuinely-REJECTING §5.4.5:566 manifest re-derivation (count @type=="data" leaves at/below ceiling) lives ONLY in the **Sequence source** (stream.rs:1648, re-hashes leaves) — exercised by tests (event_log.rs:1086 AC22 asserts bad event NOT appended) + future xctx/import. This is INHERENT to ADR-061 same-context payload-drop (frontier keeps O(log n) root+counts, drops chunk Vec; pump is sole author same-context, no independent 2nd source) and preserved off-line per §5.4.5:606 (replay retained chunk sequence). NOT a defect. Only nit: StreamManifestCommitment doc (invoke.rs) claims passing manifest separately avoids "tautological" equality "rather than the event's self-reported fields" — imprecise: same-context both operands still fold from the same `summary`; the de-tautologizer is the Sequence source, not the struct separation. Recommend softening the doc.
+
+**PRIOR LOW (CancelAckTracker doc wrong) — CLOSED.** FIX 5: doc now accurate — Some for Pending + Closed-with-pre-terminal-cancel, None for Active + Closed-without-cancel. Matches code.
+
+**PRIOR LOW (§5.4.5 struct-sketch omits cancel_ack_seq) — CLOSED.** FIX 6: 05-contexts.md:579 sketch now lists `cancel_ack_seq: Option<u64>`. Parity restored.
+
+**FIX 5 spec-fidelity — ALIGNED.** CancelState::Closed{cancel_ack_seq:Option<u64>} (stream.rs:1006). record_terminal preserves pinned value across terminal transition; cancel_ack_seq()/billing_ceiling() return it post-close (was collapsing to None/u64::MAX). Preserves §5.4.5:558-566 ceiling-must-persist. Additive robustness ("future reorder"), no live regression (close-path reads cancel_ack_seq before terminal; event uses summary.cancel_ack_seq captured at cancel). Test `cancel_ack_seq_survives_terminal_transition` covers cancelled+uncancelled.
+
+**FIX 3 test NOTE — ALIGNED.** Rewritten NOTE (stream/dispatch pump_midstream_cancel test) matches §5.4.5:530(3): cancel_ack_seq=5 slot belongs to terminal cancel-ack chunk, gate drops non-terminal seq>=5, sealed manifest Data 0..=4=FIVE, inclusive predicate counts five, chunks_billed==5. Retired the stale "=6 bill SIX" model. Accurate.
+
+**FIX 1 (BLOCKER, bonus verify) — spec-faithful.** TOCTOU: re-reads LIVE ceiling AFTER off-lock signing await, under accrual lock; `!terminal && seq >= billing_ceiling()` ⇒ drop (no accrue/ingest/forward/cursor-bump, `continue`), terminal occupies cancel_ack_seq. §5.4.5:530 (MUST NOT emit Data>cancel-ack; terminal-occupies-slot). `>=` for non-terminal + `<=` accrual are consistent (ceiling slot is non-Data terminal). Deterministic BarrierSigner test `pump_cancel_during_signing_drops_boundary_data_not_billed_round9_f1`.
+
+**FIX 4/7 (PRD hygiene) — OK.** 4: removed false SCP-OUT-037→036 blockedBy (037 same-ctx FFI; resolves done-over-pending). 7: 035 files[] corrected to real outlets/ paths.
+
+**NEW-misalignment scan — none blocking.** Trait refactor sound (default method, all impls updated: CapturingInvokedSink/ChannelInvokedSink/ActorOutletInvokedEventSink; prod resolves to MerkleEventLogProvider::append_event). record() manifest param internal-only, no FFI/marshaling change (correct — no binding regen). OBSERVATION (LOW-ish, durable-records tenet): ActorOutletInvokedEventSink.record is fire-and-forget spawn, warn-on-failure, DECOUPLED from settlement sink — a persist failure loses the §5.4.5 audit OutletInvokedEvent with only tracing::warn (money still moved via separate PaymentReceipt §19.15.5). Strictly better than before (unpersisted), mirrors ActorStreamSettlementSink best-effort posture, and same-ctx append is tautological-pass (only infra faults fail) — but worth future hardening (retry/surface) for audit durability.
+
+VERDICT: ALIGNED. Prior MEDIUM resolved (wire-rejection now LIVE + spec-faithful in the sense that persists+runs at real boundary; the same-context tautology is ADR-061-structural, not a gap). Both prior LOWs closed. Only residual: 1 LOW doc-nit (tautology framing) + 1 OBS (audit-event best-effort durability).

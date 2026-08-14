@@ -36,14 +36,14 @@ use crate::validate;
 fn parse_action_type(s: &str) -> PyResult<scp_core::economy::PaidActionType> {
     match s {
         "MessageSend" | "message_send" => Ok(scp_core::economy::PaidActionType::MessageSend),
-        "ToolInvoke" | "tool_invoke" => Ok(scp_core::economy::PaidActionType::ToolInvoke),
+        "OutletCall" | "outlet_call" => Ok(scp_core::economy::PaidActionType::OutletCall),
         "ContextJoin" | "context_join" => Ok(scp_core::economy::PaidActionType::ContextJoin),
         "SubscriptionPeriod" | "subscription_period" => {
             Ok(scp_core::economy::PaidActionType::SubscriptionPeriod)
         }
         "ByteStored" | "byte_stored" => Ok(scp_core::economy::PaidActionType::ByteStored),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "invalid action type: {s:?} — expected one of: MessageSend, ToolInvoke, \
+            "invalid action type: {s:?} — expected one of: MessageSend, OutletCall, \
              ContextJoin, SubscriptionPeriod, ByteStored"
         ))),
     }
@@ -108,7 +108,7 @@ fn parse_metrics(dict: &Bound<'_, PyDict>) -> PyResult<scp_core::economy::Observ
 ///
 /// * `policy_json` — The context's economic policy as a JSON string. Pass
 ///   empty string or `"null"` for free contexts (returns 0).
-/// * `action_type` — The action type string: `"MessageSend"`, `"ToolInvoke"`,
+/// * `action_type` — The action type string: `"MessageSend"`, `"OutletCall"`,
 ///   `"ContextJoin"`, `"SubscriptionPeriod"`, or `"ByteStored"`.
 /// * `metrics` — Dict with observable metric values: `context_message_rate`,
 ///   `member_count`, `relay_queue_depth`, `time_of_day`, `sender_velocity`,
@@ -267,7 +267,7 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(did)?;
 
-        let member_did = scp_identity::DID::from(did);
+        let member_did = scp_did::DID::from(did);
         let remaining = bi
             .core
             .with_economy_budget(context_id, |tracker| tracker.remaining(&member_did));
@@ -283,7 +283,7 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(did)?;
 
-        let member_did = scp_identity::DID::from(did);
+        let member_did = scp_did::DID::from(did);
         bi.core.with_economy_budget_mut(context_id, |tracker| {
             tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
         });
@@ -307,7 +307,7 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(did)?;
 
-        let member_did = scp_identity::DID::from(did);
+        let member_did = scp_did::DID::from(did);
         bi.core.with_economy_budget_mut(context_id, |tracker| {
             tracker
                 .record_spend(&member_did, scp_core::economy::Amount::new(amount))
@@ -333,7 +333,7 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(sender_did)?;
 
-        let did = scp_identity::DID::from(sender_did);
+        let did = scp_did::DID::from(sender_did);
         bi.core.with_economy_antispam(context_id, |tracker| {
             tracker.record_message(&did, timestamp);
         });
@@ -362,7 +362,7 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(sender_did)?;
 
-        let did = scp_identity::DID::from(sender_did);
+        let did = scp_did::DID::from(sender_did);
         let velocity = bi
             .core
             .with_economy_antispam(context_id, |tracker| tracker.get_velocity(&did, now));
@@ -415,7 +415,7 @@ impl crate::scp::PyScp {
                 .collect(),
         };
 
-        let did = scp_identity::DID::from(sender_did);
+        let did = scp_did::DID::from(sender_did);
         let cost = bi.core.with_economy_antispam(context_id, |tracker| {
             tracker.compute_escalated_cost(
                 &did,
@@ -547,7 +547,8 @@ mod tests {
     fn parse_action_type_all_variants() {
         assert!(parse_action_type("MessageSend").is_ok());
         assert!(parse_action_type("message_send").is_ok());
-        assert!(parse_action_type("ToolInvoke").is_ok());
+        assert!(parse_action_type("OutletCall").is_ok());
+        assert!(parse_action_type("outlet_call").is_ok());
         assert!(parse_action_type("ContextJoin").is_ok());
         assert!(parse_action_type("SubscriptionPeriod").is_ok());
         assert!(parse_action_type("ByteStored").is_ok());
@@ -560,8 +561,8 @@ mod tests {
             "locked": false,
             "cost_schedule": {
                 "currency": [85,83,68,0],
-                "per_message": 10,
-                "per_tool_invoke": null,
+                "per_message": "10",
+                "per_outlet_call": null,
                 "per_join": null,
                 "per_period": null,
                 "per_byte_stored": null

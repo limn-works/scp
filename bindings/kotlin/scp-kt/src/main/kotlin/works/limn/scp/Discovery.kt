@@ -135,7 +135,7 @@ interface DiscoveryBindings {
 
     // Handle registry operations (§22.3.1)
 
-    /** Registers a handle in a context with discovery tools. Returns JSON result. */
+    /** Registers a handle in a context with discovery outlets. Returns JSON result. */
     @Suppress("LongParameterList")
     fun handleRegister(
         discoveryContextId: String,
@@ -146,14 +146,14 @@ interface DiscoveryBindings {
         tags: List<String>?,
     ): String
 
-    /** Looks up a handle in a context with discovery tools. Returns JSON result. */
+    /** Looks up a handle in a context with discovery outlets. Returns JSON result. */
     fun handleLookup(
         discoveryContextId: String,
         handle: String,
         typeFilter: String?,
     ): String
 
-    /** Deregisters a handle from a context with discovery tools. Returns JSON result. */
+    /** Deregisters a handle from a context with discovery outlets. Returns JSON result. */
     fun handleDeregister(
         discoveryContextId: String,
         handle: String,
@@ -406,7 +406,7 @@ class DiscoveryBridge internal constructor(
     // Handle registry operations (§22.3.1)
 
     /**
-     * Registers a handle in a context with discovery tools.
+     * Registers a handle in a context with discovery outlets.
      *
      * @param discoveryContextId ID of the context.
      * @param handle The handle string to register.
@@ -437,7 +437,7 @@ class DiscoveryBridge internal constructor(
         }
 
     /**
-     * Looks up a handle in a context with discovery tools.
+     * Looks up a handle in a context with discovery outlets.
      *
      * @param discoveryContextId ID of the context.
      * @param handle The handle string to look up.
@@ -454,7 +454,7 @@ class DiscoveryBridge internal constructor(
         }
 
     /**
-     * Deregisters a handle from a context with discovery tools.
+     * Deregisters a handle from a context with discovery outlets.
      *
      * @param discoveryContextId ID of the context.
      * @param handle The handle string to deregister.

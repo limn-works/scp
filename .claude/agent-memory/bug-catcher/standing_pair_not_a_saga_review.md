@@ -1,0 +1,18 @@
+# §5.15.8 standing-pair "not-a-saga" v2 review (branch spec/standing-pair-not-a-saga-v2, HEAD 536c6d192)
+
+Docs-only spec rewrite: standing-pair = single-context async MLS creation (was 2PC saga). Length-prefixed
+derived_context_id, 4(a0) Welcome-receipt mismatch guard, collision atomic sequence, observation-free reaper.
+
+## Findings (2 internal contradictions in newly-added honesty prose; algorithm itself sound)
+
+- **MEDIUM — KeyPackage-consumption residual contradicts step-2 consume-at-join (05-contexts.md §5.15.8, line 1882, *Get-or-create idempotency* "Residual (disclosed)").** Claims a `did_hi` self-only re-drive "consumes one of `did_lo`'s published single-use KeyPackages" and "The KeyPackage is consumed at `did_hi`'s own `add_member`/join (step 2)." But step 2 (line 1857) states single-use is enforced at the **invitee's join** (fused-join, ADR-049 §9), NOT at the adder's `add_member`. In a `did_hi` self-only re-drive, `did_lo` is the invitee and `did_lo` **ignores** the Welcome (never joins) → `did_lo`'s KeyPackage is never consumed. Doubly wrong: (a) ignore-rule means no consumption; (b) misattributes consumption to add_member when step-2 says invitee-join. An implementer following the residual would consume at add_member, defeating fused-join anti-drain. Fix: rewrite residual to "reserves/references (does NOT consume) one of did_lo's KeyPackages; because did_lo ignores the Welcome it never joins, so the KeyPackage is NOT consumed and remains available for the canonical pairing — no pool drain occurs," and delete the "consumed at did_hi's own add_member/join (step 2)" sentence.
+
+- **MEDIUM — `did_lo`-ignores arm mis-classified as "(a0)-level id-agreement" decision (05-contexts.md §5.15.8, line 1848, *Concurrent-creation collision resolution*).** Sequence defined as `id-agreement(a0) → block-list → confirm-bound-creator → fresh-join → destroy`. Prose then claims "the `did_lo`-ignores arm ... is likewise an (a0)-level id-agreement/ignore decision." FALSE: when `did_lo` receives a `did_hi`-authored Welcome, the id MATCHES (determinism guarantees it) so (a0) PASSES; `did_lo` ignores because creator=`did_hi`≠survivor `did_lo` — a creator-binding / survivor-role determination (sequence step 3 confirm-bound-creator), NOT the (a0) id-agreement step (step 1). Contradicts the same paragraph's own sequence. Behavior is correct (did_lo ignores) but the gate-ordering explanation is wrong. Fix: reclassify did_lo's ignore as a survivor-role / creator-binding determination, OR add an explicit "am I `did_lo` (the survivor)? if so ignore all Welcomes under this id" local pre-check distinct from (a0).
+
+## Verified CLEAN
+- Length-prefixed derivation: injective by construction, symmetric (sort before prefix), domain-prefix "standing:" is fixed constant (no len needed). §9.18.3 table edit consistent.
+- 4(a0) failure-states: transient=retryable-deferral-within-welcome_ttl (B knows default welcome_ttl), permanent-un-canonicalizable=reject. No silent join either path. Sound.
+- Anti-spam carve-out gate-decidable (holds-own-self-created-group is local); honest amplifier disclosure (publicly-computable id → un-throttled DID-resolve+sig-verify per forged convergence Welcome) accurate & bounded.
+- §5.12.2 three-arm coverage: shared_context/discovery_context/known_did not-self-clearable; mutual cross-ref with §5.15.8 step-4(b) consistent.
+- No dangling saga machinery (Prepare-A/B/CreationReceipt/saga_pending/PreparingX) left in §5.15.8. 3→2 saga count corrected everywhere; remaining "three" refs are explicitly historical.
+- ADR-049/DEFERRED/sketch/sdk-common all consistent with two-saga + single-context-async framing.

@@ -114,6 +114,7 @@ struct ErrorResponse {
 ///         Reach::Domain { domain: "placeholder.scp.ctx.network".to_owned() },
 ///         IdentitySource::Generate { custody, did_method },
 ///         storage,
+///         BlobStorageBackend::sqlite(&blob_db)?, // durable backend for a public node
 ///     )
 /// })
 /// .await?;

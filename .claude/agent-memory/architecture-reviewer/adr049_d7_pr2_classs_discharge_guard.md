@@ -1,0 +1,24 @@
+---
+name: adr049-d7-pr2-classs-discharge-guard
+description: ADR-049 Decision-7 PR-2 (EventLogPersistence+ContextEventLogProvider async, ClassSDischargeGuard RAII) @065a0e22c — APPROVED, design sound+minimal
+metadata:
+  type: project
+---
+
+# ADR-049 Decision-7 PR-2 @ 065a0e22c (base 171325edc) — APPROVED (2 MINOR)
+
+PR-2 converts `EventLogPersistence` (full async) + `ContextEventLogProvider` (PARTIAL async) to `#[async_trait]`, deletes the `ProtocolRepositoryEventLogBridge` sync→async shim in store/context.rs (4 block_in_place + 4 block_on), ZERO new block_on. Follows PR-0 (RecoveryBackend, see [[adr049-d7-async-trait-send-template]]) and PR-1 (ContextPersistence, see [[adr049-d7-async-provider-send-discipline]]).
+
+**Central design artifact = `ClassSDischargeGuard` RAII** (`class_s.rs`). Problem: `finalize_governance_action` INTERLEAVES async Merkle-leaf appends with `&mut state` mutations inside a deferred `ClassSCommitToken` discharge; `discharge_with` takes a SYNC `FnOnce(ClassSMut)->Result` closure that can't await, and an async closure needs `for<'a> Fn(..)->BoxFuture<'a>` HRTB forcing `'static` captures. **Resolution = split begin/view/commit across ONE borrow lifetime**: `ClassSCommitToken::begin_discharge(&mut cell) -> ClassSDischargeGuard{token, state:&mut cell.state}`; `guard.view() -> ClassSMut` (held across finalize awaits — `&mut PerContextState` across await is Send, unlike a shared `&` which is !Send since PerContextState is Send+!Sync); `guard.commit_fail_closed(deps,ctx).await` does the SINGLE fail-closed persist. This is the RIGHT structural answer, NOT scar tissue — the 2 alternatives are worse (hoist-appends-out breaks append/mutation ordering+atomicity; async-token = the HRTB dead-end).
+
+**Semantic equivalence to `discharge_with` VERIFIED** (byte-for-byte §9): (1) consumed=true set BEFORE persist await; (2) persist runs REGARDLESS of finalize result (commit_fail_closed called unconditionally before `finalize_result?`); (3) error priority `finalize_result?; persist_result?;` = old `(Err(f_err),_)=>Err(f_err)` first; (4) drop-without-commit (panic) fires token Drop obligation = un-committed token; (5) Send-discipline: commit_fail_closed builds owned snapshot in sync prelude, only `self`(holds &mut PerContextState=Send) live across await — same shape as discharge_with holding `&mut ClassSCell`.
+
+**Additive to Class-S, does NOT weaken airtight-borrow** (invariant check): begin_discharge is on `impl ClassSCommitToken` NOT `impl ClassSCell` → does NOT touch `class_s_no_persist_mutator_whitelist_is_bounded` tripwire. Guard's raw `&mut PerContextState` is module-private field; only exposure = `view()->ClassSMut` (same view discharge_with's closure gets). Unlike `subsume` (discards obligation zero-persist → has bounded-caller allowlist), begin_discharge NEVER discards (commit-or-Drop-into-fault) → correctly needs NO allowlist. No enforcement regression.
+
+**Partial-async ContextEventLogProvider = COHERENT.** Split boundary exact: touches async EventLogPersistence backend⇒async (init/append*/destroy/import/restore/prune); pure in-memory Merkle read⇒SYNC (event_log_entries, event_log_merkle_root, export_event_log_data, prove_event_inclusion/consistency, rebuild_event_log_for_proof). Sync reads called by sync FFI-boundary supervisor probes (Supervisor::event_log_entries/participation_record via GIL/NAPI/UniFFI) that can't await → forcing async = reintroduce block_on at FFI seam = Decision-7 anti-goal. Mirrors is_connected-stays-sync carve-out. `std::sync::Mutex` retained (every lock scoped+dropped before await; disallowed_types allow-reasons rewritten to say so). ADR-049 line ~162 NOW documents this normatively (added this PR). Asymmetry vs fully-async ContextPersistence justified (ContextPersistence has no pure-in-memory reads).
+
+**PR-3 (transport) unaffected** — guard is specific to Class-S+async-event-log interleave; transport is best-effort Class C, holds no ClassSMut across await in a discharge token. No debt.
+
+**Ratchet SOUND** (block-in-place-count.json): store/context.rs 8→0, scp-runtime 22→14, strictly tightening. 14-vs-live-8 gap = disclosed pre-existing tools_helpers_legacy slack; per-file enforced so aggregate discrepancy harmless (known "crates-aggregate ≠ files-sum" pattern).
+
+**2 MINOR (non-blocking):** (1) DOC GAP — ADR-049 §9 Enforcement prose (line ~186) still enumerates discharge paths as "commit / discharge_with", NOT updated to list the new `begin_discharge`→`ClassSDischargeGuard::commit_fail_closed` async-body shape; a §9 auditor wouldn't know it exists (same class as PR-1's "pattern only in doc-comments not ADR text"). (2) DRY — commit_fail_closed + discharge_with independently repeat consumed=true→build_snapshot_for_persist→persist_snapshot_fail_closed (~3 lines); both must stay semantically identical; a shared private helper would prevent drift. Marginal.

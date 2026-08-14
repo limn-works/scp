@@ -1,0 +1,12 @@
+---
+name: verify-agent-traces-against-disk
+description: subagent code-traces (esp. cited file:line + "feature is unwired/hollow") can be hallucinated; verify load-bearing claims by awk on disk AND by running the actual test before accepting them
+metadata:
+  type: feedback
+---
+
+When a subagent reports a code-trace conclusion — especially a load-bearing one like "the live path appends X WITHOUT field Y" or "this feature is hollow / returns all-zeros end-to-end" — do NOT accept it on the cited file:line. Verify the exact lines on disk with awk/grep, and if a test exists that would prove/disprove it, RUN that test.
+
+**Why:** In the c3c participation_record work (2026-06), an Explore agent produced a confident per-event-type trace claiming the scp-runtime lifecycle appended MemberJoined/MemberLeft/RoleAssigned via `append_context_event` (empty payload) at specific line numbers (governance_helpers.rs:1231/1372/1425, lifecycle_helpers.rs:990) — concluding "every participation record returns all zeros regardless of activity." On-disk awk verification showed those exact lines actually call the SUBJECT-BEARING helpers `append_membership_change_leaf` / `append_role_assigned_leaf` (governance_helpers.rs:1235/1381/1441, lifecycle_helpers.rs:383/1017) — the trace's line numbers and the `append_context_event` calls it quoted did NOT exist on disk. A coder fork had already propagated this false conclusion into a real-napi test comment ("subject-DID payloads are not yet wired through the NAPI lifecycle path") — directly contradicted by the very next test in the same file, which asserts governanceActionsBy==3 / roleProgressionCount==1 and PASSES. Running `bun test -t participationRecord` (2 pass) settled it: the runtime is correct, the feature works end-to-end, and the trace + fork comment were phantom provenance.
+
+**How to apply:** For any "X is broken/unwired/empty" claim from a subagent that gates a decision: (1) awk the cited lines on disk to confirm the quoted code actually exists there (Read-tool and subagent quotes can both be stale/hallucinated — see [[read-tool-stale-verify-with-awk]]); (2) if a passing/failing test would decide it, run that exact test and read the result, don't trust the fork's pass/fail summary; (3) treat a self-contradicting artifact (a test comment that contradicts a passing assertion 40 lines below) as a red flag to fix the comment, not the code. Subagent self-reports are liars (CLAUDE.md) — this extends to their code traces, not just their "done" claims.

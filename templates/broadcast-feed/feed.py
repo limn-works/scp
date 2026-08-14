@@ -193,14 +193,16 @@ async def add_author(
     encrypted content. Each author maintains an independent broadcast key
     with its own epoch counter (spec section 5.14.2).
     """
-    action = json.dumps({
-        "action": {
-            "RoleChange": {
-                "target_did": new_author_did,
-                "new_role": "author",
+    action = json.dumps(
+        {
+            "action": {
+                "RoleChange": {
+                    "target_did": new_author_did,
+                    "new_role": "author",
+                }
             }
         }
-    })
+    )
     result = await propose_governance_action(ctx, action, identity_did=publisher.did)
     print(f"  Promoted to author: {new_author_did} -> {result}")
 
@@ -228,7 +230,9 @@ async def run_publisher() -> None:
         print("Publishing content:")
         await publish_content(feed, publisher, "Welcome to the broadcast feed!")
         await publish_content(feed, publisher, "This is post #2.")
-        await publish_content(feed, publisher, "Breaking: SCP broadcast contexts are live.")
+        await publish_content(
+            feed, publisher, "Breaking: SCP broadcast contexts are live."
+        )
 
         # 5. Demonstrate subscriber management.
         print("\nSubscriber management:")

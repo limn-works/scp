@@ -44,6 +44,7 @@ new allowlist entries) are permitted.  See CLAUDE.md §enforcement files.
 ADR reference: ADR-052 in .docs/adrs/phase-2.md; standard:
 .docs/standards/construction.md (M1, M5).
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -120,7 +121,9 @@ M1_BOOL_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
 
 # Matches a struct definition line, capturing the struct name.
 # Handles: `pub struct Foo`, `struct Foo`, `pub(crate) struct Foo`.
-_STRUCT_DEF_RE = re.compile(r"^\s*(?:pub(?:\([^)]+\))?\s+)?struct\s+([A-Za-z][A-Za-z0-9_]*)")
+_STRUCT_DEF_RE = re.compile(
+    r"^\s*(?:pub(?:\([^)]+\))?\s+)?struct\s+([A-Za-z][A-Za-z0-9_]*)"
+)
 
 # Unit struct — struct with NO body (ends with `;` after the name, possibly
 # with a generic clause).  E.g. `struct HasDomain;` `pub struct NoDomain;`
@@ -133,11 +136,14 @@ _UNIT_STRUCT_RE = re.compile(
 # Group 1: field name.  Group 2: field type.
 # E.g. `    pub plaintext: bool,`
 #      `    pub enable_foo: bool,`
-_PUB_FIELD_RE = re.compile(r"^\s+pub\s+([A-Za-z][A-Za-z0-9_]*)\s*:\s*([A-Za-z][A-Za-z0-9_:<>, ]*)")
+_PUB_FIELD_RE = re.compile(
+    r"^\s+pub\s+([A-Za-z][A-Za-z0-9_]*)\s*:\s*([A-Za-z][A-Za-z0-9_:<>, ]*)"
+)
 
 # ---------------------------------------------------------------------------
 # Helper: is this struct name a typestate-marker name?
 # ---------------------------------------------------------------------------
+
 
 def _is_typestate_name(name: str) -> bool:
     """Return True if the struct name looks like a typestate marker.
@@ -154,6 +160,7 @@ def _is_typestate_name(name: str) -> bool:
 # Helper: does this struct name end in Builder?
 # ---------------------------------------------------------------------------
 
+
 def _is_builder_name(name: str) -> bool:
     return name.endswith("Builder")
 
@@ -161,6 +168,7 @@ def _is_builder_name(name: str) -> bool:
 # ---------------------------------------------------------------------------
 # Helper: does this field name look like a semantic choice?
 # ---------------------------------------------------------------------------
+
 
 def _is_semantic_bool_field(field_name: str) -> bool:
     lower = field_name.lower()
@@ -170,6 +178,7 @@ def _is_semantic_bool_field(field_name: str) -> bool:
 # ---------------------------------------------------------------------------
 # File scanner
 # ---------------------------------------------------------------------------
+
 
 def scan_file(path: pathlib.Path) -> list[str]:
     """Scan a single construction-module file.
@@ -279,6 +288,7 @@ def scan_file(path: pathlib.Path) -> list[str]:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> int:
     repo_root = pathlib.Path(".")

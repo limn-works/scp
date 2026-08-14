@@ -399,8 +399,85 @@ mod tests {
         }
     }
 
-    fn new_store() -> ProtocolRepository<scp_platform::testing::InMemoryStorage> {
-        ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new())
+    fn new_store() -> ProtocolRepository<scp_platform::in_memory::InMemoryStorage> {
+        ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new())
+    }
+
+    /// A [`Storage`] that injects faults on every read AND write operation, used
+    /// to prove that backend faults surface as [`TrustError::StoreError`] (an
+    /// INFRA fault that the verify-on-ingest layer MUST propagate, never classify
+    /// as a per-entry verification rejection).
+    struct AllFaultyStorage;
+
+    #[allow(clippy::manual_async_fn)]
+    impl Storage for AllFaultyStorage {
+        fn store(
+            &self,
+            _key: &str,
+            _data: &[u8],
+        ) -> impl std::future::Future<Output = Result<(), scp_platform::PlatformError>> + Send
+        {
+            async move {
+                Err(scp_platform::PlatformError::StorageError(
+                    "injected store fault".to_owned(),
+                ))
+            }
+        }
+        fn retrieve(
+            &self,
+            _key: &str,
+        ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, scp_platform::PlatformError>> + Send
+        {
+            async move {
+                Err(scp_platform::PlatformError::StorageError(
+                    "injected retrieve fault".to_owned(),
+                ))
+            }
+        }
+        fn delete(
+            &self,
+            _key: &str,
+        ) -> impl std::future::Future<Output = Result<(), scp_platform::PlatformError>> + Send
+        {
+            async move {
+                Err(scp_platform::PlatformError::StorageError(
+                    "injected delete fault".to_owned(),
+                ))
+            }
+        }
+        fn list_keys(
+            &self,
+            _prefix: &str,
+        ) -> impl std::future::Future<Output = Result<Vec<String>, scp_platform::PlatformError>> + Send
+        {
+            async move {
+                Err(scp_platform::PlatformError::StorageError(
+                    "injected list_keys fault".to_owned(),
+                ))
+            }
+        }
+        fn delete_prefix(
+            &self,
+            _prefix: &str,
+        ) -> impl std::future::Future<Output = Result<u64, scp_platform::PlatformError>> + Send
+        {
+            async move {
+                Err(scp_platform::PlatformError::StorageError(
+                    "injected delete_prefix fault".to_owned(),
+                ))
+            }
+        }
+        fn exists(
+            &self,
+            _key: &str,
+        ) -> impl std::future::Future<Output = Result<bool, scp_platform::PlatformError>> + Send
+        {
+            async move {
+                Err(scp_platform::PlatformError::StorageError(
+                    "injected exists fault".to_owned(),
+                ))
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -658,6 +735,56 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // Infra-fault propagation — backend faults surface as StoreError
+    // -------------------------------------------------------------------
+
+    /// A backend read fault must surface as [`TrustError::StoreError`] (an INFRA
+    /// fault), NEVER as a canonicalization/verification rejection. This is what
+    /// keeps the verify-on-ingest layer from silently dropping every credential
+    /// on a transient store error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bridge_read_fault_surfaces_as_store_error() {
+        let store = Arc::new(ProtocolRepository::new_for_testing(AllFaultyStorage));
+        let handle = tokio::runtime::Handle::current();
+        let bridge = ProtocolRepositoryTrustBridge::new(store, handle);
+
+        let err = tokio::task::spawn_blocking(move || {
+            bridge
+                .get_cached_attestations("ctx-1", "did:key:alice")
+                .expect_err("a backend read fault must error")
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(err, TrustError::StoreError { .. }),
+            "backend read fault must map to StoreError (infra → propagate), got {err:?}"
+        );
+    }
+
+    /// A backend write fault must likewise surface as [`TrustError::StoreError`].
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bridge_write_fault_surfaces_as_store_error() {
+        let store = Arc::new(ProtocolRepository::new_for_testing(AllFaultyStorage));
+        let handle = tokio::runtime::Handle::current();
+        let bridge = ProtocolRepositoryTrustBridge::new(store, handle);
+        let entry = make_cached("att-1", "did:key:alice", 1000, 300);
+
+        let err = tokio::task::spawn_blocking(move || {
+            bridge
+                .store_cached_attestation("ctx-1", entry)
+                .expect_err("a backend write fault must error")
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(err, TrustError::StoreError { .. }),
+            "backend write fault must map to StoreError (infra → propagate), got {err:?}"
+        );
     }
 
     // -------------------------------------------------------------------

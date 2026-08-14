@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use scp_core::store::ProtocolRepository;
-use scp_identity::DID;
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_did::DID;
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
 
 /// A test identity with custody, storage, and protocol repository pre-wired.
 ///

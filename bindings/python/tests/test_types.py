@@ -3,7 +3,7 @@
 Covers:
 - Exception hierarchy (ScpError and all subclasses)
 - Message and Provenance dataclasses
-- ToolDefinition and TestVector dataclasses
+- OutletDefinition and TestVector dataclasses
 - Enums (MemoryScope, SourceType, DiscoveryMethod, ProvenanceQuality, Capability)
 - Bridge error mapping
 
@@ -18,13 +18,13 @@ from scp_sdk.errors import (
     ContextError,
     CryptoError,
     IdentityError,
+    OutletError,
     ScpError,
-    ToolError,
     TransportError,
     UcanPermissionError,
     ValidationError,
 )
-from scp_sdk.tools import TestVector, ToolDefinition
+from scp_sdk.outlets import OutletDefinition, OutletKind, TestVector
 from scp_sdk.types import (
     Capability,
     CeilingPolicy,
@@ -127,12 +127,12 @@ class TestExceptionSubclasses:
     def test_transport_error_default_code(self) -> None:
         assert TransportError("x").code == "SCP-TRANS-5000"
 
-    def test_tool_error_is_scp_error(self) -> None:
-        err = ToolError("tool not found")
+    def test_outlet_error_is_scp_error(self) -> None:
+        err = OutletError("outlet not found")
         assert isinstance(err, ScpError)
 
-    def test_tool_error_default_code(self) -> None:
-        assert ToolError("x").code == "SCP-TOOL-6000"
+    def test_outlet_error_default_code(self) -> None:
+        assert OutletError("x").code == "SCP-OUTLET-6000"
 
     def test_validation_error_is_scp_error(self) -> None:
         err = ValidationError("schema mismatch")
@@ -148,7 +148,7 @@ class TestExceptionSubclasses:
             UcanPermissionError,
             CryptoError,
             TransportError,
-            ToolError,
+            OutletError,
             ValidationError,
         ]
         for cls in subclasses:
@@ -168,7 +168,7 @@ class TestBridgeErrorMap:
             "UcanError",
             "CryptoError",
             "TransportError",
-            "ToolError",
+            "OutletError",
             "ValidationError",
         }
         assert set(BRIDGE_ERROR_MAP.keys()) == expected_keys
@@ -288,7 +288,7 @@ class TestProvenance:
 
 
 # -----------------------------------------------------------------------
-# ToolDefinition and TestVector dataclass tests
+# OutletDefinition and TestVector dataclass tests
 # -----------------------------------------------------------------------
 
 
@@ -310,62 +310,154 @@ class TestTestVector:
         assert tv.description == ""
 
 
-class TestToolDefinition:
-    """Tests for the ToolDefinition dataclass."""
+class TestOutletDefinition:
+    """Tests for the OutletDefinition dataclass."""
 
-    def test_tool_definition_required_fields(self) -> None:
-        tool = ToolDefinition(
+    def test_outlet_definition_required_fields(self) -> None:
+        outlet = OutletDefinition(
             name="recipe_search",
             description="Search recipes by ingredients",
+            kind=OutletKind.Action,
             input_schema={"type": "object"},
             output_schema={"type": "object"},
             operator="did:dht:z6MkOperator",
         )
-        assert tool.name == "recipe_search"
-        assert tool.description == "Search recipes by ingredients"
-        assert tool.input_schema == {"type": "object"}
-        assert tool.output_schema == {"type": "object"}
-        assert tool.operator == "did:dht:z6MkOperator"
-        assert tool.test_vectors is None
-        assert tool.implementation_hash is None
+        assert outlet.name == "recipe_search"
+        assert outlet.description == "Search recipes by ingredients"
+        assert outlet.input_schema == {"type": "object"}
+        assert outlet.output_schema == {"type": "object"}
+        assert outlet.operator == "did:dht:z6MkOperator"
+        assert outlet.test_vectors is None
+        assert outlet.implementation_hash is None
 
-    def test_tool_definition_with_test_vectors(self) -> None:
+    def test_outlet_definition_with_test_vectors(self) -> None:
         tv = TestVector(
             input={"query": "cake"},
             expected_output={"results": ["chocolate cake"]},
         )
-        tool = ToolDefinition(
+        outlet = OutletDefinition(
             name="recipe_search",
             description="Search recipes",
+            kind=OutletKind.Action,
             input_schema={},
             output_schema={},
             operator="did:dht:z6MkOp",
             test_vectors=[tv],
         )
-        assert tool.test_vectors is not None
-        assert len(tool.test_vectors) == 1
-        assert tool.test_vectors[0].input == {"query": "cake"}
+        assert outlet.test_vectors is not None
+        assert len(outlet.test_vectors) == 1
+        assert outlet.test_vectors[0].input == {"query": "cake"}
 
-    def test_tool_definition_with_implementation_hash(self) -> None:
-        tool = ToolDefinition(
+    def test_outlet_definition_with_implementation_hash(self) -> None:
+        outlet = OutletDefinition(
             name="hasher",
-            description="Hash tool",
+            description="Hash outlet",
+            kind=OutletKind.Action,
             input_schema={},
             output_schema={},
             operator="did:dht:z6MkOp",
             implementation_hash=b"\xde\xad\xbe\xef",
         )
-        assert tool.implementation_hash == b"\xde\xad\xbe\xef"
+        assert outlet.implementation_hash == b"\xde\xad\xbe\xef"
 
-    def test_tool_definition_operator_can_be_string(self) -> None:
-        tool = ToolDefinition(
+    def test_outlet_definition_operator_can_be_string(self) -> None:
+        outlet = OutletDefinition(
             name="t",
             description="d",
+            kind=OutletKind.Action,
             input_schema={},
             output_schema={},
             operator="did:dht:z6MkSomeone",
         )
-        assert isinstance(tool.operator, str)
+        assert isinstance(outlet.operator, str)
+
+    def test_outlet_definition_kind_required(self) -> None:
+        import pytest
+
+        with pytest.raises(TypeError):
+            OutletDefinition(  # type: ignore[call-arg]
+                name="t",
+                description="d",
+                input_schema={},
+                output_schema={},
+                operator="did:dht:z6MkSomeone",
+            )
+
+    def test_outlet_definition_to_dict_query_kind(self) -> None:
+        outlet = OutletDefinition(
+            name="recipe_search",
+            description="Search recipes",
+            kind=OutletKind.Query,
+            input_schema={"type": "object"},
+            output_schema={"type": "object"},
+            operator="did:dht:z6MkOperator",
+        )
+        payload = outlet.to_dict()
+        assert payload["kind"] == "query"
+        assert payload["name"] == "recipe_search"
+        assert payload["description"] == "Search recipes"
+        assert payload["operator_did"] == "did:dht:z6MkOperator"
+        assert payload["schema"] == {
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+        }
+        # Optional fields are omitted when unset.
+        assert "test_vectors" not in payload
+        assert "implementation_hash" not in payload
+        assert "cost" not in payload
+
+    def test_outlet_definition_to_dict_action_kind_and_optionals(self) -> None:
+        tv = TestVector(input={"q": "x"}, expected_output={"r": 1}, description="d")
+        outlet = OutletDefinition(
+            name="do_thing",
+            description="An action outlet",
+            kind=OutletKind.Action,
+            input_schema={},
+            output_schema={},
+            operator="did:dht:z6MkOp",
+            test_vectors=[tv],
+            implementation_hash=b"\xde\xad\xbe\xef",
+        )
+        payload = outlet.to_dict()
+        assert payload["kind"] == "action"
+        assert payload["test_vectors"] == [
+            {"input": {"q": "x"}, "expected_output": {"r": 1}, "description": "d"}
+        ]
+        # implementation_hash crosses the bridge as a hex string, not raw bytes.
+        assert payload["implementation_hash"] == "deadbeef"
+
+    def test_outlet_kind_parse(self) -> None:
+        import pytest
+
+        from scp_sdk.errors import ValidationError
+
+        assert OutletKind.parse("query") is OutletKind.Query
+        assert OutletKind.parse("action") is OutletKind.Action
+        assert OutletKind.parse(OutletKind.Query) is OutletKind.Query
+        with pytest.raises(ValidationError) as excinfo:
+            OutletKind.parse("bogus")
+        assert excinfo.value.code == "SCP-VALID-7050"
+
+    async def test_outlet_register_accepts_typed_definition(self) -> None:
+        from unittest.mock import MagicMock
+
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native.outlet_register.return_value = "outlet-do_thing"
+        outlet = OutletDefinition(
+            name="do_thing",
+            description="An action outlet",
+            kind=OutletKind.Query,
+            input_schema={},
+            output_schema={},
+            operator="did:dht:z6MkOp",
+        )
+        result = await SCP.outlet_register(scp, "ctx-123", outlet)
+        assert result == "outlet-do_thing"
+        # The bridge received the serialized dict with the wire kind string.
+        (_ctx, payload), _kwargs = scp._native.outlet_register.call_args
+        assert payload["kind"] == "query"
 
 
 # -----------------------------------------------------------------------
@@ -463,8 +555,9 @@ class TestCapability:
     def test_standard_capabilities(self) -> None:
         assert Capability.MESSAGES_READ.value == "messages:read"
         assert Capability.MESSAGES_WRITE.value == "messages:write"
-        assert Capability.TOOL_INVOKE_ALL.value == "tool:invoke:*"
-        assert Capability.TOOL_REGISTER.value == "tool:register"
+        assert Capability.OUTLET_QUERY_ALL.value == "outlet:query:*"
+        assert Capability.OUTLET_CALL_ALL.value == "outlet:call:*"
+        assert Capability.OUTLET_REGISTER.value == "outlet:register"
         assert Capability.MEMBER_INVITE.value == "member:invite"
         assert Capability.MEMBER_REMOVE.value == "member:remove"
         assert Capability.ROLE_ASSIGN.value == "role:assign"
@@ -472,7 +565,7 @@ class TestCapability:
         assert Capability.GOVERNANCE_VOTE.value == "governance:vote"
         assert Capability.CONTEXT_CLOSE.value == "context:close"
         assert Capability.CHILD_CONTEXT_CREATE.value == "context:child:create"
-        assert Capability.TOOL_INTERFACE.value == "tool:interface"
+        assert Capability.OUTLET_INTERFACE.value == "outlet:interface"
         assert Capability.BRIDGING.value == "bridging"
         assert Capability.MEDIA_VOICE.value == "media:voice"
         assert Capability.MEDIA_VIDEO.value == "media:video"
@@ -481,11 +574,15 @@ class TestCapability:
         assert Capability.METADATA_EDIT.value == "metadata:edit"
 
     def test_variant_count(self) -> None:
-        assert len(Capability) == 18
+        assert len(Capability) == 19
 
-    def test_tool_invoke_parameterised(self) -> None:
-        cap = Capability.tool_invoke("my-tool-id")
-        assert cap == "tool:invoke:my-tool-id"
+    def test_outlet_call_parameterised(self) -> None:
+        cap = Capability.outlet_call("my-outlet-id")
+        assert cap == "outlet:call:my-outlet-id"
+
+    def test_outlet_query_parameterised(self) -> None:
+        cap = Capability.outlet_query("my-outlet-id")
+        assert cap == "outlet:query:my-outlet-id"
 
     def test_custom_parameterised(self) -> None:
         cap = Capability.custom("my-custom-cap")
@@ -511,7 +608,7 @@ class TestPackageReExports:
         assert scp_sdk.UcanPermissionError is UcanPermissionError
         assert scp_sdk.CryptoError is CryptoError
         assert scp_sdk.TransportError is TransportError
-        assert scp_sdk.ToolError is ToolError
+        assert scp_sdk.OutletError is OutletError
         assert scp_sdk.ValidationError is ValidationError
 
     def test_types_accessible_from_top_level(self) -> None:
@@ -521,8 +618,8 @@ class TestPackageReExports:
         assert scp_sdk.MemoryScope is MemoryScope
         assert scp_sdk.SourceType is SourceType
 
-    def test_tools_accessible_from_top_level(self) -> None:
-        assert scp_sdk.ToolDefinition is ToolDefinition
+    def test_outlets_accessible_from_top_level(self) -> None:
+        assert scp_sdk.OutletDefinition is OutletDefinition
         assert scp_sdk.TestVector is TestVector
 
     def test_site_config_accessible_from_top_level(self) -> None:

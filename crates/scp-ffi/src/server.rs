@@ -16,8 +16,7 @@
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice D (#1549).
 //!
-//! Gated behind the `server` feature on `scp-ffi-common`. Not available for
-//! WASM (ADR-034).
+//! Gated behind the `server` feature on `scp-ffi-common`.
 
 use std::sync::Arc;
 
@@ -27,7 +26,7 @@ use zeroize::Zeroizing;
 use scp_ffi_common::server::{
     self, ConcreteDidMethod, NodeIdentity, RunningNode, RunningRelay, ServerError,
 };
-use scp_identity::{DidCache, InMemoryDhtClient};
+use scp_identity::DidCache;
 use scp_node::NodeError;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
@@ -102,12 +101,18 @@ fn auto_wire_context_manager(
         ))
     }) {
         Ok(adapter) => {
-            let crypto = std::sync::Arc::new(
-                scp_core::crypto::mls::provider::MlsCryptoProvider::new(did_owned.clone()),
-            );
+            let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
+                did_owned.clone(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            ));
             let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
-            let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
-                Box::new(crate::runtime::NoOpEventLogProvider);
+            // The supervisor's own event log MUST be the persistent Merkle
+            // provider (sharing the bridge instance's single storage backend),
+            // NOT a NoOp — `Supervisor::participation_record` (§7.3.2) and other
+            // supervisor reads of the convergent log require entry/Merkle-root
+            // support. A NoOp silently dropped every governance/role/membership
+            // leaf. Matches `configure_relay_transport` and the local path.
+            let event_log = crate::runtime::build_event_log_provider(bi);
             crate::runtime::init_context_manager_with(
                 bi, &did_owned, crypto, transport, event_log, None,
             );
@@ -579,7 +584,16 @@ fn build_node_identity(bi: &crate::runtime::PyBridgeInstance, did: &str) -> PyRe
     crate::runtime::with_identity(bi, did, |entry| {
         let custody = Arc::clone(&entry.custody);
         let sign_fn = ConcreteDidMethod::make_sign_fn(custody);
-        let dht_client = Arc::new(InMemoryDhtClient::new());
+        // Publish through the instance's shared DHT client (the one the
+        // resolver reads from) so a node serving this identity re-publishes
+        // into the same DHT the rest of the bridge resolves against. Fall back
+        // to a fail-closed production client if the resolver was never
+        // initialized — never an in-memory nullifier on a shipped path
+        // (ADR-062 §Decision 1).
+        let dht_client = match crate::runtime::resolver_dht_client(bi) {
+            Some(client) => client,
+            None => Arc::new(crate::identity::build_ffi_dht_client()?),
+        };
         let cache = Arc::new(DidCache::new());
         let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
             dht_client, cache, sign_fn,

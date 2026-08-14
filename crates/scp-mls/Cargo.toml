@@ -1,0 +1,76 @@
+[package]
+name = "scp-mls"
+version = "0.1.0-beta.2"
+description = "Synchronous MLS state machine for SCP — wasm32-safe, shared by the native runtime and in-browser clients (ADR-057)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+# Enables non-production DID formats (did:key:, did:test:) in ScpCredential
+# construction, mirroring scp-protocol/testing. Used by the broad test suite.
+testing = ["scp-protocol/testing", "scp-did/testing"]
+
+[dependencies]
+# scp-mls depends ONLY on the wasm-safe capability crates plus the openmls
+# stack. It MUST NOT depend on scp-runtime (tokio/actor orchestration) or
+# scp-identity (tokio-coupled custody/DHT) — the ADR-057 mechanical fence that
+# keeps the crate compilable to wasm32-unknown-unknown. credential.rs imports
+# the DID model (DID, DidDocument, …) from scp-did directly rather than via
+# scp-identity.
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+scp-did = { path = "../scp-did", version = "=0.1.0-beta.2" }
+scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
+# Wasm-safe leaf: the single §9.10.4.A pseudonym-derivation source (ADR-057
+# Option A). `derive_pseudonym` derives this member's per-context pseudonym over
+# the wasm-held MLS SignatureKeyPair via this crate — no forked HMAC/HKDF recipe.
+scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2" }
+# The Ed25519 seed extracted from the MLS SignatureKeyPair is reconstructed into
+# a `SigningKey` to feed `scp_crypto::pseudonym::derive_pseudonym_keypair`.
+ed25519-dalek = { workspace = true }
+
+openmls = { workspace = true, features = ["libcrux-provider", "js"] }
+openmls_traits = { workspace = true }
+openmls_basic_credential = { workspace = true }
+openmls_rust_crypto = { workspace = true }
+openmls_memory_storage = { workspace = true }
+tls_codec = "0.4"
+
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# wasm32 backends: mirror scp-protocol/Cargo.toml. openmls's `js` feature pulls
+# fluvio-wasm-timer + getrandom/wasm_js for KeyPackage Lifetime wall-clock time.
+# The root .cargo/config.toml already sets getrandom_backend="wasm_js" globally
+# for the wasm32 target, so no per-crate config is needed.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+# getrandom 0.4 is pulled transitively via the openmls libcrux provider
+# (openmls_libcrux_crypto → hpke-rs-libcrux → rand 0.10 → getrandom 0.4). Unlike
+# openmls's own `js` feature (which only wires getrandom 0.3's wasm_js), this
+# major version needs its wasm_js feature enabled here so the wasm32 build has a
+# randomness backend. See ADR-057 Prerequisite 1.
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+uuid = { version = "1", features = ["v4", "js"] }
+
+[dev-dependencies]
+scp-did = { path = "../scp-did", features = ["testing"] }
+scp-protocol = { path = "../scp-protocol", features = ["testing"] }
+openmls_basic_credential = { workspace = true, features = ["test-utils"] }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+bs58 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+proptest = "1"
+
+[lints]
+workspace = true

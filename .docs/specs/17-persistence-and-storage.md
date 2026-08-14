@@ -102,8 +102,8 @@ context/{context_id}/event_meta/count
 context/{context_id}/event_meta/root
 context/{context_id}/event_tree/{level}/{index}
 context/{context_id}/merkle_event_log/{seq:020d}
-context/{context_id}/tool/{tool_id}
-context/{context_id}/tool_session/{session_id}
+context/{context_id}/outlet/{outlet_id}
+context/{context_id}/outlet_session/{session_id}
 context/{context_id}/ucan_token/{token_id}
 context/{context_id}/ucan_revocation/{token_id}
 context/{context_id}/broadcast_state
@@ -239,15 +239,15 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn store_tofu_record(&self, did: &DID, record: &[u8]) -> Result<(), StoreError>;
     pub async fn load_tofu_record(&self, did: &DID) -> Result<Option<Vec<u8>>, StoreError>;
 
-    // --- Tools ---
-    pub async fn store_tool(&self, context_id: &ContextId, tool_id: &ToolId, registration: &[u8]) -> Result<(), StoreError>;
-    pub async fn load_tool(&self, context_id: &ContextId, tool_id: &ToolId) -> Result<Option<Vec<u8>>, StoreError>;
-    pub async fn list_tools(&self, context_id: &ContextId) -> Result<Vec<ToolId>, StoreError>;
+    // --- Outlets ---
+    pub async fn store_outlet(&self, context_id: &ContextId, outlet_id: &OutletId, registration: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_outlet(&self, context_id: &ContextId, outlet_id: &OutletId) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn list_outlets(&self, context_id: &ContextId) -> Result<Vec<OutletId>, StoreError>;
 
-    // --- Tool sessions ---
-    pub async fn store_tool_session(&self, context_id: &ContextId, session_id: &str, session: &[u8]) -> Result<(), StoreError>;
-    pub async fn load_tool_session(&self, context_id: &ContextId, session_id: &str) -> Result<Option<Vec<u8>>, StoreError>;
-    pub async fn delete_tool_session(&self, context_id: &ContextId, session_id: &str) -> Result<(), StoreError>;
+    // --- Outlet sessions ---
+    pub async fn store_outlet_session(&self, context_id: &ContextId, session_id: &str, session: &[u8]) -> Result<(), StoreError>;
+    pub async fn load_outlet_session(&self, context_id: &ContextId, session_id: &str) -> Result<Option<Vec<u8>>, StoreError>;
+    pub async fn delete_outlet_session(&self, context_id: &ContextId, session_id: &str) -> Result<(), StoreError>;
 
     // --- Relay scores ---
     pub async fn store_relay_score(&self, relay_url: &str, score: &[u8]) -> Result<(), StoreError>;
@@ -309,7 +309,7 @@ scp-core/src/store/
     identity.rs     # Identity documents, private state, TOFU, DID cache
     nonce.rs        # UCAN nonce tracking, pruning
     tls.rs          # TLS certificate chain + private key (§18.6.3)
-    tools.rs        # Tool registration, sessions
+    outlets.rs        # Outlet registration, sessions
     transport.rs    # Relay scores, key packages
     economy.rs      # Economic policy, payment receipts, spending UCANs, adapter credentials
 ```
@@ -335,7 +335,7 @@ Every value written by `ProtocolRepository` is wrapped in `StoredValue`. On read
 **Context export integrity (signed snapshot).** A portable `ContextExport` (the serialized form produced for backup, migration, or device transfer) carries TWO independent integrity protections, both verified on import before any state is restored:
 
 1. **Event-log Merkle chain** — the serialized event-log entries are hash-chained and the export records the Merkle root; import recomputes and compares it (tamper detection on the event history).
-2. **Signed snapshot** — the *entire* embedded context snapshot is bound by an Ed25519 `snapshot_signature`, computed and verified **exactly as specified in §23.16.8 (Signed Context Export)**: Ed25519 over `SHA-256("SCP-CONTEXT-EXPORT-V1:" || scope-tag-byte || JCS(ContextSnapshot))`, where `scope-tag-byte` is the single export-scope discriminant (`0x00` for `Full`, `0x01` for `Public`) placed immediately after the domain separator and before the JCS bytes, and `JCS` is the RFC 8785 canonical-JSON serialization of the whole snapshot. Binding the scope byte into the preimage means a tampered envelope `scope` field fails signature verification by construction (§23.16.8, ADR-050). The export domain separator `"SCP-CONTEXT-EXPORT-V1:"` is deliberately distinct from the §23.16.4 sync-delta separator `"SCP-CONTEXT-SNAPSHOT-V1:"` so that an export signature can never be confused with a sync-delta signature under the same creator key (§9.18.2). The signature is produced by the snapshot's `creator_did` `#active`/`#agent` custody key (ADR-039); on import the verifying key is resolved from `creator_did`, the envelope's `exporter_did` MUST equal `creator_did`, and the signature MUST verify before any state is restored. The signature covers every trusted field the importer restores verbatim — role ceilings, member/suspended capabilities, role assignments, threshold signers and value, governance model configuration, economic policy, consequence rules, read-exclusion list, access-key store, pending ceiling modification, and tool registrations — not only membership and parameters. A subset hash (such as the §23.16.4 sync-delta recipe) would leave those fields forgeable and MUST NOT be used for export. Per-instance anti-abuse and accounting state carried in the snapshot is signed but intentionally wiped or sanitized on import (§23.16.8).
+2. **Signed snapshot** — the *entire* embedded context snapshot is bound by an Ed25519 `snapshot_signature`, computed and verified **exactly as specified in §23.16.8 (Signed Context Export)**: Ed25519 over `SHA-256("SCP-CONTEXT-EXPORT-V1:" || scope-tag-byte || JCS(ContextSnapshot))`, where `scope-tag-byte` is the single export-scope discriminant (`0x00` for `Full`, `0x01` for `Public`) placed immediately after the domain separator and before the JCS bytes, and `JCS` is the RFC 8785 canonical-JSON serialization of the whole snapshot. Binding the scope byte into the preimage means a tampered envelope `scope` field fails signature verification by construction (§23.16.8, ADR-050). The export domain separator `"SCP-CONTEXT-EXPORT-V1:"` is deliberately distinct from the §23.16.4 sync-delta separator `"SCP-CONTEXT-SNAPSHOT-V1:"` so that an export signature can never be confused with a sync-delta signature under the same creator key (§9.18.2). The signature is produced by the snapshot's `creator_did` `#active`/`#agent` custody key (ADR-039); on import the verifying key is resolved from `creator_did`, the envelope's `exporter_did` MUST equal `creator_did`, and the signature MUST verify before any state is restored. The signature covers every trusted field the importer restores verbatim — role ceilings, member/suspended capabilities, role assignments, threshold signers and value, governance model configuration, economic policy, consequence rules, read-exclusion list, access-key store, pending ceiling modification, and outlet registrations — not only membership and parameters. A subset hash (such as the §23.16.4 sync-delta recipe) would leave those fields forgeable and MUST NOT be used for export. Per-instance anti-abuse and accounting state carried in the snapshot is signed but intentionally wiped or sanitized on import (§23.16.8).
 
 The export format `version` is incremented when this integrity envelope changes (the scope-bound full-snapshot signed construction is native export `version` 4); imports reject any version that is not the current signed format with a dedicated *version* error surfaced as `SCP-CTX-2094`, which is distinct from a signature-verification failure (`SCP-CTX-2093`). See §23.16.8 for the canonical construction and the importer's normative verification and authorization requirements, and §23.17 for the sequence-floor invariants that imports must additionally enforce.
 
@@ -414,7 +414,6 @@ The `Storage` trait operates on opaque bytes. Platform-specific encryption happe
 | Platform | Mechanism | Notes |
 |----------|-----------|-------|
 | Native (iOS, Android, macOS, Linux, Windows, Python, Node) | `rusqlite` with `bundled-sqlcipher` feature | AES-256 encryption, PBKDF2 with SHA-512 key derivation (256K iterations). Encryption key derived from identity key material stored in platform key custody (Keychain/Keystore). |
-| Browser (WASM) | Value-level AES-256-GCM encryption | SQLCipher unavailable in WASM. Each value is encrypted individually before writing to wa-sqlite. Key derivation: the identity's `#0` key is imported into WebCrypto as raw key material, then `HKDF` is used with `salt = SHA-256("SCP-WASM-STORAGE-V1")`, `info = "scp-wasm-storage:" || did` (UTF-8), `hash = SHA-256`, `derivedKeyLength = 256` to produce an AES-256-GCM key. Per-value encryption: 12-byte nonce generated via `crypto.getRandomValues()` for each `store()` call. Stored format: `nonce (12 bytes) \|\| ciphertext \|\| tag (16 bytes)`. The key is stored in memory only (non-extractable WebCrypto key object). AAD (additional authenticated data): the storage key string (UTF-8 bytes), binding each encrypted value to its key path to prevent value relocation attacks. |
 | iOS | `NSFileProtectionCompleteUntilFirstUserAuthentication` | Allows background processing while device is locked. Applied to the SQLite database file. |
 | Android | TEE-backed key for SQLCipher key derivation | Android Keystore generates the key; SQLCipher uses it for database encryption. StrongBox opt-in only (dramatically slow). |
 
@@ -425,27 +424,30 @@ The `Storage` trait operates on opaque bytes. Platform-specific encryption happe
 | `InMemoryStorage` | `HashMap<String, Vec<u8>>` + `RwLock` | All | Testing, CI, short-lived agents | Phase 1 (update for new methods) |
 | `SqliteStorage` | `rusqlite` + `bundled-sqlcipher`, WAL mode | Native (all) | **Default production backend** — universal | Phase 2 |
 | `FilesystemStorage` | Key -> file path | POSIX systems | Server/CLI, inspectable/debuggable storage | Phase 2 |
-| `WasmSqliteStorage` | wa-sqlite (TypeScript) | Browser WASM | Browser default | Phase 4 |
+
+Storage selection is the **first and canonical instance** of the general capability-selection principle in §17.17. The rules in this subsection — selection is mandatory, selection fails closed, the runtime never defaults storage, and in-memory storage is dev/test-only — are the storage specialization of the mandatory/fails-closed/never-default requirements (SCP-CAPSEL-8000/8001/8002) and the durability-only-vs-nullifier classification (SCP-CAPSEL-8010/8011) that §17.17 defines for *every* provider capability. Read §17.17 for the general form; this subsection is where it was first stated and remains the worked example.
 
 ### In-Memory Storage Is Dev/Test-Only
 
-In-memory storage — `InMemoryStorage`, the FFI-layer `BridgeInMemoryStorage`, and `EncryptingAdapter<InMemoryStorage>` — is a development and test affordance only. It MUST NOT be used as a production system-of-record.
+In-memory storage — `InMemoryStorage` and `EncryptingAdapter<InMemoryStorage>` — is a development and test affordance only. It MUST NOT be used as a production system-of-record.
 
 In-memory storage loses all state on process restart. For SCP, that state includes MLS group state, identity keys, the event log, and provenance records. Losing it on restart contradicts the durability and provenance tenets directly: a restarted node would silently lose its cryptographic membership, its append-only audit trail, and its identity. Production deployments MUST use a durable, encrypted backend — `SqliteStorage` (SQLCipher) is the default.
 
+Under the §17.17 classification, in-memory storage is a **durability-only affordance** (SCP-CAPSEL-8010/8011), not a security nullifier: it forgets state but presents no false guarantee. It fails closed — a restarted node with lost state simply has no state; it cannot silently answer as though the state were intact. It is therefore explicitly selectable in any build, but — like every durability-only arm — never a default, never a fallback, and never the only reachable storage arm in a shipped SDK. Contrast the in-memory DHT backend (§17.17.3), which fails *open* and is a nullifier.
+
 ### Storage Selection Is Mandatory
 
-Storage selection is mandatory. Constructing an `SCP` without an explicit storage choice is an error (`SCP-STORAGE-8000`); there is no default. The two choices are `{type: in_memory}` (development) and `{type: sqlite, ...}` (production). Bridges that can express this requirement at compile time (e.g. the typed UniFFI `StorageConfig` constructor, the required Swift/Kotlin/TypeScript constructor argument) MUST do so; bridges that cannot (the dynamically-typed PyO3 dict, the JSON-string NAPI factory) MUST reject a missing selection at runtime with `SCP-STORAGE-8000`. No bridge or SDK may expose a zero-argument constructor that silently selects a storage backend on the caller's behalf.
+Storage selection is the storage instance of SCP-CAPSEL-8000 (§17.17.1). Storage selection is mandatory. Constructing an `SCP` without an explicit storage choice is an error (`SCP-STORAGE-8000`, the storage-specific error surface of SCP-CAPSEL-8000); there is no default. The two choices are `{type: in_memory}` (development) and `{type: sqlite, ...}` (production). Bridges that can express this requirement at compile time (e.g. the typed UniFFI `StorageConfig` constructor, the required Swift/Kotlin/TypeScript constructor argument) MUST do so; bridges that cannot (the dynamically-typed PyO3 dict, the JSON-string NAPI factory) MUST reject a missing selection at runtime with `SCP-STORAGE-8000`. No bridge or SDK may expose a zero-argument constructor that silently selects a storage backend on the caller's behalf.
 
 ### Storage Selection Fails Closed
 
-When a caller selects a durable storage backend (e.g. `Sqlite`) and the backend cannot be opened — bad path, insufficient permissions, corruption, or a wrong key/passphrase — the bridge or builder layer MUST return an error. Silent fallback to in-memory storage, or to no storage at all, is FORBIDDEN.
+This is the storage instance of SCP-CAPSEL-8001 (§17.17.1). When a caller selects a durable storage backend (e.g. `Sqlite`) and the backend cannot be opened — bad path, insufficient permissions, corruption, or a wrong key/passphrase — the bridge or builder layer MUST return an error. Silent fallback to in-memory storage, or to no storage at all, is FORBIDDEN.
 
 In-memory storage is reachable only through an explicit in-memory selection (`{type: "in_memory"}`). It MUST NOT be reachable as a degradation path from a failed durable-backend open. A failed durable open is a terminal error the caller observes, not a condition the system silently recovers from by downgrading durability.
 
 ### The Runtime Never Defaults Storage
 
-The runtime core (`scp-runtime`) MUST NOT manufacture or default a storage backend. Storage is supplied by the caller at the bridge or builder layer and threaded into the supervisor as a required (non-optional) parameter. This requirement is enforced by the type system — the supervisor construction surface takes storage as a non-`Option` argument, so there is no code path by which the runtime can run without a caller-supplied backend. The choice of backend (durable vs. in-memory) is made once, at the bridge/builder layer, never silently inside the runtime.
+This is the storage instance of SCP-CAPSEL-8002 (§17.17.1). The runtime core (`scp-runtime`) MUST NOT manufacture or default a storage backend. Storage is supplied by the caller at the bridge or builder layer and threaded into the supervisor as a required (non-optional) parameter. This requirement is enforced by the type system — the supervisor construction surface takes storage as a non-`Option` argument, so there is no code path by which the runtime can run without a caller-supplied backend. The choice of backend (durable vs. in-memory) is made once, at the bridge/builder layer, never silently inside the runtime.
 
 ### SQLite Is the Universal Default
 
@@ -536,14 +538,24 @@ conn.execute_batch("
 ")?;
 ```
 
-### Browser: The One Exception
+### Browser Clients Run Storage In-Process
 
-The Rust core's `rusqlite` cannot target browser WASM (no filesystem). **wa-sqlite** with **OPFSCoopSyncVFS** is the browser backend:
+Per ADR-057 (which supersedes ADR-055's browser-deployment conclusion), a browser SCP client runs the participant protocol in-tab with keys on-device — it is not a custodial remote thin client. Its persistence is therefore its own concern, held in a browser-local key/value store (`IndexedDB`, or a wa-sqlite/OPFS backend), never a server's.
 
-- Supports 1GB+ databases
-- Works in all major browsers (Chrome, Firefox, Safari, Edge)
-- Falls back to **IDBBatchAtomicVFS** for Safari incognito (no OPFS access)
-- This is a TypeScript adapter, not Rust — it implements the `Storage` trait interface in TypeScript and communicates with the Rust WASM core via the binding layer
+The in-browser client persists **per-context participant state as a self-contained snapshot** written after every state-mutating operation and read back when a tab reopens. A snapshot captures the MLS crypto state (group tree, epoch secrets, key schedule, and the on-device MLS signer), the §9.16 sender-key state (local key, the per-sender key store, epoch high-water floors, and the receive-replay tracker), the canonical event-log event stream, the membership set with per-member sequence counters, a §9.9.3 checkpoint (the event-log Merkle root), and the **receive buffer** — decrypted messages awaiting delivery to the application. The receive buffer is persisted deliberately: a message decrypted before the tab closed is delivered **exactly once** on reopen rather than lost, and it *cannot* be re-obtained from the relay, because decrypting it already advanced the forward-secrecy ratchet whose advance is itself persisted (the relay would re-deliver a ciphertext the restored group can no longer open). Persisting the buffer keeps the anti-replay floors consistent with the persisted ratchet — both advance together on decrypt and are captured together.
+
+**Pending pre-join material is also persisted**, as a distinct per-context pending-join record stored separately from the per-context snapshot: the private half of a key package that has been generated but whose Welcome has not yet arrived. Persisting it lets an **interrupted join resume** after a reopen instead of stranding a consumed key package. The pending blob is bound to the owning identity and the context it is for, and those bindings are verified on restore, so a swapped or mislabeled blob is rejected fail-closed.
+
+Both the receive buffer and the pending material hold decrypted / private key material, so — like the rest of the snapshot — they rely on the store's authenticated encryption at rest (below).
+
+Two integrity and durability properties are mandatory:
+
+- **Crash consistency.** A single-tab client has no server-side actor to serialize writes; instead each snapshot is a single atomic write of one blob per context. A crash leaves either the last fully-committed snapshot or the prior one — never a torn intra-context state. On restore, the checkpoint is recomputed from the reconstructed event log and compared to the recorded Merkle root; a mismatch fails the restore closed rather than resuming an inconsistent context. The recorded root lives inside the same blob, so this checkpoint is a torn-write / corruption / truncation consistency guard on the **event log**, not a whole-blob tamper-resistance mechanism — the MLS state, sender keys, and anti-replay floors are outside it. Because the receive buffer round-trips through the snapshot, ordinary state loss is bounded to the **last un-persisted mutation**, not to decrypted-but-undrained messages in general. The one true-loss case is narrow: a message whose decrypt advanced the ratchet in memory but whose follow-on snapshot write then *failed* before committing. That failure is not swallowed — it **poisons the context** (the durable snapshot is now strictly older than the live in-memory state, which have diverged), so every further operation on that context is refused and the client recovers by reconstructing from the last durable snapshot rather than silently continuing on a forked state.
+- **Authenticated encryption at rest.** The snapshot carries raw private key material (the MLS signer and epoch/HPKE secrets, the sender keys), the decrypted receive buffer, and the anti-replay floors. It is neither self-encrypting nor self-authenticating; the browser-local store MUST provide **authenticated** encryption at rest (an AEAD-backed store, not merely a confidential one). Confidentiality keeps the keys and plaintext secret; **authentication is the *sole* defense for whole-blob authenticity — the protocol itself does not defend against rollback or resurrection of a persisted blob.** Only the store's AEAD prevents a rolled-back blob from lowering a persisted replay floor and re-opening the §9.16 replay window on restore, or a deleted-on-close blob from being resurrected (the event-log checkpoint above does not cover those fields, and the ordered write-behind flush that a close relies on is likewise an embedder obligation). The browser tab is the platform-layer custody and plaintext boundary in this model (ADR-057), so page hardening (CSP, SRI, COOP/COEP) is load-bearing for confidentiality, not optional.
+
+Storage selection remains explicit and fails closed (see below): a browser client is constructed with its store, and a durable-backend open failure is a terminal error, never a silent downgrade.
+
+A **custodial remote thin client** — the node holding the protocol engine, MLS group state, custody, event log, and persistent storage, with the browser issuing operations over RPC/WebSocket — remains a valid *opt-in* secondary mode for users who explicitly choose convenience over self-sovereignty (ADR-057 Alternatives). It is not the default and not what "browser client" means.
 
 ### PostgreSQL Is NOT First-Party for Client Storage
 
@@ -565,6 +577,8 @@ base_dir/
 ```
 
 ## 17.7 First-Party BlobStore Adapters (Relay/Server)
+
+Relay blob storage is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001), the runtime never defaults it (SCP-CAPSEL-8002), and `InMemoryBlobStore` is a durability-only development arm (SCP-CAPSEL-8010/8011) — explicitly selectable, never a default or fallback, never the sole reachable arm in a shipped relay.
 
 | Adapter | Backend | Good for | Ships in |
 |---------|---------|----------|----------|
@@ -640,6 +654,8 @@ The `BlobStorage` trait provides streaming variants of `store` and `get` for bac
 ## 17.8 Platform-Specific Key Custody
 
 Key custody is NOT part of this spec — it is the existing `KeyCustody` trait (ADR-006). Referenced here for completeness of the persistence picture:
+
+Key custody is a provider capability governed by the general capability-selection principle (§17.17): the backend selection is mandatory and fails closed (SCP-CAPSEL-8000/8001) and the runtime never defaults it (SCP-CAPSEL-8002). Its in-memory arm (`InMemoryKeyCustody`, plaintext keys) is a **security nullifier**, not a durability-only affordance, and so must be provably absent from shipped production artifacts (SCP-CAPSEL-8012) — the realization is downstream in ADR-062.
 
 | Platform | Key Storage | Key Types | Notes |
 |----------|-------------|-----------|-------|
@@ -855,7 +871,7 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 | Test | Verifies |
 |------|----------|
 | `context_lifecycle_persists` | Create context, store state, reload from storage, verify state matches |
-| `context_delete_removes_all` | Create context with members, events, tools. `delete_context` removes everything. Verify no keys with context prefix remain. |
+| `context_delete_removes_all` | Create context with members, events, outlets. `delete_context` removes everything. Verify no keys with context prefix remain. |
 | `event_log_range_query` | Append 100 events, load range 50-75, verify correct events in order |
 | `nonce_replay_rejected` | Record nonce, attempt same nonce again, verify rejection |
 | `nonce_pruning` | Record nonce with short expiry, advance time, prune, verify nonce is gone |
@@ -894,8 +910,7 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 
 ### Phase 4
 
-- `WasmSqliteStorage` (wa-sqlite + OPFSCoopSyncVFS, IDBBatchAtomicVFS fallback) for browser
-- TypeScript SDK storage configuration
+- TypeScript SDK storage configuration (native `SqliteStorage` for Node/Bun; browser = in-tab SCP client with browser-local snapshot storage — `IndexedDB`/OPFS — per ADR-057, keys on-device; the custodial remote-thin-client to a node remains only as an opt-in secondary mode, not the default)
 
 ### Phase 5
 
@@ -969,10 +984,58 @@ This ordering is sound because every recovery arm that must reach a live actor n
 For each unresolved saga:
 
 - Pre-Prepare states (no actor committed): discard.
-- Prepare-in-progress with one actor already Prepared: abort the Prepared actor (idempotent); discard. **Exception — a cross-context saga whose caller deduction was durably staged (normative, §6.2.4).** For a cross-context tool saga, Prepare-A **durably** persists the caller's velocity/budget/hard-rate-limit deduction **and** its `CallerReservationRecord` **before** the FSM journals the `PreparingB` entry, so a crash can leave a `PreparingA` **or** `PreparingB` journal over a **LIVE durable caller reservation**. For such an entry the recovery does **NOT** unconditionally discard: it reverses the caller's LOCAL economy from the durable `CallerReservationRecord` (the same reversal the live abort performs) and confirms delivery, writing **terminal-`Aborted` only** on a **confirmed reversal** (caller acknowledged `SettledOrAbsent`) **or** a **permanently-deleted caller context**. Because context restore precedes this reconcile (above), the caller is RESIDENT when the reversal is driven, so on the normal startup pass the reversal is delivered in-pass and the entry reaches terminal-`Aborted` with the refund applied. The journal is left **non-terminal** ONLY in the **genuinely-undeliverable** case — the caller context failed to restore, or its persistence existence cannot be confirmed (a transient read error is treated conservatively as "still present," never reaped) — and is then carried to the NEXT process start, whose restore-then-replay pass re-drives it. Marking terminal while a refund is outstanding would strand the durable deduction forever (this scan re-drives only non-terminal journals) — a permanent caller over-charge plus escrow leak. This crash-only path applies to both `PreparingA` and `PreparingB`; it does not alter the live abort path, where the in-process RAII reservation guard remains authoritative. A non-cross-context Prepare-in-progress entry has nothing to reverse and discards as above.
+- Prepare-in-progress with one actor already Prepared: abort the Prepared actor (idempotent); discard. **Exception — a cross-context saga whose caller deduction was durably staged (normative, §6.2.4).** For a cross-context outlet saga, Prepare-A **durably** persists the caller's velocity/budget/hard-rate-limit deduction **and** its `CallerReservationRecord` **before** the FSM journals the `PreparingB` entry, so a crash can leave a `PreparingA` **or** `PreparingB` journal over a **LIVE durable caller reservation**. For such an entry the recovery does **NOT** unconditionally discard: it reverses the caller's LOCAL economy from the durable `CallerReservationRecord` (the same reversal the live abort performs) and confirms delivery, writing **terminal-`Aborted` only** on a **confirmed reversal** (caller acknowledged `SettledOrAbsent`) **or** a **permanently-deleted caller context**. Because context restore precedes this reconcile (above), the caller is RESIDENT when the reversal is driven, so on the normal startup pass the reversal is delivered in-pass and the entry reaches terminal-`Aborted` with the refund applied. The journal is left **non-terminal** ONLY in the **genuinely-undeliverable** case — the caller context failed to restore, or its persistence existence cannot be confirmed (a transient read error is treated conservatively as "still present," never reaped) — and is then carried to the NEXT process start, whose restore-then-replay pass re-drives it. Marking terminal while a refund is outstanding would strand the durable deduction forever (this scan re-drives only non-terminal journals) — a permanent caller over-charge plus escrow leak. This crash-only path applies to both `PreparingA` and `PreparingB`; it does not alter the live abort path, where the in-process RAII reservation guard remains authoritative. A non-cross-context Prepare-in-progress entry has nothing to reverse and discards as above.
 - Commit-in-progress: re-send Commit to all participants; participants deduplicate by saga identifier.
 - `NeedsRepair`: surface via a metric (e.g., `saga_repair_needed`); operator retries via a repair command, or the saga is resolved on next process start after the underlying cause is addressed.
 - **Corrupt, torn, or undecodable entry (normative).** An entry whose framing fails the integrity check (§17.16.1 length-prefix + checksum) — a torn write, bit-rot, or otherwise undecodable record — is surfaced via the same `saga_repair_needed` metric, SKIPPED for operator repair, and the sweep CONTINUES. A single unrecoverable entry MUST NOT abort recovery of the remaining sagas: the scan recovers every other unresolved saga and never silently falls back to an earlier-seq entry for the corrupt saga (which could resurrect stale pre-commit state). The corrupt saga is neither replayed nor marked resolved; it awaits operator repair.
 - **Non-canonical key suffix — key-namespace anomaly (normative).** Distinct from the corrupt-framing case above: a journal entry may be well-framed and fully decodable yet be stored under a NON-canonical key — a key whose trailing seq suffix is not the canonical 20-digit zero-padded decimal sequence (`:020d`, §17) that the append path writes, including a 20-digit-but-out-of-`u64`-range value. This is a key-namespace anomaly, not an "undecodable" record, and it is dangerous precisely because latest-per-saga selection is the lexicographic MAX key per saga: a non-canonical suffix can sort ABOVE every real zero-padded seq and thereby win selection, overriding the canonical latest entry. Such an entry MUST be SKIPPED, flagged via the same `saga_repair_needed` metric, and MUST NEVER win latest-per-saga selection — the same sweep-isolation guarantee as the corrupt-entry case applies: every other unresolved saga is still recovered, the anomalous entry is neither replayed nor marked resolved, and it awaits operator repair. The read path enforces this in parity with the append path, which only ever emits canonical, in-range `:020d` suffixes.
 
 **Permanently-deleted caller (normative).** The ONE case reaped to terminal-`Aborted` rather than carried forward is a caller context PERMANENTLY DELETED from durable persistence: its reservation record died with the context, so there is nothing left to reverse locally and carrying the entry forward would loop forever without resolving. (An external escrow hold staged on a since-deleted context is irrecoverable from journal evidence alone and is settled by operator / external-system reconciliation — see §6.2.4.)
+
+## 17.17 Capability Selection Is Mandatory, Fails Closed, and Never Defaults
+
+Storage (§17.6) is one instance of a rule that governs **every provider capability** in SCP. A *provider capability* is any pluggable dependency the system resolves to a concrete implementation at construction time and that carries a runtime "which implementation?" choice: client storage (§17.6), relay blob storage (§17.7), DID/DHT resolution (§3.10), credential storage, key custody (§17.8), device attestation, and the relay querier are the current set. Each such capability falls under the normative rule stated here.
+
+§17.6 ("First-Party Storage Adapters") is the **first and canonical instance** of this rule. The sub-rules it states for storage — *Storage Selection Is Mandatory*, *Storage Selection Fails Closed*, *The Runtime Never Defaults Storage*, and *In-Memory Storage Is Dev/Test-Only* — are the storage specialization of the general requirements below. Storage got this discipline first; every other provider capability is held to the same standard.
+
+**Scope of this section (ownership boundary).** This section is protocol-normative: it defines *what* must hold for every capability, and it defines the security classification that decides how a capability's development arm may exist in a shipped artifact. It deliberately does **not** prescribe the engineering realization — the dispatch shape (a typed selector versus an injected interface), how a build is configured, or the mechanism by which a nullifier arm's absence is *proven*. Those are downstream of this section and are specified in ADR-062. When this section says a nullifier arm "MUST be provably absent," it states the requirement; the proof mechanism is the ADR's to define.
+
+### 17.17.1 Selection Requirements
+
+**SCP-CAPSEL-8000 — Selection is mandatory; there is no default.** Every provider capability with a runtime implementation choice MUST be explicitly selected by the caller at the construction boundary (the SDK/bridge/builder layer where a client, node, or relay is assembled). Constructing without an explicit selection for a required capability is an error. No constructor — in any binding — may expose a zero-argument form, an omit-the-field form, or any other shape that silently selects an implementation on the caller's behalf. Bindings that can express the requirement at compile time (a required constructor argument, a config type with no default) MUST do so; bindings that cannot (dynamically-typed or string-configured surfaces) MUST reject a missing selection at runtime with a dedicated error. `SCP-STORAGE-8000` (§17.6) is the storage-specific error surface of this rule.
+
+**SCP-CAPSEL-8001 — Selection fails closed.** When a caller selects a production backend and that backend cannot be satisfied — a resource cannot be opened, a dependency is unreachable, a key or credential is wrong, or the named implementation can never succeed — the construction boundary MUST return a terminal error the caller observes. Silent fallback to a development/in-memory arm, to a no-op implementation, or to no backend at all is FORBIDDEN. A development/in-memory arm is reachable ONLY through an explicit selection of that arm, never as a degradation path from a failed production selection. A best-effort, silently-swallowed failure is defensible only for a real backend's transient flakiness (e.g. a momentarily unreachable network peer that a later retry reaches); it is never defensible for a stub or in-memory arm that can never satisfy the guarantee at all.
+
+**SCP-CAPSEL-8002 — The runtime never defaults or manufactures a backend.** The runtime core MUST NOT manufacture, default, or infer a provider backend for any capability. The selection is made once, at the construction boundary, and threaded into the runtime as a required (non-optional) parameter. There MUST be no code path by which the runtime runs a capability against an implementation the caller did not explicitly supply.
+
+These three requirements are exactly the three §17.6 states for storage, lifted to every capability. A capability that satisfies all three cannot silently run against an implementation the operator did not choose, and cannot silently downgrade to a weaker one when the chosen one is unavailable.
+
+### 17.17.2 Security Classification of Development Arms
+
+Many capabilities ship a development/in-memory arm — an implementation intended for testing, CI, or local development. Every such arm MUST be classified, and its classification decides how — and whether — it may exist in a shipped production artifact. The classification is **mandatory before the capability ships**: every provider capability enumerated in §17.17 (client storage, relay blob storage, DID/DHT resolution, credential storage, key custody, device attestation, relay querier) MUST have its development arm classified as durability-only or nullifier before that capability is present on any shipped path. A capability shipping with an *unclassified* development arm — one whose classification has never been recorded, so no one has decided whether it is a nullifier — is itself a violation of this section, independent of what the arm later turns out to be: the absence of a classification is a decision not made, which SCP-CAPSEL-8000's "no silent selection" forbids at the classification level.
+
+**SCP-CAPSEL-8010 — Every development arm carries exactly one of two classifications.** A capability's in-memory/development arm is either:
+
+- a **durability-only affordance** — it may lose state (e.g. on process restart) but nullifies **no** security or verifiability property; or
+- a **security nullifier** — it nullifies a security or verifiability property the capability is responsible for (authenticity, reachability, freshness, revocation, attestation, or confidentiality).
+
+The classification is a property of *what the arm destroys*, not of how convenient it is. An arm that merely forgets state is durability-only. An arm that silently voids a guarantee a relying party depends on is a nullifier, however convenient. A durability-only arm fails **closed** — losing its state leaves the system unable to answer, not able to answer falsely. A nullifier fails **open** — it continues to answer, but its answer no longer carries the guarantee the caller believes it does.
+
+**SCP-CAPSEL-8011 — Durability-only arms are explicitly selectable, never default, never fallback, and never the only reachable arm in a shipped SDK.** A durability-only arm (e.g. in-memory storage, §17.6) MAY be compiled into any build and selected explicitly. It MUST NOT be a default (SCP-CAPSEL-8000), MUST NOT be reached as a fallback from a failed production selection (SCP-CAPSEL-8001), and a shipped SDK MUST also make a durable production arm reachable — a durability-only arm may never be the sole option a shipped artifact offers for its capability.
+
+**SCP-CAPSEL-8012 — Security-nullifier arms MUST be provably absent from shipped production artifacts.** A nullifier arm MUST NOT be *present in* — not merely unreachable within — a shipped production artifact. Absence is a property of the artifact, not of a runtime branch: a nullifier that is compiled in but guarded by a runtime flag is still an attack surface and still violates this rule, because the guarantee then rests on a flag never being flipped rather than on the dangerous code being gone. The *mechanism* by which absence is established and proven for a given artifact is downstream (ADR-062); the normative requirement is that a shipped production artifact contains no security-nullifier arm for any capability.
+
+> **ID note.** The classification IDs SCP-CAPSEL-8010/8011/8012/8013 are internal to this section and intentionally do NOT parallel the unrelated, pre-existing `SCP-STORAGE-8010`..`SCP-STORAGE-8013` block (browser/`scp-client-wasm` snapshot error codes, `sdk-common.md`). Only SCP-CAPSEL-8000 deliberately mirrors SCP-STORAGE-8000 (both name the storage-selection-mandatory rule). Do not read the matching `801x` suffixes as a cross-reference — there is no relationship between the two `801x` ranges.
+
+### 17.17.3 The DHT Backend Is an Instance — and Its In-Memory Arm Is a Nullifier
+
+DID/DHT resolution (§3.10) is a provider capability, so its backend selection is governed by §17.17.1 exactly as storage is: a shipped SDK must select its DHT backend explicitly, must fail closed when a production DHT backend is unsatisfiable, and must not let the runtime default one.
+
+**SCP-CAPSEL-8013 — In-memory DHT resolution is a security nullifier, categorically more dangerous than in-memory storage.** An in-memory DHT backend preserves the self-certification authenticity of any record it happens to hold (§3.10.8) — but **reachability and freshness are network properties**, and an in-memory backend destroys both: a publish reaches no peer, and a resolve sees no peer's writes. Under it, publishing to the DHT layer silently no-ops — a key rotation or revocation (§3.9 rotation-is-publication) is written into a process-local map no other resolver ever consults. The harm is *not* that rotation can never propagate: in a deployment whose relay layer (§3.10.2) is healthy, the rotation still propagates via relays and §3.10.7 highest-sequence-wins still defeats a stale DHT record. The harm is twofold and precise:
+
+- **Silent false success.** The SDK reports a successful publish while one of the two layers §3.10.6 mandates received nothing. This is categorically different from the *explicit, warned* DHT opt-out §3.10.6 permits (`disable_dht()`, which logs "DID resolution layer disabled. This identity may not be resolvable by all peers."): that opt-out is a legible, consented reduction of reach; an in-memory DHT backend is an unwarned misrepresentation of what was published. The nullifier is the *silence*, not the reduced reach.
+- **Loss of dual-layer suppression resilience (§3.10.8).** With a real DHT, an attacker must suppress a document on ALL of an identity's relays AND the DHT to prevent resolution. An in-memory DHT contributes nothing to that redundancy, collapsing the required attack to relay-only suppression — and leaving any resolver that must fall back to the DHT (all of an identity's relays unreachable, §3.10.3; or a non-SCP BEP44 client that reaches only the DHT, §3.10.6) with stale-or-absent data that still verifies by signature.
+
+Because its publish reports success while doing nothing and its resolve contributes no freshness, an in-memory DHT arm fails **open** on the DHT layer. That is the sharp contrast with in-memory storage (§17.6), which fails **closed**: a restarted node with lost state cannot silently present a false guarantee, it simply has no state. An in-memory DHT arm is therefore a **security nullifier**, not a durability-only affordance, and is governed by SCP-CAPSEL-8012 (provably absent from shipped production artifacts), not SCP-CAPSEL-8011.
+
+This is the determination the general rule exists to force. Two capabilities can each offer an "in-memory" arm, and one (storage) is a legitimate development affordance while the other (DHT) is a shipped-artifact security hole. Uniformly treating both as "just the dev backend" is the error §17.17 closes: the durability-only-vs-nullifier classification MUST be made explicitly, per capability, against the property that capability is responsible for — never assumed uniform across capabilities because they share the label "in-memory."

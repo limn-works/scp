@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::ContextHandle;
-use scp_identity::DID;
+use crate::context::builder::ContextEventLogProvider;
+use scp_did::DID;
+use scp_event_log::payload::{AppBoundPayload, AppUnboundPayload, encode_payload};
 use scp_protocol::context::roles::Capability;
 
 // ---------------------------------------------------------------------------
@@ -91,6 +93,14 @@ pub enum SandboxError {
     /// Serialization or deserialization failed.
     #[error("serialization failed: {0}")]
     SerializationFailed(String),
+
+    /// Appending the bind or unbind event to the durable event log failed.
+    ///
+    /// Returned when `ContextEventLogProvider::append_context_event_with_payload`
+    /// fails during `bind_app` or `unbind_app`. The bind/unbind operation is
+    /// rejected — silent app attachment is not possible (spec §8.4).
+    #[error("event log failed: {0}")]
+    EventLogFailed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -140,19 +150,19 @@ impl CapabilityEntry {
     #[must_use]
     pub fn to_capabilities(&self) -> Vec<Capability> {
         // Extract the capability category from the resource URI.
-        // Format: scp:ctx:{context_id}/{category} or scp:ctx:{context_id}/tools/{tool_id}
+        // Format: scp:ctx:{context_id}/{category} or scp:ctx:{context_id}/outlets/{outlet_id}
         let category = self.resource.rsplit('/').next().unwrap_or(&self.resource);
 
-        // Check if this is a tools/{tool_id} resource
+        // Check if this is an outlets/{outlet_id} resource
         let parts: Vec<&str> = self.resource.split('/').collect();
-        let is_tool = parts.len() >= 2 && parts[parts.len() - 2] == "tools";
+        let is_outlet = parts.len() >= 2 && parts[parts.len() - 2] == "outlets";
 
         let mut capabilities = Vec::new();
 
         for action in &self.actions {
-            match (category, action.as_str(), is_tool) {
+            match (category, action.as_str(), is_outlet) {
                 (_, "invoke", true) => {
-                    capabilities.push(Capability::ToolInvoke(category.to_owned()));
+                    capabilities.push(Capability::OutletCall(category.to_owned()));
                 }
                 ("messaging" | "members", "read", _) => {
                     capabilities.push(Capability::MessagesRead);
@@ -161,9 +171,9 @@ impl CapabilityEntry {
                 ("members", "write" | "admin", _) => {
                     capabilities.push(Capability::MemberInvite);
                 }
-                ("tools", "invoke", _) => capabilities.push(Capability::ToolInvokeAll),
-                ("tools", "register" | "admin", _) => {
-                    capabilities.push(Capability::ToolRegister);
+                ("outlets", "invoke", _) => capabilities.push(Capability::OutletCallAll),
+                ("outlets", "register" | "admin", _) => {
+                    capabilities.push(Capability::OutletRegister);
                 }
                 ("governance", "write", _) => capabilities.push(Capability::GovernancePropose),
                 ("governance", "admin", _) => {
@@ -542,29 +552,29 @@ impl ScopedHandle {
         self.check_capability(&Capability::GovernanceVote)
     }
 
-    /// Checks `ToolInvokeAll` or `ToolInvoke(tool_id)` capability.
+    /// Checks `OutletCallAll` or `OutletCall(outlet_id)` capability.
     ///
     /// # Errors
     ///
-    /// Returns `SandboxError::CapabilityDenied` if neither `ToolInvokeAll` nor
-    /// `ToolInvoke(tool_id)` is granted.
-    pub fn check_tool_invoke(&self, tool_id: &str) -> Result<(), SandboxError> {
+    /// Returns `SandboxError::CapabilityDenied` if neither `OutletCallAll` nor
+    /// `OutletCall(outlet_id)` is granted.
+    pub fn check_outlet_call(&self, outlet_id: &str) -> Result<(), SandboxError> {
         if self
             .allowed_capabilities
-            .contains(&Capability::ToolInvokeAll)
+            .contains(&Capability::OutletCallAll)
         {
             return Ok(());
         }
-        self.check_capability(&Capability::ToolInvoke(tool_id.to_owned()))
+        self.check_capability(&Capability::OutletCall(outlet_id.to_owned()))
     }
 
-    /// Checks `ToolRegister` capability.
+    /// Checks `OutletRegister` capability.
     ///
     /// # Errors
     ///
-    /// Returns `SandboxError::CapabilityDenied` if `ToolRegister` is not granted.
-    pub fn check_tool_register(&self) -> Result<(), SandboxError> {
-        self.check_capability(&Capability::ToolRegister)
+    /// Returns `SandboxError::CapabilityDenied` if `OutletRegister` is not granted.
+    pub fn check_outlet_register(&self) -> Result<(), SandboxError> {
+        self.check_capability(&Capability::OutletRegister)
     }
 
     /// Checks `MemberInvite` capability.
@@ -666,13 +676,13 @@ impl ScopedHandle {
         self.check_capability(&Capability::MediaScreenShare)
     }
 
-    /// Checks `ToolInterface` capability.
+    /// Checks `OutletInterface` capability.
     ///
     /// # Errors
     ///
-    /// Returns `SandboxError::CapabilityDenied` if `ToolInterface` is not granted.
-    pub fn check_tool_interface(&self) -> Result<(), SandboxError> {
-        self.check_capability(&Capability::ToolInterface)
+    /// Returns `SandboxError::CapabilityDenied` if `OutletInterface` is not granted.
+    pub fn check_outlet_interface(&self) -> Result<(), SandboxError> {
+        self.check_capability(&Capability::OutletInterface)
     }
 }
 
@@ -769,11 +779,16 @@ pub fn validate_declaration(
 
     for cap in &requested {
         if !ceiling_set.contains(cap) {
-            // Check if ToolInvokeAll covers ToolInvoke(specific)
-            if matches!(cap, Capability::ToolInvoke(_))
-                && ceiling_set.contains(&Capability::ToolInvokeAll)
+            // The "All"-covers-specific shortcut mirrors `CapabilityCeiling::contains`
+            // (roles.rs): `OutletCallAll` covers `OutletCall(id)` and `OutletQueryAll`
+            // covers `OutletQuery(id)`. The two classes are disjoint (query ≠ call,
+            // §5.4.2), so each wildcard only covers its own family.
+            if (matches!(cap, Capability::OutletCall(_))
+                && ceiling_set.contains(&Capability::OutletCallAll))
+                || (matches!(cap, Capability::OutletQuery(_))
+                    && ceiling_set.contains(&Capability::OutletQueryAll))
             {
-                // ToolInvokeAll in ceiling covers specific ToolInvoke
+                // A wildcard in the ceiling covers this specific capability.
             } else {
                 denied.push(DeniedCapability {
                     capability: cap.clone(),
@@ -782,11 +797,13 @@ pub fn validate_declaration(
             }
         }
         if !role_set.contains(cap) {
-            // Check if ToolInvokeAll covers ToolInvoke(specific)
-            if matches!(cap, Capability::ToolInvoke(_))
-                && role_set.contains(&Capability::ToolInvokeAll)
+            // Same "All"-covers-specific shortcut for the role's granted set.
+            if (matches!(cap, Capability::OutletCall(_))
+                && role_set.contains(&Capability::OutletCallAll))
+                || (matches!(cap, Capability::OutletQuery(_))
+                    && role_set.contains(&Capability::OutletQueryAll))
             {
-                // ToolInvokeAll in role covers specific ToolInvoke
+                // A wildcard in the role covers this specific capability.
             } else {
                 denied.push(DeniedCapability {
                     capability: cap.clone(),
@@ -817,59 +834,103 @@ pub fn validate_declaration(
 }
 
 // ---------------------------------------------------------------------------
-// AppBindEvent / AppUnbindEvent (event log entries)
+// Durable event log operations (spec §8.4)
 // ---------------------------------------------------------------------------
 
-/// Event log entry for when an app is bound to a context.
+/// Validates a capability declaration and binds the app, appending an
+/// `AppBound` (tag 74) event to the durable event log (spec §8.4).
 ///
-/// Recorded in the context's event log at bind time for auditability
-/// (spec 8.4.2). Context members can inspect which apps are bound and
-/// what capabilities they hold.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppBindEvent {
-    /// The DID of the app that was bound.
-    pub app_did: DID,
-    /// The capabilities granted to the app.
-    pub capabilities: Vec<Capability>,
-    /// The app name from the declaration.
-    pub app_name: String,
-    /// The app version from the declaration.
-    pub app_version: String,
-}
+/// This is the authoritative bind path. It first calls `validate_declaration`
+/// for all-or-nothing capability checking, then serialises an
+/// [`AppBoundPayload`] and appends it via
+/// [`ContextEventLogProvider::append_context_event_with_payload`]. If the
+/// event log append fails the bind is rejected — silent app attachment is not
+/// possible.
+///
+/// # Errors
+///
+/// Returns `SandboxError::CeilingExceeded` / `SandboxError::InvalidDeclaration`
+/// / `SandboxError::SignatureVerificationFailed` (via `validate_declaration`)
+/// or `SandboxError::EventLogFailed` when the durable append fails.
+pub async fn bind_app(
+    declaration: &CapabilityDeclaration,
+    context_ceiling: &[Capability],
+    role_capabilities: &[Capability],
+    context_handle: ContextHandle,
+    event_log: &dyn ContextEventLogProvider,
+    actor_did: &str,
+    timestamp_secs: u64,
+) -> Result<ScopedHandle, SandboxError> {
+    let scoped = validate_declaration(
+        declaration,
+        context_ceiling,
+        role_capabilities,
+        context_handle,
+    )?;
 
-/// Event log entry for when an app is unbound from a context.
-///
-/// Recorded in the context's event log when an app is removed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppUnbindEvent {
-    /// The DID of the app that was unbound.
-    pub app_did: DID,
-}
-
-/// Formats an `AppBindEvent` as an event log string.
-///
-/// Returns a string suitable for appending to the context's Merkle event log
-/// via `ContextEventLogProvider::append_event`.
-#[must_use]
-pub fn format_bind_event(event: &AppBindEvent) -> String {
-    let cap_names: Vec<String> = event
-        .capabilities
+    let mut capabilities: Vec<String> = scoped
+        .allowed_capabilities()
         .iter()
         .map(std::string::ToString::to_string)
         .collect();
-    format!(
-        "AppBound:{}:{}:{}:[{}]",
-        event.app_did,
-        event.app_name,
-        event.app_version,
-        cap_names.join(",")
-    )
+    capabilities.sort_unstable();
+    let payload = encode_payload(&AppBoundPayload {
+        app_did: scoped.app_did().to_string(),
+        app_name: scoped.declaration().app_name.clone(),
+        app_version: scoped.declaration().app_version.clone(),
+        capabilities,
+    })
+    .map_err(|e| SandboxError::EventLogFailed(e.to_string()))?;
+
+    let context_id_bytes = super::state::context_id_to_bytes(scoped.context_id());
+    event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::AppBound,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+        .await
+        .map_err(|e| SandboxError::EventLogFailed(e.to_string()))?;
+
+    Ok(scoped)
 }
 
-/// Formats an `AppUnbindEvent` as an event log string.
-#[must_use]
-pub fn format_unbind_event(event: &AppUnbindEvent) -> String {
-    format!("AppUnbound:{}", event.app_did)
+/// Unbinds an app from a context, appending an `AppUnbound` (tag 75) event
+/// to the durable event log (spec §8.4).
+///
+/// Serialises an [`AppUnboundPayload`] and appends it via
+/// [`ContextEventLogProvider::append_context_event_with_payload`]. If the
+/// event log append fails the unbind is rejected — silent app detachment is
+/// not possible.
+///
+/// # Errors
+///
+/// Returns `SandboxError::EventLogFailed` when the durable append fails.
+pub async fn unbind_app(
+    context_id: &str,
+    app_did: &str,
+    event_log: &dyn ContextEventLogProvider,
+    actor_did: &str,
+    timestamp_secs: u64,
+) -> Result<(), SandboxError> {
+    let payload = encode_payload(&AppUnboundPayload {
+        app_did: app_did.to_owned(),
+    })
+    .map_err(|e| SandboxError::EventLogFailed(e.to_string()))?;
+
+    let context_id_bytes = super::state::context_id_to_bytes(context_id);
+    event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::AppUnbound,
+            actor_did,
+            payload,
+            timestamp_secs,
+        )
+        .await
+        .map_err(|e| SandboxError::EventLogFailed(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -900,22 +961,16 @@ fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, SandboxErr
 fn extract_ed25519_pubkey_from_did(did: &DID) -> Result<[u8; 32], SandboxError> {
     let did_str = did.as_ref();
 
-    if let Some(id_part) = did_str.strip_prefix("did:dht:") {
-        // did:dht uses z-base-32 encoding of the Ed25519 public key.
-        let decoded = zbase32::decode(id_part).map_err(|_| {
-            SandboxError::InvalidDeclaration(format!(
-                "failed to decode z-base-32 from did:dht: {did_str}"
-            ))
-        })?;
-        if decoded.len() != 32 {
-            return Err(SandboxError::InvalidDeclaration(format!(
-                "did:dht key is {} bytes, expected 32",
-                decoded.len()
-            )));
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        Ok(key)
+    if did_str.starts_with("did:dht:") {
+        // did:dht encodes the Ed25519 public key as z-base-32 in the DID
+        // suffix (`did:dht:z<z-base-32>`). Delegate to the single hardened
+        // `scp-did` parser so prefix handling, the 32-byte length check, AND
+        // z-base-32 canonicality all come from ONE place, identical to the
+        // native identity/FFI decoders (single-parser parity). The prior inline
+        // code stripped only "did:dht:" (not the multibase 'z'), leaving the 'z'
+        // in the decoded payload → 33 bytes → it rejected EVERY valid did:dht
+        // DID; delegation fixes that and adds the canonicality guard.
+        scp_did::extract_public_key_from_did(did_str).map_err(SandboxError::InvalidDeclaration)
     } else if let Some(id_part) = did_str.strip_prefix("did:key:z") {
         // did:key uses base58btc encoding with a multicodec prefix.
         // Ed25519 multicodec prefix is 0xed01.
@@ -1004,7 +1059,10 @@ pub fn declaration_content_hash(
     clippy::expect_used,
     clippy::panic,
     clippy::redundant_clone,
-    clippy::large_stack_frames
+    clippy::large_stack_frames,
+    // `std::sync::Mutex` is used by the `RecordingEventLog` test mock; it is
+    // never held across an `.await` point so it cannot deadlock the runtime.
+    clippy::disallowed_types
 )]
 mod tests {
     use super::*;
@@ -1527,37 +1585,37 @@ mod tests {
     }
 
     #[test]
-    fn scoped_handle_check_tool_invoke_specific_granted() {
-        let handle = make_scoped_handle(vec![Capability::ToolInvoke("my_tool".to_owned())]);
-        assert!(handle.check_tool_invoke("my_tool").is_ok());
+    fn scoped_handle_check_outlet_call_specific_granted() {
+        let handle = make_scoped_handle(vec![Capability::OutletCall("my_outlet".to_owned())]);
+        assert!(handle.check_outlet_call("my_outlet").is_ok());
     }
 
     #[test]
-    fn scoped_handle_check_tool_invoke_specific_denied() {
-        let handle = make_scoped_handle(vec![Capability::ToolInvoke("my_tool".to_owned())]);
+    fn scoped_handle_check_outlet_call_specific_denied() {
+        let handle = make_scoped_handle(vec![Capability::OutletCall("my_outlet".to_owned())]);
         assert!(matches!(
-            handle.check_tool_invoke("other_tool"),
+            handle.check_outlet_call("other_outlet"),
             Err(SandboxError::CapabilityDenied { .. })
         ));
     }
 
     #[test]
-    fn scoped_handle_check_tool_invoke_all_covers_specific() {
-        let handle = make_scoped_handle(vec![Capability::ToolInvokeAll]);
-        assert!(handle.check_tool_invoke("any_tool").is_ok());
+    fn scoped_handle_check_outlet_call_all_covers_specific() {
+        let handle = make_scoped_handle(vec![Capability::OutletCallAll]);
+        assert!(handle.check_outlet_call("any_outlet").is_ok());
     }
 
     #[test]
-    fn scoped_handle_check_tool_register_granted() {
-        let handle = make_scoped_handle(vec![Capability::ToolRegister]);
-        assert!(handle.check_tool_register().is_ok());
+    fn scoped_handle_check_outlet_register_granted() {
+        let handle = make_scoped_handle(vec![Capability::OutletRegister]);
+        assert!(handle.check_outlet_register().is_ok());
     }
 
     #[test]
-    fn scoped_handle_check_tool_register_denied() {
+    fn scoped_handle_check_outlet_register_denied() {
         let handle = make_scoped_handle(vec![]);
         assert!(matches!(
-            handle.check_tool_register(),
+            handle.check_outlet_register(),
             Err(SandboxError::CapabilityDenied { .. })
         ));
     }
@@ -1656,9 +1714,9 @@ mod tests {
     }
 
     #[test]
-    fn scoped_handle_check_tool_interface_granted() {
-        let handle = make_scoped_handle(vec![Capability::ToolInterface]);
-        assert!(handle.check_tool_interface().is_ok());
+    fn scoped_handle_check_outlet_interface_granted() {
+        let handle = make_scoped_handle(vec![Capability::OutletInterface]);
+        assert!(handle.check_outlet_interface().is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -1676,8 +1734,8 @@ mod tests {
         assert!(handle.check_send_message().is_err());
         assert!(handle.check_propose_governance_action().is_err());
         assert!(handle.check_governance_vote().is_err());
-        assert!(handle.check_tool_invoke("any").is_err());
-        assert!(handle.check_tool_register().is_err());
+        assert!(handle.check_outlet_call("any").is_err());
+        assert!(handle.check_outlet_register().is_err());
         assert!(handle.check_member_invite().is_err());
         assert!(handle.check_member_remove().is_err());
         assert!(handle.check_role_assign().is_err());
@@ -1689,7 +1747,7 @@ mod tests {
         assert!(handle.check_media_voice().is_err());
         assert!(handle.check_media_video().is_err());
         assert!(handle.check_media_screen_share().is_err());
-        assert!(handle.check_tool_interface().is_err());
+        assert!(handle.check_outlet_interface().is_err());
     }
 
     #[test]
@@ -1701,36 +1759,6 @@ mod tests {
         assert!(handle.check_send_message().is_err());
         assert!(handle.check_propose_governance_action().is_err());
         assert!(handle.check_governance_vote().is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // Event Log Recording
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn format_bind_event_produces_parseable_string() {
-        let event = AppBindEvent {
-            app_did: DID::from("did:key:z1234"),
-            capabilities: vec![Capability::MessagesRead, Capability::MessagesWrite],
-            app_name: "Test App".to_owned(),
-            app_version: "1.0.0".to_owned(),
-        };
-
-        let formatted = format_bind_event(&event);
-        assert!(formatted.starts_with("AppBound:"));
-        assert!(formatted.contains("did:key:z1234"));
-        assert!(formatted.contains("messages:read"));
-        assert!(formatted.contains("messages:write"));
-    }
-
-    #[test]
-    fn format_unbind_event_produces_parseable_string() {
-        let event = AppUnbindEvent {
-            app_did: DID::from("did:key:z1234"),
-        };
-
-        let formatted = format_unbind_event(&event);
-        assert_eq!(formatted, "AppUnbound:did:key:z1234");
     }
 
     // -----------------------------------------------------------------------
@@ -1772,25 +1800,25 @@ mod tests {
     }
 
     #[test]
-    fn capability_entry_tools_invoke() {
+    fn capability_entry_outlets_invoke() {
         let entry = CapabilityEntry {
-            resource: "scp:ctx:test/tools".to_owned(),
+            resource: "scp:ctx:test/outlets".to_owned(),
             actions: vec!["invoke".to_owned()],
             constraints: None,
         };
         let caps = entry.to_capabilities();
-        assert_eq!(caps, vec![Capability::ToolInvokeAll]);
+        assert_eq!(caps, vec![Capability::OutletCallAll]);
     }
 
     #[test]
-    fn capability_entry_specific_tool() {
+    fn capability_entry_specific_outlet() {
         let entry = CapabilityEntry {
-            resource: "scp:ctx:test/tools/my_tool".to_owned(),
+            resource: "scp:ctx:test/outlets/my_outlet".to_owned(),
             actions: vec!["invoke".to_owned()],
             constraints: None,
         };
         let caps = entry.to_capabilities();
-        assert_eq!(caps, vec![Capability::ToolInvoke("my_tool".to_owned())]);
+        assert_eq!(caps, vec![Capability::OutletCall("my_outlet".to_owned())]);
     }
 
     #[test]
@@ -1901,19 +1929,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ToolInvokeAll covers ToolInvoke in ceiling/role validation
+    // OutletCallAll covers OutletCall in ceiling/role validation
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tool_invoke_all_covers_specific_tool_in_ceiling() {
+    fn outlet_call_all_covers_specific_outlet_in_ceiling() {
         let (signing_key, did) = test_keypair();
         let mut decl = CapabilityDeclaration {
             scp_version: "1.0".to_owned(),
             app_id: did.clone(),
-            app_name: "Tool App".to_owned(),
+            app_name: "Outlet App".to_owned(),
             app_version: "1.0.0".to_owned(),
             capabilities: vec![CapabilityEntry {
-                resource: "scp:ctx:test/tools/specific_tool".to_owned(),
+                resource: "scp:ctx:test/outlets/specific_outlet".to_owned(),
                 actions: vec!["invoke".to_owned()],
                 constraints: None,
             }],
@@ -1922,9 +1950,9 @@ mod tests {
         };
         sign_declaration(&mut decl, &signing_key).unwrap();
 
-        // Ceiling has ToolInvokeAll, not the specific tool.
-        let ceiling = vec![Capability::ToolInvokeAll];
-        let role_caps = vec![Capability::ToolInvokeAll];
+        // Ceiling has OutletCallAll, not the specific outlet.
+        let ceiling = vec![Capability::OutletCallAll];
+        let role_caps = vec![Capability::OutletCallAll];
         let handle = ContextHandle::new("ctx-1".to_owned(), ContextParams::default());
 
         let result = validate_declaration(&decl, &ceiling, &role_caps, handle);
@@ -2049,35 +2077,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // App Bind/Unbind Event Serialization
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn app_bind_event_serialization() {
-        let event = AppBindEvent {
-            app_did: DID::from("did:key:z1234"),
-            capabilities: vec![Capability::MessagesRead],
-            app_name: "My App".to_owned(),
-            app_version: "1.0.0".to_owned(),
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        let roundtripped: AppBindEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtripped, event);
-    }
-
-    #[test]
-    fn app_unbind_event_serialization() {
-        let event = AppUnbindEvent {
-            app_did: DID::from("did:key:z1234"),
-        };
-
-        let json = serde_json::to_string(&event).unwrap();
-        let roundtripped: AppUnbindEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(roundtripped, event);
-    }
-
-    // -----------------------------------------------------------------------
     // sign_declaration
     // -----------------------------------------------------------------------
 
@@ -2123,6 +2122,65 @@ mod tests {
         let did = DID::from("did:web:example.com");
         let result = extract_ed25519_pubkey_from_did(&did);
         assert!(matches!(result, Err(SandboxError::InvalidDeclaration(_))));
+    }
+
+    #[test]
+    fn extract_pubkey_from_canonical_did_dht() {
+        // Regression: the inline decoder stripped only "did:dht:" (not the
+        // multibase 'z'), so the 'z' stayed in the z-base-32 payload → 33 bytes
+        // → it rejected EVERY valid did:dht DID. Delegation to the hardened
+        // scp-did parser fixes the prefix handling: a canonical did:dht:z DID
+        // now resolves to the correct 32-byte Ed25519 key.
+        let pubkey_bytes: [u8; 32] = [0x37; 32];
+        let did = DID::from(format!("did:dht:z{}", zbase32::encode(&pubkey_bytes)));
+
+        let result = extract_ed25519_pubkey_from_did(&did)
+            .expect("a canonical did:dht DID must resolve to its Ed25519 key");
+        assert_eq!(
+            result, pubkey_bytes,
+            "extracted key must equal the encoded public key"
+        );
+    }
+
+    #[test]
+    fn extract_pubkey_rejects_non_canonical_did_dht() {
+        // The delegated scp-did parser enforces z-base-32 canonicality: a
+        // non-canonical spelling of a valid key (differing only in the
+        // trailing padding bits) MUST be rejected, so two DID strings can never
+        // resolve to the same app-declaration signing key.
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let pubkey_bytes: [u8; 32] = [0x37; 32];
+        let canonical_encoded = zbase32::encode(&pubkey_bytes);
+
+        // Build a non-canonical alternate by toggling a padding bit of the
+        // trailing char.
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[last_idx ^ 1];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+
+        // Sanity: the mutated spelling still decodes to the same 32 bytes.
+        assert_eq!(
+            zbase32::decode(&mutated_encoded)
+                .expect("alternate decodes")
+                .as_slice(),
+            &pubkey_bytes[..],
+            "the mutated spelling must be a real non-canonical alternate of the same key"
+        );
+
+        let did = DID::from(format!("did:dht:z{mutated_encoded}"));
+        let result = extract_ed25519_pubkey_from_did(&did);
+        assert!(
+            matches!(result, Err(SandboxError::InvalidDeclaration(_))),
+            "non-canonical did:dht spelling must be rejected"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2225,7 +2283,7 @@ mod tests {
         assert!(!handle.has_capability(&Capability::MessagesRead));
         assert!(!handle.has_capability(&Capability::MessagesWrite));
         assert!(!handle.has_capability(&Capability::GovernancePropose));
-        assert!(!handle.has_capability(&Capability::ToolInvokeAll));
+        assert!(!handle.has_capability(&Capability::OutletCallAll));
     }
 
     #[test]
@@ -2264,18 +2322,6 @@ mod tests {
         let caps = decl.requested_capabilities();
         assert!(caps.contains(&Capability::MessagesRead));
         assert!(caps.contains(&Capability::GovernancePropose));
-    }
-
-    #[test]
-    fn format_bind_event_empty_capabilities() {
-        let event = AppBindEvent {
-            app_did: DID::from("did:key:z1234"),
-            capabilities: vec![],
-            app_name: "Empty App".to_owned(),
-            app_version: "0.0.1".to_owned(),
-        };
-        let formatted = format_bind_event(&event);
-        assert!(formatted.contains("[]"));
     }
 
     #[test]
@@ -2324,7 +2370,7 @@ mod tests {
                     }),
                 },
                 CapabilityEntry {
-                    resource: "scp:ctx:test/tools/scheduler".to_owned(),
+                    resource: "scp:ctx:test/outlets/scheduler".to_owned(),
                     actions: vec!["invoke".to_owned()],
                     constraints: Some(CapabilityConstraint {
                         max_message_size: None,
@@ -2354,7 +2400,7 @@ mod tests {
             Capability::MessagesRead,
             Capability::MessagesWrite,
             Capability::GovernancePropose,
-            Capability::ToolInvokeAll,
+            Capability::OutletCallAll,
             Capability::MemberInvite,
         ];
         let handle = make_scoped_handle(caps);
@@ -2362,10 +2408,296 @@ mod tests {
         assert!(handle.check_read_messages().is_ok());
         assert!(handle.check_send_message().is_ok());
         assert!(handle.check_propose_governance_action().is_ok());
-        assert!(handle.check_tool_invoke("any_tool").is_ok());
+        assert!(handle.check_outlet_call("any_outlet").is_ok());
         assert!(handle.check_member_invite().is_ok());
         // Not granted:
         assert!(handle.check_context_close().is_err());
         assert!(handle.check_member_remove().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // bind_app / unbind_app — durable event log append (spec §8.4)
+    // -----------------------------------------------------------------------
+
+    use crate::context::builder::ContextEventLogProvider;
+    use scp_event_log::{EventPayload, EventType};
+    use scp_protocol::context::builder::ContextCreationError;
+    use std::sync::{Arc, Mutex};
+
+    /// Minimal mock that records every `append_event` call.
+    struct RecordingEventLog {
+        calls: Arc<Mutex<Vec<(EventType, String)>>>,
+        fail: bool,
+    }
+
+    impl RecordingEventLog {
+        fn new_ok() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+            }
+        }
+
+        fn new_fail() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                fail: true,
+            }
+        }
+
+        fn recorded(&self) -> Vec<(EventType, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for RecordingEventLog {
+        async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event_type: EventType,
+            actor_did: &str,
+            _payload: EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            if self.fail {
+                return Err(ContextCreationError::EventLogFailed(
+                    "simulated failure".to_owned(),
+                ));
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .push((event_type, actor_did.to_owned()));
+            Ok(())
+        }
+
+        async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_app_appends_app_bound_event() {
+        let (signing_key, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        sign_declaration(&mut decl, &signing_key).unwrap();
+
+        let ceiling = vec![Capability::MessagesRead, Capability::MessagesWrite];
+        let role_caps = ceiling.clone();
+        let handle = ContextHandle::new("ctx-bind".to_owned(), ContextParams::default());
+        let log = RecordingEventLog::new_ok();
+
+        let result = bind_app(
+            &decl,
+            &ceiling,
+            &role_caps,
+            handle,
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let calls = log.recorded();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, EventType::AppBound);
+        assert_eq!(calls[0].1, "did:key:actor");
+    }
+
+    #[tokio::test]
+    async fn bind_app_ceiling_exceeded_does_not_append() {
+        let (signing_key, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        sign_declaration(&mut decl, &signing_key).unwrap();
+
+        // Ceiling does NOT include MessagesWrite even though the declaration
+        // requests it — so validate_declaration should fail BEFORE the log
+        // append.
+        let ceiling = vec![Capability::MessagesRead];
+        let role_caps = ceiling.clone();
+        let handle = ContextHandle::new("ctx-bind".to_owned(), ContextParams::default());
+        let log = RecordingEventLog::new_ok();
+
+        let result = bind_app(
+            &decl,
+            &ceiling,
+            &role_caps,
+            handle,
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await;
+
+        assert!(matches!(result, Err(SandboxError::CeilingExceeded { .. })));
+        // No event must be appended when validation fails.
+        assert!(log.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bind_app_event_log_failure_propagates() {
+        let (signing_key, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        sign_declaration(&mut decl, &signing_key).unwrap();
+
+        let ceiling = vec![Capability::MessagesRead, Capability::MessagesWrite];
+        let role_caps = ceiling.clone();
+        let handle = ContextHandle::new("ctx-bind".to_owned(), ContextParams::default());
+        let log = RecordingEventLog::new_fail();
+
+        let result = bind_app(
+            &decl,
+            &ceiling,
+            &role_caps,
+            handle,
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await;
+
+        assert!(matches!(result, Err(SandboxError::EventLogFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn unbind_app_appends_app_unbound_event() {
+        let log = RecordingEventLog::new_ok();
+
+        let result = unbind_app(
+            "ctx-unbind",
+            "did:key:app",
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let calls = log.recorded();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, EventType::AppUnbound);
+        assert_eq!(calls[0].1, "did:key:actor");
+    }
+
+    #[tokio::test]
+    async fn unbind_app_event_log_failure_propagates() {
+        let log = RecordingEventLog::new_fail();
+
+        let result = unbind_app(
+            "ctx-unbind",
+            "did:key:app",
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await;
+
+        assert!(matches!(result, Err(SandboxError::EventLogFailed(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Payload field assertion test
+    // -----------------------------------------------------------------------
+
+    /// Recording mock that captures the full payload for field-level assertions.
+    struct RecordingEventLogWithPayload {
+        calls: Arc<Mutex<Vec<(EventType, String, EventPayload)>>>,
+    }
+
+    impl RecordingEventLogWithPayload {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn recorded(&self) -> Vec<(EventType, String, EventPayload)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for RecordingEventLogWithPayload {
+        async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            event_type: EventType,
+            actor_did: &str,
+            payload: EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((event_type, actor_did.to_owned(), payload));
+            Ok(())
+        }
+
+        async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_app_payload_fields_match_scoped_handle() {
+        use scp_event_log::payload::{AppBoundPayload, decode_payload};
+
+        let (signing_key, did) = test_keypair();
+        let mut decl = test_declaration(&did);
+        sign_declaration(&mut decl, &signing_key).unwrap();
+
+        let ceiling = vec![Capability::MessagesRead, Capability::MessagesWrite];
+        let role_caps = ceiling.clone();
+        let handle = ContextHandle::new("ctx-payload".to_owned(), ContextParams::default());
+        let log = RecordingEventLogWithPayload::new();
+
+        let scoped = bind_app(
+            &decl,
+            &ceiling,
+            &role_caps,
+            handle,
+            &log,
+            "did:key:actor",
+            1_000_000,
+        )
+        .await
+        .expect("bind_app should succeed");
+
+        let calls = log.recorded();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, EventType::AppBound);
+        assert_eq!(calls[0].1, "did:key:actor");
+
+        // Decode and verify payload fields match the ScopedHandle.
+        let payload: AppBoundPayload =
+            decode_payload(&calls[0].2).expect("payload should decode as AppBoundPayload");
+
+        assert_eq!(payload.app_did, scoped.app_did().to_string());
+        assert_eq!(payload.app_name, decl.app_name);
+        assert_eq!(payload.app_version, decl.app_version);
+
+        // Verify capabilities are sorted (deterministic Merkle leaves).
+        assert!(
+            payload.capabilities.windows(2).all(|w| w[0] <= w[1]),
+            "AppBoundPayload.capabilities must be sorted for Merkle convergence"
+        );
+        // Verify the content matches what was granted.
+        let mut expected: Vec<String> = scoped
+            .allowed_capabilities()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(payload.capabilities, expected);
     }
 }

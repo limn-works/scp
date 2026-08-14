@@ -251,12 +251,20 @@ pub(crate) async fn ucan_validate_on(
     handle: &NapiContextHandle,
     token: String,
     capability: String,
-    presenting_agent_did: Option<String>,
+    presenting_agent_did: String,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    // FAIL CLOSED (no silent security default): `presenting_agent_did` is a
+    // REQUIRED parameter — never defaulted to the token's own `aud` (which would
+    // make the step-5 audience check tautological and inflate trust). Validated as
+    // a pure input before any state lookup / token parse — mirrors
+    // `ucan_evaluate_on`. `validate_did` rejects an empty/whitespace value.
+    let agent_did = presenting_agent_did.trim();
+    validate_did(agent_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
@@ -273,11 +281,6 @@ pub(crate) async fn ucan_validate_on(
                 message: format!("invalid capability URI '{capability}': {e}"),
                 code: codes::PERM_3001.to_owned(),
             })?;
-
-    // Determine the presenting agent DID: explicit parameter or token audience.
-    let agent_did = presenting_agent_did
-        .as_deref()
-        .unwrap_or(&parsed_token.payload.aud);
 
     // Build proof resolver from optional proof tokens.
     // Uses compute_cid (SHA-256 of encoded JWT) — NOT compute_revocation_cid
@@ -313,7 +316,11 @@ pub(crate) async fn ucan_validate_on(
             context_creator_did: &rt.core.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            // Generic validate site: not an outlet-invocation path, so caveat
+            // resolution is a constant `None` (`NoCaveatResolver`). Only
+            // outlet-invocation sites use `TokenNbCaveatResolver`.
+            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
         };
 
         // Execute the full 11-step validation pipeline.
@@ -332,19 +339,44 @@ pub(crate) async fn ucan_validate_on(
 /// the same 11-step ADR-016 pipeline via `evaluate_ucan` but returns a
 /// structured [`NapiCapabilityValidation`] instead of throwing, and never
 /// records the token's nonce (read-only probe).
+///
+/// `capability` is OPTIONAL: `None` (or empty) evaluates the token's intrinsic
+/// validity with no invoked-capability grant-match challenge (mirroring
+/// `evaluate_ucan(None, ..)`); `Some` additionally requires the token grants it.
+///
+/// FAIL CLOSED: `presenting_agent_did` is a REQUIRED (non-optional) parameter (no
+/// silent security default). It is never defaulted to the token's own `aud` —
+/// defaulting would make the step-5 audience check a tautological self-check
+/// (`aud == aud`) that does NOT bind the token to any external subject, so a token
+/// addressed to someone else would report `signatures_valid` (trust inflation). An
+/// empty/whitespace value is rejected by `validate_did`. The SDK trust path always
+/// passes the subject; raw diagnostic callers must pass an explicit presenting agent.
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
 pub(crate) async fn ucan_evaluate_on(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     token: String,
-    capability: String,
-    presenting_agent_did: Option<String>,
+    capability: Option<String>,
+    presenting_agent_did: String,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<NapiCapabilityValidation> {
     crate::napi_check_handle!(&bi.core, handle);
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    // An empty/whitespace-only capability means "no challenge" — treat it as
+    // absent rather than validating it as a (non-empty) URI.
+    let capability = capability.filter(|c| !c.trim().is_empty());
+    if let Some(ref cap) = capability {
+        validate_capability_uri(cap).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    }
+
+    // FAIL CLOSED (no silent security default): `presenting_agent_did` is a
+    // REQUIRED parameter — never defaulted to the token's own `aud` (which would
+    // make the step-5 audience check tautological and inflate trust). Validated as
+    // a pure input before any state lookup. `validate_did` rejects an
+    // empty/whitespace value.
+    let agent_did = presenting_agent_did.trim();
+    validate_did(agent_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
@@ -353,19 +385,18 @@ pub(crate) async fn ucan_evaluate_on(
     // Step 1: Parse the UCAN token using scp-core's parser.
     let parsed_token = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
-    // Parse the required capability URI.
-    let required_cap: CapabilityUri =
-        capability
-            .parse()
-            .map_err(|e: CoreUcanError| ScpNapiError::Permission {
-                message: format!("invalid capability URI '{capability}': {e}"),
-                code: codes::PERM_3001.to_owned(),
-            })?;
-
-    // Determine the presenting agent DID: explicit parameter or token audience.
-    let agent_did = presenting_agent_did
+    // Parse the optional required capability URI. `None` => intrinsic-validity
+    // diagnostic (no invoked-capability grant-match challenge).
+    let required_cap: Option<CapabilityUri> = capability
         .as_deref()
-        .unwrap_or(&parsed_token.payload.aud);
+        .map(|cap| {
+            cap.parse::<CapabilityUri>()
+                .map_err(|e: CoreUcanError| ScpNapiError::Permission {
+                    message: format!("invalid capability URI '{cap}': {e}"),
+                    code: codes::PERM_3001.to_owned(),
+                })
+        })
+        .transpose()?;
 
     // Build proof resolver from optional proof tokens.
     let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
@@ -395,10 +426,14 @@ pub(crate) async fn ucan_evaluate_on(
             context_creator_did: &rt.core.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            // Generic evaluate site: not an outlet-invocation path, so caveat
+            // resolution is a constant `None` (`NoCaveatResolver`). Only
+            // outlet-invocation sites use `TokenNbCaveatResolver`.
+            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
         };
 
-        Ok(evaluate_ucan(&parsed_token, &required_cap, &ctx))
+        Ok(evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx))
     })
     .map_err(napi::Error::from)?;
 
@@ -474,7 +509,7 @@ pub(crate) async fn ucan_mint_on(
     // Sign the token by delegating to the retained `KeyCustody` via scp-core.
     // napi-rs async functions already run on the tokio runtime, so we can
     // await directly without spawning a separate task.
-    let token = mint_ucan(&params, custody.as_ref(), &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, custody.as_ref(), &scp_clock::SystemClock)
         .await
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Permission {
@@ -535,8 +570,7 @@ pub(crate) async fn ucan_delegate_on(
     // Defense-in-depth: verify delegator DID matches parent token's audience.
     // The delegator must be the audience of the parent token to form a valid
     // delegation chain (iss/aud linkage). scp-core enforces this too, but
-    // catching it at the bridge level provides clearer error messages and
-    // matches the WASM bridge's defense-in-depth check.
+    // catching it at the bridge level provides clearer error messages.
     if delegator_did != parsed_parent.payload.aud {
         return Err(napi::Error::from(ScpNapiError::Permission {
             message: format!(
@@ -608,12 +642,7 @@ pub(crate) async fn ucan_delegate_on(
         let rt_handle = tokio::runtime::Handle::current();
         let result = tokio::task::block_in_place(|| {
             rt_handle.block_on(async {
-                delegate_ucan(
-                    &params,
-                    entry.custody.as_ref(),
-                    &scp_primitives::SystemClock,
-                )
-                .await
+                delegate_ucan(&params, entry.custody.as_ref(), &scp_clock::SystemClock).await
             })
         });
 
@@ -750,12 +779,12 @@ fn encode_hex(bytes: &[u8]) -> String {
 )]
 mod tests {
     use super::*;
+    use scp_clock::Clock;
     use scp_core::crypto::ucan::UcanToken;
     use scp_core::crypto::ucan::validate::{
         DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     };
     use scp_ffi_common::BridgeDidResolver;
-    use scp_primitives::Clock;
 
     // -----------------------------------------------------------------------
     // BridgeDidResolver
@@ -840,6 +869,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: "h.p.s".to_owned(),
@@ -869,12 +899,12 @@ mod tests {
 
     #[test]
     fn bridge_nonce_tracker_delegates_to_inner() {
-        use scp_identity::cache::SystemClock;
+        use scp_clock::SystemClock;
 
         let mut tracker =
             scp_core::crypto::ucan::nonce::NonceTracker::new("ctx-test".to_owned(), SystemClock);
 
-        let now_millis = scp_primitives::SystemClock.now_millis();
+        let now_millis = scp_clock::SystemClock.now_millis();
         let now_secs = now_millis / 1000;
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;
@@ -1171,7 +1201,7 @@ mod tests {
     // This test verifies the registry correctly distinguishes different DIDs.
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[test]
     fn identity_registry_returns_correct_identity_for_different_dids() {
         use std::sync::Arc;
@@ -1193,8 +1223,12 @@ mod tests {
         let pre_rotation_custody_b =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
 
-        let dht_a = scp_identity::DidDht::new();
-        let dht_b = scp_identity::DidDht::new();
+        let dht_a = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            scp_dht::InMemoryDhtClient::new(),
+        ));
+        let dht_b = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            scp_dht::InMemoryDhtClient::new(),
+        ));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1288,7 +1322,7 @@ mod tests {
         runtime::remove_identity(&bi, &did_b);
     }
 
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[test]
     fn remove_identity_cleans_up_registry() {
         use std::sync::Arc;
@@ -1303,7 +1337,9 @@ mod tests {
         ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-        let dht = scp_identity::DidDht::new();
+        let dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            scp_dht::InMemoryDhtClient::new(),
+        ));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1347,7 +1383,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[test]
     fn remove_identity_if_present_returns_correct_bool() {
         use std::sync::Arc;
@@ -1362,7 +1398,9 @@ mod tests {
         ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-        let dht = scp_identity::DidDht::new();
+        let dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            scp_dht::InMemoryDhtClient::new(),
+        ));
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1443,6 +1481,65 @@ mod tests {
         assert!(
             reason.contains("SCP-IDENT-1017"),
             "expected SCP-IDENT-1017, got: {reason}"
+        );
+    }
+
+    /// SECURITY (Finding 2). `ucan_evaluate` MUST reject an empty/whitespace
+    /// `presenting_agent_did` rather than defaulting to the token's own `aud`.
+    /// Omission is impossible — the parameter is a required non-`Option` `String`,
+    /// so the type system enforces presence. The check is a pure-input gate before
+    /// context lookup / token parse, so a dummy token suffices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_evaluate_rejects_empty_presenting_agent_did() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-eval-fail-closed".to_owned(),
+            "did:dht:z6MkCreator".to_owned(),
+        );
+
+        let empty = ucan_evaluate_on(
+            &bi,
+            &handle,
+            "header.payload.sig".to_owned(),
+            None,
+            "   ".to_owned(),
+            None,
+        )
+        .await;
+        assert!(
+            empty.is_err(),
+            "ucan_evaluate must fail closed when presenting_agent_did is empty"
+        );
+    }
+
+    /// SECURITY (symmetric gate hardening). The ENFORCING `ucan_validate` gate
+    /// MUST reject an empty/whitespace `presenting_agent_did` rather than
+    /// defaulting to the token's own `aud`. Omission is impossible — the parameter
+    /// is a required non-`Option` `String`, so the type system enforces presence.
+    /// Pure-input gate before context lookup / token parse, so a dummy token
+    /// suffices.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_validate_rejects_empty_presenting_agent_did() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let handle = crate::context::NapiContextHandle::test_active_on(
+            &bi,
+            "ctx-validate-fail-closed".to_owned(),
+            "did:dht:z6MkCreator".to_owned(),
+        );
+
+        let empty = ucan_validate_on(
+            &bi,
+            &handle,
+            "header.payload.sig".to_owned(),
+            "messages:write".to_owned(),
+            "   ".to_owned(),
+            None,
+        )
+        .await;
+        assert!(
+            empty.is_err(),
+            "ucan_validate must fail closed when presenting_agent_did is empty"
         );
     }
 }

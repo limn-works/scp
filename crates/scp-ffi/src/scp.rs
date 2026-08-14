@@ -144,7 +144,7 @@ impl PyScp {
                 };
                 // Defense-in-depth: validate path string at FFI boundary
                 // (matches the project pattern for every other caller-supplied
-                // string — DID, relay URL, tool name, etc.). #1543 PR-C
+                // string — DID, relay URL, outlet name, etc.). #1543 PR-C
                 // security review found this was the lone unvalidated string
                 // input. See crates/scp-ffi/common/src/validate.rs.
                 scp_ffi_common::validate::validate_storage_path(&path_str).map_err(|e| {
@@ -361,7 +361,7 @@ impl PyScp {
     ///
     /// In-memory construction is infallible (it cannot perform any I/O), so
     /// this never returns an error and never panics.
-    #[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_in_memory_for_test() -> Self {
         Self {
@@ -528,5 +528,78 @@ mod tests {
                 "unknown-selection error must carry SCP-STORAGE-8000: {msg}"
             );
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-062 §Decision 6 / SCP-CAPINJECT-006 — shipped-build fail-closed proofs.
+    //
+    // These run in the shipped (no-`testing`) test lane (`cargo test -p scp-ffi`
+    // with the crate's own `testing` feature OFF), where this PyO3 bridge's own
+    // `identity_create` / device-attestation *verify* arms select the fail-closed
+    // path. They are the AC5 (create → SCP-IDENT-1059) and AC3 (verify →
+    // SCP-IDENT-1016) per-bridge assertions, independent of the scp-identity
+    // `config.rs` and scp-node proofs. Gated `#[cfg(not(feature = "testing"))]`.
+    // -----------------------------------------------------------------------
+
+    /// AC5: on a shipped build the production `identity_create` path fails closed
+    /// with [`IDENT_1059`](scp_ffi_common::error_codes::IDENT_1059) — it reaches
+    /// the pre-rotation commitment step (after real File custody + real Pkarr DHT
+    /// construction) and returns the typed error rather than minting the
+    /// `InMemoryPreRotationCustody` nullifier. File custody is used because
+    /// `in_memory` custody is itself severed on shipped builds; a temp `HOME` +
+    /// `SCP_KEY_PASSPHRASE` give the File backend a real, isolated key file.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn identity_create_fails_closed_without_pre_rotation_backend() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().expect("runtime init");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Isolate the File custody key directory (`$HOME/.scp/keys.bin`) and set
+        // the passphrase it requires. nextest runs each test in its own process,
+        // so these env mutations do not leak into sibling tests.
+        // SAFETY: single-threaded test process (nextest process-per-test); no
+        // other thread reads the environment concurrently.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("SCP_KEY_PASSPHRASE", "fail-closed-test-passphrase");
+        }
+        Python::with_gil(|py| {
+            let scp = PyScp::new_in_memory_for_test();
+            let msg = match scp.identity_create(py, "file", None) {
+                Ok(_) => panic!(
+                    "shipped identity_create must FAIL CLOSED — the in-memory \
+                     pre-rotation nullifier must not be minted on a production path"
+                ),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                msg.contains(scp_ffi_common::error_codes::IDENT_1059),
+                "shipped identity_create must fail closed with SCP-IDENT-1059, got: {msg}"
+            );
+        });
+    }
+
+    /// AC3: on a shipped build the device-attestation *verify* op fails closed
+    /// with [`IDENT_1016`](scp_ffi_common::error_codes::IDENT_1016) — an honest
+    /// "no production backend" error, never a silently-valid `true` (spec §9:187,
+    /// ADR-062 §Decision 3). This is the free-function verify surface, which fails
+    /// closed with no identity/DHT/custody precondition.
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn verify_device_attestation_fails_closed() {
+        let msg = match crate::identity::identity_verify_device_attestation(
+            "did:dht:z6MkExampleShippedBuild",
+            "dGVzdC10b2tlbg==",
+        ) {
+            Ok(_) => panic!(
+                "shipped device-attestation verify must FAIL CLOSED — never return a \
+                 silently-valid result without a real backend"
+            ),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            msg.contains(scp_ffi_common::error_codes::IDENT_1016),
+            "shipped verify must fail closed with SCP-IDENT-1016, got: {msg}"
+        );
     }
 }

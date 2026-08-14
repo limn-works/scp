@@ -1,0 +1,25 @@
+---
+name: adr049-d7-commit-broadcast-retry-tests
+description: Review of commit_broadcast_retry_tests (governance_helpers.rs @e3b30309f) — fail-closed MLS-Commit retry bookkeeping. SHIP; call-site keep-vs-coalesced choice is the honest uncovered boundary.
+metadata:
+  type: project
+---
+
+Branch chore/adr049-d7-transport, commit e3b30309f. 8 tests, module `commit_broadcast_retry_tests` at tail of `crates/scp-runtime/src/context/governance_helpers.rs` (~6200-6552). ADR-049 Decision 7: async MLS-Commit broadcast split from its retry bookkeeping.
+
+Helpers under test (same file): `try_broadcast_commit`@5445 (async send only, no state), `apply_broadcast_failure`@5502 (sync; applies to 3 disjoint Class-C fields; MAX_PENDING_COMMITS cap→commit_fault at 5520), `keep_broadcast_failure`@5589 (wraps apply in `commit_class_s_keep` = FAIL-CLOSED persist).
+
+**Regression detection VERIFIED sound at helper level.** `commit_class_s_keep` (class_s.rs:2803-2813) runs f THEN `persist_state_fail_closed` synchronously; `class_c_view` (class_s.rs:3200) has NO persist. So Test 6 `persists==1` and Test 7 `Err(PersistenceFailed)` genuinely catch "keep_broadcast_failure stops persisting" / "helper internal re-hoisted to class_c_view". Load-bearing.
+
+**KEY FINDING (honest, documented boundary):** the tests do NOT cover the CALL-SITE choice of keep-vs-coalesced. Safety-gated sites use `keep_broadcast_failure` (remove@1452, rotate@2868, recovery trust_recovery_helpers.rs:259, leave lifecycle_helpers.rs:392); best-effort sites use coalesced `apply_broadcast_failure(cell.class_c_view()...)` (add@1278, reset@2501/2514). Swapping a safety-gated site's `keep_broadcast_failure(...)` → `apply_broadcast_failure(cell.class_c_view()...)` — arguably the literal "original bug" shape — passes ALL 8 tests green. Cause: cfg(test) no-crypto pipeline serializes Commit to EMPTY bytes → try_broadcast_commit short-circuits None before the enqueue (Test 5 corroborates: empty→None,0 sends). Author's NOTE discloses this. Mild overstatement: "surrounding governance/remove/rotate/leave suites cover the call-site wiring" — those suites run under the SAME no-crypto pipeline so they cover the SUCCESS-path wiring only; the failure→keep routing is unguarded anywhere except code review + doc comments. No structural gate enforces keep at safety-gated sites.
+
+**Minor strengthenings (non-blocking):** Test 2 fillers use `remove_op()` == the failure's op, so `marker.operation==remove_op()` can't distinguish dropped-op from filler-op — make fillers a different CommitOperation. Test 8 (recovery-tagged enqueue) is low-ROI/near-dup of Test 1 (operation-tag preservation already proven generically); its recovery-specific value is exactly the call-site keep-routing it admits it can't test. Test 6 could capture persisted snapshot to prove entry was IN it (currently ordering-implied via CountingOkPersistence which discards snapshot). Test 7 could assert commit_fault stayed None for parity with Test 1.
+
+Flakiness LOW: current-thread tokio, AtomicUsize SeqCst, TestClock fixed, in-memory transport+storage, no sleep/poll/order-dep. Real MlsCryptoProvider + real ActorDeps + real ContextPersistence (not mocked internals) — behavior-level. Test 1 explicitly asserts commit_fault.is_none() (good — the "asserts push but not that fault stayed None" trap is avoided). Verdict: SHIP.
+
+**SECOND ZERO @db73de872 (tests) + 86fc093e5 (doc) — all 4 round-1 findings cleanly RESOLVED, 8/8 pass:**
+1. Test 2 provenance FIXED: fillers now `RotateContentKeys{reason:None}`, injected failure stays RemoveMember. `marker.operation==remove_op()` now load-bearing — apply_broadcast_failure@5522 sources marker.operation from `pending.operation` (the FAILURE's dropped op), fillers are separate queue entries never inspected; distinct variants make it a real provenance discriminator (catches a refactor that built the marker from a filler).
+2. Test 6 snapshot content FIXED: CountingOkPersistence gained `last_snapshot: Arc<Mutex<Option<ContextSnapshot>>>`, stores `snapshot.clone()` in persist_context; test asserts captured `snapshot.pending_commits.len()==1` via expect() (proves entry IS in the durable snapshot, capture non-stale). ContextSnapshot.pending_commits is real (state.rs:943).
+3. Test 7 gate FIXED: adds `cell.commit_fault.is_none()` after the failed persist — proves persist failure doesn't spuriously trip the gate (queue-empty enqueue never sets fault; only queue-full/exhaustion does).
+4. Module NOTE reworded HONESTLY: no longer claims surrounding suites "cover the call-site wiring"; now states keep-vs-coalesced SITE choice is an ACCEPTED boundary guarded by CODE REVIEW (no-crypto pipeline can't manufacture non-empty Commit to reach failure branch). Accurate, no overclaim.
+Mutex pattern SOUND: `clippy::disallowed_types` allow at module@5954 mirrors sibling CapturingPersistence (lifecycle_helpers.rs:3384, allow@3288); lock is single synchronous statement, never held across .await. Genuine test-mock pattern, not a smell.

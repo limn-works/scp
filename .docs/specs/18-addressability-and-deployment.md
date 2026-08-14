@@ -18,7 +18,7 @@ Every step in this chain is self-certifying or cryptographically verified. No HT
 
 `scp://` URIs are the direct-connection mechanism — a context ID plus relay URL, no HTTP intermediary. They are the canonical way to share a context reference out-of-band.
 
-`.well-known/scp` is an **optional web on-ramp** for the "I know a domain, nothing else" entry point. It is advisory only — HTTPS-dependent, not self-certifying. Clients MUST verify `.well-known/scp` data against DHT-resolved DID documents before trusting it (§18.3.2). Web clients (TypeScript/WASM in browser) use `.well-known/scp` to bridge from HTTP-land, then verify via DHT. This layering must be explicit: HTTP is the outermost, least-trusted discovery layer. The core protocol operates entirely without it.
+`.well-known/scp` is an **optional web on-ramp** for the "I know a domain, nothing else" entry point. It is advisory only — HTTPS-dependent, not self-certifying. Clients MUST verify `.well-known/scp` data against DHT-resolved DID documents before trusting it (§18.3.2). Web clients (a browser — normally an in-tab client running the protocol itself with keys on-device per ADR-057, or optionally a remote custodial thin client to a server-side `scp-node`) use `.well-known/scp` to bridge from HTTP-land, then verify via DHT. This layering must be explicit: HTTP is the outermost, least-trusted discovery layer. The core protocol operates entirely without it.
 
 The agent workstation tier (§10.2) is the primary deployment target for addressability. A dedicated always-on machine running builder agents is the natural host for SCP infrastructure: relay, identity, contexts, and HTTP serving are marginal additional load on hardware that's already running 24/7. The `ApplicationNode` (§18.6) is the SDK type that makes this deployment trivial.
 
@@ -54,7 +54,7 @@ SCP uses multiple DID document service endpoint types, each serving a distinct p
 | Type | Purpose | Consumer | Spec Reference |
 |------|---------|----------|----------------|
 | `SCPRelay` | Transport-layer relay URLs for encrypted blob routing | `TransportManager` (ADR-012) | §18.2.1 |
-| `SCPCapabilities` | Application-layer capability endpoints (tool schemas, agent descriptions) | Discovery Engine (§6.2.2) | ADR-020 |
+| `SCPCapabilities` | Application-layer capability endpoints (outlet schemas, agent descriptions) | Discovery Engine (§6.2.2) | ADR-020 |
 | `IdentityPrivateState` | Relay URLs storing identity private state blobs | Identity Manager | §3.7 |
 | `PreRotationCommitment` | SHA-256 commitment hash for pre-rotation key (applies to `#0` and `#active` only; `#agent` is a software key with simpler rotation — no pre-rotation needed, see ADR-039) | Identity Manager (§9.12) | ADR-003 |
 | `SCPBroadcastContext` | Broadcast context ID + relay URLs for author discovery | Discovery Engine | §5.14.11 |
@@ -65,7 +65,7 @@ SCP uses multiple DID document service endpoint types, each serving a distinct p
 **SCPRelay vs SCPCapabilities.** These are distinct service types with different consumers and different purposes:
 
 - `SCPRelay` = **transport layer**. Where to send encrypted blobs. Consumed by `TransportManager`. Any SCP participant publishing to this identity routes through these URLs.
-- `SCPCapabilities` = **application layer**. What tools and capabilities an agent offers. Consumed by the Discovery Engine. Agents looking for specific capabilities query these endpoints.
+- `SCPCapabilities` = **application layer**. What outlets and capabilities an agent offers. Consumed by the Discovery Engine. Agents looking for specific capabilities query these endpoints.
 
 A relay operator's DID document contains `SCPRelay` entries (where to connect). An agent's DID document may contain both `SCPRelay` entries (how to reach the agent) and `SCPCapabilities` entries (what the agent can do).
 

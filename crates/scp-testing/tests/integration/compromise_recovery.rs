@@ -10,13 +10,14 @@
 
 use std::collections::HashSet;
 
+use async_trait::async_trait;
 use scp_core::identity::recovery::{
     CompromiseRecoveryOrchestrator, CompromiseTier, ContactNotification, ContextRecoveryState,
     KeyRotationOutcome, PskRotationParams, RecoveryBackend, RecoveryError, RecoveryResult,
     RecoveryStepError, active_key_rotation_outcome, agent_key_rotation_outcome,
     identity_key_rotation_outcome,
 };
-use scp_identity::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -48,8 +49,9 @@ impl MockBackend {
     }
 }
 
+#[async_trait(?Send)]
 impl RecoveryBackend for MockBackend {
-    fn mls_update(
+    async fn mls_update(
         &self,
         context_id: &str,
         _key_rotation: &KeyRotationOutcome,
@@ -62,7 +64,7 @@ impl RecoveryBackend for MockBackend {
         Ok(())
     }
 
-    fn revoke_ucans(
+    async fn revoke_ucans(
         &self,
         context_id: &str,
         _key_rotation: &KeyRotationOutcome,
@@ -75,7 +77,7 @@ impl RecoveryBackend for MockBackend {
         Ok(())
     }
 
-    fn rotate_key_packages(
+    async fn rotate_key_packages(
         &self,
         context_id: &str,
         _key_rotation: &KeyRotationOutcome,
@@ -88,7 +90,7 @@ impl RecoveryBackend for MockBackend {
         Ok(())
     }
 
-    fn notify_contacts(
+    async fn notify_contacts(
         &self,
         _did: &DID,
         _tier: CompromiseTier,
@@ -98,7 +100,7 @@ impl RecoveryBackend for MockBackend {
         self.notify_contacts_result
     }
 
-    fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+    async fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
         self.rotate_psk_result
     }
 }
@@ -130,7 +132,7 @@ async fn compromise_tier_agent() {
             &HashSet::new(),
             None,
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -173,7 +175,7 @@ async fn compromise_tier_active_signing() {
             &contacts,
             Some(&psk_params),
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -216,7 +218,7 @@ async fn compromise_tier_identity_key() {
             &contacts,
             Some(&psk_params),
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -442,7 +444,7 @@ async fn recovery_result_completed_vs_failed() {
             &HashSet::new(),
             None,
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -490,7 +492,7 @@ async fn recovery_result_with_rejoin_context() {
             &HashSet::new(),
             None,
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -541,7 +543,7 @@ async fn psk_rotation_params() {
     let kr = active_key_rotation_outcome(&alice, 7000);
     let backend = MockBackend::new();
 
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let result = orch
         .execute_recovery(
             CompromiseTier::ActiveSigning,
@@ -646,7 +648,7 @@ async fn recovery_with_contact_notification_failure() {
             &contacts,
             None,
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -683,7 +685,7 @@ async fn recovery_with_psk_rotation_failure() {
             &HashSet::new(),
             Some(&psk_params),
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();
@@ -753,7 +755,7 @@ async fn recovery_with_no_contexts() {
             &HashSet::new(),
             None,
             &backend,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .await
         .unwrap();

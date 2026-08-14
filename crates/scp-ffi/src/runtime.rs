@@ -3,14 +3,14 @@
 //! The FFI bridge functions accept `context_id: &str` parameters but need
 //! access to both the shared [`ContextManager`] (for lifecycle, membership,
 //! governance, and messaging operations) and per-context FFI-specific state
-//! (tool registries, event logs, UCAN state, message channels).
+//! (outlet registries, event logs, UCAN state, message channels).
 //!
 //! # Architecture (post-#386 rewrite)
 //!
 //! Context lifecycle is delegated to a shared [`ContextManager`] which holds
 //! the canonical membership, role, governance, broadcast, and TTL state.
-//! Per-context FFI-specific state (tool registries, event logs, UCAN
-//! revocation/nonce tracking, tool handlers, message channels) lives in
+//! Per-context FFI-specific state (outlet registries, event logs, UCAN
+//! revocation/nonce tracking, outlet handlers, message channels) lives in
 //! [`FfiBridgeState`] — a thin struct that does NOT duplicate any
 //! `ContextManager` state.
 //!
@@ -21,7 +21,7 @@
 //! share these registries. Context IDs and identity DIDs from one tenant are
 //! accessible to another. This is a known architectural limitation.
 //!
-//! The NAPI (`Node.js`), `UniFFI` (Swift/Kotlin), and WASM bridges avoid this
+//! The NAPI (`Node.js`) and `UniFFI` (Swift/Kotlin) bridges avoid this
 //! issue by using per-instance handle objects instead of global registries.
 //! The `PyO3` bridge must be refactored to match.
 //!
@@ -58,33 +58,33 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
-use scp_core::context::builder::{
-    ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
-};
+use scp_core::context::app_sandbox::ScopedHandle;
+use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+use scp_core::context::outlets::OutletRegistry;
 use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::providers::{
     MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
 };
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
-use scp_core::context::tools::ToolRegistry;
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
+use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
+use scp_ffi_common::credentials::FfiCredentialStore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `pyscp_check_handle!` macro can refer to it as
 // `$crate::runtime::CoreFields`.
+use scp_clock::{Clock, SystemClock};
+use scp_did::DidDocument;
 pub use scp_ffi_common::bridge_instance::CoreFields;
-use scp_identity::cache::SystemClock;
-use scp_identity::{DidDocument, ScpIdentity};
+use scp_identity::ScpIdentity;
 use scp_platform::PlatformError;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::sqlite::SqliteStorage;
-use scp_platform::testing::InMemoryStorage;
 use scp_platform::traits::Storage;
-use scp_primitives::Clock;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
@@ -139,14 +139,14 @@ macro_rules! pyscp_check_handle {
     }};
 }
 
-/// A sync tool handler function that takes JSON input and returns JSON output.
+/// A sync outlet handler function that takes JSON input and returns JSON output.
 ///
-/// Stored in the FFI bridge state when Python callers register tool handlers
-/// via [`register_tool_handler`]. The FFI bridge dispatches tool invocations
+/// Stored in the FFI bridge state when Python callers register outlet handlers
+/// via [`register_outlet_handler`]. The FFI bridge dispatches outlet invocations
 /// through these handlers instead of echoing validated input.
 ///
 /// See SCP-212 and ADR-010 for the handler registration design.
-pub type ToolHandler =
+pub type OutletHandler =
     Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
@@ -450,18 +450,6 @@ pub struct PyBridgeInstance {
     /// drop during instance shutdown.
     pub(crate) mcp_client_registry: Arc<DashMap<String, crate::mcp::McpClientState>>,
 
-    /// Bridge credential store (replaces `CREDENTIAL_STORE` in
-    /// `bridge_connector.rs`).
-    ///
-    /// Migrated from a process-global `OnceLock<InMemoryCredentialStore>`
-    /// singleton in commit 5. Production deployments should replace this with
-    /// a `Storage`-backed implementation when it lands (spec §12.11.2).
-    /// Dropping the `Arc` on shutdown zeroizes any retained bridge credential
-    /// keys via the store's `Zeroizing` fields — there is no explicit clear
-    /// step in `bridge_specific_shutdown`, so the store lives exactly as long
-    /// as its last `Arc` reference.
-    pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
-
     /// Most recently connected relay URL (replaces `CONNECTED_RELAY_URL` in
     /// `transport.rs`).
     ///
@@ -471,13 +459,44 @@ pub struct PyBridgeInstance {
     /// currently bound to an active `TransportManager`.
     pub(crate) connected_relay_url: RwLock<Option<String>>,
 
+    /// Per-instance active outlet-stream registry (§5.4.5, SCP-OUT-037).
+    ///
+    /// Maps a `StreamHandleId` (the stream's `request_id` as lowercase hex)
+    /// to the live [`StreamEntry`](crate::outlet_stream::StreamEntry) that
+    /// owns the returned `StreamSessionHandle` (control plane) and its
+    /// detached chunk receiver (data plane), plus the `invoker_did` pinned
+    /// at open. Per-INSTANCE (not a process-global) so handle-affinity and
+    /// no-bridge-globals hold: a stream opened on one bridge instance is
+    /// invisible to another, and instance shutdown drops every live stream
+    /// with the `Arc`. Entries are evicted when `poll_next` observes the
+    /// terminal (channel-closed) sentinel.
+    pub(crate) outlet_stream_registry: Arc<DashMap<String, crate::outlet_stream::StreamEntry>>,
+
+    /// Per-instance active cross-context streaming-saga registry (§5.4.5,
+    /// SCP-OUT-047).
+    ///
+    /// Maps a saga id (the durable `SagaId` string minted at the
+    /// Commit-transition) to the live
+    /// [`StreamingSagaEntry`](scp_ffi_common::streaming_saga::StreamingSagaEntry)
+    /// that owns A's plaintext operator-signed chunk receiver (handed out
+    /// PROMPTLY at Commit, AC1) plus the pinned target-context id / invoker DID /
+    /// `request_id` a truncated-close recovery keys on. Per-INSTANCE (not a
+    /// process-global) so handle-affinity and no-bridge-globals hold — a saga
+    /// opened on one bridge instance is invisible to another, and instance
+    /// shutdown drops every live saga stream with the `Arc`. Entries are evicted
+    /// when `poll_next` observes the terminal (channel-closed) sentinel. DISTINCT
+    /// from `outlet_stream_registry` (same-context streams) so the two surfaces
+    /// never collide on a handle id.
+    pub(crate) outlet_streaming_saga_registry:
+        Arc<DashMap<String, scp_ffi_common::streaming_saga::StreamingSagaEntry>>,
+
     /// Shared full-stack test network (replaces `NETWORK` in `testing.rs`).
     ///
     /// Migrated from a process-global
     /// `std::sync::Mutex<Option<FullStackNetwork>>` singleton in commit 9.
-    /// Feature-gated behind `allow_in_memory_custody` to mirror `testing.rs`
+    /// Feature-gated behind `testing` to mirror `testing.rs`
     /// which is only compiled with that feature.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
 }
 
@@ -494,11 +513,10 @@ impl PyBridgeInstance {
             ffi_bridge_state: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
-            credential_store: Arc::new(
-                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-            ),
             connected_relay_url: RwLock::new(None),
-            #[cfg(feature = "allow_in_memory_custody")]
+            outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
         }
     }
@@ -512,7 +530,7 @@ impl PyBridgeInstance {
     /// dev/test in-memory selection (spec §17.6), NOT a silent default —
     /// the public `SCP(config)` constructor still requires an explicit
     /// storage dict.
-    #[cfg(any(test, feature = "testing", feature = "allow_in_memory_custody"))]
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn new_in_memory_for_test() -> Self {
         let instance = Self::new_py();
@@ -537,11 +555,10 @@ impl PyBridgeInstance {
             ffi_bridge_state: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
-            credential_store: Arc::new(
-                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-            ),
             connected_relay_url: RwLock::new(None),
-            #[cfg(feature = "allow_in_memory_custody")]
+            outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "testing")]
             network: std::sync::Mutex::new(None),
         }
     }
@@ -628,11 +645,10 @@ impl PyBridgeInstance {
                     ffi_bridge_state: Arc::new(DashMap::new()),
                     mcp_server_registry: Arc::new(DashMap::new()),
                     mcp_client_registry: Arc::new(DashMap::new()),
-                    credential_store: Arc::new(
-                        scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-                    ),
                     connected_relay_url: RwLock::new(None),
-                    #[cfg(feature = "allow_in_memory_custody")]
+                    outlet_stream_registry: Arc::new(DashMap::new()),
+                    outlet_streaming_saga_registry: Arc::new(DashMap::new()),
+                    #[cfg(feature = "testing")]
                     network: std::sync::Mutex::new(None),
                 };
                 let _ = instance
@@ -702,12 +718,37 @@ impl PyBridgeInstance {
         &self.mcp_client_registry
     }
 
-    /// Returns a reference to the bridge credential store.
+    /// Selects this instance's **durable** bridge credential store from the
+    /// chosen storage backend, or `None` if storage has not yet been selected.
+    ///
+    /// The credential store is derived on demand from the SAME per-instance
+    /// [`StorageProvider`] the supervisor's `mls_storage` / saga journal derive
+    /// from (spec §17.6) — so a `Sqlite` selection persists bridge tokens across
+    /// restart and an encrypted-in-memory selection keeps them encrypted at
+    /// rest. Because `StorageProvider` is not itself `EncryptedStorage` (the
+    /// sealed marker lives in `scp-platform`), the concrete inner
+    /// `EncryptedStorage` handle is dispatched per variant, exactly as
+    /// `build_persistence_provider` does for `ProtocolRepository`.
+    ///
+    /// Returns `None` only in the storage-before-selection window; production
+    /// `PyScp` construction always goes through
+    /// [`PyBridgeInstance::with_storage_py`], which selects storage first. The
+    /// caller ([`crate::bridge_connector`]) maps `None` to a fail-closed error
+    /// emitted as `SCP-CTX-2105` (`codes::CTX_2105`) — never a silent in-memory
+    /// fallback. This satisfies requirement SCP-CAPSEL-8001 (spec §17.17.1,
+    /// "selection fails closed"); note SCP-CAPSEL-8001 is a classification
+    /// requirement, not the emitted error code. There is no in-memory arm on
+    /// this shipped path (ADR-062 §Decision 5, SCP-CAPINJECT-009).
     #[must_use]
-    pub const fn credential_store(
-        &self,
-    ) -> &Arc<scp_core::bridge::credentials::InMemoryCredentialStore> {
-        &self.credential_store
+    pub fn credential_store(&self) -> Option<FfiCredentialStore> {
+        match self.storage_provider()? {
+            StorageProvider::InMemoryEncrypted(handle) => {
+                Some(FfiCredentialStore::durable_from_handle(Arc::clone(handle)))
+            }
+            StorageProvider::Sqlite(handle) => {
+                Some(FfiCredentialStore::durable_from_handle(Arc::clone(handle)))
+            }
+        }
     }
 
     /// Returns a reference to the connected-relay URL slot.
@@ -721,7 +762,7 @@ impl PyBridgeInstance {
     }
 
     /// Returns a reference to the shared full-stack test network slot.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     #[must_use]
     pub const fn network(
         &self,
@@ -755,13 +796,23 @@ impl BridgeInstanceCore for PyBridgeInstance {
             provider.close();
         }
         // Clear the typed per-context FFI state registry so per-context
-        // `ToolRegistry`, `EventLog`, receive channel senders, and
-        // registered tool handlers drop.
+        // `OutletRegistry`, `EventLog`, receive channel senders, and
+        // registered outlet handlers drop.
         self.ffi_bridge_state.clear();
         // Clear MCP registries so server shutdown senders and client
         // connections drop, allowing background tasks to terminate cleanly.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        // Clear the outlet-stream registry so every live stream's
+        // `StreamSessionHandle` (and its detached chunk receiver) drops —
+        // dropping the receiver closes the channel and lets the off-mailbox
+        // pump observe the close and settle out during instance shutdown.
+        self.outlet_stream_registry.clear();
+        // Clear the cross-context streaming-saga registry so every live saga
+        // stream's chunk receiver drops — dropping the receiver closes the
+        // channel and lets the off-mailbox seal task observe the close and
+        // settle out during instance shutdown (SCP-OUT-047).
+        self.outlet_streaming_saga_registry.clear();
         // Reset lifecycle-owned typed slots so their held URLs / networks
         // do not survive past shutdown. Best-effort: on lock poisoning
         // we swallow the error and leave the slot alone — a poisoned
@@ -771,7 +822,7 @@ impl BridgeInstanceCore for PyBridgeInstance {
         if let Ok(mut slot) = self.connected_relay_url.write() {
             *slot = None;
         }
-        #[cfg(feature = "allow_in_memory_custody")]
+        #[cfg(feature = "testing")]
         if let Ok(mut net) = self.network.lock() {
             *net = None;
         }
@@ -812,13 +863,16 @@ impl Drop for PyBridgeInstance {
 
 /// Initializes the global [`ContextManager`] with production providers.
 ///
-/// Uses `MlsCryptoProvider` (real OpenMLS-backed encryption, sender keys, and
+/// Uses `NodeMlsFactory` (real OpenMLS-backed encryption, sender keys, and
 /// group management — ported from NAPI bridge #1305, closes #1324),
 /// `NotConfiguredTransportProvider` (returns descriptive errors until transport
-/// is configured via `transport_connect`), and `NoOpEventLogProvider`
-/// (bridge-level `EventLog` instances handle Merkle ops).
+/// is configured via `transport_connect`), and the persistent
+/// `MerkleEventLogProvider` from [`build_event_log_provider`] (sharing the
+/// bridge instance's single storage backend), so the supervisor's own
+/// convergent event log is readable by `Supervisor::participation_record`
+/// (§7.3.2) and the other supervisor log queries — not a no-op.
 ///
-/// The `local_did` is passed to `MlsCryptoProvider::new` which uses it as
+/// The `local_did` is passed to `NodeMlsFactory::new` which uses it as
 /// the MLS credential identity for group operations and sender key generation.
 ///
 /// The key resolver rejects all lookups with an error rather than silently
@@ -833,7 +887,7 @@ impl Drop for PyBridgeInstance {
 /// restarts without requiring callers to manually wire persistence.
 /// See issue #329.
 ///
-/// The `local_did` is consumed only by `MlsCryptoProvider::new` — the
+/// The `local_did` is consumed only by `NodeMlsFactory::new` — the
 /// `BridgeInstance` itself carries no DID (spec §12.2.3).
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
@@ -848,7 +902,10 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
     }
 
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
@@ -878,14 +935,14 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
 pub fn init_context_manager_with(
     bi: &PyBridgeInstance,
     _local_did: &str,
-    crypto: Arc<MlsCryptoProvider>,
+    crypto: Arc<NodeMlsFactory>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) {
     // `_local_did` is retained in the signature for API stability: callers
     // construct `crypto` with the DID before calling into this function
-    // (it is the `MlsCryptoProvider` that carries the DID; see spec §12.2.3).
+    // (it is the `NodeMlsFactory` that carries the DID; see spec §12.2.3).
     if bi.core.has_supervisor() {
         return;
     }
@@ -906,7 +963,7 @@ pub fn init_context_manager_with(
 /// Identical to [`init_context_manager`] except the transport provider is
 /// `LocalTransportProvider` (silently succeeds on all send/publish calls)
 /// instead of `NotConfiguredTransportProvider` (rejects everything). Like
-/// production initialization, it installs a real `MlsCryptoProvider` bound to
+/// production initialization, it installs a real `NodeMlsFactory` bound to
 /// `local_did` so encryption is exercised end to end against an in-process
 /// loopback transport.
 ///
@@ -939,7 +996,10 @@ pub fn init_context_manager_with_local_transport(bi: &PyBridgeInstance, local_di
             .set(StorageProvider::new_in_memory_encrypted());
     }
     let did = local_did.to_owned();
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
+        did,
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ));
     let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
         bi,
@@ -983,8 +1043,9 @@ pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
             .storage_provider
             .set(StorageProvider::new_in_memory_encrypted());
     }
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
         "did:test:pyo3-bridge-test".to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
     ));
     let persistence = build_persistence_provider(bi);
     let supervisor_arc = match build_supervisor(
@@ -1062,54 +1123,37 @@ impl ArcContextPersistence {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextPersistence for ArcContextPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &scp_core::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.persist_context(context_id, snapshot)
+        self.inner.persist_context(context_id, snapshot).await
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<
         Option<scp_core::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        self.inner.load_context(context_id)
+        self.inner.load_context(context_id).await
     }
 
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.persist_broadcast(context_id, snapshot)
-    }
-
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<
-        Option<scp_core::context::broadcast::BroadcastContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        self.inner.load_broadcast(context_id)
-    }
-
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.delete_context(context_id)
+        self.inner.delete_context(context_id).await
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        self.inner.list_persisted_contexts()
+        self.inner.list_persisted_contexts().await
     }
 }
 
@@ -1118,8 +1162,9 @@ impl ContextPersistence for ArcContextPersistence {
 ///
 /// This is NOT a direct reuse of
 /// `scp-ffi-common::bridge_runtime::build_event_log_provider` — that common
-/// fn owns its own storage (creates a fresh `BridgeInMemoryStorage` +
-/// `ProtocolRepository` and returns both) so the NAPI / `UniFFI` bridges can
+/// fn owns its own storage (creates a fresh
+/// `scp_platform::in_memory::InMemoryStorage` + `ProtocolRepository` and
+/// returns both) so the NAPI / `UniFFI` bridges can
 /// keep the repository handle around for later queries. The `PyO3` bridge
 /// instead reads from `DEFAULT_BRIDGE_INSTANCE.storage_provider()` so the
 /// event log shares storage with every other per-context data sink
@@ -1137,9 +1182,9 @@ impl ContextPersistence for ArcContextPersistence {
 /// and is visible to `py_event_log_query`.
 ///
 /// This replaced `NoOpEventLogProvider` so that the `PyO3` bridge emits the
-/// same initial `ContextCreated` event as the NAPI, WASM, and `UniFFI`
+/// same initial `ContextCreated` event as the NAPI and `UniFFI`
 /// bridges (cross-bridge parity, ADR-046 `OP_EVENT_LOG_APPEND`).
-fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogProvider> {
+pub(crate) fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogProvider> {
     match bi.storage_provider() {
         Some(StorageProvider::InMemoryEncrypted(storage)) => {
             let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
@@ -1165,7 +1210,7 @@ fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogPro
 /// outbound webhook dispatcher (spec §12.10.5), wired in
 /// [`crate::server::node_start_in_memory`]/`node_start_local`. Lagging consumers
 /// drop the oldest events (logged, never panics); `1024` is the documented
-/// default shared across all three non-WASM bridges.
+/// default shared across all three FFI bridges.
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// `Supervisor::with_providers` is the single entry point that constructs the
@@ -1194,7 +1239,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// never defaults storage; the caller (bridge layer) must supply it first.
 fn build_supervisor(
     bi: &PyBridgeInstance,
-    crypto: Arc<MlsCryptoProvider>,
+    crypto: Arc<NodeMlsFactory>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
@@ -1221,6 +1266,11 @@ fn build_supervisor(
         .map_or_else(not_configured_key_resolver, |r| {
             document_vm_key_resolver(std::sync::Arc::clone(r))
         });
+    // Share the provider's exact hardened `Clock` Arc with the supervisor so the
+    // "one hardened clock per node" invariant (see the `NodeMlsFactory::clock`
+    // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
+    // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
+    let clock = crypto.clock();
     Ok(
         scp_core::context::supervisor::Supervisor::with_providers_and_journal(
             crypto,
@@ -1230,7 +1280,7 @@ fn build_supervisor(
             persistence,
             None,
             Some(event_tx),
-            None,
+            Some(clock),
             durable,
         ),
     )
@@ -1300,24 +1350,30 @@ where
         )));
 }
 
-/// Returns the in-memory DHT client backing this instance's DID resolver, if
+/// Returns the shared DHT client backing this instance's DID resolver, if
 /// initialized.
 ///
-/// Used by `identity_create` to publish freshly minted in-memory DID documents
-/// into the same client the resolver reads from, so the DID resolves for
-/// signature verification (UCAN validation, governance vote verification).
+/// The client is the shared [`FfiDhtClient`](scp_ffi_common::dht::FfiDhtClient)
+/// — the real Mainline Pkarr client in a shipped build, or the in-memory test
+/// seam under `testing`. Used by `identity_create`/rotation/migration to
+/// publish freshly minted DID documents into the same client the resolver
+/// reads from, so the DID resolves for signature verification (UCAN
+/// validation, governance vote verification).
 #[must_use]
-pub fn resolver_dht_client(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::InMemoryDhtClient>> {
+pub fn resolver_dht_client(
+    bi: &PyBridgeInstance,
+) -> Option<Arc<scp_ffi_common::dht::FfiDhtClient>> {
     bi.core.dht_client().map(Arc::clone)
 }
 
-/// Stores the in-memory DHT client backing this instance's DID resolver.
+/// Stores the shared DHT client backing this instance's DID resolver.
 ///
-/// Called once during resolver initialization with the SAME `InMemoryDhtClient`
-/// `Arc` the resolver was built over. Subsequent calls are no-ops.
+/// Called once during resolver initialization with the SAME
+/// [`FfiDhtClient`](scp_ffi_common::dht::FfiDhtClient) `Arc` the resolver was
+/// built over. Subsequent calls are no-ops.
 pub fn set_resolver_dht_client(
     bi: &PyBridgeInstance,
-    client: Arc<scp_identity::InMemoryDhtClient>,
+    client: Arc<scp_ffi_common::dht::FfiDhtClient>,
 ) {
     bi.core.set_dht_client(client);
 }
@@ -1348,9 +1404,10 @@ pub fn resolver_cache(bi: &PyBridgeInstance) -> Option<Arc<scp_identity::cache::
 /// (and pre-rotation `#active` key) until the cache TTL expired — defeating
 /// rotation's revocation purpose. Best-effort: a no-op when no cache is wired.
 pub fn invalidate_resolver_cache(bi: &PyBridgeInstance, did: &str, rt: &tokio::runtime::Runtime) {
-    if let Some(cache) = bi.core.resolver_cache() {
-        rt.block_on(cache.remove(did));
-    }
+    // Delegates to the shared `BridgeInstanceCore::invalidate_resolver_cache`
+    // (the single implementation of the invalidation body); the sync PyO3 bridge
+    // drives the async method on the shared runtime.
+    rt.block_on(bi.core.invalidate_resolver_cache(did));
 }
 
 // ---------------------------------------------------------------------------
@@ -1382,28 +1439,6 @@ fn document_vm_key_resolver(
 // descriptive errors when transport operations are attempted without a relay.
 use scp_core::context::NotConfiguredTransportProvider;
 
-/// No-op event log provider for bridge-layer `ContextManager` initialization.
-pub(crate) struct NoOpEventLogProvider;
-
-impl ContextEventLogProvider for NoOpEventLogProvider {
-    fn init_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn append_event(
-        &self,
-        _context_id: &[u8; 32],
-        _event_type: scp_event_log::EventType,
-        _actor_did: &str,
-        _payload: scp_event_log::EventPayload,
-        _timestamp_secs: u64,
-    ) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_event_log(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // FfiBridgeState -- per-context FFI-specific state
 // ---------------------------------------------------------------------------
@@ -1414,8 +1449,8 @@ impl ContextEventLogProvider for NoOpEventLogProvider {
 /// Resolves the registry via the typed `ffi_bridge_state` field on the
 /// passed [`PyBridgeInstance`].
 ///
-/// Stores state that is NOT managed by [`ContextManager`]: tool registries,
-/// event logs, UCAN revocation/nonce tracking, tool handlers, and message
+/// Stores state that is NOT managed by [`ContextManager`]: outlet registries,
+/// event logs, UCAN revocation/nonce tracking, outlet handlers, and message
 /// channels. Context lifecycle state (membership, roles, governance,
 /// broadcast, TTL) lives in the `ContextManager`.
 pub(crate) fn ffi_state_registry(bi: &PyBridgeInstance) -> &DashMap<String, FfiBridgeState> {
@@ -1424,18 +1459,18 @@ pub(crate) fn ffi_state_registry(bi: &PyBridgeInstance) -> &DashMap<String, FfiB
 
 /// Per-context FFI-specific state that does NOT duplicate [`ContextManager`].
 ///
-/// Contains subsystem state used by `tools.rs`, `ucan.rs`, `event_log.rs`,
-/// and `mcp.rs`, plus FFI-specific message channel and tool handler state.
+/// Contains subsystem state used by `outlets.rs`, `ucan.rs`, `event_log.rs`,
+/// and `mcp.rs`, plus FFI-specific message channel and outlet handler state.
 pub struct FfiBridgeState {
-    /// Tool registry for this context.
-    pub tool_registry: ToolRegistry,
+    /// Outlet registry for this context.
+    pub outlet_registry: OutletRegistry,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
     /// Role state tracking member capabilities.
     ///
     /// Also maintained by `ContextManager` for lifecycle operations.
-    /// This copy is used by UCAN validation (`ucan.rs`) and tool capability
-    /// checking (`tools.rs`, `mcp.rs`) which access state via `with_ffi_state`.
+    /// This copy is used by UCAN validation (`ucan.rs`) and outlet capability
+    /// checking (`outlets.rs`, `mcp.rs`) which access state via `with_ffi_state`.
     /// Both copies are kept in sync: `register_ffi_state` initializes from
     /// the same parameters, and `py_context_join` updates both.
     pub role_state: ContextRoleState,
@@ -1448,16 +1483,16 @@ pub struct FfiBridgeState {
     pub ceiling_strings: HashSet<String>,
     /// The DID of the context creator.
     pub creator_did: String,
-    /// Registered tool handlers keyed by tool ID.
+    /// Registered outlet handlers keyed by outlet ID.
     ///
     /// Python callers register callable handlers via
-    /// [`register_tool_handler`]. When a tool is invoked through
+    /// [`register_outlet_handler`]. When an outlet is invoked through
     /// `FfiBridgeProvider::invoke_tool`, the handler is looked up here and
     /// called with the validated JSON input. If no handler is registered,
     /// the invocation falls back to echoing the validated input.
     ///
     /// See SCP-212 for the handler registration design.
-    pub tool_handlers: HashMap<String, ToolHandler>,
+    pub outlet_handlers: HashMap<String, OutletHandler>,
     /// Sender half of the receive channel (SCP-216).
     ///
     /// Stored here so that the transport layer (and `deliver_message`) can
@@ -1474,11 +1509,16 @@ pub struct FfiBridgeState {
     /// Uses `tokio::sync::Mutex` so the lock can be held across `.await`
     /// points in `__anext__`.
     pub message_rx: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>>,
-    /// Session store for stateful tool sessions (spec section 6.2.1).
+    /// Session store for stateful outlet sessions (spec section 6.2.1).
     ///
-    /// Stores active tool sessions keyed by session ID. Sessions are created
-    /// via `py_tool_session_create` and cleaned up on context close.
-    pub session_store: scp_core::context::tools::SessionStore,
+    /// Stores active outlet sessions keyed by session ID. Sessions are created
+    /// via `py_outlet_session_create` and cleaned up on context close.
+    pub session_store: scp_core::context::outlets::SessionStore,
+    /// App binding registry for this context (spec §8.4).
+    ///
+    /// Maps `app_did` → `ScopedHandle` for every app bound to this context.
+    /// Populated by `py_app_bind` and cleared by `py_app_unbind`.
+    pub bound_apps: HashMap<String, ScopedHandle>,
 }
 
 /// Buffer capacity for the receive channel (SCP-216, sketch.md §receive).
@@ -1489,13 +1529,13 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 
 /// Registers FFI-specific state for a new context.
 ///
-/// Creates a [`ToolRegistry`], [`EventLog`], [`ContextRoleState`], and
+/// Creates a [`OutletRegistry`], [`EventLog`], [`ContextRoleState`], and
 /// [`RevocationList`] for the context. The creator DID is assigned admin
 /// capabilities (all capabilities in the ceiling).
 ///
 /// `user_ceiling` contains user-provided ceiling strings in colon format
-/// (e.g. `"tool:invoke:*"`). These are converted to UCAN underscore format
-/// (e.g. `"tool_invoke:*"`) via `Capability::new` + `ucan_capability_name`.
+/// (e.g. `"outlet:call:*"`). These are converted to UCAN underscore format
+/// (e.g. `"outlet_call:*"`) via `Capability::new` + `ucan_capability_name`.
 /// Pass an empty slice to use the default ceiling.
 ///
 /// # Errors
@@ -1519,7 +1559,7 @@ pub fn register_ffi_state(
             )));
         }
         Entry::Vacant(vacant) => {
-            let tool_registry = ToolRegistry::new();
+            let outlet_registry = OutletRegistry::new();
             let event_log = EventLog::new(context_id.to_owned());
             let ceiling = default_ceiling();
             let ceiling_strings = if user_ceiling.is_empty() {
@@ -1543,13 +1583,25 @@ pub fn register_ffi_state(
                 // still rejects a no-colon `payments` that would otherwise be widened
                 // to `payments:*`.
                 for entry in user_ceiling {
-                    scp_core::context::roles::Capability::new(entry)
-                        .validate_as_ceiling_entry()
+                    // Fail-closed: a malformed capability string (deleted
+                    // legacy outlet-invoke / pre-rename outlet-invoke stems,
+                    // invalid §5.4.2.1 outlet suffix) parses to `None` and is
+                    // rejected at the FFI boundary rather than silently dropped.
+                    let cap =
+                        scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
+                            ScpPyError::context(format!(
+                                "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
+                            ))
+                        })?;
+                    cap.validate_as_ceiling_entry()
                         .map_err(|e| ScpPyError::context(e.to_string()))?;
                 }
                 user_ceiling
                     .iter()
-                    .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+                    .filter_map(|s| {
+                        scp_core::context::roles::Capability::new(s)
+                            .map(|c| c.ucan_capability_name())
+                    })
                     .collect::<HashSet<String>>()
             };
             let role_state =
@@ -1561,17 +1613,18 @@ pub fn register_ffi_state(
             let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
 
             let state = FfiBridgeState {
-                tool_registry,
+                outlet_registry,
                 event_log,
                 role_state,
                 revocation_list,
                 nonce_tracker,
                 ceiling_strings,
                 creator_did: creator_did.to_owned(),
-                tool_handlers: HashMap::new(),
+                outlet_handlers: HashMap::new(),
                 message_tx: None,
                 message_rx: None,
-                session_store: scp_core::context::tools::SessionStore::new(),
+                session_store: scp_core::context::outlets::SessionStore::new(),
+                bound_apps: HashMap::new(),
             };
 
             vacant.insert(state);
@@ -1621,33 +1674,33 @@ pub fn context_ids_for_member(bi: &PyBridgeInstance, member_did: &str) -> Vec<St
         .collect()
 }
 
-/// Registers a tool handler for a specific tool in a context.
+/// Registers an outlet handler for a specific outlet in a context.
 ///
 /// The handler is a sync closure that takes JSON input and returns JSON
 /// output. It is called by `FfiBridgeProvider::invoke_tool` when the
-/// tool is invoked via MCP. The handler must already have a corresponding
-/// tool registration in the context's `ToolRegistry` (registered via
-/// `py_tool_register`).
+/// outlet is invoked via MCP. The handler must already have a corresponding
+/// outlet registration in the context's `OutletRegistry` (registered via
+/// `py_outlet_register`).
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found or the
-/// tool is not registered in the context's `ToolRegistry`.
-pub fn register_tool_handler(
+/// outlet is not registered in the context's `OutletRegistry`.
+pub fn register_outlet_handler(
     bi: &PyBridgeInstance,
     context_id: &str,
-    tool_id: &str,
-    handler: ToolHandler,
+    outlet_id: &str,
+    handler: OutletHandler,
 ) -> Result<(), ScpPyError> {
     with_ffi_state(bi, context_id, |st| {
-        // Verify the tool exists in the registry before accepting a handler.
-        if st.tool_registry.get(tool_id).is_none() {
+        // Verify the outlet exists in the registry before accepting a handler.
+        if st.outlet_registry.get(outlet_id).is_none() {
             return Err(ScpPyError::context(format!(
-                "tool '{tool_id}' not found in context '{context_id}' \
-                 -- register the tool before adding a handler"
+                "outlet '{outlet_id}' not found in context '{context_id}' \
+                 -- register the outlet before adding a handler"
             )));
         }
-        st.tool_handlers.insert(tool_id.to_owned(), handler);
+        st.outlet_handlers.insert(outlet_id.to_owned(), handler);
         Ok(())
     })
 }
@@ -1673,7 +1726,7 @@ pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
 ///
 /// Must be called after any governance action that modifies role state
 /// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that the
-/// FFI-side copy used by UCAN/tool capability checks stays current.
+/// FFI-side copy used by UCAN/outlet capability checks stays current.
 ///
 /// # Errors
 ///
@@ -1721,6 +1774,39 @@ pub async fn sync_role_state_from_manager_async(
 
     with_ffi_state(bi, context_id, |st| {
         st.role_state = new_role_state;
+        Ok(())
+    })
+}
+
+/// Re-syncs the `FfiBridgeState.ceiling_strings` for a context from the
+/// AUTHENTICATED context params carried by a joined
+/// [`ContextHandle`](scp_core::context::ContextHandle).
+///
+/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
+/// the UCAN/outlet capability-check ceiling string set. Used by
+/// `context_join_from_welcome`: the joiner no longer supplies a ceiling, so the
+/// FFI state is registered with the DEFAULT ceiling as a reversible precheck,
+/// then this overwrites it with the ceiling AUTHENTICATED by the joined MLS
+/// group's signed context binding. The ceiling entries are normalized to their
+/// enforced UCAN capability-name form (`{resource}:{action}`), matching the set
+/// [`register_ffi_state`] builds on the create path.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the context's FFI state is not
+/// registered (unreachable on the join success path — the state was just
+/// registered and not removed).
+pub fn sync_ceiling_from_params(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    ceiling: &[scp_core::context::roles::Capability],
+) -> Result<(), ScpPyError> {
+    let ceiling_strings: HashSet<String> = ceiling
+        .iter()
+        .map(scp_core::context::roles::Capability::ucan_capability_name)
+        .collect();
+    with_ffi_state(bi, context_id, |st| {
+        st.ceiling_strings = ceiling_strings;
         Ok(())
     })
 }
@@ -1851,7 +1937,7 @@ pub fn deliver_message_with_handles(
                 bi,
                 "scp:system".to_owned(),
                 b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
-                scp_primitives::SystemClock.now_secs() as f64,
+                SystemClock.now_secs() as f64,
                 context_id.to_owned(),
             );
             let _ = tx.try_send(overflow_warning);
@@ -1965,6 +2051,13 @@ pub struct IdentityEntry {
     /// from operational `key_custody` (spec §9.7.4.1 §3). The same `Arc` is
     /// preserved across migrations (we don't mint a new custody per
     /// migration — only a new handle).
+    ///
+    /// TEST-HARNESS ONLY (`#[cfg(feature = "testing")]`, ADR-062 §Decision 6):
+    /// the only `PreRotationCustody` backend is the in-memory nullifier. On a
+    /// shipped build, identity creation FAILS CLOSED (`IDENT_1059`) before any
+    /// `IdentityEntry` is constructed, so no production entry ever carries this
+    /// field — the retained-custody + migration machinery is gated with it.
+    #[cfg(feature = "testing")]
     pub pre_rotation_custody: Arc<scp_platform::testing::InMemoryPreRotationCustody>,
 }
 
@@ -2168,7 +2261,7 @@ pub fn clear_transport_manager(bi: &PyBridgeInstance) -> Result<(), ScpPyError> 
 /// FFI state registry.
 ///
 /// This function ensures that both the shared `ContextManager` (for lifecycle
-/// operations) and the FFI bridge state (for tool/UCAN/event-log operations)
+/// operations) and the FFI bridge state (for outlet/UCAN/event-log operations)
 /// are initialized for the given context. Used during the transition period
 /// where the full `ContextManager` flow is being connected.
 ///
@@ -2186,7 +2279,7 @@ pub fn register_context(
     // Production uses NotConfiguredTransportProvider — publish_context
     // returns an error that create_context logs as a warning (best-effort;
     // context is valid locally even without relay publication, #501).
-    // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1324).
+    // Passes the creator DID to NodeMlsFactory for real MLS encryption (#1324).
     #[cfg(test)]
     init_context_manager_for_test(bi);
     #[cfg(not(test))]
@@ -2309,6 +2402,12 @@ pub fn remove_identity_if_present(bi: &PyBridgeInstance, did: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    // Test-harness key-custody nullifier: used only by the `#[cfg(feature =
+    // "testing")]` identity-registry tests below. Gated so the shipped
+    // (no-`testing`) test lane — which exists now that this module carries
+    // `#[cfg(not(feature = "testing"))]` fail-closed proofs elsewhere in the
+    // crate — does not see an unused import (ADR-062 §Decision 6 parity).
+    #[cfg(feature = "testing")]
     use scp_platform::testing::InMemoryKeyCustody;
 
     /// Helper to generate unique context IDs for parallel test isolation.
@@ -2321,6 +2420,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "testing")]
     /// Helper to create a minimal `DidDocument` for testing.
     fn test_did_document(did: &str) -> DidDocument {
         DidDocument {
@@ -2367,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn registry_stats_reflects_identity_registration() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
@@ -2449,7 +2549,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn remove_identity_if_present_returns_true_when_found() {
         let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
         let bi = &*bi_arc;
@@ -2546,8 +2646,8 @@ mod tests {
 
     /// The close-teardown fail-closed ordering: once the FFI bridge state
     /// is removed (which `context_close` now does BEFORE the actor
-    /// despawn, so a fail-open rate-limit can't gate unthrottled tool
-    /// dispatch), `with_context`/`with_ffi_state` tool lookups fail
+    /// despawn, so a fail-open rate-limit can't gate unthrottled outlet
+    /// dispatch), `with_context`/`with_ffi_state` outlet lookups fail
     /// closed — yet the receive-channel handles captured BEFORE removal
     /// still deliver the `SystemClose` event to an active receiver.
     #[tokio::test(flavor = "multi_thread")]
@@ -2571,7 +2671,7 @@ mod tests {
 
         // Capture the channel handles BEFORE removing the FFI state — this
         // is what the close teardown does so it can still deliver the
-        // close event after failing the tool path closed.
+        // close event after failing the outlet path closed.
         let handles =
             clone_receive_channel_handles(bi, &ctx_id).expect("an open channel yields handles");
 
@@ -2579,7 +2679,7 @@ mod tests {
         remove_context(bi, &ctx_id);
         assert!(
             with_ffi_state(bi, &ctx_id, |_| Ok(())).is_err(),
-            "tool dispatch lookup must fail closed once FFI state is removed"
+            "outlet dispatch lookup must fail closed once FFI state is removed"
         );
 
         // Delivery through the captured handles still works after removal.
@@ -2602,8 +2702,8 @@ mod tests {
         );
     }
 
-    /// User-provided ceiling strings in colon format (e.g. `"tool:invoke:*"`)
-    /// must be converted to UCAN underscore format (e.g. `"tool_invoke:*"`)
+    /// User-provided ceiling strings in colon format (e.g. `"outlet:call:*"`)
+    /// must be converted to UCAN underscore format (e.g. `"outlet_call:*"`)
     /// when stored in `FfiBridgeState.ceiling_strings`. Without this
     /// conversion, `mint_ucan` ceiling checks fail because the minted
     /// capability name (underscore format) doesn't match the stored
@@ -2617,10 +2717,10 @@ mod tests {
         let creator = "did:dht:z6MkCeilingConv";
 
         let user_ceiling = vec![
-            "tool:invoke:*".to_owned(),
+            "outlet:call:*".to_owned(),
             "messages:write".to_owned(),
             "context:child:create".to_owned(),
-            "tool:invoke:calculator".to_owned(),
+            "outlet:call:calculator".to_owned(),
         ];
 
         register_context(bi, &ctx_id, creator, &user_ceiling).unwrap();
@@ -2629,16 +2729,16 @@ mod tests {
 
         // Compound resources must have underscores joining their segments.
         assert!(
-            ceiling.contains("tool_invoke:*"),
-            "expected 'tool_invoke:*' but got: {ceiling:?}"
+            ceiling.contains("outlet_call:*"),
+            "expected 'outlet_call:*' but got: {ceiling:?}"
         );
         assert!(
             ceiling.contains("context_child:create"),
             "expected 'context_child:create' but got: {ceiling:?}"
         );
         assert!(
-            ceiling.contains("tool_invoke:calculator"),
-            "expected 'tool_invoke:calculator' but got: {ceiling:?}"
+            ceiling.contains("outlet_call:calculator"),
+            "expected 'outlet_call:calculator' but got: {ceiling:?}"
         );
         // Simple two-segment capabilities should pass through unchanged.
         assert!(
@@ -2647,8 +2747,8 @@ mod tests {
         );
         // Raw colon-format strings must NOT be present.
         assert!(
-            !ceiling.contains("tool:invoke:*"),
-            "raw 'tool:invoke:*' should not be in ceiling: {ceiling:?}"
+            !ceiling.contains("outlet:call:*"),
+            "raw 'outlet:call:*' should not be in ceiling: {ceiling:?}"
         );
         assert!(
             !ceiling.contains("context:child:create"),
@@ -2672,14 +2772,14 @@ mod tests {
 
         let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
 
-        // Default ceiling must include tool_invoke:* (not tool:invoke:*).
+        // Default ceiling must include outlet_call:* (not outlet:call:*).
         assert!(
-            ceiling.contains("tool_invoke:*"),
-            "default ceiling should contain 'tool_invoke:*' but got: {ceiling:?}"
+            ceiling.contains("outlet_call:*"),
+            "default ceiling should contain 'outlet_call:*' but got: {ceiling:?}"
         );
         assert!(
-            !ceiling.contains("tool:invoke:*"),
-            "default ceiling should not contain raw 'tool:invoke:*': {ceiling:?}"
+            !ceiling.contains("outlet:call:*"),
+            "default ceiling should not contain raw 'outlet:call:*': {ceiling:?}"
         );
 
         remove_context(bi, &ctx_id);
@@ -2732,11 +2832,12 @@ mod tests {
             .expect("in-memory storage construction is infallible");
         let supervisor_arc = build_supervisor(
             &isolated,
-            Arc::new(MlsCryptoProvider::new(
+            Arc::new(NodeMlsFactory::new(
                 "did:test:pyo3-bridge-test".to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
             )),
             Box::new(scp_core::context::LocalTransportProvider),
-            Box::new(NoOpEventLogProvider),
+            build_event_log_provider(&isolated),
             None,
         )
         .expect("build_supervisor must succeed with in-memory storage set");
@@ -2764,7 +2865,14 @@ mod tests {
     // PyBridgeInstance tests (#1549 Phase 4 PR 1)
     // -----------------------------------------------------------------------
 
+    // Gated `#[cfg(feature = "testing")]`: it constructs an `IdentityEntry` whose
+    // `custody` (`FfiKeyCustody::InMemory`) and `pre_rotation_custody`
+    // (`InMemoryPreRotationCustody`) fields are severed to the test harness only
+    // (ADR-062 §Decision 6). Without this gate the shipped (no-`testing`) test
+    // lane fails to compile — the very lane that now runs the crate's
+    // `#[cfg(not(feature = "testing"))]` fail-closed proofs.
     #[test]
+    #[cfg(feature = "testing")]
     fn test_py_bridge_instance_typed_identity_registry_roundtrip() {
         // Verify that the typed identity_registry field is wired correctly:
         // inserting an entry through the field is observable via the same
@@ -3080,10 +3188,10 @@ mod tests {
     }
 
     /// `register_context` accepts a well-formed custom ceiling entry, an explicit
-    /// `{resource}:*` wildcard, the parameterized `tool:invoke:{tool_id}`
+    /// `{resource}:*` wildcard, the parameterized `outlet:call:{outlet_id}`
     /// built-in, and a built-in supplied in its canonical UCAN wire spelling
-    /// (`tool_invoke:*`, `context_child:create`, `bridging:*`,
-    /// `tool_invoke:{id}`). Pins the regression where a UCAN-form built-in entry
+    /// (`outlet_call:*`, `context_child:create`, `bridging:*`,
+    /// `outlet_call:{id}`). Pins the regression where a UCAN-form built-in entry
     /// — the canonical stored ceiling spelling — was misparsed to a `Custom`
     /// lookalike and rejected with `InvalidCeilingCategory`.
     #[test]
@@ -3091,11 +3199,11 @@ mod tests {
         for good in [
             "payments:approve",
             "payments:*",
-            "tool:invoke:calc",
-            "tool:invoke:*",
+            "outlet:call:calc",
+            "outlet:call:*",
             "context:child:create",
-            "tool_invoke:*",
-            "tool_invoke:calc",
+            "outlet_call:*",
+            "outlet_call:calc",
             "context_child:create",
             "bridging:*",
         ] {

@@ -6,9 +6,8 @@
 //! This module hosts messaging-domain helpers that operate on actor-owned
 //! [`PerContextState`](crate::context::actor::state::PerContextState) and
 //! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
-//! The legacy `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::messaging_helpers_legacy`] until Phase 2A
-//! finalization removes the shim fallback.
+//! The pre-migration `&Supervisor` lock-and-call bodies have been removed
+//! (Phase 2A finalization); this module is the sole home for these helpers.
 //!
 //! # Pipeline shape
 //!
@@ -21,8 +20,10 @@
 //!
 //! # Helpers
 //!
-//! 1. [`build_encrypted_envelope`] — pure: access-key wrap, inner
-//!    envelope sign+pad, sender-key + MLS + outer-envelope seal.
+//! 1. [`build_inner_wire`] (pure: access-key wrap + inner-envelope
+//!    sign+pad) feeding [`build_encrypted_envelope_actor`] — the
+//!    ADR-049 PR-7 actor seal (sender-key + MLS + outer-envelope)
+//!    against an actor-owned `ContextCryptoState`.
 //! 2. [`enforce_send_economy`] — unified economy enforcement against
 //!    actor-owned governance state.
 //! 3. [`build_broadcast_envelope`] — broadcast-mode publish (pure).
@@ -54,12 +55,15 @@ use std::sync::Arc;
 use sha2::Digest;
 use subtle::ConstantTimeEq;
 
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::ContextError;
-use scp_protocol::context::broadcast::BroadcastContext;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::pseudonym::{
+    self, PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement, PseudonymAnnouncementDecision,
+    classify_pseudonym_announcement, is_pseudonym_announcement_payload,
+};
 use scp_protocol::context::roles::Capability;
 use scp_protocol::crypto::access_keys::wrapping::Recipient;
 use scp_protocol::crypto::access_keys::{AccessKey, WrappedContent};
@@ -67,21 +71,16 @@ use scp_protocol::crypto::sender_keys::broadcast::BroadcastEnvelope;
 use scp_protocol::crypto::ucan::UcanToken;
 use scp_protocol::envelope::inner::{InnerEnvelope, InnerEnvelopeParams, MessageType};
 use scp_protocol::envelope::validation::SequenceCheck;
-use scp_protocol::identity::SigningKeyId;
 use scp_protocol::provenance::attach::SourceContextInfo;
 use scp_protocol::trust::consequence::{ConsequenceRule, evaluate_consequence_rules};
 
 use crate::context::ContextHandle;
-use crate::context::actor::class_s::ClassCMut;
+use crate::context::actor::class_s::{BroadcastContextClassCMut, ClassCMut};
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::governance_helpers;
-use crate::context::state::{
-    self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, PSEUDONYM_ANNOUNCEMENT_TAG,
-    PseudonymAnnouncement, emit_event_into,
-};
+use crate::context::state::{self, CHECKPOINT_PAYLOAD_TAG, CheckpointMessage, emit_event_into};
 use crate::context::supervisor::MessageSigner;
-use crate::crypto::mls::provider::MlsCryptoProvider;
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
 /// external subscribers (webhook dispatcher, SDK event streams).
@@ -92,32 +91,39 @@ pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEve
 /// long enough to absorb transient relay outages.
 ///
 /// Public so the lifecycle path can re-use the same value when sealing
-/// welcome envelopes.
-pub const DEFAULT_BLOB_TTL_SECS: u32 = 300;
+/// welcome envelopes. Sourced from the wasm-safe
+/// [`scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS`] so the
+/// native runtime and the in-browser `scp-client` driver request the identical
+/// relay-storage window for the same message (ADR-057 "share, don't fork") — the
+/// value is unchanged (300s); only its single source of truth moved.
+pub const DEFAULT_BLOB_TTL_SECS: u32 =
+    scp_protocol::envelope::outer::DEFAULT_APP_DATA_BLOB_TTL_SECS;
 
 // ---------------------------------------------------------------------------
-// 1. build_encrypted_envelope
+// 1. build_inner_wire (shared inner-envelope construction)
 // ---------------------------------------------------------------------------
+//
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001, C8): the `#[cfg(test)]` provider seal twin
+// `build_encrypted_envelope` is DELETED — its last callers (the send-path unit /
+// pipeline / agent-binding fixtures) now drive the production actor seal
+// `build_encrypted_envelope_actor` directly against an actor-owned
+// `ContextCryptoState`. The shared inner-envelope construction below
+// (`build_inner_wire`) is retained; the actor path bottoms out in it, so the
+// sealed wire stays byte-identical across the flip.
 
-/// Builds the encrypted envelope bytes for the send path.
+/// Builds and signs the [`InnerEnvelope`] for an application-data send (access-key
+/// wrap → inner-envelope stamp+sign), returning it alongside the canonical
+/// 32-byte context-id digest.
 ///
-/// Pure helper — no per-context state. Identical to the legacy
-/// [`crate::context::messaging_helpers_legacy::build_encrypted_envelope_legacy`]
-/// body; carried here so the actor-shape send path does not have to
-/// import from the legacy module.
-///
-/// # Routing
-///
-/// The outer envelope's cleartext `routing_id` is zeroed (`[0u8; 32]`) for
-/// application data: a single sealed blob fans out to N per-member pseudonym
-/// transport addresses, so no single per-recipient value belongs in the
-/// envelope, and embedding the relay-derivable `context_routing_id` would leak
-/// a correlator to the relay (§9.10.4). The receiver ignores this field for
-/// app-data, routing on the transport key instead.
+/// Shared by both seal seams — the deleted pre-PR-7 provider path and the
+/// ADR-049 PR-7 actor path ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)
+/// driven from the Class-C view in [`encrypt_and_send`], via
+/// [`build_encrypted_envelope_actor`]) — so both bottom out in ONE
+/// inner-envelope construction and the sealed wire stays byte-identical across
+/// the flip (the 16 golden byte-identity tests continue to hold).
 #[allow(clippy::too_many_arguments)]
-pub fn build_encrypted_envelope(
+fn build_inner_wire(
     clock: &Arc<dyn Clock>,
-    crypto: &Arc<MlsCryptoProvider>,
     context_id: &str,
     sender_did: &DID,
     payload: &[u8],
@@ -126,8 +132,11 @@ pub fn build_encrypted_envelope(
     sequence: u64,
     source_provenance: Option<&SourceContextInfo>,
     message_type: MessageType,
-) -> Result<Vec<u8>, ContextError> {
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+) -> Result<(InnerEnvelope, [u8; 32]), ContextError> {
+    // ADR-056: key the send-path crypto by the canonical digest (matches
+    // `state.context_id` and the MLS group keyed at creation), not a re-hash
+    // of the hex id.
+    let context_id_bytes = state::context_id_to_bytes(context_id);
     let provenance = source_provenance.map(|source_info| {
         let target_context: scp_protocol::provenance::ContextId = context_id.to_owned();
         let dp = scp_protocol::provenance::attach::attach_provenance(
@@ -187,24 +196,71 @@ pub fn build_encrypted_envelope(
     let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signer.key())
         .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-    // §9.10.4 privacy: the cleartext outer-envelope `routing_id` is zeroed for
-    // application data. One sealed blob is fanned out to N per-member pseudonym
-    // transport addresses (seal-once-send-to-all), so there is no single
-    // per-recipient value to embed here. Embedding the relay-derivable
-    // `context_routing_id(context_id)` would let a curious relay read it off
-    // every pseudonym-addressed app-data blob and re-correlate all senders,
-    // defeating the pseudonym scheme. The all-zero value is a RESERVED/forbidden
-    // pseudonym (§9.10.4), so it cannot collide with a real routing ID, and the
-    // receiver never reads this field for app-data (it routes on the transport
-    // key and MLS-decrypts `encrypted_blob`), so receive is unaffected.
-    // `create_outer_envelope` enforces `routing_id.len() == 32`, which a
-    // 32-byte zero sentinel satisfies.
+    Ok((inner, context_id_bytes))
+}
+
+/// Builds and seals an application-data send through the ADR-049 PR-7 actor
+/// crypto state (Class-C `&mut ContextCryptoState`), the field-granular crypto
+/// sub-state reached via `ClassCMut::mode_mut()`. Byte-identical to the deleted
+/// pre-PR-7 provider seal path: it shares [`build_inner_wire`] and
+/// passes the same all-zero app-data `routing_id`, `DEFAULT_BLOB_TTL_SECS`, and
+/// the caller-supplied `aad_sequence` (the authoritative sender-layer AAD
+/// sequence — today `MembershipState::next_sequence_number`, matching what the
+/// provider's `seal` derived from the inner envelope). `local_did` is sourced
+/// from `deps.crypto.local_did()` so the sealed sender-layer AAD binds the same
+/// local identity the provider used.
+#[allow(clippy::too_many_arguments)]
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): widened from module-private so the relocated
+// app-data send-path callers (crypto/mls/provider.rs `encrypt_and_send`, plus the
+// agent_binding_pipeline_tests) can drive the PRODUCTION actor app-data seal — the
+// one that zeroes the outer `routing_id` (§9.10.4) — after the deleted provider
+// twin `build_encrypted_envelope` is removed. `pub(crate)` is the minimal correct
+// visibility: callers span `crypto/mls/provider.rs` and `context/`, so a
+// `pub(super)` / `pub(in crate::context)` cap would wrongly forbid the crypto/mls
+// caller (E0624). It is a purely internal crate seam with no FFI/SDK surface, so it
+// carries no cross-layer bridge-export requirement. `redundant_pub_crate` is a
+// false positive here for the same reason as `Supervisor::build_actor_deps`: the
+// enclosing module is `pub(crate)`, but the item is genuinely reached crate-wide.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn build_encrypted_envelope_actor(
+    clock: &Arc<dyn Clock>,
+    crypto_state: &mut crate::context::actor::state::ContextCryptoState,
+    local_did: &str,
+    context_id: &str,
+    sender_did: &DID,
+    payload: &[u8],
+    signer: MessageSigner<'_>,
+    recipients_data: &std::collections::HashMap<String, AccessKey>,
+    aad_sequence: u64,
+    source_provenance: Option<&SourceContextInfo>,
+    message_type: MessageType,
+) -> Result<Vec<u8>, ContextError> {
+    let (inner, context_id_bytes) = build_inner_wire(
+        clock,
+        context_id,
+        sender_did,
+        payload,
+        signer,
+        recipients_data,
+        aad_sequence,
+        source_provenance,
+        message_type,
+    )?;
+    // §9.10.4 privacy: app-data outer `routing_id` is the 32-byte zero sentinel
+    // — one sealed blob fans out to N per-member pseudonym transport addresses,
+    // so no single per-recipient value belongs here, and embedding the
+    // relay-derivable `context_routing_id` would leak a correlator to the relay.
+    // The all-zero value is a RESERVED/forbidden pseudonym that cannot collide
+    // with a real routing ID; the receiver routes on the transport key and never
+    // reads this field for app-data.
     let routing_id = [0u8; 32];
-    crypto.seal(
+    crypto_state.seal(
         &context_id_bytes,
+        local_did,
         &inner,
         &routing_id,
         DEFAULT_BLOB_TTL_SECS,
+        aad_sequence,
     )
 }
 
@@ -278,7 +334,7 @@ pub fn enforce_send_economy(
     })
 }
 
-/// Discharge a deferred spending-nonce [`ClassSCommitToken`] on a `send_message`
+/// Discharge a deferred spending-nonce [`ClassSCommitToken`](crate::context::actor::class_s::ClassSCommitToken) on a `send_message`
 /// EARLY-ABORT path (ADR-049 §9, keep-direction) and return the error to
 /// propagate.
 ///
@@ -307,19 +363,32 @@ pub fn enforce_send_economy(
 ///
 /// Internal cross-module helper — `pub` only so the sibling `crate::context`
 /// dispatch modules can call it; not part of the SDK surface.
-pub fn commit_send_nonce_token_on_abort(
+///
+/// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
+///
+/// SYNC fn returning a future: [`ClassSCommitToken::commit`](crate::context::actor::class_s::ClassSCommitToken::commit) is itself a
+/// sync-returns-future that consumes the `&PerContextState` in its prelude, so
+/// the returned future here captures only the (already state-free) commit future
+/// plus the owned `abort_err`. An `async fn` would keep the `&PerContextState`
+/// parameter across the await and make the awaiting handler `!Send`.
+pub fn commit_send_nonce_token_on_abort<'d, 'c>(
     token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     state: &PerContextState,
-    deps: &ActorDeps,
-    context_id: &str,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
     abort_err: ContextError,
-) -> ContextError {
-    match token {
-        None => abort_err,
-        Some(t) => match t.commit(state, deps, context_id) {
-            Ok(()) => abort_err,
-            Err(persist_err) => persist_err,
-        },
+) -> impl std::future::Future<Output = ContextError> + Send + use<'d, 'c> {
+    // `t.commit(...)` runs its snapshot-building prelude synchronously here
+    // (consuming the `&PerContextState`) and yields a state-free `Send` future.
+    let commit_fut = token.map(|t| t.commit(state, deps, context_id));
+    async move {
+        match commit_fut {
+            None => abort_err,
+            Some(fut) => match fut.await {
+                Ok(()) => abort_err,
+                Err(persist_err) => persist_err,
+            },
+        }
     }
 }
 
@@ -330,7 +399,7 @@ pub fn commit_send_nonce_token_on_abort(
 /// Builds a broadcast envelope for the send path. Pure helper.
 pub fn build_broadcast_envelope(
     clock: &dyn Clock,
-    bc: &mut BroadcastContext,
+    bc: &mut BroadcastContextClassCMut<'_>,
     sender_did: &DID,
     payload: &[u8],
     signing_key: &ed25519_dalek::SigningKey,
@@ -462,13 +531,14 @@ pub fn deliver_plaintext_or_announcement(
             // A received pseudonym announcement is a §9.10.4 routing-bootstrap
             // signal, NOT a durable Merkle event. `ingest_pseudonym_announcement`
             // already inserted the peer's routing ID into the in-memory registry
-            // and emitted `ContextEvent::PseudonymAnnounced` to the receive
-            // buffer (the announcement's entire function). Returning `None`
+            // and — when the value was new or changed (emit-on-change) — emitted
+            // `ContextEvent::PseudonymAnnounced` to the receive buffer (the
+            // announcement's entire function). Returning `None`
             // suppresses any durable append, exactly as for received application
             // messages (`NotAnnouncement` below): a per-receiver, per-arrival-order
             // append cannot converge across honest members (late joiners miss
-            // earlier announcements; WASM never appends on receive), which would
-            // false-positive §9.9.3 equivocation detection.
+            // earlier announcements; honest members never append on receive),
+            // which would false-positive §9.9.3 equivocation detection.
             None
         }
         AnnouncementOutcome::Rejected(_reason) => None,
@@ -494,69 +564,6 @@ pub fn deliver_plaintext_or_announcement(
 // §9.10.4 announcement / routing helpers
 // ---------------------------------------------------------------------------
 
-/// Classifies a send-path payload as a `PseudonymAnnouncement` (§9.10.4).
-///
-/// Announcements are the ONLY payload class permitted to use the shared
-/// `context_routing_id` as an addressee — they form the bootstrap channel
-/// peers use to learn each other's pseudonyms before regular app data can fan
-/// out on pseudonym-only paths. Returns `true` only when the payload
-/// deserializes as a well-formed `PseudonymAnnouncement` AND carries the magic
-/// tag (`PSEUDONYM_ANNOUNCEMENT_TAG`, `\0`-prefixed to avoid collision with
-/// UTF-8 user content). False positives from adversarial payloads cannot
-/// escalate: the worst outcome is a legitimate app message routed to the
-/// shared RID, which is not a confidentiality issue (MLS still gates content)
-/// and is detected as a non-announcement on the receive path.
-fn is_pseudonym_announcement_payload(payload: &[u8]) -> bool {
-    rmp_serde::from_slice::<PseudonymAnnouncement>(payload)
-        .is_ok_and(|a| a.tag == PSEUDONYM_ANNOUNCEMENT_TAG)
-}
-
-/// Returns `true` if `pseudonym` is a reserved routing ID a member is not
-/// permitted to announce as their own (§9.10.4).
-///
-/// The pseudonym registry maps each member's DID to the routing ID honest
-/// senders fan their app-data ciphertext out to. If a member could announce a
-/// reserved value for their own DID, they could redirect every honest sender's
-/// app-data:
-///
-/// - `[0u8; 32]` — the zero/degraded sentinel; maps to nothing meaningful.
-/// - `context_routing_id(context_id)` — the shared bootstrap RID; announcing
-///   it would push app-data ciphertext onto the shared channel, defeating
-///   unlinkability.
-/// - `broadcast_routing_id(context_id)` — the derivable `SHA-256(context_id)`
-///   broadcast RID; same leak vector.
-///
-/// Honest pseudonyms are the raw 32-byte Ed25519 public key of the member's
-/// per-context keypair (stored and routed on verbatim, NOT hashed). They
-/// collide with these reserved values only with negligible probability, so
-/// rejecting them costs nothing for legitimate members.
-fn is_reserved_pseudonym(pseudonym: &[u8; 32], context_id: &str) -> bool {
-    *pseudonym == [0u8; 32]
-        || *pseudonym == scp_protocol::context::context_routing_id(context_id)
-        || *pseudonym == scp_protocol::context::broadcast_routing_id(context_id)
-}
-
-/// Returns `true` if `pseudonym` is already registered under a DID OTHER than
-/// `announcer_did` (§9.10.4 defense-in-depth).
-///
-/// The announcement path already enforces `announcement.member_did ==
-/// sender_did`, so a member can only announce a routing ID for their own DID.
-/// This guards the remaining vector: a member claiming a routing ID an
-/// existing peer already legitimately uses, which would let two DIDs resolve
-/// to one routing ID (a relay would then receive both members' fan-out at one
-/// address, and honest senders addressing the colliding DID could misroute).
-/// A member re-announcing the SAME value for their OWN DID is legitimate (key
-/// rotation re-broadcast) and is NOT a collision.
-fn pseudonym_collides_with_other_did(
-    registry: &std::collections::HashMap<DID, [u8; 32]>,
-    announcer_did: &DID,
-    pseudonym: &[u8; 32],
-) -> bool {
-    registry.iter().any(|(other_did, other_pseudonym)| {
-        other_pseudonym == pseudonym && other_did != announcer_did
-    })
-}
-
 /// Outcome of running the shared §9.10.4 pseudonym-announcement ingest
 /// validator over a single inbound plaintext.
 ///
@@ -567,7 +574,9 @@ fn pseudonym_collides_with_other_did(
 /// normal message.
 pub enum AnnouncementOutcome {
     /// The plaintext was a well-formed announcement that passed every check;
-    /// the peer registry was updated and a `PseudonymAnnounced` event emitted.
+    /// the peer registry was updated. A `PseudonymAnnounced` event is emitted
+    /// only when the recorded pseudonym was NEW or CHANGED (emit-on-change) —
+    /// an identical re-announce records the (unchanged) value and emits nothing.
     Recorded,
     /// The plaintext is not a tagged `PseudonymAnnouncement` — deliver it as a
     /// normal application message.
@@ -603,88 +612,99 @@ fn ingest_pseudonym_announcement(
     context_id: &str,
     event_tx: Option<&ContextEventSender>,
 ) -> AnnouncementOutcome {
-    // Step 1: tag-decode. A non-announcement (or untagged payload) is ordinary
-    // application data.
-    let Ok(announcement) = rmp_serde::from_slice::<PseudonymAnnouncement>(plaintext) else {
-        return AnnouncementOutcome::NotAnnouncement;
-    };
-    if announcement.tag != PSEUDONYM_ANNOUNCEMENT_TAG {
-        return AnnouncementOutcome::NotAnnouncement;
-    }
-
-    // Step 2: the announced DID must match the authenticated sender. A member
-    // can only announce a routing ID for their OWN DID.
-    if announcement.member_did != sender_did {
-        crate::metrics::record_pseudonym_announcement_rejected();
-        tracing::warn!(
-            context_id,
-            sender_did,
-            claimed_did = %announcement.member_did,
-            "pseudonym announcement sender mismatch — rejecting forged announcement"
-        );
-        return AnnouncementOutcome::Rejected(
-            "pseudonym announcement member_did does not match sender",
-        );
-    }
-
-    let announced_did = DID(announcement.member_did.clone());
-
-    // Step 3: reject reserved pseudonym VALUES before touching the registry.
-    // Announcing the zero sentinel, the shared bootstrap RID, or the broadcast
-    // RID for one's own DID would redirect every honest sender's app-data
-    // fan-out, defeating unlinkability or leaking ciphertext onto the shared
-    // channel.
-    if is_reserved_pseudonym(&announcement.pseudonym, context_id) {
-        crate::metrics::record_pseudonym_announcement_rejected();
-        tracing::warn!(
-            context_id,
-            sender_did,
-            "pseudonym announcement uses a reserved routing ID — rejecting"
-        );
-        return AnnouncementOutcome::Rejected("pseudonym announcement uses a reserved routing ID");
-    }
-
-    // Step 4: registry updates are meaningful only for encrypted contexts. A
-    // broadcast context carries no peer registry — reject as a spec-level
-    // violation. Otherwise reject a routing ID already claimed by a DIFFERENT
-    // member (same-DID re-announce for key rotation stays allowed), then insert.
-    let Some(pseudonym_registry) = view.routing_mut().peer_registry_mut() else {
-        crate::metrics::record_pseudonym_announcement_rejected();
-        tracing::warn!(
-            context_id,
-            sender_did,
-            "pseudonym announcement received on broadcast context — rejecting"
-        );
-        return AnnouncementOutcome::Rejected(
-            "pseudonym announcement received on broadcast context",
-        );
-    };
-    if pseudonym_collides_with_other_did(
-        pseudonym_registry,
-        &announced_did,
-        &announcement.pseudonym,
+    // Run the shared, wasm-safe §9.10.4 decision core over the immutable peer
+    // registry (`None` for a broadcast context). The classifier owns the
+    // four-step validation; the native side effects — the rejection metric, the
+    // per-branch `tracing` warn, the registry insert, and the `PseudonymAnnounced`
+    // buffer emit — stay HERE and are byte-and-trace-identical to the previous
+    // inline implementation.
+    // S1 own-pseudonym guard (centralized in the shared classifier — ADR-057): pass
+    // this member's OWN pseudonym so a forged `attacker_did → our_pseudonym`
+    // announcement is rejected as a collision. `local_pseudonym()` and
+    // `peer_registry()` both read the routing state; capture the local pseudonym
+    // first so the two borrows do not overlap.
+    let local_pseudonym = view.routing_mut().local_pseudonym();
+    match classify_pseudonym_announcement(
+        plaintext,
+        sender_did,
+        context_id,
+        view.routing_mut().peer_registry(),
+        local_pseudonym,
     ) {
-        crate::metrics::record_pseudonym_announcement_rejected();
-        tracing::warn!(
-            context_id,
-            sender_did,
-            "pseudonym announcement collides with another member's routing ID — rejecting"
-        );
-        return AnnouncementOutcome::Rejected(
-            "pseudonym announcement collides with another member's routing ID",
-        );
+        PseudonymAnnouncementDecision::NotAnnouncement => AnnouncementOutcome::NotAnnouncement,
+        PseudonymAnnouncementDecision::Rejected {
+            reason,
+            claimed_did,
+        } => {
+            crate::metrics::record_pseudonym_announcement_rejected();
+            // Reproduce the exact warn that fired before for each rejection
+            // branch. The sender-mismatch branch is the ONLY one carrying a
+            // `claimed_did`, and it logs it as a field (`%claimed_did` renders
+            // the raw DID string, identical to the prior `%announcement.member_did`);
+            // the other three branches are disambiguated by their stable reason.
+            if let Some(claimed_did) = claimed_did {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    claimed_did = %claimed_did,
+                    "pseudonym announcement sender mismatch — rejecting forged announcement"
+                );
+            } else if reason == pseudonym::REJECT_RESERVED {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    "pseudonym announcement uses a reserved routing ID — rejecting"
+                );
+            } else if reason == pseudonym::REJECT_BROADCAST {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    "pseudonym announcement received on broadcast context — rejecting"
+                );
+            } else {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    "pseudonym announcement collides with another member's routing ID — rejecting"
+                );
+            }
+            AnnouncementOutcome::Rejected(reason)
+        }
+        PseudonymAnnouncementDecision::Accept {
+            member_did,
+            pseudonym,
+        } => {
+            // The classifier only returns `Accept` for an encrypted context whose
+            // peer registry is present and non-colliding; re-borrow it mutably to
+            // insert. The `if let` (rather than a workspace-denied `expect`) is a
+            // total match over that proven invariant — the registry presence
+            // cannot change between the classify read and this insert (no mutation
+            // occurs in between). `HashMap::insert` returns the PRIOR value, which
+            // drives the emit-on-change predicate below.
+            let previous = view
+                .routing_mut()
+                .peer_registry_mut()
+                .and_then(|registry| registry.insert(member_did.clone(), pseudonym));
+            // Record + emit-ON-CHANGE. Emit the `PseudonymAnnounced` observability
+            // event only when the recorded pseudonym is NEW **or CHANGED** — a
+            // first-contact peer, or a KNOWN peer that rotated its pseudonym and
+            // re-announced a different value (surfacing the routing change to a
+            // stream watcher). An IDENTICAL re-announce leaves the registry value
+            // unchanged and emits nothing, deduping the mesh's reciprocal-cascade
+            // re-sends. This mirrors the browser client's ingest predicate
+            // (`scp-client` `ingest_application_plaintext`) so accept/emit cannot
+            // drift across targets (share-don't-fork). The `routing_mut()` borrow
+            // above has ended (NLL) before this disjoint `receive_buffer` emit.
+            if previous != Some(pseudonym) {
+                let event = ContextEvent::PseudonymAnnounced {
+                    member_did,
+                    pseudonym,
+                };
+                emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
+            }
+            AnnouncementOutcome::Recorded
+        }
     }
-    pseudonym_registry.insert(announced_did.clone(), announcement.pseudonym);
-
-    // Record + emit. The validator stops here; per-site follow-up runs at the
-    // call site. The `routing_mut()` borrow above has ended (NLL) before this
-    // disjoint `receive_buffer` emit.
-    let event = ContextEvent::PseudonymAnnounced {
-        member_did: announced_did,
-        pseudonym: announcement.pseudonym,
-    };
-    emit_event_into(view.receive_buffer_mut(), event, context_id, event_tx);
-    AnnouncementOutcome::Recorded
 }
 
 // ---------------------------------------------------------------------------
@@ -722,8 +742,8 @@ fn ingest_pseudonym_announcement(
 /// armed (retained as the RED-CS3b engine signal for callers that observe it).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn run_buffered_post_delivery(
-    view: &mut ClassCMut,
+pub async fn run_buffered_post_delivery(
+    view: &mut ClassCMut<'_>,
     obligation: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -755,12 +775,14 @@ pub fn run_buffered_post_delivery(
     // Durable Merkle append ONLY for sender-authenticated events. Application
     // messages (`None`) skip the append but still run governance below.
     if let Some(event_name) = event_name
-        && let Err(e) = event_log.append_context_event(
-            context_id_bytes,
-            event_name,
-            sender_did,
-            event_timestamp_secs,
-        )
+        && let Err(e) = event_log
+            .append_context_event(
+                context_id_bytes,
+                event_name,
+                sender_did,
+                event_timestamp_secs,
+            )
+            .await
     {
         tracing::warn!(
             context_id,
@@ -813,6 +835,7 @@ pub fn run_buffered_post_delivery(
             },
             obligation,
         )
+        .await
     };
 
     *view.checkpoint_events_since_mut() += 1;
@@ -835,7 +858,7 @@ pub fn run_buffered_post_delivery(
 /// per-sender sequence. Returns the original `abort_err` when the token persists
 /// cleanly (or no token was burned), or the [`ContextError::PersistenceFailed`]
 /// when the fail-closed persist of the burned nonce itself fails.
-fn discharge_send_abort(
+async fn discharge_send_abort(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -843,7 +866,7 @@ fn discharge_send_abort(
     ticket: crate::context::economy_logic::EconomyTicket,
     abort_err: ContextError,
 ) -> Result<(), ContextError> {
-    let err = commit_send_nonce_token_on_abort(token, cell, deps, context_id, abort_err);
+    let err = commit_send_nonce_token_on_abort(token, cell, deps, context_id, abort_err).await;
     crate::context::economy_logic::rollback_economy_ticket_inline_view(
         cell.class_c_view().governance_class_c_mut(),
         ticket,
@@ -880,7 +903,8 @@ pub async fn send_message(
     spending_ucan: Option<&UcanToken>,
 ) -> Result<(), ContextError> {
     let context_id = handle.context_id().to_owned();
-    let context_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
+    // ADR-056: canonical digest, not a re-hash of the hex id.
+    let context_id_bytes = state::context_id_to_bytes(&context_id);
 
     // Pre-economy active + commit-fault gates run FIRST (matching the legacy
     // ordering: `require_active` → `check_commit_fault_marker` → signer-`None` →
@@ -925,7 +949,7 @@ pub async fn send_message(
     let velocity_token = {
         let mut view = cell.class_c_view();
         // H7: capability check BEFORE budget deduction.
-        if view.broadcast_context_mut().is_none() {
+        if view.broadcast_class_c_mut().is_none() {
             let role = view.role_state_class_c_mut();
             if !role.member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite) {
                 let is_suspended = role
@@ -949,6 +973,8 @@ pub async fn send_message(
             return Err(ContextError::RateLimited {
                 resource: "send".to_owned(),
                 message: "hard rate limit exceeded for sender".to_owned(),
+                // Token-bucket hard limit: no exact refill instant to surface.
+                retry_after_ms: None,
             });
         }
         // M4: record velocity BEFORE economy enforcement.
@@ -1025,11 +1051,11 @@ pub async fn send_message(
         ContextError,
     > = {
         let mut view = cell.class_c_view();
-        if let Some(bc) = view.broadcast_context_mut().as_mut() {
+        if let Some(mut bc) = view.broadcast_class_c_mut() {
             // `signer` was validated non-`None` at the top of the function; the
             // broadcast envelope is signed with the same key the encrypted path
             // would stamp, sourced from the one `MessageSigner`.
-            build_broadcast_envelope(&*deps.clock, bc, sender_did, payload, signer.key()).map(
+            build_broadcast_envelope(&*deps.clock, &mut bc, sender_did, payload, signer.key()).map(
                 |env| {
                     // Broadcast: SHA-256(context_id) per spec §5.14.
                     let broadcast_rid = scp_protocol::context::broadcast_routing_id(&context_id);
@@ -1057,7 +1083,8 @@ pub async fn send_message(
                     ContextError::MemberNotFound(format!(
                         "cannot assign sequence: {sender_did} is not a member"
                     )),
-                );
+                )
+                .await;
             };
             // §9.10.4: encrypted contexts fan out to each member's pseudonym
             // routing ID. App data embeds NO correlating routing value: the outer
@@ -1138,7 +1165,8 @@ pub async fn send_message(
                         spending_nonce_token.take(),
                         ticket,
                         err,
-                    );
+                    )
+                    .await;
                 }
                 let recipients = view.access_mut().access_key_store.get_all(&context_id);
                 Ok((None, recipients, seq, false, peer_pseudonyms))
@@ -1156,7 +1184,8 @@ pub async fn send_message(
                     spending_nonce_token.take(),
                     ticket,
                     err,
-                );
+                )
+                .await;
             }
         };
 
@@ -1183,9 +1212,10 @@ pub async fn send_message(
         // (fail-closed) instead of the no-op `Ok(())`. The Class-C reversal
         // (ticket + sequence) runs regardless.
         // The token's `commit` takes a SHARED `&PerContextState` (via `&*cell`).
-        let nonce_persist = spending_nonce_token
-            .take()
-            .map_or(Ok(()), |t| t.commit(cell, deps, &context_id));
+        let nonce_persist = match spending_nonce_token.take() {
+            Some(t) => t.commit(cell, deps, &context_id).await,
+            None => Ok(()),
+        };
         crate::context::economy_logic::rollback_economy_ticket_inline_view(
             cell.class_c_view().governance_class_c_mut(),
             ticket,
@@ -1220,7 +1250,8 @@ pub async fn send_message(
                     deps,
                     &context_id,
                     e,
-                );
+                )
+                .await;
                 crate::context::economy_logic::rollback_economy_ticket_inline_view(
                     cell.class_c_view().governance_class_c_mut(),
                     ticket,
@@ -1236,19 +1267,34 @@ pub async fn send_message(
     };
 
     // Phase 2: encrypt + send.
-    let phase2_result = encrypt_and_send(
-        deps,
-        broadcast_envelope,
-        signer,
-        &context_id,
-        sender_did,
-        payload,
-        &recipients_data,
-        sequence,
-        source_provenance,
-        &send_routing_ids,
-        MessageType::Content,
-    );
+    //
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): seal through the actor's field-granular
+    // Class-C `&mut ContextCryptoState` (reached via `mode_mut().crypto_mut()`).
+    // Broadcast contexts have no crypto sub-state, so `crypto_mut()` is `None` and
+    // the broadcast branch of `encrypt_and_send` builds the wire without it. The
+    // `&mut` view is scoped to just this call so `cell` is free for the abort /
+    // finalize arms below (NLL). Holding a `&mut ContextCryptoState` across the
+    // fan-out await is `Send` (mirrors `handle_deliver_incoming`'s `class_c_view`
+    // held across its timeout await).
+    let phase2_result = {
+        let mut view = cell.class_c_view();
+        let crypto_state = view.mode_mut().crypto_mut();
+        encrypt_and_send(
+            deps,
+            crypto_state,
+            broadcast_envelope,
+            signer,
+            &context_id,
+            sender_did,
+            payload,
+            &recipients_data,
+            sequence,
+            source_provenance,
+            &send_routing_ids,
+            MessageType::Content,
+        )
+        .await
+    };
     if let Err(e) = phase2_result {
         // Keep-direction (ADR-049 §9): persist the burned nonce fail-closed
         // (via `&*cell`) BEFORE the existing escrow-void + ticket rollback. If the
@@ -1260,7 +1306,8 @@ pub async fn send_message(
             deps,
             &context_id,
             e,
-        );
+        )
+        .await;
         // Void escrow + roll back ticket on send failure.
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(deps, a, &context_id).await;
@@ -1284,13 +1331,13 @@ pub async fn send_message(
     // `spending_nonce_tracker` — security-critical monotonic state that does
     // NOT survive an actor crash. It MUST be durably persisted (fail-closed)
     // BEFORE this paid send is acknowledged to the caller, exactly as the
-    // structurally-identical TOOL-INVOKE path does in `reserve_tool_economy`.
+    // structurally-identical OUTLET-INVOKE path does in `reserve_outlet_economy`.
     // A best-effort (coalesced) persist would let an actor crash in the ≤50ms
     // coalesce window roll the consume back, freshening the spending UCAN's
     // nonce after the caller already saw the send succeed — a replay /
     // double-spend window. `finalize_send` therefore persists fail-closed when
     // a spending nonce was committed for THIS send (mirroring the exact gating
-    // `reserve_tool_economy` uses: `deducted_cost.is_some() &&
+    // `reserve_outlet_economy` uses: `deducted_cost.is_some() &&
     // spending_ucan.is_some()`); on persist failure it returns an error and we
     // REVERSE the economy reservation (budget / velocity / rate-limit) and void
     // the escrow hold below — leaving the consumed nonce CONSUMED (the
@@ -1321,7 +1368,9 @@ pub async fn send_message(
         Some(signer.key()),
         spending_nonce_token.take(),
         is_broadcast,
-    ) {
+    )
+    .await
+    {
         // Fail-closed persist of the Class-S nonce consume failed. Reverse the
         // economy reservation (the ticket is still alive — it is NOT committed
         // until finalize succeeds) and void the escrow hold. The sequence
@@ -1399,14 +1448,16 @@ pub enum DeliverOutcome {
 /// undischarged obligation a Drop-guard PANIC in debug/CI rather than a silently
 /// dropped flag.
 #[allow(clippy::too_many_lines)]
-pub fn deliver_incoming(
-    view: &mut ClassCMut,
+pub async fn deliver_incoming(
+    view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     encrypted_blob: &[u8],
     downward_auth_sink: &mut Option<crate::context::actor::class_s::ClassSCommitToken>,
 ) -> Result<DeliverOutcome, ContextError> {
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    // ADR-056: canonical digest (matches the MLS group / sender keys), not a
+    // re-hash of the hex id.
+    let context_id_bytes = state::context_id_to_bytes(context_id);
 
     state::require_active(view.handle_mut())?;
 
@@ -1428,8 +1479,18 @@ pub fn deliver_incoming(
     drop(local_dids);
 
     // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
-    let Some(opened_envelope) =
-        decrypt_and_dispatch(deps, context_id, &context_id_bytes, encrypted_blob)?
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's field-granular
+    // Class-C `&mut ContextCryptoState` (`mode_mut().crypto_mut()`). Broadcast
+    // contexts carry no crypto sub-state (`None`), matching the retained provider
+    // fallback; the `&mut` view is released as soon as the sync call returns, so
+    // `view` is free for the dispatch cascade below.
+    let Some(opened_envelope) = decrypt_and_dispatch(
+        deps,
+        view.mode_mut().crypto_mut(),
+        context_id,
+        &context_id_bytes,
+        encrypted_blob,
+    )?
     else {
         // MLS Commit / Proposal — processed internally by the crypto layer,
         // no inner envelope to classify.
@@ -1502,7 +1563,8 @@ pub fn deliver_incoming(
     // Anti-replay + reorder buffer (§9.8.2, §9.8.5).
     let now_ms = deps.clock.now_millis();
     let sequence_check =
-        validate_and_drain_timeouts(view, deps, context_id, &inner, now_ms, downward_auth_sink)?;
+        validate_and_drain_timeouts(view, deps, context_id, &inner, now_ms, downward_auth_sink)
+            .await?;
 
     let is_local_sender = sender_did == local_member_did;
 
@@ -1518,7 +1580,8 @@ pub fn deliver_incoming(
                 &plaintext,
                 is_local_sender,
                 downward_auth_sink,
-            )?;
+            )
+            .await?;
             if consumed_as_announcement {
                 Ok(DeliverOutcome::Handled)
             } else {
@@ -1535,7 +1598,8 @@ pub fn deliver_incoming(
                 &plaintext,
                 now_ms,
                 downward_auth_sink,
-            );
+            )
+            .await;
             Ok(DeliverOutcome::Handled)
         }
     }
@@ -1610,8 +1674,9 @@ fn deliver_checkpoint_message(
 /// Encrypts the payload and sends it via transport (Phase 2 of
 /// [`send_message`]).
 #[allow(clippy::too_many_arguments)]
-pub fn encrypt_and_send(
+pub async fn encrypt_and_send(
     deps: &ActorDeps,
+    crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     broadcast_envelope: Option<BroadcastEnvelope>,
     signer: MessageSigner<'_>,
     context_id: &str,
@@ -1633,9 +1698,25 @@ pub fn encrypt_and_send(
         let encrypt_start = std::time::Instant::now();
         // The key and stamped persona travel together in the one `MessageSigner`
         // straight into the single stamp+sign site, so they cannot diverge.
-        let result = build_encrypted_envelope(
+        //
+        // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): seal through the actor's OWNED
+        // field-granular Class-C `&mut ContextCryptoState`
+        // ([`build_encrypted_envelope_actor`]) — every non-broadcast send seam
+        // (`send_message` / `send_checkpoint` / `send_heartbeat`) now supplies it.
+        // The provider `build_encrypted_envelope` twin is deleted. This else-branch
+        // is only reached for a non-broadcast encrypted send (a broadcast send took
+        // the pre-built-envelope branch above), so a `None` crypto state means a
+        // non-broadcast context with no MLS group — fail closed.
+        let cs = crypto_state.ok_or_else(|| {
+            ContextError::CryptoFailed(
+                "no MLS crypto state for encrypted send (non-broadcast context has no group)"
+                    .to_string(),
+            )
+        })?;
+        let result = build_encrypted_envelope_actor(
             &deps.clock,
-            &deps.crypto,
+            cs,
+            deps.crypto.local_did(),
             context_id,
             sender_did,
             payload,
@@ -1662,7 +1743,7 @@ pub fn encrypt_and_send(
     let mut last_err = None;
     let mut any_success = false;
     for rid in routing_ids {
-        match deps.transport.send_message(rid, &encrypted) {
+        match deps.transport.send_message(rid, &encrypted).await {
             Ok(()) => {
                 any_success = true;
                 crate::metrics::record_message_sent();
@@ -1684,7 +1765,7 @@ pub fn encrypt_and_send(
 // 9b. send_checkpoint (§9.9.3, §23.7)
 // ---------------------------------------------------------------------------
 
-/// Broadcasts a signed [`ConsistencyCheckpoint`] to context peers so they can
+/// Broadcasts a signed [`ConsistencyCheckpoint`](scp_event_log::checkpoint::ConsistencyCheckpoint) to context peers so they can
 /// compare Merkle roots at equal event counts and detect relay equivocation
 /// (§9.9.3, §23.7).
 ///
@@ -1713,14 +1794,52 @@ pub fn encrypt_and_send(
 /// every fan-out send fails. Callers that publish checkpoints opportunistically
 /// (the periodic-broadcast path in [`finalize_send`]) treat any error as
 /// best-effort and MUST NOT roll back the originating send.
-pub fn send_checkpoint(
+// ADR-049 PR-7 (inquisitor item 8): narrowed `pub` → `pub(crate)`. The only
+// callers of this FREE function are in-crate actor handlers (the reconnection
+// driver in `handlers/messaging.rs` and `finalize_send` here); cross-crate code
+// reaches checkpoint sending through the distinct `Supervisor::send_*` methods,
+// never this helper. `pub(crate)` is the minimal correct visibility, and it keeps
+// this internal seam out of the source-text `check-cross-layer` gate at the root
+// (no FFI/SDK surface, no bridge-export obligation) with no PR-body exemption.
+// `redundant_pub_crate` is a false positive: the enclosing `messaging_helpers`
+// module is already `pub(crate)`, but this item is genuinely reached crate-wide
+// (same rationale as `build_encrypted_envelope_actor` above).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) async fn send_checkpoint(
     deps: &ActorDeps,
-    state: &PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     sender_did: &DID,
     signing_key: &ed25519_dalek::SigningKey,
     checkpoint: &scp_event_log::checkpoint::ConsistencyCheckpoint,
 ) -> Result<(), ContextError> {
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): this is now a plain `async fn` taking
+    // `&mut ClassSCell` — `&mut PerContextState` is `Send`, so the crypto view can
+    // be held across the fan-out await and the former sync-prelude gymnastics (a
+    // `&PerContextState`-shared prelude producing owned routing data because
+    // `&PerContextState` is `!Send`) are gone.
+    //
+    // Routing (shared reads via `cell` `Deref`) into OWNED data, parallel to the
+    // application-data send path (§9.10.4): broadcast contexts address the
+    // derivable broadcast RID; encrypted contexts fan out to each known peer
+    // pseudonym. An empty encrypted routing set is a legitimate no-op.
+    let (recipients_data, routing_ids) = if cell.broadcast_context.is_some() {
+        (
+            std::collections::HashMap::new(),
+            vec![scp_protocol::context::broadcast_routing_id(context_id)],
+        )
+    } else {
+        let peer_pseudonyms: Vec<[u8; 32]> = cell
+            .routing
+            .peer_registry()
+            .map(|reg| reg.values().copied().collect())
+            .unwrap_or_default();
+        (
+            cell.access.access_key_store.get_all(context_id),
+            peer_pseudonyms,
+        )
+    };
+
     let message = CheckpointMessage {
         tag: CHECKPOINT_PAYLOAD_TAG.to_owned(),
         checkpoint: checkpoint.clone(),
@@ -1729,32 +1848,22 @@ pub fn send_checkpoint(
         ContextError::CryptoFailed(format!("checkpoint message serialization: {e}"))
     })?;
 
-    // Routing parallels the application-data send path (§9.10.4): broadcast
-    // contexts address the derivable broadcast RID; encrypted contexts fan out
-    // to each known peer pseudonym. An empty encrypted routing set (no peers
-    // known yet) is a legitimate no-op — there is simply nobody to inform.
-    let (broadcast_envelope, recipients_data, routing_ids) = if state.broadcast_context.is_some() {
-        let broadcast_rid = scp_protocol::context::broadcast_routing_id(context_id);
-        // Broadcast contexts carry the checkpoint inside an encrypted inner
-        // envelope addressed to the broadcast RID (the checkpoint exchange is
-        // an MLS-management-style message, not author-keyed broadcast content).
-        (None, std::collections::HashMap::new(), vec![broadcast_rid])
-    } else {
-        let peer_pseudonyms: Vec<[u8; 32]> = state
-            .routing
-            .peer_registry()
-            .map(|reg| reg.values().copied().collect())
-            .unwrap_or_default();
-        (
-            None,
-            state.access.access_key_store.get_all(context_id),
-            peer_pseudonyms,
-        )
+    // Seal through the actor's field-granular Class-C `&mut ContextCryptoState`.
+    let mut view = cell.class_c_view();
+    let Some(crypto_state) = view.mode_mut().crypto_mut() else {
+        // Broadcast context: no MLS `ContextCryptoState` to seal with. This is
+        // DELIVERY-IDENTICAL to the pre-PR-7 provider path (which errored "no MLS
+        // group" and was swallowed best-effort → nothing delivered); we simply
+        // drop the spurious warn. Whether broadcast-context checkpoints SHOULD
+        // deliver via MLS is a pre-existing gap — broadcast checkpoint
+        // MLS-delivery: tracked as a separate §9.9.3 finding (a broadcast-native
+        // redesign, outside this ownership move).
+        return Ok(());
     };
-
     encrypt_and_send(
         deps,
-        broadcast_envelope,
+        Some(crypto_state),
+        None,
         // Consistency checkpoints are device/human-originated signals, not
         // agent-autonomous messages — sign under `#active` (ADR-039).
         MessageSigner::Active(signing_key),
@@ -1769,6 +1878,7 @@ pub fn send_checkpoint(
         &routing_ids,
         MessageType::ConsistencyCheckpoint,
     )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1804,32 +1914,40 @@ pub fn send_checkpoint(
 /// any error as best-effort (a failed heartbeat is itself a suppression
 /// signal, surfaced separately by the receiver's gap detection) and MUST NOT
 /// tear down the subscription on a single failure.
-pub fn send_heartbeat(
+// ADR-049 PR-7 (inquisitor item 8): narrowed `pub` → `pub(crate)`. Same rationale
+// as `send_checkpoint` above — the only callers of this FREE function are in-crate
+// actor handlers (`handle_send_heartbeat`); cross-crate code reaches heartbeat
+// sending through the distinct `Supervisor::send_heartbeat` method. `pub(crate)`
+// is the minimal correct visibility and keeps the seam out of the source-text
+// `check-cross-layer` gate with no PR-body exemption. `redundant_pub_crate` is a
+// false positive (the enclosing module is already `pub(crate)`, the item is
+// reached crate-wide).
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) async fn send_heartbeat(
     deps: &ActorDeps,
-    state: &PerContextState,
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     sender_did: &DID,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<(), ContextError> {
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): plain `async fn` taking `&mut ClassSCell`
+    // (Send), so the seal runs on the actor's crypto view held across the fan-out
+    // await — the former sync-prelude (needed only because `&PerContextState` is
+    // `!Send`) is gone.
+    //
     // Send-authorization gates, mirroring `send_message` (§9.9.2 routes a
     // heartbeat through the same write path, so it must clear the same write
     // gates). Without these a member whose `MessagesWrite` capability was
-    // suspended or revoked could keep asserting liveness on the write path,
-    // and a heartbeat racing a context close could slip through after the
-    // context is no longer active.
-    //
-    // 1. The context must be active. A send racing context-close is rejected.
-    state::require_active(&state.handle)?;
-    // 2. Capability check (broadcast contexts have no per-member write
-    //    capability and address the public broadcast routing ID, exactly as in
-    //    `send_message`). A suspended capability surfaces a distinct message so
-    //    the scheduler's best-effort log is actionable.
-    if state.broadcast_context.is_none()
-        && !state
+    // suspended or revoked could keep asserting liveness on the write path, and a
+    // heartbeat racing a context close could slip through after the context is no
+    // longer active. Shared reads via `cell` `Deref`.
+    state::require_active(&cell.handle)?;
+    if cell.broadcast_context.is_none()
+        && !cell
             .role_state
             .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
     {
-        let is_suspended = state
+        let is_suspended = cell
             .role_state
             .suspended_for(sender_did.as_ref())
             .is_some_and(|s| s.contains(&Capability::MessagesWrite));
@@ -1841,46 +1959,56 @@ pub fn send_heartbeat(
         return Err(ContextError::PermissionDenied(msg));
     }
 
-    // Routing parallels the application-data and checkpoint send paths
-    // (§9.10.4): broadcast contexts address the derivable broadcast RID;
-    // encrypted contexts fan out to each known peer pseudonym. An empty
-    // encrypted routing set (no peers known yet) is a legitimate no-op —
-    // there is simply nobody to signal liveness to.
-    let (broadcast_envelope, recipients_data, routing_ids) = if state.broadcast_context.is_some() {
-        let broadcast_rid = scp_protocol::context::broadcast_routing_id(context_id);
-        (None, std::collections::HashMap::new(), vec![broadcast_rid])
+    // Routing parallels the application-data and checkpoint send paths (§9.10.4):
+    // broadcast contexts address the derivable broadcast RID; encrypted contexts
+    // fan out to each known peer pseudonym. An empty encrypted routing set is a
+    // legitimate no-op.
+    let (recipients_data, routing_ids) = if cell.broadcast_context.is_some() {
+        (
+            std::collections::HashMap::new(),
+            vec![scp_protocol::context::broadcast_routing_id(context_id)],
+        )
     } else {
-        let peer_pseudonyms: Vec<[u8; 32]> = state
+        let peer_pseudonyms: Vec<[u8; 32]> = cell
             .routing
             .peer_registry()
             .map(|reg| reg.values().copied().collect())
             .unwrap_or_default();
         (
-            None,
-            state.access.access_key_store.get_all(context_id),
+            cell.access.access_key_store.get_all(context_id),
             peer_pseudonyms,
         )
     };
 
+    // Seal through the actor's field-granular Class-C `&mut ContextCryptoState`.
+    let mut view = cell.class_c_view();
+    let Some(crypto_state) = view.mode_mut().crypto_mut() else {
+        // Broadcast context: no MLS `ContextCryptoState`. Delivery-identical no-op
+        // (see `send_checkpoint`). Broadcast checkpoint MLS-delivery: tracked as a
+        // separate §9.9.3 finding.
+        return Ok(());
+    };
     encrypt_and_send(
         deps,
-        broadcast_envelope,
+        Some(crypto_state),
+        None,
         // Heartbeats are device/human-originated liveness beacons, not
         // agent-autonomous messages — sign under `#active` (ADR-039).
         MessageSigner::Active(signing_key),
         context_id,
         sender_did,
-        // Heartbeats carry NO user content — the empty payload is the whole
-        // point: a minimal liveness beacon, padded by the envelope machinery.
+        // Heartbeats carry NO user content — the empty payload is the whole point:
+        // a minimal liveness beacon, padded by the envelope machinery.
         &[],
         &recipients_data,
-        // Heartbeats do not consume the application content sequence; the
-        // receive path classifies them before the sequence tracker.
+        // Heartbeats do not consume the application content sequence; the receive
+        // path classifies them before the sequence tracker.
         0,
         None,
         &routing_ids,
         MessageType::Heartbeat,
     )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2034,6 +2162,11 @@ fn record_send_participation(
             context_id,
             send_merkle,
             now,
+            // attestation_count is a credential-layer, verifier-relative fact
+            // (§7.3.2); this messaging path gates only on participation_count and
+            // has no attestation-cache access, so it passes an empty accessible-
+            // attestation set (count 0) by design — NOT a stub.
+            &[],
         )
         && record.participation_count > 0
     {
@@ -2058,8 +2191,8 @@ fn record_send_participation(
 /// actor crash), and `None` for a free / non-spending send. When `Some`, the
 /// final persist is the token's FAIL-CLOSED `commit`: a persist failure returns
 /// [`ContextError::PersistenceFailed`] so the paid send is NOT acknowledged
-/// while its nonce-consume is unpersisted, exactly mirroring the tool-invoke
-/// path in `reserve_tool_economy`. When `None`, the persist stays best-effort
+/// while its nonce-consume is unpersisted, exactly mirroring the outlet-invoke
+/// path in `reserve_outlet_economy`. When `None`, the persist stays best-effort
 /// (Class C) — the common path is not regressed. The token is consumed on EVERY
 /// path `finalize_send` can take (the TTL-expiry arm commits it too — a late TTL
 /// expiry must still persist the burned nonce, keep-direction).
@@ -2085,7 +2218,7 @@ fn record_send_participation(
 /// alive — finalize did not commit them); only the sequence is the caller's
 /// deferred responsibility, discharged here.
 #[allow(clippy::too_many_arguments)]
-pub fn finalize_send(
+pub async fn finalize_send(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2126,7 +2259,7 @@ pub fn finalize_send(
         // (ADR-049 §9 Class S, keep-direction). A free send carries no token. The
         // token's `commit` takes a SHARED `&PerContextState` (via `&*cell`).
         if let Some(t) = token {
-            t.commit(cell, deps, context_id)?;
+            t.commit(cell, deps, context_id).await?;
         }
         return Ok(());
     }
@@ -2199,7 +2332,8 @@ pub fn finalize_send(
                     event_tx: deps.event_tx.as_ref(),
                 },
                 &mut downward_auth_sink,
-            );
+            )
+            .await;
         }
 
         // Participation record (#1530).
@@ -2216,7 +2350,8 @@ pub fn finalize_send(
         // Checkpoint tracking (§9.9.3).
         *view.checkpoint_events_since_mut() += 1;
     }
-    create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signing_key, now);
+    create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signing_key, now)
+        .await;
 
     // Reconcile the GROW-armed `downward_auth_sink` with the send's nonce `token`
     // so EXACTLY ONE fail-closed persist is owed on every branch (ADR-049 §9,
@@ -2246,6 +2381,7 @@ pub fn finalize_send(
         is_broadcast,
         downward_auth_obligation,
     )
+    .await
 }
 
 /// Creates a consistency checkpoint when due (§9.9.3 thresholds) and, when one
@@ -2261,7 +2397,7 @@ pub fn finalize_send(
 /// consistency-monitoring artifact, not part of the message's delivery
 /// guarantee. A missing signing key (e.g. a context with no local custody)
 /// skips checkpoint creation entirely.
-fn create_and_broadcast_checkpoint_if_due(
+async fn create_and_broadcast_checkpoint_if_due(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2277,7 +2413,7 @@ fn create_and_broadcast_checkpoint_if_due(
     // ends before the shared-`&` `send_checkpoint` read below (NLL).
     let due_checkpoint = {
         let mut view = cell.class_c_view();
-        let broadcast_context_is_none = view.broadcast_context_mut().is_none();
+        let broadcast_context_is_none = view.broadcast_class_c_mut().is_none();
         let mls_epoch = view.epoch_mut().mls_epoch;
         crate::context::queries_helpers::create_checkpoint_if_due_view(
             &mut view,
@@ -2290,9 +2426,11 @@ fn create_and_broadcast_checkpoint_if_due(
             &*deps.event_log,
         )
     };
-    // `send_checkpoint` takes a SHARED `&PerContextState`, reachable via `&*cell`.
+    // ADR-049 PR-7: `send_checkpoint` now takes `&mut ClassSCell` (Send) and seals
+    // on the actor crypto view; `cell` is free here (the `due_checkpoint` view
+    // borrow above ended) and this is its last use.
     if let Some(checkpoint) = due_checkpoint
-        && let Err(e) = send_checkpoint(deps, cell, context_id, sender_did, sk, &checkpoint)
+        && let Err(e) = send_checkpoint(deps, cell, context_id, sender_did, sk, &checkpoint).await
     {
         tracing::warn!(
             context_id,
@@ -2324,7 +2462,7 @@ fn create_and_broadcast_checkpoint_if_due(
 /// from best-effort to fail-closed so a coalesce-window crash cannot silently
 /// re-grant removed authority. The token carrier (vs. the prior `bool`) makes a
 /// populated-but-undischarged obligation a Drop-guard PANIC in debug/CI.
-fn persist_finalized_send(
+async fn persist_finalized_send(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2348,7 +2486,7 @@ fn persist_finalized_send(
                 "paid send mints no separate downward-auth obligation — the nonce \
                  token's commit covers the GROW",
             );
-            if let Err(e) = t.commit(cell, deps, context_id) {
+            if let Err(e) = t.commit(cell, deps, context_id).await {
                 if !is_broadcast {
                     cell.class_c_view()
                         .membership_class_c_mut()
@@ -2363,9 +2501,9 @@ fn persist_finalized_send(
         // obligation's token commits fail-closed (ADR-049 §9, keep-direction).
         None => {
             if let Some(obligation) = downward_auth_obligation {
-                obligation.commit(cell, deps, context_id)?;
+                obligation.commit(cell, deps, context_id).await?;
             } else {
-                persist_state_best_effort(cell, deps, context_id);
+                persist_state_best_effort(cell, deps, context_id).await;
             }
         }
     }
@@ -2378,14 +2516,36 @@ fn persist_finalized_send(
 /// `needs_reconnect` (so restore fires the §23.11 reconnection pipeline)
 /// rather than failing — the crypto state is Class M (crash-surviving), so a
 /// transient export failure does not lose security state.
-fn build_snapshot_for_persist(
+///
+/// `pub(crate)` so the `ClassSCommitToken` deferred-persist terminals
+/// (`commit` / `discharge_with`) can build the owned snapshot in their OWN
+/// frame and drop the `&PerContextState` borrow BEFORE awaiting
+/// [`persist_snapshot_fail_closed`]. `PerContextState` is `!Sync` (it holds a
+/// `dyn FnMut` sink), so a `&PerContextState` held across an `.await` makes the
+/// actor future `!Send` and fails `tokio::spawn`. Building the snapshot first
+/// keeps the borrow off the await point (ADR-049 Decision 7).
+pub fn build_snapshot_for_persist(
     state: &PerContextState,
     deps: &ActorDeps,
     context_id: &str,
 ) -> crate::context::state::ContextSnapshot {
     let mut snapshot = build_snapshot_from_state(state);
-    let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-    match deps.crypto.export_crypto_state(&ctx_id_bytes) {
+    // ADR-056: canonical digest, not a re-hash of the hex id.
+    let ctx_id_bytes = state::context_id_to_bytes(context_id);
+    // ADR-049 PR-6 (read-authority switch): the per-sender epoch + recv-sequence
+    // floors are sourced from the AUTHORITATIVE Supervisor-owned Class-M registry
+    // (`deps.supervisor.export_*`) and threaded into `export_crypto_state` as the
+    // durable-blob params. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the export now runs
+    // on the actor's `state` (was the provider); the X25519 wrapping keypair enters
+    // as params from the retained `deps.crypto.wrapping_keypair()`, and the send
+    // sequence is read from `state.send_tracker` inside the twin.
+    let (wrapping_public_key, wrapping_secret_key) = deps.crypto.wrapping_keypair();
+    match state.export_crypto_state(
+        deps.supervisor.export_sender_key_epochs(&ctx_id_bytes),
+        deps.supervisor.export_recv_sequence_floors(&ctx_id_bytes),
+        wrapping_public_key,
+        &*wrapping_secret_key,
+    ) {
         Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
         Err(e) => {
             snapshot.needs_reconnect = true;
@@ -2402,6 +2562,31 @@ fn build_snapshot_for_persist(
     snapshot
 }
 
+/// Whether an MLS crypto export is durable enough to stand up a Welcome-JOINER.
+///
+/// [`build_snapshot_for_persist`] is deliberately FAIL-OPEN for existing
+/// members: on an `export_crypto_state` failure it writes an EMPTY crypto blob
+/// with `needs_reconnect = true` and the persist SUCCEEDS, so restore re-enters
+/// the §23.11 reconnection pipeline. A Welcome-JOINER cannot reconnect-derive
+/// (it would need a fresh Welcome), so for the spawn-from-Welcome entrypoint an
+/// empty / errored crypto export is FATAL — a keyless snapshot there means a
+/// live send-capable actor with no durable keys.
+///
+/// The persisted snapshot's crypto blob is a 1:1 copy of the
+/// `export_crypto_state` result, so re-reading the live export tells the
+/// entrypoint exactly what the snapshot carries WITHOUT depending on the
+/// persistence backend supporting read-back (the default `NoopContextPersistence`
+/// and the `for_query_shim` path do not). Returns `true` only when the export
+/// succeeded AND carries a non-empty blob.
+///
+/// The sole caller is `Supervisor::spawn_actor_from_welcome` (test-only until
+/// the FFI follow-on slice wires a production consumer), hence `dead_code`.
+#[must_use]
+#[allow(dead_code)]
+pub const fn welcome_snapshot_crypto_is_durable(export: &Result<Vec<u8>, ContextError>) -> bool {
+    matches!(export, Ok(blob) if !blob.is_empty())
+}
+
 /// Best-effort persist of the current actor state. Mirrors the legacy
 /// Phase 3 snapshot persistence path, but reads from actor-owned state.
 ///
@@ -2415,21 +2600,43 @@ fn build_snapshot_for_persist(
 /// (Class S — spending-nonce consume, executed-proposals, downward-authorization
 /// transitions), use [`persist_state_fail_closed`] so a persist failure returns
 /// an error instead of silently acknowledging an unpersisted mutation.
-pub fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
+///
+/// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
+///
+/// This is a SYNC fn returning a future, NOT an `async fn`. The
+/// `&PerContextState` is consumed by [`build_snapshot_for_persist`] in the
+/// synchronous prelude and is NOT captured by the returned future (which holds
+/// only the owned snapshot + `deps` / `context_id`). `PerContextState` is
+/// `!Sync` (it holds a `dyn FnMut` sink), so an `async fn` — which keeps its
+/// `&PerContextState` parameter in the future for the whole future lifetime —
+/// would make every awaiting actor handler `!Send` and fail `tokio::spawn`.
+/// `use<'d, 'c>` precisely captures only the `deps` / `context_id` lifetimes
+/// (edition 2024), excluding the `state` borrow.
+pub fn persist_state_best_effort<'d, 'c>(
+    state: &PerContextState,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
+) -> impl std::future::Future<Output = ()> + Send + use<'d, 'c> {
     let snapshot = build_snapshot_for_persist(state, deps, context_id);
-    if let Err(e) = deps.persistence.persist_context(context_id, &snapshot) {
-        crate::metrics::record_persistence_failure();
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist context snapshot"
-        );
+    async move {
+        if let Err(e) = deps
+            .persistence
+            .persist_context(context_id, &snapshot)
+            .await
+        {
+            crate::metrics::record_persistence_failure();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist context snapshot"
+            );
+        }
     }
 }
 
-/// Fail-closed sync persist of the current actor state (ADR-049 §9 Class S).
+/// Fail-closed persist of the current actor state (ADR-049 §9 Class S).
 ///
-/// Persists synchronously and, on failure, returns
+/// Persists and, on failure, returns
 /// [`ContextError::PersistenceFailed`] instead of swallowing the error — so a
 /// security-critical mutation (spending-nonce consume, executed-proposals,
 /// downward-authorization transition) is NEVER acknowledged to a caller unless
@@ -2448,14 +2655,47 @@ pub fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, cont
 ///
 /// Returns [`ContextError::PersistenceFailed`] if the underlying
 /// `persist_context` write fails.
-pub fn persist_state_fail_closed(
+/// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
+///
+/// SYNC fn returning a future (see [`persist_state_best_effort`] for the full
+/// rationale): the `&PerContextState` is consumed in the synchronous prelude and
+/// is NOT captured by the returned future, so every awaiting actor handler stays
+/// `Send`.
+pub fn persist_state_fail_closed<'d, 'c>(
     state: &PerContextState,
+    deps: &'d ActorDeps,
+    context_id: &'c str,
+) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c> {
+    // Build the owned snapshot FIRST so the `&PerContextState` borrow is dropped
+    // before the returned future — keeps this future `Send` (see
+    // [`build_snapshot_for_persist`]).
+    let snapshot = build_snapshot_for_persist(state, deps, context_id);
+    async move { persist_snapshot_fail_closed(&snapshot, deps, context_id).await }
+}
+
+/// Fail-closed persist of an ALREADY-BUILT snapshot (ADR-049 §9 Class S).
+///
+/// The `&PerContextState`-holding half of [`persist_state_fail_closed`] split
+/// out so the `ClassSCommitToken` deferred-persist terminals can build the
+/// snapshot in their own frame (dropping the `!Send` `&PerContextState` borrow)
+/// and then await this owned-`&ContextSnapshot` persist. `ContextSnapshot` is
+/// `Send`, so a caller holding `&snapshot` across the await stays `Send`.
+///
+/// Records the failure metric and logs on error, identically to
+/// [`persist_state_fail_closed`].
+///
+/// # Errors
+///
+/// Returns [`ContextError::PersistenceFailed`] if the underlying
+/// `persist_context` write fails.
+pub async fn persist_snapshot_fail_closed(
+    snapshot: &crate::context::state::ContextSnapshot,
     deps: &ActorDeps,
     context_id: &str,
 ) -> Result<(), ContextError> {
-    let snapshot = build_snapshot_for_persist(state, deps, context_id);
     deps.persistence
-        .persist_context(context_id, &snapshot)
+        .persist_context(context_id, snapshot)
+        .await
         .map_err(|e| {
             crate::metrics::record_persistence_failure();
             tracing::error!(
@@ -2475,7 +2715,6 @@ pub fn build_snapshot_from_state(
     state: &PerContextState,
 ) -> crate::context::state::ContextSnapshot {
     use crate::context::state::{GovernanceState, VelocityTrackerSnapshot};
-    use scp_protocol::context::ContextState;
 
     // ADR-049 §9 (white-hat P2): exhaustively destructure `GovernanceState` so a
     // NEW governance field forces a conscious persist decision AT COMPILE TIME.
@@ -2494,8 +2733,8 @@ pub fn build_snapshot_from_state(
         freeze: _freeze,
         pending_ceiling_modification: _pending_ceiling_modification,
         pending_economic_policy_change: _pending_economic_policy_change,
-        registered_tools: _registered_tools,
-        tool_interfaces: _tool_interfaces,
+        registered_outlets: _registered_outlets,
+        outlet_interfaces: _outlet_interfaces,
         pruning_policy: _pruning_policy,
         economic_policy: _economic_policy,
         budget_tracker: _budget_tracker,
@@ -2519,9 +2758,6 @@ pub fn build_snapshot_from_state(
                 spending_nonce_tracker: _spending_nonce_tracker,
             },
         // --- Transient: deliberately NOT persisted (rebuilt at restore). ---
-        // `timeout_task`: governance-timer handle, re-installed by the actor
-        // registry on respawn (no durable identity to preserve).
-        timeout_task: _timeout_task_transient,
         // `deadlock`: per-context deadlock-detection scratch state, recomputed
         // from the live proposal set after restore.
         deadlock: _deadlock_transient,
@@ -2533,11 +2769,11 @@ pub fn build_snapshot_from_state(
         pending_epoch_resets: _pending_epoch_resets_transient,
     } = &state.governance;
 
-    let context_state_value = state
-        .handle
-        .try_read_state()
-        .unwrap_or(ContextState::Active);
-    let ttl_remaining_secs = state.ttl.timer.remaining_secs();
+    let context_state_value = state.handle.state();
+    // Persist the ABSOLUTE convergent deadline verbatim (ADR-049 §9): restore/
+    // import re-arm the SAME instant, so a create-window `None` re-derives from
+    // `creation + ttl` and a prior extension is not recomputed away (D1/D2).
+    let ttl_deadline_secs = state.ttl.timer.deadline_unix_secs;
     let grace_entries = state.epoch.grace_store.to_grace_entries();
 
     crate::context::state::ContextSnapshot {
@@ -2555,10 +2791,10 @@ pub fn build_snapshot_from_state(
             .keys()
             .copied()
             .collect(),
-        ttl_remaining_secs,
-        registered_tools: state.governance.registered_tools.clone(),
+        ttl_deadline_secs,
+        registered_outlets: state.governance.registered_outlets.clone(),
         read_exclusion_list: state.access.read_exclusion_list.clone(),
-        tool_interfaces: state.governance.tool_interfaces.clone(),
+        outlet_interfaces: state.governance.outlet_interfaces.clone(),
         threshold_signers: state.governance.class_s.threshold_signers.clone(),
         threshold_value: state.governance.class_s.threshold_value,
         pruning_policy: state.governance.pruning_policy.clone(),
@@ -2609,12 +2845,31 @@ pub fn build_snapshot_from_state(
         // survives an actor crash. See [`saga_pending_snapshot`].
         saga_pending: saga_pending_snapshot(state),
         xctx_committed_outputs: xctx_committed_outputs_snapshot(state),
+        xctx_committed_stream_outputs: xctx_committed_stream_outputs_snapshot(state),
         xctx_committed_invocations: xctx_committed_invocations_snapshot(state),
         // ADR-049 §9 Class S (spec §6.2.4): persist the caller-side durable
         // reservation reversal records so a `PreparingB`-window crash can reverse
         // the caller deduction + void the escrow without the in-memory carrier.
         xctx_caller_reservations: xctx_caller_reservations_snapshot(state),
         xctx_nonce_dedup: xctx_nonce_dedup_snapshot(state),
+        // §7.3.8 Class S: persist the value-caveat counters so a consumed
+        // `max_calls` / `amount_max_cumulative` / `rate_window` cap survives an
+        // actor crash rather than un-consuming. See [`caveat_counters_snapshot`].
+        caveat_counters: caveat_counters_snapshot(state),
+        // Fix-D Class S: persist the streaming reservation recovery records so a
+        // crash-restore can RELEASE the escrow hold + cumulative counter reserve
+        // of any stream whose off-mailbox pump survived the crash. See
+        // [`stream_reservations_snapshot`].
+        stream_reservations: stream_reservations_snapshot(state),
+        // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold the broadcast
+        // security + roster state (per-author key epochs, block lists, subscriber
+        // registry) into the fail-closed snapshot so a block / governance ban /
+        // key-epoch advance is durable BEFORE the operation acks. `None` for
+        // non-broadcast contexts.
+        broadcast: state
+            .broadcast_context
+            .as_ref()
+            .map(scp_protocol::context::broadcast::BroadcastContext::to_snapshot),
     }
 }
 
@@ -2650,27 +2905,45 @@ pub(in crate::context) fn saga_pending_snapshot(
 }
 
 /// Build the Class-S snapshot projection of the actor's COMMITTED
-/// cross-context tool-invocation captures (spec §6.2.4 "Exactly-once
+/// cross-context outlet-invocation captures (spec §6.2.4 "Exactly-once
 /// execution with durable output capture"; ADR-049 §9). The live
-/// [`CommittedToolInvocation`](crate::context::supervisor::saga_prepared_state::CommittedToolInvocation)
+/// [`CommittedOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation)
 /// carries no §9.4.3 bearer bytes (public receipt + output), so — unlike
 /// [`saga_pending_snapshot`] — the snapshot stores it directly via `Clone`.
 /// Used at every snapshot builder so a crash between Commit-B capture and the
 /// next coalesced write cannot lose the durable output (which would re-invoke
-/// the tool on replay).
+/// the outlet on replay).
 pub(in crate::context) fn xctx_committed_outputs_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<
     crate::context::supervisor::saga_journal::SagaId,
-    crate::context::supervisor::saga_prepared_state::CommittedToolInvocation,
+    crate::context::supervisor::saga_prepared_state::CommittedOutletInvocation,
 > {
     state.class_s.xctx_committed_outputs.clone()
 }
 
+/// Build the Class-S snapshot projection of the actor's COMMITTED cross-context
+/// **streaming** outlet-invocation captures (ADR-061 seal phase; spec §6.2.5
+/// streaming saga; ADR-049 §9). The streaming sibling of
+/// [`xctx_committed_outputs_snapshot`]. The live
+/// [`CommittedStreamingOutletInvocation`](crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation)
+/// carries no §9.4.3 bearer bytes (public receipt + sealed root), so the snapshot
+/// stores it directly via `Clone`. Used at every snapshot builder so a crash
+/// between the seal-close capture and the next coalesced write cannot lose the
+/// durable witness (which would re-invoke the outlet on replay).
+pub(in crate::context) fn xctx_committed_stream_outputs_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<
+    crate::context::supervisor::saga_journal::SagaId,
+    crate::context::supervisor::saga_prepared_state::CommittedStreamingOutletInvocation,
+> {
+    state.class_s.xctx_committed_stream_outputs.clone()
+}
+
 /// Build the Class-S snapshot projection of the actor's caller-side (A-owned)
-/// COMMITTED cross-context tool-invocation witness set (spec §6.2.4 "Commit",
+/// COMMITTED cross-context outlet-invocation witness set (spec §6.2.4 "Commit",
 /// caller side; §17.16.4 crash recovery; ADR-049 §9). The live
-/// [`PerContextState::xctx_committed_invocations`](crate::context::actor::state::PerContextState::xctx_committed_invocations)
+/// [`ClassSState::xctx_committed_invocations`](crate::context::actor::state::ClassSState::xctx_committed_invocations)
 /// is a `{SagaId}` idempotency-witness set carrying no §9.4.3 bearer bytes, so —
 /// like [`xctx_committed_outputs_snapshot`] — the snapshot stores it directly
 /// via `Clone`. Exists so EVERY snapshot builder projects this Class-S saga
@@ -2689,7 +2962,7 @@ pub(in crate::context) fn xctx_committed_invocations_snapshot(
 /// Build the Class-S snapshot projection of the actor's caller-side durable
 /// reservation reversal records (spec §6.2.4 "Reservation release on every
 /// terminal path"; §17.16.4 crash recovery; ADR-049 §9). The live
-/// [`PerContextState::xctx_caller_reservations`](crate::context::actor::state::PerContextState::xctx_caller_reservations)
+/// [`ClassSState::xctx_caller_reservations`](crate::context::actor::state::ClassSState::xctx_caller_reservations)
 /// is a `{SagaId → CallerReservationRecord}` map whose values carry no §9.4.3
 /// bearer bytes (public economy metadata), so — like
 /// [`xctx_committed_invocations_snapshot`] — the snapshot stores it directly via
@@ -2715,13 +2988,43 @@ pub(in crate::context) fn xctx_caller_reservations_snapshot(
 /// to a plain `{nonce → first-seen secs}` map via `entries()`. Persisting it at
 /// every snapshot builder makes the replay-protection cache CRASH-SURVIVING: a
 /// restart no longer reopens the 5-minute window for a fresh-`SagaId` replay of
-/// a `CrossContextToolInvoke` (BLACK-624-01). Same-node restore rehydrates it;
+/// a `CrossContextOutletInvoke` (BLACK-624-01). Same-node restore rehydrates it;
 /// cross-node export/import drops it to empty (B's freshness state has no
 /// authority on a foreign node).
 pub(in crate::context) fn xctx_nonce_dedup_snapshot(
     state: &PerContextState,
 ) -> std::collections::HashMap<[u8; 16], u64> {
     state.class_s.xctx_nonce_dedup.entries()
+}
+
+/// Build the Class-S snapshot projection of the actor's §7.3.8 value-caveat
+/// counters (ADR-049 §9). The live
+/// [`CaveatCounters`](crate::trust::caveat_counters::CaveatCounters) is a plain
+/// `Clone` serde value, so — like `xctx_committed_invocations_snapshot` — the
+/// snapshot stores the map directly. Exists so EVERY snapshot builder projects
+/// this Class-S field through ONE helper, exactly like its siblings — no Class-S
+/// field is centralized by convention alone. Without persisting it, a crash that
+/// rolled a consumed cap back behind an acked invocation would re-open the
+/// spend/rate window the counter closes.
+pub(in crate::context) fn caveat_counters_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<String, crate::trust::caveat_counters::CaveatCounters> {
+    state.class_s.caveat_counters.clone()
+}
+
+/// Project [`ClassSState::stream_reservations`](crate::context::actor::state::ClassSState::stream_reservations)
+/// onto its snapshot map (Fix-D). The live
+/// [`StreamReservationRecord`](crate::context::outlets::invoke::StreamReservationRecord)
+/// is a plain `Clone` serde value, so — like [`caveat_counters_snapshot`] — the
+/// snapshot stores the map directly. Exists so EVERY snapshot builder projects
+/// this Class-S field through ONE helper, exactly like its siblings. Without
+/// persisting it, a crash while a stream's off-mailbox pump is mid-flight would
+/// strand the open-time escrow hold + cumulative counter reserve (the pump's
+/// close-time settle lands on the respawned generation and is dropped).
+pub(in crate::context) fn stream_reservations_snapshot(
+    state: &PerContextState,
+) -> std::collections::HashMap<String, crate::context::outlets::invoke::StreamReservationRecord> {
+    state.class_s.stream_reservations.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -2732,27 +3035,212 @@ pub(in crate::context) fn xctx_nonce_dedup_snapshot(
 /// messages.
 pub fn decrypt_and_dispatch(
     deps: &ActorDeps,
+    crypto_state: Option<&mut crate::context::actor::state::ContextCryptoState>,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     encrypted_blob: &[u8],
 ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
     let decrypt_start = std::time::Instant::now();
-    let open_result = deps.crypto.open(context_id_bytes, encrypted_blob)?;
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): open through the actor's OWNED
+    // field-granular Class-C `&mut ContextCryptoState` (driven from
+    // `deliver_incoming`'s `ClassCMut` view) — byte-identical to the deleted
+    // provider `open` twin (the 16 golden tests hold). `process_incoming_sender_key`
+    // below stays on the provider (it HPKE-opens with the NODE-RESIDENT wrapping
+    // secret — receive-side, NOT in the delete set); the sender-key INSTALL,
+    // however, now writes to the ACTOR-owned `cs.sender_key_store.set_unchecked`
+    // (the provider store is empty on a taken context — see the KeyResponse arm
+    // below), and `local_did` is likewise retained. A `None` crypto
+    // state means a context with no MLS group (a broadcast context, which never
+    // reaches this MLS-decrypt path — its receive path is author-signed) — fail
+    // closed, matching the deleted provider `open`'s "no MLS group" error.
+    let cs = crypto_state.ok_or_else(|| {
+        ContextError::CryptoFailed(
+            "no MLS crypto state for decrypt (context has no group)".to_string(),
+        )
+    })?;
+    let open_result = cs.open(&*deps.clock, context_id_bytes, context_id, encrypted_blob)?;
     crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
     match open_result {
-        scp_protocol::context::builder::OpenResult::Application(env) => Ok(Some(*env)),
+        scp_protocol::context::builder::OpenResult::Application(env) => {
+            // ADR-049 PR-6 (read-authority switch): the Supervisor-owned Class-M
+            // floor registry is now AUTHORITATIVE for the receive-side
+            // `(epoch, sequence)` anti-replay floor. `open()` performed pure
+            // decrypt + surfaced `env.receive_floor`; the enforcement is HERE,
+            // FAIL-CLOSED. The `?` fires BEFORE any `OpenedEnvelope` is
+            // dispatched, so a replayed/reordered envelope decrypts harmlessly
+            // and is then rejected — no envelope surfaces (D1 close).
+            //
+            // F-3 (black-hat): the receive-side overshoot ceiling reads
+            // `sender_epochs[sender_did]`, which co-mingles remote per-sender
+            // epochs with the LOCAL scalar keyed by `local_did`. This is safe
+            // only while `local_did` never appears as a remote sender on its own
+            // recv path — assert it rather than split the map (splitting ripples
+            // through merge/export/blob format; a violation here is fail-safe).
+            debug_assert_ne!(
+                env.sender_did.as_str(),
+                deps.crypto.local_did(),
+                "F-3: local_did must never appear as a remote sender on its own recv path"
+            );
+            deps.supervisor.check_and_advance_recv_sequence(
+                context_id_bytes,
+                &env.sender_did,
+                env.receive_floor,
+                scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+            )?;
+            Ok(Some(*env))
+        }
         scp_protocol::context::builder::OpenResult::Control => Ok(None),
         scp_protocol::context::builder::OpenResult::Management {
             sender_did,
             payload,
         } => {
             tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
-            deps.crypto
-                .process_incoming_sender_key(context_id_bytes, &sender_did, &payload)?;
-            Ok(None)
+            // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2: a management payload is a
+            // `SenderKeyDistributionMessage`. Branch on its variant — a PULL
+            // REQUEST is ANSWERED on the actor's OWNED crypto state (the answer
+            // HPKE-seals to the requester's EPHEMERAL wrapping key, so no signing
+            // key is needed — a clean receive-side answer); a RESPONSE is the
+            // push-distribution install path.
+            let dist = scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::from_bytes(
+                &payload,
+            )
+            .map_err(|e| ContextError::CryptoFailed(format!("distribution message decode: {e}")))?;
+            match dist {
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyRequest(
+                    request,
+                ) => {
+                    // BLACK-P7-1 (identity binding): the actor answer gates BOTH
+                    // membership (§9.16.6 Mitigation-1) and the block list on
+                    // `request.requester_did` — a PAYLOAD field. It MUST equal the
+                    // MLS-authenticated `sender_did`, or a member could request
+                    // under a DIFFERENT member's identity: e.g. a BLOCKED member
+                    // naming an unblocked one to pass the membership + block gates,
+                    // then receiving the sender key sealed to their OWN ephemeral
+                    // wrapping key. Bind the two here, before answering. The
+                    // requester public key the request signature is verified against
+                    // is ALSO resolved from `sender_did` (below), so this makes the
+                    // gated DID, the authenticated DID, and the signing key one and
+                    // the same.
+                    if request.requester_did != sender_did {
+                        return Err(ContextError::CryptoFailed(
+                            "sender-key request requester_did does not match the \
+                             MLS-authenticated sender"
+                                .to_string(),
+                        ));
+                    }
+                    // The request's Ed25519 signature is by the requester
+                    // (== MLS-authenticated `sender_did`) over its ephemeral
+                    // wrapping key. MLS already authenticated `sender_did`; the
+                    // request signature additionally binds the ephemeral key, so
+                    // resolve the requester's Active verification key to check it.
+                    let requester_pk =
+                        (deps.key_resolver)(&DID(sender_did.clone()), SigningKeyId::Active)
+                            .ok_or_else(|| {
+                                ContextError::CryptoFailed(format!(
+                                    "cannot resolve requester public key for {sender_did}"
+                                ))
+                            })?;
+                    // The actor answer takes the request as bytes (byte-identical
+                    // to the retained oracle); re-serialize the parsed request.
+                    let request_bytes = rmp_serde::to_vec_named(&request).map_err(|e| {
+                        ContextError::CryptoFailed(format!("request re-serialization: {e}"))
+                    })?;
+                    // No per-context sender-key block list is resident on the actor
+                    // (the blocking-flow wiring into the actor answer path is a
+                    // forward-only follow-up, tracked in #2146); the §9.16.6
+                    // Mitigation-1 membership gate on the MLS group tree is the live
+                    // Sybil defense.
+                    let blocked = std::collections::HashSet::new();
+                    let now_secs = deps.clock.now_secs();
+                    if let Some(sealed) = cs.handle_sender_key_request(
+                        context_id_bytes,
+                        deps.crypto.local_did(),
+                        now_secs,
+                        &request_bytes,
+                        requester_pk.as_bytes(),
+                        &blocked,
+                    )? {
+                        // Queue the ephemeral-sealed answer for MLS-wrap + transmit
+                        // by `drain_and_deliver_sender_keys` after the Class-C view
+                        // drops (in `handle_deliver_incoming`). A blocked requester
+                        // returns `None` (§9.16.2 silent drop) — nothing queued.
+                        cs.pending_distributions.push((sender_did.clone(), sealed));
+                    }
+                    Ok(None)
+                }
+                scp_protocol::crypto::sender_keys::SenderKeyDistributionMessage::KeyResponse(_) => {
+                    // ADR-049 PR-6 GATE-BEFORE-INSTALL + PR-7 install-onto-ACTOR
+                    // fix. `process_incoming_sender_key` HPKE-opens with the
+                    // NODE-RESIDENT wrapping secret (unaffected by the crypto move)
+                    // and returns the authenticated `(key, epoch)`; the
+                    // authoritative Class-M registry gates epoch monotonicity + the
+                    // poisoning ceiling FAIL-CLOSED BEFORE install; the install then
+                    // writes to the ACTOR's OWNED `cs.sender_key_store`. The provider
+                    // store is EMPTY on a taken (actor-owned) context, so the former
+                    // `deps.crypto.set_sender_key_unchecked` was a silent no-op — the
+                    // latent bug this fixes (D1 close, fail-safe ordering preserved).
+                    let (sender_key, epoch) = deps.crypto.process_incoming_sender_key(
+                        context_id_bytes,
+                        &sender_did,
+                        &payload,
+                    )?;
+                    deps.supervisor.check_and_advance_sender_epoch(
+                        context_id_bytes,
+                        &sender_did,
+                        epoch,
+                        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+                    )?;
+                    let ctx_id_hex = hex::encode(context_id_bytes);
+                    cs.sender_key_store
+                        .set_unchecked(&ctx_id_hex, &sender_did, sender_key);
+                    Ok(None)
+                }
+                other => Err(ContextError::CryptoFailed(format!(
+                    "unexpected sender-key distribution variant on the receive path: {other:?}"
+                ))),
+            }
         }
     }
+}
+
+/// ADR-049 PR-6 (read-authority switch): advance the LOCAL sender-key epoch
+/// floor in the authoritative Class-M registry after a local rotation.
+///
+/// Call AFTER a local `rotate_sender_key` succeeds, passing the post-rotation
+/// local epoch as `epoch`. ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the epoch is now a
+/// CALLER-SUPPLIED parameter rather than re-read here: all call sites source it
+/// from the actor's
+/// [`PerContextState::local_sender_key_epoch`](crate::context::actor::state::PerContextState::local_sender_key_epoch)
+/// (read inside the same `commit_class_s_keep` closure that durably persisted the
+/// bump) — the read-authority follows the write-authority coherently.
+///
+/// The floor is advanced in the supervisor registry keyed by the local DID.
+/// FAIL-CLOSED: a non-monotonic / overshooting local advance surfaces as a
+/// [`ContextError`] (via `From<FloorAdvanceError>`) that the caller `?`-propagates
+/// — this registry floor raise is the never-regressing anti-replay backstop, so
+/// it is NEVER swallowed even though the sender-key rotation + distribution around
+/// it is best-effort (M23). In practice a local rotation advances the scalar
+/// monotonically by +1, so this never fires; propagating it is the fail-closed
+/// default rather than a rollback the caller must orchestrate.
+///
+/// # Errors
+///
+/// Returns [`ContextError::CryptoFailed`] if the registry rejects the local
+/// epoch advance (non-monotonic or overshoot).
+pub(in crate::context) fn mirror_forward_local_sender_epoch(
+    deps: &ActorDeps,
+    ctx: &[u8; 32],
+    epoch: u64,
+) -> Result<(), ContextError> {
+    let local_did = deps.crypto.local_did();
+    deps.supervisor.check_and_advance_sender_epoch(
+        ctx,
+        local_did,
+        epoch,
+        scp_protocol::crypto::sender_keys::MAX_EPOCH_ADVANCE,
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2766,8 +3254,8 @@ pub fn decrypt_and_dispatch(
 /// runs consequence enforcement that performs a downward-authorization mutation (a
 /// capability suspension or an `AssignRole` demotion), so the cell-holding caller
 /// commits it fail-closed.
-pub fn validate_and_drain_timeouts(
-    view: &mut ClassCMut,
+pub async fn validate_and_drain_timeouts(
+    view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -2787,7 +3275,8 @@ pub fn validate_and_drain_timeouts(
 
     // Drain timed-out gaps. `drain_timed_out_gaps` bundles the simultaneous
     // `&mut reorder_buffer` + `&sequence_tracker` borrow internally.
-    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    // ADR-056: canonical digest, not a re-hash of the hex id.
+    let context_id_bytes = state::context_id_to_bytes(context_id);
     let timed_out = view.drain_timed_out_gaps(now_ms);
     for (gap_info, messages) in timed_out {
         let gap_event = ContextEvent::SequenceGapDetected {
@@ -2842,7 +3331,8 @@ pub fn validate_and_drain_timeouts(
                 &*deps.clock,
                 &*deps.event_log,
                 deps.event_tx.as_ref(),
-            );
+            )
+            .await;
         }
     }
 
@@ -2862,8 +3352,8 @@ pub fn validate_and_drain_timeouts(
 /// capability suspension or an `AssignRole` demotion), so the cell-holding caller
 /// commits it fail-closed.
 #[allow(clippy::too_many_arguments)]
-pub fn buffer_ahead_message(
-    view: &mut ClassCMut,
+pub async fn buffer_ahead_message(
+    view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -2880,7 +3370,8 @@ pub fn buffer_ahead_message(
     };
 
     if let Some((mut gap_info, messages)) = view.reorder_buffer_mut().buffer(buffered_msg) {
-        let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+        // ADR-056: canonical digest, not a re-hash of the hex id.
+        let context_id_bytes = state::context_id_to_bytes(context_id);
         let expected = view
             .sequence_tracker_mut()
             .expected_sequence(context_id, sender_did)
@@ -2939,7 +3430,8 @@ pub fn buffer_ahead_message(
                 &*deps.clock,
                 &*deps.event_log,
                 deps.event_tx.as_ref(),
-            );
+            )
+            .await;
         }
     }
 }
@@ -2961,8 +3453,8 @@ pub fn buffer_ahead_message(
 /// fail-closed (keep-direction).
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
-pub fn deliver_message_and_drain_buffered(
-    view: &mut ClassCMut,
+pub async fn deliver_message_and_drain_buffered(
+    view: &mut ClassCMut<'_>,
     deps: &ActorDeps,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -3014,14 +3506,15 @@ pub fn deliver_message_and_drain_buffered(
             // Fall through to the normal-message delivery path below.
         }
         AnnouncementOutcome::Recorded => {
-            // Recorded + emitted by the shared validator (registry insert +
-            // `ContextEvent::PseudonymAnnounced` buffer signal). The remaining
+            // Recorded by the shared validator (registry insert + a
+            // `ContextEvent::PseudonymAnnounced` buffer signal emitted
+            // on-change). The remaining
             // follow-up — sequence-tracker advance, reorder-buffer drain,
             // velocity, and consequence evaluation — is specific to the in-order
             // direct path and runs here only. There is NO durable Merkle append:
             // a received announcement is a §9.10.4 routing-bootstrap signal, not a
-            // convergent event (per-receiver arrival order; WASM never appends on
-            // receive), so appending it would false-positive §9.9.3 equivocation
+            // convergent event (per-receiver arrival order; honest members never
+            // append on receive), so appending it would false-positive §9.9.3 equivocation
             // detection — the same reason received application messages are
             // buffer-only.
             view.sequence_tracker_mut().advance(
@@ -3074,7 +3567,8 @@ pub fn deliver_message_and_drain_buffered(
                     &*deps.clock,
                     &*deps.event_log,
                     deps.event_tx.as_ref(),
-                );
+                )
+                .await;
             }
 
             let now = deps.clock.now_secs();
@@ -3118,7 +3612,8 @@ pub fn deliver_message_and_drain_buffered(
                         event_tx: deps.event_tx.as_ref(),
                     },
                     downward_auth_sink,
-                );
+                )
+                .await;
             }
             *view.checkpoint_events_since_mut() += 1;
 
@@ -3183,7 +3678,8 @@ pub fn deliver_message_and_drain_buffered(
             &*deps.clock,
             &*deps.event_log,
             deps.event_tx.as_ref(),
-        );
+        )
+        .await;
     }
 
     // §9.9.3: received application messages are NOT appended to the durable
@@ -3235,7 +3731,8 @@ pub fn deliver_message_and_drain_buffered(
                 event_tx: deps.event_tx.as_ref(),
             },
             downward_auth_sink,
-        );
+        )
+        .await;
     }
 
     *view.checkpoint_events_since_mut() += 1;
@@ -3265,8 +3762,8 @@ pub async fn send_pseudonym_announcement(
     let Some(pseudonym) = cell.routing.local_pseudonym() else {
         return;
     };
-    let announcement = state::PseudonymAnnouncement {
-        tag: state::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+    let announcement = PseudonymAnnouncement {
+        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
         member_did: sender_did.as_ref().to_owned(),
         pseudonym,
     };
@@ -3303,14 +3800,8 @@ pub async fn send_pseudonym_announcement(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod pseudonym_routing_tests {
-    use super::{
-        is_pseudonym_announcement_payload, is_reserved_pseudonym, pseudonym_collides_with_other_did,
-    };
-    use crate::context::state::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
-    use scp_identity::DID;
-    use std::collections::HashMap;
-
-    const CTX: &str = "ctx-pseudonym-routing-tests";
+    use scp_did::DID;
+    use scp_protocol::context::pseudonym::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
 
     fn announcement_bytes(member_did: &str, pseudonym: [u8; 32]) -> Vec<u8> {
         let ann = PseudonymAnnouncement {
@@ -3321,77 +3812,14 @@ mod pseudonym_routing_tests {
         rmp_serde::to_vec_named(&ann).expect("serialize announcement")
     }
 
-    /// §9.10.4: the shared `context_routing_id` is a RESERVED value — a member
-    /// must not be able to announce it as their own pseudonym, because honest
-    /// senders fan app-data out to announced pseudonyms and the shared RID is
-    /// relay-derivable. This is the type-level proof that the deleted
-    /// `shared_rid` fallback cannot be reintroduced through an announcement.
-    #[test]
-    fn shared_context_routing_id_is_reserved() {
-        let shared = scp_protocol::context::context_routing_id(CTX);
-        assert!(
-            is_reserved_pseudonym(&shared, CTX),
-            "shared context routing id must be rejected as a pseudonym value"
-        );
-    }
-
-    #[test]
-    fn zero_and_broadcast_routing_ids_are_reserved() {
-        assert!(
-            is_reserved_pseudonym(&[0u8; 32], CTX),
-            "zero sentinel reserved"
-        );
-        let broadcast = scp_protocol::context::broadcast_routing_id(CTX);
-        assert!(
-            is_reserved_pseudonym(&broadcast, CTX),
-            "broadcast routing id reserved"
-        );
-    }
-
-    #[test]
-    fn honest_pseudonym_is_not_reserved() {
-        // A raw Ed25519-public-key-shaped value (non-zero, not a derivable RID).
-        let honest = [7u8; 32];
-        assert!(
-            !is_reserved_pseudonym(&honest, CTX),
-            "an ordinary pseudonym must be accepted"
-        );
-    }
-
-    #[test]
-    fn cross_did_collision_detected_same_did_allowed() {
-        let mut registry: HashMap<DID, [u8; 32]> = HashMap::new();
-        let alice = DID("did:key:alice".to_owned());
-        let bob = DID("did:key:bob".to_owned());
-        let rid = [9u8; 32];
-        registry.insert(alice.clone(), rid);
-
-        // Bob claiming Alice's routing ID is a cross-DID collision.
-        assert!(
-            pseudonym_collides_with_other_did(&registry, &bob, &rid),
-            "a different DID claiming an existing routing ID is a collision"
-        );
-        // Alice re-announcing her OWN routing ID (key rotation rebroadcast) is fine.
-        assert!(
-            !pseudonym_collides_with_other_did(&registry, &alice, &rid),
-            "same-DID re-announce is not a collision"
-        );
-    }
-
-    #[test]
-    fn announcement_classifier_matches_only_tagged_payloads() {
-        let tagged = announcement_bytes("did:key:alice", [3u8; 32]);
-        assert!(
-            is_pseudonym_announcement_payload(&tagged),
-            "a well-formed tagged announcement is classified as such"
-        );
-        // Arbitrary user content must NOT be classified as an announcement, so
-        // it never gets routed to the shared bootstrap RID.
-        assert!(
-            !is_pseudonym_announcement_payload(b"hello world"),
-            "ordinary app data is not an announcement"
-        );
-    }
+    // The pure §9.10.4 predicate + classifier unit tests
+    // (`is_reserved_pseudonym`, `pseudonym_collides_with_other_did`,
+    // `is_pseudonym_announcement_payload`, `classify_pseudonym_announcement`)
+    // moved to `scp_protocol::context::pseudonym` alongside the logic they
+    // exercise (ADR-057 T-1). The behavioral ingest tests below STAY here: they
+    // drive the native `&mut ClassCMut` wrapper (`ingest_pseudonym_announcement`)
+    // against a real `PerContextState`, proving the wrapper's collapse onto the
+    // shared classifier is behavior-identical.
 
     // -----------------------------------------------------------------------
     // Behavioral ingest-hardening tests — buffered site + shared validator.
@@ -3458,6 +3886,38 @@ mod pseudonym_routing_tests {
     }
 
     #[test]
+    fn buffered_forged_own_pseudonym_announcement_is_rejected() {
+        // S1 (centralized in the shared classifier — ADR-057): BOB forges
+        // `BOB → victim_pseudonym`, where `victim_pseudonym` is THIS receiver's own
+        // pseudonym. The sender-mismatch guard passes (BOB announces for BOB) and
+        // the value is not in the peer registry (which excludes self), but the
+        // classifier — given the receiver's own pseudonym via `local_pseudonym()` —
+        // rejects it as a collision, so native does NOT record `BOB → our address`.
+        // Mirrors the browser `classify_rejects_announcement_of_the_receivers_own_pseudonym`.
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        let victim_pseudonym = [0x77u8; 32];
+        ClassCMut::from_state(&mut state)
+            .routing_mut()
+            .set_local_pseudonym(victim_pseudonym);
+
+        let result = deliver_plaintext_or_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            BOB,
+            &announcement_bytes(BOB, victim_pseudonym),
+            &ctx,
+            None,
+        );
+        // Rejected → no typed-append and (crucially) no registry insert.
+        assert_eq!(result, None);
+        let reg = state.routing.peer_registry().expect("encrypted ⇒ registry");
+        assert!(
+            reg.get(&DID(BOB.to_owned())).is_none(),
+            "a forged own-pseudonym announcement must NOT be recorded (S1)"
+        );
+    }
+
+    #[test]
     fn buffered_same_did_reannounce_succeeds_and_updates_registry() {
         let mut state = encrypted_state();
         let ctx = ctx_hex(0x11);
@@ -3493,6 +3953,78 @@ mod pseudonym_routing_tests {
             reg.get(&DID(ALICE.to_owned())),
             Some(&rotated),
             "a same-DID re-announce must update (not reject) the registry"
+        );
+    }
+
+    /// Emit-on-CHANGE: the receive buffer surfaces a `PseudonymAnnounced` event
+    /// on a NEW peer and on a CHANGED (rotated) pseudonym, but NOT on an
+    /// identical re-announce (the reciprocal cascade re-sends the same value
+    /// idempotently). Mirrors the browser client's `ingest_application_plaintext`
+    /// predicate so the emit decision cannot drift across targets
+    /// (share-don't-fork — ADR-057). Guards the silent-rotation gap: a known
+    /// peer that rotates its routing ID MUST surface the change to a stream
+    /// watcher, not update the registry silently.
+    #[test]
+    fn ingest_emits_pseudonym_announced_on_change_only() {
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        let first = [0x42u8; 32];
+        let rotated = [0x43u8; 32];
+
+        let count_events = |s: &PerContextState| {
+            s.receive_buffer
+                .event_log_entries()
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        scp_protocol::context::membership::ContextEvent::PseudonymAnnounced { .. }
+                    )
+                })
+                .count()
+        };
+
+        // (1) First contact — a NEW peer: emits.
+        ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_bytes(ALICE, first),
+            &ctx,
+            None,
+        );
+        assert_eq!(
+            count_events(&state),
+            1,
+            "a first-contact announcement must emit a PseudonymAnnounced event"
+        );
+
+        // (2) Identical re-announce — SAME value: registry value is unchanged,
+        // so NO new event fires (the reciprocal-cascade dedup).
+        ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_bytes(ALICE, first),
+            &ctx,
+            None,
+        );
+        assert_eq!(
+            count_events(&state),
+            1,
+            "an identical re-announce must NOT emit a duplicate PseudonymAnnounced event"
+        );
+
+        // (3) Rotation — CHANGED value: emits again, surfacing the address change.
+        ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            ALICE,
+            &announcement_bytes(ALICE, rotated),
+            &ctx,
+            None,
+        );
+        assert_eq!(
+            count_events(&state),
+            2,
+            "a rotated (changed) pseudonym re-announce must emit a fresh PseudonymAnnounced event"
         );
     }
 
@@ -3706,7 +4238,7 @@ mod pseudonym_routing_tests {
     // -----------------------------------------------------------------------
 
     use crate::context::actor::state::PerContextState as RegressionState;
-    use scp_primitives::TestClock;
+    use scp_clock::TestClock;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     /// Event-log provider that flags which `EventType`s were appended so the
@@ -3721,15 +4253,16 @@ mod pseudonym_routing_tests {
         saw_message_sent: AtomicBool,
     }
 
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for RecordingEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
 
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             event: scp_event_log::EventType,
@@ -3750,7 +4283,7 @@ mod pseudonym_routing_tests {
             Ok(())
         }
 
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -3758,8 +4291,8 @@ mod pseudonym_routing_tests {
         }
     }
 
-    #[test]
-    fn buffered_application_message_runs_velocity_consequence_and_checkpoint() {
+    #[tokio::test]
+    async fn buffered_application_message_runs_velocity_consequence_and_checkpoint() {
         use crate::context::messaging_helpers::{
             deliver_plaintext_or_announcement, run_buffered_post_delivery,
         };
@@ -3768,7 +4301,9 @@ mod pseudonym_routing_tests {
         };
 
         let ctx = ctx_hex(0x11);
-        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        // `ctx` is a real 64-hex id; key it through the ADR-056 chokepoint for
+        // fidelity with production keying (decodes the digest, never re-hashes).
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx);
         let mut state: RegressionState = encrypted_state();
 
         // Install a MessageVelocity rule that triggers on the FIRST message from
@@ -3820,7 +4355,8 @@ mod pseudonym_routing_tests {
             &clock,
             &event_log,
             None,
-        );
+        )
+        .await;
         // No GROW occurs on this velocity-trigger path, so no obligation is armed.
         assert!(
             obligation.is_none(),
@@ -3886,7 +4422,7 @@ mod pseudonym_routing_tests {
     // -----------------------------------------------------------------------
     // STRONGER regression: drive a buffered APPLICATION message END-TO-END
     // through a REAL buffered-drain call site so a re-introduced
-    // `if let Some(event_name) { run_buffered_post_delivery(...) }` gate is
+    // `if let Some(event_name) { run_buffered_post_delivery(...).await }` gate is
     // caught.
     //
     // The helper-contract test above calls `run_buffered_post_delivery`
@@ -3924,15 +4460,16 @@ mod pseudonym_routing_tests {
         any_append: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for DrainRecordingEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
 
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             event: scp_event_log::EventType,
@@ -3956,7 +4493,7 @@ mod pseudonym_routing_tests {
             Ok(())
         }
 
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -3981,7 +4518,7 @@ mod pseudonym_routing_tests {
             payload: Vec::new(),
             provenance: None,
             provenance_hash: [0u8; 32],
-            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
             signature: [0u8; 64],
             extensions: std::collections::HashMap::new(),
         }
@@ -3993,11 +4530,12 @@ mod pseudonym_routing_tests {
         event_log: Box<dyn crate::context::builder::ContextEventLogProvider>,
     ) -> crate::context::actor::deps::ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
         use std::sync::Arc;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             ALICE.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -4008,8 +4546,7 @@ mod pseudonym_routing_tests {
                     InMemoryStorage::new(),
                 )),
             );
-        let clock: Arc<dyn scp_primitives::Clock> =
-            Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
         let supervisor = Supervisor::with_providers(
             crypto,
             transport,
@@ -4114,12 +4651,13 @@ mod pseudonym_routing_tests {
             now_ms,
             &mut downward_auth_applied,
         )
+        .await
         .expect("validate_and_drain_timeouts");
         // The `SuspendAccess` action is a downward-auth GROW, so the drain
         // populated the sink; discharge it (commit performs the fail-closed persist)
         // so the token's Drop guard is satisfied.
         if let Some(token) = downward_auth_applied.take() {
-            let _ = token.commit(&state, &deps, &ctx);
+            let _ = token.commit(&state, &deps, &ctx).await;
         }
 
         // (a) Velocity recorded for the buffered sender via the drain path.
@@ -4198,14 +4736,15 @@ mod pseudonym_routing_tests {
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
         let ctx = ctx_hex(0x11);
-        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        // `ctx` is a real 64-hex id; key it through the ADR-056 chokepoint for
+        // fidelity with production keying (decodes the digest, never re-hashes).
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx);
         let mut state: PerContextState = encrypted_state();
 
         // The direct delivery path requires an Active context handle.
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
 
         // ALICE must be a writable member: the direct path checks membership +
@@ -4235,8 +4774,8 @@ mod pseudonym_routing_tests {
         // routing ID). The drain path reads sequence/timestamp/context/sender
         // from the inner envelope; the announcement payload is the `plaintext`.
         let alice_pseudonym = [0x42u8; 32];
-        let announcement = crate::context::state::PseudonymAnnouncement {
-            tag: crate::context::state::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        let announcement = PseudonymAnnouncement {
+            tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
             member_did: ALICE.to_owned(),
             pseudonym: alice_pseudonym,
         };
@@ -4256,11 +4795,12 @@ mod pseudonym_routing_tests {
             false,
             &mut downward_auth_applied,
         )
+        .await
         .expect("deliver_message_and_drain_buffered");
         // No consequence rules are installed here, so the sink stays `None`; the
         // `take()` is a no-op that satisfies the token's Drop guard either way.
         if let Some(token) = downward_auth_applied.take() {
-            let _ = token.commit(&state, &deps, &ctx);
+            let _ = token.commit(&state, &deps, &ctx).await;
         }
 
         // The announcement WAS recognized + processed (consumed as an internal
@@ -4283,6 +4823,90 @@ mod pseudonym_routing_tests {
         assert!(
             !saw_any_append.load(AtomicOrdering::SeqCst),
             "a received pseudonym announcement must NOT mint any durable Merkle leaf (§9.9.3)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // NATIVE-PARITY FOLLOW-UP (#2179): reciprocal-announce mesh completion.
+    //
+    // The browser client (`scp-client`) completes the §9.10.4 pseudonym mesh over
+    // a real relay via RECIPROCAL-ANNOUNCE: when a member records a NEW peer's
+    // pseudonym (a DID not previously in its registry) it re-announces its OWN
+    // pseudonym, guarded first-time-per-peer so the cascade converges
+    // (joiner-announce seed → existing members reciprocate → joiner reciprocates →
+    // quiescent). Native `ingest_pseudonym_announcement` records + emits but does
+    // NOT reciprocate.
+    //
+    // This is a GENUINE external constraint, not a deferral dressed as a decision:
+    // the native runtime wires no live relay-receive PUMP today, so a native
+    // reciprocal has nothing to drive against and is presently untestable
+    // end-to-end. Native must adopt reciprocal-announce in
+    // `ingest_pseudonym_announcement` WHEN it wires that live receive pump (#2179),
+    // so the trigger lands together with the loop that exercises it.
+    //
+    // This scaffold exercises the trigger CONDITION today (a first-time new-peer
+    // recording — the exact event the reciprocal keys on) against the real native
+    // ingest and pins the expected contract. It is #[ignore]d until #2179 wires the
+    // receive pump, at which point it is extended to assert the outbound reciprocal
+    // announcement (this member's own pseudonym, first-time-per-peer guarded) and
+    // un-ignored.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "native reciprocal-announce follow-up — see #2179"]
+    fn native_reciprocal_announce_on_new_peer_is_a_follow_up() {
+        let mut state = encrypted_state();
+        let ctx = ctx_hex(0x11);
+        // ALICE (this member) holds her own local pseudonym; BOB is a brand-new
+        // peer whose announcement ALICE is about to ingest for the first time.
+        let alice_pseudonym = [0xA1u8; 32];
+        ClassCMut::from_state(&mut state)
+            .routing_mut()
+            .set_local_pseudonym(alice_pseudonym);
+
+        // Precondition: BOB is NOT yet known — recording him is a FIRST-TIME new
+        // peer, the exact event reciprocal-announce keys on.
+        assert!(
+            state
+                .routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .get(&DID(BOB.to_owned()))
+                .is_none(),
+            "BOB must be unknown before the ingest so this is a first-time new-peer recording"
+        );
+
+        let bob_pseudonym = [0xB0u8; 32];
+        let outcome = ingest_pseudonym_announcement(
+            &mut ClassCMut::from_state(&mut state),
+            BOB,
+            &announcement_bytes(BOB, bob_pseudonym),
+            &ctx,
+            None,
+        );
+        assert!(
+            matches!(outcome, AnnouncementOutcome::Recorded),
+            "a legitimate new-peer announcement is recorded"
+        );
+        assert_eq!(
+            state
+                .routing
+                .peer_registry()
+                .expect("encrypted ⇒ registry")
+                .get(&DID(BOB.to_owned())),
+            Some(&bob_pseudonym),
+            "BOB's pseudonym is now recorded (the first-time trigger fired)"
+        );
+
+        // EXPECTED (unmet today — #2179): recording BOB as a NEW peer must drive a
+        // RECIPROCAL announcement of ALICE's own pseudonym so BOB learns ALICE — the
+        // mesh-completion half of §9.10.4. Native produces no reciprocal here because
+        // there is no live receive pump to carry it; when #2179 wires that pump this
+        // test asserts the outbound reciprocal announcement is produced, then is
+        // un-ignored. Fail loudly if run so the gap is never mistaken for closed.
+        panic!(
+            "native reciprocal-announce is not implemented — recording a new peer must \
+             trigger a reciprocal announcement of this member's own pseudonym (#2179)"
         );
     }
 
@@ -4330,8 +4954,7 @@ mod pseudonym_routing_tests {
             "checkpoint tag must be null-prefixed to avoid UTF-8 content collision"
         );
         assert_ne!(
-            CHECKPOINT_PAYLOAD_TAG,
-            crate::context::state::PSEUDONYM_ANNOUNCEMENT_TAG,
+            CHECKPOINT_PAYLOAD_TAG, PSEUDONYM_ANNOUNCEMENT_TAG,
             "checkpoint and announcement tags must be distinct"
         );
     }

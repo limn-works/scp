@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import ScpError, _coded_bridge_error
 
 if TYPE_CHECKING:
     pass
@@ -101,28 +101,49 @@ def normalize_address(address: str) -> str:
     return bridge.discovery_normalize_address(address)
 
 
-# ---------------------------------------------------------------------------
-# Petname operations (spec section 22.4)
-# ---------------------------------------------------------------------------
+def discover(query: str) -> list[dict[str, Any]]:
+    """Discover contexts from a DID or an ``scp://`` URI.
+
+    Delegates to the ``_scp_core`` ``context_discover`` bridge op, which
+    combines client-side sources (local runtime registry, known-contexts
+    registry, and an optional relay probe when a transport is connected)
+    and deduplicates by context ID. The relay is a dumb blob store with no
+    identity-to-context mapping; discovery is purely client-side (see
+    spec §5.14.11, §18.2.2, §18.4).
+
+    Args:
+        query: Either a DID (``did:...``) to resolve the contexts a member
+            participates in, or an ``scp://`` URI to resolve directly.
+
+    Returns:
+        A list of result dicts. Each contains ``context_id`` and ``source``
+        (``"local"`` / ``"relay"`` / ``"local+relay"``), ``relay_active``,
+        plus optional ``creator_did`` / ``member_count`` / ``outlet_count``.
+
+    Raises:
+        ScpError: (or an appropriate subclass) if the query is invalid, DID
+            resolution fails, or the bridge raises any protocol error.
+    """
+    bridge = _bridge()
+    try:
+        results = bridge.context_discover(query)
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
+    return [dict(r) for r in results]
 
 
-# ---------------------------------------------------------------------------
-# Handle registry operations (spec section 22.3.1)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Address resolution (spec section 22.8)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Scope registry operations (spec section 22.3.5, ADR-043)
-# ---------------------------------------------------------------------------
+def discover_contexts(query: str) -> list[dict[str, Any]]:
+    """Alias for :func:`discover` matching the cross-SDK ``discover_contexts``
+    capability name (TypeScript ``discoverContexts``); both spellings refer to
+    the same client-side context discovery op.
+    """
+    return discover(query)
 
 
 __all__ = [
     "create_query",
+    "discover",
+    "discover_contexts",
     "normalize_address",
     "parse_address",
 ]

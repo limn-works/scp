@@ -1,0 +1,24 @@
+# PR-6c Kotlin saga wrapper @a9c0cdcac (#1939 slice 4/4)
+
+ToolSagaTest.kt — 9 tests, §6.2.4 cross-context tool-invocation saga Kotlin SDK wrapper. SHIP.
+
+## RE-REVIEW @efe9006c4 — 10th test added (null-ucanProofId forwarding), SHIP
+- Inspection-only (build deadlocks vs main-worktree WIP Rust via shared cargo target — DO NOT build). Prior run proven green 10/10 skipped=0 at this HEAD.
+- NEW test `invokeCrossContextSaga forwards null ucanProofId`: passes ucanProofId=null, asserts lastSagaArgs[8]=="null" (stub records ucanProofId.toString()). LOAD-BEARING strengthener — proves null is forwarded as null (not coerced to "" / sentinel) AND the other 8 still forward in order. Closes the null-coercion gap the 9-test version left.
+- All else identical to @7c4575dfc analysis below: positional lastSagaArgs exact-list (9 distinct values) catches drop/swap on the ToolBridge→NativeBindings path; BridgeException fail() catches swallow; nonce 32hex/16B correct; e2e contains("code=") non-vacuous by codegen. Typed-error + SagaResult construction tests = contract-pins (non-blocking).
+- Residual (non-blocking, known): PUBLIC Scp.kt wrapper → inner(NativeScp) positional fidelity only smoke-tested by e2e (can't catch swap); mitigated by named-arg call site. Conformance stub covers the flat ToolBridge path, not the public-shim path.
+
+## RE-REVIEW @7c4575dfc — e2e assertion strengthened, vacuity RESOLVED
+- Commit 7c4575dfc replaced the vacuous e2e catch `e.message?.isNotEmpty() ?: true` with `e.message!!.contains("code=")`. NOW non-vacuous AND provably robust.
+- PROVEN by inspection of generated bindings `internal/uniffi/scp/scp.kt`: EVERY ScpException variant (Identity/Context/Permission/Crypto/Transport/Tool/Validation + SagaAborted/SagaNeedsRepair/SagaBusy) has `override val message get() = "msg=…, code=…, …"`. So `contains("code=")` holds for ANY terminal the real engine reaches → no false-fail risk. NOTE: `code=` comes from UniFFI's generated structured toString, NOT the Rust thiserror Display (`saga aborted [{code}]: {msg}` — no literal `code=`). Don't confuse the two layers.
+- Signal: catch-block entry (`catch (e: ScpException)`) is the smoke signal (a wrapper NPE/IllegalState would NOT be caught → test fails); `contains("code=")` adds "caught thing is a structured protocol error carrying a code". Honest scoping comment intact: still cannot prove per-arg positional fidelity (deferred to conformance lastSagaArgs + Rust/integration).
+- No re-run needed at this HEAD: provably-passing by codegen inspection; prior a9c0cdcac run already proved e2e reaches real engine + catches typed ScpException (skipped=0). Build caveat (main-worktree WIP Rust collision) doesn't affect this.
+- ScpViewModelTest.kt + CoroutineBridgeTest.kt diffs = mechanical NativeBindings-interface conformance (fakes must implement new method or fail compile). Not new tests.
+
+- Ran 9/9 pass, 0 skipped → e2e (`Scp(StorageConfig.InMemory)` + assumeTrue) actually exercised the REAL engine; native lib present in this worktree. Strong.
+- Generated UniFFI types match constructions exactly: SagaResult(sagaId:String, receipt:ByteArray?, output:ByteArray?); ScpException.SagaAborted(msg,code,retryAfterMs:ULong?), SagaNeedsRepair(...,sagaId) code 13065, SagaBusy(...,contendedContext) code 13066. Typed-error tests CONSTRUCT+assert fields = compile-time contract-pin on codegen (case exists + labels/types/nullability), Low ROI non-blocking — same posture as Swift sibling.
+- Nonce fixture NONCE_HEX="abababababababababababababababab" = 32 hex / 16 bytes, valid hex. Correct.
+- ToolBridge.invokeCrossContextSaga conformance test LOAD-BEARING — mutation-proven: swapped callerDid<->toolRegistrationId in wrapper call → `forwards all arguments` test fails (stub records positional lastSagaArgs, all 9 values distinct, exact-list assert). BridgeException-propagation test load-bearing by construction (code 13066 assert + fail()).
+- e2e catch body assertion `e.message?.isNotEmpty() ?: true` is VACUOUS (security flagged correctly): every generated ScpException subclass overrides message to non-empty "msg=...,code=...", so isNotEmpty() always-true and the ?:true fallback is dead. The REAL load-bearing signal is `catch (e: ScpException)` itself — reaching a TYPED exception (not NPE/IllegalState from wrapper) is the smoke signal; body assert adds zero. Non-blocking but trivially strengthenable → assert e.message!!.contains("code=") / "SCP-".
+- Known acknowledged gap (in test comment): e2e does NOT catch a same-typed positional swap through the real bridge (any terminal passes) — contract-expensive (needs bidirectional-consent committed saga). Reasonably declined at wrapper unit layer; flat conformance test covers per-arg fidelity instead.
+- Kotlin JUnit5 + backtick names; capability matrix flipped kotlin:true + dropped #1939 exemption (correct).

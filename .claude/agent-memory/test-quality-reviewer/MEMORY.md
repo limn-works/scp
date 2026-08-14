@@ -61,3 +61,9 @@
 - Every SDK source module needs a corresponding test file (Trust.swift was missing tests)
 - Cross-reference acceptance criteria operations against actual SDK API surface (e.g., "append" vs "query")
 - For wiring tests: verify the test goes through ContextManager public API, not internal state manipulation
+- [TS SDK bridge error shape](ts_sdk_bridge_error_shape.md) — trust.ts classifies plain-Error bridge errors by [SCP-PERM] message regex; mapBridgeError is bypassed
+- [TS SDK trust/parity tests](ts-sdk-trust-tests.md) — strict mock-bridge harness (M-1) is gold standard; TS classifier ~46 cases vs Python ~111 (per-prefix gap); tier mapping only in skipped real-NAPI group
+- [Bounded reply-await tests](bounded-reply-await-tests.md) — gold-standard `start_paused` virtual-time timeout test pattern (elapsed>=BUDGET guard + "did not reply" substring = non-vacuous); 4-site DRY/testability gap
+- [OutletError conformance contract (SCP-OUT-031)](outlet-error-conformance-contract.md) — cross-SDK §5.4.4 gate; strong malformed corpus + registry rename-pinning, but slug ADDITIONS ungated (no ALL_SLUGS), no golden wire-bytes/HMAC, ExecutionPanic + large-u64 untested. Input-vectors prove self-consistency ≠ cross-SDK wire identity.
+- [Gate self-tests over-determined](gate-selftest-over-determined.md) — validator "fails on bad input → exit 1" tests pass for the wrong reason if input trips multiple error branches; isolate the branch + assert the specific signal, not just exit code
+- [RELAYRES-003 DID-slot tests](relayres-003-did-slot-tests.md) — did_slot.rs unit + 4-transport e2e; ADEQUATE. Weakness: rate-limit-ordering test uses absent blob (under-discriminates CPU-amp defense); cold-index e2e only WS+QUIC not UDP/WT

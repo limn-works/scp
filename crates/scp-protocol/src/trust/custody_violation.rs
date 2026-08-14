@@ -32,7 +32,7 @@
 //! - **Category A** (human-only): `did_document`, `verification_method`,
 //!   `identity`, `pre_rotation`, `service`, `relay_config` — any resource
 //!   that modifies the DID document itself.
-//! - **Category B/C** (agent-permitted): `messages`, `tool_invoke`, `member`,
+//! - **Category B/C** (agent-permitted): `messages`, `outlet_call`, `member`,
 //!   `role`, `context`, `spending`, and all other operational resources.
 //!
 //! The classifier is deliberately conservative: unknown resource types default
@@ -45,8 +45,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::SigningKeyId;
-use scp_primitives::DID;
+use scp_did::{DID, SigningKeyId};
 
 // ---------------------------------------------------------------------------
 // Action categories (AB-020)
@@ -67,7 +66,7 @@ pub enum ActionCategory {
 
     /// Operational actions — agent key (`#agent`) permitted.
     ///
-    /// Includes: messaging, tool invocation, member management, role
+    /// Includes: messaging, outlet invocation, member management, role
     /// assignment, context operations, spending, and all other non-DID-
     /// document actions.
     CategoryB,
@@ -94,7 +93,7 @@ const CATEGORY_A_RESOURCES: &[&str] = &[
 ///
 /// These are the UCAN capability resource types that modify the DID document
 /// and therefore require human (`#active`) signing. Exposed for conformance
-/// testing against mirror implementations (e.g. WASM).
+/// testing against mirror implementations.
 ///
 /// # Examples
 ///
@@ -126,7 +125,7 @@ pub const fn category_a_resources() -> &'static [&'static str] {
 /// assert_eq!(classify_action("did_document"), ActionCategory::CategoryA);
 /// assert_eq!(classify_action("verification_method"), ActionCategory::CategoryA);
 /// assert_eq!(classify_action("messages"), ActionCategory::CategoryB);
-/// assert_eq!(classify_action("tool_invoke"), ActionCategory::CategoryB);
+/// assert_eq!(classify_action("outlet_call"), ActionCategory::CategoryB);
 /// ```
 #[must_use]
 pub fn classify_action(resource: &str) -> ActionCategory {
@@ -786,8 +785,8 @@ mod tests {
     }
 
     #[test]
-    fn classify_tool_invoke_as_category_b() {
-        assert_eq!(classify_action("tool_invoke"), ActionCategory::CategoryB);
+    fn classify_outlet_call_as_category_b() {
+        assert_eq!(classify_action("outlet_call"), ActionCategory::CategoryB);
     }
 
     #[test]

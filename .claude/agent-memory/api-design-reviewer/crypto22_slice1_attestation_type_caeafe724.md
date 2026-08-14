@@ -1,0 +1,18 @@
+---
+name: crypto22-slice1-attestation-type-caeafe724
+description: CRYPTO-22 Slice 1 scp-mls KeyPackageAttestation pure type+serialization+Vector37 API review @caeafe724
+metadata:
+  type: project
+---
+
+# CRYPTO-22 Slice 1 — scp-mls `KeyPackageAttestation` type (@caeafe724, branch crypto22-s1-attestation-type)
+
+SHIP IT (1 MODERATE misuse note, rest LOW/obs). Implements the spec reviewed in [[crypto22-keypackage-attestation-26b45229c]] (0xFF03 deterministic len-prefixed binary body, Vector 37). Pure type + serialization + KAT only; no signer/verifier/wiring (later slices).
+
+**Why the review mattered:** Three byte-producing methods — `signing_preimage()->Vec<u8>` (domain+8 fields, 211B), `signing_hash()->[u8;32]` (SHA256(preimage)), `to_extension_body()->Vec<u8>` (8 fields+64B sig, NO domain). Ed25519 signature covers `signing_hash` (the 32-byte prehash), NOT preimage, NOT body. `signing_preimage` is `pub` and module-doc (lines 23-24) conflates preimage+hash as "the bytes a later signer signs over" → realistic footgun: crypto-aware later author signs the preimage ("Ed25519 hashes anyway"), gets a valid-looking sig that diverges from Vector 37's KAT constant → cross-impl verify fails. `[u8;32]` vs `Vec<u8>` return-type split is the only guardrail. FIX: narrow `signing_preimage` to `pub(crate)` (only in-module KAT tests + `signing_hash` consume it; no cross-crate need) so `signing_hash()` is the SOLE signable output; or sharpen module doc.
+
+**How to apply (next slices):** signer slice constructs struct w/ placeholder sig → `signing_hash()` → sign → set `.signature` (so pub `signature` field is necessary, all-pub struct is correct for round-trip). Verifier is the sole consistency gate (type can't self-validate sig w/o DID pubkey). Later WIRING slice needs a `leaf_node_params_with_attestation` (sibling wrapping_extension has `leaf_node_params_with_wrapping_key`) carrying BOTH 0xFF01+0xFF03 — `scp_capabilities_with_keypackage_attestation()` already declares both (good forethought).
+
+**RESOLVED @d39636213 (Pass A re-review, SHIP IT):** MOD footgun closed. `signing_preimage` now `pub(crate)` — cross-crate signer (downstream of scp-mls) sees only pub `signing_hash()`/`to_extension_body()`/`from_extension_body()`/`make_attestation_extension()`/`extract_attestation()`; `signing_preimage` invisible outside crate. Module doc rewritten to a "# What a later signer signs" section: signing_hash is the ONLY signable output, MUST NOT sign preimage or extension body. `to_extension_body` doc now explicitly "NOT a signable input." Signer flow intact: all struct fields incl `signature` still pub → construct, `signing_hash()`, sign, set `.signature`. Refactor also swapped hand-rolled `write_canonical_fields` for shared `scp_protocol::crypto::canonical::canonical_hash_bytes` (VarBytes/Fixed32/U64 = same 4B-BE-prefix/raw-32/8B-BE encoding); byte-equivalence proven by unchanged Vector 37 KAT tests + 3 new negative tests (non-UTF8 did/skid, oversized len-prefix). Deleted trivial `attestation_trigger_variants_distinct` test (tautology). No new footgun for signer/verifier slices.
+
+Consistency w/ sibling wrapping_extension.rs: make/extract are METHODS on struct (`att.make_attestation_extension()`, `KeyPackageAttestation::extract_attestation`) vs sibling's free fns — defensible (rich struct vs raw [u8;32]). `AttestationTrigger{Add,Update}` + `MAX_ATTESTATION_KEY_RESOLUTION_STALENESS` exported unused-in-slice (verifier consumes) — documented, acceptable. Docs excellent (field-level, spec refs). `write_canonical_fields` unwrap_or(u32::MAX) silently corrupts on >4GiB did but infallible-by-contract, fine.

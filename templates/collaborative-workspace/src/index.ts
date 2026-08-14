@@ -45,9 +45,8 @@ const WORKSPACE_CEILING: readonly string[] = [
   "role:assign",
   "member:invite",
   "member:remove",
-  "tool:register",
-  "tool:invoke",
-  "tool:invoke:*",
+  "outlet:register",
+  "outlet:call:*",
   "governance:propose",
   "governance:vote",
 ];
@@ -59,15 +58,14 @@ const WORKSPACE_ROLES: Readonly<Record<string, readonly string[]>> = {
     "messages:read",
     "messages:write",
     "member:invite",
-    "tool:invoke",
-    "tool:invoke:*",
+    "outlet:call:*",
     "governance:propose",
     "governance:vote",
   ],
   Member: [
     "messages:read",
     "messages:write",
-    "tool:invoke",
+    "outlet:call:*",
   ],
   Observer: [
     "messages:read",
@@ -238,12 +236,12 @@ async function main(): Promise<void> {
   const memberToolToken = await mintUcan(
     ctx,
     member.identity.did,
-    ["tool:invoke", `tool:invoke:${summarizeToolId}`],
+    ["outlet:call:*", `outlet:call:${summarizeToolId}`],
   );
   log("ucan", `Minted tool token for member: ${memberToolToken.id}`);
 
   // Validate the token against the required capability.
-  await validateUcan(ctx, memberToolToken.encoded, `tool:invoke:${summarizeToolId}`);
+  await validateUcan(ctx, memberToolToken.encoded, `outlet:call:${summarizeToolId}`);
   log("ucan", "Token validated for summarize tool invocation");
 
   // Delegate a subset of the moderator's capabilities to the member.

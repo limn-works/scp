@@ -14,8 +14,8 @@ use std::time::Duration;
 use rand::Rng as _;
 use tokio::sync::{RwLock, mpsc};
 
-use crate::native::protocol::RelayMessage;
 use crate::native::storage::StoredBlob;
+use scp_relay_client::RelayMessage;
 
 // ---------------------------------------------------------------------------
 // Global owner ID counter (cross-transport collision prevention)

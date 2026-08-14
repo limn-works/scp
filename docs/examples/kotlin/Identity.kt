@@ -69,7 +69,7 @@ fun identityExample(bridge: CoroutineBridge) = runBlocking {
 
     // 8. Migrate identity to a new DID (Layer 2 rotation).
     //    The DidRotationEvent JSON must be distributed to every active
-    //    context where the OLD DID is a member (spec §3.2.1 step 4b)
+    //    context where the OLD DID is a member (spec §9.12, ADR-003 §4b)
     //    so peers accept the new DID's #active key. Pre-context callers
     //    can ignore the event (it has nowhere to go yet).
     val migrated = advanced.migrateWithRotationEvent(identityHandle)

@@ -14,8 +14,8 @@
 //! Refactored from `store/ucan.rs` per spec section 17.4 Module Structure.
 //! See SCP-PERSIST-011.
 
+use scp_clock::Clock;
 use scp_platform::traits::Storage;
-use scp_primitives::Clock;
 use serde::{Deserialize, Serialize};
 
 use super::{ProtocolRepository, StoreError};
@@ -139,7 +139,7 @@ impl<S: Storage> ProtocolRepository<S> {
         // storage read (last-prune timestamp) is negligible relative
         // to the two reads and one write that the nonce check already
         // performs. See spec section 17.3 on nonce pruning.
-        let now = scp_primitives::SystemClock.now_secs();
+        let now = scp_clock::SystemClock.now_secs();
         self.maybe_prune_nonces(context_id, now).await?;
 
         let key = nonce_key(context_id, nonce_hash)?;
@@ -237,8 +237,8 @@ impl<S: Storage> ProtocolRepository<S> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use scp_platform::testing::InMemoryStorage;
-    use scp_primitives::Clock;
+    use scp_clock::Clock;
+    use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
 
@@ -390,7 +390,7 @@ mod tests {
             h[0] = 0xBB;
             h
         };
-        let now = scp_primitives::SystemClock.now_secs();
+        let now = scp_clock::SystemClock.now_secs();
         store
             .check_and_record_nonce("ctx-1", &nonce_b, now, now + 3600)
             .await
@@ -408,7 +408,7 @@ mod tests {
     async fn check_and_record_skips_prune_within_interval() {
         let store = make_store();
 
-        let now = scp_primitives::SystemClock.now_secs();
+        let now = scp_clock::SystemClock.now_secs();
 
         // First call sets _last_prune to now.
         let nonce_a = {

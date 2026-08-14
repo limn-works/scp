@@ -392,7 +392,7 @@ impl KeyCustody for SqliteKeyCustody {
             // pseudonym_secret is derived from the private seed via HKDF (§9.10.4.A),
             // NOT the public key, to prevent membership enumeration attacks.
             let pseudonym_signing_key =
-                crate::pseudonym::derive_pseudonym_keypair(signing_key, &context_id, None);
+                scp_crypto::pseudonym::derive_pseudonym_keypair(signing_key, &context_id, None);
             let pseudonym_verifying_key = pseudonym_signing_key.verifying_key();
 
             // Store the derived signing key in the cache only (not persisted —
@@ -439,7 +439,7 @@ impl KeyCustody for SqliteKeyCustody {
             //   || "scp-pseudonym-v2")). The pseudonym_secret is derived from the
             // private seed via HKDF (§9.10.4.A), NOT the public key, to prevent
             // membership enumeration attacks. epoch_BE breaks long-term correlation.
-            let pseudonym_signing_key = crate::pseudonym::derive_pseudonym_keypair(
+            let pseudonym_signing_key = scp_crypto::pseudonym::derive_pseudonym_keypair(
                 signing_key,
                 &context_id,
                 Some(pseudonym_epoch),

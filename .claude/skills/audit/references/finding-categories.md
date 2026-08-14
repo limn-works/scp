@@ -12,7 +12,7 @@ A public function in `scp-core` that has no corresponding export in any FFI brid
 
 **How to detect:**
 1. List all `pub fn` / `pub async fn` in `scp-core` modules
-2. For each, search for calls in `crates/scp-ffi/src/` (PyO3), `crates/scp-ffi/uniffi/` (UniFFI), `crates/scp-ffi/napi/` (NAPI), `crates/scp-ffi/wasm/` (WASM)
+2. For each, search for calls in `crates/scp-ffi/src/` (PyO3), `crates/scp-ffi/uniffi/` (UniFFI), `crates/scp-ffi/napi/` (NAPI)
 3. Missing from ALL bridges = wiring gap
 
 **Example finding:**
@@ -86,7 +86,6 @@ Code that signals incompleteness.
 Similar logic implemented in multiple locations.
 
 **Common duplication sites:**
-- WASM bridge reimplements core algorithms (intentional per ADR-034, but must stay in sync)
 - Multiple FFI bridges have similar boilerplate
 - Test utilities duplicated across test files
 - Error mapping logic repeated per module

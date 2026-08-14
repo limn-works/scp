@@ -94,7 +94,7 @@ if $CHECK_MODE; then
     fi
   done
 
-  for cargo_tool in cargo-nextest wasm-pack maturin cargo-deny; do
+  for cargo_tool in cargo-nextest maturin cargo-deny; do
     if mise ls --installed "cargo:$cargo_tool" &>/dev/null && [[ -n "$(mise ls --installed "cargo:$cargo_tool" 2>/dev/null)" ]]; then
       ok "cargo:$cargo_tool"
     else

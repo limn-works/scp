@@ -1,272 +1,67 @@
 # Security Reviewer Memory
 
-## SCP Codebase Security Patterns
+Index only — one line per entry. Detail lives in the linked topic files.
 
-### Event-Log Phase-2 Substrate Swap FINAL (16a2cd42b) -- 2026-06-20
-- See `eventlog-phase2-final-16a2cd42b.md`. ONE HIGH: bf9266777 made econ-policy/ceiling effective_at = proposal.created_at (PROPOSER-backdatable) + PERIOD; no clamp; breaks §19 commit-anchored 24h MUST; pre-Phase-2 used applying member's now() -> NEW regression. Rest CLEAN (merkle_root mirror removal neutral-or-stronger; committer-ts signed-bound).
-- FIX RE-VERIFIED (f234988bc) -- see `notification-window-backdating-fix-f234988bc.md`. Canonical import observed_at re-pin to local clock. Bypass CLOSED, no new regression. RESTORE-verbatim correct (self-respawn). WASM gov-leaf b"" parity + dedup contiguous-seq + convergent_consequence_timestamp move all clean. MERGE-GATING CONFIRMED.
-- FIX VERIFIED (4cad781e5) -- see `notification-window-backdating-fix-4cad781e5.md`. HIGH RESOLVED, no new regression. Added per-member observed_at floor: is_effective = current>=max(effective_at, observed_at+PERIOD); leaf still effective_at (convergent); observed_at self-attested only (Full export = creator self-sig, never cross-member compared); freeze residual sound (expiry removes BOTH proposals, no authz grant).
-### ADR-039 MessageSigner refactor (f7fb2fa6, double-zero round 2) -- 2026-06-20 -- ZERO FINDINGS
-- MessageSigner<'a> enum (supervisor.rs ~395-440) pairs key+persona; key()/signing_key_id() total const matches, no panic. Supervisor::send_message now takes non-optional MessageSigner, sets payload signing_key=Some(...)+signing_key_id from one source.
-- Mailbox seam: SendMessagePayload still carries 2 fields, but set atomically by supervisor; handle_send_message (handlers/messaging.rs:245-254) passes them straight to messaging_helpers::send_message which RE-PAIRS into MessageSigner at entry (~697-718). No independent re-derivation => persona cannot desync from key. Round-1 attribution property intact end-to-end.
-- Fail-closed CONSOLIDATED: single None check at messaging_helpers::send_message entry BEFORE rate-limit/velocity/economy mutation (no rollback needed). Removed broadcast+encrypted downstream None branches subsumed. No state mutated before the check.
-- FFI fail-closed REAL: uniffi/bridge.rs + napi/context.rs now resolved_signing_key.ok_or_else(Crypto{CRYPTO_4001})? => RETURN error, no panic, no unsigned send. PyO3 unchanged (resolve_signing_key already non-optional). All 3 hardcode MessageSigner::Active (NOT attacker-controllable).
-- validate.rs enforce_ucan_category_a kid-parse routed through SigningKeyId::from_fragment (primitives/identity.rs:200): byte-identical to old match (#active/#agent only, else None=>MalformedToken). absent kid still unwrap_or("#active"). #agent Category-A rejection below untouched. NO new accept path.
-- Only added expect() is in #[cfg(test)] mod live_supervisor_send (agent_binding_pipeline_tests.rs).
+## Recent reviews (newest first)
 
-### ADR-039 Per-Message Persona Wiring (SCP-AB-021, ba06a8e0+7d4cdcf0) -- 2026-06-20 -- ZERO BLOCKING FINDINGS
-- KeyResolver widened to Fn(&DID, SigningKeyId)->Option<VerifyingKey>. Threaded signing_key_id through Supervisor::send_message -> handle_send_message -> messaging_helpers::send_message -> encrypt_and_send -> build_encrypted_envelope (removed hardcoded Active stamp at messaging_helpers.rs:178).
-- ATTRIBUTION INTEGRITY SOUND. verify_and_unwrap (messaging_helpers.rs:309) resolves key by SENDER-declared inner.signing_key_id, then verifies sig against THAT key. Forging persona fails: claim #agent while signing with #active => sig fails against registered #agent key. Mismatch caught at receive. Send-side has NO binding between signing_key and signing_key_id (both caller-supplied) -- usability footgun (produces unverifiable msg), NOT a forgery vector.
-- Governance votes ALL pin SigningKeyId::Active (majority/multisig/unanimity/SingleAdmin). Deliberate+documented: one-DID-one-vote scoped to human. Attacker cannot cast vote under #agent. SAFE.
-- Checkpoint send (send_checkpoint #active) + verify (verify_remote_checkpoint_authenticity queries_helpers.rs:735 #active) symmetric. Membership BEFORE sig BEFORE Merkle. Correct.
-- SigningKeyId::from_fragment (identity.rs) single canonical decoder, fail-closed (#active/#agent only; #0/bare/empty rejected). Deserialize routed through it.
-- economy KeyResolverDidResolver: bare path->Active; by_kid parses via from_fragment, MalformedToken on unknown. Fail-closed. Err msg includes VM name (public constant) -- no leak.
-- ALL production resolvers fail-closed: not_configured_key_resolver None for ALL kids; self_host/bridge_instance |_,_| None; FFI context_send PyO3/NAPI/UniFFI hardcode Active (NOT attacker-controllable). No prod resolver resolves real DID-doc VM keys yet (pre-existing: verification effectively off until wired).
-- OBSERVATION (PRE-EXISTING, not this diff): enforce_inner_envelope_category_a defined in scp-protocol but NEVER called on live receive path (verify_and_unwrap omits it). Inner-envelope Category-A custody enforcement unwired at runtime; absent in base 1dcbdd4b too.
-- No new unwrap/expect/panic in non-test code; agent_binding_pipeline_tests.rs (843 lines) is #[cfg(test)] gated.
+- [SCP-RELAYRES-004 FINAL state (9ca2c3f05)](relayres-004-final-9ca2c3f05.md) — both round-1 MEDIUMs CLOSED (`LiveSlot::modify` is module-private beside its only writer). 2 new MEDIUMs: `sanitize_relay_text` misses Unicode bidi/U+2028/U+2029 (`is_control()` is Cc-only); sanitizer applied on the WRITE half only — READ half leaks raw relay text across FFI. No nullifier; DhtMode gate is a real chokepoint.
+- [SCP-RELAYRES-004 WRITE path + node live slots (5b89baada)](relayres-004-write-path-5b89baada.md) — all 4 round-1 HIGHs RE-DERIVED closed (signed record is now an output of signing, zero network input; DHT read-back gone). 2 MEDIUMs left: ACK-and-drop suppression undetected; slot `set` is crate-visible not module-private.
+- [#2028 F5 Welcome-seam ceiling gate (935d6b929)](issue2028-welcome-ceiling-gate-935d6b929.md) — gate sound + not a nullifier, BUT vacuous after FFI restore (default params), ceiling lowering has no authz effect anywhere, in-actor gate untested.
+- [SCP-OUT-031 PR-2a outlet error surface (dccc50c1b + 7eaebb81c)](#) — SECURE. Oracle-collapse holds (NotAuthorized ≡ NotFound byte-identical surface); source_chain always empty on this seam; my round-1 MEDIUM (raw SCP-OUTLET-6080 state leak on unary invoke) fixed by typed `OutletContextNotActive` with const-only Display; ExecutionPanic now hashes outlet_id not panic message.
+- [reply-await bounding sweep (1728385f6)](reply-await-sweep-core-1728385f6.md) — SHIP IT. ~61 unbounded oneshots → `bounded_reply_await` (2min); ALL wedge dispositions fail-closed (hard_rate_limit Elapsed→DENY closes a prior bypass; economy→TransportFailed never grants/refunds).
+- [SCP-RELAYRES-003 chokepoint closure (370d123d0)](relayres-003-closure-370d123d0.md) — NO FINDINGS. `gate_delete` rate-limits before storage+classify; suppression closed at QUERY via storage-authoritative filter; no nullifier.
+- [PR#2235 app-bound/unbound durable event log §8.4](pr2235-app-bound-unbound.md) — no BLOCKER. WARNING: caller-controlled unclamped `timestamp_secs` into the Merkle leaf (backdatable audit log). INFOs: raw provider err in CTX_2057; NotInCeiling-vs-NotInRole cap-enumeration oracle.
+- [Event-Log Phase-2 substrate swap (16a2cd42b)](eventlog-phase2-final-16a2cd42b.md) — one HIGH (proposer-backdatable `effective_at`), fixed + re-verified in [4cad781e5](notification-window-backdating-fix-4cad781e5.md) and [f234988bc](notification-window-backdating-fix-f234988bc.md) (observed_at floor, canonical-import re-pin).
+- ADR-039 MessageSigner refactor (f7fb2fa6) — ZERO FINDINGS. Key+persona paired in one enum; single fail-closed None check before any mutation; all 3 FFI bridges return typed error, never panic, never unsigned send.
+- ADR-039 per-message persona wiring (ba06a8e0 + 7d4cdcf0) — ZERO BLOCKING. Attribution integrity sound (receiver resolves by sender-declared `signing_key_id`, verifies against THAT key). Governance votes pin `#active`. OBSERVATION (pre-existing): `enforce_inner_envelope_category_a` is never called on the live receive path.
+- [ADR-051 convergent clock / causal DAG](adr051-convergent-clock.md) — APPROVE + 1 MEDIUM (ADR req#6 machine-readable `anchored` flag exists only as prose in spec07/spec19).
+- [PyO3 passphrase storage + redacting Debug (ed6290851)](pyo3-passphrase-storage-ed6290851.md) — CLEAN.
+- SDK coverage fail-closed + parity (b27ef7bff, f1edb7498, [f6caeb5dd](trust-error-classifier-f6caeb5dd.md)) — CLEAN. Fuzzy symbol matching removed; error-string classifiers must be START-anchored `startsWith`, never `includes()`; `test-guard.ts` freezes env at module load.
+- [PR#76](pr76-findings.md) · [production-readiness commits](production-readiness-commits.md) · [transport expansion SEC-001..008](transport-expansion-audit.md) · [PyO3 PR#112](pyo3-audit-20260228.md) · [persistence layer](persistence-layer-findings.md) · [governance gaps #266](governance-gaps-findings.md) · [tiered storage SCP-213](tiered-storage-scp213.md) · [wiring batch 1 messaging](wiring-batch1-messaging-findings.md) · [black-hat PR#4](/tmp/black-hat-review.md).
 
-### PyO3 Passphrase Storage + Redacting Debug (ed6290851, actor-per-context) -- 2026-06-04
-- See `pyo3-passphrase-storage-ed6290851.md`. CLEAN, no findings. Fail-closed passphrase path,
-  exactly-one-of key/passphrase, hand-written redacting Debug on all 3 bridges, dev-affordance
-  gated on storage_provider().is_none(), capability matrix notes-only. with_passphrase lives only
-  in scp-platform/src/sqlite/mod.rs (fails closed: no salt regen beside existing DB).
-- GOTCHA: Bash cwd resets; `cd /Users/alec/Developer/limn/scp` = MAIN worktree, not actor-per-context.
-  Use the worktree path or `git show <sha>:<file>`.
+## Cross-cutting patterns (the durable value)
 
-### Adversarial Review (PR#4) -- Black Hat Findings
-- See `/tmp/black-hat-review.md` and PR#4 comment for full details
-- Key themes: relay metadata surveillance, missing auth guards, no rate limiting, schema bypass, Sybil weakness
+- Clock: `unwrap_or_default()` / static-fallback on `SystemTime` is a systemic recurring pattern; `now_secs()` returning 0 on clock error is fail-open.
+- Freshness validators must check BOTH directions (past staleness AND future skew); `saturating_sub` silently accepts future timestamps.
+- Hash/HKDF inputs with variable-length fields need length prefixes or domain separators — boundary-shift collisions found in `build_hpke_info` (access keys) and Merkle event names.
+- Signed wire types need `deny_unknown_fields` (sender-key, access-key, BlockListEvent still missing).
+- Nonce/replay: sender keys have `NonceDedup`, access keys still do not; `handle_sender_key_request` has no timestamp/nonce check.
+- Unbounded collections are the most common MEDIUM: SenderVelocityTracker, recv_sequence_tracker, EventLogMetrics, broadcast subscribers/authors/block_list, CheckpointManager::checkpoints, participation_cache, standing_contexts, static DashMap registries (no eviction).
+- Empty-collection-wrapped-in-`Some` vs `None` is a recurring FFI-bridge fail-open/fail-closed bug (UCAN ceiling #339). Convert empty → None at the boundary.
+- WASM/NAPI reimplementations of scp-core validators consistently drop defensive checks — always diff line-by-line against core.
+- Error-string classifiers and revocation checks must use exact/anchored matching, never `contains()` (CapabilitySuspension `contains("write")`, RemoveSigner token revocation).
+- Multiple mutexes on one struct need a documented acquisition order (crypto.rs broadcast_keys vs sender_keys deadlock).
+- Load-modify-store on shared storage (`append_block_list_event`) needs atomicity or caller-side serialization.
+- TOCTOU: a capability checked under one lock acquisition and acted on under another is a TOCTOU (GovernancePropose fixed, GovernanceVote known gap). Phase-3 lock reacquire must verify a generation token.
+- zeroize is inconsistent: store layer yes; identity signing keys, MLS key pairs, TLS private keys no. `destroy_group` FREES but does not zeroize the Ed25519 signer.
+- `bridge_instance()` enforces lifecycle; `context_manager()` does not — all bridges must route through `bridge_instance()`.
+- clippy denies unwrap/expect in lib code; Rust 2024; `#![forbid(unsafe_code)]` except scp-ffi.
 
-### PR#76 Audit Findings (2026-02-26)
-- See `pr76-findings.md` for full details (initial review + fix verification)
-- UNFIXED: CurrencyCode Deserialize bypasses ASCII; EventLogMetrics Vecs unbounded; SenderVelocityTracker unbounded HashMap
+## Known-open findings by area
 
-### Production Readiness Commits (2026-03-06)
-- See `production-readiness-commits.md` for full details
-- 7 commits reviewed: sender key msgpack, HPKE domain sep, deny_unknown_fields, ProtocolRepository named msgpack, dedup TTL, serde rename, conflict pairs
-- MEDIUM x2 on 7f341b8 (future timestamp window + missing test); rest CLEAN
-- Pre-existing gaps: sender key wire types lack deny_unknown_fields; handle_sender_key_request no timestamp/nonce check; RestoreReadAccess self-conflict missing
+- **Ceiling / governance**: `ModifyCeiling` never propagates to other nodes (NoMlsChange, no receive arm, `CeilingModified` leaf has zero consumers); FFI `ceiling_strings` is genesis-only forever; `apply_pending_ceiling_modification` takes a caller-supplied timestamp (§5.3.2 window is caller-controlled). `validate_projection_ucan` is structural-only. `compute_vote_hash` omits proposal_id (cross-proposal replay). `verify_vote()` defined but never called. Conflict pair RestoreReadAccess-vs-RestoreReadAccess missing.
+- **UCAN**: `validate_ucan_stateless` skips nonce/revocation/chain/attenuation. AND-composition `check_and_composition` allows None/None/free = Ok. `system_assign_role` is `pub` and bypasses RoleAssign audit differentiation.
+- **Crypto/custody**: SqliteKeyCustody still derives the pseudonym HMAC key from the PUBLIC key (oracle) — InMemory/File were fixed to HKDF(private); WASM custody JSDoc still documents the insecure pattern. HKDF `info` is empty (no forward separation).
+- **Event log / WASM**: `compute_event_hash` in WASM ≠ native (`SHA-256(0x00||type||ctx||ts)` vs MessagePack of the full event) — Merkle roots never match cross-platform; conformance tests only check tree shape.
+- **FFI/bridges**: `did:key:<hex>` non-standard form not `cfg(test)`-gated (UniFFI/NAPI/WASM); NAPI `ucan_mint` zero-signature placeholder; `transport_connect` accepts any URL scheme; scp-platform `testing` feature in production deps; single-context `restore_context` passes `ContextParams::default()` and the next persist writes it durably over genesis.
+- **Providers**: `encrypt_message` skips the ADR-007 sender-key layer; `init_broadcast_key` stores the wrong key material; `validate_key_package` only checks the `did:` prefix.
+- **Node/relay**: dev_token logged at INFO and minted with `thread_rng()`; no localhost enforcement; bridge secret in query param; total-connection-limit TOCTOU. MCP: no pre-initialization guard, `resources/read` skips UCAN.
+- **Bridge/shadow identity**: GovernanceAction carries no signature; canonical hash has no field separators.
+- **Docs-only guarantees** (enforce or delete): BootstrapConfig `expected_creator_did` is documentation-only; `scp-ffi/CLAUDE.md` requires `sync_role_state_from_manager` after ModifyCeiling and no bridge does it.
 
-### MCP Server (`crates/scp-mcp/src/server.rs`)
-- FINDING (PR#4): No pre-initialization guard; `resources/read` no UCAN check; schema validation type-check-only
-- GOOD: `tools/list` filters by role + UCAN; `tools/call` validates UCAN before invocation
+## Positive patterns worth preserving
 
-### Relay Server (`crates/scp-transport/src/native/server.rs`)
-- PARTIAL FIX (2026-03-03): Shared PublishRateLimiter + ConnectionTracker across WS/QUIC
-- REMAINING (MEDIUM): Total connection limit TOCTOU
+- Reject-before-mutate gates placed ahead of every mutation, sharing ONE predicate between the front door and the chokepoint.
+- Fail-closed defaults: economy, `from_class` unregistered slug → Authorization, `SigningKeyId::from_fragment` (single canonical decoder), production key resolvers returning None for all kids.
+- Oracle collapse: not-authorized and not-found produce byte-identical surfaces; decrypt collapses CiphertextTooShort into AuthenticationFailed.
+- Type-enforced persistence classes (`ClassSCell` with no `DerefMut`) instead of source-text scanners.
+- Signature verified BEFORE anti-replay; membership BEFORE signature BEFORE Merkle root on checkpoints.
+- Zeroize + redacting `Debug` on AccessKey / IdentityEntry / CertificateData / the three PyO3 bridges.
+- Exhaustive match arms in governance dispatch (no wildcards); `OpenResult` enum forcing exhaustive handling.
+- Escrow/budget pattern with `reverse_spend`; `ConsequenceRule::validate` whitelist.
 
-### Transport Expansion Audit (2026-03-04) -- QUIC/HTTP3/WebTransport/UDP/CoAP
-- See `transport-expansion-audit.md` for full finding list (SEC-001 through SEC-008)
+## Gotchas for future sessions
 
-### UCAN (`crates/scp-core/src/crypto/ucan/`)
-- 11-step validation pipeline thorough; SpendingCapability attenuation correct
-- FINDING: `validate_ucan_stateless` skips nonce, revocation, chain, attenuation
-- FINDING: `now_secs()` uses `unwrap_or_default()` -- returns 0 on clock error
-
-### Shadow Identity (`crates/scp-core/src/bridge/`)
-- HIGH: GovernanceAction no signature; canonical hash no field separators
-- MEDIUM: did:key:<hex> non-standard not gated behind cfg(test)
-
-### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`) -- Audit 2026-02-28
-- See `pyo3-audit-20260228.md` for full PR#112 fix list
-- SCP-212: invoke_tool, routing ID derivation findings documented there
-
-### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 + PR#127
-- CRITICAL: scp-platform testing feature in production deps
-- HIGH: transport_connect accepts ANY URL scheme; did:key hex not gated
-
-### FFI Bridge -- WASM (`crates/scp-ffi/wasm/`) -- PR#86 + PR#127 R2 + PR#479
-- HIGH: did:key hex in production; runtime.rs reimplements scp-core logic
-- GOOD: Full 11-step UCAN validation; RED-105 prefix collision protection
-- CRITICAL (UNFIXED): compute_event_hash uses SHA-256(0x00||event_type||context_id||timestamp) vs native SHA-256(0x00||MessagePack(full_event)). Merkle roots never match cross-platform. Conformance tests only verify tree structure, not leaf hash computation.
-- FIXED (PR#479 815461c0): governance authorization -- initiator_did + member_has_capability + required_capability_for_action for all 24 variants
-- FIXED (PR#479 02b47eac): IdentityEntry Zeroize+ZeroizeOnDrop, Zeroizing<[u8;32]>, no Clone. Minor: Debug derived on private struct prints raw bytes via Zeroizing
-
-### FFI Bridge -- NAPI (`crates/scp-ffi/napi/`) -- PR#86 + PR#127
-- CRITICAL: ucan_mint uses [0u8; 64] placeholder zero signature
-- HIGH: did:key hex not gated behind cfg(test)
-
-### TLS (`crates/scp-node/src/tls.rs`)
-- TLS 1.3 enforced; ACME HTTP-01 correct; CertificateData Debug redacts key
-- `zeroize` crate still not used for private key material
-
-### Economy
-- UNFIXED: SenderVelocityTracker unbounded HashMap growth
-- SCP-156: HIGH: Step 5 missing adapter.verify()
-
-### Android Platform Adapter (SCP-110 through SCP-113) -- 2026-02-28
-- HIGH: publicKeyFromKeystore takeLast(32) fragile
-- See pseudonym HMAC key material inconsistency below
-
-### Pseudonym Oracle Fix (PR fix/audit-batch-1-p0-blockers, #1431)
-- FIXED: InMemoryKeyCustody + FileKeyCustody now use HKDF(private_key) -> pseudonym_secret -> HMAC
-- UNFIXED: SqliteKeyCustody still uses public key (verifying_key) -- same oracle vulnerability
-- UNFIXED: WASM custody JSDoc documents public key algorithm -- implementors will use insecure pattern
-- Pattern: HKDF-SHA-256(salt="scp-pseudonym-secret-v1", ikm=signing_key_bytes), expand with empty info
-- Defense-in-depth gap: HKDF info param is empty; should use "scp-pseudonym-v1" for forward separation
-
-### Tiered Storage & Context Discovery
-- See `tiered-storage-scp213.md` for full details
-
-### Governance Engines (PR#127 R2)
-- HIGH: compute_vote_hash omits proposal_id -- cross-proposal vote replay
-- MEDIUM: verify_vote() defined but never called in any engine
-- GOOD: Deadline guards, duplicate proposal rejection, deterministic IDs
-
-### CI/CD Security (PR#127)
-- MEDIUM: pr-review.yml/claude.yml contents:write with untrusted input
-- GOOD: cargo-deny, PyPI OIDC Trusted Publishers
-
-### Broadcast Context (`scp-core/src/context/broadcast.rs`)
-- REMAINING (MEDIUM): subscribers/authors/block_list unbounded
-
-### Event Log Checkpoint (`scp-core/src/event_log/checkpoint.rs`)
-- REMAINING (MEDIUM): CheckpointManager::checkpoints Vec unbounded
-
-### scp-node HTTP Features (SCP-242/245/249) -- 2026-03-02
-- HIGH: dev_token logged at INFO plaintext; uses thread_rng() not OsRng
-- MEDIUM: No localhost enforcement; unbounded epoch growth; bridge secret in query param
-
-### Persistence Layer (2026-03-03)
-- See `persistence-layer-findings.md` for details
-- HIGH x3: identity keys not zeroized; MLS bridge bypasses sanitize_key_component; SyncableStorage no auth
-
-### Governance Gaps (closes #266) -- 2026-03-05
-- See `governance-gaps-findings.md` for details
-- HIGH: validate_projection_ucan structural-only; message_handler Gated check after decryption
-- MEDIUM: conflict_resolution missing RestoreReadAccess vs RestoreReadAccess pair (still open)
-
-### UCAN Ceiling Enforcement (#339) -- 2026-03-06
-- HIGH: FFI bridges (PyO3/NAPI/UniFFI) pass Some(empty_set) not None for contexts without ceiling -- blocks ALL ucan_mint/delegate
-- HIGH: Option<HashSet<String>> on MintParams/DelegateParams is fail-open; all ~70 test sites pass ceiling: None
-- MEDIUM: mint_ucan parses capabilities twice (ceiling check + attestation build) -- TOCTOU-class divergence risk
-- GOOD: WASM bridge handles empty ceiling correctly (skips when empty); delegate ordering correct (attenuation before ceiling)
-- Pattern: empty-collection-wrapped-in-Some vs None -- recurring FFI bridge issue. Always convert empty to None at boundary.
-
-### Production Providers (#385) -- 2026-03-06
-- HIGH: encrypt_message skips sender key layer -- only MLS, no ADR-007 sender key encryption. Defeats blocking/content access control.
-- HIGH: init_broadcast_key generates broadcast key then discards it, stores unrelated sender key material. Three keys generated, none correct.
-- MEDIUM: Merkle hash lacks length prefix on variable-length event name -- collision possible at event/timestamp boundary
-- MEDIUM: unwrap_or_default() on SystemTime in event log (recurring pattern)
-- MEDIUM: init_broadcast_key and destroy_sender_key acquire broadcast_keys/sender_keys mutexes in opposite order -- deadlock risk
-- MEDIUM: validate_key_package only checks "did:" prefix -- no ciphersuite, signature, or credential validation
-- GOOD: PoisonError::into_inner consistent; lock scopes minimal; encrypt/decrypt round-trip test real crypto; Merkle chain verification tested
-
-### Iteration 17 (2026-03-07) -- SCP-270, SCP-CAC-001, SCP-CAC-004, SCP-ACR-001
-- HIGH: access_keys/wire.rs build_hpke_info lacks length separators -- boundary-shift collision on context_id||member_did
-- HIGH: AccessKeyRequest has no nonce/dedup -- replay within 30s freshness window (sender keys have NonceDedup, access keys don't)
-- HIGH: validate_request_freshness accepts future timestamps (saturating_sub returns 0)
-- MEDIUM: AccessKeyRequest/Response and BlockListEvent lack deny_unknown_fields
-- MEDIUM: execute_add_signer nonce fallback "gov-signer-add-0" static on clock failure
-- MEDIUM: RemoveSigner token revocation uses substring contains() not exact match
-- MEDIUM: BlockListState/event log unbounded growth; append_block_list_event load-modify-store race
-- GOOD: AccessKey Zeroize/ZeroizeOnDrop + Debug redacts; store_value_zeroize; CanonicalField::VarBytes in request hash
-- GOOD: Exhaustive match arms in governance dispatch (no wildcards)
-- GOOD: Unanimity check via set-difference pattern in ExtendTtl and PromoteContext
-
-### Wiring Batch 2 Governance (2026-03-25, updated)
-- HIGH x4: double budget charge on send/join (enforce_*_economy + execute_paid_action both record_spend); budget not rolled back on payment failure; CapabilitySuspension substring matching (contains("write")) misses non-read/write caps; event_log_entries_for_consequences sets all timestamps to now (defeats time windowing)
-- HIGH: record_spend result silently discarded in execute_paid_action (let _ =)
-- MEDIUM x5: standing context ID 64-bit collision (hash[..8]); NoOpPaymentAdapter pub without feature gate; check_standing silently passes on compute_participation_record Err; enforce_role_demotion ignores return value (success always true); participation_cache/cooldown_until unbounded
-- MEDIUM x2: tool invoke uses zero metrics for cost eval (arbitrage risk); standing_contexts HashMap unbounded
-- MEDIUM: lock ordering fragile in standing_context (standing_contexts + contexts simultaneous)
-- FIXED from prior review: consequences now enforced (not just logged); sender key removed BEFORE MLS removal; advance_epoch wired for RotateContentKeys
-- GOOD: fail-closed economy defaults; lock-drop-async pattern; auto_accept guard; cooldown prevents consequence spam; consequence_rules stripped from public export
-
-### Wiring Batch 1 Messaging (2026-03-24, updated)
-- See `wiring-batch1-messaging-findings.md` for full details (15 files, line-by-line review)
-- HIGH x4: NAPI/UniFFI signing key .ok() falls back to None; Recovery MessageType bypass skips access key unwrapping; access key TOCTOU between Phase 1/3; reorder buffer stores pre-decrypted plaintext
-- MEDIUM x7: sender key AAD zeros (#1422 -- FIXED in PR#1606); access key wrapping AAD zeros; bridge trust level discarded; SequenceTracker not persisted; SequenceTracker validate() TOCTOU; snapshot key bytes not Zeroizing; FFI access key ops lack authorization
-- GOOD: Sig verify before anti-replay; cross-context injection defense; MLS credential match; constant-time hash; domain-sep routing IDs; fail-closed defaults; correct timestamp validator; sequence 0 rejection; bounded reorder buffer; correct sign order
-
-### ADR-051 Convergent Clock / Causal-DAG (2026-06-19)
-- See `adr051-convergent-clock.md`. APPROVE + 1 MEDIUM. Multi-vantage median (sender/node/relay/receiver-quorum),
-  clamped >= max(sender,relay-ingest), receiver-quorum anchored. Soft signal honestly stated; size-independent
-  (spread=latency not N); vantage stamps signed in SCP-CHECKPOINT-V2 preimage (forge-proof).
-- MEDIUM (track into impl program): ADR req#6 mandates machine-readable `anchored` flag but spec07
-  ParticipationProfile (L218) + spec19 PaymentReceipt got PROSE COMMENT only — no field. Interim is shipping
-  state, so anchored=false surfacing is load-bearing NOW. Add per-fact bool/bitmask when interim lands.
-
-### General Patterns
-- clippy deny unwrap/expect in lib code; thiserror; Rust 2024; #![forbid(unsafe_code)] except scp-ffi
-- zeroize inconsistent: store layer yes, identity signing keys and MLS key pairs no
-- unwrap_or_default() on clock ops is recurring systemic pattern (also unwrap_or_else with static fallback)
-- DashMap shard locks must not cross Python GIL; clone Arc first
-- Static DashMap registries lack eviction
-- validate_projection_ucan structural-only -- recurring UCAN validation gap
-- Signed wire types should have deny_unknown_fields (InnerEnvelope fixed; sender key types + access key types + BlockListEvent still missing)
-- handle_sender_key_request has no timestamp freshness or NonceDedup integration
-- Access key request also lacks NonceDedup -- both key protocols need nonce replay protection
-- Multiple Mutex locks on same struct: enforce consistent acquisition order to prevent deadlock (crypto.rs broadcast_keys vs sender_keys)
-- Hash inputs with variable-length fields need length prefixes or domain separators to prevent boundary-shift collisions
-- HKDF info strings are NOT the same as canonical hashes -- build_hpke_info concatenates raw bytes without length prefixes (found in access keys; check sender keys too)
-- Future timestamp rejection: always check BOTH directions (past staleness AND future clock skew) in freshness validators
-- Load-modify-store on shared storage (append_block_list_event pattern) needs atomicity or caller-side serialization
-
-### PR #465 -- scp-chat, scp-demo, UPnP, FFI E2E (2026-03-10)
-- See findings below; scp-chat is a demo app, not production, but ships as a standalone binary
-- HIGH: /api/send sender_did spoofing (no session-DID binding); WebAuthn missing origin validation; scp-demo /tmp key leakage
-- MEDIUM: Hardcoded passphrase; thread_rng for challenges; no input size limits; unbounded members/challenges; error message leakage; testing feature in prod dep
-- GOOD: textContent (no innerHTML XSS); TLS key Zeroizing; challenge TTL+GC; scp-testing isolation; gitignore for key files
-
-### Phase 4 SDK Bindings -- BroadcastContent Publish (2026-03-16, re-reviewed x2)
-- All 9 post-merge audit fixes VERIFIED: body size on serialize, WASM NFC, blob_id content-addressed, 4-bridge batch limit, bounded commit_deploy query, single-asset deploy_id auto-gen, gated immutable cache, CSP case-insensitive, wrapping_add
-- WASM NFC: FIXED -- validate_content_path_wasm applies .nfc().collect() before inner validation
-- WASM blob_id: FIXED -- SHA-256(wire_bytes), deterministic and content-addressed
-- NAPI batch limit: FIXED -- MAX_BATCH_ASSETS=10_000 at line 1210
-- REMAINING MEDIUM: site_handler non-immutable branch uses "public, max-age=0, must-revalidate" for gated contexts -- should be "private, max-age=0, must-revalidate" (projection.rs line 2154)
-- Error codes 2070-2075: clean, no collisions
-- Pattern: WASM reimplementations of scp-core validators consistently miss defensive checks that the core version has. Always diff WASM vs core line-by-line when reimplementing.
-
-### fix/audit-remaining-findings (2026-03-20)
-- Zeroizing removal from signature bytes (NAPI/PyO3/WASM context.rs): CORRECT -- signatures are public values, not secrets. No security regression.
-- RevocationStatus type safety (TypeScript/Swift/Kotlin): CORRECT. TypeScript _fromBridgeValue handles Rust enum variants {"Revoked":{revoked_at,reason}} and "Active" string. Edge case: bare "revoked" string throws (correct, prevents silent data loss). No active/revoked confusion path.
-- Attestation CRUD in Swift/Kotlin/TypeScript: all 4 ops (create/list/remove/renew) guarded with "not yet available" errors + SCP-ATTEST-9001..9005 codes. Bridge function check in TS uses runtime property lookup (correct pattern).
-- BootstrapConfig: DiscoveryContext -> HandleRegistry rename + BootstrapContextEntry adds expected_creator_did field. Docs clearly state callers MUST verify post-join (NOT enforced in resolver itself -- acceptable, documented).
-- WASM manager.rs: maxChainDepth clamped to 32, sessionCap clamped to 10_000. Defense-in-depth good.
-- Context import TOCTOU gap: re-check under lock at step 7. Correct fix.
-- RUSTSEC-2026-0044/0048/0049 (aws-lc-sys): suppressed as transitive, awaiting upstream. Appropriate.
-- MEDIUM REMAINING: BootstrapConfig bootstrap resolver doesn't enforce expected_creator_did -- intentional but documentation-only guarantee. If callers skip post-join verification, Sybil attack vector remains.
-
-### PR #1628 -- BridgeInstance Extraction (2026-04-14)
-- HIGH: context_manager() bypasses check_ready() -- 52 NAPI + 42 UniFFI operations skip shutdown/suspend guard
-- MEDIUM: known_contexts eviction TOCTOU; rate limiter ephemeral bypass at capacity; STORAGE_PROVIDER not clearable; shutdown hook panic payload leaks; hook silent drop on mutex poison
-- GOOD: TransportLockError sanitized; shutdown idempotent via swap; check_ready ordered; bounded registries; catch_unwind on hooks; hook-after-shutdown runs immediately; Send+Sync compile assert
-- Pattern: bridge_instance() enforces lifecycle; context_manager() does not -- all bridges must route through bridge_instance()
-
-### PR #1606 -- Epoch/Sequence AAD, MLS Management Messages, Timestamp Bounds (2026-03-31, R2)
-- FIXED: sender key AAD zeros (#1422) -- real epoch/sequence wired into AES-256-GCM AAD with length-prefixed build_sender_aad
-- FIXED: sender key distributions now MLS-wrapped via mls_encrypt_management (SCPM magic prefix dispatch)
-- FIXED: buffer event timestamp bounds (M18) -- 1h past + 5s future tolerance
-- FIXED: E2eCryptoProvider now uses real epoch/sequence (was hardcoded 0/0)
-- FIXED: recv-side sequence tracking added (per-sender epoch/seq monotonicity)
-- FIXED: epoch poisoning defense (MAX_EPOCH_ADVANCE=1000)
-- FIXED: asymmetric access key freshness (past=300s, future=30s)
-- MEDIUM REMAINING: E2eCryptoProvider::open missing management payload 64KiB size check (production has it)
-- MEDIUM REMAINING: mls_encrypt_management has no send-side size check (only recv-side enforced)
-- MEDIUM REMAINING: recv_sequence_tracker unbounded HashMap growth (never pruned on member removal)
-- MEDIUM REMAINING: E2eCryptoProvider seal TOCTOU on epoch/sequence (separate lock acquisitions)
-- MEDIUM REMAINING: Error messages in replay detection and epoch poisoning leak internal state (epoch, sequence, sender_did)
-- MEDIUM PRE-EXISTING: NonceDedup still not wired for access keys
-- GOOD: OpenResult enum forces exhaustive handling; send_sequence persisted; wrapping_add; shared header helpers
-
-### P0 Audit Batch 1 Review (2026-03-19) -- fix/audit-batch-1-p0-blockers
-- FIXES VERIFIED: #1418 (WASM event tags), #1419 (ceiling escalation), #1420 (phantom events), #1431 (pseudonym oracle), #1470 (atomic writes)
-- REMAINING HIGH: SqliteKeyCustody pseudonym oracle (same as #1431 but unfixed)
-- REMAINING MEDIUM: append_entry missing fsync before rename; stale .tmp blocks create_new; HKDF empty info
-- send_message 3-phase pattern: sound; TOCTOU gap handled by Phase 3 re-validation; seq burn is harmless
-- Ceiling fix: NAPI + UniFFI fixed; PyO3 was already correct (resolves at registration); WASM was already correct
-- Atomic write: create_new has fsync; append_entry does NOT have fsync -- inconsistency
-
-### Complete PR Work Review (2026-04-01, re-reviewed 2026-04-04) -- claude/complete-pr-work-review-0TQtO
-- HIGH: validate_governance_action_strings + all callees DELETED from FFI -- role names, reasons, descriptions now unvalidated (length, control chars, HTML). reject_html_special_chars also deleted.
-- HIGH: AND-composition check_and_composition allows None/None/free=Ok(()) -- action_ucan explicitly discarded with `let _ =`. Rename or audit all callers.
-- HIGH: system_assign_role pub (not pub(crate)), bypasses RoleAssign with no audit trail differentiation
-- MEDIUM: SenderKeyStore::remove clears epoch tracking -- epoch rollback possible on re-add
-- MEDIUM: SuspendAll consequence is application-level only (no MLS exclusion)
-- MEDIUM: evaluate_sybil_resistance always passes -- build_identity_assessment uses empty signal HashMap
-- MEDIUM: SenderVelocityTracker still unbounded (from_snapshot/record_message grow without limit)
-- MEDIUM: ConsequenceTriggered events leak trigger_type (Debug format) and rule_index to SDK
-- MEDIUM: send_sequence wrapping_add allows theoretical nonce reuse at u64::MAX
-- FIXED from prior: sender key AAD zeros; MLS management messages; epoch poisoning defense; error message sanitization
-- GOOD: Escrow budget pattern with reverse_spend; ConsequenceRule::validate whitelist; NoOpPaymentAdapter cfg-gated; decrypt collapses CiphertextTooShort into AuthenticationFailed (oracle prevention); TOCTOU guard in enforce_triggered_consequences
+- `cd /Users/alec/Developer/limn/scp` is the MAIN worktree and is frequently STALE/detached. Read the branch worktree path, or use `git show <sha>:<file>`.
+- The shared cargo target dir is poisoned by the stale main checkout — set an isolated `CARGO_TARGET_DIR` before running cargo in a worktree.
+- Never modify the enforcement files listed in root CLAUDE.md to make a check pass.

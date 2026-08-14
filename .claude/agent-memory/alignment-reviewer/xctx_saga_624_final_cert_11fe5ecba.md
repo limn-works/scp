@@ -1,0 +1,20 @@
+---
+name: xctx-saga-624-final-cert-11fe5ecba
+description: §6.2.4 saga FINAL alignment certification at HEAD 11fe5ecba (wave-25) — ALIGNED, zero misalignments; closes the f29937089 LOW (divergence preimage now in spec) + the gate-honesty relabel
+metadata:
+  type: project
+---
+
+# §6.2.4 Saga FINAL Certification (worktree xctx-saga, HEAD 11fe5ecba, wave-25, 2026-06-19) — ALIGNED, ZERO misalignments
+
+Final read-only certification of the COMPLETE §6.2.4 cross-context tool-invocation saga PR. Both prior-reviewed HEADs are ANCESTORS of 11fe5ecba: f29937089 (full-impl, see [[xctx-saga-624-review-f29937089]]) and 6c939108b (crash-recovery spec contract + ref-mut gate, see [[xctx-crash-recovery-spec-contract-6c939108b]]). Lineage tip-only since 6c939108b = wave-25 (11fe5ecba) + wave-23 (b757e0cf1, added divergence preimage block).
+
+**Item-by-item:**
+1. **Seven §6.2.4 clauses ALIGNED** — all clause-realizing symbols live at HEAD: validate_ucan_rebind (saga.rs), CallerReservationRecord/reverse_caller_reservation_record (tools_helpers.rs), SagaSetReservation/reserved_saga_contexts per-pair RAII gating (supervisor.rs), SagaId::new=Uuid::new_v4 supervisor-minted (saga_journal.rs), emit_divergence_marker/CrossContextDivergenceMarker (saga.rs). Carried from f29937089 verification; saga FSM byte-IDENTICAL since.
+2. **Crash-recovery contract MATCHES code** — §6.2.4 (06:289-296) + §17.16.4 (17:966) byte-identical to 6c939108b; all 5 symbols present (recover_saga_entry, recover_preparing_b_entry, redrive_caller_local_reversal, caller_context_deleted_from_persistence, CallerAbortReversal). supervisor.rs/tools_helpers.rs/cross_context_saga.rs/both specs UNCHANGED since 6c939108b.
+3. **Divergence preimage spec block MATCHES code** — CLOSES the f29937089 LOW. Spec §6.2.4 (06:321-333) now pins SCP-XCTX-DIVERGENCE-V1: preimage [VarBytes(saga_id), RawBytes16(nonce), U8(committed_side.tag()), VarBytes(committed_event_id)] + tag mapping Caller=0/Target=1; byte-faithful to cross_context_saga.rs:375 signing_preimage + CommittedSide::tag():86. §9.18.2 separator rows BOTH present (09:1624 receipt, 1625 divergence).
+4. **Class-S gate = honest defense-in-depth** — wave-25 ONLY touches check-class-s-fail-closed.sh. Removed all false "EXHAUSTS finite grammar / CONVERGED / no 4th axis" claims; honestly documents the autoref method-name evasion (.entry().or_insert_with/.get_mut/.drain/IndexMut/...) as a CONSCIOUSLY ACCEPTED Class-A residual; names the committed convergent fix = type-system guard (private Class-S fields + Deref-no-DerefMut + #[must_use] commit-guard → mutation-without-persist = COMPILE error, ADR-052/construction.md direction). This squarely SATISFIES CLAUDE.md §189 (gates are defense-in-depth not primary; denylist chasing "one more spelling" is non-convergent; type-system enforcement is superior). The autoref residual is documented/accepted — do NOT re-flag. ONLY executable change = fixture-73 persist_state_fail_closed→persist_state_best_effort (makes its MUST-NOT-HIT assertion FALSIFIABLE instead of vacuous = a STRENGTHENING). NO markers removed, NO assertions weakened. Gate runs EXIT=0, self-tests green, real scan 0/0/0/.../1152.
+
+VERDICT: ALIGNED. No spec-drift, no phantom provenance, no clause under-delivered. The one LOW from the full-impl review is closed.
+
+LESSON: a multi-wave saga PR's FINAL cert = confirm prior-verified HEADs are ANCESTORS (git merge-base --is-ancestor), diff-stat the FSM+spec files against the last verified HEAD to prove they're untouched (empty diff = carry the verdict forward), then focus the fresh read on ONLY the tip delta. A gate "honesty relabel" that downgrades its own self-description from "exhaustive/converged" to "best-effort defense-in-depth backstop + accepted residual + named type-system successor" is ALIGNED with the mechanical-enforcement principle, NOT a weakening — verify it removed only COMMENT claims (no marker/assertion deletions) and that any fixture edit STRENGTHENS falsifiability. Verify a newly-added preimage spec block field-by-field against the code's canonical_hash call, not just by presence.

@@ -12,7 +12,7 @@
  *
  * Prerequisites:
  *   1. Build the native addon:
- *      cargo build -p scp-ffi-napi --release --features allow_in_memory_custody
+ *      cargo build -p scp-ffi-napi --release --features testing
  *
  *   2. Wire it into node_modules (macOS arm64 — adjust for your platform):
  *      PKG_DIR="node_modules/@limn-works/scp-ts-napi-darwin-arm64"

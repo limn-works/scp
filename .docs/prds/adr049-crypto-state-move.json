@@ -1,0 +1,257 @@
+{
+  "project": "ADR-049 PR-7 — crypto-state move (key-move)",
+  "description": "The atomic migration of all per-context deps.crypto.* call sites off the supervisor-owned MlsCryptoProvider onto the actor-owned &mut PerContextState crypto state, wiring take_crypto_state at the actor spawn seam. Final slice of the ADR-049 PR-4 -> PR-6 -> PR-7 read-authority/state-ownership sequence. See ADR-049 Decision 15.",
+  "gates": [
+    {
+      "id": "gate-cryptomove-0",
+      "name": "Additive prep (prep-then-atomic)",
+      "stories": ["SCP-CRYPTOMOVE-000a", "SCP-CRYPTOMOVE-000b", "SCP-CRYPTOMOVE-000c", "SCP-CRYPTOMOVE-000d", "SCP-CRYPTOMOVE-000e"]
+    },
+    {
+      "id": "gate-cryptomove-1",
+      "name": "Atomic crypto-state move",
+      "stories": ["SCP-CRYPTOMOVE-001"]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-CRYPTOMOVE-000a",
+      "title": "Define crypto orchestration + state-management as inherent methods on PerContextState (verbatim move, byte-identity guarded)",
+      "gate": "gate-cryptomove-0",
+      "priority": "P0",
+      "severity": "major",
+      "status": "done",
+      "files": [
+        "crates/scp-runtime/src/context/actor/state.rs",
+        "crates/scp-runtime/src/crypto/mls/provider.rs"
+      ],
+      "description": "Additive prep for the atomic crypto-state move (ADR-049 Decision 15, prep-then-atomic). Per Decision 6, define crypto ORCHESTRATION (seal, open, rotate_sender_key, advance_epoch, remove_member, destroy_mls_group, destroy_sender_key, mls_encrypt_management) as inherent methods on &mut PerContextState, and crypto STATE-MANAGEMENT (export_crypto_state, restore/destroy) as inherent methods on PerContextState — methods on the state, NOT free functions and NOT field-bag helpers. Each method body is moved VERBATIM from the corresponding current MlsCryptoProvider method body (crypto/mls/provider.rs); the provider's own copies are RETAINED (this story does NOT delete them — the atomic core SCP-CRYPTOMOVE-001 does), giving a bounded two-definition coexistence guarded by golden byte-identity tests, mirroring PR-6's newtype/old-field window. MLS/HPKE primitives stay on the MlsBackend/HpkeBackend traits. Node-resident data (local_did, wrapping keypair, injected clock) enters as METHOD PARAMETERS, never stored as fields on PerContextState. This story is additive and green: the provider remains fully functional and every existing call site is unchanged. validate_key_package is out of scope here (it is stateless -> free-fn, see 000c).",
+      "acceptanceCriteria": [
+        "Inherent methods exist on the actor crypto state for each orchestration op: grep confirms fn seal, fn open, fn rotate_sender_key, fn advance_epoch, fn remove_member, fn destroy_mls_group, fn destroy_sender_key, fn mls_encrypt_management are defined in an impl block on PerContextState or ContextCryptoState in crates/scp-runtime/src/context/actor/state.rs (or a sibling module file in context/actor/), taking &mut self, and fn export_crypto_state defined taking &self.",
+        "Node-resident data enters as parameters, not fields: the new methods that need local_did / wrapping keypair / clock take them as function parameters; grep confirms context/actor/state.rs::ContextCryptoState (and PerContextState) declares NO new field named local_did, wrapping_public_key, wrapping_secret_key, or clock.",
+        "The provider's copies are RETAINED and unchanged: grep confirms MlsCryptoProvider::seal / open / rotate_sender_key / advance_epoch / remove_member / destroy_mls_group / destroy_sender_key / export_crypto_state still exist in crypto/mls/provider.rs, and every pre-existing deps.crypto.* call site is byte-for-byte unchanged by this story (git diff touches only additions).",
+        "Golden byte-identity tests: for each migrated method, a test drives the new inherent method and the retained provider method with identical inputs (same MLS group, sender key, epoch, sequence, AAD) and asserts byte-identical output (e.g. seal produces the identical ciphertext+AAD blob; export_crypto_state produces the identical serialized snapshot). At least one golden test per orchestration + state-management method.",
+        "Primitives stay on the backends: the new methods call MlsBackend / HpkeBackend for MLS/HPKE primitives (create/encrypt/decrypt/process_commit/advance_epoch/seal/unseal) rather than re-implementing them; sender-key AES-GCM stays a direct aes-gcm call as today.",
+        "Full CI green: cargo fmt --all -- --check; cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings; DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace — all exit 0."
+      ],
+      "actionItems": [
+        "Add an impl block on PerContextState (and/or ContextCryptoState) in context/actor/ defining the orchestration methods (&mut self) and state-management methods (&self), moving each body VERBATIM from the matching MlsCryptoProvider method.",
+        "Thread node-resident data (local_did, wrapping keypair, clock) through as method parameters; do not add fields to the actor state.",
+        "Keep the provider methods in place (do not delete or edit call sites — that is the atomic core's job).",
+        "Add golden byte-identity tests pairing each new method against its retained provider twin.",
+        "Run fmt + clippy + workspace tests."
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 6. `ContextCryptoProvider` (26 methods) is deleted; replaced by two narrow traits" },
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 15. PR-7 crypto-state move is one atomic PR, not per-domain" }
+      ],
+      "details": { "phase": "2 (ADR-049)", "crate": "scp-runtime", "adr": "ADR-049", "pr": "PR-7-prep" }
+    },
+    {
+      "id": "SCP-CRYPTOMOVE-000b",
+      "title": "Provide node-resident accessors (wrapping keypair, clock, local_did) for the inherent crypto methods",
+      "gate": "gate-cryptomove-0",
+      "priority": "P0",
+      "severity": "major",
+      "status": "done",
+      "files": [
+        "crates/scp-runtime/src/crypto/mls/provider.rs"
+      ],
+      "description": "Additive prep for ADR-049 Decision 15. The inherent PerContextState crypto methods (000a) take node-resident data (local_did, wrapping keypair, clock) as parameters; the atomic core must fetch that data from the provider to supply it. Provide the accessors: promote wrapping_keypair_snapshot from #[cfg(any(test, feature = testing))] to pub(crate) (or add pub(crate) wrapping_public_key() / wrapping_secret() accessors), and confirm the existing pub clock() (provider.rs) and pub(crate) local_did() (provider.rs) suffice. Additive and green: the provider remains fully functional; no call site changes.",
+      "acceptanceCriteria": [
+        "A pub(crate) (or wider) production accessor exists for the wrapping keypair: grep confirms either wrapping_keypair_snapshot is no longer gated solely behind #[cfg(any(test, feature = \"testing\"))] and is at least pub(crate), or new pub(crate) wrapping_public_key() and wrapping_secret() accessors exist on MlsCryptoProvider — reachable from the atomic core's actor-seeding path in a non-test build.",
+        "The wrapping-secret accessor returns the secret wrapped in zeroize::Zeroizing (no bare [u8;32] secret escapes), matching the existing wrapping_keypair_snapshot signature.",
+        "clock() and local_did() suffice: grep confirms MlsCryptoProvider::clock() (returns Arc<dyn Clock>) and MlsCryptoProvider::local_did() (returns &str, pub(crate)) exist and are reachable from the seeding path; if local_did() is not sufficiently visible, widen it to pub(crate) in this story.",
+        "Additive only: git diff shows no change to any existing call site or method body other than visibility/accessor additions.",
+        "Full CI green: cargo fmt --all -- --check; the full-feature clippy command; DYLD_LIBRARY_PATH=... cargo test --workspace — all exit 0."
+      ],
+      "actionItems": [
+        "Promote wrapping_keypair_snapshot to pub(crate) (removing the test-only cfg) OR add pub(crate) wrapping_public_key()/wrapping_secret() accessors returning Zeroizing for the secret.",
+        "Confirm/ widen clock() and local_did() visibility so the atomic core can read them.",
+        "Run fmt + clippy + workspace tests."
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 6. `ContextCryptoProvider` (26 methods) is deleted; replaced by two narrow traits" },
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 15. PR-7 crypto-state move is one atomic PR, not per-domain" }
+      ],
+      "details": { "phase": "2 (ADR-049)", "crate": "scp-runtime", "adr": "ADR-049", "pr": "PR-7-prep" }
+    },
+    {
+      "id": "SCP-CRYPTOMOVE-000c",
+      "title": "Move validate_key_package to a stateless free-fn / MlsBackend over &dyn Clock",
+      "gate": "gate-cryptomove-0",
+      "priority": "P0",
+      "severity": "moderate",
+      "status": "done",
+      "files": [
+        "crates/scp-runtime/src/crypto/mls/provider.rs",
+        "crates/scp-runtime/src/crypto/mls/backend.rs",
+        "crates/scp-runtime/src/crypto/mls/production_backend.rs",
+        "crates/scp-runtime/src/context/supervisor/key_package_actor_tests.rs"
+      ],
+      "description": "Additive prep for ADR-049 Decision 15. validate_key_package is stateless: it touches only the injected clock (via validate_key_package_lifetime over the hardened Clock), never with_context / self.contexts. Per ADR-049 Decision 6 (which lists validate_key_package as an MlsBackend method), the stateless form is the MlsBackend trait method — NOT a new shared free function in the scp-runtime orchestration layer. It is made stateless by threading the hardened clock in as a `clock: &dyn Clock` parameter instead of reading backend state. This lets the atomic core replace deps.crypto.validate_key_package with a stateless MlsBackend call rather than an actor-state method. Additive and green: change the trait method signature (add clock param), thread it through the ProductionMlsBackend impl and the FailingBackend mock; the sync provider wrapper MlsCryptoProvider::validate_key_package is retained byte-identical (it already threads self.clock through the shared scp-mls validate_key_package_lifetime primitive, and a sync fn cannot call the async trait method without block_on, forbidden by ADR-049 Invariant 4) until the atomic core flips call sites.",
+      "acceptanceCriteria": [
+        "A stateless MlsBackend trait method exists: `MlsBackend::validate_key_package(&self, key_package_bytes: &[u8], clock: &dyn Clock) -> Result<ValidatedKeyPackage, MlsError>` in crates/scp-runtime/src/crypto/mls/backend.rs — grep confirms the `clock: &dyn Clock` parameter on the trait method, and the method takes no per-context state (ADR-049 Decision 6 arm).",
+        "It touches no contexts and no backend clock field: grep over the ProductionMlsBackend::validate_key_package body (crypto/mls/production_backend.rs) confirms zero references to self.contexts / with_context / taken_context_ids AND zero references to self.clock (the lifetime re-check uses the `clock` parameter, not backend state).",
+        "The provider method is retained for now: MlsCryptoProvider::validate_key_package still exists in crypto/mls/provider.rs and is left byte-identical (this story does not flip call sites; production call sites lifecycle_helpers.rs and governance_helpers.rs are unchanged).",
+        "A unit test drives the stateless MlsBackend::validate_key_package form directly: a valid KeyPackage returns Ok(ValidatedKeyPackage); an expired-lifetime KeyPackage (TestClock advanced past KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS) returns Err(MlsError::KeyPackageLifetimeInvalid). The retained provider wrapper MlsCryptoProvider::validate_key_package maps the same expired-lifetime condition to ContextError::InvalidKeyPackage, asserted by the existing provider::tests::validate_key_package_rejects_expired_lifetime_at_gate — both layers are covered.",
+        "Full CI green: cargo fmt --all -- --check; the full-feature clippy command; DYLD_LIBRARY_PATH=... cargo test --workspace — all exit 0."
+      ],
+      "actionItems": [
+        "Make the MlsBackend::validate_key_package trait method stateless by adding a `clock: &dyn Clock` parameter (ADR-049 Decision 6 arm; no new shared free function).",
+        "Thread the clock param through the ProductionMlsBackend impl (use `clock`, not `self.clock`) and the FailingBackend mock, and update the trait method's test callers.",
+        "Leave the sync MlsCryptoProvider::validate_key_package wrapper unchanged — do not flip call sites.",
+        "Add a direct unit test (valid -> Ok(ValidatedKeyPackage); expired-lifetime -> Err(MlsError::KeyPackageLifetimeInvalid)).",
+        "Run fmt + clippy + workspace tests."
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 6. `ContextCryptoProvider` (26 methods) is deleted; replaced by two narrow traits" },
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 15. PR-7 crypto-state move is one atomic PR, not per-domain" }
+      ],
+      "details": { "phase": "2 (ADR-049)", "crate": "scp-runtime", "adr": "ADR-049", "pr": "PR-7-prep" }
+    },
+    {
+      "id": "SCP-CRYPTOMOVE-000d",
+      "title": "Add build_restored_owned: restore_crypto_state owned-return path (no contexts.insert)",
+      "gate": "gate-cryptomove-0",
+      "priority": "P0",
+      "severity": "major",
+      "status": "done",
+      "files": [
+        "crates/scp-runtime/src/crypto/mls/provider.rs"
+      ],
+      "description": "Additive prep for ADR-049 Decision 15 (the respawn one-way-take invariant). Today MlsCryptoProvider::restore_crypto_state constructs a ContextCryptoState and then self.contexts.insert(...)s it, returning only RestoredFloors. Add build_restored_owned: a path that RETURNS (OwnedMlsCryptoState, RestoredFloors) WITHOUT inserting into self.contexts and WITHOUT calling take_crypto_state — the construction site already builds the owned payload, so it hands it back instead of installing it. Additive and green: the new path is unit-tested and unused until the atomic core (001) seeds actors from it via the split restore_crypto_state_with_floor_guard; the existing insert-based restore_crypto_state is retained until then.",
+      "acceptanceCriteria": [
+        "build_restored_owned exists and returns owned material: grep confirms a method on MlsCryptoProvider returning (OwnedMlsCryptoState, RestoredFloors) (or Result thereof) whose body performs NO self.contexts.insert and NO take_crypto_state call.",
+        "It reuses the existing construction: the owned payload carries the same eight fields the current restore path constructs (mls_group, sender_key, sender_key_store, sender_key_epoch, send_sequence, pending_distributions, nonce_dedup, member_wrapping_keys) and the same RestoredFloors (sender_epochs + recv_sequence) the current path returns.",
+        "The legacy insert-based restore_crypto_state is retained: grep confirms it still exists and still returns RestoredFloors, unchanged by this story (no call site flipped).",
+        "A unit test drives build_restored_owned over a serialized snapshot and asserts (a) the returned OwnedMlsCryptoState fields match the snapshot, (b) the context is NOT present in provider.contexts afterward, and (c) the returned RestoredFloors match the snapshot's epoch/recv floors.",
+        "Full CI green: cargo fmt --all -- --check; the full-feature clippy command; DYLD_LIBRARY_PATH=... cargo test --workspace — all exit 0."
+      ],
+      "actionItems": [
+        "Factor the ContextCryptoState construction in restore_crypto_state so it can return the owned payload instead of inserting; expose build_restored_owned returning (OwnedMlsCryptoState, RestoredFloors).",
+        "Leave the legacy insert-based restore_crypto_state in place (atomic core flips consumers).",
+        "Add the unit test (fields match, no contexts insert, floors match).",
+        "Run fmt + clippy + workspace tests."
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 15. PR-7 crypto-state move is one atomic PR, not per-domain" },
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 10. Actor panic recovery" }
+      ],
+      "details": { "phase": "2 (ADR-049)", "crate": "scp-runtime", "adr": "ADR-049", "pr": "PR-7-prep" }
+    },
+    {
+      "id": "SCP-CRYPTOMOVE-000e",
+      "title": "Add arm_rotation_failure_once one-shot persist-failure test seam",
+      "gate": "gate-cryptomove-0",
+      "priority": "P0",
+      "severity": "moderate",
+      "status": "done",
+      "files": [
+        "crates/scp-runtime/src/crypto/mls/provider.rs"
+      ],
+      "description": "Additive prep for ADR-049 Decision 15 / Decision 9. Add an injectable one-shot persist-failure test seam for sender-key rotation, mirroring the existing force_export_failure AtomicBool + arm_export_failure_once one-shot seam (provider.rs). The seam makes the Class-S 'injected persist failure => rotation returns Err (fail-closed)' criterion testable end-to-end. Gated behind #[cfg(any(test, feature = \"testing\"))] so the production build carries neither the field nor the branch. Additive and green.",
+      "acceptanceCriteria": [
+        "A one-shot rotation persist-failure seam exists: grep confirms a #[cfg(any(test, feature = \"testing\"))] AtomicBool field (e.g. force_rotation_failure) plus a pub arm_rotation_failure_once() that sets it, mirroring force_export_failure / arm_export_failure_once.",
+        "One-shot semantics: the seam fires exactly once then clears itself (the rotation persist after the induced failure behaves normally), matching the export seam's one-shot behavior.",
+        "Production build carries neither field nor branch: the field and its consuming branch are entirely under #[cfg(any(test, feature = \"testing\"))]; a default (non-testing) cargo build compiles without them.",
+        "A unit or async test arms the seam and asserts the next sender-key rotation persist returns Err (fail-closed), and a subsequent rotation persists normally.",
+        "Full CI green: cargo fmt --all -- --check; the full-feature clippy command; DYLD_LIBRARY_PATH=... cargo test --workspace — all exit 0."
+      ],
+      "actionItems": [
+        "Add the #[cfg(any(test, feature = \"testing\"))] force_rotation_failure AtomicBool and arm_rotation_failure_once() mirroring the export seam.",
+        "Wire the one-shot check into the rotation persist path under the same cfg gate.",
+        "Add a test that arms it and asserts fail-closed then normal.",
+        "Run fmt + clippy + workspace tests."
+      ],
+      "blockedBy": [],
+      "sources": [
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 9. Persistence: coalesced by default, sync for safety-critical" },
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 15. PR-7 crypto-state move is one atomic PR, not per-domain" }
+      ],
+      "details": { "phase": "2 (ADR-049)", "crate": "scp-runtime", "adr": "ADR-049", "pr": "PR-7-prep" }
+    },
+    {
+      "id": "SCP-CRYPTOMOVE-001",
+      "title": "Move per-context crypto state from MlsCryptoProvider onto actor-owned PerContextState (take_crypto_state at spawn)",
+      "gate": "gate-cryptomove-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "done",
+      "files": [
+        "crates/scp-runtime/src/context/lifecycle_helpers.rs",
+        "crates/scp-runtime/src/context/messaging_helpers.rs",
+        "crates/scp-runtime/src/context/governance_helpers.rs",
+        "crates/scp-runtime/src/context/ttl_close_helpers.rs",
+        "crates/scp-runtime/src/context/trust_recovery_helpers.rs",
+        "crates/scp-runtime/src/context/broadcast_helpers.rs",
+        "crates/scp-runtime/src/context/actor/handlers/lifecycle.rs",
+        "crates/scp-runtime/src/context/actor/handlers/trust_recovery.rs",
+        "crates/scp-runtime/src/context/actor/state.rs",
+        "crates/scp-runtime/src/context/actor/deps.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "crates/scp-runtime/src/crypto/mls/provider.rs"
+      ],
+      "description": "PR-7 (the 'key-move') of the ADR-049 PR-4 -> PR-6 -> PR-7 sequence. PR-6 (merged at origin/main HEAD 8e2110f93) flipped read-authority for the Class-M epoch/recv floors onto the Supervisor-owned ContextFloors registry and deleted the provider mirrors. This story does the state move: it migrates ALL ~32 per-context deps.crypto.* call sites (lifecycle 16, messaging 5, governance 4, ttl_close 3, trust_recovery 3, broadcast 1) off the Arc<MlsCryptoProvider> and onto the actor-owned &mut PerContextState crypto state (ContextCryptoState in context/actor/state.rs), and wires take_crypto_state(context_id) at the actor spawn seam so the crypto material is moved into the actor exactly once at spawn. Per ADR-049 Decision 15 this MUST be ONE atomic PR: take_crypto_state is atomic and one-way per context (it DashMap::removes the context from the provider and records it in taken_context_ids; afterward every deps.crypto.* on that context returns CryptoFailed('context state owned by actor')), so a per-domain move would break the un-migrated domains at runtime for the life of the context. Scope exception (recorded, per prd.md story-scope guidance): this story is deliberately larger than the ~15-30 min single-iteration norm because the move is indivisible by construction (Decision 15) — it cannot be split into independently-mergeable stories without shipping a broken build between merges. FLOORS ARE EXCLUDED from the move and STAY in the ContextFloors registry (Class-M); the actor's dormant recv_sequence_tracker field (state.rs) MUST stay dead (Decision 15, PR-6 annotation); the floor-gate seams (deps.supervisor.check_and_advance_* and mirror_forward_local_sender_epoch) are unchanged. The durable-blob crypto export migrates too: export_crypto_state becomes an inherent method on PerContextState/ContextCryptoState (floors already come from the registry per PR-6), so no per-context deps.crypto.export_crypto_state call survives in the domain helpers. PR-7 relocates OWNERSHIP of existing per-context crypto state (mint-or-restore-then-move); it does NOT relocate group CREATION — the provider stays the birth/restore seam, so create_mls_group / add_member remain permitted provider calls at the Create/Join spawn/birth seam, and their removal is deferred to the separable §6 provider-dissolution end-state (explicitly NOT PR-7). local_did stays a node/provider-level constant (not per-context state) and is exempt from the move. The moved sender_key_epoch counter is the local node's key-generation counter and is Class-S (sync-persist fail-closed on rotation per ADR-049 Decision 9), with the registry floor for local_did continuing to be raised and never regressing on a coalesce-window rollback. send_sequence seeds PerContextState::send_tracker via SendSequenceTracker::from_persisted (there is no ContextCryptoState.send_sequence field). Respawn/restore reconstitutes the actor crypto state directly from the snapshot into the new actor (never round-tripping the provider), preserving the one-way take invariant. The relocated operations become INHERENT METHODS on PerContextState (Decision 6 methods-on-PerContextState, NOT free functions / field-bag helpers), extracted verbatim and byte-identity-guarded in the additive prep stories SCP-CRYPTOMOVE-000a..000e that land FIRST (blockedBy) with the provider left fully functional; this atomic core then flips the call sites onto the inherent methods and deletes the provider copies in one commit. validate_key_package is the exception: it is stateless (touches only self.clock, never contexts), so it becomes a stateless free-fn / MlsBackend call over &dyn Clock (prep story 000c), NOT a state method. One further per-context seal outside the six domain helpers — recovery_send_notification_direct in supervisor/supervisor.rs (the unregistered-context recovery-notification path, crypto.seal on the provider ref) — the original six-helper enumeration missed; it also relocates onto the inherent seal, and because it seals a context with NO live actor the atomic core resolves it by respawn-then-actor-seal: the no-live-actor fallback spawns (get-or-respawn) the context's own actor via the existing respawn path (seeded from build_restored_owned) and seals through that actor's authoritative persist-before-ack send_sequence + MLS generation via the normal mailbox handler — NOT materializing per-context state outside an actor (which would admit MLS generation reuse across two recovery seals from the same snapshot) and NOT retaining a separate provider seal copy (no §15 zero-grep exception). The recovery-time get-or-respawn MUST acquire the bootstrap_spawn_lock cleanly (not re-entrant against the recovery flow's locking).",
+      "acceptanceCriteria": [
+        "Zero steady-state per-context provider crypto calls remain: grep -rE 'deps\\.crypto\\.(seal|open|advance_epoch|rotate_sender_key|remove_member|destroy_mls_group|destroy_sender_key|mls_encrypt_management|local_sender_key_epoch|validate_key_package|export_crypto_state)' over crates/scp-runtime/src/context/{lifecycle_helpers,messaging_helpers,governance_helpers,ttl_close_helpers,trust_recovery_helpers,broadcast_helpers}.rs AND crates/scp-runtime/src/context/actor/handlers/{lifecycle,trust_recovery}.rs returns 0 matches; AND crates/scp-runtime/src/context/supervisor/supervisor.rs has no production (non-#[cfg(test)]) per-context seal on the crypto-provider ref — specifically recovery_send_notification_direct (~supervisor.rs:3950) no longer calls crypto.seal(..) (the original six-helper grep missed this per-context seal) — its no-live-actor fallback instead performs respawn-then-actor-seal (get-or-respawn the context's actor via the existing respawn path seeded from build_restored_owned, then seal through the actor's mailbox handler), acquiring bootstrap_spawn_lock; there is NO retained provider recovery_seal copy and NO §15 zero-grep exception for one. The relocated operations are rewritten as INHERENT-METHOD CALLS on the actor-owned crypto state — state.seal(..), state.open(..), state.rotate_sender_key(..), state.advance_epoch(..), state.remove_member(..), state.destroy_mls_group(), state.export_crypto_state() (Decision 6 methods-on-PerContextState, defined in prep story SCP-CRYPTOMOVE-000a) — inherent methods on the actor state, NOT free functions and NOT a detached field bag. Per the ADR-049 §15 option-b receiver-shape refinement, the §9 Class-C coalesced send/receive orchestration (seal, open, mls_encrypt_management) is driven from the FIELD-GRANULAR Class-C view rather than a whole &mut self (see the dedicated Class-C-receiver acceptance criterion). EXCEPTION: validate_key_package does NOT migrate onto the state (it touches only self.clock, never contexts) — it becomes a stateless free-fn / MlsBackend call over &dyn Clock per prep story SCP-CRYPTOMOVE-000c.",
+        "The birth/restore seam calls create_mls_group and add_member remain PERMITTED (not migrated by PR-7): the provider still constructs the MLS group at the Create/Join handler before take_crypto_state moves it, and their removal is the separable §6 provider-dissolution follow-on — PR-7 does not delete create_mls_group / add_member from the provider.",
+        "local_did stays a node/provider-level constant and is exempt: deps.crypto.local_did calls may remain (they read node identity, not per-context crypto state) and are excluded from the zero-grep in the first criterion.",
+        "Pre-existing-group spawn seams seed the actor crypto PRE-dispatch (before the actor accepts commands): for restore_context, respawn_from_snapshot, cold restart (restore_all_contexts), and the spawn-from-Welcome path where the provider installed the joined group before spawn, the actor's ContextCryptoState.mls_group.is_some() holds immediately after spawn and before the first command — verified by async tests. On the restore/respawn/cold-restart legs the crypto is seeded from the owned material returned by restore_crypto_state (NOT a re-take): the test asserts no take_crypto_state is called on the already-taken context and the context never re-appears in provider.contexts.",
+        "Fresh create builds the group in-dispatch, so the provider-build + take runs AFTER the actor accepts commands: for a fresh create the MLS group is constructed inside the Create handler (crates/scp-runtime/src/context/actor/handlers/lifecycle.rs) in the actor's dispatch loop (ContextCryptoState.mls_group is None between spawn and that handler — state.rs), and take_crypto_state moves the provider-built group into the actor within that handler — verified by an async test asserting mls_group.is_none() immediately after spawn and mls_group.is_some() only AFTER the Create command completes (not at spawn). The seam enumeration therefore includes the in-dispatch Create/Join handler, not only the spawn_actor_* functions; a grep confirms take_crypto_state is reached from BOTH the pre-existing-group spawn seams (spawn_actor_with_state / restore_context / respawn_from_snapshot / spawn_actor_from_welcome) AND the in-dispatch Create/Join handler.",
+        "The move payload send_sequence seeds the send tracker, not a crypto-state field: the take path routes OwnedMlsCryptoState.send_sequence into PerContextState::send_tracker via SendSequenceTracker::from_persisted, and context/actor/state.rs::ContextCryptoState declares no send_sequence field — verified by grep over the type definition and the take-seam call site.",
+        "The dormant recv anti-replay mirror stays dead: grep -rn '\\.recv_sequence_tracker' over crates/scp-runtime/src (excluding the field definition and doc-comment in context/actor/state.rs, and excluding #[cfg(test)] modules) returns 0 write or read sites — the authoritative recv floor is read only from the ContextFloors registry.",
+        "Floors never appear on the move payload or the actor crypto state: OwnedMlsCryptoState (provider.rs) has exactly the fields {mls_group, sender_key, sender_key_store, sender_key_epoch, send_sequence, pending_distributions, nonce_dedup, member_wrapping_keys}, and neither OwnedMlsCryptoState nor context/actor/state.rs::ContextCryptoState declares any field of type ReceiveFloor or named sender_epochs / recv_sequence — verified by grep over both type definitions.",
+        "The live floor-gate seams are unchanged: git diff over PR-7 shows no modification to the check_and_advance_epoch / check_and_advance_recv_sequence gate calls in the decrypt_and_dispatch receive path nor to mirror_forward_local_sender_epoch (the move relocates sender-key material, not the gate).",
+        "Sender-key rotation on the moved state is Class-S sync-persist fail-closed AND raises the registry floor: an async test rotates the sender key on a migrated context and asserts (a) sender_key_epoch is durably persisted before the rotation acks, (b) an injected persist failure (via the one-shot rotation persist-failure test seam) causes the rotation to return Err (fail-closed, not Ok), and (c) the ContextFloors registry entry for local_did is raised and a subsequent simulated coalesce-window rollback of the actor snapshot does not regress that registry floor.",
+        "Cross-domain reachability of the migrated state: an async test creates a context, takes its crypto state into the actor at spawn, then drives one lifecycle-domain operation and one governance-domain operation against the SAME context and asserts both succeed operating on the actor-owned crypto state (proving the move did not orphan any domain's reader), and asserts a raw deps.crypto.with_context on that context id returns CryptoFailed('context state owned by actor').",
+        "Respawn preserves the one-way take invariant via returned owned material (not a provider round-trip): an async test spawns an actor for a context, simulates an actor crash + respawn_from_snapshot, and asserts (a) the respawned actor's ContextCryptoState is reconstituted DIRECTLY from the material returned by restore_crypto_state (mls_group.is_some()), (b) restore_crypto_state performed NO provider.contexts insert and NO re-take, (c) the provider's taken_context_ids marker for the context is unchanged (still taken), and (d) the context never re-appears in provider.contexts at any point.",
+        "ADR-049 provenance is intact: crates/scp-runtime/src/context/actor/state.rs::ContextCryptoState::recv_sequence_tracker retains its DORMANT PR-7 annotation, and the ADR-049 Decision 15 heading exists and is cited by the moved-handler modules or their module docs.",
+        "Recovery seal via respawn-then-actor-seal (no retained provider seal): recovery_send_notification_direct's no-live-actor fallback gets-or-respawns the context's actor via the existing respawn path (seeded from build_restored_owned) and seals through the actor's mailbox handler using the actor's authoritative persist-before-ack send_sequence + MLS generation — grep confirms NO provider recovery_seal / crypto.seal survives on the recovery path and that the respawn acquires bootstrap_spawn_lock; an async test drives the no-live-actor recovery-seal path and asserts (a) a context actor is spawned when absent, (b) the seal is produced through the actor (not a materialized-outside-an-actor transient and not a provider seal), and (c) two consecutive recovery seals for the same context do NOT reuse the MLS generation (the second observes the actor's advanced send_sequence).",
+        "H1 (retained birth-seam destroy): the provider destroy_mls_group and destroy_sender_key are RETAINED (not deleted) because context/builder.rs CreationReceipt::rollback calls them in the creation-failure birth window before any actor exists — grep confirms MlsCryptoProvider::destroy_mls_group and MlsCryptoProvider::destroy_sender_key still exist and are still called from builder.rs rollback; the actor-owned state.destroy_mls_group / state.destroy_sender_key coexist for the ttl/close actor-owned path.",
+        "H2 (double-owner fail-closed + taken marker): create_group_into_slot, install_joined_group, and generate_sender_key return CreationFailed when taken_context_ids.contains(context_id) — verified by a test that takes a context then attempts each and asserts CreationFailed; AND the build_restored_owned actor-seeding path records the context into taken_context_ids (grep + test: after respawn/restore seeding, taken_context_ids.contains(context_id) holds so the context is never Vacant-and-unmarked). A positive structural check asserts every provider contexts-insert write-path consults taken_context_ids.",
+        "H3 (wrapping-keypair single-slot atomicity): the wrapping keypair is stored as a SINGLE ArcSwap<Arc<(public: [u8;32], secret: zeroize::Zeroizing<[u8;32]>)>> (not two separate ArcSwaps), so the pair rotates and is read atomically — grep confirms one ArcSwap holding the tuple and that no reader loads public and secret across two separate .load() calls; the accessor returns ([u8;32], Zeroizing<[u8;32]>) from a single load. This supersedes the two separate prep-B accessors (their callers/tests are updated).",
+        "H4 (whole-PerContextState disposal at every destroy seam): at each destroy seam (ttl terminal transition, close, and the broadcast destroy no-op) the actor discards/zeroizes the WHOLE PerContextState crypto material (inherent destroy_mls_group nulls only mls_group) — an async test asserts that after the destroy seam the residual sender_key and sender_key_store are cleared/zeroized (not left resident).",
+        "H5 (cold-restart floor routing, behavioral replay-rejection): on the cold-restart empty-registry path the actor-seeder routes build_restored_owned's returned RestoredFloors (sender_epochs + recv_sequence) into validate_and_merge_all_floors — covered by a BEHAVIORAL test (NOT a string/pipeline assertion): cold-restart from a snapshot carrying non-zero floors, then a replayed old-epoch Application message is REJECTED (decrypt_and_dispatch returns Err and yields no OpenedEnvelope).",
+        "H6 (send_tracker single-advance): there is exactly ONE canonical send-sequence reservation — under the §15 option-b receiver shape the handler reserves the send-sequence ONCE from the Class-C send_tracker view (SequenceReservation with the u64::MAX overflow guard preserved) and passes the reserved sequence into the reshaped seal; the previously-parallel second SequenceReservation::reserve on the send path is DELETED. The sequence advances EXACTLY once per send, and the emit path is rollback-immune: the tracker is rolled back ONLY when the seal provably never emitted — a transport timeout (Err(_elapsed)) does NOT mean the relay failed to receive, so it does NOT roll back (BLACK-CM-004). Verified by a test that a successful send advances send_tracker by exactly one, and grep confirms no double-reserve remains on the handle_send_message path.",
+        "MlsCryptoSnapshot stays pub(crate): grep confirms MlsCryptoSnapshot remains pub(crate) (NOT re-narrowed to private) because the actor export_crypto_state references it — it is not widened past pub(crate) either.",
+        "Class-C receiver shape (ADR-049 §15 option-b refinement): the §9 Class-C COALESCED send/receive crypto orchestration — seal (build_encrypted_envelope, messaging_helpers.rs), open (the receive/decrypt path, messaging_helpers.rs), and mls_encrypt_management — operate on the FIELD-GRANULAR Class-C view (ClassCMut's &mut mode/crypto plus a send-sequence the handler reserved ONCE from the Class-C send_tracker view via commit_class_c_best_effort), NOT on a whole &mut self / ClassSMut::rest_mut (which is fail-closed Class-S only and would force a per-message fail-closed persist, reversing §9 coalescing and blowing the Decision-14 <15% perf budget). The genuinely-Class-S ops (rotate_sender_key, advance_epoch, remove_member) KEEP the &mut self shape driven through commit_class_s_keep→rest_mut where fail-closed persistence is correct. Verified: no seal/open/mls_encrypt_management call acquires rest_mut on the send/receive path; the reshaped seal/open produce byte-identical wire output to the pre-reshape Prep-A methods (same (epoch, send_sequence) AAD + random-nonce path), pinned by the retained golden byte-identity tests updated to drive the reshaped methods and assert cross-decode parity with the provider twin.",
+        "Full CI is green on every commit of the PR: cargo fmt --all -- --check; cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings; cargo check -p scp-protocol --target wasm32-unknown-unknown; DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace; python3.12 scripts/check-block-in-place.py; bash scripts/check-deleted-primitives.sh; python3.12 scripts/check-protocol-sync.py; bash scripts/check-protocol-deps.sh — all exit 0.",
+        "python3.12 scripts/validate-prd.py exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Land ADR-049 Decision 15 (with the decomposition amendment) FIRST so this story's sources resolve, then land the additive prep stories SCP-CRYPTOMOVE-000a..000e (byte-identity-guarded inherent methods, node-resident accessors, stateless validate_key_package, build_restored_owned, arm_rotation_failure_once) BEFORE this atomic core; the atomic core branches from the merged prep.",
+        "Flip the 16 lifecycle_helpers.rs deps.crypto.* sites to inherent-method calls on the actor-owned crypto state — state.destroy_mls_group(), state.destroy_sender_key(), state.remove_member(..), state.rotate_sender_key(..), state.mls_encrypt_management(..) (methods from 000a); validate_key_package becomes a stateless free-fn / MlsBackend call (000c), NOT a state method.",
+        "Flip the 5 messaging_helpers.rs sites to inherent-method calls: state.rotate_sender_key(..), state.local_sender_key_epoch(), state.export_crypto_state(); local_did stays a provider/node constant and is NOT migrated.",
+        "Flip the 4 governance_helpers.rs (advance_epoch, rotate_sender_key), 3 ttl_close_helpers.rs (export_crypto_state), 3 trust_recovery_helpers.rs (advance_epoch, export_crypto_state, seal), and 1 broadcast_helpers.rs (export_crypto_state) sites, plus the actor/handlers/{lifecycle,trust_recovery}.rs sites AND the recovery_send_notification_direct seal in supervisor/supervisor.rs, to inherent-method calls on the actor crypto state (state.advance_epoch(..), state.rotate_sender_key(..), state.export_crypto_state(), state.seal(..)). For the recovery_send_notification_direct seal (no live actor), do NOT materialize the per-context state outside an actor and do NOT retain a provider seal copy — instead perform respawn-then-actor-seal: the no-live-actor fallback gets-or-respawns the context's actor via the existing respawn path (seeded from build_restored_owned) and seals through the actor's mailbox handler using its authoritative persist-before-ack send_sequence + MLS generation; verify the recovery-time respawn acquires bootstrap_spawn_lock cleanly (not re-entrant against the recovery flow's locking).",
+        "Wire take_crypto_state into Supervisor::spawn_actor_with_state and the create/restore/respawn/welcome entrypoints so the OwnedMlsCryptoState payload seeds the actor's ContextCryptoState, and route send_sequence into PerContextState::send_tracker via SendSequenceTracker::from_persisted, exactly once at spawn.",
+        "Consume the build_restored_owned owned-return (added additively in prep story 000d): restore_crypto_state RETURNS (OwnedMlsCryptoState, RestoredFloors) without self.contexts.insert. Split restore_crypto_state_with_floor_guard into (a) merge snapshot floors into the ContextFloors registry (unchanged from PR-6) and (b) seed the new actor's ContextCryptoState directly from the returned owned material (wrapping mls_group/sender_key in Some(..), routing send_sequence into send_tracker). On a warm respawn the context is already in taken_context_ids, so restore MUST NOT re-take (a take on a taken context returns CryptoFailed('context state owned by actor')). Keep the provider as the birth seam only: create_mls_group / add_member stay provider calls at the Create/Join handler — their removal is the deferred concrete-MlsCryptoProvider-struct dissolution follow-on (consistent with §6's crypto-provider-trait replacement), NOT PR-7.",
+        "Keep the ContextCryptoState::recv_sequence_tracker field dormant (no reads/writes) and update the ActorDeps::crypto doc-comment (deps.rs) to reflect the completed steady-state dissolution — the provider is now a birth/restore seam only.",
+        "Use the arm_rotation_failure_once one-shot test seam (added additively in prep story 000e, mirroring arm_export_failure_once / force_export_failure in provider.rs) to drive the 'rotation Class-S fail-closed' criterion (injected persist failure => rotation returns Err) end-to-end without a broken production build.",
+        "Add the async tests enumerated in the acceptance criteria (pre-dispatch-seed for restore/respawn/welcome, fresh-create in-dispatch take timing, send_sequence-seeds-send_tracker, cross-domain reachability, rotation Class-S fail-closed + registry-floor-no-regress, respawn one-way-invariant via returned owned material, provider-returns-owned-by-actor).",
+        "Apply the mandatory hardening folded into the atomic core: H1 retain provider destroy_mls_group + destroy_sender_key as birth-seam machinery (builder.rs rollback); H2 make create_group_into_slot / install_joined_group / generate_sender_key return CreationFailed when taken_context_ids.contains(context_id) and have the build_restored_owned seeding path record the context into taken_context_ids; H3 unify the wrapping keypair to a single ArcSwap<Arc<(public, Zeroizing<secret>)>> (superseding prep-B's two separate accessors, updating their callers/tests); H4 discard/zeroize the whole PerContextState crypto material at every destroy seam (ttl terminal, close, broadcast no-op); H5 route build_restored_owned's RestoredFloors into validate_and_merge_all_floors on the cold-restart empty-registry path with a behavioral replay-rejection test; H6 delete the parallel SequenceReservation::reserve at actor/handlers/messaging.rs (~362) so the send_tracker advances exactly once via the inherent seal (u64::MAX guard inherited).",
+        "Document the pre-existing OBS-2 property in the restore split: build_restored_owned mutates the node wrapping-keypair slot as a side effect (last-writer-wins, idempotent for a consistent snapshot set), and the wrapping keypair is NOT rolled back on a floor-merge reject — cite this as deliberate, not a regression. Keep MlsCryptoSnapshot pub(crate) (do not re-narrow to private; the actor export references it).",
+        "Run the full ADR-049 Verification command block plus the review roster to double-zero before opening the PR."
+      ],
+      "blockedBy": ["SCP-CRYPTOMOVE-000a", "SCP-CRYPTOMOVE-000b", "SCP-CRYPTOMOVE-000c", "SCP-CRYPTOMOVE-000d", "SCP-CRYPTOMOVE-000e"],
+      "sources": [
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 15. PR-7 crypto-state move is one atomic PR, not per-domain" },
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 1. ContextActor owns state by move" },
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 6. `ContextCryptoProvider` (26 methods) is deleted; replaced by two narrow traits" },
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 9. Persistence: coalesced by default, sync for safety-critical" },
+        { "file": ".docs/adrs/ADR-049-actor-per-context.md", "section": "### 10. Actor panic recovery" }
+      ],
+      "details": {
+        "phase": "2 (ADR-049)",
+        "crate": "scp-runtime",
+        "adr": "ADR-049",
+        "pr": "PR-7",
+        "scopeException": "single atomic story by construction — Decision 15 (take_crypto_state is atomic/one-way per context); not decomposable into independently-mergeable stories"
+      }
+    }
+  ]
+}

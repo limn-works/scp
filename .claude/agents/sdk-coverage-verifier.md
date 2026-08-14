@@ -36,7 +36,7 @@ For each `(domain, operation, sdk)` where the matrix says `true`:
 
 4. **Check semantic correctness.** Read the function body. Does it delegate to the corresponding bridge function?
    - Python: calls `_scp_core.py_<operation>` or similar
-   - TypeScript: calls `bridge.<operation>` or `napi.<operation>` or `wasm.<operation>`
+   - TypeScript: calls `bridge.<operation>` or `napi.<operation>`
    - Kotlin: calls the UniFFI bridge binding
    - Swift: calls the UniFFI bridge binding via `ScpBindings`
 

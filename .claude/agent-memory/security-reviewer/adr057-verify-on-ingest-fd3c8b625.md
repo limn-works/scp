@@ -1,0 +1,18 @@
+# ADR-057 Structured Capability Validation + §7.3.2 Verify-on-Ingest (fd3c8b625) — 2026-06-30 — ZERO FINDINGS
+
+Branch feat/actor-2c-xctx-tool-saga. Read-only audit. CLEAN across all 4 threat categories. This is a HARDENING change set that closes the exact vulns it targets, with paired positive+negative tests.
+
+## What it does (the defended properties)
+- `ucan_evaluate` = read-only diagnostic (Option<&CapabilityUri>); `validate_ucan` = throwing gate (mandatory &CapabilityUri). validate.rs evaluate_ucan(None) SKIPS only step-6 grant-match; every other step still runs; never flips a bool true that another check sets false. nonce is READ-ONLY probe (never recorded). audience (verify_audience) runs in BOTH before any field set true.
+- Verify-on-ingest (scp-ffi/common/src/trust_store.rs): caller attestations routed through verify_and_cache_with_revocation (Ed25519 vs resolver-resolved issuer key + expiry + issuer revocation_status field + context external revocation list; trusted verified_at from injected clock, caller's IGNORED). Challenge results through verify_challenge_verification (sig + context_id binding + expiry). Forged/expired/cross-context/None-context all dropped.
+- Read-path revocation (aggregate.rs get_verified_attestations): RevocationMapChecker consulted on EVERY read on BOTH fresh-return and stale-reverify paths — a later context-revoked entry is dropped before TTL expiry (closes fail-open).
+- Closed allowlist is_verification_rejection: rejection variants (Attestation{SignatureInvalid,Expired,Revoked,RevocationInvalid,EvidenceInvalid}, Challenge{VerificationSignatureInvalid,VerificationExpired,ContextMismatch}, InvalidEventData, ChallengeSigningFailed) DROP the one entry; everything else (StoreError=poisoned lock) PROPAGATES. lock_error() deliberately moved from InvalidEventData→StoreError so infra never collides with canonicalization-rejection. DID resolution failure maps to AttestationSignatureInvalid (in allowlist) so unresolvable issuer/verifier drops single entry, not batch-abort.
+- Fail-closed audience: all 3 bridges require presenting_agent_did, NO aud self-default. PyO3/NAPI: trim+filter-empty+reject+validate_did before token parse. UniFFI: compile-required `String` (non-Option) + empty-string reject. Grepped: zero residual `unwrap_or(&parsed_token.payload.aud)`.
+- Error chokepoint: bridges map empty-log→CTX_2076, infra/other→CTX_2000 (propagates, fail-closed). Identical across PyO3/NAPI/UniFFI. SDKs (Python trust.py / TS scp.ts) branch ONLY on SCP-CTX-2076, re-raise/throw all else. Python _coded_bridge_error re-raises every native exc as coded SDK exc. TS mapBridgeError passes typed ScpError through untouched (never downgrades). No failure→success mapping anywhere.
+
+## Observations (non-blocking)
+- compute_participation_record (scp-protocol) TRUSTS accessible_attestations as pre-verified; the trust boundary is the FFI ingest. credential_attestation_history adds defense-in-depth (Active + subject-match filter). Any future NON-FFI caller must verify first.
+- attestation_count is Sybil-inflatable by self-issuance — HONESTLY documented in SDK doc-comments as credential-layer claim count, not a standalone trust score (§7.3.5 threshold/independence + §9.3 device attestation provide Sybil resistance). Not a defect.
+- Swift Trust.swift / Kotlin BridgeConnector.kt high-level evaluateTrust NOT restructured in this set (still old json aggregate path); UniFFI bridge ops (participation_record, ucan_evaluate fail-closed) ARE exported. "Both SDKs" in scope = Python + TS. Not a regression (predates change).
+
+GOTCHA: Bash cwd resets between calls; worktree path = /Users/alec/Developer/limn/scp/.claude/worktrees/agent-a1400c1b005b502a3. Use `git -C <path>` or absolute paths.

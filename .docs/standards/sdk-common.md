@@ -10,11 +10,16 @@ All SDKs implement the same error hierarchy. Language-specific idioms (exception
 ScpError (root)
 ├── IdentityError        — DID creation, resolution, key rotation failures
 ├── ContextError         — Context lifecycle (create, join, leave, close) failures
-├── PermissionError      — UCAN capability validation failures (Python: `UcanPermissionError` to avoid shadowing `builtins.PermissionError`)
+├── UcanPermissionError  — UCAN capability validation failures (avoids shadowing `builtins.PermissionError` in Python and the global `PermissionError` in TypeScript)
 ├── CryptoError          — Encryption, decryption, signature failures
 ├── TransportError       — Network, relay, connection failures
-├── ToolError            — Tool registration, invocation, verification failures
-└── ValidationError      — Input validation, schema, parameter failures
+├── OutletError          — Outlet registration, invocation, verification failures
+├── ValidationError      — Input validation, schema, parameter failures
+├── StorageError         — Persistent-storage operation failures (SCP-STORAGE range)
+├── AttestationError     — Device and identity attestation failures (SCP-ATTEST range)
+├── McpError             — MCP protocol and tool-invocation failures (SCP-MCP range)
+├── GovernanceError      — Context governance proposal and voting failures (SCP-GOV range)
+└── EconomyError         — Payment, budget, and economic-policy failures (SCP-ECON range)
 ```
 
 ### Error requirements
@@ -35,7 +40,7 @@ ScpError (root)
 | `SCP-PERM-` | 3000-3999 |
 | `SCP-CRYPTO-` | 4000-4999 |
 | `SCP-TRANS-` | 5000-5999 |
-| `SCP-TOOL-` | 6000-6999 |
+| `SCP-OUTLET-` | 6000-6999 |
 | `SCP-VALID-` | 7000-7999 |
 | `SCP-STORAGE-` | 8000-8999 |
 | `SCP-ATTEST-` | 9000-9999 |
@@ -71,7 +76,7 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13000` | protocol | Canonical preimage construction exceeded the length-prefix ceiling |
 | `SCP-SAGA-13001` | protocol | Ed25519 saga signature failed verification |
 | `SCP-SAGA-13002` | protocol | Malformed Ed25519 verifying key |
-| `SCP-SAGA-13010` | handler | Caller lacks `tool:interface` capability (outbound) |
+| `SCP-SAGA-13010` | handler | Caller lacks `outlet:interface` capability (outbound) |
 | `SCP-SAGA-13011` | handler | Caller not in outbound `allowed_callers` |
 | `SCP-SAGA-13012` | handler | `ucan_proof_id` not resolvable in target proof store |
 | `SCP-SAGA-13013` | handler | UCAN re-validation failed (confused-deputy re-bind) |
@@ -98,10 +103,10 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13037` | handler | Divergence-marker serialization failed |
 | `SCP-SAGA-13038` | handler | Saga phase reached the wrong dispatch helper |
 | `SCP-SAGA-13050` | supervisor | Initiator is not a member of the named caller context (caller-axis authorize-before-reserve) |
-| `SCP-SAGA-13051` | supervisor | Prepare — `CrossContextToolInvocation` reached `start_saga` without an executor context |
+| `SCP-SAGA-13051` | supervisor | Prepare — `CrossContextOutletInvocation` reached `start_saga` without an executor context |
 | `SCP-SAGA-13052` | supervisor | Prepare-A — caller context is not a co-resident actor |
 | `SCP-SAGA-13053` | supervisor | Prepare-B — target context is not a co-resident actor |
-| `SCP-SAGA-13054` | supervisor | Commit — `CrossContextToolInvocation` reached `start_saga` without an executor context |
+| `SCP-SAGA-13054` | supervisor | Commit — `CrossContextOutletInvocation` reached `start_saga` without an executor context |
 | `SCP-SAGA-13055` | supervisor | Commit-B — target context is not a co-resident actor |
 | `SCP-SAGA-13056` | supervisor | Commit-B — executor already consumed but no output stashed (coordinator bug) |
 | `SCP-SAGA-13057` | supervisor | Commit-B — cross-context tool executor failed |
@@ -112,6 +117,113 @@ holds `13050-13099`, so the two layers never contend for the same number.
 | `SCP-SAGA-13062` | supervisor | No established interface for the (caller, target, tool) triple (target-axis authorize-before-reserve) |
 | `SCP-SAGA-13063` | supervisor | Commit — target receipt missing for saga |
 | `SCP-SAGA-13064` | supervisor | Commit — target receipt signature invalid |
+| `SCP-SAGA-13065` | supervisor | `NeedsRepair` terminal — Commit-retry exhausted; saga diverged and requires operator repair (carries `saga_id`) |
+| `SCP-SAGA-13066` | supervisor | `Busy` terminal — participant context set overlaps an in-flight saga (per-participant-context-set gating, §5.15.4) |
+| `SCP-SAGA-13067` | supervisor | Generic saga terminal abort with no specific sub-code (e.g. Prepare-phase 30s timeout, journal I/O failure) — the message string carries the specific cause |
+| `SCP-SAGA-13068` | supervisor | `ParticipantUnavailable` — Prepare-phase abort: participant actor unavailable to complete the Prepare exchange — inbox closed/terminated (transient, retryable) |
+
+### Registered SCP-CTX- / SCP-CRYPTO- / SCP-TRANS- / SCP-VALID- codes (native registry vs. browser participant)
+
+The native FFI-common registry (`crates/scp-ffi/common/src/error_codes.rs`) is
+the Rust materialization of the per-number meanings for the **native** bridges
+(`PyO3`, napi-rs, `UniFFI`). The browser participant surface
+(`crates/scp-client-wasm/src/error.rs`, plus the `@limn-works/scp-ts-wasm` SDK
+wrapper) **cannot** import that registry — the ADR-057 wasm/tokio fence keeps
+`scp-client-wasm` off `scp_ffi_common` — so it hand-writes its
+`[SCP-{CATEGORY}-{NUMBER}]` literals, which MUST agree with this ledger.
+
+**Scope of the guarantee (be precise — #2144).** Error codes are emitted from
+FIVE surfaces: the native registry, the Swift SDK (`bindings/swift/**`), the
+Kotlin SDK (`bindings/kotlin/**`), the ts-native SDK (`bindings/typescript/src/**`),
+and this ts-wasm surface. `scripts/check-error-codes.sh` machine-checks band
+ranges and native-registry uniqueness, but its Phase-2 cross-surface collision
+detector has a documented KNOWN LIMITATION: it does **not** inspect the
+SDK-wrapper literals (Swift/Kotlin/TS/Python), which "must be reviewed manually
+against error_codes.rs to prevent collisions." A **full cross-surface
+`SCP-<band>-<n>` union** was computed by hand across all five surfaces, and every
+**browser-owned** code registered below was assigned a number **absent from that
+union** — i.e. cross-surface-unique as of this change. The ONE deliberate
+exception is `SCP-CTX-2095`, whose meaning (pseudonym-registry-empty) is
+identical on native + Swift + Kotlin + ts-native + this surface.
+
+This is NOT a claim that *every* SCP code has one meaning across all surfaces:
+pre-existing cross-language overlaps predate and are out of scope for #2144 (e.g.
+`SCP-VALID-7010`/`7011`/`7012` mean UCAN-validation in the native registry but
+are reused by the Swift/ts-native SDKs for their own validation conditions, and
+`SCP-CTX-2003` is overloaded — see below). #2144 fixes only the browser
+participant's own allocations so they stop colliding; the broader cross-language
+reconciliation — auditing the full cross-surface namespace and strengthening the
+compliance mechanism (`check-error-codes.sh` Phase-2 does not machine-check
+SDK-wrapper or match-arm literals; see its documented KNOWN LIMITATION) — is
+tracked in discussion #2208, not addressed here.
+
+This table documents the allocation; it is not a new enforcement mechanism. The
+scp-client-wasm mapping is additionally guarded by an exhaustive positive
+allowlist test in `crates/scp-client-wasm/src/error.rs` (which also pins the
+`lib.rs` direct-emitter literals via the shared `WASM_INPUT_VALIDATION_CODE`
+constant).
+
+| Code | Owner | Condition |
+|------|-------|-----------|
+| `SCP-CTX-2001` | native FFI-common registry (also Swift/Kotlin/ts-native SDKs) | Context operation failed (generic) — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2002` | native FFI-common registry | Context not found — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2003` | native FFI-common registry — **cross-surface OVERLOADED (pre-existing, out of #2144 scope)** | native = "Context already exists"; Swift = "message stream already active"; Kotlin = "not a member". NOT reused by `scp-client-wasm` precisely because of this overload |
+| `SCP-CTX-2004` | native FFI-common registry | Context creation failed — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2005` | native FFI-common registry | Context join failed — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2040` | native FFI-common registry | Context operation error (native `CTX_2040`) — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CTX-2082` | `scp-client-wasm` (browser participant) | Unknown / not-held context (`ClientError::UnknownContext`) |
+| `SCP-CTX-2083` | `scp-client-wasm` (browser participant) | Context already exists in this client (`ClientError::ContextAlreadyExists`) — browser-owned; does NOT reuse the overloaded native `2003` |
+| `SCP-CTX-2084` | `scp-client-wasm` (browser participant) | Unsupported membership change — a received Commit removes a member (out of ADR-057 Slice 2 convergent scope) (`ClientError::UnsupportedMembershipChange`) |
+| `SCP-CTX-2085` | `scp-client-wasm` (browser participant) | Driver invariant violation / malformed driver argument (`ClientError::Driver`) |
+| `SCP-CTX-2086` | `scp-client-wasm` (browser participant) | No retained pending join material — join must reconstruct from the durable snapshot (`ClientError::NoPendingJoinMaterial`). (Sits at 2086 because 2080/2081 are taken by the Kotlin SDK.) |
+| `SCP-CTX-2095` | native FFI-common registry + Swift + Kotlin + ts-native + `scp-client-wasm` (**shared meaning, all surfaces**) | Pseudonym registry empty — peers have not announced routing IDs (§9.10.4); native `ContextError::PseudonymRegistryEmpty`, browser `ClientError::PseudonymRegistryEmpty` |
+| `SCP-CRYPTO-4010` | native FFI-common registry (also Kotlin SDK) | MLS group create error — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-CRYPTO-4020` | `scp-client-wasm` (browser participant) | Sender-key (§9.16) layer failure (`ClientError::SenderKey`) |
+| `SCP-CRYPTO-4030` | `scp-client-wasm` (browser participant) | Event-log append / proof failure (`ClientError::EventLog`) |
+| `SCP-CRYPTO-4040` | `scp-client-wasm` (browser participant) | Convergent committer-timestamp AAD failure — missing or malformed (ADR-057) (`ClientError::Mls(ConvergentTimestampMissing \| ConvergentTimestampMalformed)`) |
+| `SCP-CRYPTO-4041` | `scp-client-wasm` (browser participant) | Generic MLS group operation failure — create/add/join/encrypt/decrypt/commit catch-all (`ClientError::Mls(_)`) |
+| `SCP-TRANS-5005` | `scp-client-wasm` (browser participant) | Injected outbound `Socket`/`RelaySink` failed to enqueue a relay frame — WebSocket closed / JS exception (`ClientError::Transport`) |
+| `SCP-TRANS-5010` | native FFI-common registry (also Kotlin SDK) | Transport subscription error — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-VALID-7010` | native FFI-common registry (**pre-existing cross-language overlap**: reused by Swift/Kotlin/ts-native SDKs for their own validation conditions) | UCAN token validation error — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-VALID-7011` | native FFI-common registry (**pre-existing cross-language overlap** with Swift/Kotlin/ts-native) | UCAN mint validation error — native meaning; NOT emitted by `scp-client-wasm` |
+| `SCP-VALID-7028` | `scp-client-wasm` (browser participant) | Browser participant wire/input (de)serialization or byte-shape validation failure — `ClientError::Codec` (MLS wire codec) plus the wasm free-function input validators (`requestId`/`operatorPk`/`caveatsBinding` length, `OutletStreamChunk` decode, event-log & wrapping-key MessagePack serde). Emitted via the shared `WASM_INPUT_VALIDATION_CODE` constant |
+| `SCP-VALID-7029` | `scp-client-wasm` (browser participant) | Frame content type did not match its relay channel — §9.10.4 mis-routed frame, defense-in-depth (`ClientError::ChannelContentMismatch`) |
+| `SCP-VALID-7025` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | wasm module not initialized — `initScp()` (or `ScpBrowserClient.connect`) must be awaited before constructing/using a client |
+| `SCP-VALID-7026` | `@limn-works/scp-ts-wasm` (browser SDK wrapper) | `WebSocketRelaySocket` (the managed transport) passed to `create()` instead of `ScpBrowserClient.connect()` — it would be left unattached |
+
+The browser participant reuses **only** `SCP-CTX-2095` from the shared band —
+its condition is semantically identical on all five surfaces. Every other
+browser condition took a distinct browser-owned number (`2082-2086`,
+`4020/4030/4040/4041`, `5005`, `7028/7029`, and the SDK-wrapper `7025/7026`),
+each verified absent from the native/Swift/Kotlin/ts-native union so no
+browser-owned code string collides with any other surface as of this change.
+Notably `SCP-CTX-2083` (already-exists) does **not** reuse native `2003`, because
+`2003` is already overloaded across native/Swift/Kotlin.
+
+### Registered SCP-STORAGE- codes
+
+The `SCP-STORAGE-` band (`8000-8999`) is shared across the storage-selection
+layer and several platform/adapter storage backends, so a code is unique to one
+distinct condition. `8000` is the storage-selection error (§17.6 "Storage
+Selection Is Mandatory"). The remaining numbers are allocated per-owner below;
+when adding a new storage code, take the next free number **inside the owning
+sub-block** — never reuse a number assigned to a different backend, even across
+languages. (This table is documentation of the existing allocation, not a new
+enforcement mechanism.)
+
+| Code | Owner | Condition |
+|------|-------|-----------|
+| `SCP-STORAGE-8000` | selection layer (all bridges) | No storage backend selected (mandatory selection missing) |
+| `SCP-STORAGE-8001` | `scp-kt-android` `AndroidStorage` | Storage key not found |
+| `SCP-STORAGE-8002` | `scp-kt-android` `AndroidStorage` | Storage operation failed |
+| `SCP-STORAGE-8003` | `scp-kt-android` `AndroidStorage` | Key derivation failed |
+| `SCP-STORAGE-8010` | `scp-client-wasm` (browser participant) | Injected `Storage` backend I/O fault (`get`/`put`/`delete`/`list_keys`) |
+| `SCP-STORAGE-8011` | `scp-client-wasm` (browser participant) | Corrupt snapshot — bad decode / unknown version / context-id-vs-key mismatch / §9.9.3 checkpoint mismatch |
+| `SCP-STORAGE-8012` | `scp-client-wasm` (browser participant) | Snapshot / pending-join blob belongs to a different identity (owner-DID mismatch) |
+| `SCP-STORAGE-8013` | `scp-client-wasm` (browser participant) | Context poisoned — a persist failed after the in-memory ratchet advanced; reconstruct from the last durable snapshot |
+
+The browser participant codes (`8010-8013`) start at `8010` specifically to avoid
+colliding with the Android backend's `8001-8003`, which were allocated first.
 
 ### Registered SCP-ATTEST- codes
 
@@ -141,13 +253,7 @@ and are documented with their own features.
 |------|-------------|
 | `SCP-IDENT-1017` | Operation requires retained signing custody (identity loaded externally with no retained custody, or handle is sign-only). Surfaced by handle-borne bridges for UCAN **mint** (NAPI + UniFFI), event-log **checkpoint** (NAPI + UniFFI), and **broadcast publish** (NAPI + UniFFI). UCAN **delegate** surfaces `SCP-IDENT-1017` on **UniFFI only**: NAPI resolves the delegator key from the identity registry and surfaces `SCP-IDENT-1001` on a registry miss (same structural reason as PyO3), so NAPI delegate does **not** surface `SCP-IDENT-1017`. |
 
-**Cross-bridge note (native bridges).** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise); NAPI's UCAN **delegate** path is registry-based for the same structural reason and surfaces `SCP-IDENT-1001` as well (see the table above). On the native bridges (PyO3, NAPI, and UniFFI → Swift / Kotlin / TS-via-NAPI), consumers that catch the `IdentityError` category are safe for the missing-custody condition; only code that switches on the exact code string must account for the per-bridge code splits described above.
-
-**WASM note (per signing path).** WASM maintains a DID-keyed `IDENTITY_REGISTRY` holding `OsRng`-generated keypairs (the private key never crosses FFI, ADR-006), so it *can* sign in-Rust where the registry has the key. The three signing paths nonetheless diverge by *path*, not as one uniform code:
-
-- **UCAN mint / delegate** → `SCP-PERM-3000` (`UcanPermissionError`, capability-absent per ADR-034). The Rust side returns this immediately and defers UCAN signing to JS-side key custody (`WebCrypto`/`SubtleCrypto`). This is the **only** path where the `SCP-PERM-3000` claim holds — and it is a distinct condition from the native bridges' missing-custody `IdentityError`, so a WASM consumer must handle `UcanPermissionError` / `SCP-PERM-3000` separately; catching `IdentityError` alone does **not** cover it.
-- **Event-log checkpoint** → signs **in-process** with the identity's `#active` key resolved from the DID-keyed `IDENTITY_REGISTRY`, returning a *successful signed* checkpoint carrying both the Ed25519 `signature` and the canonical `signing_payload_hash` — identical to the native bridges (ADR-048 §7b RESOLVED). The path fails closed in two distinct cases: if the DID is **not present** in the local registry it surfaces `SCP-IDENT-1001` (identity-not-found); if the DID **is registered** but the record retains no signing key (a `Resolved` DID-resolution-only handle) it surfaces `SCP-IDENT-1028` (registered-but-no-retained-custody). Both are `IdentityError`-category; neither raises `SCP-PERM-3000` (or a JS-custody deferral) on this path.
-- **Broadcast publish** → **no in-Rust custody gate**. The `SCP-PERM-3000` errors WASM raises on this path are suspended-write and non-author authorization checks, a different condition entirely — not a missing-custody signal.
+**Cross-bridge note.** PyO3 surfaces the analogous failure as `SCP-IDENT-1001` (registry-based key resolution per ADR-048 §7 — a registered identity always retains custody, so the "registered-but-no-custody" condition cannot arise); NAPI's UCAN **delegate** path is registry-based for the same structural reason and surfaces `SCP-IDENT-1001` as well (see the table above). On all three bridges (PyO3, NAPI, and UniFFI → Swift / Kotlin / TS-via-NAPI), consumers that catch the `IdentityError` category are safe for the missing-custody condition; only code that switches on the exact code string must account for the per-bridge code splits described above.
 
 ## Stub and Placeholder Policy
 
@@ -170,6 +276,20 @@ Code that does not fully implement its documented contract (acceptance criterion
 | TypeScript | ESLint `no-warning-comments` rule (CI). |
 
 All languages: PR review must verify that any function described as a stub in code comments has a corresponding PRD story with `status != "done"`.
+
+### No dev/test-only stand-in may mask a missing production implementation
+
+A stub is honest about its gap on its own path. It is a **separate, forbidden failure** for a stub — or any production code path — to reach for a **dev/test-only construct** to *appear* functional in production. Prohibited on every shipped path:
+
+- A **security nullifier** — in-memory/plaintext key custody, an always-succeeds attestation or certificate verifier, a non-resolving or in-memory DID/DHT resolver, an in-memory pre-rotation recovery custody — used because the real backend isn't built yet.
+- A **`#[cfg(test)]`- or `testing`-feature-gated type**, an in-memory/no-op adapter, or a `*::testing::*` construct constructed on a production create/run path.
+- A **placeholder value** — hardcoded default, empty result, `None`/`null`/`""`, or a value reconstructed from arguments — standing in for data that a real implementation would produce.
+
+**The rule:** if the real implementation is not ready, the capability **fails closed** — return a typed error, or produce the honest protocol-supported absent state (e.g., an identity created with *no* recovery commitment rather than one backed by an in-memory nullifier). It does **not** silently fall back to the dev stand-in. A dev stand-in that ships in production emits a *false guarantee* — callers believe a security property holds when it does not — which is strictly worse than the capability being honestly absent, because absence is detectable and a nullifier lies.
+
+**Deferral boundary:** deferring the *real backend* to a tracked workstream (issue/RFC) is legitimate. Shipping a dev stand-in *for it* in the interim is not. The two are independent: sever the nullifier now (make it test-harness-only, fail closed in prod); build the real backend on its own schedule.
+
+**Mechanical enforcement:** the shipped-feature-graph prove-absence gate (per ADR-062 / spec §17.17) asserts `resolved-feature-set(artifact) ⊆ an allowlist of durability-only features` and admits **zero nullifier features — no exceptions**. There is no "documented," "tracked," or "legible" allowlisted nullifier edge; a tracked deferral of the real backend does not earn one. Durability-only in-memory arms (state-loss only, no nullified security property — e.g. in-memory storage/push) remain legitimate *explicitly-selected* runtime options and are the only in-memory constructs the allowlist admits. See spec §17.17 for the durability-only-vs-nullifier classification.
 
 ## Async Patterns
 
@@ -301,7 +421,7 @@ let ctx = sdk.create_context(ContextConfig {
     ttl: Some(Duration::from_secs(3600)),
     tools: vec![recipe_search, nutrition_lookup],
     ..ContextConfig::defaults(ContextCreation::Explicit {
-        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite, Capability::ToolInvokeAll],
+        ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite, Capability::OutletQueryAll, Capability::OutletCallAll],
         roles: vec![admin_role, member_role, observer_role],
         governance: Governance::SingleAdmin,
         memory_scope: MemoryScope::Summary,
@@ -344,7 +464,7 @@ sdk.set_auto_accept_policy(
 
 **No default:** absent an explicit, human-configured policy, every invitation prompts the agent/human (default-deny). `known_did` is the only auto-accept trigger; co-membership and discoverability are not trust signals.
 
-**Hard constraint (all SDKs, non-overridable):** Auto-accept policies NEVER apply to contexts whose ceiling includes any tool-related capability (`ToolInvokeAll`, `ToolInvokeSpecific`, `ToolRegister`). Tool-bearing contexts always require explicit confirmation. This is enforced in the SDK and cannot be disabled by configuration.
+**Hard constraint (all SDKs, non-overridable):** Auto-accept policies NEVER apply to contexts whose ceiling includes any outlet-related capability (`OutletQueryAll`, `OutletQuery(_)`, `OutletCallAll`, `OutletCall(_)`, `OutletRegister`). Outlet-bearing contexts always require explicit confirmation. This is enforced in the SDK and cannot be disabled by configuration.
 
 ### Auto-accept persistence
 

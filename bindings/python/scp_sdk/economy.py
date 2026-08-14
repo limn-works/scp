@@ -9,13 +9,70 @@ See ``.docs/specs/`` section 19 (Economic Governance) and ADR-033.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import EconomyError, ScpError
 
 if TYPE_CHECKING:
-    pass
+    from scp_sdk.scp import SCP
+
+# ---------------------------------------------------------------------------
+# Payment receipt verification types
+# ---------------------------------------------------------------------------
+
+
+class _PaymentReceiptVerificationEntryRequired(TypedDict):
+    """Required fields present on every PaymentReceiptVerificationEntry."""
+
+    ok: bool
+    """Whether the adapter successfully processed this receipt.
+
+    ``True`` means the adapter responded — NOT that the payment is valid.
+    Inspect ``valid`` / :attr:`PaymentReceiptVerificationResult.all_valid`
+    for actual validity.
+    """
+
+
+class PaymentReceiptVerificationEntry(_PaymentReceiptVerificationEntryRequired, total=False):
+    """One entry in a :class:`PaymentReceiptVerificationResult` results list.
+
+    ``ok`` is always present. All other keys are optional and only populated
+    when the adapter responded (``ok == True``), except ``error`` which is
+    set when the adapter failed (``ok == False``).
+
+    Mirrors the TypeScript ``PaymentReceiptVerificationEntry`` interface and
+    the wire shape produced by ``verification_results_to_json`` in
+    ``scp-runtime/economy/receipt.rs``.
+    """
+
+    receipt_id: str
+    """Receipt identifier — present only when ``ok`` is ``True``."""
+    valid: bool
+    """Whether the receipt was cryptographically valid — present only when ``ok`` is ``True``."""
+    result: dict[str, object]
+    """Structured verification detail — present only when ``ok`` is ``True``."""
+    error: str
+    """Error message — present only when ``ok`` is ``False``."""
+
+
+class PaymentReceiptVerificationResult(TypedDict):
+    """Result of verifying a batch of payment receipts.
+
+    Returned by :meth:`~scp_sdk.SCP.economy_verify_payment_receipts`.
+
+    ``all_valid`` is ``True`` iff every receipt both reached the adapter
+    and the adapter reported it valid. Vacuously ``True`` for an empty batch.
+    Mirrors the TypeScript ``PaymentReceiptVerificationResult`` interface.
+    """
+
+    all_valid: bool
+    """``True`` iff every receipt reached the adapter and was reported valid."""
+    results: list[PaymentReceiptVerificationEntry]
+    """Per-receipt verification outcomes."""
+
 
 logger = logging.getLogger("scp_sdk")
 
@@ -41,6 +98,98 @@ def _bridge() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Amount display formatting (ADR-060 SDK display surface)
+# ---------------------------------------------------------------------------
+
+# Number of decimal places for well-known currencies, keyed by uppercase
+# currency code. The SCP protocol does NOT store per-currency decimals -- the
+# wire form is always a smallest-unit integer -- so this table lives entirely
+# in the SDK for display purposes. The same values are used across every SDK
+# (TypeScript, Swift, Kotlin) for cross-binding consistency.
+_KNOWN_CURRENCY_DECIMALS: dict[str, int] = {
+    "USD": 2,
+    "EUR": 2,
+    "GBP": 2,
+    "BTC": 8,
+    "SAT": 0,
+    "SOL": 9,
+    "USDC": 6,
+    "ETH": 18,
+}
+
+
+def _format_with_decimals(amount: int, decimals: int) -> str:
+    if amount < 0:
+        raise EconomyError(
+            f"amount must be non-negative, got {amount}",
+            code="SCP-ECON-12070",
+        )
+    if decimals < 0 or decimals > 100:
+        raise EconomyError(
+            f"decimals must be in 0..=100, got {decimals}",
+            code="SCP-ECON-12070",
+        )
+    if decimals == 0:
+        # The amount is already expressed in whole display units -- no fraction.
+        return str(amount)
+    divisor = 10**decimals
+    whole, fraction = divmod(amount, divisor)
+    return f"{whole}.{fraction:0{decimals}d}"
+
+
+def format_amount(
+    amount: int,
+    currency: str | None = None,
+    *,
+    decimals: int | None = None,
+) -> str:
+    """Format a smallest-unit monetary amount as a human-readable decimal string.
+
+    Applies the currency's decimal scale using pure integer/string arithmetic
+    (no floating point), so amounts far beyond ``2**53`` format exactly.
+
+    Examples:
+        >>> format_amount(150, "USD")
+        '1.50'
+        >>> format_amount(100_000_000, "BTC")
+        '1.00000000'
+        >>> format_amount(1500, decimals=3)
+        '1.500'
+
+    Args:
+        amount: Smallest-unit amount (e.g. cents, satoshis). Must be non-negative.
+        currency: A known currency code (case-insensitive). Mutually exclusive
+            with ``decimals``.
+        decimals: An explicit decimal-scale override for unknown/custom
+            currencies. Mutually exclusive with ``currency``.
+
+    Returns:
+        The human-decimal representation as a string.
+
+    Raises:
+        ScpError: If neither/both of ``currency`` and ``decimals`` are given, if
+            the currency is unknown and no ``decimals`` override is supplied, or
+            if ``amount``/``decimals`` are out of range.
+    """
+    if (currency is None) == (decimals is None):
+        raise EconomyError(
+            "exactly one of 'currency' or 'decimals' must be supplied",
+            code="SCP-ECON-12070",
+        )
+    if decimals is not None:
+        return _format_with_decimals(amount, decimals)
+    assert currency is not None  # narrowed by the exclusivity check above
+    known = _KNOWN_CURRENCY_DECIMALS.get(currency.upper())
+    if known is None:
+        raise EconomyError(
+            f"unknown currency {currency!r} has no known decimals; "
+            "pass an explicit decimals= override",
+            code="SCP-ECON-12070",
+        )
+    return _format_with_decimals(amount, known)
+
+
+# ---------------------------------------------------------------------------
 # Cost estimation
 # ---------------------------------------------------------------------------
 
@@ -55,7 +204,7 @@ def estimate_cost(
     Args:
         policy_json: The context's economic policy as a JSON string.
             Pass empty string or ``"null"`` for free contexts.
-        action_type: One of ``"MessageSend"``, ``"ToolInvoke"``,
+        action_type: One of ``"MessageSend"``, ``"OutletCall"``,
             ``"ContextJoin"``, ``"SubscriptionPeriod"``, ``"ByteStored"``.
         metrics: Observable metrics dict with optional keys:
             ``context_message_rate``, ``member_count``, ``relay_queue_depth``,
@@ -154,20 +303,68 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
 
 
 # ---------------------------------------------------------------------------
-# Budget tracking
+# Payment receipt verification
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Antispam velocity tracking
-# ---------------------------------------------------------------------------
+async def verify_payment_receipts(
+    scp: SCP,
+    receipts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Verify a batch of payment receipts against the configured adapter.
+
+    Dispatches to the ``economy_verify_payment_receipts`` bridge op on the
+    :class:`~scp_sdk.SCP` instance, which routes through the runtime payment
+    adapter (per receipt). At most 10,000 receipts per call.
+
+    The result distinguishes adapter reachability from payment validity:
+    ``all_valid`` is ``True`` iff every receipt both reached the adapter
+    (``ok``) *and* the adapter reported it valid (``valid``); it is
+    vacuously ``True`` for an empty batch. A caller scanning for failures
+    MUST inspect ``valid`` / ``all_valid`` -- an invalid-but-reachable
+    receipt has ``ok == True``, ``valid == False``.
+
+    Args:
+        scp: The :class:`~scp_sdk.SCP` instance to dispatch on.
+        receipts: A list of ``PaymentReceipt`` dicts (serialized to JSON
+            for the bridge).
+
+    Returns:
+        A dict ``{"all_valid": bool, "results": [...]}``. Each ``results``
+        entry is either ``{"receipt_id": str, "ok": True, "valid": bool,
+        "result": {...}}`` on success or ``{"ok": False, "error": str}``
+        on failure.
+
+    Raises:
+        ScpError: (or an appropriate subclass) if the bridge raises any
+            protocol error, including invalid receipts or an uninitialized
+            supervisor.
+    """
+    from scp_sdk.errors import _coded_bridge_error
+
+    instance = scp._native
+    receipts_json = json.dumps(receipts)
+    try:
+        result = await asyncio.to_thread(
+            instance.economy_verify_payment_receipts,
+            receipts_json,
+        )
+    except Exception as exc:
+        raise _coded_bridge_error(exc) from exc
+    if isinstance(result, str):
+        return json.loads(result)
+    return result
 
 
 __all__ = [
+    "PaymentReceiptVerificationEntry",
+    "PaymentReceiptVerificationResult",
     "auto_accept_blocked",
     "check_policy_lock",
     "estimate_cost",
     "evaluate_formula",
+    "format_amount",
     "policy_requires_payment",
     "validate_policy_change",
+    "verify_payment_receipts",
 ]

@@ -1,0 +1,27 @@
+[package]
+name = "scp-crypto"
+version = "0.1.0-beta.2"
+description = "Low-level cryptographic anchor (Ed25519 verification) for SCP (Shared Context Protocol)"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["protocol", "cryptography", "ed25519"]
+categories = ["cryptography"]
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+# Pseudonym derivation (§9.10.4.A): HKDF-SHA-256 pseudonym secret + HMAC-SHA-256
+# per-context keypair derivation. All pure RustCrypto primitives already in the
+# wasm tree, so `scp-crypto` stays wasm-safe with the derivation moved here.
+hkdf = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,5 +1,36 @@
 # White Hat Agent Memory
 
+- [PR #2234 checkpoint counter / KEA fail-closed](pr2234-checkpoint-counter.md) — counter gates only checkpoint TIMING; append_event persist is best-effort so "durable" is false; HANDLER_TIMEOUT cancellation under-counts; 3 stale accumulate-then-bump sites remain.
+- [PR #2235 app-bound event-log](pr2235-app-bound-event-log.md) — validate_did allows whitespace (trim load-bearing); version-parse fail-open on garbage/overflow minor; CTX_2056-2059→ContextError. Fixes verified.
+
+## TS SDK fail-closed test-seam Review (2026-06-20, branch fix/sdk-coverage-fail-closed-and-parity)
+
+### Defense architecture (TS bridge-swap hardening)
+- Two dangerous seams: `__setBridgeForTests` (bridge.ts:832) and `__constructScpWithNativeForTests` (scp.ts:2837). BOTH gated by `assertTestEnvironment` BEFORE the mutating op (`_nativeBridgeForScp.set` / `new SCP({NATIVE_OVERRIDE})`). Correct fail-closed ordering.
+- `_IS_TEST_ENVIRONMENT` frozen at IMPORT time (IIFE), so runtime `process.env` mutation post-import cannot flip it — defeats late-stage env-poisoning. Strong.
+- `Object.hasOwn` on NODE_ENV/BUN_TEST defeats `Object.prototype.NODE_ENV="test"` pollution. Tested (test-guard.test.ts:57).
+- BUN_TEST requires `!== undefined && .length > 0` — empty-string no longer elevates trust. Tested.
+- UCAN error regexes prefix-anchored `/^\[SCP-PERM-\d+\]/` (trust.ts:457,461,507) — embedded-substring forgery in a benign message body can't spoof classification.
+- `_nativeBridgeForScp` WeakMap has only 3 writers: getBridge (legit lazy init), getBridgeSync (read), __setBridgeForTests (guarded). NATIVE_OVERRIDE is module-private `unique symbol`, only reachable via guarded factory. No unguarded injection path.
+- package.json exports map is `"."` only — no subpath, so `import "@limn-works/scp-ts/internal/test-guard"` deep-import is blocked by Node/bundler resolution.
+
+### PERM-3030 re-raise (HEAD 57840faab, verified round 4)
+- PERM-3030 = HandleAffinityError (handle issued by a DIFFERENT SCP instance; caller misuse). Mapped to ScpPyError::UcanError w/ code PERM_3030 in error.rs:737-744. Re-raised (trust.py:770, trust.ts:461) BEFORE __classifyUcanError so a programming bug isn't absorbed into a false all-false trust verdict. Correct posture: a cross-instance handle error is not a UCAN-validity signal about the subject.
+- FORWARD-COMPAT (fail-closed): re-raise is prefix-gated on "[SCP-PERM-3030]". If that code string ever changes, the re-raise stops firing and the message falls into __classifyUcanError → no prefix bucket matches a handle-affinity string → returns "unknown" → _PASSED_BEFORE["unknown"]=empty set → ALL SIX CapabilityValidation fields=false. So a format drift degrades to a conservative all-false (denies), never a spurious pass. The dict .get(cat, set()) default is also empty=fail-closed.
+- evaluateTrust no-token path: CapabilityValidation defaults ALL false (no fabricated pass). Optimistic-flip (all true) only entered when capabilityTokens non-empty AND each ucan_validate returns w/o exception (= all 11 ADR-016 steps passed). No trust-escalation introduced.
+
+### Coverage gate (HEAD 57840faab)
+- Gate is DEFENSE-IN-DEPTH, not primary guarantee (matrix/wrapper presence is). Fail-closed: true-without-symbol = ERROR unless coverage_exemptions reason recorded.
+- ALIASES = positive closed whitelist (domain,op)->{sdk:[exact symbols]}. Suffix/substring matching REMOVED (was ~23 fabricated-name bypass) — only exact match on aliases + domain-prefixed variants. Sound. test_bare_name_does_not_satisfy_domain_prefixed_op asserts the bypass is closed.
+- coverage_exemptions escape hatch BOUNDED by all-exempted guard (L1615-1627): error if every true-SDK is exempted AND none statically verified → at least one SDK must be ground-truth verified. Cannot become unbounded prose bypass.
+- Gate green (223 ops, 0 errors, 1 coverage-exempt: Kotlin add_relay_url, generated UniFFI not git-tracked — legit). Self-test suite 11/11 pass.
+
+### Residual (acknowledged, low severity)
+- NODE_ENV="development" intentionally permits the bridge-swap seam (dev builds need it). Defense relies on deploy hygiene, not code.
+- assertTestEnvironment is the SOLE layer gating the seam (single gate). Frozen-constant + import-time eval makes it strong. Acceptable — exported test helpers are inherently single-gate.
+- VERDICT (round 4, 57840faab): APPROVED. Defenses robust, defense-in-depth, fail-closed by construction. No new actionable findings.
+- VERDICT (round 5, HEAD 341df72cc): APPROVED. 4 commits since 57840faab are docstring/cosmetic only — ZERO behavioral change to the 4 security surfaces. Re-verified live: gate green (223 ops, 0 errors, 1 legit kotlin add_relay_url coverage-exempt), self-test 11/11. NATIVE_OVERRIDE module-private unique symbol (scp.ts:486), only via guarded __constructScpWithNativeForTests (assertTestEnvironment BEFORE new SCP, L2904). _nativeBridgeForScp.set 2 writers: lazy-init createNativeBridge (no caller value, L804) + guarded __setBridgeForTests (L837 gate before L838). exports map "."-only, internal/ deep-import blocked. PERM-3030 re-raise prefix-anchored BEFORE classify (trust.py:770, trust.ts:461); evaluateTrust no-token path defaults ALL-FALSE, optimistic-flip only on non-empty tokens. No trust-escalation path.
+
 ## Governance-Gaps Feature Review (2026-03-05)
 
 ### P1 Findings
@@ -186,6 +217,9 @@
 - All 3 bridges register shutdown hooks correctly; all scp_shutdown uses catch_unwind.
 - Transport Arc pattern for async safety (RwLock<Option<Arc>>>, strong_count check for mut).
 - remove_ffi_state cleans up known_context + bridge_state + economy_state per context.
+
+## PR #2235 AppBound/AppUnbound Review (2026-08-03)
+See [pr2235-appbound-review.md](pr2235-appbound-review.md). No BLOCKERs. WARNINGs: was-bound check TOCTOU (subsumed by #2230), uncapped CapabilityEntry.actions Vec, UniFFI-vs-PyO3/NAPI trim parity on unbind lookup, unvalidated timestamp_secs into durable leaves. Well-defended: capabilities.sort before encode (deterministic Merkle), fail-closed insert/remove-after-append.
 
 ## Recurring Patterns
 - TOCTOU races in check-then-act patterns (nonce replay, standing channels, budget)

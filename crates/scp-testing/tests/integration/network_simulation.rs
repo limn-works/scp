@@ -1,10 +1,10 @@
-// ADR-049 commit 12c.9e: ContextCryptoProvider trait deleted; DemoCrypto
+// ADR-049 §15: ContextCryptoProvider trait deleted; DemoCrypto
 // was a bespoke mock with `seal`/`open` overrides that bypassed encryption
-// for demo purposes. ADR-049 commit 12c.9f introduces backend injection on
-// `MlsCryptoProvider::with_backends`, which is the seam this file should
+// for demo purposes. ADR-049 §15 introduces backend injection on
+// `NodeMlsFactory::with_backends`, which is the seam this file should
 // rewire to. The full rewire (every test scenario re-expressed via mock
 // `MlsBackend` / `HpkeBackend` impls and the real
-// `MlsCryptoProvider::with_backends` constructor) is tracked alongside the
+// `NodeMlsFactory::with_backends` constructor) is tracked alongside the
 // commit-12 deletion of `ContextManager`. Entire file is gated out until
 // the rewire lands.
 #![cfg(any())]
@@ -13,7 +13,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::cast_possible_truncation,
-    // ADR-049 commit 12c.2: lifecycle hoist inflates some test-path
+    // ADR-049 §15: lifecycle hoist inflates some test-path
     // futures past clippy's 16 KB stack budget.
     clippy::large_futures
 )]
@@ -44,7 +44,7 @@ use scp_core::envelope::inner::{
 use scp_core::envelope::outer::{open_envelope, seal_envelope};
 use scp_core::envelope::padding::strip_padding;
 use scp_core::envelope::pseudonym::derive_pseudonym;
-use scp_core::identity::SigningKeyId;
+use scp_did::SigningKeyId;
 use scp_platform::error::PlatformError;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{
@@ -140,7 +140,7 @@ impl KeyCustody for MlsGroupKeyCustody<'_> {
 // -------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "DemoCrypto mock impls the deleted ContextCryptoProvider trait; full file rewire to MlsCryptoProvider::with_backends mock backends is tracked alongside the commit-12 deletion of ContextManager. File-level cfg(any()) gates compilation."]
+#[ignore = "DemoCrypto mock impls the deleted ContextCryptoProvider trait; full file rewire to NodeMlsFactory::with_backends mock backends is tracked alongside the commit-12 deletion of ContextManager. File-level cfg(any()) gates compilation."]
 #[allow(clippy::too_many_lines)]
 async fn end_to_end_network_demo() {
     println!();
@@ -249,7 +249,7 @@ async fn end_to_end_network_demo() {
 
     let alice_cred =
         ScpCredential::new(alice_did_str.to_owned(), None, SigningKeyId::Active).unwrap();
-    let mut alice_group = create_group(&alice_cred).unwrap();
+    let mut alice_group = create_group(&alice_cred, &scp_clock::SystemClock).unwrap();
     println!("  Alice created MLS group");
     println!(
         "    group_id:   {}...",
@@ -262,7 +262,8 @@ async fn end_to_end_network_demo() {
 
     // Bob joins.
     let bob_cred = ScpCredential::new(bob_did_str.to_owned(), None, SigningKeyId::Active).unwrap();
-    let (bob_kp_bundle, bob_signer, bob_provider) = generate_key_package(&bob_cred).unwrap();
+    let (bob_kp_bundle, bob_signer, bob_provider) =
+        generate_key_package(&bob_cred, &scp_clock::SystemClock).unwrap();
 
     println!("  Bob generated KeyPackage for group join");
 
@@ -271,7 +272,7 @@ async fn end_to_end_network_demo() {
         .tls_serialize_detached()
         .unwrap();
     let kp_in = KeyPackageIn::tls_deserialize(&mut kp_bytes.as_slice()).unwrap();
-    let add_result = add_member(&mut alice_group, kp_in).unwrap();
+    let add_result = add_member(&mut alice_group, kp_in, &scp_clock::SystemClock).unwrap();
     let mut bob_group = join_group(&add_result.welcome, bob_provider, bob_signer).unwrap();
 
     println!("  Alice added Bob to group via Welcome message");
@@ -314,7 +315,7 @@ async fn end_to_end_network_demo() {
     println!();
 
     // Bob requests Alice's sender key via HPKE.
-    let clock = scp_primitives::SystemClock;
+    let clock = scp_clock::SystemClock;
     let req_result = request_sender_key(
         &bob_custody,
         &bob_sign_key,
@@ -867,11 +868,11 @@ async fn end_to_end_network_demo() {
 }
 
 // =========================================================================
-// DEMO 2: Application Layer — ContextManager, Tools, Governance
+// DEMO 2: Application Layer — ContextManager, Outlets, Governance
 // =========================================================================
 
 /// Mock crypto provider — returns payload as-is (no real encryption).
-/// The `ContextManager` pipeline, tool system, governance engine, and role
+/// The `ContextManager` pipeline, outlet system, governance engine, and role
 /// system are all 100% real. Only the MLS/sender-key operations are mocked.
 #[derive(Default)]
 struct DemoCrypto;
@@ -973,7 +974,16 @@ impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
             })?;
         let sender_did = inner.sender_did.clone();
         Ok(scp_core::context::builder::OpenResult::Application(
-            Box::new(scp_core::context::builder::OpenedEnvelope { inner, sender_did }),
+            Box::new(scp_core::context::builder::OpenedEnvelope {
+                inner,
+                sender_did,
+                // ADR-049 PR-4: mock open() has no live recv tracker; the
+                // follower mirror-forward drop is non-fatal.
+                receive_floor: scp_core::context::builder::ReceiveFloor {
+                    epoch: 0,
+                    sequence: 0,
+                },
+            }),
         ))
     }
 }
@@ -1033,14 +1043,19 @@ struct DemoEventLog {
     events: std::sync::Mutex<Vec<String>>,
 }
 
+// `unused_async`: `init_event_log` / `destroy_event_log` have no await because
+// they are no-op test doubles, but the ADR-049 Decision-7 async
+// `ContextEventLogProvider` trait requires the `async fn` signature.
+#[async_trait::async_trait]
+#[allow(clippy::unused_async)]
 impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
-    fn init_event_log(
+    async fn init_event_log(
         &self,
         _: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn append_event(
+    async fn append_event(
         &self,
         _: &[u8; 32],
         event_type: scp_event_log::EventType,
@@ -1051,7 +1066,7 @@ impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
         self.events.lock().unwrap().push(format!("{event_type:?}"));
         Ok(())
     }
-    fn destroy_event_log(
+    async fn destroy_event_log(
         &self,
         _: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
@@ -1062,9 +1077,7 @@ impl scp_core::context::builder::ContextEventLogProvider for DemoEventLog {
 /// Deterministic key resolver for governance vote verification.
 fn demo_key_resolver() -> scp_core::context::governance::KeyResolver {
     std::sync::Arc::new(
-        |did: &scp_identity::DID,
-         _kid: scp_identity::SigningKeyId|
-         -> Option<ed25519_dalek::VerifyingKey> {
+        |did: &scp_did::DID, _kid: scp_did::SigningKeyId| -> Option<ed25519_dalek::VerifyingKey> {
             use ed25519_dalek::SigningKey;
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1077,7 +1090,7 @@ fn demo_key_resolver() -> scp_core::context::governance::KeyResolver {
     )
 }
 
-fn demo_signing_key(did: &scp_identity::DID) -> ed25519_dalek::SigningKey {
+fn demo_signing_key(did: &scp_did::DID) -> ed25519_dalek::SigningKey {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     did.as_ref().hash(&mut hasher);
@@ -1088,20 +1101,20 @@ fn demo_signing_key(did: &scp_identity::DID) -> ed25519_dalek::SigningKey {
 }
 
 #[tokio::test]
-#[ignore = "DemoCrypto mock impls the deleted ContextCryptoProvider trait; full file rewire to MlsCryptoProvider::with_backends mock backends is tracked alongside the commit-12 deletion of ContextManager. File-level cfg(any()) gates compilation."]
+#[ignore = "DemoCrypto mock impls the deleted ContextCryptoProvider trait; full file rewire to NodeMlsFactory::with_backends mock backends is tracked alongside the commit-12 deletion of ContextManager. File-level cfg(any()) gates compilation."]
 #[allow(clippy::too_many_lines)]
 async fn application_layer_demo() {
     use scp_core::context::manager::ContextManager;
     use scp_core::context::membership::{ContextEvent, KeyPackage};
+    use scp_core::context::outlets::registry::{OutletRegistration, OutletRegistry, OutletSchema};
+    use scp_core::context::outlets::{invoke_outlet_aggregating, register_outlet};
     use scp_core::context::roles::{CapabilityCeiling, ContextRoleState};
-    use scp_core::context::tools::registry::{ToolRegistration, ToolRegistry, ToolSchema};
-    use scp_core::context::tools::{invoke_tool, register_tool};
     use scp_core::context::{Capability, ContextParams, ContextState, GovernanceAction};
-    use scp_identity::DID;
+    use scp_did::DID;
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║     SCP APPLICATION LAYER — CONTEXT, TOOLS, GOVERNANCE     ║");
+    println!("║     SCP APPLICATION LAYER — CONTEXT, OUTLETS, GOVERNANCE     ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -1114,7 +1127,7 @@ async fn application_layer_demo() {
     let transport_for_manager: Box<dyn scp_core::context::builder::ContextTransportProvider> =
         Box::new(DemoTransport::new());
 
-    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor` so
+    // ADR-049 §15 — wrap with `attach_test_supervisor` so
     // `ContextManager`'s messaging/governance/broadcast/economy
     // forwarders can resolve their `Weak<Supervisor>` back-pointer.
     let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
@@ -1131,15 +1144,15 @@ async fn application_layer_demo() {
 
     let params = ContextParams {
         ceiling: vec![
-            Capability::new("messages:read"),
-            Capability::new("messages:write"),
-            Capability::new("tool:register"),
-            Capability::new("tool:invoke:*"),
-            Capability::new("role:assign"),
-            Capability::new("member:remove"),
-            Capability::new("governance:propose"),
-            Capability::new("governance:vote"),
-            Capability::new("context:close"),
+            Capability::new("messages:read").expect("known capability"),
+            Capability::new("messages:write").expect("known capability"),
+            Capability::new("outlet:register").expect("known capability"),
+            Capability::new("outlet:call:*").expect("known capability"),
+            Capability::new("role:assign").expect("known capability"),
+            Capability::new("member:remove").expect("known capability"),
+            Capability::new("governance:propose").expect("known capability"),
+            Capability::new("governance:vote").expect("known capability"),
+            Capability::new("context:close").expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -1157,7 +1170,7 @@ async fn application_layer_demo() {
         .create_context(ctx_id.to_owned(), params, alice.clone(), None)
         .await
         .unwrap();
-    let state = handle.state().await;
+    let state = handle.state();
 
     println!("  Context created!");
     println!("    state:    {state:?}");
@@ -1286,34 +1299,34 @@ async fn application_layer_demo() {
     println!();
 
     // =====================================================================
-    // PHASE 4: Tool Registration
+    // PHASE 4: Outlet Registration
     // =====================================================================
-    println!("━━━ PHASE 4: Tool Registration ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("━━━ PHASE 4: Outlet Registration ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
     // Build the role state directly — ContextManager tracks this internally,
-    // but for the free-function tool API we need to construct it.
+    // but for the free-function outlet API we need to construct it.
     let ceiling = CapabilityCeiling::new(vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("tool:register"),
-        Capability::new("tool:invoke:*"),
-        Capability::new("role:assign"),
-        Capability::new("member:remove"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("outlet:register").expect("known capability"),
+        Capability::new("outlet:call:*").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("member:remove").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
     ]);
     let mut role_state = ContextRoleState::new(
         ctx_id,
         alice.as_ref(),
         ceiling,
         vec![],
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .unwrap();
 
-    // Add Bob and Charlie as members with "member" role (ToolInvokeAll capability).
+    // Add Bob and Charlie as members with "member" role (OutletInvokeAll capability).
     {
         use scp_core::context::roles::assign_role;
         role_state.members.insert(bob.as_ref().to_owned());
@@ -1323,7 +1336,7 @@ async fn application_layer_demo() {
             bob.as_ref(),
             "member",
             alice.as_ref(),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assign_role(
@@ -1331,18 +1344,19 @@ async fn application_layer_demo() {
             charlie.as_ref(),
             "member",
             alice.as_ref(),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
     }
 
-    let mut tool_registry = ToolRegistry::new();
+    let mut outlet_registry = OutletRegistry::new();
 
-    let search_tool = ToolRegistration {
-        tool_id: "search-web".to_owned(),
+    let search_outlet = OutletRegistration {
+        outlet_id: "search-web".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: "Web Search".to_owned(),
         description: "Search the web for information".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1361,39 +1375,47 @@ async fn application_layer_demo() {
                     "total": { "type": "integer" }
                 }
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xAB; 32],
         test_vectors: vec![],
         operator_did: alice.clone(),
         cost: None,
+        message_catalog: Vec::new(),
         registered_at: 1_700_000_000,
         signature: vec![],
     };
 
-    println!("  Registering tool: '{}'", search_tool.name);
-    println!("    tool_id:     {}", search_tool.tool_id);
-    println!("    operator:    {}", search_tool.operator_did);
+    println!("  Registering outlet: '{}'", search_outlet.name);
+    println!("    outlet_id:     {}", search_outlet.outlet_id);
+    println!("    operator:    {}", search_outlet.operator_did);
     println!("    input:       query (string), max_results (integer)");
     println!("    output:      results (array), total (integer)");
 
-    let (tool_id, reg_event) =
-        register_tool(&mut tool_registry, &role_state, search_tool, alice.as_ref()).unwrap();
+    let (outlet_id, reg_event) = register_outlet(
+        &mut outlet_registry,
+        &role_state,
+        search_outlet,
+        alice.as_ref(),
+    )
+    .unwrap();
 
-    println!("  Registered! tool_id = {tool_id}");
+    println!("  Registered! outlet_id = {outlet_id}");
     println!(
-        "    event: tool_id={}, registrant={}",
-        reg_event.tool_id, reg_event.registrant_did
+        "    event: outlet_id={}, registrant={}",
+        reg_event.outlet_id, reg_event.registrant_did
     );
-    assert_eq!(tool_registry.len(), 1);
-    println!("    registry size: {}", tool_registry.len());
+    assert_eq!(outlet_registry.len(), 1);
+    println!("    registry size: {}", outlet_registry.len());
     println!();
 
-    // Register a second tool.
-    let calc_tool = ToolRegistration {
-        tool_id: "calculator".to_owned(),
+    // Register a second outlet.
+    let calc_outlet = OutletRegistration {
+        outlet_id: "calculator".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: "Calculator".to_owned(),
         description: "Perform arithmetic operations".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1409,26 +1431,33 @@ async fn application_layer_demo() {
                     "operation": { "type": "string" }
                 }
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xCD; 32],
         test_vectors: vec![],
         operator_did: alice.clone(),
         cost: None,
+        message_catalog: Vec::new(),
         registered_at: 1_700_000_001,
         signature: vec![],
     };
 
-    let (calc_id, _) =
-        register_tool(&mut tool_registry, &role_state, calc_tool, alice.as_ref()).unwrap();
-    println!("  Registered tool: 'Calculator' (id={calc_id})");
-    println!("    registry size: {}", tool_registry.len());
-    assert_eq!(tool_registry.len(), 2);
+    let (calc_id, _) = register_outlet(
+        &mut outlet_registry,
+        &role_state,
+        calc_outlet,
+        alice.as_ref(),
+    )
+    .unwrap();
+    println!("  Registered outlet: 'Calculator' (id={calc_id})");
+    println!("    registry size: {}", outlet_registry.len());
+    assert_eq!(outlet_registry.len(), 2);
     println!();
 
     // =====================================================================
-    // PHASE 5: Tool Invocation
+    // PHASE 5: Outlet Invocation
     // =====================================================================
-    println!("━━━ PHASE 5: Tool Invocation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("━━━ PHASE 5: Outlet Invocation ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
     let search_input = serde_json::json!({
@@ -1439,17 +1468,17 @@ async fn application_layer_demo() {
     println!("  Invoking 'search-web' as Bob:");
     println!("    input: {search_input}");
 
-    // The executor is a real async function that simulates the tool.
-    let (output, invoke_event, _consequences, _receipt) = invoke_tool(
+    // The executor is a real async function that simulates the outlet.
+    let (output, invoke_event, _consequences, _receipt) = invoke_outlet_aggregating(
         &handle,
-        &tool_registry,
+        &outlet_registry,
         &role_state,
         &"search-web".to_owned(),
         search_input,
         &bob,
         Some(5000),
         |input| async move {
-            // Simulate a web search — this is the tool's actual executor.
+            // Simulate a web search — this is the outlet's actual executor.
             let query = input["query"].as_str().unwrap_or("unknown");
             let max = input["max_results"].as_u64().unwrap_or(10);
             Ok(serde_json::json!({
@@ -1460,15 +1489,16 @@ async fn application_layer_demo() {
                 "total": std::cmp::min(max, 2)
             }))
         },
-        None::<&mut scp_core::context::tools::invoke::ToolEconomyContext<'_>>,
+        None::<&mut scp_core::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None,
     )
     .await
     .unwrap();
 
     println!("    output: {output}");
     println!(
-        "    event:  tool={}, invoker={}, duration_ms={}",
-        invoke_event.tool_id, invoke_event.invoker_did, invoke_event.execution_time_ms
+        "    event:  outlet={}, invoker={}, duration_ms={}",
+        invoke_event.outlet_id, invoke_event.invoker_did, invoke_event.execution_time_ms
     );
     assert_eq!(output["total"], 2);
     println!();
@@ -1482,9 +1512,9 @@ async fn application_layer_demo() {
     println!("  Invoking 'calculator' as Charlie:");
     println!("    input: {calc_input}");
 
-    let (calc_output, _, _consequences, _receipt) = invoke_tool(
+    let (calc_output, _, _consequences, _receipt) = invoke_outlet_aggregating(
         &handle,
-        &tool_registry,
+        &outlet_registry,
         &role_state,
         &"calculator".to_owned(),
         calc_input,
@@ -1508,7 +1538,8 @@ async fn application_layer_demo() {
                 "operation": op
             }))
         },
-        None::<&mut scp_core::context::tools::invoke::ToolEconomyContext<'_>>,
+        None::<&mut scp_core::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None,
     )
     .await
     .unwrap();
@@ -1584,7 +1615,7 @@ async fn application_layer_demo() {
     println!("  Proposed & auto-executed: CloseContext");
     println!("    status: {:?}", close_proposal.status);
 
-    let final_state = handle.state().await;
+    let final_state = handle.state();
     println!("  Context state: {final_state:?}");
     assert!(
         matches!(final_state, ContextState::Closing | ContextState::Closed),
@@ -1602,13 +1633,13 @@ async fn application_layer_demo() {
     println!("║    1. Context creation via ContextManager (real lifecycle)  ║");
     println!("║    2. Membership: join, verify, member_count, is_member    ║");
     println!("║    3. Messaging: send_message, drain_events                ║");
-    println!("║    4. Tool registration (schema validation, capability ck) ║");
-    println!("║    5. Tool invocation (real async executors, timeouts)     ║");
+    println!("║    4. Outlet registration (schema validation, capability ck) ║");
+    println!("║    5. Outlet invocation (real async executors, timeouts)     ║");
     println!("║    6. Governance: propose + execute (SingleAdmin engine)   ║");
     println!("║    7. Context close via governance action                  ║");
     println!("║                                                            ║");
     println!("║  What's real vs mocked:                                    ║");
-    println!("║    REAL: ContextManager, tool registry, schema validation, ║");
+    println!("║    REAL: ContextManager, outlet registry, schema validation, ║");
     println!("║          role system, capability checks, governance engine, ║");
     println!("║          event log, membership state, context lifecycle    ║");
     println!("║    MOCK: MLS group ops, sender key ops, relay transport    ║");

@@ -25,13 +25,14 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use scp_identity::DID;
+use scp_did::DID;
 
-// ContextManager type deleted in ADR-049 commit 12; recovery binds to
+// ContextManager type deleted in ADR-049 §15; recovery binds to
 // the supervisor directly.
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 // ---------------------------------------------------------------------------
 // CompromiseTier — which key was compromised
@@ -324,6 +325,14 @@ pub struct PskRotationParams {
 /// the actual MLS group manager, UCAN store, relay transport, etc.
 ///
 /// See spec §9.12.
+///
+/// The trait is `async` (via [`macro@async_trait`], ADR-049 Decision 7) so the
+/// production backend can `.await` the supervisor mailbox directly rather than
+/// bridging through `block_in_place` + `Handle::block_on`. It is consumed as
+/// `&dyn RecoveryBackend`, so `#[async_trait(?Send)]` is used — the trait
+/// object is deliberately not `Sync` (the orchestrator holds it across await
+/// points on a single task; see [`CompromiseRecoveryOrchestrator::execute_recovery`]).
+#[async_trait(?Send)]
 pub trait RecoveryBackend {
     /// Step 2: Issue an MLS `Update` proposal in the given context.
     ///
@@ -339,7 +348,7 @@ pub trait RecoveryBackend {
     /// Returns [`RecoveryStepError`] if the MLS update proposal cannot be
     /// issued (e.g., the member requires rejoin or the MLS group is
     /// unavailable).
-    fn mls_update(
+    async fn mls_update(
         &self,
         context_id: &str,
         key_rotation: &KeyRotationOutcome,
@@ -358,7 +367,7 @@ pub trait RecoveryBackend {
     /// # Errors
     ///
     /// Returns [`RecoveryStepError`] if UCAN revocation or re-issuance fails.
-    fn revoke_ucans(
+    async fn revoke_ucans(
         &self,
         context_id: &str,
         key_rotation: &KeyRotationOutcome,
@@ -374,7 +383,7 @@ pub trait RecoveryBackend {
     ///
     /// Returns [`RecoveryStepError`] if old key packages cannot be deleted
     /// or new ones cannot be published.
-    fn rotate_key_packages(
+    async fn rotate_key_packages(
         &self,
         context_id: &str,
         key_rotation: &KeyRotationOutcome,
@@ -385,7 +394,7 @@ pub trait RecoveryBackend {
     /// Contacts who completed Key Continuity Verification (§9.11) are alerted
     /// that re-verification is needed. Returns `true` if notifications were
     /// successfully sent.
-    fn notify_contacts(
+    async fn notify_contacts(
         &self,
         did: &DID,
         tier: CompromiseTier,
@@ -397,7 +406,7 @@ pub trait RecoveryBackend {
     ///
     /// If the compromise involved a device, that device is excluded from the
     /// new PSK distribution. Returns `true` if PSK rotation succeeded.
-    fn rotate_psk(&self, params: &PskRotationParams) -> bool;
+    async fn rotate_psk(&self, params: &PskRotationParams) -> bool;
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +488,6 @@ impl CompromiseRecoveryOrchestrator {
     ///
     /// Per-context failures are recorded in `RecoveryResult::failed_contexts`,
     /// NOT as errors from this method.
-    #[allow(clippy::unused_async)] // async by design: SDK integration layer adds await points
     #[allow(clippy::future_not_send)] // backend trait object is not Sync by design
     pub async fn execute_recovery(
         &self,
@@ -501,7 +509,7 @@ impl CompromiseRecoveryOrchestrator {
             let mut state = ContextRecoveryState::new(context_id.clone());
 
             // Step 2: MLS Update.
-            match backend.mls_update(context_id, key_rotation) {
+            match backend.mls_update(context_id, key_rotation).await {
                 Ok(()) => {
                     state.mls_updated = true;
                 }
@@ -521,7 +529,7 @@ impl CompromiseRecoveryOrchestrator {
             }
 
             // Step 3: UCAN revocation (depends on step 2).
-            match backend.revoke_ucans(context_id, key_rotation) {
+            match backend.revoke_ucans(context_id, key_rotation).await {
                 Ok(()) => {
                     state.ucan_revoked = true;
                 }
@@ -533,7 +541,7 @@ impl CompromiseRecoveryOrchestrator {
             }
 
             // Step 4: KeyPackage rotation (depends on step 3).
-            match backend.rotate_key_packages(context_id, key_rotation) {
+            match backend.rotate_key_packages(context_id, key_rotation).await {
                 Ok(()) => {
                     state.key_packages_rotated = true;
                 }
@@ -556,16 +564,19 @@ impl CompromiseRecoveryOrchestrator {
         let contacts_notified = if contact_dids.is_empty() {
             true // Nothing to do.
         } else {
-            backend.notify_contacts(&self.did, tier, key_rotation, contact_dids)
+            backend
+                .notify_contacts(&self.did, tier, key_rotation, contact_dids)
+                .await
         };
 
         // Step 6: Identity private state re-encryption.
         // Only for ActiveSigning and IdentityKey tiers.
         let private_state_reencrypted = match tier {
             CompromiseTier::Agent => true, // PSK unaffected for agent-only compromise.
-            CompromiseTier::ActiveSigning | CompromiseTier::IdentityKey => {
-                psk_params.is_some_and(|params| backend.rotate_psk(params))
-            }
+            CompromiseTier::ActiveSigning | CompromiseTier::IdentityKey => match psk_params {
+                Some(params) => backend.rotate_psk(params).await,
+                None => false,
+            },
         };
 
         let completed_at = clock.now_millis();
@@ -710,10 +721,10 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32], did: &str) -> Optio
 /// UCAN, `KeyPackage`, notification, and PSK operations through the
 /// supervisor's trust-recovery actor mailbox.
 ///
-/// This struct bridges the synchronous [`RecoveryBackend`] trait to the
-/// async supervisor mailbox using `tokio::task::block_in_place` +
-/// `Handle::current().block_on()` — the same pattern used by
-/// `ContextPersistenceBridge` in `store/context.rs`.
+/// [`RecoveryBackend`] is an `async` trait (ADR-049 Decision 7), so this
+/// struct's methods `.await` the supervisor mailbox directly — there is no
+/// `block_in_place` + `Handle::block_on` bridge (the former `block_on_async`
+/// helper was deleted when the trait became async).
 ///
 /// # ADR-049 Phase 2B — mailbox dispatch
 ///
@@ -781,34 +792,31 @@ impl ProductionRecoveryBackend {
         }
     }
 
-    /// Bridges a synchronous trait method call to an async supervisor
-    /// operation.
+    /// Maps a dispatch-level [`ContextError`](scp_protocol::context::ContextError)
+    /// into a [`RecoveryStepError`].
     ///
-    /// Uses `tokio::task::block_in_place` to avoid blocking the async runtime's
-    /// worker threads, then `Handle::current().block_on()` to run the future
-    /// to completion. This is safe because `RecoveryBackend` methods are always
-    /// called from within a tokio runtime context (the orchestrator's
-    /// `execute_recovery` is async).
-    fn block_on_async<F, T>(future: F) -> Result<T, RecoveryStepError>
-    where
-        F: std::future::Future<Output = Result<T, scp_protocol::context::ContextError>>,
-    {
-        tokio::task::block_in_place(|| {
-            let handle = tokio::runtime::Handle::current();
-            handle.block_on(future).map_err(|e| RecoveryStepError {
-                step: 0, // Caller overrides this.
-                description: e.to_string(),
-            })
-        })
+    /// The `RecoveryBackend` trait is `async` (ADR-049 Decision 7), so backends
+    /// `.await` the supervisor mailbox directly — there is no longer a
+    /// `block_in_place` + `Handle::block_on` bridge. This helper only performs
+    /// the error-shape conversion the former bridge also did: `step` is set to
+    /// `0` and each caller overrides it with the concrete recovery-step number.
+    // Takes the error by value so it can be used directly as a `.map_err(...)`
+    // fn-pointer (which hands the closure the owned error).
+    #[allow(clippy::needless_pass_by_value)]
+    fn dispatch_step_error(e: scp_protocol::context::ContextError) -> RecoveryStepError {
+        RecoveryStepError {
+            step: 0, // Caller overrides this.
+            description: e.to_string(),
+        }
     }
 
-    /// Dispatches a [`TrustRecoveryCommand`] through the supervisor's
+    /// Dispatches a [`TrustRecoveryCommand`](crate::context::actor::commands::TrustRecoveryCommand) through the supervisor's
     /// trust-recovery mailbox (ADR-049 Phase 2B) and awaits the typed
     /// reply that the command carries on its embedded oneshot.
     ///
     /// `build_cmd` receives the freshly-created reply sender and returns
     /// the fully-constructed command. Routing decision lives entirely in
-    /// [`Supervisor::dispatch_trust_recovery_command`]: when a context
+    /// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command): when a context
     /// actor is registered the command runs against that actor's owned
     /// `&mut PerContextState` (no per-context map lookup); otherwise it
     /// falls through to the supervisor-scoped direct path. Either way the typed
@@ -820,8 +828,8 @@ impl ProductionRecoveryBackend {
     ///
     /// The dispatch error (the `Outcome` channel) and the command's own
     /// typed reply are folded into a single `Result`: a closed reply
-    /// channel surfaces as a [`ContextError::TransportFailed`] so the
-    /// caller's `block_on_async` maps it to a [`RecoveryStepError`].
+    /// channel surfaces as a [`ContextError::TransportFailed`](scp_protocol::context::ContextError::TransportFailed) so the
+    /// caller's [`Self::dispatch_step_error`] maps it to a [`RecoveryStepError`].
     async fn dispatch_trust_recovery<F, T>(
         &self,
         build_cmd: F,
@@ -852,7 +860,7 @@ impl ProductionRecoveryBackend {
     /// sequence, signing key) used by every recovery step that sends a
     /// notification to an already-known context (spec §9.12 steps 2–4,
     /// 6). The signing key is copied into the boxed payload via
-    /// [`SigningKeyBytes::from_signing_key`] so it zeroizes on drop while
+    /// [`SigningKeyBytes::from_signing_key`](crate::context::actor::commands::SigningKeyBytes::from_signing_key) so it zeroizes on drop while
     /// the command is in flight.
     async fn dispatch_recovery_send_notification(
         &self,
@@ -880,8 +888,9 @@ impl ProductionRecoveryBackend {
     }
 }
 
+#[async_trait(?Send)]
 impl RecoveryBackend for ProductionRecoveryBackend {
-    fn mls_update(
+    async fn mls_update(
         &self,
         context_id: &str,
         key_rotation: &KeyRotationOutcome,
@@ -890,12 +899,13 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // The ContextManager increments the epoch counter, places the old
         // epoch into the grace window, and emits an event log entry.
         use crate::context::actor::commands::TrustRecoveryCommand;
-        let result = Self::block_on_async(self.dispatch_trust_recovery(|reply| {
-            TrustRecoveryCommand::RecoveryAdvanceEpoch {
+        let result = self
+            .dispatch_trust_recovery(|reply| TrustRecoveryCommand::RecoveryAdvanceEpoch {
                 context_id: context_id.to_owned(),
                 reply,
-            }
-        }));
+            })
+            .await
+            .map_err(Self::dispatch_step_error);
         match result {
             Ok(_epoch) => {
                 // Send a scoped epoch-advance notification including the
@@ -909,13 +919,15 @@ impl RecoveryBackend for ProductionRecoveryBackend {
                 });
                 match serde_json::to_vec(&scoped_payload) {
                     Ok(payload_bytes) => {
-                        let notify_result =
-                            Self::block_on_async(self.dispatch_recovery_send_notification(
+                        let notify_result = self
+                            .dispatch_recovery_send_notification(
                                 context_id,
                                 key_rotation.did_after.as_ref(),
                                 &payload_bytes,
                                 0, // sequence 0: MLS epoch-advance notification
-                            ));
+                            )
+                            .await
+                            .map_err(Self::dispatch_step_error);
                         // Notification failure is non-fatal — the epoch was
                         // already advanced, which is the critical security step.
                         if let Err(e) = notify_result {
@@ -950,7 +962,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         }
     }
 
-    fn revoke_ucans(
+    async fn revoke_ucans(
         &self,
         context_id: &str,
         key_rotation: &KeyRotationOutcome,
@@ -985,12 +997,15 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Distribute the revocation via the context manager's recovery
         // notification channel so all members receive and merge it.
-        let result = Self::block_on_async(self.dispatch_recovery_send_notification(
-            context_id,
-            key_rotation.did_after.as_ref(),
-            &revocation_payload,
-            1, // sequence 1: UCAN revocation notification
-        ));
+        let result = self
+            .dispatch_recovery_send_notification(
+                context_id,
+                key_rotation.did_after.as_ref(),
+                &revocation_payload,
+                1, // sequence 1: UCAN revocation notification
+            )
+            .await
+            .map_err(Self::dispatch_step_error);
         match result {
             Ok(()) => Ok(()),
             Err(mut e) => {
@@ -1000,7 +1015,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         }
     }
 
-    fn rotate_key_packages(
+    async fn rotate_key_packages(
         &self,
         context_id: &str,
         key_rotation: &KeyRotationOutcome,
@@ -1032,12 +1047,15 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Send the key-package-rotation notification via the recovery
         // notification channel. This records the event and alerts members.
-        let result = Self::block_on_async(self.dispatch_recovery_send_notification(
-            context_id,
-            sender_did,
-            payload.as_bytes(),
-            2, // sequence 2: key-package rotation notification
-        ));
+        let result = self
+            .dispatch_recovery_send_notification(
+                context_id,
+                sender_did,
+                payload.as_bytes(),
+                2, // sequence 2: key-package rotation notification
+            )
+            .await
+            .map_err(Self::dispatch_step_error);
         match result {
             Ok(()) => Ok(()),
             Err(mut e) => {
@@ -1047,7 +1065,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         }
     }
 
-    fn notify_contacts(
+    async fn notify_contacts(
         &self,
         did: &DID,
         tier: CompromiseTier,
@@ -1106,20 +1124,23 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             // `RecoveryNotifyContact` mailbox command searches registered
             // contexts to find a suitable channel, then dispatches a
             // `RecoverySendNotification` through it.
-            let send_result = Self::block_on_async(self.dispatch_trust_recovery(|reply| {
-                use crate::context::actor::commands::{
-                    RecoveryNotifyContactPayload, SigningKeyBytes, TrustRecoveryCommand,
-                };
-                TrustRecoveryCommand::RecoveryNotifyContact {
-                    payload: Box::new(RecoveryNotifyContactPayload {
-                        recovering_did: did_str.to_owned(),
-                        contact_did: contact_did_str.to_owned(),
-                        payload: payload.clone(),
-                        signing_key: SigningKeyBytes::from_signing_key(&self.signing_key),
-                    }),
-                    reply,
-                }
-            }));
+            let send_result = self
+                .dispatch_trust_recovery(|reply| {
+                    use crate::context::actor::commands::{
+                        RecoveryNotifyContactPayload, SigningKeyBytes, TrustRecoveryCommand,
+                    };
+                    TrustRecoveryCommand::RecoveryNotifyContact {
+                        payload: Box::new(RecoveryNotifyContactPayload {
+                            recovering_did: did_str.to_owned(),
+                            contact_did: contact_did_str.to_owned(),
+                            payload: payload.clone(),
+                            signing_key: SigningKeyBytes::from_signing_key(&self.signing_key),
+                        }),
+                        reply,
+                    }
+                })
+                .await
+                .map_err(Self::dispatch_step_error);
 
             if send_result.is_ok() {
                 any_sent = true;
@@ -1133,7 +1154,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         any_sent || contacts.is_empty()
     }
 
-    fn rotate_psk(&self, params: &PskRotationParams) -> bool {
+    async fn rotate_psk(&self, params: &PskRotationParams) -> bool {
         // Step 6: Rotate the PSK and re-encrypt identity private state.
         //
         // Generate a fresh 32-byte PSK, then wrap it for each enrolled
@@ -1213,12 +1234,15 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Send via recovery notification. We use a synthetic context ID
         // derived from "identity-private-state" since PSK rotation is
         // identity-scoped, not context-scoped.
-        let result = Self::block_on_async(self.dispatch_recovery_send_notification(
-            "identity-private-state",
-            "system",
-            &payload,
-            3, // sequence 3: PSK rotation notification
-        ));
+        let result = self
+            .dispatch_recovery_send_notification(
+                "identity-private-state",
+                "system",
+                &payload,
+                3, // sequence 3: PSK rotation notification
+            )
+            .await
+            .map_err(Self::dispatch_step_error);
 
         result.is_ok()
     }
@@ -1273,8 +1297,9 @@ mod tests {
         }
     }
 
+    #[async_trait(?Send)]
     impl RecoveryBackend for MockRecoveryBackend {
-        fn mls_update(
+        async fn mls_update(
             &self,
             context_id: &str,
             _key_rotation: &KeyRotationOutcome,
@@ -1287,7 +1312,7 @@ mod tests {
             Ok(())
         }
 
-        fn revoke_ucans(
+        async fn revoke_ucans(
             &self,
             context_id: &str,
             _key_rotation: &KeyRotationOutcome,
@@ -1300,7 +1325,7 @@ mod tests {
             Ok(())
         }
 
-        fn rotate_key_packages(
+        async fn rotate_key_packages(
             &self,
             context_id: &str,
             _key_rotation: &KeyRotationOutcome,
@@ -1313,7 +1338,7 @@ mod tests {
             Ok(())
         }
 
-        fn notify_contacts(
+        async fn notify_contacts(
             &self,
             _did: &DID,
             _tier: CompromiseTier,
@@ -1323,7 +1348,7 @@ mod tests {
             self.notify_contacts_result
         }
 
-        fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+        async fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
             self.rotate_psk_result
         }
     }
@@ -1525,7 +1550,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1564,7 +1589,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1597,7 +1622,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1623,7 +1648,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1650,7 +1675,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1681,7 +1706,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1716,7 +1741,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1740,7 +1765,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -1827,7 +1852,7 @@ mod tests {
                     &contacts,
                     None,
                     &backend,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .await
                 .unwrap();
@@ -1849,7 +1874,7 @@ mod tests {
                     &contacts,
                     Some(&psk_params),
                     &backend,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .await
                 .unwrap();
@@ -1870,7 +1895,7 @@ mod tests {
                     &contacts,
                     Some(&psk_params),
                     &backend,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 )
                 .await
                 .unwrap();
@@ -1948,11 +1973,11 @@ mod tests {
 
     /// Helper to create a minimal `ContextManager` for testing.
     ///
-    /// After ADR-049 commit 12c.9e, the `ContextCryptoProvider` trait is
+    /// After ADR-049 §15, the `ContextCryptoProvider` trait is
     /// deleted and tests bind to a real
-    /// [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
+    /// [`NodeMlsFactory`](crate::crypto::mls::provider::NodeMlsFactory)
     /// — fail-injection and stub-seal overrides move to
-    /// backend-injection in commit 12c.9f.
+    /// backend-injection in ADR-049 §15.
     fn test_context_manager() -> Arc<crate::context::supervisor::Supervisor> {
         use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
         use scp_protocol::context::builder::ContextCreationError;
@@ -1961,31 +1986,33 @@ mod tests {
         const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
         struct TestTransport;
+        #[async_trait::async_trait]
         impl ContextTransportProvider for TestTransport {
             fn is_connected(&self) -> bool {
                 true
             }
-            fn publish_context(
+            async fn publish_context(
                 &self,
                 _: &[u8; 32],
                 _: &ContextParams,
             ) -> Result<(), ContextCreationError> {
                 Ok(())
             }
-            fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
                 Ok(())
             }
-            fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
+            async fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
                 Ok(())
             }
         }
 
         struct TestEventLog;
+        #[async_trait::async_trait]
         impl ContextEventLogProvider for TestEventLog {
-            fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
                 Ok(())
             }
-            fn append_event(
+            async fn append_event(
                 &self,
                 _: &[u8; 32],
                 _: scp_event_log::EventType,
@@ -1995,7 +2022,7 @@ mod tests {
             ) -> Result<(), ContextCreationError> {
                 Ok(())
             }
-            fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
                 Ok(())
             }
             fn event_log_entries(
@@ -2006,15 +2033,16 @@ mod tests {
             }
         }
 
-        // ADR-049 commit 12: `ContextManager` is gone. Build the
+        // ADR-049 §15: `ContextManager` is gone. Build the
         // `Supervisor` directly via `test_supervisor`.
         crate::context::test_supervisor(
-            Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
                 TEST_DID.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
             )),
             Box::new(TestTransport),
             Box::new(TestEventLog),
-            Arc::new(|_: &scp_identity::DID, _: scp_protocol::identity::SigningKeyId| None),
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None),
         )
     }
 
@@ -2044,9 +2072,9 @@ mod tests {
             governance: GovernanceModel::SingleAdmin,
             // Include role:assign capability so the admin can add members.
             ceiling: vec![
-                Capability::new("messages:read"),
-                Capability::new("messages:write"),
-                Capability::new("role:assign"),
+                Capability::new("messages:read").expect("known capability"),
+                Capability::new("messages:write").expect("known capability"),
+                Capability::new("role:assign").expect("known capability"),
             ],
             ..ContextParams::default()
         };
@@ -2067,25 +2095,28 @@ mod tests {
         }
     }
 
-    /// Seeds the MLS group for an identity-scoped recovery pseudo-context
-    /// directly in the supervisor's crypto provider.
+    /// Stands up a live registered context actor for the identity-scoped
+    /// recovery pseudo-context so PSK-rotation notifications can seal.
     ///
     /// PSK rotation (spec §9.12 step 6) seals its recovery notification
-    /// against a synthetic `identity-private-state` context that is never
-    /// registered as a per-context actor and never flows through
-    /// `create_context`. The real `MlsCryptoProvider` that backs
-    /// [`test_context_manager`] still requires an existing MLS group for
-    /// that id before [`MlsCryptoProvider::seal`] will succeed, so tests
-    /// exercising `rotate_psk` (directly or through `execute_recovery`)
-    /// must establish the group up front — exactly as the production
-    /// create-context path does for ordinary contexts.
-    fn seed_identity_private_state_group(manager: &Arc<crate::context::supervisor::Supervisor>) {
-        let context_id_bytes = crate::context::state::context_id_to_bytes("identity-private-state");
-        manager
-            .crypto_ref()
-            .expect("crypto provider attached to test supervisor")
-            .create_mls_group(&context_id_bytes)
-            .expect("failed to seed identity-private-state MLS group");
+    /// against a synthetic `identity-private-state` context. Pre-PR-7 the
+    /// per-context MLS crypto was provider-resident, so seeding an MLS group
+    /// directly on the supervisor's shared `NodeMlsFactory` sufficed for
+    /// [`NodeMlsFactory::seal`] to succeed. ADR-049 PR-7
+    /// (SCP-CRYPTOMOVE-001) moved that crypto state onto the per-context
+    /// actor by a one-way take, and `dispatch_recovery_send_notification`
+    /// routes through [`Supervisor::dispatch_trust_recovery_command`], which
+    /// mailbox-dispatches to a registered actor when one exists (and only
+    /// falls through to the non-64-hex-rejecting supervisor-direct path when
+    /// none is). So the notification now seals through the actor's OWNED
+    /// `ContextCryptoState` — which requires a registered actor for the id,
+    /// created here exactly as `create_context` does for any context. This is
+    /// the actor-model equivalent of the retired provider-group seed.
+    async fn seed_identity_private_state_group(
+        manager: &Arc<crate::context::supervisor::Supervisor>,
+    ) {
+        let owner = did("did:dht:zRecoveryIdentityPrivateStateOwner");
+        setup_context(manager, "identity-private-state", &owner).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2099,7 +2130,7 @@ mod tests {
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
-        let result = backend.mls_update(context_id, &key_rotation);
+        let result = backend.mls_update(context_id, &key_rotation).await;
         assert!(result.is_ok(), "mls_update should succeed: {result:?}");
     }
 
@@ -2110,7 +2141,9 @@ mod tests {
         let alice = did("did:dht:alice");
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
-        let result = backend.mls_update("nonexistent-context", &key_rotation);
+        let result = backend
+            .mls_update("nonexistent-context", &key_rotation)
+            .await;
         assert!(result.is_err(), "mls_update on unknown context should fail");
         assert_eq!(result.unwrap_err().step, 2);
     }
@@ -2126,7 +2159,7 @@ mod tests {
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
-        let result = backend.revoke_ucans(context_id, &key_rotation);
+        let result = backend.revoke_ucans(context_id, &key_rotation).await;
         assert!(result.is_ok(), "revoke_ucans should succeed: {result:?}");
     }
 
@@ -2141,7 +2174,7 @@ mod tests {
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
 
-        let result = backend.rotate_key_packages(context_id, &key_rotation);
+        let result = backend.rotate_key_packages(context_id, &key_rotation).await;
         assert!(
             result.is_ok(),
             "rotate_key_packages should succeed: {result:?}"
@@ -2164,8 +2197,9 @@ mod tests {
         let key_rotation = agent_key_rotation_outcome(&alice, 1000);
         let contacts = HashSet::from([bob, carol]);
 
-        let result =
-            backend.notify_contacts(&alice, CompromiseTier::Agent, &key_rotation, &contacts);
+        let result = backend
+            .notify_contacts(&alice, CompromiseTier::Agent, &key_rotation, &contacts)
+            .await;
         assert!(result, "notify_contacts should succeed");
     }
 
@@ -2181,15 +2215,16 @@ mod tests {
         // Note: notify_contacts with empty set is not called by the orchestrator
         // (it checks `contact_dids.is_empty()` first) but the backend should
         // handle it gracefully.
-        let result =
-            backend.notify_contacts(&alice, CompromiseTier::Agent, &key_rotation, &contacts);
+        let result = backend
+            .notify_contacts(&alice, CompromiseTier::Agent, &key_rotation, &contacts)
+            .await;
         assert!(result, "notify_contacts with empty set should succeed");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_rotate_psk_succeeds() {
         let manager = test_context_manager();
-        seed_identity_private_state_group(&manager);
+        seed_identity_private_state_group(&manager).await;
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
 
         let params = PskRotationParams {
@@ -2198,14 +2233,14 @@ mod tests {
             compromised_device_pubkey: None,
         };
 
-        let result = backend.rotate_psk(&params);
+        let result = backend.rotate_psk(&params).await;
         assert!(result, "rotate_psk should succeed");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn production_backend_rotate_psk_excludes_compromised_device() {
         let manager = test_context_manager();
-        seed_identity_private_state_group(&manager);
+        seed_identity_private_state_group(&manager).await;
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
 
         let params = PskRotationParams {
@@ -2214,7 +2249,7 @@ mod tests {
             compromised_device_pubkey: Some(vec![2u8; 32]),
         };
 
-        let result = backend.rotate_psk(&params);
+        let result = backend.rotate_psk(&params).await;
         assert!(
             result,
             "rotate_psk should succeed with compromised device excluded"
@@ -2233,7 +2268,7 @@ mod tests {
             compromised_device_pubkey: Some(vec![1u8; 32]),
         };
 
-        let result = backend.rotate_psk(&params);
+        let result = backend.rotate_psk(&params).await;
         assert!(!result, "rotate_psk should fail with no eligible devices");
     }
 
@@ -2260,7 +2295,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -2285,7 +2320,7 @@ mod tests {
         setup_context_with_members(&manager, context_id, &alice, &[&bob]).await;
         // ActiveSigning recovery rotates the PSK, which seals against the
         // synthetic identity-private-state context — seed its MLS group.
-        seed_identity_private_state_group(&manager);
+        seed_identity_private_state_group(&manager).await;
 
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
@@ -2304,7 +2339,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -2328,7 +2363,7 @@ mod tests {
         setup_context_with_members(&manager, context_id, &alice, &[&bob, &carol]).await;
         // IdentityKey recovery rotates the PSK, which seals against the
         // synthetic identity-private-state context — seed its MLS group.
-        seed_identity_private_state_group(&manager);
+        seed_identity_private_state_group(&manager).await;
 
         let backend = ProductionRecoveryBackend::new(manager, test_signing_key());
         let orch = CompromiseRecoveryOrchestrator::new(alice.clone(), vec![context_id.to_owned()]);
@@ -2347,7 +2382,7 @@ mod tests {
                 &contacts,
                 Some(&psk_params),
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();
@@ -2388,7 +2423,7 @@ mod tests {
                 &contacts,
                 None,
                 &backend,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .await
             .unwrap();

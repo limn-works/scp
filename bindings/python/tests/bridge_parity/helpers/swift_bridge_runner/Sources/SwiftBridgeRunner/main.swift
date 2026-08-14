@@ -391,28 +391,29 @@ func opEventLogAppend(_ req: BridgeRequest) async throws -> [String: JSONValue] 
 
 // MARK: - Ops 6-10
 
-let parityToolName = "parity_probe"
-let parityToolCeiling = [
+let parityOutletName = "parity_probe"
+let parityOutletCeiling = [
     "messages:read",
     "messages:write",
-    "tool:register",
-    "tool_invoke:*"
+    "outlet:register",
+    "outlet_call:*"
 ]
 
-func opToolRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+func opOutletRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     let scp = try Scp.withStorage(config: .inMemory)
-    let ceiling = ceilingFromArgs(req.args, default: parityToolCeiling)
+    let ceiling = ceilingFromArgs(req.args, default: parityOutletCeiling)
     let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
     let handle = try await scp.contextCreate(
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
     let inputSchema = "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"label\":{\"type\":\"string\"}}}"
     let outputSchema = "{\"type\":\"object\",\"properties\":{\"y\":{\"type\":\"integer\"},\"status\":{\"type\":\"string\"}}}"
-    let toolId = try await scp.toolRegister(
+    let outletId = try await scp.outletRegister(
         handle: handle,
-        definition: ToolDefinition(
-            name: parityToolName,
-            description: "parity harness probe tool",
+        definition: OutletDefinition(
+            name: parityOutletName,
+            description: "parity harness probe outlet",
+            kind: .action,
             inputSchemaJson: inputSchema,
             outputSchemaJson: outputSchema,
             operatorDid: identity.did(),
@@ -421,7 +422,7 @@ func opToolRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {
             cost: nil
         )
     )
-    return ["tool_id": .string(toolId)]
+    return ["outlet_id": .string(outletId)]
 }
 
 func opUcanMint(_ req: BridgeRequest) async throws -> [String: JSONValue] {
@@ -462,11 +463,13 @@ func opUcanValidateMalformed(_ req: BridgeRequest) async throws -> [String: JSON
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
     do {
+        // Fail-closed presenting-agent gate: supply one so the malformed JWT is
+        // rejected at PARSE (the behavior under test).
         try await scp.ucanValidate(
             handle: handle,
             token: "not.a.jwt",
             capability: "scp:ctx:any/messages:read",
-            presentingAgentDid: nil,
+            presentingAgentDid: identity.did(),
             proofTokens: nil
         )
         return [
@@ -500,11 +503,13 @@ func opUcanEvaluateMalformed(_ req: BridgeRequest) async throws -> [String: JSON
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
     do {
+        // Fail-closed presenting-agent gate: supply one so the malformed JWT is
+        // rejected at PARSE (the behavior under test).
         _ = try await scp.ucanEvaluate(
             handle: handle,
             token: "not.a.jwt",
             capability: "scp:ctx:any/messages:read",
-            presentingAgentDid: nil,
+            presentingAgentDid: identity.did(),
             proofTokens: nil
         )
         return [
@@ -558,7 +563,7 @@ func opUcanEvaluateStructured(_ req: BridgeRequest) async throws -> [String: JSO
         handle: handle,
         token: token.encoded(),
         capability: required,
-        presentingAgentDid: nil,
+        presentingAgentDid: memberDid,
         proofTokens: nil
     )
     return [
@@ -575,7 +580,7 @@ func opTransportStatus(_ req: BridgeRequest) async throws -> [String: JSONValue]
     _ = req
     // ADR-048 §7a: UniFFI now exposes a handleless `transportManagerStatus()`
     // alongside the handle-taking `transportStatus(manager:)`, matching the
-    // PyO3 / NAPI / WASM probe contract. The parity harness drives the
+    // PyO3 / NAPI probe contract. The parity harness drives the
     // handleless path so no relay fixture is needed on the UniFFI runners.
     let scp = try Scp.withStorage(config: .inMemory)
     let status = try await scp.transportManagerStatus()
@@ -595,7 +600,7 @@ func opUnregisteredDidRejected(_ req: BridgeRequest) async throws -> [String: JS
     _ = req
     // UniFFI `scpidSign` takes an opaque `Identity` handle rather than
     // a DID string, so we cannot reach the bridge-local registry-lookup
-    // path the PyO3/NAPI/WASM bridges expose. Instead we exercise the
+    // path the PyO3/NAPI bridges expose. Instead we exercise the
     // SAME error code via `identityResolve` on the fake DID: its 64-char
     // zbase32 suffix decodes to 40 bytes (not the 32 required by
     // did:dht), so `DidDht::extract_public_key` returns
@@ -731,8 +736,8 @@ func dispatch(_ req: BridgeRequest) async -> Any {
             result = try await opEventLogAppend(req)
         case "sign_message":
             result = try await opSignMessage(req)
-        case "tool_register":
-            result = try await opToolRegister(req)
+        case "outlet_register":
+            result = try await opOutletRegister(req)
         case "ucan_mint":
             result = try await opUcanMint(req)
         case "ucan_evaluate_malformed":

@@ -14,6 +14,7 @@ import type {
   DIDDocument,
   Event,
   Message,
+  OutletDefinition,
   ParticipationFact,
   ParticipationProfile,
   ParticipationThreshold,
@@ -21,12 +22,37 @@ import type {
   RequireParticipation,
   ResolutionPath,
   SiteConfig,
-  ToolDefinition,
   TransportStatus,
   TrustLevel,
   UcanToken,
 } from "../src/types";
-import { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "../src/types";
+import {
+  Capabilities,
+  outletCall,
+  outletQuery,
+  validateAdmission,
+  validateBroadcastKeyHex,
+  validateSiteConfig,
+} from "../src/types";
+
+describe("Capability strings", () => {
+  it("exposes canonical outlet capability constants", () => {
+    expect(Capabilities.OUTLET_QUERY_ALL).toBe("outlet:query:*");
+    expect(Capabilities.OUTLET_CALL_ALL).toBe("outlet:call:*");
+    expect(Capabilities.OUTLET_REGISTER).toBe("outlet:register");
+    expect(Capabilities.OUTLET_INTERFACE).toBe("outlet:interface");
+    expect(Capabilities.MESSAGES_READ).toBe("messages:read");
+    expect(Capabilities.MESSAGES_WRITE).toBe("messages:write");
+  });
+
+  it("builds parameterised outlet:call capability strings", () => {
+    expect(outletCall("calculator")).toBe("outlet:call:calculator");
+  });
+
+  it("builds parameterised outlet:query capability strings", () => {
+    expect(outletQuery("calculator")).toBe("outlet:query:calculator");
+  });
+});
 
 describe("type definitions", () => {
   it("ContextParams has required ceiling field", () => {
@@ -80,15 +106,17 @@ describe("type definitions", () => {
     expect(doc.verificationMethods).toHaveLength(1);
   });
 
-  it("ToolDefinition has all required fields", () => {
-    const def: ToolDefinition = {
+  it("OutletDefinition has all required fields", () => {
+    const def: OutletDefinition = {
       name: "calculator",
       description: "Simple calculator",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: "did:dht:z6MkTest",
     };
     expect(def.name).toBe("calculator");
+    expect(def.kind).toBe("action");
   });
 
   it("UcanToken has all required fields", () => {
@@ -260,7 +288,7 @@ describe("type definitions", () => {
       "ParticipationDuration",
       "GovernanceActionsAgainst",
       "GovernanceActionsBy",
-      "ToolInvocationCount",
+      "OutletInvocationCount",
       "ContextCreationCount",
       "RoleProgressionCount",
       "AttestationCount",
@@ -285,8 +313,8 @@ describe("type definitions", () => {
       participationDurationSecs: 3600,
       governanceActionsAgainst: 2,
       governanceActionsBy: 5,
-      toolInvocationCount: 10,
-      toolInvocationCountAnchored: false,
+      outletInvocationCount: 10,
+      outletInvocationCountAnchored: false,
       contextCreationCount: 3,
       roleProgressionCount: 1,
       attestationCount: 7,
@@ -299,8 +327,8 @@ describe("type definitions", () => {
     expect(profile.participationDurationSecs).toBe(3600);
     expect(profile.governanceActionsAgainst).toBe(2);
     expect(profile.governanceActionsBy).toBe(5);
-    expect(profile.toolInvocationCount).toBe(10);
-    expect(profile.toolInvocationCountAnchored).toBe(false);
+    expect(profile.outletInvocationCount).toBe(10);
+    expect(profile.outletInvocationCountAnchored).toBe(false);
     expect(profile.contextCreationCount).toBe(3);
     expect(profile.roleProgressionCount).toBe(1);
     expect(profile.attestationCount).toBe(7);
@@ -324,12 +352,12 @@ describe("type definitions", () => {
 
   it("RequireParticipation with GreaterThan threshold", () => {
     const requirement: RequireParticipation = {
-      fact: "ToolInvocationCount",
+      fact: "OutletInvocationCount",
       threshold: { GreaterThan: 50 },
       maxAgeSecs: 7200,
       minContexts: 3,
     };
-    expect(requirement.fact).toBe("ToolInvocationCount");
+    expect(requirement.fact).toBe("OutletInvocationCount");
     expect(requirement.maxAgeSecs).toBe(7200);
     expect(requirement.minContexts).toBe(3);
   });
@@ -366,7 +394,7 @@ describe("type definitions", () => {
   });
 
   it("Checkpoint is a flat always-signed shape with a required signature", () => {
-    // Every live runtime (NAPI + WASM) signs the checkpoint in-process, so the
+    // The NAPI runtime signs the checkpoint in-process, so the
     // SDK surface is a flat checkpoint carrying a required hex `signature` —
     // matching the Python (`SignedCheckpoint`), Swift, and Kotlin SDKs. The
     // field set (contextId, senderDid, merkleRoot, eventCount, epoch,

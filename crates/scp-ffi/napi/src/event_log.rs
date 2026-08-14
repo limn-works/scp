@@ -8,8 +8,8 @@
 //! See ADR-011 (Event Log) and ADR-022 in `.docs/adrs/`.
 
 use napi_derive::napi;
+use scp_clock::Clock;
 use scp_ffi_common::error_codes as codes;
-use scp_primitives::Clock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -24,7 +24,7 @@ use crate::runtime::NapiBridgeInstance;
 /// See ADR-011 (Event Log) and spec section 13 (Event Log).
 #[napi(object)]
 pub struct NapiEvent {
-    /// The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"ToolInvoked"`).
+    /// The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"OutletInvoked"`).
     pub event_type: String,
     /// DID of the actor who produced this event.
     pub actor_did: String,
@@ -111,7 +111,10 @@ pub(crate) async fn event_log_query_on(
     // instance; the supervisor-owned `MerkleEventLogProvider` is the
     // authoritative source.
     let context_id_str = handle.context_id();
-    let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id_str);
+    // ADR-056: resolve the context-id string to its 32-byte digest via the
+    // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
+    // double-hashes a real 64-hex id and queries the wrong event-log key).
+    let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id_str);
 
     let manager_entries = crate::runtime::supervisor(bi)
         .ok()
@@ -145,15 +148,27 @@ pub(crate) async fn event_log_query_on(
                     code: codes::CTX_2000.to_owned(),
                 })
             })?;
+            // Project the typed payload's bridge-facing fields (e.g.
+            // `target_did` for governance/access-revocation events,
+            // `subject_did` for role/membership events) through the single
+            // shared `scp_event_log::payload::project_payload` decoder (via the
+            // `inject_projection` helper) so all three native bridges surface
+            // byte-identical values. Each key is omitted when the projection
+            // yields `None`.
+            let mut payload_value = serde_json::json!({
+                "hash": hex::encode(leaf_hash),
+            });
+            scp_ffi_common::event_log::inject_projection(
+                &mut payload_value,
+                &entry.event_type,
+                &entry.payload,
+            );
             #[allow(clippy::cast_precision_loss)]
             events.push(NapiEvent {
                 event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
                 actor_did: entry.actor_did.0.clone(),
                 timestamp: entry.timestamp as f64,
-                payload_json: serde_json::json!({
-                    "hash": hex::encode(leaf_hash),
-                })
-                .to_string(),
+                payload_json: payload_value.to_string(),
                 sequence: seq as f64,
             });
         }
@@ -181,7 +196,7 @@ pub(crate) async fn event_log_query_on(
 
     // Unix timestamp seconds fit in f64 mantissa for centuries.
     #[allow(clippy::cast_precision_loss)]
-    let timestamp = scp_primitives::SystemClock.now_secs() as f64;
+    let timestamp = scp_clock::SystemClock.now_secs() as f64;
 
     let summary_event = NapiEvent {
         event_type: "LogSummary".to_owned(),
@@ -235,7 +250,10 @@ pub(crate) async fn event_log_verify_on(
     // EventLog so that prove_inclusion / prove_absence operate on the same
     // tree that tracks lifecycle events. The UCAN-state EventLog starts
     // empty; this populates it from the authoritative MerkleEventLogProvider.
-    let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id);
+    // ADR-056: resolve the context-id string to its 32-byte digest via the
+    // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
+    // double-hashes a real 64-hex id and queries the wrong event-log key).
+    let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
     if let Some(entries) = crate::runtime::supervisor(bi)
         .ok()
         .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten())
@@ -463,7 +481,7 @@ pub(crate) fn event_log_checkpoint_on(
         })?;
 
         let context_id = handle.context_id();
-        let sender_did = scp_identity::DID(identity.inner.did.clone());
+        let sender_did = scp_did::DID(identity.inner.did.clone());
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
         let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
@@ -525,7 +543,7 @@ pub(crate) fn event_log_checkpoint_by_did_on(
         .map_err(napi::Error::from)?;
 
         let context_id = handle.context_id();
-        let sender_did = scp_identity::DID(did);
+        let sender_did = scp_did::DID(did);
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
         let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {

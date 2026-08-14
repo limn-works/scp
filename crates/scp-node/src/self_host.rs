@@ -34,9 +34,14 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use scp_identity::cache::SystemClock;
+use scp_clock::SystemClock;
+use scp_dht::{DisabledDhtClient, PkarrDhtClient};
+// `InMemoryDhtClient` backs the test-harness-only `build_memory_did_method`
+// (`DhtMode::Memory`); it is a §17.17.3 nullifier, gated out of shipped builds.
+#[cfg(any(test, feature = "testing"))]
+use scp_dht::InMemoryDhtClient;
 use scp_identity::dht::SequenceStore;
-use scp_identity::{DidCache, DidDht, IdentityError, InMemoryDhtClient, PkarrDhtClient};
+use scp_identity::{DidCache, DidDht, IdentityError};
 use scp_platform::KeyCustody;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_platform::traits::Storage;
@@ -317,7 +322,7 @@ where
 /// the commit completes.)
 pub struct SelfHostDeployer {
     supervisor: Arc<scp_core::context::supervisor::Supervisor>,
-    author_did: scp_identity::DID,
+    author_did: scp_did::DID,
     context_id: String,
     signing_key_handle: scp_platform::KeyHandle,
 }
@@ -350,7 +355,7 @@ impl SelfHostDeployer {
     where
         S: Storage + 'static,
     {
-        let author_did: scp_identity::DID = scp_identity::DID::from(node_did.clone());
+        let author_did: scp_did::DID = scp_did::DID::from(node_did.clone());
 
         // Build the in-process supervisor on the node's OWN loopback relay and
         // register the local DID + the broadcast context. The supervisor carries
@@ -502,38 +507,36 @@ pub fn colocated_document_vm_key_resolver<R: scp_identity::resolver::DidResolver
     resolver: Arc<R>,
     handle: tokio::runtime::Handle,
 ) -> scp_core::context::governance::KeyResolver {
-    Arc::new(
-        move |did: &scp_identity::DID, kid: scp_identity::SigningKeyId| {
-            let resolver = Arc::clone(&resolver);
-            let did_owned = did.as_ref().to_owned();
-            let handle = handle.clone();
-            // Bridge async -> sync with a runtime-FLAVOR-aware match. `block_in_place`
-            // is multi-thread-only and PANICS on a current-thread runtime, so the
-            // current-thread regime is driven on a dedicated thread instead.
-            match tokio::runtime::Handle::try_current() {
-                // No ambient runtime: drive the resolve directly on `handle`.
-                Err(_) => {
-                    let outcome = handle.block_on(resolver.resolve(&did_owned)); // ci-allow: block-on: co-located KeyResolver async→sync bridge (no-runtime branch)
+    Arc::new(move |did: &scp_did::DID, kid: scp_did::SigningKeyId| {
+        let resolver = Arc::clone(&resolver);
+        let did_owned = did.as_ref().to_owned();
+        let handle = handle.clone();
+        // Bridge async -> sync with a runtime-FLAVOR-aware match. `block_in_place`
+        // is multi-thread-only and PANICS on a current-thread runtime, so the
+        // current-thread regime is driven on a dedicated thread instead.
+        match tokio::runtime::Handle::try_current() {
+            // No ambient runtime: drive the resolve directly on `handle`.
+            Err(_) => {
+                let outcome = handle.block_on(resolver.resolve(&did_owned)); // ci-allow: block-on: co-located KeyResolver async→sync bridge (no-runtime branch)
+                let doc = outcome.ok().flatten()?;
+                scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
+            }
+            Ok(current) => match current.runtime_flavor() {
+                // Multi-thread runtime: `block_in_place` re-enters `handle`.
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    let outcome = tokio::task::block_in_place(|| {
+                        handle.block_on(resolver.resolve(&did_owned)) // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread branch re-enters handle)
+                    }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors stop_and_wait / try_consume_hard_rate_limit_from_any_context)
                     let doc = outcome.ok().flatten()?;
                     scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
                 }
-                Ok(current) => match current.runtime_flavor() {
-                    // Multi-thread runtime: `block_in_place` re-enters `handle`.
-                    tokio::runtime::RuntimeFlavor::MultiThread => {
-                        let outcome = tokio::task::block_in_place(|| {
-                            handle.block_on(resolver.resolve(&did_owned)) // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread branch re-enters handle)
-                        }); // ci-allow: block-on: co-located KeyResolver async→sync bridge (multi-thread block_in_place; mirrors stop_and_wait / try_consume_hard_rate_limit_from_any_context)
-                        let doc = outcome.ok().flatten()?;
-                        scp_identity::resolver::verifying_key_from_document(&doc.document, kid)
-                    }
-                    // Current-thread runtime: `block_in_place` would panic. Drive the
-                    // resolve on a dedicated thread that owns its own runtime, and
-                    // return the resolved key (a vote must be verified, not rejected).
-                    _ => colocated_resolve_vm_on_dedicated_thread(resolver, did_owned, kid),
-                },
-            }
-        },
-    )
+                // Current-thread runtime: `block_in_place` would panic. Drive the
+                // resolve on a dedicated thread that owns its own runtime, and
+                // return the resolved key (a vote must be verified, not rejected).
+                _ => colocated_resolve_vm_on_dedicated_thread(resolver, did_owned, kid),
+            },
+        }
+    })
 }
 
 /// Dedicated-thread escape hatch for the current-thread-runtime regime, where
@@ -550,7 +553,7 @@ pub fn colocated_document_vm_key_resolver<R: scp_identity::resolver::DidResolver
 fn colocated_resolve_vm_on_dedicated_thread<R: scp_identity::resolver::DidResolver + 'static>(
     resolver: Arc<R>,
     did_owned: String,
-    kid: scp_identity::SigningKeyId,
+    kid: scp_did::SigningKeyId,
 ) -> Option<ed25519_dalek::VerifyingKey> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -597,7 +600,7 @@ fn colocated_resolve_vm_on_dedicated_thread<R: scp_identity::resolver::DidResolv
 async fn connect_loopback_supervisor<S>(
     node: &ApplicationNode<S>,
     node_did: &str,
-    author_did: &scp_identity::DID,
+    author_did: &scp_did::DID,
     key_resolver: scp_core::context::governance::KeyResolver,
     durable: scp_core::context::supervisor::DurableProviders,
 ) -> Result<Arc<scp_core::context::supervisor::Supervisor>, SelfHostError>
@@ -623,13 +626,19 @@ where
     let transport: Box<dyn scp_core::context::builder::ContextTransportProvider> = Box::new(
         scp_transport::provider::RelayTransportProvider::new(adapter),
     );
-    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+    let crypto = Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
         node_did.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
     ));
     let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
         Box::new(scp_core::context::providers::MerkleEventLogProvider::new());
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1000);
 
+    // Share the provider's exact hardened `Clock` Arc with the supervisor so the
+    // "one hardened clock per node" invariant (see the `NodeMlsFactory::clock`
+    // field doc, ADR-057 §Prereq-1) holds by construction — the supervisor does
+    // not fabricate a second `SystemClock`. Read before `crypto` is moved below.
+    let clock = crypto.clock();
     // The durable saga journal is built over the SAME `Storage` backend as
     // `mls_storage` so crash-recovery replay loads unresolved saga entries from
     // one store on restart — guaranteed by the `DurableProviders` newtype
@@ -642,7 +651,7 @@ where
         None,
         None,
         Some(event_tx),
-        None,
+        Some(clock),
         durable,
     );
 
@@ -659,7 +668,7 @@ where
 async fn publish_assets<C>(
     supervisor: &scp_core::context::supervisor::Supervisor,
     context_id: &str,
-    author_did: &scp_identity::DID,
+    author_did: &scp_did::DID,
     deploy_id: &str,
     signing_key_handle: scp_platform::KeyHandle,
     custody: &C,
@@ -866,17 +875,18 @@ pub struct HostSiteReady {
 ///
 /// # Local demo vs public hosting
 ///
-/// [`HostSiteConfig::defaults`] is fail-safe: [`DhtMode::Memory`] means the DID
+/// [`HostSiteConfig::defaults`] is fail-safe: [`DhtMode::Disabled`] means the DID
 /// document is NOT published to the DHT, [`TlsMode::SelfSigned`] serves HTTPS,
 /// and the reach is whatever you pass. For a fully local demo, pass
 /// [`Reach::Local`] (skips NAT probing) and set `tls: TlsMode::Plaintext` so no
 /// router port is opened and the listener serves plain HTTP. For PUBLIC hosting,
 /// pass [`Reach::NatTraversal`] and opt into [`DhtMode::Production`]
 /// deliberately (it publishes the host's address bound to its DID to the global
-/// Mainline DHT — a location disclosure). [`DhtMode::Memory`] (no publish) is
-/// the fail-safe direction and is valid for every reach — including
-/// [`Reach::NatTraversal`], the "reachable but not DHT-discoverable" config
-/// (share the address out-of-band) — never an error.
+/// Mainline DHT — a location disclosure). [`DhtMode::Disabled`] (no publish) is
+/// the fail-safe, non-disclosing direction and is valid for every reach —
+/// including [`Reach::NatTraversal`], the "reachable but not DHT-discoverable"
+/// config (share the address out-of-band) — never an error. [`DhtMode::Memory`]
+/// is the test-harness-only analog and is not a shipped option.
 ///
 /// See the runnable example at `crates/scp-node/examples/website.rs` and the
 /// guide `.docs/guides/self-hosting-a-website-on-scp.md`.
@@ -900,17 +910,25 @@ pub struct HostSiteConfig {
     /// HTTPS-Only browsers refuse `http://`); [`TlsMode::SelfSigned`] serves
     /// self-signed HTTPS.
     pub tls: TlsMode,
-    /// Which DHT client to use. Defaults to the fail-safe [`DhtMode::Memory`],
-    /// which never touches the network. Set [`DhtMode::Production`] to opt into
+    /// Which DHT client to use. Defaults to the fail-safe [`DhtMode::Disabled`],
+    /// which never touches the network (`Memory` is test-harness-only). Set
+    /// [`DhtMode::Production`] to opt into
     /// public hosting — it publishes the host's public address bound to the node
     /// DID to the global Mainline DHT (an IP-to-identity / location disclosure).
     ///
-    /// [`DhtMode::Memory`] (no publish) is the fail-safe, non-disclosing
+    /// [`DhtMode::Disabled`] (no publish) is the fail-safe, non-disclosing
     /// direction and is valid with **any** [`reach`](Self::reach), including the
     /// publishing-capable [`Reach::NatTraversal`]: that pairing is the
     /// reachable-but-unpublished config (share the address out-of-band), never an
     /// error — the same M2 stance as [`NodeConfig`](crate::NodeConfig). Only
     /// [`DhtMode::Production`] discloses, so only it is an explicit opt-in.
+    ///
+    /// This value is **load-bearing**, not advisory: it is threaded into
+    /// `NodeConfig.dht` (via `build_host_site_node`) and drives
+    /// `publish_did_document_for_mode`, and it also selects the concrete
+    /// DID-method client `D` in `dispatch_hosted_site_by_dht_mode`. The two are
+    /// kept in agreement on every path (a Pkarr `D` with `dht: Disabled` never
+    /// publishes; a `Disabled` `D` never sees a `Production` publish request).
     pub dht: DhtMode,
 
     // --- Defaulted fields ---
@@ -925,9 +943,11 @@ pub struct HostSiteConfig {
     /// `SQLite` storage directory. `None` resolves to the XDG default
     /// (`$XDG_DATA_HOME/scp/node`, falling back to `$HOME/.local/share/scp/node`).
     pub storage_path: Option<PathBuf>,
-    /// DHT HTTP gateway URLs threaded into the production pkarr client. Empty by
-    /// default (Mainline DHT only). Ignored when [`dht`](Self::dht) is
-    /// [`DhtMode::Memory`].
+    /// DHT HTTP gateway URLs threaded into the production pkarr client (validated
+    /// via the shared `scp_dht::validate_gateway_url` contract). Empty by default
+    /// (Mainline DHT only). Only consulted when [`dht`](Self::dht) is
+    /// [`DhtMode::Production`] (the only publishing mode); a non-publishing
+    /// [`DhtMode::Disabled`] node builds no pkarr client, so gateways are unused.
     pub dht_gateways: Vec<String>,
     /// Per-IP rate limit for the projection endpoints. Defaults to
     /// [`DEFAULT_PROJECTION_RATE_LIMIT`](crate::DEFAULT_PROJECTION_RATE_LIMIT).
@@ -947,7 +967,7 @@ impl HostSiteConfig {
     /// (`reach`), filling every other field with its **fail-safe** default
     /// (ADR-052 M4).
     ///
-    /// Fail-safe defaults: `tls = TlsMode::SelfSigned`, `dht = DhtMode::Memory`
+    /// Fail-safe defaults: `tls = TlsMode::SelfSigned`, `dht = DhtMode::Disabled`
     /// (no publish), `site_dir = None` (embedded site), `port =
     /// DEFAULT_HTTP_BIND_ADDR.port()`, `storage_path = None` (XDG default),
     /// `dht_gateways = []`, `projection_rate_limit = DEFAULT_PROJECTION_RATE_LIMIT`,
@@ -968,7 +988,7 @@ impl HostSiteConfig {
         Self {
             reach,
             tls: TlsMode::SelfSigned,
-            dht: DhtMode::Memory,
+            dht: DhtMode::Disabled,
             site_dir: None,
             port: crate::DEFAULT_HTTP_BIND_ADDR.port(),
             storage_path: None,
@@ -1024,7 +1044,7 @@ pub enum HostSiteError {
     /// listener does not provision ([`TlsMode::Acme`] — no DNS name to provision
     /// for; [`TlsMode::Terminated`] / [`TlsMode::Custom`] — no upstream
     /// terminator here). The DHT axis is NOT a source of this error:
-    /// [`DhtMode::Memory`] (no publish) is the fail-safe direction and valid for
+    /// [`DhtMode::Disabled`] (no publish) is the fail-safe direction and valid for
     /// every reach.
     #[error("invalid host-site config: {0}")]
     InvalidConfig(String),
@@ -1085,13 +1105,13 @@ pub enum HostSiteError {
 ///   threaded in `host_site`. [`Reach::Domain`] is a loud error: `host_site` builds
 ///   a no-domain node, so a domain reach has no meaning here.
 ///
-/// This lowering does NOT validate the DHT axis: [`DhtMode::Memory`] (do not
+/// This lowering does NOT validate the DHT axis: [`DhtMode::Disabled`] (do not
 /// publish the DID document) is the fail-safe, non-disclosing direction and is
 /// valid for every [`Reach`], including the publishing-capable
 /// [`Reach::NatTraversal`] — the reachable-but-unpublished self-host case
 /// ("publicly reachable, address shared out-of-band, not published to the DHT").
 /// Only [`DhtMode::Production`] discloses, and it is already a deliberate opt-in
-/// (Memory is the default), so there is nothing to reject — the same rule
+/// ([`DhtMode::Disabled`] is the default), so there is nothing to reject — the same rule
 /// [`NodeConfig`](crate::NodeConfig) enforces. `dht` is therefore not an input
 /// here; it selects the DHT client downstream, not validity.
 fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool), HostSiteError> {
@@ -1164,7 +1184,7 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// `crates/scp-node/examples/website.rs`, and the guide
 /// `.docs/guides/self-hosting-a-website-on-scp.md`.
 ///
-/// The default [`DhtMode::Memory`] publishes nothing to the network (fail-safe).
+/// The default [`DhtMode::Disabled`] publishes nothing to the network (fail-safe).
 /// To make the site publicly reachable, opt in with [`DhtMode::Production`],
 /// which publishes this node's public address bound to its DID to the global
 /// Mainline DHT (an IP-to-identity / location disclosure).
@@ -1177,7 +1197,7 @@ fn lower_host_site_reach_tls(reach: &Reach, tls: &TlsMode) -> Result<(bool, bool
 /// Returns a [`HostSiteError`] if the config names something this deployment
 /// driver cannot serve ([`HostSiteError::InvalidConfig`] — a [`Reach::Domain`]
 /// or a non-self-host [`TlsMode`]; the DHT axis is never an error since
-/// [`DhtMode::Memory`] is valid for every reach) or any stage fails: storage
+/// [`DhtMode::Disabled`] is valid for every reach) or any stage fails: storage
 /// path/key resolution,
 /// storage/custody/blob open, DID method construction, node build, asset load,
 /// TLS config, deploy, or serve. Returns `Ok(())` on clean shutdown.
@@ -1217,7 +1237,7 @@ where
 
     // -- Validate (TLS×Reach) and lower the construction-pattern enums onto
     //    the internal `plaintext` / `skip_nat` booleans the build path threads.
-    //    `tls` folds `plaintext`; `reach` folds `skip_nat`. `DhtMode::Memory`
+    //    `tls` folds `plaintext`; `reach` folds `skip_nat`. `DhtMode::Disabled`
     //    (no publish) is the fail-safe direction and valid for every reach, so
     //    the DHT axis needs no validation — `dht_mode` selects the DHT client
     //    downstream (the match below). --
@@ -1264,6 +1284,8 @@ where
         port,
         plaintext,
         skip_nat,
+        // `DhtMode` is `Copy`; the same value also drives the dispatch below.
+        dht_mode,
         projection_rate_limit,
         refresh_interval,
         storage_dir,
@@ -1274,20 +1296,67 @@ where
         on_ready,
     };
 
-    // The co-located participant's governance resolver MUST share the node's
-    // `DidCache` (consistency + the load-bearing cache-level anti-rollback
-    // sequence guard) and resolve via the same DHT client the node uses. Each
-    // arm builds a `DualLayerResolver` over the concrete `DidDht`'s shared
-    // `cache()`/`dht_client()`, then lowers it to the object-safe governance
-    // `KeyResolver` (ADR-053 / spec §10.17, SHB-002). The `DhtMode::Memory` arm
-    // wires the in-memory client (the resolver only ever resolves the local
-    // participant's own published DID document there).
+    dispatch_hosted_site_by_dht_mode(
+        dht_mode,
+        &dht_gateways,
+        common,
+        cache,
+        sequence_store,
+        shutdown,
+    )
+    .await
+}
+
+/// Selects the DID method for the requested [`DhtMode`] and dispatches into the
+/// generic [`serve_hosted_site`] path.
+///
+/// The co-located participant's governance resolver MUST share the node's
+/// [`DidCache`] (consistency + the load-bearing cache-level anti-rollback
+/// sequence guard) and resolve via the same DHT client the node uses. Each arm
+/// builds a `DualLayerResolver` over the concrete `DidDht`'s shared
+/// `cache()`/`dht_client()`, then lowers it to the object-safe governance
+/// `KeyResolver` (ADR-053 / spec §10.17, SHB-002). The two DHT modes produce
+/// DIFFERENT concrete DID-method types (`DidDht<DisabledDhtClient>` /
+/// `DidDht<InMemoryDhtClient>` / `DidDht<PkarrDhtClient>`), so the rest of the
+/// flow is generic over `D` and called from each arm.
+async fn dispatch_hosted_site_by_dht_mode<F>(
+    dht_mode: DhtMode,
+    dht_gateways: &[String],
+    common: ServeHostedSite,
+    cache: Arc<DidCache>,
+    sequence_store: Arc<dyn SequenceStore>,
+    shutdown: F,
+) -> Result<(), HostSiteError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let handle = tokio::runtime::Handle::current();
     match dht_mode {
+        DhtMode::Disabled => {
+            tracing::info!(
+                "DhtMode::Disabled — DHT layer off: the DID document is NOT published (no address \
+                 disclosed, fail-closed on publish) and the DHT resolution arm returns Ok(None). \
+                 DID resolution composes the relay layer around the off DHT arm (the fail-safe \
+                 default; set DhtMode::Production to host publicly)"
+            );
+            let (did_method, seq_init) = build_disabled_did_method(cache);
+            let key_resolver = build_shared_cache_key_resolver(
+                Arc::clone(did_method.dht_client()),
+                Arc::clone(did_method.cache()),
+                handle,
+            );
+            // `sequence_store` is unused for a non-publishing node; drop it
+            // explicitly so the move is intentional, not an oversight.
+            drop(sequence_store);
+            serve_hosted_site(common, did_method, key_resolver, seq_init, shutdown).await
+        }
+        // Gated `feature = "testing"` ONLY (ADR-062 A5) to match the
+        // `DhtMode::Memory` variant's single activation path.
+        #[cfg(feature = "testing")]
         DhtMode::Memory => {
             tracing::info!(
                 "using InMemoryDhtClient — DID document will NOT be published to the network \
-                 (the fail-safe default; set DhtMode::Production to host publicly)"
+                 (test-harness-only; DhtMode::Disabled is the shipped no-publish value)"
             );
             let (did_method, seq_init) =
                 build_memory_did_method(Arc::clone(&common.custody), cache, sequence_store);
@@ -1301,14 +1370,14 @@ where
         DhtMode::Production => {
             tracing::warn!(
                 "DhtMode::Production — publishing this node's public address bound to its DID \
-                 to the global Mainline DHT (an IP-to-identity disclosure). Use DhtMode::Memory \
+                 to the global Mainline DHT (an IP-to-identity disclosure). Use DhtMode::Disabled \
                  to keep the DID document local."
             );
             let (did_method, seq_init) = build_production_did_method(
                 Arc::clone(&common.custody),
                 cache,
                 sequence_store,
-                &dht_gateways,
+                dht_gateways,
             )?;
             let key_resolver = build_shared_cache_key_resolver(
                 Arc::clone(did_method.dht_client()),
@@ -1333,7 +1402,7 @@ where
 /// [`NoOpRelayQuerier`](scp_identity::resolver::NoOpRelayQuerier): the node's own
 /// loopback relay is a protocol-unaware blob pipe (§10.4), not a DID-document
 /// QUERY source, so DID resolution flows through the DHT layer (and cache).
-fn build_shared_cache_key_resolver<D: scp_identity::dht_client::DhtClient + 'static>(
+fn build_shared_cache_key_resolver<D: scp_dht::DhtClient + 'static>(
     dht_client: Arc<D>,
     cache: Arc<DidCache>,
     handle: tokio::runtime::Handle,
@@ -1358,6 +1427,11 @@ struct ServeHostedSite {
     port: u16,
     plaintext: bool,
     skip_nat: bool,
+    /// The caller-selected publish [`DhtMode`], threaded into
+    /// [`build_host_site_node`] so `NodeConfig.dht` agrees with the concrete
+    /// DID-method `D` that [`dispatch_hosted_site_by_dht_mode`] selected from the
+    /// same value (never a re-derivation from `skip_nat`).
+    dht_mode: DhtMode,
     projection_rate_limit: u32,
     refresh_interval: Duration,
     storage_dir: PathBuf,
@@ -1374,6 +1448,10 @@ struct ServeHostedSite {
 /// Parameterized over the DID method `D` so both the production-pkarr and
 /// in-memory DHT modes share this body (mirrors the binary's
 /// `run_self_host_with`).
+// A single linear build → deploy → serve orchestration; each step must be
+// sequenced with its own error/teardown handling, so it reads as one flat body
+// rather than fragmenting into helpers that would obscure the ordering.
+#[allow(clippy::too_many_lines)]
 async fn serve_hosted_site<D, F>(
     common: ServeHostedSite,
     did_method: Arc<D>,
@@ -1390,6 +1468,7 @@ where
         port,
         plaintext,
         skip_nat,
+        dht_mode,
         projection_rate_limit,
         refresh_interval,
         storage_dir,
@@ -1411,6 +1490,7 @@ where
         did_method,
         projection_rate_limit,
         skip_nat,
+        dht_mode,
     )
     .await?;
 
@@ -1860,16 +1940,21 @@ impl<S: Storage + 'static> SequenceStore for StorageSequenceStore<S> {
 
 /// Creates a BEP44 sequence-initialization callback for a `DidDht` method.
 #[must_use]
-pub fn make_seq_init<D: scp_identity::DhtClient + 'static>(
+pub fn make_seq_init<D: scp_dht::DhtClient + 'static>(
     did_method: Arc<DidDht<D, SystemClock>>,
 ) -> SeqInitFn {
     Box::new(move |did| Box::pin(async move { did_method.initialize_sequence(&did).await }))
 }
 
-/// Builds the in-memory DID method (offline; DID docs are NOT published).
+/// Builds the **test-harness-only** in-memory DID method (`DhtMode::Memory`).
 ///
 /// The returned method signs with `custody` and persists its BEP44 sequence in
-/// `sequence_store`, but its [`InMemoryDhtClient`] never reaches the network.
+/// `sequence_store`, but its [`InMemoryDhtClient`] is a §17.17.3 resolve
+/// nullifier — a publish reaches no peer and a resolve sees no peer's writes.
+/// Compiled only under `feature = "testing"` (ADR-062 §Decision 1, D-B); shipped
+/// nodes use [`build_disabled_did_method`] (no-publish) or
+/// [`build_production_did_method`] (real Pkarr).
+#[cfg(any(test, feature = "testing"))]
 #[must_use]
 pub fn build_memory_did_method(
     custody: Arc<SqliteKeyCustody>,
@@ -1883,6 +1968,27 @@ pub fn build_memory_did_method(
         cache,
         sign_fn,
         sequence_store,
+    ));
+    let seq_init = make_seq_init(Arc::clone(&did_method));
+    (did_method, seq_init)
+}
+
+/// Builds the DHT-layer-off DID method (`DhtMode::Disabled` — the shipped
+/// no-publish value).
+///
+/// The DHT arm is a [`DisabledDhtClient`]: publish fails closed (no address is
+/// disclosed) and resolve contributes an honest `Ok(None)` — never a fabricated
+/// or in-memory answer (ADR-062 §Decision 1, A2). The method shares the node's
+/// [`DidCache`] with the co-located resolver but carries no signer (it never
+/// publishes). DID resolution still runs: the [`DualLayerResolver`] composes the
+/// relay layer around the off DHT arm.
+#[must_use]
+pub fn build_disabled_did_method(
+    cache: Arc<DidCache>,
+) -> (Arc<DidDht<DisabledDhtClient, SystemClock>>, SeqInitFn) {
+    let did_method = Arc::new(DidDht::with_client_and_cache(
+        Arc::new(DisabledDhtClient),
+        cache,
     ));
     let seq_init = make_seq_init(Arc::clone(&did_method));
     (did_method, seq_init)
@@ -1926,6 +2032,17 @@ pub fn build_pkarr_client(dht_gateways: &[String]) -> Result<Arc<PkarrDhtClient>
     for gateway in dht_gateways {
         let gateway = gateway.trim();
         if !gateway.is_empty() {
+            // The ONE shared gateway-URL validation contract
+            // (`scp_dht::validate_gateway_url`), identical to the FFI-bridge
+            // `ClientDhtConfig::into_client` — both fail closed on the same rule
+            // (previously this path accepted any non-empty string, diverging from
+            // the bridge which rejects malformed URLs).
+            scp_dht::validate_gateway_url(gateway).map_err(|e| {
+                HostSiteError::DidMethod(format!(
+                    "invalid DHT gateway URL {:?}: {}",
+                    e.url, e.reason
+                ))
+            })?;
             tracing::info!(gateway = %gateway, "adding DHT HTTP gateway");
             dht_builder = dht_builder.gateway_url(gateway);
         }
@@ -2037,11 +2154,54 @@ fn read_site_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<Asset>) -> Res
 // Node + deployer construction
 // ---------------------------------------------------------------------------
 
+/// Derives the [`NatSlot`] (plus retained port-mapper handles for teardown) for a
+/// hosted-site node from `skip_nat` and the build features.
+///
+/// A `skip_nat` host (or any non-`upnp` build) uses [`NatSlot::Auto`] and
+/// constructs no mappers. Otherwise the `upnp` build wires a
+/// [`DefaultNatStrategy`](crate::DefaultNatStrategy) with `UPnP` + NAT-PMP mappers
+/// and KEEPS the handles so teardown can release them (`NatSlot::Auto` would lose
+/// them). Split out of [`build_host_site_node`] as a readability seam so the NAT
+/// derivation does not inflate the builder body. `HostSiteConfig` has no `nat`
+/// field, so there is no config-level NAT injection point (unlike
+/// `NodeConfig.nat`) — see #2162 to add one for parity + hermetic host-site tests.
+fn derive_host_site_nat_slot(
+    #[cfg_attr(not(feature = "upnp"), allow(unused_variables))] skip_nat: bool,
+) -> (NatSlot, OptionalPortMapper, OptionalPortMapper) {
+    #[cfg(feature = "upnp")]
+    {
+        if skip_nat {
+            (NatSlot::Auto, None, None)
+        } else {
+            let upnp: Arc<dyn scp_transport::nat::PortMapper> =
+                Arc::new(scp_transport::nat::UpnpPortMapper::new());
+            let natpmp: Arc<dyn scp_transport::nat::PortMapper> =
+                Arc::new(scp_transport::nat::NatPmpPortMapper::new());
+            let strategy = crate::DefaultNatStrategy::new(None, None)
+                .with_port_mapper(Arc::clone(&upnp))
+                .with_fallback_mapper(Arc::clone(&natpmp));
+            (
+                NatSlot::Custom(Arc::new(strategy) as Arc<dyn crate::NatStrategy>),
+                Some(upnp),
+                Some(natpmp),
+            )
+        }
+    }
+    #[cfg(not(feature = "upnp"))]
+    {
+        (NatSlot::Auto, None, None)
+    }
+}
+
 /// Builds the no-domain self-host [`ApplicationNode`] over persistent storage,
 /// returning it behind an `Arc` alongside the retained NAT port-mapper handles.
 ///
 /// Mirrors the binary's `build_self_host_node` but returns a [`HostSiteError`]
 /// (releasing any established mappings best-effort) instead of exiting.
+// Node builder internal: all parameters are required for server construction
+// (the `dht_mode` was threaded in per ADR-062 Slice 1 R2-1 so the publish policy
+// agrees with the selected DID-method client `D`).
+#[allow(clippy::too_many_arguments)]
 async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
     http_addr: SocketAddr,
     storage_dir: &Path,
@@ -2050,6 +2210,7 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
     did_method: Arc<D>,
     projection_rate_limit: u32,
     skip_nat: bool,
+    dht_mode: DhtMode,
 ) -> Result<
     (
         Arc<ApplicationNode<Arc<SqliteStorage>>>,
@@ -2067,41 +2228,33 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
             ))
         })?;
 
-    // -- Reach + DHT from `skip_nat`. A `skip_nat` host reaches only locally
-    //    (non-publishing → DhtMode::Memory); otherwise it NAT-traverses and
-    //    publishes a routable address (DhtMode::Production, M2). --
-    let (reach, dht) = if skip_nat {
-        (Reach::Local, DhtMode::Memory)
+    // -- Reach from `skip_nat`: a `skip_nat` host reaches only locally, otherwise
+    //    it NAT-traverses a routable address. --
+    let reach = if skip_nat {
+        Reach::Local
     } else {
-        (Reach::NatTraversal, DhtMode::Production)
+        Reach::NatTraversal
     };
 
-    // -- NAT slot with RETAINED mapper handles for clean teardown. When
-    //    `skip_nat`, no mapper is constructed and the reach skips the probe;
-    //    `NatSlot::Auto` is correct there. When NOT `skip_nat` (upnp build),
-    //    `NatSlot::Custom(strategy)` carries the strategy and we KEEP the mapper
-    //    handles for teardown — `NatSlot::Auto` would lose them. --
-    #[cfg(feature = "upnp")]
-    let (nat, upnp_mapper, natpmp_mapper): (NatSlot, OptionalPortMapper, OptionalPortMapper) =
-        if skip_nat {
-            (NatSlot::Auto, None, None)
-        } else {
-            let upnp: Arc<dyn scp_transport::nat::PortMapper> =
-                Arc::new(scp_transport::nat::UpnpPortMapper::new());
-            let natpmp: Arc<dyn scp_transport::nat::PortMapper> =
-                Arc::new(scp_transport::nat::NatPmpPortMapper::new());
-            let strategy = crate::DefaultNatStrategy::new(None, None)
-                .with_port_mapper(Arc::clone(&upnp))
-                .with_fallback_mapper(Arc::clone(&natpmp));
-            (
-                NatSlot::Custom(Arc::new(strategy) as Arc<dyn crate::NatStrategy>),
-                Some(upnp),
-                Some(natpmp),
-            )
-        };
-    #[cfg(not(feature = "upnp"))]
-    let (nat, upnp_mapper, natpmp_mapper): (NatSlot, OptionalPortMapper, OptionalPortMapper) =
-        (NatSlot::Auto, None, None);
+    // -- Publish `DhtMode` is the caller's selected `dht_mode` — the SAME value
+    //    that selected the concrete DID-method `D` in
+    //    `dispatch_hosted_site_by_dht_mode`. It is NOT re-derived from `skip_nat`.
+    //    Re-deriving (`skip_nat ? Disabled : Production`) discarded `config.dht`,
+    //    so a documented-valid `{reach: NatTraversal, dht: Disabled}` site
+    //    selected `DisabledDhtClient` (via the dispatch) yet set
+    //    `NodeConfig.dht = Production`, making `publish_did_document_for_mode`
+    //    call `DisabledDhtClient::publish()` → `Err(DhtError::Disabled)` and fail
+    //    `Node::start` on a legitimate non-publishing config. Threading the real
+    //    `dht_mode` keeps the selected client `D` and the publish policy in
+    //    agreement on every path (a Pkarr `D` with `dht: Disabled` never
+    //    publishes; a `Disabled` `D` never sees a `Production` publish request). --
+    let dht = dht_mode;
+
+    // -- NAT slot with RETAINED mapper handles for clean teardown, derived from
+    //    `skip_nat`/features by `derive_host_site_nat_slot`. `HostSiteConfig` has
+    //    no `nat` field, so (unlike `NodeConfig.nat`) there is no injection seam
+    //    here — see #2162 to add `nat: NatSlot` for parity + hermetic tests. --
+    let (nat, upnp_mapper, natpmp_mapper) = derive_host_site_nat_slot(skip_nat);
 
     // `IdentitySource::Persisted` gives the self-host node a STABLE DID across
     // restarts: it creates+persists the identity on first boot and reloads it
@@ -2112,7 +2265,11 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
         nat,
         http_bind_addr: Some(http_addr),
         projection_rate_limit: Some(projection_rate_limit),
-        blob_storage: Some(blob_storage),
+        // The self-host binary's operator-chosen backend: a durable, persistent
+        // SQLite blob store (opened above, fail-closed on error). Passed as the
+        // required `blob_storage` selection at this construction boundary — the
+        // legitimate config default (an explicit caller choice), NOT a runtime
+        // manufactured default (SCP-CAPINJECT-010 / spec §17.17.1).
         ..NodeConfig::defaults(
             reach,
             IdentitySource::Persisted {
@@ -2120,6 +2277,7 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
                 did_method,
             },
             node_storage,
+            blob_storage,
         )
     };
 
@@ -2356,10 +2514,10 @@ mod tests {
     //
     // These cover the ADR-052 P3c folds: `HostSiteConfig::defaults` is fail-safe
     // (M4 — no whole-struct Default, a reach-keyed factory instead), `plaintext`
-    // is folded into `TlsMode`, `skip_nat` into `Reach`. `DhtMode::Memory` (no
+    // is folded into `TlsMode`, `skip_nat` into `Reach`. `DhtMode::Disabled` (no
     // publish) is the fail-safe direction and valid for every reach, so the
     // lowering does not validate the DHT axis (M2: only `Production` discloses,
-    // and it is the explicit opt-in).
+    // and it is the explicit opt-in; `Memory` is test-harness-only).
     // -----------------------------------------------------------------------
 
     /// `HostSiteConfig::defaults(reach)` fills every non-required field with the
@@ -2373,8 +2531,10 @@ mod tests {
         );
         assert_eq!(
             config.dht,
-            DhtMode::Memory,
-            "defaults must NOT publish to the DHT (fail-safe, M2)"
+            DhtMode::Disabled,
+            "defaults must NOT publish to the DHT — `DhtMode::Disabled` is the \
+             fail-safe no-publish value (ADR-062 §Decision 1; `Memory` is now \
+             test-harness-only)"
         );
         assert!(
             config.site_dir.is_none(),
@@ -2429,7 +2589,7 @@ mod tests {
     }
 
     /// `Reach::NatTraversal` lowers cleanly regardless of DHT mode: the lowering
-    /// validates only the TLS×Reach axis, never the DHT axis. `DhtMode::Memory`
+    /// validates only the TLS×Reach axis, never the DHT axis. `DhtMode::Disabled`
     /// (no publish) is the fail-safe direction and valid for every reach — the
     /// reachable-but-unpublished self-host case (publicly reachable via NAT
     /// traversal, address shared out-of-band, not published to the DHT). It is
@@ -2439,11 +2599,40 @@ mod tests {
     fn nat_traversal_lowers_for_both_dht_modes() {
         // `lower_host_site_reach_tls` no longer takes a `dht` arg — the DHT mode
         // does not affect reach/TLS lowering. The successful lowering is the
-        // proof that a publishing-capable reach is accepted with the default
-        // (Memory) DHT mode (the old, inverted rule rejected NatTraversal+Memory).
+        // proof that a publishing-capable reach is accepted with the fail-safe
+        // default (`DhtMode::Disabled`) DHT mode (the old, inverted rule rejected
+        // a publishing-capable reach paired with a non-publishing DHT mode).
         let (_p, skip_nat) = lower_host_site_reach_tls(&Reach::NatTraversal, &TlsMode::SelfSigned)
             .expect("NatTraversal lowers cleanly; DHT mode does not gate validity");
         assert!(!skip_nat, "Reach::NatTraversal must probe NAT");
+    }
+
+    /// Gateway-normalization PARITY with the FFI-bridge
+    /// [`ClientDhtConfig::into_client`](scp_ffi_common): [`build_pkarr_client`]
+    /// TRIMS each gateway and SKIPS empty entries before validating against the
+    /// shared [`scp_dht::validate_gateway_url`] contract. A whitespace-padded
+    /// valid gateway is trimmed-then-accepted, a whitespace-only / empty entry is
+    /// skipped (not an error), and a malformed gateway still fails closed. Both
+    /// callers now accept/reject exactly these inputs — the "identical contract"
+    /// the docs claim (companion:
+    /// `into_client_trims_and_skips_gateways_like_the_node_path`).
+    #[test]
+    fn build_pkarr_client_trims_and_accepts_whitespace_padded_gateway() {
+        // A whitespace-padded VALID gateway is trimmed then accepted.
+        build_pkarr_client(&["  https://dns.example.org  ".to_owned()])
+            .expect("a whitespace-padded valid gateway must be trimmed-then-accepted");
+
+        // Whitespace-only / empty entries are skipped (not rejected) — same as an
+        // empty gateway list, building the default direct-Mainline client.
+        build_pkarr_client(&["   ".to_owned(), String::new()])
+            .expect("whitespace-only / empty gateways must be skipped, not rejected");
+
+        // A padded but MALFORMED gateway still fails closed (trim does not rescue).
+        let malformed = build_pkarr_client(&["  not-a-valid-url  ".to_owned()]);
+        assert!(
+            matches!(malformed, Err(HostSiteError::DidMethod(_))),
+            "a malformed gateway must still fail closed after trimming, got {malformed:?}"
+        );
     }
 
     /// `Reach::Domain` has no meaning for the no-domain `host_site` deployment
@@ -2636,7 +2825,7 @@ mod tests {
         dht: &InMemoryDhtClient,
     ) -> (String, ed25519_dalek::VerifyingKey) {
         use ed25519_dalek::{Signer, SigningKey};
-        use scp_identity::DhtClient;
+        use scp_dht::DhtClient;
 
         // Distinct identity (#0) and active (#active) keys.
         let identity_signing = SigningKey::from_bytes(&[11u8; 32]);
@@ -2654,7 +2843,7 @@ mod tests {
             )
             .into()
         };
-        let doc = scp_identity::DidDocument::new(
+        let doc = scp_did::DidDocument::new(
             &did,
             identity_public.as_bytes(),
             active_public.as_bytes(),
@@ -2663,7 +2852,7 @@ mod tests {
 
         // BEP44-sign the serialized document with the identity key (seq = 1).
         let value = doc.to_json().expect("doc serializes").into_bytes();
-        let signable = scp_identity::dht::bep44_signable(&value, 1);
+        let signable = scp_dht::bep44_signable(&value, 1);
         let signature: [u8; 64] = identity_signing.sign(&signable).to_bytes();
         dht.publish(identity_public.as_bytes(), &signature, &value, 1)
             .await
@@ -2700,12 +2889,7 @@ mod tests {
         let active_result = tokio::task::spawn_blocking({
             let key_resolver = Arc::clone(&key_resolver);
             let did = did.clone();
-            move || {
-                key_resolver(
-                    &scp_identity::DID::from(did),
-                    scp_identity::SigningKeyId::Active,
-                )
-            }
+            move || key_resolver(&scp_did::DID::from(did), scp_did::SigningKeyId::Active)
         })
         .await
         .expect("resolver task joins");
@@ -2724,8 +2908,8 @@ mod tests {
             let key_resolver = Arc::clone(&key_resolver);
             move || {
                 key_resolver(
-                    &scp_identity::DID::from(unknown_did),
-                    scp_identity::SigningKeyId::Active,
+                    &scp_did::DID::from(unknown_did),
+                    scp_did::SigningKeyId::Active,
                 )
             }
         })
@@ -2772,10 +2956,7 @@ mod tests {
 
         // Invoke DIRECTLY on the current-thread runtime's thread — the path that
         // panicked under the old `block_in_place` gate. Must resolve, not panic.
-        let active_result = key_resolver(
-            &scp_identity::DID::from(did),
-            scp_identity::SigningKeyId::Active,
-        );
+        let active_result = key_resolver(&scp_did::DID::from(did), scp_did::SigningKeyId::Active);
         assert_eq!(
             active_result,
             Some(active_public),

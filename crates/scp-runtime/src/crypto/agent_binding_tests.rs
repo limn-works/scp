@@ -16,7 +16,7 @@
 mod tests {
     use std::collections::HashSet;
 
-    use scp_identity::document::{DidDocument, VerificationMethod};
+    use scp_did::{DidDocument, VerificationMethod};
     use scp_platform::testing::InMemoryKeyCustody;
     use scp_platform::traits::{KeyCustody, KeyType};
 
@@ -27,7 +27,7 @@ mod tests {
     use scp_protocol::crypto::ucan::UcanError;
     use scp_protocol::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryRevocationChecker,
-        ValidationContext,
+        NoCaveatResolver, ValidationContext,
     };
 
     // -----------------------------------------------------------------------
@@ -110,7 +110,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -162,7 +162,7 @@ mod tests {
 
         // mint_ucan rejects self-delegation without key_scope at mint time
         // (ADR-039 enforcement).
-        let result = mint_ucan(&params, &custody, &scp_primitives::SystemClock).await;
+        let result = mint_ucan(&params, &custody, &scp_clock::SystemClock).await;
         assert!(
             result.is_err(),
             "self-delegation (iss == aud) without key_scope must be rejected"
@@ -212,7 +212,7 @@ mod tests {
             ceiling: None,
         };
 
-        let token = mint_ucan(&params, &custody_agent, &scp_primitives::SystemClock)
+        let token = mint_ucan(&params, &custody_agent, &scp_clock::SystemClock)
             .await
             .unwrap();
 
@@ -234,16 +234,18 @@ mod tests {
             "ctx-test", "messages", "write",
         );
 
+        let caveat_resolver = NoCaveatResolver;
         let mut ctx = ValidationContext {
             did_resolver: &resolver,
             nonce_tracker: &mut nonce_tracker,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
+            caveat_resolver: &caveat_resolver,
             ceiling: &ceiling,
             context_creator_did: &human_did,
             presenting_agent_did: &human_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
         };
 
         let result =
@@ -320,7 +322,7 @@ mod tests {
 
     #[test]
     fn one_did_cannot_cast_two_governance_votes() {
-        use scp_identity::DID;
+        use scp_did::DID;
         use scp_protocol::context::governance::majority::MajorityVoteEngine;
         use scp_protocol::context::governance::{
             GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceError,
@@ -344,29 +346,24 @@ mod tests {
         let third_vk = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]).verifying_key();
         #[allow(clippy::type_complexity)]
         let resolver: std::sync::Arc<
-            dyn Fn(
-                    &scp_identity::DID,
-                    scp_identity::SigningKeyId,
-                ) -> Option<ed25519_dalek::VerifyingKey>
+            dyn Fn(&scp_did::DID, scp_did::SigningKeyId) -> Option<ed25519_dalek::VerifyingKey>
                 + Send
                 + Sync,
         > = {
             let admin_d = admin_did.clone();
             let voter_d = voter_did.clone();
             let third_d = third_did.clone();
-            std::sync::Arc::new(
-                move |did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| {
-                    if *did == admin_d {
-                        Some(admin_vk)
-                    } else if *did == voter_d {
-                        Some(voter_vk)
-                    } else if *did == third_d {
-                        Some(third_vk)
-                    } else {
-                        None
-                    }
-                },
-            )
+            std::sync::Arc::new(move |did: &scp_did::DID, _kid: scp_did::SigningKeyId| {
+                if *did == admin_d {
+                    Some(admin_vk)
+                } else if *did == voter_d {
+                    Some(voter_vk)
+                } else if *did == third_d {
+                    Some(third_vk)
+                } else {
+                    None
+                }
+            })
         };
         let mut engine = MajorityVoteEngine::new(
             eligible_voters,

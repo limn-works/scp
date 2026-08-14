@@ -23,9 +23,7 @@
 //! including `PyO3`, maps a snapshot *signature* failure to `SCP-CTX-2093`
 //! and an export *version* gate to `SCP-CTX-2094` — the two are distinct.
 //!
-//! Requires the `resolvers` feature (scp-core, ed25519-dalek). NOT available
-//! for WASM (ADR-034); the WASM bridge resolves keys via its own constrained
-//! path.
+//! Requires the `resolvers` feature (scp-core, ed25519-dalek).
 
 use ed25519_dalek::VerifyingKey;
 
@@ -145,7 +143,7 @@ where
 /// Decodes a platform [`PublicKey`](scp_platform::PublicKey) into an Ed25519
 /// [`VerifyingKey`], enforcing the 32-byte length and canonical-point validity.
 ///
-/// This is the byte-conversion tail shared by every non-WASM bridge's
+/// This is the byte-conversion tail shared by every FFI bridge's
 /// local-custody verifying-key resolver: each bridge looks up the identity in
 /// its own registry and calls `KeyCustody::public_key` (its own HEAD), then
 /// funnels the resulting public key through this helper. Only the public

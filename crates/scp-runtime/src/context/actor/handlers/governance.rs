@@ -5,15 +5,14 @@
 //! # Dispatch shape
 //!
 //! The actor's `run()` loop invokes [`dispatch`] with `(&mut
-//! PerContextState, &ActorDeps, GovernanceCommand)`. Every governance
+//! ClassSCell, &ActorDeps, GovernanceCommand) -> Outcome<()>`. Every governance
 //! variant has an actor-shape handler (`handle_*_actor`) that reads
 //! and mutates `state.governance` directly through the actor-shape
 //! helpers in
 //! [`crate::context::governance_helpers`](crate::context::governance_helpers).
 //! The migration-window shim — `dispatch_from_shim` and the
 //! supervisor-shape `handle_*` helpers — has been deleted at Phase 2A
-//! finalization. The `Placeholder` variant remains as the mailbox-test
-//! handshake target.
+//! finalization.
 //!
 //! # Transport-timeout budget
 //!
@@ -55,7 +54,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::governance::dispatch(state, deps, cmd).await`).
+/// (`handlers::governance::dispatch(cell, deps, cmd).await`).
 ///
 /// Every variant routes through an actor-shape `handle_*_actor` helper
 /// that reads or mutates `state.governance` directly through
@@ -76,11 +75,8 @@ pub(crate) async fn dispatch(
     Box::pin(dispatch_state(cell, deps, cmd)).await
 }
 
-/// Actor-shape variant dispatch. Every governance variant now takes
-/// state + deps directly. Only the no-op `Placeholder` variant
-/// (commit-6 mailbox-test handshake) returns `NotImplemented`
-/// synchronously; deleted with the `Placeholder` itself at Phase 2A
-/// finalization.
+/// Actor-shape variant dispatch. Every governance variant takes
+/// state + deps directly.
 #[allow(
     clippy::too_many_lines,
     reason = "exhaustive GovernanceCommand match — splitting loses the \
@@ -202,20 +198,11 @@ async fn dispatch_state(
             .await
         }
         GovernanceCommand::EvaluatePeriodicConsequences { reply } => {
-            handle_evaluate_periodic_consequences_actor(cell, deps, reply)
+            handle_evaluate_periodic_consequences_actor(cell, deps, reply).await
         }
         GovernanceCommand::ProcessPendingCommits { reply } => {
             Box::pin(handle_process_pending_commits_actor(cell, deps, reply)).await
         }
-        GovernanceCommand::EvaluateTimeouts { reply } => {
-            Box::pin(handle_evaluate_timeouts_actor(cell, deps, reply)).await
-        }
-        GovernanceCommand::StartTimeoutTask { reply } => {
-            handle_start_timeout_task_actor(cell, deps, reply).await
-        }
-        // Placeholder is a no-op handshake target reserved for mailbox
-        // tests. Returns NotImplemented synchronously; no state mutation.
-        GovernanceCommand::Placeholder { reply } => reply_not_implemented(reply),
     }
 }
 
@@ -337,7 +324,7 @@ async fn handle_withdraw_governance_vote_actor(
     deps: &ActorDeps,
     context_id: &str,
     proposal_id: &scp_protocol::context::governance::ProposalId,
-    voter_did: &scp_identity::DID,
+    voter_did: &scp_did::DID,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
     let withdraw_fut = crate::context::governance_helpers::withdraw_governance_vote(
@@ -416,6 +403,7 @@ async fn handle_propose_governance_action_actor(
     let signing_key = p.signing_key.to_signing_key();
     let proposer_did = p.proposer_did.clone();
     let action = p.action;
+    let key_package = p.key_package;
 
     // Actor-shape twin of the legacy unchecked
     // `Supervisor::propose_governance_action` entry point: `check=false`.
@@ -435,6 +423,7 @@ async fn handle_propose_governance_action_actor(
                 action,
                 &signing_key,
                 false,
+                key_package.as_deref(),
             ),
         )
         .await
@@ -472,6 +461,7 @@ async fn handle_propose_governance_action_checked_actor(
     let signing_key = p.signing_key.to_signing_key();
     let proposer_did = p.proposer_did.clone();
     let action = p.action;
+    let key_package = p.key_package;
 
     let propose_fut = async move {
         Box::pin(
@@ -482,6 +472,7 @@ async fn handle_propose_governance_action_checked_actor(
                 &proposer_did,
                 action,
                 &signing_key,
+                key_package.as_deref(),
             ),
         )
         .await
@@ -692,6 +683,9 @@ async fn handle_execute_governance_action_actor(
                 // inside `execute_governance_action` from the TRACKED proposal's
                 // proposer — never a caller-supplied DID.
                 None,
+                // Direct-execute never carries an invitee KeyPackage (deferred
+                // governed invite is issue #2027).
+                None,
             ),
         )
         .await
@@ -757,14 +751,6 @@ async fn handle_apply_pending_economic_policy_change_actor(
     outcome
 }
 
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "GovernanceCommand::Placeholder — real variants migrate in commit 10 of \
-                       ADR-049; Placeholder retained for commit-6 compile stability and \
-                       deleted in commit 12 with the shim";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
-}
-
 // ---------------------------------------------------------------------------
 // Sweep handlers (Phase 2A finalization — sweep helper relocation)
 // ---------------------------------------------------------------------------
@@ -778,7 +764,7 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
 /// `evaluate_periodic_consequences_legacy` (which read
 /// `Supervisor::contexts` DashMap directly); the actor-shape variant
 /// operates on `&mut state` and never touches the supervisor's DashMap.
-fn handle_evaluate_periodic_consequences_actor(
+async fn handle_evaluate_periodic_consequences_actor(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
@@ -799,8 +785,7 @@ fn handle_evaluate_periodic_consequences_actor(
     }
     let now = deps.clock.now_secs();
     let context_id = cell.handle.context_id().to_owned();
-    let member_dids: Vec<scp_identity::DID> =
-        cell.membership.members().map(|m| m.did.clone()).collect();
+    let member_dids: Vec<scp_did::DID> = cell.membership.members().map(|m| m.did.clone()).collect();
     // Periodic sweep: one convergent window anchor shared across all members
     // so every honest member's durable consequence leaf converges (§9.9.3).
     let (events, convergent_now) = event_log_entries_for_consequences(
@@ -810,7 +795,7 @@ fn handle_evaluate_periodic_consequences_actor(
         deps.event_log.as_ref(),
     );
 
-    let mut results: Vec<(scp_identity::DID, Vec<TriggeredConsequence>)> = Vec::new();
+    let mut results: Vec<(scp_did::DID, Vec<TriggeredConsequence>)> = Vec::new();
     for member_did in member_dids {
         let triggered =
             evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now, convergent_now);
@@ -857,7 +842,8 @@ fn handle_evaluate_periodic_consequences_actor(
                     event_tx: deps.event_tx.as_ref(),
                 },
                 &mut downward_auth_obligation,
-            );
+            )
+            .await;
         }
         // `split` / `view` drop here, releasing the `&mut cell` borrow.
     }
@@ -868,9 +854,10 @@ fn handle_evaluate_periodic_consequences_actor(
     // discharges the Drop guard). On persist failure the mutation STAYS and the
     // error is surfaced to the caller; the handler still reports `mutated` so the
     // run loop also persists.
-    let reply_result = downward_auth_obligation
-        .take()
-        .map_or(Ok(()), |token| token.commit(cell, deps, &context_id));
+    let reply_result = match downward_auth_obligation.take() {
+        Some(token) => token.commit(cell, deps, &context_id).await,
+        None => Ok(()),
+    };
     let _ = reply.send(reply_result);
     Outcome::ok_mutated(())
 }
@@ -910,7 +897,7 @@ struct CommitRetryOutcome {
 /// with no `&state` borrow held. The actor's `dispatch_state` arm owns
 /// the `&mut state` borrow exclusively for the command's lifetime so
 /// no other command can interleave between Phase A and Phase B.
-fn compute_commit_retry_outcomes(
+async fn compute_commit_retry_outcomes(
     snapshot: &[crate::context::state::PendingCommit],
     now: u64,
     transport: &dyn crate::context::builder::ContextTransportProvider,
@@ -934,7 +921,10 @@ fn compute_commit_retry_outcomes(
             });
             continue;
         }
-        match transport.send_message(&pending.routing_id, &pending.commit_bytes) {
+        match transport
+            .send_message(&pending.routing_id, &pending.commit_bytes)
+            .await
+        {
             Ok(()) => {
                 outcomes.push(CommitRetryOutcome {
                     index: idx,
@@ -1110,7 +1100,7 @@ async fn handle_process_pending_commits_actor(
     let now = deps.clock.now_secs();
     let context_id = cell.handle.context_id().to_owned();
 
-    let outcomes = compute_commit_retry_outcomes(&snapshot, now, deps.transport.as_ref());
+    let outcomes = compute_commit_retry_outcomes(&snapshot, now, deps.transport.as_ref()).await;
     if outcomes.is_empty() {
         let _ = reply.send(Ok(()));
         return Outcome::ok(());
@@ -1128,27 +1118,26 @@ async fn handle_process_pending_commits_actor(
     Outcome::ok_mutated(())
 }
 
-/// Handle [`GovernanceCommand::EvaluateTimeouts`] (actor-shape).
+/// Run one tick of the governance timeout / consequence pipeline for
+/// THIS actor's context (phases 1 through 5), on actor-owned state.
 ///
-/// Per-actor body of the relocated sweep. Runs one tick of the
-/// governance timeout / consequence pipeline for THIS actor's context.
-/// Mirrors the per-context body of `start_governance_timeout_task_legacy`
-/// — phases 1 through 5.
+/// Called by the actor's own `governance_timeout` interval arm
+/// ([`ContextActor::on_governance_timeout`](crate::context::actor::ContextActor))
+/// each 60 s wake — the ACTOR-OWNED replacement for the retired
+/// supervisor-driven `EvaluateTimeouts` mailbox hop (ADR-049 Decision-1
+/// / finding A3).
 ///
-/// Replies `Ok(true)` to continue the supervisor's timer loop, `Ok(false)`
-/// to stop (context closing or removed; matches the legacy timer
-/// closure's `bool` return). The supervisor-side timer-spawn entry point
-/// in [`governance_helpers::start_governance_timeout_task`](crate::context::governance_helpers::start_governance_timeout_task)
-/// drives the cadence; per-actor governance-timeout actors land in Phase
-/// 2B per ADR-049.
-async fn handle_evaluate_timeouts_actor(
+/// Returns `Outcome<bool>`: `Ok(true)` keeps the interval ticking,
+/// `Ok(false)` signals stop (context no longer `Active`) so the caller
+/// nulls the interval. `mutated` marks the actor dirty for the coalesced
+/// persist, matching the retired mailbox handler's dirty semantics.
+pub(crate) async fn evaluate_governance_timeouts(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
-    reply: oneshot::Sender<Result<bool, ContextError>>,
-) -> Outcome<()> {
+) -> Outcome<bool> {
     use std::collections::HashSet;
 
-    use scp_identity::DID;
+    use scp_did::DID;
 
     use crate::context::governance::timeout::{
         collect_active_voters, process_pending_proposals, update_detection_state,
@@ -1162,16 +1151,12 @@ async fn handle_evaluate_timeouts_actor(
     // through a short-lived non-persisting Class-C view whose borrow is dropped
     // before the next call — coalesced (no per-site persist; the run loop
     // flushes after the handler reports `mutated`).
-    let current_state = cell.handle.try_read_state();
-    if !matches!(
-        current_state,
-        Some(scp_protocol::context::ContextState::Active)
-    ) {
-        // None = write-contended, continue next tick.
-        // Not Active = context closing, stop the loop.
-        let continue_loop = current_state.is_none();
-        let _ = reply.send(Ok(continue_loop));
-        return Outcome::ok(());
+    let current_state = cell.handle.state();
+    if current_state != scp_protocol::context::ContextState::Active {
+        // Not Active = context closing / terminal, stop the interval. (The
+        // lock-free `ArcSwap` read can never fail, so there is no
+        // "retry next tick" contended case.)
+        return Outcome::ok(false);
     }
 
     let gov_ctx = build_governance_context(&*cell, deps.clock.as_ref());
@@ -1254,7 +1239,7 @@ async fn handle_evaluate_timeouts_actor(
     // mailbox dispatch — both operate on the `cell` already owned by
     // this handler. No view borrow is live here.
     let (consequence_reply_tx, _consequence_reply_rx) = oneshot::channel();
-    let _ = handle_evaluate_periodic_consequences_actor(cell, deps, consequence_reply_tx);
+    let _ = handle_evaluate_periodic_consequences_actor(cell, deps, consequence_reply_tx).await;
 
     // Phase 5 (PR #1606 C6): drain MLS commit retry queue. Same pattern
     // as Phase 4 — direct in-handler call.
@@ -1266,28 +1251,7 @@ async fn handle_evaluate_timeouts_actor(
     ))
     .await;
 
-    let _ = reply.send(Ok(true));
-    Outcome::ok_mutated(())
-}
-
-/// Handle [`GovernanceCommand::StartTimeoutTask`] (actor-shape).
-///
-/// Installs the per-context governance-timeout interval task on
-/// actor-owned `state.governance.timeout_task` via the actor-shape
-/// [`governance_helpers::spawn_governance_timeout_task`](crate::context::governance_helpers::spawn_governance_timeout_task).
-/// The spawned loop mailboxes [`GovernanceCommand::EvaluateTimeouts`]
-/// back to THIS actor each tick — no DashMap reach, no generation gate.
-///
-/// Awaits the `tracked_spawn` task_set push so the abort handle is
-/// installed on `state.governance.timeout_task` before replying.
-async fn handle_start_timeout_task_actor(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    crate::context::governance_helpers::spawn_governance_timeout_task(cell, deps).await;
-    let _ = reply.send(Ok(()));
-    Outcome::ok_mutated(())
+    Outcome::ok_mutated(true)
 }
 
 #[cfg(test)]
@@ -1305,7 +1269,7 @@ mod consequence_fail_closed_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use scp_identity::DID;
+    use scp_did::DID;
     use scp_protocol::context::membership::ContextEvent;
     use scp_protocol::context::params::Capability;
     use scp_protocol::trust::consequence::{
@@ -1327,15 +1291,16 @@ mod consequence_fail_closed_tests {
 
     /// Persistence whose `persist_context` ALWAYS fails — the fail-closed path.
     struct FailPersistence;
+    #[async_trait::async_trait]
     impl ContextPersistence for FailPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err("induced persist failure".into())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -1344,26 +1309,13 @@ mod consequence_fail_closed_tests {
         > {
             Ok(None)
         }
-        fn persist_broadcast(
+        async fn delete_context(
             &self,
             _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -1375,10 +1327,11 @@ mod consequence_fail_closed_tests {
     /// non-convergent `MessageVelocity` evidence; the durable log stays empty).
     async fn build_fail_closed_deps() -> ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             ADMIN.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -1390,8 +1343,7 @@ mod consequence_fail_closed_tests {
                     InMemoryStorage::new(),
                 )),
             );
-        let clock: Arc<dyn scp_primitives::Clock> =
-            Arc::new(scp_primitives::TestClock::new(1_700_000_000));
+        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
         let supervisor = Supervisor::with_providers(
             crypto,
             transport,
@@ -1459,7 +1411,7 @@ mod consequence_fail_closed_tests {
 
         let (reply_tx, reply_rx) = oneshot::channel();
         let outcome =
-            super::handle_evaluate_periodic_consequences_actor(&mut cell, &deps, reply_tx);
+            super::handle_evaluate_periodic_consequences_actor(&mut cell, &deps, reply_tx).await;
 
         // The reply surfaces the fail-closed persist error — the suspension
         // OUTCOME was NOT acknowledged as durable while the write failed.
@@ -1507,11 +1459,13 @@ mod consequence_fail_closed_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
         let mut cell = ClassSCell::new(state);
         let ctx_str = hex::encode([CTX_BYTE; 32]);
-        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx_str);
+        // ADR-056: `ctx_str` is a real 64-hex id, so the code under test keys
+        // under its DECODED digest. Resolve the explicit arg the same way the
+        // internal keying does, not via the raw `SHA-256(ctx_str)` primitive.
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_str);
 
         // Free (non-paid) send: no token, no signing key, not broadcast.
         let result = crate::context::messaging_helpers::finalize_send(
@@ -1525,7 +1479,8 @@ mod consequence_fail_closed_tests {
             None,
             None,
             false,
-        );
+        )
+        .await;
 
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
@@ -1559,11 +1514,13 @@ mod consequence_fail_closed_tests {
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
         let mut cell = ClassSCell::new(state);
         let ctx_str = hex::encode([CTX_BYTE; 32]);
-        let ctx_bytes = scp_protocol::context::context_id_bytes(&ctx_str);
+        // ADR-056: `ctx_str` is a real 64-hex id, so the code under test keys
+        // under its DECODED digest. Resolve the explicit arg the same way the
+        // internal keying does, not via the raw `SHA-256(ctx_str)` primitive.
+        let ctx_bytes = crate::context::state::context_id_to_bytes(&ctx_str);
 
         let inner = scp_protocol::envelope::inner::InnerEnvelope {
             version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
@@ -1578,7 +1535,7 @@ mod consequence_fail_closed_tests {
             payload: Vec::new(),
             provenance: None,
             provenance_hash: [0u8; 32],
-            signing_key_id: scp_protocol::identity::SigningKeyId::Active,
+            signing_key_id: scp_did::SigningKeyId::Active,
             signature: [0u8; 64],
             extensions: std::collections::HashMap::new(),
         };
@@ -1597,6 +1554,7 @@ mod consequence_fail_closed_tests {
             false,
             &mut downward_auth_sink,
         )
+        .await
         .expect("delivery of an in-order application message succeeds");
 
         assert!(
@@ -1611,7 +1569,7 @@ mod consequence_fail_closed_tests {
         // error — the keep-direction `commit` consumes the token regardless, which
         // is all that is needed to satisfy the Drop guard.
         if let Some(token) = downward_auth_sink.take() {
-            let persist = token.commit(&cell, &deps, &ctx_str);
+            let persist = token.commit(&cell, &deps, &ctx_str).await;
             assert!(
                 matches!(persist, Err(ContextError::PersistenceFailed(_))),
                 "the failing backend surfaces the §9 durability error on commit; got \

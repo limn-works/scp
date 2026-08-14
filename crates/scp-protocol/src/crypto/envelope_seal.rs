@@ -151,6 +151,54 @@ pub fn hpke_open_invitation(
         .map_err(|e| EnvelopeSealError::OpenFailed(e.to_string()))
 }
 
+/// HPKE-opens a sealed invitation whose KEM Diffie-Hellman output was computed
+/// **inside a `KeyCustody` boundary** — the split-custody counterpart of
+/// [`hpke_open_invitation`] (spec §5.12.3.1, ADR-006).
+///
+/// This is the joiner path: the recipient key is the invitee's Ed25519
+/// `#active` identity key, held in custody. The one step that must touch the
+/// non-extractable private key — `dh = DH(sk_active_x25519, enc)` — is performed
+/// in custody via `KeyCustody::ed25519_to_x25519_agree(handle, enc)`; the
+/// private key never leaves the boundary. This function takes that
+/// custody-computed `dh` plus `recipient_pk` (`pkRm`, the invitee's own `#active`
+/// public key mapped to X25519 via [`ed25519_pubkey_to_x25519`]) and completes
+/// the RFC 9180 Decap + AEAD open in software. The `info`/`aad` are built with
+/// the SAME [`build_invitation_info`]/[`build_invitation_aad`] as the seal side,
+/// so the two never diverge.
+///
+/// # Caller contract (load-bearing)
+///
+/// For one and the same custody `#active` handle and one and the same `enc`:
+/// `dh = KeyCustody::ed25519_to_x25519_agree(handle, enc)` and
+/// `recipient_pk = ed25519_pubkey_to_x25519(KeyCustody::public_key(handle))`.
+/// A mismatched `dh`/`recipient_pk`/`enc`/`info`/`aad` fails closed (AEAD tag
+/// mismatch), indistinguishable from a wrong-key error. Binding `enc || pkRm`
+/// into the shared secret closes the unknown-key-share gap.
+///
+/// `context_id` / `creator_did` are the **binding hints** used to build
+/// `info`/`aad`; a successful open proves the sealer used the identical values
+/// (they are AEAD-authenticated). The caller MUST still cross-check them against
+/// the decrypted, signature-verified bundle before deriving any authority.
+///
+/// # Errors
+///
+/// Returns [`EnvelopeSealError::OpenFailed`] if HPKE open fails (wrong
+/// `dh`/`recipient_pk`/`enc`, wrong context/DID binding, or tampered `sealed`).
+pub fn hpke_open_invitation_with_external_dh(
+    sealed: &[u8],
+    dh: &[u8; 32],
+    recipient_pk: &[u8; 32],
+    enc: &[u8; 32],
+    context_id: &str,
+    creator_did: &str,
+) -> Result<Vec<u8>, EnvelopeSealError> {
+    let info = build_invitation_info(context_id, creator_did);
+    let aad = build_invitation_aad(context_id, creator_did);
+
+    hpke::custody::open_with_external_dh(dh, recipient_pk, enc, &info, &aad, sealed)
+        .map_err(|e| EnvelopeSealError::OpenFailed(e.to_string()))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -270,6 +318,63 @@ mod tests {
         .unwrap();
 
         assert_eq!(recovered, b"welcome message");
+    }
+
+    #[test]
+    fn external_dh_open_matches_seal() {
+        // Seal to Bob's Ed25519 #active key via birational conversion, then open
+        // via the split-custody external-DH path (dh computed "outside" the HPKE
+        // core, as `KeyCustody::ed25519_to_x25519_agree` would).
+        let bob_signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let bob_verifying = bob_signing.verifying_key();
+        let bob_x25519_pub = ed25519_pubkey_to_x25519(&bob_verifying.to_bytes()).unwrap();
+
+        let (sealed, enc) = hpke_seal_invitation(
+            b"bundle-wire-bytes",
+            &bob_x25519_pub,
+            "ctx-xdh",
+            "did:dht:z6MkAlice",
+        )
+        .unwrap();
+
+        // Recompute dh = DH(sk_active_x25519, enc) exactly as custody would.
+        let bob_x25519_secret = x25519_dalek::StaticSecret::from(bob_signing.to_scalar_bytes());
+        let enc_pub = X25519Pub::from(enc);
+        let dh = bob_x25519_secret.diffie_hellman(&enc_pub);
+
+        let recovered = hpke_open_invitation_with_external_dh(
+            &sealed,
+            dh.as_bytes(),
+            &bob_x25519_pub,
+            &enc,
+            "ctx-xdh",
+            "did:dht:z6MkAlice",
+        )
+        .unwrap();
+        assert_eq!(recovered, b"bundle-wire-bytes");
+    }
+
+    #[test]
+    fn external_dh_open_wrong_binding_fails() {
+        let bob_signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let bob_x25519_pub =
+            ed25519_pubkey_to_x25519(&bob_signing.verifying_key().to_bytes()).unwrap();
+        let (sealed, enc) =
+            hpke_seal_invitation(b"payload", &bob_x25519_pub, "ctx-xdh", "did:dht:z6MkAlice")
+                .unwrap();
+        let bob_x25519_secret = x25519_dalek::StaticSecret::from(bob_signing.to_scalar_bytes());
+        let dh = bob_x25519_secret.diffie_hellman(&X25519Pub::from(enc));
+
+        // Wrong creator_did in the binding hint → AEAD open fails closed.
+        let result = hpke_open_invitation_with_external_dh(
+            &sealed,
+            dh.as_bytes(),
+            &bob_x25519_pub,
+            &enc,
+            "ctx-xdh",
+            "did:dht:z6MkMallory",
+        );
+        assert!(result.is_err());
     }
 
     #[test]

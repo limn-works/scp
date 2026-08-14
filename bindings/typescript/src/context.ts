@@ -5,7 +5,7 @@
  * to a pure handle type: no `#scp` backing, no instance methods that
  * touch the bridge, no static factories other than `_fromHandle`. All
  * context lifecycle and content operations (create, join, send,
- * receive, leave, close, tool registration, governance, broadcast,
+ * receive, leave, close, outlet registration, governance, broadcast,
  * economic policy, TTL, export/import, event drain, etc.) live as
  * methods on the {@link SCP} class.
  *
@@ -19,9 +19,11 @@
  * `.docs/scaffold/typescript.md`.
  */
 
-import { ValidationError } from "./errors";
+import { ContextError, ValidationError } from "./errors";
 import type { BridgeContextHandle } from "./internal/bridge";
-import type { SCP } from "./scp";
+import type { OutletStreamNative } from "./outlets";
+import { Outlets } from "./outlets";
+import { __getNativeScp, type SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // EconomicPolicy schema validation (§19.3, ADR-034)
@@ -30,10 +32,9 @@ import type { SCP } from "./scp";
 /**
  * Validates that a JSON string conforms to the `EconomicPolicy` schema.
  *
- * Defense-in-depth for the WASM path: the WASM bridge can only validate
- * that the input is well-formed JSON (ADR-034 prevents importing scp-core
- * types). This function checks required fields and basic types so schema
- * violations are caught before crossing the FFI boundary.
+ * Defense-in-depth at the SDK layer: this function checks required fields
+ * and basic types so schema violations are caught before crossing the FFI
+ * boundary.
  *
  * @throws {ValidationError} if the JSON is malformed or missing required fields.
  * @internal Exported as `_validateEconomicPolicyJson` for testing.
@@ -270,7 +271,7 @@ export function _validateDeployId(deployId: string): void {
  * After Phase 4 PR 4 Agent B1, `Context` is a pure handle type: it
  * carries the context ID, the raw bridge handle, and the joined
  * identity DID. All lifecycle operations (`create`, `import`,
- * `leave`, `close`, `send`, `receive`, tool registration, governance,
+ * `leave`, `close`, `send`, `receive`, outlet registration, governance,
  * broadcast, economic policy, TTL, event drain, etc.) live as methods
  * on the {@link SCP} class. Pass a `Context` wherever the underlying
  * bridge call needs the context handle.
@@ -299,24 +300,62 @@ export class Context {
   /** The DID of the identity that created/joined this context. */
   readonly identityDid: string;
 
-  private constructor(contextId: string, rawHandle: BridgeContextHandle, identityDid: string) {
+  /**
+   * @internal The owning `SCP` instance, or `null` for a bare handle. Backs
+   *   the {@link outlets} accessor, whose streaming ops dispatch to the SCP
+   *   native bridge (SCP-OUT-038, mirroring the Python `Context._scp`).
+   */
+  readonly #scp: SCP | null;
+
+  private constructor(
+    contextId: string,
+    rawHandle: BridgeContextHandle,
+    identityDid: string,
+    scp: SCP | null,
+  ) {
     this.contextId = contextId;
     this._rawHandle = rawHandle;
     this.identityDid = identityDid;
+    this.#scp = scp;
   }
 
   /**
    * Constructs a `Context` from an existing bridge handle.
    *
-   * The `scp` parameter is retained for API symmetry with the other
-   * `_fromHandle` statics — the handle itself is self-contained so no
-   * `SCP` reference is stored.
+   * The `scp` parameter is retained so the {@link outlets} accessor can
+   * dispatch the §5.4.5 streaming ops to the owning SCP native bridge
+   * (SCP-OUT-038); it is otherwise unused (all other lifecycle operations
+   * live as `SCP` methods that take `ctx._rawHandle`).
    *
    * @internal Phase 4 PR 4 (#1549, ADR-048) — used by `SCP.contextCreate`
    *   and related forwarders.
    */
-  static _fromHandle(_scp: SCP, raw: BridgeContextHandle, identityDid: string): Context {
-    return new Context(raw.contextId, raw, identityDid);
+  static _fromHandle(scp: SCP, raw: BridgeContextHandle, identityDid: string): Context {
+    return new Context(raw.contextId, raw, identityDid, scp);
+  }
+
+  /**
+   * The outlet accessor for this context (§5.4.5, SCP-OUT-038).
+   *
+   * Exposes the single public invocation verb —
+   * `ctx.outlets.invoke(outletId, input, { ucanToken })` — returning an
+   * {@link InvocationHandle} that is both `PromiseLike<Aggregate>` (the
+   * aggregated result) and `AsyncIterable<OutletStreamChunk>` (per-chunk
+   * streaming).
+   *
+   * @throws {ContextError} If this `Context` was created without an owning
+   *   `SCP` instance (a bare handle used only for inspection).
+   */
+  get outlets(): Outlets {
+    if (this.#scp === null) {
+      throw new ContextError(
+        "Context has no bound SCP instance; obtain the context from an SCP " +
+          "factory method (e.g. scp.contextCreate) to use ctx.outlets",
+        "SCP-CTX-2000",
+      );
+    }
+    const native = __getNativeScp(this.#scp) as unknown as OutletStreamNative;
+    return new Outlets(native, this._rawHandle, this.identityDid);
   }
 }
 
@@ -370,7 +409,7 @@ export interface OperationalMetadata {
   name: string | null;
   description: string | null;
   economic_policy: string | null;
-  tool_count: number | null;
+  outlet_count: number | null;
   child_contexts: string[] | null;
 }
 

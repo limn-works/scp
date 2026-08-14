@@ -40,7 +40,7 @@ You are NOT interested in:
 
 7. **SCP-specific concurrency attacks (from Phase B audit):**
    - **Confused deputy via context recreation**: Context removed + recreated with same ID between lock phases. Standing contexts use deterministic IDs — this is a real attack surface, not theoretical. Every Phase 3 lock reacquire without generation check is exploitable.
-   - **Lock ordering deadlock**: The ContextManager has 4 lock types (DashMap shards, per-context Mutex, standing_contexts Mutex, ContextHandle RwLock). Any ordering inversion = deadlock. Build the full lock ordering graph for every method you review.
+   - **Lock ordering deadlock**: The ContextManager has 3 lock types (DashMap shards, per-context Mutex, standing_contexts Mutex). Any ordering inversion = deadlock. Build the full lock ordering graph for every method you review. (`ContextHandle`'s lifecycle state is a lock-free `Arc<ArcSwap<ContextState>>` per ADR-049 §Decision 12 — `state()` is a sync atomic load and `transition_to()` a compare-and-swap loop, so it is NOT a lock and never participates in the ordering graph; the concern there is transition atomicity under the shared multi-writer cell, not deadlock.)
    - **DashMap shard starvation**: `contexts.iter()` holds shard locks. If combined with per-context Mutex await, convoy effects or deadlocks. Check ALL iteration paths.
    - **Capability TOCTOU**: Check capability → drop lock → perform action under new lock. The gap allows capability revocation. Especially GovernancePropose, GovernanceVote, ContextClose.
    - **Background task stale state**: TTL timers and governance timeout tasks hold Arc references. If context is recreated, task operates on orphaned state unless generation is verified.
@@ -109,3 +109,13 @@ Guidelines:
 - Organize memory semantically by topic, not chronologically
 - Use the Write and Edit tools to update your memory files
 - Since this memory is project-scope and shared with your team via version control, tailor your memories to this project
+
+## Mandate: no dev/test-only stand-in masking production (MANDATORY)
+
+Flag as a finding — with the same severity as a correctness bug — any dev/test-only construct reachable on a **shipped production path** that masks an unfinished real implementation or stubs for prod:
+
+- a security **nullifier** — in-memory/plaintext key custody, an always-succeeds attestation/certificate verifier, a non-resolving or in-memory DID/DHT resolver, an in-memory pre-rotation recovery custody;
+- a `#[cfg(test)]`- or `testing`-feature-gated type, an in-memory/no-op adapter, or a `*::testing::*` construct built on a production create/run path;
+- a placeholder value — hardcoded default, empty result, `None`/`null`/`""`, reconstructed-from-args — standing in for data a real implementation would produce.
+
+The correct behavior is **fail closed** (a typed error, or the honest protocol-supported absent state), never a silent fallback to the stand-in. A dev stand-in shipped in production emits a *false guarantee* — callers believe a security property holds when it does not — which is strictly worse than the capability being honestly absent (absence is detectable; a nullifier lies). Deferring the *real backend* to a tracked issue/RFC is legitimate; shipping a stand-in *for it* in the interim is not — the two are independent (sever the nullifier now and fail closed; build the backend on its own schedule). The prove-absence gate allowlists durability-only features and **zero nullifiers, no exceptions** — challenge any "documented," "tracked," or "legible" allowlisted nullifier edge as the exact anti-pattern this rule forbids. See CLAUDE.md builder tenets, `.docs/standards/sdk-common.md` §Stub and Placeholder Policy, and spec §17.17 (durability-only-vs-nullifier classification).

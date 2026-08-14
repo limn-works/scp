@@ -8,6 +8,3 @@ pub mod block_list;
 pub mod private_state;
 pub mod private_state_events;
 pub mod scpid;
-
-// Re-export identity primitives from scp-primitives for convenience.
-pub use scp_primitives::{SigningKeyId, extract_public_key_from_did};

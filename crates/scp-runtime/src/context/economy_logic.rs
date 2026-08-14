@@ -3,7 +3,7 @@
 //! Implements the correct 9-step payment integration as an escrow pattern:
 //! 1. `authorize_paid_action` — evaluates cost, checks spending UCAN,
 //!    checks budget, calls adapter.authorize (escrow). Returns authorization.
-//! 2. The caller performs the action (encrypt, MLS add, tool execute).
+//! 2. The caller performs the action (encrypt, MLS add, outlet execute).
 //! 3. `complete_paid_action` — captures payment, stores receipt, records spend.
 //! 4. `void_paid_action` — voids authorization, rolls back budget on failure.
 //!
@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use scp_identity::DID;
+use scp_did::{DID, SigningKeyId};
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::crypto::ucan::UcanError;
@@ -28,7 +28,6 @@ use scp_protocol::crypto::ucan::validate::{
 };
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
-use scp_protocol::identity::SigningKeyId;
 
 use crate::economy::adapter::{PaymentAdapterDyn, PaymentReceipt};
 use crate::economy::integration::{self, IntegrationError};
@@ -60,7 +59,7 @@ use crate::economy::integration::{self, IntegrationError};
 /// surfaces as a signature failure — closing the C1 attack where a fabricated
 /// UCAN with no real signer was accepted.
 ///
-/// Public so the cross-context tool-invocation saga handler
+/// Public so the cross-context outlet-invocation saga handler
 /// ([`crate::context::actor::handlers::saga`]) reuses the SAME VM-aware DID→key
 /// adapter for its §7 UCAN re-validation (spec §6.2.4), rather than
 /// reimplementing the `#active`/`#agent` resolution and so producing a divergent
@@ -79,7 +78,7 @@ impl DidResolver for KeyResolverDidResolver<'_> {
     fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], UcanError> {
         // No `kid` in the header: resolve the default verification method
         // (`#active`, the human signing key).
-        let did_owned = scp_identity::DID::from(did.to_owned());
+        let did_owned = scp_did::DID::from(did.to_owned());
         (self.key_resolver)(&did_owned, SigningKeyId::Active)
             .map(|vk| vk.to_bytes())
             .ok_or_else(|| {
@@ -101,7 +100,7 @@ impl DidResolver for KeyResolverDidResolver<'_> {
                  (expected \"#active\" or \"#agent\") for DID '{did}'"
             ))
         })?;
-        let did_owned = scp_identity::DID::from(did.to_owned());
+        let did_owned = scp_did::DID::from(did.to_owned());
         (self.key_resolver)(&did_owned, signing_key_id)
             .map(|vk| vk.to_bytes())
             .ok_or_else(|| {
@@ -122,7 +121,7 @@ impl DidResolver for KeyResolverDidResolver<'_> {
 /// set. This is the opposite of a stub: it is the empty case of a real
 /// integration.
 ///
-/// `pub(crate)` so the cross-context tool-invocation saga handler reuses the
+/// `pub(crate)` so the cross-context outlet-invocation saga handler reuses the
 /// SAME per-context revocation surface for its §7 UCAN re-validation (spec
 /// §6.2.4), backed by the same `revoked_spending_ucan_cids` set.
 pub struct ContextRevocationChecker<'a> {
@@ -156,12 +155,10 @@ pub fn validate_spending_ucan_or_error(
     spending: &scp_protocol::crypto::ucan::UcanToken,
     actor_did: &DID,
     context_id: &str,
-    nonce_tracker: &mut scp_protocol::crypto::ucan::nonce::NonceTracker<
-        Arc<dyn scp_primitives::Clock>,
-    >,
+    nonce_tracker: &mut scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn scp_clock::Clock>>,
     revoked_cids: &HashSet<String>,
     key_resolver: &KeyResolver,
-    clock: &dyn scp_primitives::Clock,
+    clock: &dyn scp_clock::Clock,
 ) -> Result<(), ContextError> {
     let did_resolver = KeyResolverDidResolver::new(key_resolver);
     let revocation_checker = ContextRevocationChecker { revoked_cids };
@@ -196,7 +193,7 @@ pub fn validate_spending_ucan_or_error(
 /// Holds the escrow authorization and evaluated cost so that
 /// `complete_paid_action` and `void_paid_action` can finalize or roll back.
 ///
-/// Field visibility widened to `pub(crate)` in ADR-049 commit 12c.9g.1
+/// Field visibility widened to `pub(crate)` in ADR-049 §15
 /// so the hoisted free functions in
 /// [`crate::context::economy_helpers`] can construct / destructure the
 /// token without going through this module.
@@ -213,7 +210,7 @@ pub struct PaidActionAuthorization {
 
 /// Maps an [`IntegrationError`] to a [`ContextError`] with proper SCP error codes.
 ///
-/// Visibility widened in ADR-049 commit 12c.9g.1 so the hoisted
+/// Visibility widened in ADR-049 §15 so the hoisted
 /// [`crate::context::economy_helpers`] free functions can map the same
 /// way the legacy methods did. The enclosing `economy` module is
 /// `pub(crate)` so the effective visibility is unchanged.
@@ -253,7 +250,7 @@ pub fn integration_error_to_context(err: IntegrationError) -> ContextError {
 
 /// Verifies a receipt and checks it is valid.
 ///
-/// Visibility widened in ADR-049 commit 12c.9g.1 so the hoisted
+/// Visibility widened in ADR-049 §15 so the hoisted
 /// [`crate::context::economy_helpers::complete_paid_action`] free
 /// function can call the same verifier the legacy method did. The
 /// enclosing `economy` module is `pub(crate)` so the effective
@@ -304,12 +301,12 @@ pub struct EnforceEconomyRequest<'a> {
     /// Context ID the spending UCAN must scope to.
     pub context_id: &'a str,
     /// Clock used for UCAN expiry validation.
-    pub clock: &'a dyn scp_primitives::Clock,
+    pub clock: &'a dyn scp_clock::Clock,
     /// Per-context pricing configuration (escalation curve, floor, cap).
     pub pricing: &'a scp_protocol::economy::antispam::ContextMessagePricingConfig,
     /// Per-context nonce tracker for spending-UCAN replay prevention.
     pub nonce_tracker: &'a mut scp_protocol::crypto::ucan::nonce::NonceTracker<
-        std::sync::Arc<dyn scp_primitives::Clock>,
+        std::sync::Arc<dyn scp_clock::Clock>,
     >,
     /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
     ///
@@ -340,7 +337,7 @@ pub struct EnforceEconomyRequest<'a> {
 /// The cost is composed by (a) evaluating the policy formula (if any) to obtain
 /// a base cost — falling back to `pricing.base_cost` when the formula is absent
 /// — and then (b) layering the per-DID escalation/floor/cap from `pricing` via
-/// [`SenderVelocityTracker::compute_escalated_cost`] (spec §19.7).
+/// [`SenderVelocityTracker::compute_escalated_cost`](scp_protocol::economy::antispam::SenderVelocityTracker::compute_escalated_cost) (spec §19.7).
 ///
 /// Returns the deducted cost for rollback on failure, or `None` if no cost.
 pub fn enforce_economy(
@@ -375,12 +372,12 @@ pub fn enforce_economy(
     // pricing formula, evaluate it against observable metrics; otherwise the
     // formula is absent and `evaluate_cost` consults the flat `CostSchedule`.
     //
-    // §19.7 escalation applies to MessageSend, ContextJoin, and ToolInvoke.
+    // §19.7 escalation applies to MessageSend, ContextJoin, and OutletCall.
     // For SubscriptionPeriod and ByteStored we delegate entirely to the
     // policy (no per-DID escalation makes sense for them).
     let escalation_eligible = matches!(
         action_type,
-        PaidActionType::MessageSend | PaidActionType::ContextJoin | PaidActionType::ToolInvoke
+        PaidActionType::MessageSend | PaidActionType::ContextJoin | PaidActionType::OutletCall
     );
 
     let velocity = velocity_tracker.get_velocity(actor_did, now);

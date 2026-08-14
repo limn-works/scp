@@ -14,9 +14,9 @@
 //! - `petname_resolve_context` -- Resolve a petname to context IDs.
 //! - `petname_get_for_did` -- Get the petname for a DID.
 //! - `petname_get_for_context` -- Get the petname for a context.
-//! - `handle_register` -- Register a handle in a context with discovery tools.
-//! - `handle_lookup` -- Look up a handle in a context with discovery tools.
-//! - `handle_deregister` -- Deregister a handle from a context with discovery tools.
+//! - `handle_register` -- Register a handle in a context with discovery outlets.
+//! - `handle_lookup` -- Look up a handle in a context with discovery outlets.
+//! - `handle_deregister` -- Deregister a handle from a context with discovery outlets.
 //! - `address_resolve` -- Resolve an address via multi-path resolution.
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
@@ -185,7 +185,14 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
             })
         })
     } else if query.starts_with("did:") {
-        let did_dht = scp_identity::DidDht::new();
+        // No bridge instance is in scope for this free-function discovery
+        // entrypoint, so build the shipped DHT client fail-closed (real Mainline
+        // Pkarr in a shipped build; the in-memory test seam only under
+        // `testing`). Never a silent in-memory nullifier on a production path
+        // (ADR-062 §Decision 1).
+        let did_dht = scp_identity::DidDht::with_client(std::sync::Arc::new(
+            crate::identity::build_ffi_dht_client().map_err(napi::Error::from)?,
+        ));
         let results = scp_core::discovery::resolve_contexts_from_did(&query, &did_dht)
             .await
             .map_err(|e| {

@@ -36,7 +36,11 @@ startup = ["dep:tracing-subscriber"]
 [dependencies]
 scp-core = { path = "../scp-core", version = "=0.1.0-beta.2" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.2" }
-scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.2" }
+scp-clock = { path = "../scp-clock", version = "=0.1.0-beta.2" }
+# The relay wire types (ClientMessage/RelayMessage + constants + code) live in
+# the wasm-safe scp-relay-client leaf, shared with the in-browser client
+# (ADR-057 Slice 3, Decision D5). The native relay/adapters import them directly.
+scp-relay-client = { path = "../scp-relay-client", version = "=0.1.0-beta.2" }
 scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.2", optional = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

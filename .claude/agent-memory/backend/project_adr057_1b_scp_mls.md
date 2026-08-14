@@ -1,0 +1,41 @@
+---
+name: project-adr057-1b-scp-mls
+description: ADR-057 Slice 1b — extract scp-mls crate (9 sync MLS units) from scp-runtime; wasm32-safe; move map, Clock injection, Prereq-1 finding
+metadata:
+  type: project
+---
+
+ADR-057 Slice 1b: create `crates/scp-mls/` holding the synchronous MLS state machine, wasm32-safe, adopted by scp-runtime with no behavior change. Stacked on Slice 1a (branch `feat/adr057-1a-did-document-protocol` @ 0d4ba99b7, which moved DID-document types to scp-protocol). Worktree branch `feat/adr057-1b-scp-mls`.
+
+**Why:** browser SCP clients run the protocol in-tab over shared scp-mls compiled to wasm32 (keys on-device). The blocker that killed the old WASM bridge was scp-runtime's tokio/actor orchestration, NOT the MLS crypto — which is fully sync and liftable. Headline acceptance: `cargo check -p scp-mls --target wasm32-unknown-unknown` → exit 0.
+
+**How to apply (move map):**
+- The 9 sync units move via `git mv` from `crates/scp-runtime/src/crypto/mls/`: group.rs, encrypt.rs, ratchet.rs, credential.rs, key_package.rs, error.rs, wrapping_extension.rs, epoch_grace.rs + the `pub type InMemoryMlsProvider = openmls_rust_crypto::OpenMlsRustCrypto;` alias (storage.rs:1034).
+- STAYS in scp-runtime: storage.rs / provider.rs / backend.rs / production_backend.rs / storage_adapter.rs (the async durable bridge, block_in_place, ScpMlsProvider<S>).
+- scp-mls deps = scp-protocol, scp-primitives, openmls stack ONLY. MUST NOT dep scp-runtime or scp-identity (mechanical fence). `cargo tree -p scp-mls | grep -E "scp-runtime|scp-identity|tokio"` must be empty.
+- credential.rs imports change `scp_identity::{DidDocument,SigningKeyId,decode_multibase_key}` → `scp_protocol::identity::document::{DidDocument,VerificationMethod,decode_multibase_key}` + `scp_primitives::SigningKeyId`. (Slice 1a moved these to scp_protocol::identity::document; scp_identity merely re-exports.) Test helper at credential.rs:380 uses `scp_identity::document::VerificationMethod` → `scp_protocol::identity::document::VerificationMethod`.
+- Cross-file `super::X` / `crate::crypto::mls::X` become `crate::X` within scp-mls.
+
+**Adoption (LOW churn):** ~108 refs across scp-runtime use `crate::crypto::mls::{module}::Symbol`. Keep `scp-runtime/src/crypto/mls/mod.rs` as a re-export shim: `pub use scp_mls::{group, encrypt, ratchet, credential, key_package, error, wrapping_extension, epoch_grace};` plus the flattened `pub use scp_mls::{ScpCredential, MlsError, ...}`. storage.rs imports `InMemoryMlsProvider` from `scp_mls`. This keeps all 108 call sites compiling unchanged.
+
+**Clock injection (epoch_grace.rs, fix #2):** Currently uses `tokio::time::Instant` for deadlines (monotonic) + to_grace_entries/restore_from_entries convert to/from wall-clock secs via SystemClock. Replace with injected `scp_primitives::Clock`: deadlines stored as `u64` wall-clock millis (`deadline = clock.now_millis() + 30_000`; `clock.now_millis() < deadline`). Clock is a FIELD on EpochGraceStore (Arc<dyn Clock>), NOT on process_commit's signature (that free-fn sig in ratchet.rs:43 stays `&mut EpochGraceStore`). Keep `new()`/`default()` defaulting to SystemClock (preserves ~40 in-crate test sites + 3 store/context.rs test sites). The 4 PRODUCTION sites (state.rs:1486 new_fresh_for_actor, state.rs:1793 restore_grace_store_from_snapshot, lifecycle_helpers.rs:1502/2171) explicitly inject SystemClock. Add `with_clock(Arc<dyn Clock>)`. persisted GraceEntry form already wall-clock-secs — keep.
+
+**wrapping_extension.rs test carve-out (fix #3):** SYNC tests (lines 213-413) move with the file (use only crate-local group/ratchet/credential/epoch_grace + SigningKeyId). 3 tests STAY in scp-runtime (runtime-only deps `crate::crypto::sender_keys`, `scp_platform`): `generate_wrapping_keypair_produces_valid_keypair` (417), `sender_key_request_response_with_wrapping_key` (438, #[tokio::test]), `tampered_wrapping_key_prevents_decryption` (519, #[tokio::test]), + the line-588 test using generate_wrapping_keypair. Put these in a small scp-runtime test module using `scp_mls::wrapping_extension`.
+
+**Prereq-1 finding (openmls Lifetime clock — DOCUMENT, do not silently ship):** openmls 0.8.1 `js` feature wires `fluvio_wasm_timer::SystemTime` reading live `Date.now()`. `Lifetime::new()` (openmls .../key_packages/lifetime.rs:62) reads SystemTime::now() to stamp not_before/not_after; `Lifetime::is_valid()` (lifetime.rs:85) reads it to validate. **openmls 0.8.1 exposes NO builder API to inject a clock into Lifetime** — the now-read is internal to `Lifetime::new`, called by `KeyPackage::builder().build()` (group.rs:609/611) and during add_member/StagedWelcome validation. So routing through a hardened Clock requires an openmls API seam that does not exist cleanly → add `// SECURITY (ADR-057 §Prereq-1):` notes at group.rs KeyPackage build sites flagging the unhardened second clock; actual routing is a follow-up. This is the documented-note case the task specifies.
+
+**Prereq-4 (panic note, fix #4):** encrypt.rs catch_unwind sites at lines 145, 216, 307 — add `// NOTE (ADR-057 §Prereq-4):` that the guard is inert under wasm panic=abort; browser build must use panic=unwind.
+
+**Cargo.toml wasm:** mirror scp-protocol/Cargo.toml `[target.'cfg(target_arch="wasm32")'.dependencies]` getrandom v0.2 js + getrandom_03 (getrandom 0.3) wasm_js + uuid js. openmls in scp-mls = `features = ["libcrux-provider", "js"]` (+ openmls_rust_crypto/memory_storage/traits/basic_credential). Root `.cargo/config.toml` ALREADY sets `getrandom_backend="wasm_js"` for wasm32 globally — no crate-level config needed. Workspace openmls = v0.8 libcrux-provider (root Cargo.toml:42).
+
+**Constraints:** do NOT push, do NOT open PR. Reference ADR-057 in commit; no issue numbers in source. Baseline `cargo build -p scp-runtime` = exit 0 confirmed before changes.
+
+**OUTCOME (committed d8fc5d937 on branch feat/adr057-1b-scp-mls, stacked on 1a 0d4ba99b7; NOT pushed):** All gates green. wasm32 check exit 0; full workspace build clean; full-feature clippy -D warnings clean; fmt clean; fence empty (native+wasm); 2256 scp-mls+scp-runtime tests pass.
+
+**Gotchas discovered (for future slices):**
+- getrandom THREE versions: openmls js feature only wires getrandom 0.3 wasm_js; getrandom 0.4 arrives via libcrux provider (openmls_libcrux_crypto→hpke-rs-libcrux→rand 0.10→getrandom 0.4) and needs its OWN `getrandom_04 = {package=getrandom, version=0.4, features=[wasm_js]}` wasm32 target dep. Root .cargo/config.toml getrandom_backend cfg only covers 0.3.
+- The extraction EXPOSED cross-crate coupling: runtime provider.rs snapshot/restore reads ScpMlsGroup private fields (group/signer/provider) + constructs it + uses private EagerDropSigner. Fix = NEW public seam on scp-mls: ScpMlsGroup::from_parts(group,provider,signer) + signer_key_pair()->Result<&SignatureKeyPair>; made EagerDropSigner pub (new/as_ref/take). 3 envelope/outer/ops.rs test sites also used .signer.as_ref() → signer_key_pair().
+- epoch_grace REAL semantic bug fixed: wall-clock-millis deadlines mean same-millisecond add_epoch calls TIE (monotonic Instant was strictly increasing). Capacity eviction min_by_key MUST break ties by lowest epoch number: `.min_by_key(|&(&epoch,&deadline)| (deadline, epoch))` — closure binds `&(&u64,&u64)`. 2 tests caught it (exceed_max_capacity_by_many, callback_fires_on_capacity_eviction).
+- Prereq-1 CONFIRMED: openmls 0.8.1 Lifetime::new (key_packages/lifetime.rs:62) + is_valid (:85) read SystemTime::now() INTERNALLY; NO injectable-clock seam. Documented at group.rs build sites, routing deferred.
+- CI does NOT gate `cargo doc -D warnings` (ci.yml:564 + docs.yml use plain `cargo doc --no-deps`). scp-runtime has ~62 pre-existing redundant-link/unresolved-link rustdoc warnings in untouched files (class_s.rs etc) — harmless, not introduced. But DO run `RUSTDOCFLAGS=-D warnings cargo doc -p scp-mls` on the new crate: caught 2 broken intra-doc links (zeroize::Zeroize/ZeroizeOnDrop — scp-mls has no zeroize dep; converted to plain code spans).
+- Adoption churn was LOW thanks to mod.rs re-export shim: `pub use scp_mls::{InMemoryMlsProvider, credential, encrypt, epoch_grace, error, group, key_package, ratchet, wrapping_extension};` + flattened type re-exports kept all ~108 `crate::crypto::mls::*` call sites compiling unchanged.

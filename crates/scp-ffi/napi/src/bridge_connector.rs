@@ -226,7 +226,7 @@ pub fn bridge_register(
         })
     })?;
 
-    let approver_did: scp_identity::DID = governance_did.into();
+    let approver_did: scp_did::DID = governance_did.into();
     let (connector, _approval_event) =
         approve_registration(&mut registry, &bridge_id, &approver_did, 0).map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
@@ -307,7 +307,7 @@ pub(crate) fn bridge_create_shadow_on(
 // Credential store operations (§12.11)
 //
 // Per-bridge-instance helpers mirroring the PyO3 `*_impl` functions in
-// `crates/scp-ffi/src/bridge_connector.rs`. Each resolves the credential
+// `crates/scp-ffi/src/bridge_connector.rs`. Each resolves the durable credential
 // store from `bi.credential_store()` and drives the async
 // `BridgeCredentialStore` trait via the shared tokio runtime
 // (`crate::runtime().block_on(...)`) — the napi-rs worker thread has no

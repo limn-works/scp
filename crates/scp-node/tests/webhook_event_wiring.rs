@@ -32,7 +32,7 @@ use std::time::Duration;
 use ed25519_dalek::{SigningKey, Verifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use scp_core::context::membership::ContextEvent;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_node::webhook::{WebhookDispatcher, WebhookTarget, spawn_event_consumer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;

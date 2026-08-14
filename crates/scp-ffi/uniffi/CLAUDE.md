@@ -10,7 +10,7 @@ This crate generates Swift and Kotlin bindings from a single Rust definition via
 
 A single `Arc<Supervisor>` (from `scp-runtime`) is held in the per-bridge `BridgeInstanceCore.supervisor` slot and shared across all bridge functions. The `Supervisor` owns all per-context state (membership, roles, governance, broadcast, TTL) and the injected providers. This replaced the previously-shared `Arc<ContextManager>` (deleted in commit 12 of the ADR-049 ladder; see `.docs/adrs/ADR-049-actor-per-context.md`).
 
-The supervisor is built via `Supervisor::with_providers_and_journal(...)` (durable saga journal) with a real `MlsCryptoProvider::new(local_did)` bound to the caller's DID, a `NotConfiguredTransportProvider` (or `RelayTransportProvider` when `auto_wire_supervisor` succeeds), and a persistent `MerkleEventLogProvider` backed by `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484). The previous DID-less `FfiBridgeCrypto` / `FfiBridgeTransport` stub path was removed — first-call entry points (`context_create`, `context_join`, `context_import`, `register_local_did`, `identity_create`) now all carry the local DID. Platform-specific key custody is injected via the `KeyCustodyProvider` callback.
+The supervisor is built via `Supervisor::with_providers_and_journal(...)` (durable saga journal) with a real `NodeMlsFactory::new(local_did)` bound to the caller's DID, a `NotConfiguredTransportProvider` (or `RelayTransportProvider` when `auto_wire_supervisor` succeeds), and a persistent `MerkleEventLogProvider` backed by `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484). The previous DID-less `FfiBridgeCrypto` / `FfiBridgeTransport` stub path was removed — first-call entry points (`context_create`, `context_join`, `context_import`, `register_local_did`, `identity_create`) now all carry the local DID. Platform-specific key custody is injected via the `KeyCustodyProvider` callback.
 
 Bridge functions access the supervisor via `crate::runtime::supervisor()`.
 
@@ -32,7 +32,7 @@ Single-file bridge (`bridge.rs`) containing all UniFFI exports. Key function gro
 | Broadcast | `broadcast_subscribe`, `broadcast_unsubscribe`, `broadcast_publish`, `broadcast_block_subscriber`, `broadcast_handle_key_request`, `broadcast_subscriber_count`, `broadcast_is_subscriber`, `broadcast_admission` |
 | TTL | `context_handle_ttl_expiry`, `context_propose_ttl_extension`, `context_reset_ttl_timer` |
 | Local DID | `register_local_did`, `is_local_did` |
-| Tools | `tool_register`, `tool_invoke`, `tool_verify` |
+| Outlets | `outlet_register`, `outlet_invoke`, `outlet_verify` |
 | UCAN | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
 | Event Log | `event_log_query`, `event_log_verify` |
 | Transport | `transport_connect`, `transport_disconnect`, `transport_status` |
@@ -47,7 +47,7 @@ Single-file bridge (`bridge.rs`) containing all UniFFI exports. Key function gro
 ### Error Mapping
 
 `ScpError` enum with variants mapping to Swift `throws` / Kotlin exceptions:
-- `Identity`, `Context`, `Permission`, `Crypto`, `Transport`, `Tool`, `Validation`
+- `Identity`, `Context`, `Permission`, `Crypto`, `Transport`, `Outlet`, `Validation`
 - Each variant carries `message` (human-readable) and `code` (SCP-{CATEGORY}-{NUMBER})
 - Comprehensive `From<>` impls for all scp-core error types (15+ conversions)
 

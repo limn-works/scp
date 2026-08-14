@@ -34,7 +34,7 @@
 //!
 //! The MLS sender-key layer (spec §9.16.1, ADR-007) binds each
 //! encryption to the `(epoch, sequence)` pair as AAD. The legacy
-//! [`MlsCryptoProvider::seal`] algorithm at
+//! [`NodeMlsFactory::seal`] algorithm at
 //! `crates/scp-runtime/src/crypto/mls/provider.rs:1051-1107` uses the
 //! CURRENT counter value as the sequence-field input to the AAD
 //! construction, THEN increments the counter (post-increment step at
@@ -79,7 +79,7 @@
 //! with an AAD-mismatch failure. This is the sole known pitfall when
 //! migrating handlers off the legacy `seal`.
 //!
-//! [`MlsCryptoProvider::seal`]: crate::crypto::mls::provider::MlsCryptoProvider
+//! [`NodeMlsFactory::seal`]: crate::crypto::mls::provider::NodeMlsFactory
 
 // ---------------------------------------------------------------------------
 // SendSequenceTracker
@@ -124,12 +124,23 @@ impl SendSequenceTracker {
     /// Reserve the next sequence number. Increments the high-water mark
     /// and returns the newly-issued number.
     ///
-    /// Wraps `u64`; per `SCP` protocol the protocol-level u64 ceiling is
-    /// far beyond any realistic per-context send rate (2^64 messages),
-    /// so wrap is impossible in practice. We `saturating_add` defensively
-    /// — a reservation request after saturation returns `u64::MAX`
-    /// repeatedly until the actor restarts; the impossible case fails
-    /// loudly rather than wrapping silently.
+    /// Per `SCP` protocol the u64 ceiling is far beyond any realistic
+    /// per-context send rate (2^64 messages), so reaching it is impossible in
+    /// practice. We `saturating_add` defensively — at `u64::MAX` a reservation
+    /// request returns `u64::MAX` repeatedly (the counter never wraps to `0`,
+    /// which would reuse an AAD sequence). This is a SATURATING floor, NOT a
+    /// fail-loud error: `reserve_next` itself does not signal overflow.
+    ///
+    /// Callers that need behavioral parity with the legacy
+    /// [`ContextCryptoState::seal`] overflow semantics (`send_sequence
+    /// .checked_add(1)?` — fail-closed, emit nothing at `u64::MAX`) MUST guard
+    /// the boundary at their own call site by checking [`Self::last_issued`]
+    /// `== u64::MAX` BEFORE reserving and erroring if so. The seal path
+    /// ([`ContextCryptoState::seal`](crate::context::actor::state::ContextCryptoState::seal)) does exactly this;
+    /// the saturating behavior here is the RAII-rollback substrate, deliberately
+    /// non-erroring so `reserve` / `commit` stay infallible for the common path.
+    ///
+    /// [`ContextCryptoState::seal`]: crate::context::actor::state::ContextCryptoState::seal
     pub const fn reserve_next(&mut self) -> u64 {
         self.last_issued = self.last_issued.saturating_add(1);
         self.last_issued
@@ -167,7 +178,7 @@ impl SendSequenceTracker {
     /// 2. **Tests** — assert tracker position after a sequence of
     ///    reserve / rollback operations.
     /// 3. **AAD byte-identity (critical)** — handlers migrating off the
-    ///    legacy [`MlsCryptoProvider::seal`] path MUST read
+    ///    legacy [`NodeMlsFactory::seal`] path MUST read
     ///    `last_issued()` BEFORE calling
     ///    [`SequenceReservation::reserve`] to obtain the pre-increment
     ///    value required by the sender-layer AEAD AAD. See the module
@@ -177,7 +188,7 @@ impl SendSequenceTracker {
     ///    regression that will cause receivers running the legacy
     ///    decrypt path to reject every message.
     ///
-    /// [`MlsCryptoProvider::seal`]: crate::crypto::mls::provider::MlsCryptoProvider
+    /// [`NodeMlsFactory::seal`]: crate::crypto::mls::provider::NodeMlsFactory
     #[must_use]
     pub const fn last_issued(&self) -> u64 {
         self.last_issued
@@ -452,7 +463,7 @@ mod tests {
 
     /// AAD byte-identity convention: `last_issued()` BEFORE
     /// [`SequenceReservation::reserve`] returns the value the legacy
-    /// [`MlsCryptoProvider::seal`] path uses as the sender-layer AAD
+    /// [`NodeMlsFactory::seal`] path uses as the sender-layer AAD
     /// sequence component (0-based, pre-increment). After the
     /// reservation is created, [`SequenceReservation::number`] returns
     /// the wire-layer sequence (1-based, post-increment).
@@ -460,7 +471,7 @@ mod tests {
     /// This test pins both semantics together so a future refactor
     /// that changes either one is caught before it ships.
     ///
-    /// [`MlsCryptoProvider::seal`]: crate::crypto::mls::provider::MlsCryptoProvider
+    /// [`NodeMlsFactory::seal`]: crate::crypto::mls::provider::NodeMlsFactory
     #[test]
     fn last_issued_before_reserve_yields_legacy_aad_sequence() {
         let mut t = SendSequenceTracker::new();

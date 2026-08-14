@@ -26,11 +26,11 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::TransportError;
-use crate::native::protocol::{ClientMessage, RelayMessage};
 use crate::quic::lifecycle::QuicLifecycleManager;
 use crate::quic::streams::{LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE};
 use crate::subscription::{MAX_TRANSPORT_SUBSCRIPTIONS, TransportSubscriptionMap};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
+use scp_relay_client::{ClientMessage, RelayMessage};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
 /// [`TransportAdapter`] methods to ensure the trait is dyn-compatible.

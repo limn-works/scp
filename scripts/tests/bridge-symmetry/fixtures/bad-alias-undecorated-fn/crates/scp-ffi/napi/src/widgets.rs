@@ -12,7 +12,7 @@
 // crosses the FFI boundary regardless of any decoration the macro might
 // or might not be applied to.
 //
-// The PyO3 / UniFFI / WASM siblings DO carry their bridge-specific macro
+// The PyO3 / UniFFI siblings DO carry their bridge-specific macro
 // so the script's finding pinpoints napi exclusively.
 
 pub fn widget_create() {}

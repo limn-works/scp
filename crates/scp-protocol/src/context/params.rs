@@ -12,13 +12,13 @@
 
 use std::time::Duration;
 
-use scp_primitives::DID;
+use scp_did::DID;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::BridgeMode;
 use crate::economy::EconomicPolicy;
 use crate::provenance::CounterpartyPolicy;
-use crate::trust::RequireParticipation;
+use crate::trust::{CapabilityRequirement, RequireParticipation};
 
 pub use super::close::IncompleteVerificationPolicy;
 
@@ -44,15 +44,35 @@ pub use super::roles::Capability;
 pub use super::roles::RoleDefinition;
 
 // ---------------------------------------------------------------------------
-// ToolRegistration (re-export from tools/registry module)
+// OutletRegistration (re-export from outlets/registry module)
 // ---------------------------------------------------------------------------
 
-/// Re-export of the full [`ToolRegistration`] type from
-/// `tools/registry.rs`, which includes `tool_id`, `name`,
+/// Re-export of the full [`OutletRegistration`] type from
+/// `outlets/registry.rs`, which includes `outlet_id`, `name`,
 /// `description`, `schema`, `implementation_hash`, `test_vectors`,
 /// `operator_did`, and `cost`. See ADR-010 in
 /// `.docs/adrs/phase-2.md`.
-pub use super::tools::ToolRegistration;
+pub use super::outlets::OutletRegistration;
+
+// ---------------------------------------------------------------------------
+// OutletInterfaceDefaults (re-export — spec §6.2.0.2 classification-aware
+// rate tiers)
+// ---------------------------------------------------------------------------
+
+/// Re-export of [`super::outlets::interface::OutletInterfaceDefaults`] —
+/// the §6.2.0.2 classification-aware cross-context rate-tier defaults.
+///
+/// `OutletInterfaceDefaults::for_kind(OutletKind::Query)` returns
+/// `(per_interface = 600, per_caller = 100)`;
+/// `OutletInterfaceDefaults::for_kind(OutletKind::Action)` returns
+/// `(60, 10)` — the pre-classification baseline preserved for the Action
+/// tier per §6.2.0.2. Callers MUST use this helper rather than hardcoding
+/// `60` or `600` so a future spec revision that adjusts the tiers updates
+/// one helper and every call site follows.
+///
+/// See [`super::outlets::interface::OutletInterfaceDefaults`] for full
+/// rationale.
+pub use super::outlets::interface::OutletInterfaceDefaults;
 
 // ---------------------------------------------------------------------------
 // ContextMode
@@ -227,7 +247,7 @@ pub enum TemplateId {
     BilateralEphemeral,
     /// Messaging-only, full memory, no TTL.
     BilateralPersistent,
-    /// Messaging + tools, summary memory, TTL required.
+    /// Messaging + outlets, summary memory, TTL required.
     Coordination,
     /// Messaging + invites, full memory, optional TTL.
     GroupDiscussion,
@@ -235,12 +255,12 @@ pub enum TemplateId {
     PublicBroadcast,
     /// Broadcast mode, UCAN-gated subscriber access (spec section 5.14).
     GatedBroadcast,
-    /// Cross-context tool interface template (spec section 5.12.1, 6.2).
-    /// Messaging + tools + tool interface exposure, full memory, TTL optional.
-    #[serde(rename = "scp:template/tool-interface")]
-    ToolInterfaceTemplate,
-    /// Tool invocation context with per-invoke cost. Extends `tool-interface`.
-    /// Requires `economic_policy` with `per_tool_invoke` set at creation.
+    /// Cross-context outlet interface template (spec section 5.12.1, 6.2).
+    /// Messaging + outlets + outlet interface exposure, full memory, TTL optional.
+    #[serde(rename = "scp:template/outlet-interface")]
+    OutletInterfaceTemplate,
+    /// Outlet invocation context with per-invoke cost. Extends `outlet-interface`.
+    /// Requires `economic_policy` with `per_outlet_call` set at creation.
     ///
     /// See spec section 19.10 and ADR-033.
     #[serde(rename = "scp:template/paid-service")]
@@ -251,9 +271,9 @@ pub enum TemplateId {
     /// See spec section 19.10 and ADR-033.
     #[serde(rename = "scp:template/paid-broadcast")]
     PaidBroadcast,
-    /// Handle registry template. Encrypted mode with messaging + tool invocation
+    /// Handle registry template. Encrypted mode with messaging + outlet invocation
     /// ceiling, discoverable by default. Used for human-readable addressing
-    /// and agent discovery via standardized tool schemas (ADR-020, §22).
+    /// and agent discovery via standardized outlet schemas (ADR-020, §22).
     #[serde(
         rename = "scp:template/handle-registry",
         alias = "scp:template/discovery-context"
@@ -303,8 +323,8 @@ pub struct MetadataVisibilityPolicy {
     pub description: FieldVisibility,
     /// Visibility of the context's economic policy.
     pub economic_policy: FieldVisibility,
-    /// Visibility of the count of registered tool interfaces.
-    pub tool_interface_count: FieldVisibility,
+    /// Visibility of the count of registered outlet interfaces.
+    pub outlet_interface_count: FieldVisibility,
     /// Visibility of child context summary information.
     pub child_context_info: FieldVisibility,
 }
@@ -542,8 +562,8 @@ pub struct PublicMetadata {
     pub description: Option<String>,
     /// Economic policy. `None` when hidden by `MemberOnly`, absent, or unavailable.
     pub economic_policy: Option<EconomicPolicy>,
-    /// Count of registered tool interfaces. `None` when hidden by `MemberOnly` or unavailable.
-    pub tool_interface_count: Option<u32>,
+    /// Count of registered outlet interfaces. `None` when hidden by `MemberOnly` or unavailable.
+    pub outlet_interface_count: Option<u32>,
     /// Child context summary information. `None` when hidden by `MemberOnly` or unavailable.
     pub child_context_info: Option<Vec<String>>,
 }
@@ -563,8 +583,8 @@ pub struct RuntimeMetadata {
     pub name: Option<String>,
     /// Human-readable context description.
     pub description: Option<String>,
-    /// Count of registered tool interfaces.
-    pub tool_interface_count: Option<u32>,
+    /// Count of registered outlet interfaces.
+    pub outlet_interface_count: Option<u32>,
     /// Child context summary information (e.g., parent context IDs, summaries).
     pub child_context_info: Option<Vec<String>>,
     /// Active bridge connectors registered in this context (spec §12.2, §12.6.1).
@@ -632,7 +652,7 @@ pub struct ConsequenceConfig {
 /// Full configuration for an SCP context, declared at creation time.
 ///
 /// `ContextParams` captures every parameter that defines a context's behavior:
-/// encryption mode, capability ceiling, roles, tools, time-to-live, memory
+/// encryption mode, capability ceiling, roles, outlets, time-to-live, memory
 /// retention, and governance model. Most fields are immutable after creation.
 ///
 /// For template-based creation, all fields must match the template definition
@@ -665,8 +685,8 @@ pub struct ContextParams {
     /// the capability ceiling.
     pub roles: Vec<RoleDefinition>,
 
-    /// Initial tool registrations available within this context.
-    pub tools: Vec<ToolRegistration>,
+    /// Initial outlet registrations available within this context.
+    pub outlets: Vec<OutletRegistration>,
 
     /// Optional time-to-live. When set, the context automatically expires
     /// after this duration. Extension requires unanimous member consent.
@@ -718,7 +738,7 @@ pub struct ContextParams {
     /// When `None`, the default of 8 hops applies (ADR-043). The u8 type
     /// naturally bounds the range to [0, 255].
     ///
-    /// This bounds the worst-case amplification factor for cross-context tool
+    /// This bounds the worst-case amplification factor for cross-context outlet
     /// call chains originating from or passing through this context.
     #[serde(default)]
     pub max_chain_depth: Option<u8>,
@@ -756,8 +776,39 @@ pub struct ContextParams {
     /// When non-empty, joining members must present [`crate::trust::participation::ParticipationProfile`]
     /// attestations satisfying every entry. Empty means no participation
     /// requirements (the default).
+    ///
+    /// SECURITY (issuer legitimacy): a
+    /// [`ParticipationFact::AttestationCount`](crate::trust::ParticipationFact::AttestationCount)
+    /// requirement gates on a raw count of authentic-but-self-issuable
+    /// endorsements with NO issuer-independence / Sybil guarantee — an issuer is
+    /// self-certifying, so a joining subject can mint endorsements from DIDs it
+    /// controls to clear the threshold. A context that needs Sybil-resistant
+    /// admission MUST instead configure `sybil_policy` (the independence-scored
+    /// threshold path), not rely on an `AttestationCount` participation
+    /// requirement.
     #[serde(default)]
     pub participation_requirements: Vec<RequireParticipation>,
+
+    /// Capability requirements a joining agent must satisfy for admission
+    /// (spec §7.3.4.4, ADR-041 AC6). Each entry pairs a capability URI with a
+    /// required [`VerificationLevel`](crate::trust::VerificationLevel)
+    /// (`SelfAttested` or `ChallengeVerified`); admission is checked mechanically
+    /// by [`check_capability_requirements`](crate::trust::check_capability_requirements)
+    /// against the joining agent's self-attested capabilities and
+    /// challenge-verification records. Empty (the default) means no capability
+    /// requirements.
+    ///
+    /// SECURITY (verifier legitimacy): a `ChallengeVerified` requirement is
+    /// satisfied only by a `ChallengeVerification` whose verifier signature is
+    /// authentic and whose signed `subject_did`/`context_id` match the agent and
+    /// context being admitted — but a `verifier_did` is self-certifying, so
+    /// signature authenticity does NOT establish that the verifier is
+    /// *authorized/trusted*. A context that needs verifier legitimacy must
+    /// establish it separately (a trusted-verifier set, a context-membership
+    /// proof, or the §7.3.5 threshold/independence path), not rely on a passing
+    /// challenge-verification check alone.
+    #[serde(default)]
+    pub capability_requirements: Vec<CapabilityRequirement>,
 
     /// Policy for handling incomplete summary verification at window expiry.
     ///
@@ -820,6 +871,94 @@ pub struct ContextParams {
     /// check is performed — any valid DID can join.
     #[serde(default)]
     pub sybil_policy: Option<crate::trust::sybil::ContextSybilPolicy>,
+
+    /// Default per-stream credit window, in chunks, applied when an
+    /// `OutletStreamOpen` does not declare an explicit `credit_window`
+    /// (spec §5.4.5, §9.18.B). A stream opens with this many chunks of
+    /// headroom; each Data/Progress chunk decrements credit, and a signed
+    /// `OutletStreamCredit` grant tops it back up. Default `32`.
+    #[serde(default = "default_stream_window_default")]
+    pub stream_window_default: u32,
+
+    /// Seconds the streaming framework waits, after credit reaches `0` and
+    /// no valid grant arrives, before cancelling the stream with the
+    /// `SCP-OUTLET-6133` `execution.credit-stall` terminal error
+    /// (spec §5.4.5, §9.18.B). Default `30`.
+    #[serde(default = "default_stream_credit_stall_secs")]
+    pub stream_credit_stall_secs: u32,
+
+    /// Seconds the framework allows an executor to emit the terminal chunk
+    /// after an `OutletCancel` is received before forcing closure with the
+    /// `SCP-OUTLET-6135` `execution.cancel-ack-timeout` error
+    /// (spec §5.4.5, §9.18.B). Default `5`.
+    #[serde(default = "default_stream_cancel_ack_secs")]
+    pub stream_cancel_ack_secs: u32,
+
+    /// Period, in seconds, of the receiver-side authoritative UCAN
+    /// revocation re-check timer that runs for a stream's entire active
+    /// lifetime (spec §5.4.5 "Revocation re-check cadence", §9.18.B).
+    /// Range `[1, 60]`. Default `10`.
+    #[serde(default = "default_stream_ucan_recheck_secs")]
+    pub stream_ucan_recheck_secs: u32,
+
+    /// Maximum concurrent inbound streams a single immediate-previous-hop
+    /// invoker DID may hold open against this context (spec §5.4.5 round-5
+    /// per-invoker admission tier, §9.18.B). Bounds the `DoS` surface a single
+    /// neighbour can mount. Default `8`.
+    #[serde(default = "default_max_concurrent_inbound_streams_per_invoker")]
+    pub max_concurrent_inbound_streams_per_invoker: u32,
+
+    /// Maximum concurrent inbound streams a single origin invoker (the
+    /// outermost UCAN `iss`) may hold open, tracked by the operator across
+    /// every interface it hosts (spec §5.4.5 round-5 per-origin-invoker
+    /// admission tier, §9.18.B). Bounds fan-out from one origin regardless
+    /// of delegation-chain rewriting. Default `16`.
+    #[serde(default = "default_max_concurrent_inbound_streams_per_origin_invoker")]
+    pub max_concurrent_inbound_streams_per_origin_invoker: u32,
+
+    /// Maximum concurrent inbound streams against any one outlet across all
+    /// invokers (spec §5.4.5 round-5 per-outlet admission tier, §9.18.B).
+    /// Bounds total fan-in to a single outlet. Default `128`.
+    #[serde(default = "default_max_concurrent_inbound_streams_per_outlet")]
+    pub max_concurrent_inbound_streams_per_outlet: u32,
+}
+
+/// §9.18.B default for [`ContextParams::stream_window_default`] (chunks).
+const fn default_stream_window_default() -> u32 {
+    32
+}
+
+/// §9.18.B default for [`ContextParams::stream_credit_stall_secs`] (seconds).
+const fn default_stream_credit_stall_secs() -> u32 {
+    30
+}
+
+/// §9.18.B default for [`ContextParams::stream_cancel_ack_secs`] (seconds).
+const fn default_stream_cancel_ack_secs() -> u32 {
+    5
+}
+
+/// §9.18.B default for [`ContextParams::stream_ucan_recheck_secs`] (seconds).
+const fn default_stream_ucan_recheck_secs() -> u32 {
+    10
+}
+
+/// §9.18.B default for
+/// [`ContextParams::max_concurrent_inbound_streams_per_invoker`].
+const fn default_max_concurrent_inbound_streams_per_invoker() -> u32 {
+    8
+}
+
+/// §9.18.B default for
+/// [`ContextParams::max_concurrent_inbound_streams_per_origin_invoker`].
+const fn default_max_concurrent_inbound_streams_per_origin_invoker() -> u32 {
+    16
+}
+
+/// §9.18.B default for
+/// [`ContextParams::max_concurrent_inbound_streams_per_outlet`].
+const fn default_max_concurrent_inbound_streams_per_outlet() -> u32 {
+    128
 }
 
 impl Default for ContextParams {
@@ -830,7 +969,7 @@ impl Default for ContextParams {
             ceiling_policy: CeilingPolicy::default(),
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: Vec::new(),
-            tools: Vec::new(),
+            outlets: Vec::new(),
             ttl: None,
             memory_scope: MemoryScope::Ephemeral,
             governance: GovernanceModel::SingleAdmin,
@@ -844,12 +983,23 @@ impl Default for ContextParams {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
+            capability_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            stream_window_default: default_stream_window_default(),
+            stream_credit_stall_secs: default_stream_credit_stall_secs(),
+            stream_cancel_ack_secs: default_stream_cancel_ack_secs(),
+            stream_ucan_recheck_secs: default_stream_ucan_recheck_secs(),
+            max_concurrent_inbound_streams_per_invoker:
+                default_max_concurrent_inbound_streams_per_invoker(),
+            max_concurrent_inbound_streams_per_origin_invoker:
+                default_max_concurrent_inbound_streams_per_origin_invoker(),
+            max_concurrent_inbound_streams_per_outlet:
+                default_max_concurrent_inbound_streams_per_outlet(),
         }
     }
 }
@@ -927,7 +1077,7 @@ impl ContextParams {
     ///
     /// Fields that live on `ContextParams` (e.g., `economic_policy`) are
     /// filtered directly. Fields that are runtime state (member count, context
-    /// age, creator identity, name, description, tool interface count, child
+    /// age, creator identity, name, description, outlet interface count, child
     /// context info) must be supplied via [`RuntimeMetadata`].
     #[must_use]
     pub fn public_metadata(&self, runtime: &RuntimeMetadata) -> PublicMetadata {
@@ -956,9 +1106,9 @@ impl ContextParams {
             name: filter_field(vis.name, runtime.name.clone()),
             description: filter_field(vis.description, runtime.description.clone()),
             economic_policy: filter_field(vis.economic_policy, self.economic_policy.clone()),
-            tool_interface_count: filter_field(
-                vis.tool_interface_count,
-                runtime.tool_interface_count,
+            outlet_interface_count: filter_field(
+                vis.outlet_interface_count,
+                runtime.outlet_interface_count,
             ),
             child_context_info: filter_field(
                 vis.child_context_info,
@@ -979,7 +1129,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::context::tools::ToolSchema;
+    use crate::context::outlets::OutletSchema;
 
     #[test]
     fn context_mode_default_is_encrypted() {
@@ -999,7 +1149,7 @@ mod tests {
         assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
         assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
         assert!(params.roles.is_empty());
-        assert!(params.tools.is_empty());
+        assert!(params.outlets.is_empty());
         assert!(params.ttl.is_none());
         assert_eq!(params.memory_scope, MemoryScope::Ephemeral);
         assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -1011,6 +1161,15 @@ mod tests {
         );
         assert!(params.projection_policy.is_none());
         assert!(params.participation_requirements.is_empty());
+        assert!(params.capability_requirements.is_empty());
+        // §9.18.B streaming defaults (SCP-OUT-034 AC1).
+        assert_eq!(params.stream_window_default, 32);
+        assert_eq!(params.stream_credit_stall_secs, 30);
+        assert_eq!(params.stream_cancel_ack_secs, 5);
+        assert_eq!(params.stream_ucan_recheck_secs, 10);
+        assert_eq!(params.max_concurrent_inbound_streams_per_invoker, 8);
+        assert_eq!(params.max_concurrent_inbound_streams_per_origin_invoker, 16);
+        assert_eq!(params.max_concurrent_inbound_streams_per_outlet, 128);
     }
 
     #[test]
@@ -1018,8 +1177,8 @@ mod tests {
         let params = ContextParams {
             mode: ContextMode::Broadcast,
             ceiling: vec![
-                Capability::new("messages:read"),
-                Capability::new("messages:write"),
+                Capability::new("messages:read").expect("known capability stem"),
+                Capability::new("messages:write").expect("known capability stem"),
             ],
             ceiling_policy: CeilingPolicy::Governed,
             promotion_policy: PromotionPolicy::Promotable,
@@ -1036,16 +1195,19 @@ mod tests {
                     capabilities: HashSet::from([Capability::MessagesRead]),
                 },
             ],
-            tools: vec![ToolRegistration {
-                tool_id: "recipe-search".to_owned(),
+            outlets: vec![OutletRegistration {
+                outlet_id: "recipe-search".to_owned(),
+                kind: crate::context::outlets::OutletKind::Action,
                 name: "recipe-search".to_owned(),
                 description: "Search for recipes".to_owned(),
-                schema: ToolSchema {
+                schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object"}),
                     output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
                 },
                 implementation_hash: [0u8; 32],
                 test_vectors: vec![],
+                message_catalog: Vec::new(),
                 operator_did: "did:dht:z6MkTestOperator".into(),
                 cost: None,
                 registered_at: 0,
@@ -1064,12 +1226,20 @@ mod tests {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
+            capability_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            stream_window_default: 32,
+            stream_credit_stall_secs: 30,
+            stream_cancel_ack_secs: 5,
+            stream_ucan_recheck_secs: 10,
+            max_concurrent_inbound_streams_per_invoker: 8,
+            max_concurrent_inbound_streams_per_origin_invoker: 16,
+            max_concurrent_inbound_streams_per_outlet: 128,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -1078,7 +1248,7 @@ mod tests {
         assert_eq!(params.ceiling_policy, CeilingPolicy::Governed);
         assert_eq!(params.promotion_policy, PromotionPolicy::Promotable);
         assert_eq!(params.roles.len(), 2);
-        assert_eq!(params.tools.len(), 1);
+        assert_eq!(params.outlets.len(), 1);
         assert_eq!(params.ttl, Some(Duration::from_hours(1)));
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.template_id, Some(TemplateId::PublicBroadcast));
@@ -1087,7 +1257,7 @@ mod tests {
 
     #[test]
     fn capability_new_and_name() {
-        let cap = Capability::new("messages:write");
+        let cap = Capability::new("messages:write").expect("known capability stem");
         assert_eq!(cap.name(), "messages:write");
     }
 
@@ -1102,24 +1272,27 @@ mod tests {
     }
 
     #[test]
-    fn tool_registration_clone_eq() {
-        let tool = ToolRegistration {
-            tool_id: "search".to_owned(),
+    fn outlet_registration_clone_eq() {
+        let outlet = OutletRegistration {
+            outlet_id: "search".to_owned(),
+            kind: crate::context::outlets::OutletKind::Action,
             name: "search".to_owned(),
-            description: "Search tool".to_owned(),
-            schema: ToolSchema {
+            description: "Search outlet".to_owned(),
+            schema: OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
+            message_catalog: Vec::new(),
             operator_did: "did:dht:z6MkTestOperator".into(),
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
         };
-        let cloned = tool.clone();
-        assert_eq!(tool, cloned);
+        let cloned = outlet.clone();
+        assert_eq!(outlet, cloned);
     }
 
     #[test]
@@ -1186,14 +1359,14 @@ mod tests {
     fn context_params_serialization_roundtrip() {
         let params = ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability stem")],
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: vec![RoleDefinition {
                 name: "member".to_owned(),
                 capabilities: HashSet::from([Capability::MessagesRead]),
             }],
-            tools: vec![],
+            outlets: vec![],
             ttl: Some(Duration::from_mins(5)),
             memory_scope: MemoryScope::Summary,
             governance: GovernanceModel::SingleAdmin,
@@ -1207,12 +1380,14 @@ mod tests {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
+            capability_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            ..ContextParams::default()
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -1231,11 +1406,11 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability stem")],
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: vec![],
-            tools: vec![],
+            outlets: vec![],
             ttl: None,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
@@ -1245,7 +1420,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: Some(Amount(1)),
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: Some(Amount(100)),
                     per_period: None,
                     per_byte_stored: None,
@@ -1270,12 +1445,14 @@ mod tests {
             session_cap: None,
             counterparty_policy: CounterpartyPolicy::default(),
             participation_requirements: Vec::new(),
+            capability_requirements: Vec::new(),
             incomplete_verification_policy: IncompleteVerificationPolicy::default(),
             min_protocol_version: None,
             migration_source: None,
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            ..ContextParams::default()
         };
 
         let json = serde_json::to_string(&params).unwrap();
@@ -1294,7 +1471,7 @@ mod tests {
             "ceiling_policy": "Immutable",
             "promotion_policy": "NoPromotion",
             "roles": [],
-            "tools": [],
+            "outlets": [],
             "ttl": null,
             "memory_scope": "Ephemeral",
             "governance": "SingleAdmin",
@@ -1309,6 +1486,7 @@ mod tests {
         );
         assert!(params.projection_policy.is_none());
         assert!(params.participation_requirements.is_empty());
+        assert!(params.capability_requirements.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1342,7 +1520,7 @@ mod tests {
         assert_eq!(policy.name, FieldVisibility::PreJoin);
         assert_eq!(policy.description, FieldVisibility::PreJoin);
         assert_eq!(policy.economic_policy, FieldVisibility::PreJoin);
-        assert_eq!(policy.tool_interface_count, FieldVisibility::PreJoin);
+        assert_eq!(policy.outlet_interface_count, FieldVisibility::PreJoin);
         assert_eq!(policy.child_context_info, FieldVisibility::PreJoin);
     }
 
@@ -1355,7 +1533,7 @@ mod tests {
             name: FieldVisibility::PreJoin,
             description: FieldVisibility::PreJoin,
             economic_policy: FieldVisibility::MemberOnly,
-            tool_interface_count: FieldVisibility::PreJoin,
+            outlet_interface_count: FieldVisibility::PreJoin,
             child_context_info: FieldVisibility::MemberOnly,
         };
         let json = serde_json::to_string(&policy).unwrap();
@@ -1424,7 +1602,7 @@ mod tests {
             creator_identity: Some(DID::from("did:dht:z6MkCreator")),
             name: Some("Test Context".to_owned()),
             description: Some("A test context".to_owned()),
-            tool_interface_count: Some(3),
+            outlet_interface_count: Some(3),
             child_context_info: Some(vec!["child-1".to_owned(), "child-2".to_owned()]),
             bridges: Vec::new(),
             bridge_operator_dids: Vec::new(),
@@ -1436,7 +1614,7 @@ mod tests {
         // Default MetadataVisibilityPolicy has all fields PreJoin,
         // so public_metadata() should return everything.
         let params = ContextParams {
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability stem")],
             mode: ContextMode::Encrypted,
             ..ContextParams::default()
         };
@@ -1467,7 +1645,7 @@ mod tests {
         );
         assert_eq!(meta.name, Some("Test Context".to_owned()));
         assert_eq!(meta.description, Some("A test context".to_owned()));
-        assert_eq!(meta.tool_interface_count, Some(3));
+        assert_eq!(meta.outlet_interface_count, Some(3));
         assert_eq!(
             meta.child_context_info,
             Some(vec!["child-1".to_owned(), "child-2".to_owned()])
@@ -1520,8 +1698,8 @@ mod tests {
         // Even with all operational fields MemberOnly, structural fields persist.
         let params = ContextParams {
             ceiling: vec![
-                Capability::new("messages:read"),
-                Capability::new("messages:write"),
+                Capability::new("messages:read").expect("known capability stem"),
+                Capability::new("messages:write").expect("known capability stem"),
             ],
             ceiling_policy: CeilingPolicy::Governed,
             mode: ContextMode::Broadcast,
@@ -1541,7 +1719,7 @@ mod tests {
                 name: FieldVisibility::MemberOnly,
                 description: FieldVisibility::MemberOnly,
                 economic_policy: FieldVisibility::MemberOnly,
-                tool_interface_count: FieldVisibility::MemberOnly,
+                outlet_interface_count: FieldVisibility::MemberOnly,
                 child_context_info: FieldVisibility::MemberOnly,
             },
             ..ContextParams::default()
@@ -1571,7 +1749,7 @@ mod tests {
         assert!(meta.name.is_none());
         assert!(meta.description.is_none());
         assert!(meta.economic_policy.is_none());
-        assert!(meta.tool_interface_count.is_none());
+        assert!(meta.outlet_interface_count.is_none());
         assert!(meta.child_context_info.is_none());
     }
 
@@ -1586,7 +1764,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("USD"),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1630,7 +1808,7 @@ mod tests {
         assert!(meta.creator_identity.is_none());
         assert!(meta.name.is_none());
         assert!(meta.description.is_none());
-        assert!(meta.tool_interface_count.is_none());
+        assert!(meta.outlet_interface_count.is_none());
         assert!(meta.child_context_info.is_none());
     }
 
@@ -1657,7 +1835,7 @@ mod tests {
         // Remaining operational fields still visible.
         assert_eq!(meta.name, Some("Test Context".to_owned()));
         assert_eq!(meta.description, Some("A test context".to_owned()));
-        assert_eq!(meta.tool_interface_count, Some(3));
+        assert_eq!(meta.outlet_interface_count, Some(3));
         assert_eq!(
             meta.child_context_info,
             Some(vec!["child-1".to_owned(), "child-2".to_owned()])
@@ -1688,7 +1866,7 @@ mod tests {
         let meta = params.public_metadata(&runtime);
 
         // Bilateral-ephemeral: member_count, context_age, creator_identity
-        // (and description, economic_policy, tool_interface_count, child_context_info)
+        // (and description, economic_policy, outlet_interface_count, child_context_info)
         // are all MemberOnly. Only name is PreJoin.
         assert!(meta.member_count.is_none(), "member_count should be hidden");
         assert!(meta.context_age.is_none(), "context_age should be hidden");
@@ -1709,7 +1887,7 @@ mod tests {
     #[test]
     fn public_metadata_serialization_roundtrip() {
         let params = ContextParams {
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability stem")],
             ..ContextParams::default()
         };
         let runtime = full_runtime();
@@ -1770,7 +1948,7 @@ mod tests {
                 name: FieldVisibility::MemberOnly,
                 description: FieldVisibility::MemberOnly,
                 economic_policy: FieldVisibility::MemberOnly,
-                tool_interface_count: FieldVisibility::MemberOnly,
+                outlet_interface_count: FieldVisibility::MemberOnly,
                 child_context_info: FieldVisibility::MemberOnly,
             },
             ..ContextParams::default()
@@ -1817,7 +1995,7 @@ mod tests {
         let params = ContextParams {
             participation_requirements: vec![
                 RequireParticipation {
-                    fact: ParticipationFact::ToolInvocationCount,
+                    fact: ParticipationFact::OutletInvocationCount,
                     threshold: ParticipationThreshold::AtLeast(100),
                     max_age_secs: 86400,
                     min_contexts: 2,
@@ -1847,7 +2025,7 @@ mod tests {
             "ceiling_policy": "Immutable",
             "promotion_policy": "NoPromotion",
             "roles": [],
-            "tools": [],
+            "outlets": [],
             "ttl": null,
             "memory_scope": "Ephemeral",
             "governance": "SingleAdmin",
@@ -1855,6 +2033,56 @@ mod tests {
         }"#;
         let params: ContextParams = serde_json::from_str(json).unwrap();
         assert!(params.participation_requirements.is_empty());
+        assert!(params.capability_requirements.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // capability_requirements (SCP-ACR-008, §7.3.4.4 / ADR-041 AC6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capability_requirements_serde_roundtrip() {
+        use crate::trust::{CapabilityRequirement, VerificationLevel};
+
+        let params = ContextParams {
+            capability_requirements: vec![
+                CapabilityRequirement {
+                    capability: "scp:capability:schema-validation/v1".parse().unwrap(),
+                    verification_level: VerificationLevel::SelfAttested,
+                },
+                CapabilityRequirement {
+                    capability: "scp:capability:prompt-injection-resistance/v1"
+                        .parse()
+                        .unwrap(),
+                    verification_level: VerificationLevel::ChallengeVerified,
+                },
+            ],
+            ..ContextParams::default()
+        };
+
+        let json = serde_json::to_string(&params).unwrap();
+        let deserialized: ContextParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(params, deserialized);
+        assert_eq!(deserialized.capability_requirements.len(), 2);
+    }
+
+    #[test]
+    fn capability_requirements_backwards_compat() {
+        // JSON without capability_requirements field deserializes to empty vec.
+        let json = r#"{
+            "mode": "Encrypted",
+            "ceiling": [],
+            "ceiling_policy": "Immutable",
+            "promotion_policy": "NoPromotion",
+            "roles": [],
+            "outlets": [],
+            "ttl": null,
+            "memory_scope": "Ephemeral",
+            "governance": "SingleAdmin",
+            "template_id": null
+        }"#;
+        let params: ContextParams = serde_json::from_str(json).unwrap();
+        assert!(params.capability_requirements.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1985,7 +2213,7 @@ mod tests {
             "ceiling_policy": "Immutable",
             "promotion_policy": "NoPromotion",
             "roles": [],
-            "tools": [],
+            "outlets": [],
             "ttl": null,
             "memory_scope": "Ephemeral",
             "governance": "SingleAdmin",

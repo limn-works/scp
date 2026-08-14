@@ -11,7 +11,6 @@
 // --- Modules that exist ONLY in scp-protocol (no conflict) ---
 pub use scp_protocol::jcs;
 pub use scp_protocol::serde_util;
-pub use scp_protocol::time;
 pub use scp_protocol::uri;
 
 // --- Modules that exist ONLY in scp-runtime (no conflict) ---
@@ -24,11 +23,26 @@ pub use scp_runtime::well_known;
 
 pub mod crypto {
     pub use scp_protocol::crypto::canonical;
-    pub use scp_protocol::crypto::ed25519;
     pub use scp_protocol::crypto::envelope_seal;
     pub use scp_protocol::crypto::key_continuity;
     pub use scp_protocol::crypto::tofu;
-    pub use scp_runtime::crypto::mls;
+    /// MLS facade merging `scp-mls` with `scp-runtime`'s storage bridge.
+    ///
+    /// The wasm-safe synchronous state machine (`scp-mls`, ADR-057) supplies
+    /// the sync submodules; `scp-runtime`'s node-only async durable-storage
+    /// bridge supplies the tokio-coupled provider/storage/backend submodules.
+    pub mod mls {
+        // Synchronous MLS state machine (wasm-safe) from scp-mls.
+        pub use scp_mls::{
+            InMemoryMlsProvider, credential, encrypt, epoch_grace, error, group, key_package,
+            ratchet, wrapping_extension,
+        };
+        // Node-only async durable-storage bridge from scp-runtime.
+        pub use scp_runtime::crypto::mls::{
+            MlsStorageBridge, MlsStorageBridgeError, NodeMlsFactory, ScpMlsProvider, backend,
+            production_backend, provider, storage, storage_adapter,
+        };
+    }
     pub mod sender_keys {
         pub use scp_protocol::crypto::sender_keys::*;
         pub use scp_runtime::crypto::sender_keys::key_protocol;
@@ -55,12 +69,13 @@ pub mod context {
     pub use scp_runtime::context::app_sandbox;
     pub use scp_runtime::context::builder;
     pub use scp_runtime::context::export_import;
+    pub use scp_runtime::context::invitation_helpers;
     pub use scp_runtime::context::key_destruction;
     pub use scp_runtime::context::policy;
     pub use scp_runtime::context::providers;
     pub use scp_runtime::context::ttl;
     pub use scp_runtime::context::ttl::{
-        ExtensionConsentMode, TtlExtensionProposal, check_ttl, consent_mode_for_member_count,
+        ExtensionConsentMode, TtlExtensionProposal, consent_mode_for_member_count,
     };
     // Key runtime types re-exported at this level.
     pub use scp_protocol::context::builder::{
@@ -105,17 +120,43 @@ pub mod context {
         pub use scp_protocol::context::governance::*;
         pub use scp_runtime::context::governance::timeout;
     }
-    pub mod tools {
-        pub use scp_protocol::context::tools::*;
-        pub use scp_runtime::context::tools::invoke;
-        pub use scp_runtime::context::tools::invoke::{
-            InvocationError, has_tool_invoke_capability, invoke_tool,
-            invoke_tool_with_cancellation, validate_tool_invocation_ucan,
+    pub mod outlets {
+        pub use scp_protocol::context::outlets::*;
+        // §7.3.8 caveat/CID coupling minted by the FFI bridges (see
+        // `Supervisor::invoke_outlet_with_economy`).
+        pub use scp_runtime::context::InvocationCaveatBinding;
+        pub use scp_runtime::context::outlets::invoke;
+        pub use scp_runtime::context::outlets::invoke::{
+            InvocationError, has_outlet_call_capability, has_outlet_invocation_capability,
+            has_outlet_query_capability, invoke_outlet, invoke_outlet_aggregating,
+            invoke_outlet_with_cancellation_aggregating, one_shot_to_stream,
+            validate_outlet_invocation_ucan,
         };
-        pub use scp_runtime::context::tools::session;
-        pub use scp_runtime::context::tools::session::{
-            DEFAULT_SESSION_CAP_PER_CALLER, SessionStore, ToolSession, cleanup_expired,
+        pub use scp_runtime::context::outlets::session;
+        pub use scp_runtime::context::outlets::session::{
+            DEFAULT_SESSION_CAP_PER_CALLER, OutletSession, SessionStore, cleanup_expired,
             create_session, invoke_session,
+        };
+        // §5.4.5 streaming-native outlet invocation — the runtime control
+        // surface the native FFI bridges wrap (SCP-OUT-037). The bridges
+        // depend on `scp-core`, not `scp-runtime` directly, so the
+        // open-time parameter bundle, the returned session handle, the
+        // open-rejection taxonomy, the control-plane identities/errors,
+        // the operator chunk signer trait, and the executor trait are
+        // surfaced here.
+        pub use scp_runtime::context::outlets::dispatch::{
+            CancelIdentity, OpenStreamParams, OpenStreamRejection, StreamCloseSummary,
+            StreamSessionHandle, TerminateError,
+        };
+        pub use scp_runtime::context::outlets::invoke::{
+            MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
+        };
+        pub use scp_runtime::context::outlets::signer::{
+            StreamSigner, StreamSignerCustodyCategory, StreamSignerError,
+        };
+        pub use scp_runtime::context::outlets::stream::{
+            AdmissionCaps, CancelError, GrantError, StreamIdentity, cancel_error_to_code,
+            grant_error_to_code,
         };
     }
 }
@@ -130,12 +171,14 @@ pub mod trust {
     pub use scp_protocol::trust::attestation::{
         Attestation, AttestationEvidence, AttestationRevocationChecker, AttestorInfo,
         DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, NoOpRevocationChecker,
-        RevocationStatus, ThresholdRequirement, ThresholdResult, check_attestation_freshness,
-        check_threshold_attestation, verify_attestation, verify_attestation_with_revocation,
+        RevocationStatus, ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
+        check_attestation_freshness, check_threshold_attestation, verify_attestation,
+        verify_attestation_with_revocation,
     };
     pub use scp_protocol::trust::challenge::{
         ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
-        VerificationMethod, issue_challenge, verify_challenge_response,
+        VerificationMethod, canonical_challenge_verification_bytes, issue_challenge,
+        verify_challenge_response, verify_challenge_verification,
     };
     pub use scp_protocol::trust::consequence::{
         ConsequenceAction, ConsequenceEvidence, ConsequenceRule, ConsequenceTrigger,
@@ -143,8 +186,8 @@ pub mod trust {
         evaluate_consequence_rules,
     };
     pub use scp_protocol::trust::participation::{
-        PARTICIPATION_STATEMENTS_SERVICE_TYPE, ParticipationFact, ParticipationProfile,
-        ParticipationRecord, ParticipationThreshold, RequireParticipation,
+        PARTICIPATION_STATEMENTS_SERVICE_TYPE, ParticipationFact, ParticipationFacts,
+        ParticipationProfile, ParticipationRecord, ParticipationThreshold, RequireParticipation,
         compute_participation_record, verify_participation_requirements,
     };
     pub use scp_protocol::trust::sybil::{

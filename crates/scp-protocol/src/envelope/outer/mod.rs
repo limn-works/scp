@@ -32,6 +32,17 @@ const fn default_outer_version() -> u16 {
     super::SCP_PROTOCOL_VERSION
 }
 
+/// Default TTL (seconds) a member requests when publishing an app-data blob
+/// through a relay. 300s = 5 minutes — short enough to limit replay surface,
+/// long enough to absorb transient relay outages.
+///
+/// This is the single wasm-safe home for the value: the native runtime
+/// (`scp-runtime` `messaging_helpers::DEFAULT_BLOB_TTL_SECS`) and the in-browser
+/// participant driver (`scp-client`, over the injected `Socket`) both consume it,
+/// so a native and a browser member request the same relay-storage window for the
+/// same message (ADR-057 "share, don't fork").
+pub const DEFAULT_APP_DATA_BLOB_TTL_SECS: u32 = 300;
+
 /// The unauthenticated outer envelope used for relay routing.
 ///
 /// Wraps an MLS-encrypted ciphertext blob with routing metadata visible to

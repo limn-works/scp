@@ -5,6 +5,15 @@ exceptions exposed by the Rust bridge layer (``crates/scp-ffi/src/``). It
 enables IDE autocompletion (VS Code, PyCharm) and static analysis via
 mypy/pyright.
 
+DO NOT HAND-EDIT the function/method parameter lists. The positional
+parameter names, order, and arity of every exported function are generated
+from the authoritative PyO3 signatures by ``scripts/generate-pyi.py`` and
+enforced in CI by ``scripts/check-pyi-generated.sh`` (which fails on any
+drift). To change a signature, edit the Rust ``#[pyfunction]`` /
+``#[pymethods]`` export, then run ``python3.12 scripts/generate-pyi.py`` and
+commit the regenerated stub. Prose (docstrings, section comments, value
+classes, property blocks) is preserved verbatim and may be edited by hand.
+
 Generated from the Rust source in ``crates/scp-ffi/src/``. See ADR-013
 in ``.docs/adrs/phase-3.md`` for the full bridge specification.
 
@@ -38,6 +47,11 @@ if TYPE_CHECKING:
 #       +-- TransportError
 #       +-- UcanError
 #       +-- ValidationError
+#       +-- StorageError
+#       +-- AttestationError
+#       +-- McpError
+#       +-- GovernanceError
+#       +-- EconomyError
 
 class ScpError(Exception):
     """Base exception for all SCP protocol errors."""
@@ -74,9 +88,81 @@ class ValidationError(ScpError):
 
     ...
 
+class StorageError(ScpError):
+    """A persistent-storage operation failed (SCP-STORAGE range, 8000-8999)."""
+
+    ...
+
+class AttestationError(ScpError):
+    """A device or identity attestation operation failed (SCP-ATTEST range, 9000-9999)."""
+
+    ...
+
+class McpError(ScpError):
+    """An MCP protocol or tool-invocation operation failed (SCP-MCP range, 10000-10999)."""
+
+    ...
+
+class GovernanceError(ScpError):
+    """A context governance proposal or voting operation failed (SCP-GOV range, 11000-11999)."""
+
+    ...
+
+class EconomyError(ScpError):
+    """A payment, budget, or economic-policy operation failed (SCP-ECON range, 12000-12999)."""
+
+    ...
+
+# Cross-context outlet-invocation saga (§6.2.4 / ADR-049 §3a) terminal errors.
+# Each carries the structured terminal datum as a positional ``args`` entry
+# (``args = (message, code, datum)``), read structurally — never re-parsed
+# from the message text.
+
+class SagaAbortedError(ScpError):
+    """A §6.2.4 saga aborted at a Prepare phase.
+
+    ``args = (message, code, retry_after_ms)``: ``retry_after_ms`` is an
+    ``int`` of milliseconds or ``None`` (never ``0``).
+    """
+
+    ...
+
+class SagaNeedsRepairError(ScpError):
+    """A §6.2.4 saga exhausted its Commit retries and may have diverged.
+
+    ``args = (message, code, saga_id)``: ``saga_id`` is the durable
+    operator-repair handle.
+    """
+
+    ...
+
+class SagaBusyError(ScpError):
+    """A §6.2.4 saga's participant context set overlapped an in-flight saga.
+
+    ``args = (message, code, contended_context)``: ``contended_context`` is
+    the shared context id.
+    """
+
+    ...
+
 # ---------------------------------------------------------------------------
 # Bridge value types (crates/scp-ffi/src/{identity,context,ucan,...}.rs)
 # ---------------------------------------------------------------------------
+
+class SagaResult:
+    """The committed terminal of a §6.2.4 cross-context outlet-invocation saga.
+
+    Returned by :meth:`SCP.outlet_invoke_cross_context_saga` on a ``Committed``
+    terminal; every non-committed terminal raises a typed saga exception.
+    """
+
+    @property
+    def saga_id(self) -> str: ...
+    @property
+    def receipt(self) -> bytes | None: ...
+    @property
+    def output(self) -> bytes | None: ...
+    def __repr__(self) -> str: ...
 
 class PyIdentity:
     """An SCP identity handle.
@@ -140,6 +226,41 @@ class PyMessageReceiver:
 
     def __aiter__(self) -> PyMessageReceiver: ...
     def __anext__(self) -> Future[PyMessage]: ...
+
+class PySealedInvitation:
+    """A sealed, signed invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+
+    The input to ``SCP.context_join_from_welcome``; produced on the creator side
+    by ``SCP.invite_member``. The SDK wraps this as
+    :class:`scp_sdk.SealedInvitation`.
+    """
+
+    def __init__(
+        self, context_id: str, creator_did: str, enc: bytes, ciphertext: bytes
+    ) -> None: ...
+    @property
+    def context_id(self) -> str: ...
+    @property
+    def creator_did(self) -> str: ...
+    @property
+    def enc(self) -> bytes: ...
+    @property
+    def ciphertext(self) -> bytes: ...
+
+class PyInviteMemberOutcome:
+    """The outcome of ``SCP.invite_member``.
+
+    Carries the sealed ``bundle`` (a :class:`PySealedInvitation`, directly usable
+    as the ``sealed`` argument to ``context_join_from_welcome``) plus
+    ``delivered``. ``invite_member`` supports only ``SingleAdmin`` contexts today;
+    a voting-governed context raises instead. The SDK projects this into the
+    :class:`scp_sdk.Sealed` outcome.
+    """
+
+    @property
+    def bundle(self) -> PySealedInvitation: ...
+    @property
+    def delivered(self) -> bool: ...
 
 class UcanToken:
     """A UCAN token returned by the bridge."""
@@ -211,8 +332,8 @@ class SignedCheckpoint:
     @property
     def signature(self) -> str: ...
 
-class ToolVerificationResult:
-    """Result of a tool verification run."""
+class OutletVerificationResult:
+    """Result of an outlet verification run."""
 
     @property
     def passed(self) -> bool: ...
@@ -286,11 +407,7 @@ class SCP:
 
     # -- governance --
     def add_checkpoint_cosignature(
-        self,
-        handle: Any,
-        checkpoint_json: Any,
-        signer_did: Any,
-        signature_hex: Any,
+        self, handle: Any, checkpoint_json: Any, signer_did: Any, signature_hex: Any
     ) -> Any: ...
     def apply_pending_ceiling_modification(self, handle: Any, current_timestamp: Any) -> Any: ...
     def create_governance_checkpoint(
@@ -358,35 +475,20 @@ class SCP:
 
     # -- bridge connector / shadow --
     def bridge_create_shadow(
-        self,
-        bridge_id: Any,
-        platform_handle: Any,
-        bridge_mode: Any,
-        context_id: Any = ...,
+        self, bridge_id: Any, platform_handle: Any, bridge_mode: Any, context_id: Any = ...
     ) -> Any: ...
     def bridge_credential_delete_key(self, bridge_id: Any) -> Any: ...
     def bridge_credential_get_key(self, bridge_id: Any) -> Any: ...
     def bridge_credential_list(self, bridge_id: Any) -> Any: ...
     def bridge_credential_provision(
-        self,
-        bridge_id: Any,
-        credential_type: Any,
-        plaintext: Any,
-        bridge_credential_key: Any,
+        self, bridge_id: Any, credential_type: Any, plaintext: Any, bridge_credential_key: Any
     ) -> Any: ...
     def bridge_credential_retrieve(
-        self,
-        bridge_id: Any,
-        credential_type: Any,
-        bridge_credential_key: Any,
+        self, bridge_id: Any, credential_type: Any, bridge_credential_key: Any
     ) -> Any: ...
     def bridge_credential_revoke(self, bridge_id: Any) -> Any: ...
     def bridge_credential_rotate(
-        self,
-        bridge_id: Any,
-        credential_type: Any,
-        new_plaintext: Any,
-        bridge_credential_key: Any,
+        self, bridge_id: Any, credential_type: Any, new_plaintext: Any, bridge_credential_key: Any
     ) -> Any: ...
     def bridge_credential_store_key(self, bridge_id: Any, key: Any) -> Any: ...
 
@@ -412,13 +514,11 @@ class SCP:
         deploy_id: Any = ...,
     ) -> Any: ...
     def broadcast_publish_assets(
-        self,
-        handle: Any,
-        author_did: Any,
-        assets: Any,
-        deploy_id: Any = ...,
+        self, handle: Any, author_did: Any, assets: Any, deploy_id: Any = ...
     ) -> Any: ...
-    def broadcast_subscribe(self, handle: Any, subscriber_did: Any) -> Any: ...
+    def broadcast_subscribe(
+        self, handle: Any, subscriber_did: Any, messages_read_ucan_jwt: Any = None
+    ) -> Any: ...
     def broadcast_subscriber_count(self, handle: Any) -> Any: ...
     def broadcast_unblock_subscriber(
         self, handle: Any, subscriber_did: Any, unblocker_did: Any
@@ -438,6 +538,17 @@ class SCP:
     def context_import(self, data: Any, importer_did: Any) -> Any: ...
     def context_is_member(self, handle: Any, did: Any) -> Any: ...
     def context_join(self, handle: Any, identity_did: Any, spending_ucan_jwt: Any = ...) -> Any: ...
+    def context_join_from_welcome(
+        self, owning_did: Any, sealed: PySealedInvitation, reservation_id: Any
+    ) -> Any: ...
+    def invite_member(
+        self,
+        context_id: Any,
+        creator_did: Any,
+        invitee_did: Any,
+        invitee_key_package: Any,
+        relay_urls: Any,
+    ) -> PyInviteMemberOutcome: ...
     def context_leave(self, handle: Any, identity_did: Any) -> Any: ...
     def context_member_count(self, handle: Any) -> Any: ...
     def context_member_dids(self, handle: Any) -> Any: ...
@@ -446,17 +557,16 @@ class SCP:
         self, handle: Any, member_did: Any, proposed_seconds: Any
     ) -> Any: ...
     def context_receive(self, handle: Any) -> Any: ...
+    def context_reconnect(
+        self, identity_did: Any, context_ids: Any, last_relay_contacts: Any = ...
+    ) -> Any: ...
     def context_reset_ttl_timer(self, handle: Any, new_seconds: Any) -> Any: ...
-    # test-only — present only in `allow_in_memory_custody` builds; raises
+    # test-only — present only in `testing` builds; raises
     # AttributeError on a production wheel. Seeds a peer's §9.10.4 pseudonym to
     # simulate a delivered announcement in tests.
     def context_seed_peer_pseudonym(self, handle: Any, peer_did: Any, pseudonym: Any) -> Any: ...
     def context_send(
-        self,
-        handle: Any,
-        identity_did: Any,
-        payload: Any,
-        spending_ucan_jwt: Any = ...,
+        self, handle: Any, identity_did: Any, payload: Any, spending_ucan_jwt: Any = ...
     ) -> Any: ...
     def evaluate_invitation(
         self,
@@ -468,6 +578,7 @@ class SCP:
     ) -> Any: ...
     def get_economic_policy(self, handle: Any) -> Any: ...
     def migration_state(self, handle: Any) -> Any: ...
+    def reserve_key_package(self, owning_did: Any) -> Any: ...
     def set_economic_policy(self, handle: Any, policy_json: Any) -> Any: ...
     def tombstone_migrated_context(self, handle: Any) -> Any: ...
 
@@ -487,6 +598,7 @@ class SCP:
     def economy_budget_grant(self, context_id: Any, did: Any, amount: Any) -> Any: ...
     def economy_budget_record_spend(self, context_id: Any, did: Any, amount: Any) -> Any: ...
     def economy_budget_remaining(self, context_id: Any, did: Any) -> Any: ...
+    def economy_verify_payment_receipts(self, receipts_json: Any) -> Any: ...
 
     # -- event log --
     def event_log_checkpoint(self, context_id: Any, identity_did: Any, epoch: Any) -> Any: ...
@@ -504,7 +616,7 @@ class SCP:
     def fullstack_join_from_welcome(self, node: Any, context_id: Any) -> Any: ...
     def fullstack_remove_member(self, node: Any, context_id: Any, member_did: Any) -> Any: ...
     def fullstack_reset_network(self) -> Any: ...
-    # test-only — present only in `allow_in_memory_custody` builds.
+    # test-only — present only in `testing` builds.
     def fullstack_seed_peer_pseudonym(
         self, node: Any, context_id: Any, peer_did: Any, pseudonym: Any
     ) -> Any: ...
@@ -523,7 +635,7 @@ class SCP:
     ) -> Any: ...
     def identity_add_agent_key(self, identity: Any) -> Any: ...
     def identity_attest_device(self, identity_did: Any) -> Any: ...
-    def identity_create(self, custody: Any) -> Any: ...
+    def identity_create(self, custody: Any, testing_seed: Any = ...) -> Any: ...
     def identity_create_with_agent_key(self, custody: Any) -> Any: ...
     def identity_create_with_custody(self, provider: Any) -> Any: ...
     def identity_execute_custody_migration(
@@ -545,28 +657,21 @@ class SCP:
     def mcp_configure_stdio_allowlist(self, additional_binaries: list[str] = ...) -> None: ...
     def mcp_disable_stdio_allowlist(self) -> None: ...
     def mcp_get_stdio_allowlist(self) -> McpAllowlistState: ...
-    def mcp_register_tool_handler(self, context_id: Any, tool_name: Any, handler: Any) -> Any: ...
+    def mcp_register_outlet_handler(
+        self, context_id: Any, outlet_name: Any, handler: Any
+    ) -> Any: ...
     def mcp_reset_stdio_allowlist(self) -> None: ...
     def py_mcp_client_connect_sse(self, url: Any) -> Any: ...
     def py_mcp_client_connect_stdio(self, command: Any) -> Any: ...
     def py_mcp_client_disconnect(self, handle: Any) -> Any: ...
     def py_mcp_client_info(self, handle: Any) -> Any: ...
     def py_mcp_client_invoke(
-        self,
-        handle: Any,
-        tool_name: Any,
-        input: Any,
-        context_id: Any,
-        identity_did: Any,
+        self, handle: Any, outlet_name: Any, input: Any, context_id: Any, identity_did: Any
     ) -> Any: ...
     def py_mcp_client_list_tools(self, handle: Any) -> Any: ...
     def py_mcp_load_contexts(self, identity_did: Any, _relay_url: Any) -> Any: ...
     def py_mcp_serve(
-        self,
-        identity_did: Any,
-        context_ids: Any,
-        transport: Any,
-        ucan_token: Any = ...,
+        self, identity_did: Any, context_ids: Any, transport: Any, ucan_token: Any = ...
     ) -> Any: ...
     def py_mcp_server_info(self, handle: Any) -> Any: ...
     def py_mcp_server_stop(self, handle: Any) -> Any: ...
@@ -589,59 +694,116 @@ class SCP:
     # -- server --
     def node_start_in_memory(self, identity_did: Any = ...) -> Any: ...
     def node_start_local(
-        self,
-        data_dir: Any,
-        identity_did: Any = ...,
-        passphrase: Any = ...,
+        self, data_dir: Any, identity_did: Any = ..., passphrase: Any = ...
     ) -> Any: ...
     def relay_start_in_memory(self) -> Any: ...
     def relay_start_local(self, data_dir: Any) -> Any: ...
 
     # -- scpid --
-    def scpid_sign(self, did: Any, signing_key_id: Any, challenge_json: Any) -> Any: ...
+    def scpid_sign(
+        self, did: Any, signing_key_id: Any, challenge_json: Any, signed_at_override: Any = ...
+    ) -> Any: ...
     def scpid_verify(self, response_json: Any, challenge_json: Any) -> Any: ...
 
-    # -- tools --
-    def tool_interface_accept(self, context_id: Any, interface_json: Any) -> Any: ...
-    def tool_interface_expose(
-        self,
-        context_id: Any,
-        tool_id: Any,
-        target_context_id: Any,
-        rate_limit_json: Any = ...,
+    # -- outlets --
+    def outlet_interface_accept(self, context_id: Any, interface_json: Any) -> Any: ...
+    def outlet_interface_expose(
+        self, context_id: Any, outlet_id: Any, target_context_id: Any, rate_limit_json: Any = ...
     ) -> Any: ...
-    def tool_interface_revoke(self, context_id: Any, interface_id_hex: Any) -> Any: ...
-    def tool_invoke(
+    def outlet_interface_revoke(self, context_id: Any, interface_id_hex: Any) -> Any: ...
+    def outlet_invoke(
         self,
         context_id: Any,
-        tool_id: Any,
+        outlet_id: Any,
         input: Any,
         identity_did: Any,
         ucan_token: Any,
         proof_tokens: Any = ...,
         spending_ucan: Any = ...,
     ) -> Any: ...
-    def tool_invoke_cross_context(
+    def outlet_invoke_cross_context(
         self,
         source_context_id: Any,
         target_context_id: Any,
-        tool_id: Any,
+        outlet_id: Any,
         input: Any,
         invoker_did: Any,
         ucan_token: Any,
         chain_depth: Any,
         proof_tokens: Any = ...,
     ) -> Any: ...
-    def tool_register(self, context_id: Any, registration: Any) -> Any: ...
-    def tool_session_close(self, context_id: Any, session_id: Any) -> Any: ...
-    def tool_session_create(
+    def outlet_invoke_cross_context_saga(
+        self,
+        caller_context_id: Any,
+        target_context_id: Any,
+        caller_did: Any,
+        outlet_registration_id: Any,
+        input: Any,
+        asserted_nonce_hex: Any,
+        timestamp_ms: Any,
+        chain_depth: Any,
+        ucan_proof_id: Any = ...,
+    ) -> SagaResult: ...
+    def outlet_register(self, context_id: Any, registration: Any) -> Any: ...
+    def outlet_streaming_saga_open(
+        self,
+        caller_context_id: Any,
+        target_context_id: Any,
+        caller_did: Any,
+        outlet_registration_id: Any,
+        input: Any,
+        asserted_nonce_hex: Any,
+        timestamp_ms: Any,
+        chain_depth: Any,
+        ucan_token: Any,
+        proof_tokens: Any = ...,
+        ucan_proof_id: Any = ...,
+        timeout_ms: Any = ...,
+        estimated_chunk_count: Any = ...,
+    ) -> str: ...
+    def outlet_streaming_saga_poll_next(self, saga_id: Any) -> bytes | None: ...
+    def outlet_streaming_saga_recover_truncated_close(
+        self, saga_id: Any, caller_did: Any
+    ) -> None: ...
+    def outlet_stream_open(
         self,
         context_id: Any,
-        tool_id: Any,
-        source_context_id: Any,
-        ttl_seconds: Any = ...,
+        outlet_id: Any,
+        input: Any,
+        caller_did: Any,
+        ucan_token: Any,
+        proof_tokens: Any = ...,
+        spending_ucan: Any = ...,
+        timeout_ms: Any = ...,
+        estimated_chunk_count: Any = ...,
+    ) -> str: ...
+    def outlet_stream_poll_next(self, handle_id: Any) -> bytes | None: ...
+    def outlet_stream_grant_credit(self, handle_id: Any, caller_did: Any, grant: Any) -> None: ...
+    def outlet_stream_cancel(self, handle_id: Any, caller_did: Any) -> None: ...
+    def outlet_stream_terminate(
+        self, handle_id: Any, caller_did: Any, slug: Any, message: Any
+    ) -> None: ...
+    def outlet_stream_verify_chunk_signature(
+        self,
+        chunk_bytes: Any,
+        operator_pk: Any,
+        context_id: Any,
+        outlet_id: Any,
+        caveats_binding: Any,
+    ) -> bool: ...
+    def outlet_stream_compute_caveats_binding(
+        self,
+        ucan_cid: Any,
+        request_id: Any,
+        invoker_did: Any,
+        estimated_chunk_count: Any,
+        effective_caveats_jcs: Any,
+    ) -> bytes: ...
+    def outlet_session_close(self, context_id: Any, session_id: Any) -> Any: ...
+    def outlet_session_create(
+        self, context_id: Any, outlet_id: Any, source_context_id: Any, ttl_seconds: Any = ...
     ) -> Any: ...
-    def tool_session_invoke(
+    def outlet_session_invoke(
         self,
         context_id: Any,
         session_id: Any,
@@ -650,7 +812,7 @@ class SCP:
         ucan_token: Any,
         proof_tokens: Any = ...,
     ) -> Any: ...
-    def tool_verify(self, context_id: Any, tool_id: Any) -> Any: ...
+    def outlet_verify(self, context_id: Any, outlet_id: Any) -> Any: ...
 
     # -- transport --
     def transport_adapter_count(self) -> Any: ...
@@ -675,6 +837,13 @@ class SCP:
         challenge_results_json: Any,
     ) -> Any: ...
     def trust_query_score(self, did: Any, context_id: Any) -> Any: ...
+    def participation_record(
+        self, context_id: Any, subject_did: Any, cached_attestations_json: Any = ...
+    ) -> Any: ...
+
+    # -- media (instance — event-log-appending, ADR-024 AC 8) --
+    def media_activate_session(self, session_json: str) -> dict[str, Any]: ...
+    def media_end_session(self, session_json: str, timestamp: int) -> dict[str, Any]: ...
 
     # -- UCAN --
     def ucan_delegate(
@@ -686,11 +855,7 @@ class SCP:
         capabilities: Any,
     ) -> Any: ...
     def ucan_mint(
-        self,
-        context_id: Any,
-        member_did: Any,
-        capabilities: Any,
-        proofs: Any = ...,
+        self, context_id: Any, member_did: Any, capabilities: Any, proofs: Any = ...
     ) -> Any: ...
     def ucan_revoke(self, context_id: Any, token: Any, revoker_did: Any) -> Any: ...
     def ucan_validate(
@@ -698,7 +863,15 @@ class SCP:
         context_id: Any,
         token: Any,
         capability: Any,
-        presenting_agent_did: Any = ...,
+        presenting_agent_did: Any,
+        proof_tokens: Any = ...,
+    ) -> Any: ...
+    def ucan_evaluate(
+        self,
+        context_id: Any,
+        token: Any,
+        capability: Any,
+        presenting_agent_did: Any,
         proof_tokens: Any = ...,
     ) -> Any: ...
     def __repr__(self) -> str: ...
@@ -715,7 +888,7 @@ def version() -> str:
     """Return the bridge version string."""
     ...
 
-def shutdown_runtime(timeout_millis: int) -> None:
+def shutdown_runtime(_timeout_millis: int) -> None:
     """Shut down the shared tokio runtime (drain for ``timeout_millis`` ms)."""
     ...
 
@@ -726,11 +899,11 @@ def shutdown_runtime(timeout_millis: int) -> None:
 
 # -- pure helper functions (no bridge state) --
 
-def py_check_scoped_capability(granted_capabilities: tuple[str, ...], capability: str) -> bool: ...
+def py_check_scoped_capability(
+    granted_capabilities: tuple[str, ...], required_capability: str
+) -> bool: ...
 def py_validate_capability_declaration(
-    declaration_json: str,
-    ceiling_capabilities: list[str],
-    role_capabilities: list[str],
+    declaration_json: str, ceiling_capabilities: list[str], role_capabilities: list[str]
 ) -> str: ...
 def evaluate_invitation(
     *args: Any, **kwargs: Any
@@ -753,9 +926,9 @@ def validate_context_params(params_json: str) -> str | None: ...
 
 def discovery_parse_address(address: str) -> Any: ...
 def discovery_create_query(
-    capabilities: list[str] | None,
-    keywords: list[str] | None,
-    min_history_secs: int | None,
+    capabilities: list[str] | None = ...,
+    keywords: list[str] | None = ...,
+    min_history_secs: int | None = ...,
 ) -> str: ...
 def discovery_normalize_address(address: str) -> str: ...
 def context_discover(query: str) -> Any: ...
@@ -768,7 +941,7 @@ def economy_estimate_cost(
 def economy_policy_requires_payment(policy_json: str) -> bool: ...
 def economy_auto_accept_blocked(policy_json: str) -> bool: ...
 def economy_check_policy_lock(policy_json: str) -> bool: ...
-def economy_validate_policy_change(current_json: str, proposed_json: str) -> bool: ...
+def economy_validate_policy_change(current_policy_json: str, proposed_policy_json: str) -> bool: ...
 def economy_evaluate_formula(formula_json: str, metrics: dict[str, int] | None) -> int | None: ...
 
 # -- trust (pure) --
@@ -776,7 +949,16 @@ def economy_evaluate_formula(formula_json: str, metrics: dict[str, int] | None) 
 def trust_verify_attestation(*args: Any, **kwargs: Any) -> Any: ...
 def trust_create_challenge(*args: Any, **kwargs: Any) -> Any: ...
 def trust_verify_response(*args: Any, **kwargs: Any) -> Any: ...
-def verify_participation_requirements(profile_json: str, requirements_json: str) -> None: ...
+def verify_participation_requirements(
+    expected_subject: str, requirements_json: str, profile_json: str
+) -> None: ...
+def check_capability_requirements(
+    context_id: str,
+    subject_did: str,
+    requirements_json: str,
+    agent_capabilities_json: str,
+    challenge_verifications_json: str,
+) -> None: ...
 
 # -- sync (pure) --
 
@@ -812,9 +994,7 @@ def provenance_update_source_type(provenance_json: str, new_state: str) -> str: 
 
 def media_check_capability(ceiling: list[str], capability: str) -> bool: ...
 def media_initiate_session(*args: Any, **kwargs: Any) -> Any: ...
-def media_activate_session(session_json: str) -> dict[str, Any]: ...
 def media_join_session(session_json: str, participant_did: str) -> dict[str, Any]: ...
-def media_end_session(session_json: str, timestamp: int) -> dict[str, Any]: ...
 def media_create_offer(session_id: str, sdp: str, sender_did: str) -> dict[str, str]: ...
 def media_create_answer(session_id: str, sdp: str, sender_did: str) -> dict[str, str]: ...
 def media_create_ice_candidate(*args: Any, **kwargs: Any) -> Any: ...

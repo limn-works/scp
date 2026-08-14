@@ -1,12 +1,12 @@
 # 24. Provenance System
 
-Provenance is a core protocol principle (section 1, tenet 1): "All non-private data carries verifiable origin metadata. The absence of provenance is itself a signal." Every message, tool output, attestation, and cross-context data transfer is traceable to its source. This section specifies the provenance system architecture, types, automatic attachment model, quality evaluation, and chain depth enforcement. Section 7.7 specifies the provenance format and evaluation tiers from the trust perspective; this section specifies the system that implements them.
+Provenance is a core protocol principle (section 1, tenet 1): "All non-private data carries verifiable origin metadata. The absence of provenance is itself a signal." Every message, outlet output, attestation, and cross-context data transfer is traceable to its source. This section specifies the provenance system architecture, types, automatic attachment model, quality evaluation, and chain depth enforcement. Section 7.7 specifies the provenance format and evaluation tiers from the trust perspective; this section specifies the system that implements them.
 
 See ADR-019 in `.docs/adrs/phase-4.md` for the full architectural decision record. Implementation: `crates/scp-core/src/provenance/`.
 
 ## 24.1 Design Principles
 
-1. **Automatic attachment over manual tagging.** Agents should not need to remember to tag provenance. The protocol attaches it at cross-context boundaries -- tool interface calls (section 6.2) and structured messages carrying cross-context references. Manual tagging is error-prone and inconsistent.
+1. **Automatic attachment over manual tagging.** Agents should not need to remember to tag provenance. The protocol attaches it at cross-context boundaries -- outlet interface calls (section 6.2) and structured messages carrying cross-context references. Manual tagging is error-prone and inconsistent.
 
 2. **Quality tiers over binary trust.** Provenance quality is a spectrum (section 7.7.2), not a boolean. `PersistentVerifiable` (source still verifiable) is stronger than `EphemeralKnownParties` (source keys destroyed, parties known) which is stronger than `NoProvenance` (unknown origin). The protocol provides the quality signal; agents decide how to weight it.
 
@@ -76,7 +76,7 @@ The ordering is total: `NoProvenance < EphemeralKnownParties < SummaryVerified <
 
 ## 24.3 Provenance Attachment
 
-Provenance is attached automatically by the protocol when data crosses a context boundary through a protocol mechanism (cross-context tool interface call per section 6.2, or structured message carrying a cross-context reference).
+Provenance is attached automatically by the protocol when data crosses a context boundary through a protocol mechanism (cross-context outlet interface call per section 6.2, or structured message carrying a cross-context reference).
 
 ### 24.3.1 Attachment Point
 
@@ -100,7 +100,18 @@ Example: data originates in context A, flows to context B (depth 0), then from B
 
 ### 24.3.3 Dual Recording
 
-Provenance is recorded in both the source and target contexts' event logs. The returned `DataProvenance` is a self-contained value that can be cloned for dual recording. This ensures that both sides of a cross-context data flow have an auditable record.
+Provenance is recorded in both the source and target contexts' event logs. The returned `DataProvenance` is a self-contained value that can be cloned for dual recording. This ensures that both sides of a cross-context data flow have an auditable record. The source context records a `ProvenanceAttached` event and the target context records a `ProvenanceReceived` event; each event's payload carries the provenance hash defined below.
+
+**Provenance hash encoding (normative).** Every provenance hash in the protocol -- the `provenance_hash` bound into the BroadcastEnvelope signature (§5.14.5), the equivalent inner-envelope hash, and the hash recorded in the `ProvenanceAttached` / `ProvenanceReceived` event-log payloads -- is computed as:
+
+```
+provenance_hash = SHA-256(rmp_serde::to_vec(provenance))   if provenance is present
+provenance_hash = SHA-256(0x00)                            if provenance is absent (sentinel, ADR-002)
+```
+
+where `provenance` is the `DataProvenance` record and `rmp_serde::to_vec` is positional (array-encoded) MessagePack in struct-declaration field order. The `DataProvenance` field order is: `source_context`, `source_type`, `counterparties`, `purpose`, `discovery_method`, `age`, `memory_scope`, `chain_depth`, `chain_path`, `payment_amount`, `payment_adapter`, `payment_receipt_id` (§24.2). JSON is **not** used on any provenance-hash path.
+
+This single encoding is deliberate: it makes the hash a context member records for a `DataProvenance` value in its event log bit-for-bit identical to the `provenance_hash` a broadcast author signs over the same value, and it matches the event-log leaf encoding (which serializes the wrapping `Event` with `rmp_serde::to_vec`). A third-party reimplementer MUST use exactly this encoding to reproduce protocol-conformant provenance hashes. The `SHA-256(0x00)` absent-sentinel distinguishes "no provenance" from any real provenance value. See §25 Vector 35 for the `DataProvenance` known-answer test.
 
 ### 24.3.4 Economic Provenance
 
@@ -131,10 +142,10 @@ The `counterparties` field in `DataProvenance` reveals context membership -- a p
 Chain depth is context-configurable via `ContextParams::max_chain_depth` (default: 8, range [1, 255]). There is no protocol hard maximum — chain depth is a context concern, not a protocol integrity concern. Provenance quality naturally degrades with depth (§24.5), which is the correct trust signal. Per ADR-043.
 
 - **Context-configurable maximum:** Contexts set `max_chain_depth` in `ContextParams`. When not set, the default of 8 applies. The u8 type bounds the range to [0, 255].
-- At the configured maximum depth, data cannot trigger further cross-context tool calls.
+- At the configured maximum depth, data cannot trigger further cross-context outlet calls.
 - Exceeding the maximum produces a `ChainDepthExceeded` error (not a degradation -- a hard rejection).
 
-The `check_chain_depth` operation verifies that a provenance record's chain depth is within the allowed limit. It is called before any cross-context tool invocation to enforce the bound. The effective limit is `context.max_chain_depth.unwrap_or(8)`.
+The `check_chain_depth` operation verifies that a provenance record's chain depth is within the allowed limit. It is called before any cross-context outlet invocation to enforce the bound. The effective limit is `context.max_chain_depth.unwrap_or(8)`.
 
 ## 24.5 Provenance Quality Evaluation
 
@@ -200,7 +211,7 @@ The protocol is honest about this. Provenanced data is the norm; unprovenanced d
 |-------|----------|
 | Provenance format and evaluation tiers (trust perspective) | Section 7.7 |
 | Honest limitations of provenance tracking | Section 7.7.3 |
-| Provenance in cross-context tool calls | Section 6.2, section 9.2.1 |
+| Provenance in cross-context outlet calls | Section 6.2, section 9.2.1 |
 | Chain depth limits and amplification mitigation | Section 9.2.1 item 3 |
 | Hub context aggregation and provenance chains | Section 9.2.1 item 2 |
 | Economic provenance (payment receipts) | Section 19.6 |

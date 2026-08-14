@@ -20,7 +20,7 @@ ContextManager -- it does NOT subscribe to the relay.  Full relay-backed
 receive is verified in the TypeScript E2E tests via ``contextSubscribe``.
 
 Prerequisites:
-    ``maturin develop --release --features allow_in_memory_custody``
+    ``maturin develop --release --features testing``
 
 Run:
     PYTHONPATH=bindings/python python3.12 -m pytest bindings/python/tests/test_e2e_relay.py -v
@@ -72,7 +72,7 @@ def session_scp() -> SCP:
     supervisor build fails closed and every ``context_create`` raises
     SCP-CTX-2001. We construct via ``SCP.with_storage({"type":
     "in_memory"})`` (the sanctioned test affordance under
-    ``allow_in_memory_custody``) so a storage backend is present before
+    ``testing``) so a storage backend is present before
     ``configure_relay_transport`` derives the supervisor's ``mls_storage``
     view from it.
     """

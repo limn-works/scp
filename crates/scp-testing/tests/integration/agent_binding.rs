@@ -21,7 +21,8 @@ use scp_core::trust::custody_violation::{
     ActionCategory, CounterAttestation, CustodyViolationType, ScpCustodyViolationAttestation,
     classify_action,
 };
-use scp_identity::{DID, DidDht, DidMethod, ScpIdentity, SigningKeyId};
+use scp_did::{DID, SigningKeyId};
+use scp_identity::{DidDht, DidMethod, ScpIdentity};
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 
@@ -33,8 +34,8 @@ use scp_platform::traits::{KeyCustody, KeyType};
 /// and the agent key handle.
 async fn create_identity_with_agent_key(
     custody: &InMemoryKeyCustody,
-) -> (ScpIdentity, scp_identity::document::DidDocument) {
-    let did_dht = DidDht::new();
+) -> (ScpIdentity, scp_did::DidDocument) {
+    let did_dht = DidDht::with_client(std::sync::Arc::new(scp_dht::InMemoryDhtClient::new()));
     let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
     let (mut identity, mut doc, _pre_rotation_handle) = did_dht
         .create(custody, &pre_rotation_custody)
@@ -107,7 +108,7 @@ async fn self_delegation_ucan_with_key_scope() {
         ceiling: None,
     };
 
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .expect("mint self-delegation UCAN");
 
@@ -148,7 +149,7 @@ async fn self_delegation_without_key_scope_fails() {
         ceiling: None,
     };
 
-    let result = mint_ucan(&params, &custody, &scp_primitives::SystemClock).await;
+    let result = mint_ucan(&params, &custody, &scp_clock::SystemClock).await;
     assert!(
         result.is_err(),
         "self-delegation without key_scope must fail"
@@ -186,7 +187,7 @@ async fn key_scope_mismatch_fails() {
     };
 
     // Minting itself should succeed — the mismatch is detected at validation time.
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .expect("mint should succeed");
 
@@ -338,7 +339,7 @@ async fn classify_action_categories() {
 
     // Category B resources.
     assert_eq!(classify_action("messages"), ActionCategory::CategoryB);
-    assert_eq!(classify_action("tool_invoke"), ActionCategory::CategoryB);
+    assert_eq!(classify_action("outlet_call"), ActionCategory::CategoryB);
     assert_eq!(classify_action("member"), ActionCategory::CategoryB);
     assert_eq!(classify_action("role"), ActionCategory::CategoryB);
     assert_eq!(classify_action("context"), ActionCategory::CategoryB);

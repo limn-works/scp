@@ -22,14 +22,15 @@
 
 use std::collections::HashMap;
 
+use scp_clock::Clock;
 use scp_event_log::Event;
-use scp_primitives::Clock;
 
 use super::attestation::{
-    Attestation, AttestorInfo, DidPublicKeyResolver, FreshnessStatus, ThresholdRequirement,
-    check_attestation_freshness, check_threshold_attestation, verify_attestation,
+    Attestation, AttestationRevocationChecker, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
+    ThresholdRequirement, check_attestation_freshness, check_threshold_attestation,
+    verify_attestation, verify_attestation_with_revocation,
 };
-use super::challenge::ChallengeVerification;
+use super::challenge::{ChallengeVerification, verify_challenge_verification};
 use super::consequence::ConsequenceRule;
 use super::participation::compute_participation_record;
 use super::{AttestationType, TrustError, TrustInput};
@@ -60,9 +61,20 @@ pub trait TrustProtocolRepository: Send + Sync {
         subject_did: &str,
     ) -> Result<Vec<CachedAttestation>, TrustError>;
 
-    /// Stores a verified attestation in the cache with a TTL.
+    /// Stores an ALREADY-VERIFIED attestation in the cache with a TTL.
     ///
     /// If an attestation with the same ID already exists, it is replaced.
+    ///
+    /// SECURITY: this is a raw write that performs NO verification — the caller
+    /// is asserting the attestation was verified at `entry.verified_at`. It is
+    /// therefore NOT a safe ingest boundary for caller-controlled data: feeding
+    /// it an attestation whose `verified_at`/`ttl_secs` came from an untrusted
+    /// caller lets a forged attestation masquerade as "freshly verified" and be
+    /// returned unverified by [`AttestationCache::get_verified_attestations`].
+    /// Untrusted attestations MUST instead go through
+    /// [`AttestationCache::verify_and_cache`], which verifies the signature,
+    /// expiry, and revocation against the resolver-resolved issuer key and stamps
+    /// a trusted `verified_at` before calling this method.
     ///
     /// # Errors
     ///
@@ -117,6 +129,36 @@ pub trait TrustProtocolRepository: Send + Sync {
         context_id: &str,
         result: &ChallengeVerification,
     ) -> Result<(), TrustError>;
+}
+
+// ---------------------------------------------------------------------------
+// RevocationMapChecker
+// ---------------------------------------------------------------------------
+
+/// [`AttestationRevocationChecker`] backed by a context's persisted revocation
+/// list — an `attestation_id -> revoked` map from
+/// [`TrustProtocolRepository::get_revocation_state`].
+///
+/// Used by [`AttestationCache::get_verified_attestations`] so the READ path
+/// enforces context revocation, not only the ingest path: a cached attestation
+/// that is later context-revoked is dropped on read (even while still inside its
+/// cache TTL) rather than continuing to inflate trust until TTL expiry.
+struct RevocationMapChecker<'a> {
+    /// `attestation_id -> revoked` for the context.
+    revoked: &'a HashMap<String, bool>,
+}
+
+impl AttestationRevocationChecker for RevocationMapChecker<'_> {
+    fn check_revocation(&self, attestation_id: &str, _issuer: &scp_did::DID) -> Option<u64> {
+        // The list stores only a boolean per id (no timestamp); report `0` as the
+        // revocation time when listed. That value only populates a dropped-entry
+        // log line, not a user-facing field.
+        if self.revoked.get(attestation_id).copied().unwrap_or(false) {
+            Some(0)
+        } else {
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +237,35 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
     ///   verification succeeds, the cache entry is updated. If verification
     ///   fails (expired, revoked, bad signature), the entry is discarded.
     ///
+    /// SECURITY: returning fresh entries WITHOUT re-verification is sound only
+    /// because `verified_at` is a TRUSTED stamp — it is set exclusively by
+    /// [`Self::verify_and_cache`] AFTER a successful signature/expiry/revocation
+    /// check (and re-stamped here after a successful re-verification). The cache
+    /// invariant is therefore "fresh ⟹ verified within TTL". Callers MUST NOT
+    /// populate the backing store with caller-controlled `verified_at` via the
+    /// raw [`TrustProtocolRepository::store_cached_attestation`]; untrusted
+    /// attestations are ingested through [`Self::verify_and_cache`] (see the FFI
+    /// `verified_attestations` / `populate_and_aggregate` helpers), which is what
+    /// keeps a forged, freshly-marked entry from ever being returned here.
+    ///
+    /// SECURITY (read-path revocation): the cached-but-fresh invariant says
+    /// nothing about revocations that happen AFTER an entry is cached. The
+    /// signature/expiry stamp does not capture a later context revocation. This
+    /// method therefore consults the context revocation list
+    /// ([`TrustProtocolRepository::get_revocation_state`]) on EVERY read and
+    /// drops any revoked entry on BOTH the fresh-return path and the stale
+    /// re-verification path. Without this, a cached attestation that is later
+    /// context-revoked would keep inflating `attestation_count` / trust until its
+    /// cache TTL expired (fail-open). The lookup is O(1) per entry.
+    ///
+    /// SECURITY (read-path attestation expiry): the cache TTL is independent of
+    /// the attestation's own `expires_at`. A cache TTL longer than the
+    /// attestation's remaining lifetime would otherwise return a still-fresh
+    /// cache entry whose underlying attestation has already expired. The
+    /// fresh-return path therefore ALSO drops any entry whose
+    /// `attestation.expires_at` is `Some(t)` with `t < now`, matching the stale
+    /// path (where re-verification rejects expired attestations).
+    ///
     /// # Errors
     ///
     /// Returns [`TrustError`] if the store is unavailable or a verification
@@ -210,12 +281,34 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
             .store
             .get_cached_attestations(context_id, subject_did)?;
         let now = clock.now_secs();
+
+        // Build the context revocation checker once; applied to every entry on
+        // both the fresh and stale paths so a post-cache revocation is honored.
+        let revoked = self.store.get_revocation_state(context_id)?;
+        let revocation_checker = RevocationMapChecker { revoked: &revoked };
+
         let mut result = Vec::new();
 
         for entry in cached {
             if entry.is_expired(now) {
-                // Re-verify the attestation.
-                if verify_attestation(&entry.attestation, resolver, clock).is_ok() {
+                // Re-verify the attestation, consulting the context revocation
+                // list. `.is_ok()` keeps the entry only on success; a non-Ok
+                // result — a verification rejection (bad signature / expired /
+                // context-revoked) OR a resolver infra fault — drops this one
+                // entry. This is conservative (it can only drop, never inflate)
+                // and is sound here because the injected `resolver` is total and
+                // pure (`IdentityDidPublicKeyResolver`: a deterministic DID-string
+                // parse, no network), so no transient fault can spuriously drop a
+                // valid entry. A future networked/fallible resolver swap MUST
+                // revisit this to separate rejections from infra faults.
+                if verify_attestation_with_revocation(
+                    &entry.attestation,
+                    resolver,
+                    clock,
+                    Some(&revocation_checker),
+                )
+                .is_ok()
+                {
                     // Update cache with new verified_at.
                     let refreshed = CachedAttestation {
                         attestation: entry.attestation.clone(),
@@ -225,8 +318,18 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
                     self.store.store_cached_attestation(context_id, refreshed)?;
                     result.push(entry.attestation);
                 }
-                // If verification fails, the entry is silently discarded.
-            } else {
+                // On any non-Ok result the entry is dropped (see note above).
+            } else if revocation_checker
+                .check_revocation(&entry.attestation.id, &entry.attestation.issuer)
+                .is_none()
+                && entry.attestation.expires_at.is_none_or(|exp| exp >= now)
+            {
+                // Fresh entry: still within cache TTL, but drop it if it has
+                // since been context-revoked OR if the attestation's own
+                // `expires_at` has passed. A cache TTL longer than the
+                // attestation's lifetime would otherwise keep returning an
+                // expired credential until the cache entry itself expired
+                // (read-path fail-open).
                 result.push(entry.attestation);
             }
         }
@@ -250,6 +353,40 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         clock: &impl Clock,
     ) -> Result<(), TrustError> {
         verify_attestation(attestation, resolver, clock)?;
+
+        let entry = CachedAttestation {
+            attestation: attestation.clone(),
+            verified_at: clock.now_secs(),
+            ttl_secs: self.ttl_secs,
+        };
+        self.store.store_cached_attestation(context_id, entry)?;
+
+        Ok(())
+    }
+
+    /// Verifies and caches a new attestation, additionally consulting an
+    /// external revocation checker.
+    ///
+    /// Identical to [`verify_and_cache`](Self::verify_and_cache) except the
+    /// supplied [`AttestationRevocationChecker`] is queried during verification
+    /// (via [`verify_attestation_with_revocation`]). An attestation that is
+    /// validly signed but listed in the context's external revocation list is
+    /// rejected, so it is neither cached nor counted. Passing `None` makes this
+    /// behave exactly like `verify_and_cache` (issuer-bound `revocation_status`
+    /// field only).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError`] if verification or caching fails.
+    pub fn verify_and_cache_with_revocation(
+        &self,
+        context_id: &str,
+        attestation: &Attestation,
+        resolver: &impl DidPublicKeyResolver,
+        clock: &impl Clock,
+        revocation_checker: Option<&dyn AttestationRevocationChecker>,
+    ) -> Result<(), TrustError> {
+        verify_attestation_with_revocation(attestation, resolver, clock, revocation_checker)?;
 
         let entry = CachedAttestation {
             attestation: attestation.clone(),
@@ -339,16 +476,10 @@ where
     R: DidPublicKeyResolver,
     C: Clock,
 {
-    // 1. Compute participation record from event log.
-    let participation_record = compute_participation_record(
-        ctx.events,
-        ctx.subject_did,
-        ctx.context_id,
-        ctx.merkle_root,
-        ctx.clock.now_secs(),
-    )?;
-
-    // 2. Collect and verify attestations from cache.
+    // 1. Collect and verify attestations from cache. Computed BEFORE the
+    //    participation record because `attestation_count` is a credential-layer
+    //    fact (§7.4) sourced from these — the record needs the subject's
+    //    accessible, currently-valid attestations as input.
     let verified_attestations = ctx.cache.get_verified_attestations(
         ctx.context_id,
         ctx.subject_did,
@@ -356,11 +487,57 @@ where
         ctx.clock,
     )?;
 
-    // 3. Collect challenge results with timestamps from the store.
-    let challenge_results = ctx
+    // 2. Compute participation record from the event log, threading the
+    //    verified attestations in for the credential-layer `attestation_count`.
+    let participation_record = compute_participation_record(
+        ctx.events,
+        ctx.subject_did,
+        ctx.context_id,
+        ctx.merkle_root,
+        ctx.clock.now_secs(),
+        &verified_attestations,
+    )?;
+
+    // 3. Collect challenge results with timestamps from the store, RE-VALIDATING
+    //    each on read. The store is persistent (SQLCipher), so a challenge result
+    //    that was valid at ingest is otherwise served as a CURRENT trust signal
+    //    forever — even after its `expires_at` passes (read-path fail-open). Re-
+    //    run the same verify-on-ingest gate (`verify_challenge_verification`:
+    //    verifier signature + context binding + subject binding + expiry) against
+    //    the target context, subject, and current clock, dropping any result that
+    //    no longer verifies. Mirrors the attestation read path
+    //    ([`AttestationCache::get_verified_attestations`]), which likewise re-
+    //    validates persisted entries on every read.
+    //
+    //    INVARIANT: `.is_ok()` drops the one entry on ANY non-Ok result — a
+    //    verification rejection (bad signature / wrong context / wrong subject /
+    //    expired) OR a resolver infra fault. This is sound (conservative: it can
+    //    only ever DROP an entry, never inflate trust) ONLY because the injected
+    //    `resolver` is total and pure — `IdentityDidPublicKeyResolver` is a
+    //    deterministic DID-string parse with no network I/O, so it cannot raise a
+    //    transient fault that would spuriously drop a valid record. If a
+    //    networked/fallible resolver is ever substituted here, this filter MUST be
+    //    revisited to distinguish verification rejections from infra faults (the
+    //    `is_verification_rejection` classifier on the ingest path does exactly
+    //    this) so a transient resolver outage does not silently zero a subject's
+    //    challenge signal. The store read above still propagates its faults via
+    //    `?`.
+    let challenge_results: Vec<ChallengeVerification> = ctx
         .cache
         .store()
-        .get_challenge_results(ctx.context_id, ctx.subject_did)?;
+        .get_challenge_results(ctx.context_id, ctx.subject_did)?
+        .into_iter()
+        .filter(|cv| {
+            verify_challenge_verification(
+                cv,
+                ctx.resolver,
+                ctx.context_id,
+                ctx.subject_did,
+                ctx.clock,
+            )
+            .is_ok()
+        })
+        .collect();
 
     // 4. Consequence structure comes directly from context params.
     let consequence_structure: Vec<ConsequenceRule> = ctx.consequence_rules.to_vec();
@@ -452,8 +629,8 @@ mod tests {
 
     use super::*;
     use crate::trust::attestation::RevocationStatus;
+    use scp_clock::TestClock;
     use scp_event_log::{EventPayload, EventType};
-    use scp_primitives::TestClock;
 
     // -----------------------------------------------------------------------
     // Test helpers: InMemoryTrustStore
@@ -652,15 +829,34 @@ mod tests {
         }
     }
 
+    /// Deterministic verifier signing key used by `make_challenge_verification`,
+    /// so a test resolver can be seeded with the matching public key.
+    fn challenge_verifier_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// Builds a GENUINELY verifier-signed [`ChallengeVerification`] bound to
+    /// `context_id`. The `verifier_signature` is a real Ed25519 signature over
+    /// the canonical bytes, so it passes `verify_challenge_verification` when the
+    /// resolver is seeded via [`seed_challenge_verifier`].
     fn make_challenge_verification(
         challenge_id: &str,
         responder: &str,
         completed_at: u64,
+        context_id: Option<&str>,
     ) -> ChallengeVerification {
-        use crate::trust::challenge::{ChallengeType, VerificationMethod};
-        ChallengeVerification {
+        use crate::trust::challenge::{
+            ChallengeType, VerificationMethod, canonical_challenge_verification_bytes,
+        };
+        use ed25519_dalek::Signer;
+
+        let verifier_key = challenge_verifier_key();
+        let verifier_pub = verifier_key.verifying_key().to_bytes();
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
+
+        let mut cv = ChallengeVerification {
             verification_id: challenge_id.to_owned(),
-            verifier_did: "did:key:challenger".into(),
+            verifier_did,
             subject_did: responder.into(),
             capability_uri: String::new(),
             challenge_type: ChallengeType::schema_validation(),
@@ -675,9 +871,21 @@ mod tests {
             completed_at,
             verified_at: completed_at + 1,
             expires_at: completed_at + 86400,
-            context_id: None,
-            verifier_signature: vec![0u8; 64],
-        }
+            context_id: context_id.map(ToOwned::to_owned),
+            verifier_signature: vec![],
+        };
+        let canonical = canonical_challenge_verification_bytes(&cv).unwrap();
+        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        cv
+    }
+
+    /// Seeds `resolver` with the public key for the verifier DID used by
+    /// [`make_challenge_verification`], so the genuine signature resolves and
+    /// verifies on the challenge read path.
+    fn seed_challenge_verifier(resolver: &mut TestResolver) {
+        let verifier_pub = challenge_verifier_key().verifying_key().to_bytes();
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub).to_string();
+        resolver.keys.insert(verifier_did, verifier_pub.to_vec());
     }
 
     // -----------------------------------------------------------------------
@@ -813,7 +1021,7 @@ mod tests {
     fn store_persists_and_retrieves_challenge_results() {
         let store = InMemoryTrustStore::new();
 
-        let cv = make_challenge_verification("ch-1", "did:key:alice", 1000);
+        let cv = make_challenge_verification("ch-1", "did:key:alice", 1000, Some("ctx-1"));
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
         let results = store
@@ -828,8 +1036,8 @@ mod tests {
     fn store_accumulates_multiple_challenge_results() {
         let store = InMemoryTrustStore::new();
 
-        let cv1 = make_challenge_verification("ch-1", "did:key:alice", 1000);
-        let cv2 = make_challenge_verification("ch-2", "did:key:alice", 2000);
+        let cv1 = make_challenge_verification("ch-1", "did:key:alice", 1000, Some("ctx-1"));
+        let cv2 = make_challenge_verification("ch-2", "did:key:alice", 2000, Some("ctx-1"));
 
         store.store_challenge_result("ctx-1", &cv1).unwrap();
         store.store_challenge_result("ctx-1", &cv2).unwrap();
@@ -870,6 +1078,36 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "att-1");
+    }
+
+    #[test]
+    fn cache_drops_fresh_entry_whose_attestation_has_expired() {
+        // The cache entry is fresh (within TTL) but the attestation's own
+        // `expires_at` has passed relative to `now`. The fresh-return path must
+        // drop it rather than return an expired credential.
+        let store = InMemoryTrustStore::new();
+        // make_attestation sets expires_at = Some(5000); clock past that.
+        let clock = TestClock::new(6000);
+
+        let att = make_attestation("att-1", "did:key:alice", AttestationType::Endorsement);
+        let entry = CachedAttestation {
+            attestation: att,
+            verified_at: 5900, // fresh: 5900 + 600 = 6500 > 6000
+            ttl_secs: 600,
+        };
+        store.store_cached_attestation("ctx-1", entry).unwrap();
+
+        let cache = AttestationCache::new(store);
+        let resolver = TestResolver::new();
+
+        let result = cache
+            .get_verified_attestations("ctx-1", "did:key:alice", &resolver, &clock)
+            .unwrap();
+
+        assert!(
+            result.is_empty(),
+            "a fresh cache entry whose attestation expires_at < now must be excluded on read"
+        );
     }
 
     #[test]
@@ -914,7 +1152,10 @@ mod tests {
     fn aggregate_returns_complete_trust_input() {
         let store = InMemoryTrustStore::new();
         let clock = TestClock::new(2000);
-        let resolver = TestResolver::new();
+        // Seed the resolver with the verifier key so the genuinely-signed
+        // challenge result re-validates on the read path (Fix 1).
+        let mut resolver = TestResolver::new();
+        seed_challenge_verifier(&mut resolver);
 
         // Seed the store with cached attestations.
         let att = make_attestation("att-1", "did:key:alice", AttestationType::Endorsement);
@@ -925,8 +1166,8 @@ mod tests {
         };
         store.store_cached_attestation("ctx-1", entry).unwrap();
 
-        // Seed the store with challenge results.
-        let cv = make_challenge_verification("ch-1", "did:key:alice", 1500);
+        // Seed the store with a genuinely-signed, in-context challenge result.
+        let cv = make_challenge_verification("ch-1", "did:key:alice", 1500, Some("ctx-1"));
         store.store_challenge_result("ctx-1", &cv).unwrap();
 
         let cache = AttestationCache::new(store);
@@ -936,11 +1177,11 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:alice", 1000, 0, vec![]),
             make_event(EventType::MessageSent, "did:key:alice", 1500, 1, vec![]),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1600,
                 2,
-                b"my-tool".to_vec(),
+                b"my-outlet".to_vec(),
             ),
         ];
 
@@ -979,7 +1220,10 @@ mod tests {
         assert_eq!(input.participation_record.context_id, "ctx-1");
         assert_eq!(input.participation_record.participation_count, 3);
         assert_eq!(
-            input.participation_record.tool_invocations.get("my-tool"),
+            input
+                .participation_record
+                .outlet_invocations
+                .get("my-outlet"),
             Some(&1)
         );
 
@@ -996,6 +1240,74 @@ mod tests {
 
         // Threshold counts (empty -- no requirements defined).
         assert!(input.threshold_counts.is_empty());
+    }
+
+    #[test]
+    fn aggregate_excludes_persisted_challenge_result_after_expiry() {
+        // Fix 1 (read-path re-validation). A genuine, in-context, properly-signed
+        // challenge result is persisted; after the clock advances past its
+        // `expires_at`, re-running aggregation must EXCLUDE it (the persistent
+        // store would otherwise serve it as a current trust signal forever).
+        let store = InMemoryTrustStore::new();
+        let mut resolver = TestResolver::new();
+        seed_challenge_verifier(&mut resolver);
+
+        // completed_at = 1500 → expires_at = 1500 + 86400 = 87_900.
+        let cv = make_challenge_verification("ch-expiring", "did:key:alice", 1500, Some("ctx-1"));
+        store.store_challenge_result("ctx-1", &cv).unwrap();
+
+        let events = vec![make_event(
+            EventType::MessageSent,
+            "did:key:alice",
+            1000,
+            0,
+            vec![],
+        )];
+        let consequence_rules = vec![];
+        let threshold_requirements = HashMap::new();
+        let attestor_sets = HashMap::new();
+        let cache = AttestationCache::new(store);
+
+        // Sanity: before expiry the result IS included.
+        let before_clock = TestClock::new(2000);
+        let ctx_before = AggregationContext {
+            context_id: "ctx-1",
+            subject_did: "did:key:alice",
+            events: &events,
+            merkle_root: [0u8; 32],
+            consequence_rules: &consequence_rules,
+            threshold_requirements: &threshold_requirements,
+            attestor_sets: &attestor_sets,
+            cache: &cache,
+            resolver: &resolver,
+            clock: &before_clock,
+        };
+        let input_before = aggregate_trust_input(&ctx_before).unwrap();
+        assert_eq!(
+            input_before.challenge_results.len(),
+            1,
+            "a valid, unexpired challenge result must be included"
+        );
+
+        // After expiry the result is EXCLUDED on read.
+        let after_clock = TestClock::new(90_000);
+        let ctx_after = AggregationContext {
+            context_id: "ctx-1",
+            subject_did: "did:key:alice",
+            events: &events,
+            merkle_root: [0u8; 32],
+            consequence_rules: &consequence_rules,
+            threshold_requirements: &threshold_requirements,
+            attestor_sets: &attestor_sets,
+            cache: &cache,
+            resolver: &resolver,
+            clock: &after_clock,
+        };
+        let input_after = aggregate_trust_input(&ctx_after).unwrap();
+        assert!(
+            input_after.challenge_results.is_empty(),
+            "an expired persisted challenge result must be excluded on the read path"
+        );
     }
 
     #[test]
@@ -1175,7 +1487,7 @@ mod tests {
                 window: Duration::from_mins(1),
             },
             ConsequenceRule {
-                trigger: super::super::consequence::ConsequenceTrigger::ToolRateExceeded,
+                trigger: super::super::consequence::ConsequenceTrigger::OutletRateExceeded,
                 action: super::super::consequence::ConsequenceAction::AssignRole {
                     to_role: "observer".to_owned(),
                 },
@@ -1222,14 +1534,14 @@ mod tests {
     fn threshold_counts_with_empty_attestor_set() {
         let mut requirements = HashMap::new();
         requirements.insert(
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             ThresholdRequirement::new(2, 3, 0.5),
         );
 
         let attestor_sets = HashMap::new();
 
         let counts = compute_threshold_counts(&requirements, &attestor_sets);
-        let (met, required) = counts.get(&AttestationType::ToolIntegrity).unwrap();
+        let (met, required) = counts.get(&AttestationType::OutletIntegrity).unwrap();
         assert_eq!(*met, 0);
         assert_eq!(*required, 2);
     }
@@ -1242,7 +1554,7 @@ mod tests {
             ThresholdRequirement::new(2, 3, 0.0),
         );
         requirements.insert(
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             ThresholdRequirement::new(1, 2, 0.0),
         );
 
@@ -1268,8 +1580,8 @@ mod tests {
         assert_eq!(*met, 1);
         assert_eq!(*required, 2);
 
-        // ToolIntegrity: 0 met (no attestors), 1 required.
-        let (met, required) = counts.get(&AttestationType::ToolIntegrity).unwrap();
+        // OutletIntegrity: 0 met (no attestors), 1 required.
+        let (met, required) = counts.get(&AttestationType::OutletIntegrity).unwrap();
         assert_eq!(*met, 0);
         assert_eq!(*required, 1);
     }

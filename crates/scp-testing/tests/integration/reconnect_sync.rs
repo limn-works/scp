@@ -33,12 +33,11 @@ use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use scp_core::context::ContextState;
-use scp_core::context::governance::KeyResolver;
 use scp_core::context::membership::ContextEvent;
 use scp_core::context::params::{ContextMode, ContextParams};
 use scp_core::context::roles::Capability;
 use scp_core::sync::SyncPolicy;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_testing::fullstack::FullStackNetwork;
 use scp_transport::TransportManager;
 use scp_transport::native::adapter::NativeRelayAdapter;
@@ -66,16 +65,6 @@ fn signing_key_for(did: &str) -> SigningKey {
     SigningKey::from_bytes(&did_to_seed(did))
 }
 
-/// Key resolver that resolves any DID to the deterministic verifying key the
-/// full-stack node derives from `did_to_seed`. Lets the checkpoint-signature
-/// verification path in `compare_remote_checkpoint` succeed for legitimately
-/// signed peer checkpoints.
-fn deterministic_key_resolver() -> KeyResolver {
-    Arc::new(|did: &DID, _kid: scp_identity::SigningKeyId| {
-        Some(signing_key_for(did.as_ref()).verifying_key())
-    })
-}
-
 fn encrypted_params() -> ContextParams {
     ContextParams {
         mode: ContextMode::Encrypted,
@@ -85,6 +74,7 @@ fn encrypted_params() -> ContextParams {
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,
+            Capability::GovernancePropose,
             Capability::ContextClose,
         ],
         ..ContextParams::default()
@@ -219,7 +209,7 @@ async fn reconnect_classifies_all_three_tiers() {
     let (relay_handle, relay_addr) = start_relay().await;
     let transport = connect_transport(relay_addr).await;
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, deterministic_key_resolver());
+    let alice = network.create_node(ALICE_DID);
     alice
         .create_context(short_ctx, encrypted_params())
         .await
@@ -265,8 +255,8 @@ async fn reconnect_classifies_all_three_tiers() {
 #[tokio::test]
 async fn reconnect_tier1_builds_checkpoint_and_clears_flag() {
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, deterministic_key_resolver());
-    let bob = network.create_node(BOB_DID, deterministic_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
 
     let ctx_id = "reconnect-tier1-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
@@ -274,17 +264,18 @@ async fn reconnect_tier1_builds_checkpoint_and_clears_flag() {
         .create_context(ctx_id, encrypted_params())
         .await
         .expect("create context");
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 
     alice.add_member(&handle, BOB_DID).await.expect("add bob");
     bob.join_from_welcome(ctx_id, &ctx_bytes)
+        .await
         .expect("bob joins");
 
-    // The reconnecting member is the creator (Alice), who owns the per-context
-    // actor. (Per the ADR-049 spawn-from-Welcome follow-up, a Welcome-joined
-    // node like Bob can decrypt but has no actor-backed send context, so the
-    // reconnection driver — which reaches actor-owned state through the
-    // Supervisor mailbox — is exercised on the actor-owning creator side.)
+    // The reconnecting member is the creator (Alice). Post ADR-049 §9
+    // 2F-residual, Bob is also a live actor-backed member (he joined via
+    // `spawn_actor_from_welcome`), but this test drives Alice's reconnection —
+    // the reconnection driver reaches actor-owned state through the Supervisor
+    // mailbox on the creator side.
     //
     // Phase 5: Alice advances her own MLS epoch (post-compromise security,
     // §9.12) — exactly the step the driver's `mls_update` issues.
@@ -343,8 +334,8 @@ async fn reconnect_tier1_builds_checkpoint_and_clears_flag() {
 #[tokio::test]
 async fn reconnect_detects_forged_divergent_checkpoint() {
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, deterministic_key_resolver());
-    let bob = network.create_node(BOB_DID, deterministic_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
 
     let ctx_id = "reconnect-equivocation-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
@@ -354,11 +345,12 @@ async fn reconnect_detects_forged_divergent_checkpoint() {
         .expect("create context");
     alice.add_member(&handle, BOB_DID).await.expect("add bob");
     bob.join_from_welcome(ctx_id, &ctx_bytes)
+        .await
         .expect("bob joins");
 
-    // Bob is a member (so the checkpoint passes the membership gate) but is a
-    // Welcome-joined node with no actor (ADR-049 spawn-from-Welcome follow-up).
-    // We therefore forge Bob's checkpoint directly: build Alice's honest
+    // Bob is a member (so the checkpoint passes the membership gate). We forge
+    // Bob's checkpoint directly rather than driving his node: build Alice's
+    // honest
     // checkpoint to learn the current event count + epoch + root, then craft a
     // divergent checkpoint at the SAME count with a DIFFERENT Merkle root,
     // signed by Bob's real key. §9.9.3: equivocation is equal-count,
@@ -434,8 +426,8 @@ async fn reconnect_detects_forged_divergent_checkpoint() {
 #[tokio::test]
 async fn runtime_equivocation_dispatch_and_targeted_drain() {
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, deterministic_key_resolver());
-    let bob = network.create_node(BOB_DID, deterministic_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
 
     let ctx_id = "reconnect-runtime-equivocation-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
@@ -445,6 +437,7 @@ async fn runtime_equivocation_dispatch_and_targeted_drain() {
         .expect("create context");
     alice.add_member(&handle, BOB_DID).await.expect("add bob");
     bob.join_from_welcome(ctx_id, &ctx_bytes)
+        .await
         .expect("bob joins");
 
     // Seed an unrelated application event into Alice's receive buffer (the

@@ -6,32 +6,24 @@
 //! This module hosts governance-domain helpers that operate on
 //! actor-owned [`PerContextState`](crate::context::actor::state::PerContextState)
 //! and capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
-//! The legacy `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::governance_helpers_legacy`] until Phase 2A
-//! finalization removes the shim fallback.
+//! The pre-migration `&Supervisor` lock-and-call bodies have been removed
+//! (Phase 2A finalization); this module is the sole home for these helpers.
 //!
 //! # Migration shape
 //!
 //! Phase 2A.8 lands as a multi-commit ladder. Each commit migrates a
 //! group of related helpers, wiring the actor-shape
-//! `handlers::governance::dispatch` arms incrementally. Five
-//! supervisor-scoped helpers (`start_governance_timeout_task`,
-//! `evaluate_periodic_consequences`, `process_pending_commits`,
-//! `compute_commit_retry_outcomes`, `apply_commit_retry_outcomes`)
-//! inherently iterate the contexts `DashMap` and have no actor-shape
-//! twin — they remain in
-//! [`crate::context::governance_helpers_legacy`] until the legacy
-//! contexts map dissolves at Phase 2A finalization.
-//!
-//! Legacy `lifecycle_helpers` callsites (`create_context`,
-//! `drain_and_deliver_sender_keys`) are reached via the
-//! [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-//! escape hatch until those domains migrate (Phase 2A.9).
+//! `handlers::governance::dispatch` arms incrementally. The
+//! supervisor-scoped sweep helpers (`evaluate_periodic_consequences`,
+//! `process_pending_commits`, `compute_commit_retry_outcomes`,
+//! `apply_commit_retry_outcomes`) iterate the actor registry and drive
+//! each context's per-actor sweep body through its mailbox. (Governance
+//! timeouts are an ACTOR-OWNED interval arm — ADR-049 finding A3 — not a
+//! supervisor-spawned task.)
 
-use std::sync::Arc;
-
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::DID;
+use scp_protocol::context::broadcast::AuthorKeyRotation;
 use scp_protocol::context::governance::mls_integration::{
     MlsImpact, classify_action, generate_mls_operations,
 };
@@ -40,9 +32,9 @@ use scp_protocol::context::governance::{
     ProposalId, ProposalStatus, PruningPolicy,
 };
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
-use scp_protocol::context::params::ToolRegistration;
+use scp_protocol::context::outlets::interface::OutletInterface;
+use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{self, Capability, CapabilityCeiling};
-use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::types::EconomicPolicy;
 use tracing::instrument;
@@ -57,7 +49,7 @@ use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
     EXECUTED_PROPOSALS_TTL_SECS, GovernanceActionResult, GovernanceReconfiguredResult,
-    MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES,
+    MAX_OUTLET_INTERFACES, MAX_PENDING_COMMITS, MAX_REGISTERED_OUTLETS, MAX_THRESHOLD_SIGNERS,
     MigrationProposedResult, MigrationState, PendingCeilingModification, PendingCommit,
     PendingEconomicPolicyChange, ProposalOutcome, RestoreAccessResult, RevokeResult,
     SuspendMemberResult, commit_retry_backoff, context_id_to_bytes, emit_event_into,
@@ -264,10 +256,7 @@ pub async fn tombstone_migrated_context(
     let context_id_bytes = context_id_to_bytes(context_id);
     let now = deps.clock.now_secs();
 
-    let handle_state = cell
-        .handle
-        .try_read_state()
-        .ok_or(ContextError::ContextNotActive)?;
+    let handle_state = cell.handle.state();
     if handle_state != ContextState::MigratingOut {
         return Err(ContextError::PermissionDenied(
             "context is not in MigratingOut state — cannot tombstone".to_owned(),
@@ -299,7 +288,6 @@ pub async fn tombstone_migrated_context(
     // returns early, before any `state`-field mutation or persist.
     cell.handle
         .transition_to(&ContextState::Tombstoned)
-        .await
         .map_err(|_| {
             ContextError::PermissionDenied(
                 "cannot transition from MigratingOut to Tombstoned".to_owned(),
@@ -321,28 +309,37 @@ pub async fn tombstone_migrated_context(
         };
         emit(state, tombstone_event, context_id, deps);
 
-        state.ttl.timer.cancel();
-        state.governance.timeout_task.cancel();
+        // TTL + governance timers are actor-owned arms (ADR-049 finding A3);
+        // the tombstone leaves the context non-Active so `reconcile_timers`
+        // clears the governance interval and disarms the TTL arm. Clear the
+        // recorded TTL deadline HERE (durably, in the fail-closed snapshot) so a
+        // stale absolute deadline cannot fire against the tombstoned context on
+        // a later restore and despawn it — which would defeat tombstone finality
+        // by making the id re-creatable (BUG-1).
+        state.ttl.timer.deadline_unix_secs = None;
         state.broadcast_context = None;
         state.migration_state = None;
         // M7: Participation decay on tombstone (#1530).
         state.governance.decay_participation();
         Ok(())
-    })?;
+    })
+    .await?;
 
     let tombstone_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::ContextTombstonedPayload {
-            destination_id: destination_id.clone(),
+            destination_id,
             migration_proposal_id: migration_pid,
         })
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::ContextTombstoned,
-        "system",
-        tombstone_payload,
-        tombstone_ts,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextTombstoned,
+            "system",
+            tombstone_payload,
+            tombstone_ts,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(())
@@ -418,12 +415,14 @@ pub async fn withdraw_governance_vote(
     let context_id_bytes = context_id_to_bytes(context_id);
     let mut event_count: u64 = 0;
     for event in &events {
-        deps.event_log.append_context_event(
-            &context_id_bytes,
-            governance_event_label(event),
-            voter_did.as_ref(),
-            withdraw_ts,
-        )?;
+        deps.event_log
+            .append_context_event(
+                &context_id_bytes,
+                governance_event_label(event),
+                voter_did.as_ref(),
+                withdraw_ts,
+            )
+            .await?;
         event_count += 1;
     }
 
@@ -434,7 +433,8 @@ pub async fn withdraw_governance_vote(
         if event_count > 0 {
             *view.checkpoint_events_since_mut() += event_count;
         }
-    });
+    })
+    .await;
 
     Ok(status)
 }
@@ -496,18 +496,21 @@ pub async fn apply_pending_ceiling_modification(
             })?;
         state.governance.pending_ceiling_modification = None;
         Ok(())
-    })?;
+    })
+    .await?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::CeilingModified,
-        "",
-        // Timer-triggered deferred application: the convergent leaf timestamp is
-        // the pre-computed effective deadline (deterministic across members),
-        // never local `now()` (§7.3.1, §9.9.3).
-        pending.effective_at,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::CeilingModified,
+            "",
+            // Timer-triggered deferred application: the convergent leaf timestamp is
+            // the pre-computed effective deadline (deterministic across members),
+            // never local `now()` (§7.3.1, §9.9.3).
+            pending.effective_at,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(true)
@@ -549,40 +552,24 @@ pub async fn apply_pending_economic_policy_change(
         let gov = view.governance_class_c_mut();
         *gov.economic_policy_mut() = Some(pending.new_policy);
         *gov.pending_economic_policy_change_mut() = None;
-    });
+    })
+    .await;
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::EconomicPolicyApplied,
-        "",
-        // Timer-triggered deferred application: the convergent leaf timestamp is
-        // the pre-computed effective deadline (deterministic across members),
-        // never local `now()` (§7.3.1, §9.9.3).
-        effective_at,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::EconomicPolicyApplied,
+            "",
+            // Timer-triggered deferred application: the convergent leaf timestamp is
+            // the pre-computed effective deadline (deterministic across members),
+            // never local `now()` (§7.3.1, §9.9.3).
+            effective_at,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
     Ok(true)
-}
-
-// ---------------------------------------------------------------------------
-// Persistence helpers (best-effort)
-// ---------------------------------------------------------------------------
-
-/// Best-effort persist of broadcast snapshot via `deps.persistence`.
-fn persist_broadcast_snapshot(
-    deps: &ActorDeps,
-    context_id: &str,
-    snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-) {
-    if let Err(e) = deps.persistence.persist_broadcast(context_id, snapshot) {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist broadcast snapshot"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -783,7 +770,7 @@ fn fail_close_remove_member(
 // ---------------------------------------------------------------------------
 
 /// Executes a `SuspendMember` governance action.
-pub fn execute_suspend_member(
+pub async fn execute_suspend_member(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -832,15 +819,18 @@ pub fn execute_suspend_member(
             deps,
         );
         Ok(())
-    })?;
+    })
+    .await?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberSuspended,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberSuspended,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -853,7 +843,7 @@ pub fn execute_suspend_member(
 ///
 /// Returns the number of rotated authors (for broadcast contexts).
 #[allow(clippy::too_many_lines)]
-pub fn execute_revoke(
+pub async fn execute_revoke(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -879,11 +869,16 @@ pub fn execute_revoke(
     // did (keep-direction: a downward suspension stays applied even if the
     // persist fails — un-applying it would re-grant the revoked authority).
     // A check reject (`Err` from the closure) returns before any persist,
-    // exactly as the prior early returns did. The post-persist external work
-    // (broadcast snapshot, event-log append, sender-key rotation, the
-    // coalesced `checkpoint_events_since` bump) is UNCHANGED and runs after.
-    let (rotated, bc_snap, needs_sender_key_rotation) =
-        cell.commit_class_s_keep(deps, context_id, |mut view| {
+    // exactly as the prior early returns did. Broadcast security state (author
+    // block lists + governance-ban key-epoch advance) now rides the Class-S
+    // `ContextSnapshot`, so the combinator's fail-closed persist covers it
+    // ATOMICALLY with `read_exclusion_list` — the prior trailing best-effort
+    // `persist_broadcast_snapshot` (a separate warn-and-continue write) is gone
+    // (§5.14.8 block-before-serve). The post-persist external work (event-log
+    // append, sender-key rotation, the coalesced `checkpoint_events_since` bump)
+    // is UNCHANGED and runs after.
+    let (rotated_authors, needs_sender_key_rotation) = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
             let state = view.rest_mut();
             require_active(&state.handle)?;
 
@@ -896,8 +891,7 @@ pub fn execute_revoke(
                 return Err(ContextError::MemberNotFound(did.to_string()));
             }
 
-            let mut rotated = 0usize;
-            let mut bc_snap = None;
+            let mut rotated_authors: Vec<AuthorKeyRotation> = Vec::new();
 
             // Write revocation.
             if matches!(access, AccessScope::Write | AccessScope::Both) {
@@ -910,7 +904,6 @@ pub fn execute_revoke(
                         Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
                         Err(e) => return Err(e),
                     }
-                    bc_snap = Some(bc.to_snapshot());
                 }
 
                 emit(
@@ -930,14 +923,19 @@ pub fn execute_revoke(
                 state.access.read_exclusion_list.insert(did.clone());
 
                 if let Some(ref mut bc) = state.broadcast_context {
+                    // `governance_ban_subscriber` ALWAYS records the durable ban
+                    // AND rotates every author's broadcast key (forward secrecy,
+                    // §9.5 / #2088), whether or not the DID is a current subscriber
+                    // — a non-subscriber returns `Ok` with a NON-empty rotation set.
+                    // The `MemberNotFound` arm now covers only the internal
+                    // author-not-found safety net (unreachable in practice).
                     match bc.governance_ban_subscriber(&did.0, access) {
                         Ok(r) => {
-                            rotated = r.rotated_authors.len();
+                            rotated_authors = r.rotated_authors;
                         }
                         Err(ContextError::MemberNotFound(_)) => {}
                         Err(e) => return Err(e),
                     }
-                    bc_snap = Some(bc.to_snapshot());
                 } else {
                     state
                         .access
@@ -963,53 +961,125 @@ pub fn execute_revoke(
                 matches!(access, AccessScope::Write | AccessScope::Both)
                     && state.broadcast_context.is_none();
 
-            Ok((rotated, bc_snap, needs_sender_key_rotation))
-        })?;
+            Ok((rotated_authors, needs_sender_key_rotation))
+        })
+        .await?;
 
-    if let Some(ref bc) = bc_snap {
-        persist_broadcast_snapshot(deps, context_id, bc);
-    }
     let access_revoked_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::AccessRevokedPayload {
             target_did: did.as_ref().to_owned(),
         })
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::AccessRevoked,
-        actor_did,
-        access_revoked_payload,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::AccessRevoked,
+            actor_did,
+            access_revoked_payload,
+            timestamp_secs,
+        )
+        .await?;
     // Coalesced Class-C counter bump (rides the next run-loop persist, exactly
     // as before the combinator migration — NOT covered by the FC persist above).
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
-    // H7: Rotate sender key after write-side revocation.
-    if needs_sender_key_rotation {
-        if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "rotate_sender_key failed after access revocation"
-            );
-        }
-        // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape
-        // and operates directly on `state` + `deps`.
-        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            deps,
-            context_id,
-            &context_id_bytes,
+    // Spec §2008 / §2015: emit one best-effort KeyEpochAdvance leaf per author
+    // whose broadcast key was rotated by the governance ban.  Each rotation
+    // advances by exactly 1, so old_epoch = new_epoch.saturating_sub(1).
+    // Errors are non-fatal: warn and continue (same pattern as MemberBlocked).
+    for rotation in &rotated_authors {
+        let old_epoch = rotation.new_epoch.saturating_sub(1);
+        match scp_event_log::payload::encode_payload(
+            &scp_event_log::payload::KeyEpochAdvancePayload {
+                old_epoch,
+                new_epoch: rotation.new_epoch,
+            },
         ) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "drain_and_deliver_sender_keys failed after access revocation"
-            );
+            Ok(payload) => {
+                if let Err(e) = deps
+                    .event_log
+                    .append_context_event_with_payload(
+                        &context_id_bytes,
+                        scp_event_log::EventType::KeyEpochAdvance,
+                        rotation.author_did.as_str(),
+                        payload,
+                        timestamp_secs,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        context_id = %context_id,
+                        author_did = %rotation.author_did,
+                        error = %e,
+                        "KeyEpochAdvance event-log append failed after governance ban (best-effort)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %context_id,
+                    author_did = %rotation.author_did,
+                    error = %e,
+                    "KeyEpochAdvance payload encode failed after governance ban (best-effort)"
+                );
+            }
         }
     }
 
-    Ok(rotated)
+    // H7: Rotate sender key after write-side revocation.
+    if needs_sender_key_rotation {
+        // ADR-049 PR-7: Class-S — the epoch bump is sync-persisted fail-closed via
+        // `commit_class_s_keep`; anti-replay backstop is the never-regressing
+        // registry floor (`mirror_forward`, `?`-propagated). M23: sender-key
+        // rotation + distribution stays best-effort (rotate/persist failure logged,
+        // revocation continues — the write-side capability strip above is the hard
+        // boundary).
+        let local_did = deps.crypto.local_did().to_owned();
+        match cell
+            .commit_class_s_keep(deps, context_id, |mut v| {
+                let s = v.rest_mut();
+                s.rotate_sender_key(&local_did)?;
+                Ok(s.local_sender_key_epoch())
+            })
+            .await
+        {
+            Ok(epoch) => {
+                // ADR-049 PR-6/PR-7: advance the durably-bumped local epoch in the
+                // authoritative floor registry (fail-closed backstop).
+                crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+                    deps,
+                    &context_id_bytes,
+                    epoch,
+                )?;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "rotate_sender_key failed after access revocation"
+                );
+            }
+        }
+        // Drain through the actor's crypto state (same one the rotation populated).
+        {
+            let mut view = cell.class_c_view();
+            if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+                deps,
+                view.mode_mut().crypto_mut(),
+                context_id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "drain_and_deliver_sender_keys failed after access revocation"
+                );
+            }
+        }
+    }
+
+    Ok(rotated_authors.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,7 +1087,7 @@ pub fn execute_revoke(
 // ---------------------------------------------------------------------------
 
 /// Executes a `RestoreAccess` governance action.
-pub fn execute_restore_access(
+pub async fn execute_restore_access(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1045,10 +1115,13 @@ pub fn execute_restore_access(
     // applied in memory and the persist error surfaces (the member is, if
     // anything, MORE permissioned in memory than on disk — the safe direction).
     // The check rejects (`Err` from the closure) run before any persist exactly
-    // as the prior early returns did. The post-persist external work (broadcast
-    // snapshot, event-log append, coalesced `checkpoint_events_since` bump) is
+    // as the prior early returns did. Broadcast block-list state now rides the
+    // Class-S `ContextSnapshot`, so the combinator's fail-closed persist covers the
+    // governance-unban block-list REMOVE atomically — the prior trailing
+    // best-effort `persist_broadcast_snapshot` is gone. The post-persist external
+    // work (event-log append, coalesced `checkpoint_events_since` bump) is
     // unchanged.
-    let bc_snap = cell.commit_class_s_keep(deps, context_id, |mut view| {
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
         require_active(&state.handle)?;
 
@@ -1063,7 +1136,20 @@ pub fn execute_restore_access(
             suspended_set.is_none_or(|set| !capabilities.iter().any(|c| set.contains(c)));
         let read_excluded = state.access.read_exclusion_list.contains(did);
         let read_requested = capabilities.contains(&Capability::MessagesRead);
-        if nothing_suspended_for_request && !(read_requested && read_excluded) {
+        // #2088 Finding 2: a durable broadcast ban is a restorable condition too.
+        // BOTH `suspended_capabilities` and `read_exclusion_list` are wiped by the
+        // banned subject's own self-leave (`leave_context` clears role suspension
+        // and the exclusion entry) — but the durable `banned_subscribers` record
+        // survives it by design. Without this, `RestoreAccess{MessagesRead}` after
+        // a leave would short-circuit `NothingToRestore` and never reach
+        // `governance_unban_subscriber`, leaving the DID PERMANENTLY banned with no
+        // authority recovery — falsifying the "cleared ONLY by RestoreAccess"
+        // invariant. Treat an outstanding durable ban as a read-restorable signal.
+        let durably_banned = state
+            .broadcast_context
+            .as_ref()
+            .is_some_and(|bc| bc.is_banned(did.as_ref()));
+        if nothing_suspended_for_request && !(read_requested && (read_excluded || durably_banned)) {
             return Err(ContextError::NothingToRestore(format!(
                 "no suspended capabilities to restore for {did}"
             )));
@@ -1074,13 +1160,12 @@ pub fn execute_restore_access(
             .restore_capabilities(did.as_ref(), capabilities);
 
         let has_read = capabilities.contains(&Capability::MessagesRead);
-        let bc_snap = if has_read {
+        if has_read {
             state.access.read_exclusion_list.remove(did);
 
-            let snap = state.broadcast_context.as_mut().map(|bc| {
+            if let Some(bc) = state.broadcast_context.as_mut() {
                 bc.governance_unban_subscriber(&did.0);
-                bc.to_snapshot()
-            });
+            }
 
             if state.broadcast_context.is_none() {
                 let restored_key = scp_protocol::crypto::access_keys::generate_access_key(
@@ -1108,11 +1193,7 @@ pub fn execute_restore_access(
                 context_id,
                 deps,
             );
-
-            snap
-        } else {
-            None
-        };
+        }
 
         if capabilities.contains(&Capability::MessagesWrite) {
             emit(
@@ -1123,18 +1204,18 @@ pub fn execute_restore_access(
             );
         }
 
-        Ok(bc_snap)
-    })?;
+        Ok(())
+    })
+    .await?;
 
-    if let Some(ref bc) = bc_snap {
-        persist_broadcast_snapshot(deps, context_id, bc);
-    }
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::AccessRestored,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::AccessRestored,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     // Coalesced Class-C counter bump (rides the next run-loop persist).
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
@@ -1145,14 +1226,24 @@ pub fn execute_restore_access(
 // execute_add_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_add_member(
+#[allow(clippy::too_many_lines)]
+pub async fn execute_add_member(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
     role: &str,
+    // The invitee's TLS-serialized MLS `KeyPackage`, carried on the actor
+    // command envelope by the invitation-sealing caller
+    // ([`crate::context::supervisor::Supervisor::invite_member`]) and threaded
+    // through the governance dispatch to here. `Some(..)` on the real
+    // invitation path; `None` on the paths that never carried a real add
+    // (the generic FFI `AddMember` arm and `execute_reset_member` — issue
+    // #2029), where production `add_member` errors and `cfg(test)`/`testing`
+    // returns an empty `AddMemberOutput` (preserving the non-crypto pipeline).
+    key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
-) -> Result<(), ContextError> {
+) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
     let CommitMeta {
         pid: _,
         actor_did,
@@ -1162,10 +1253,106 @@ pub fn execute_add_member(
 
     require_active(&cell.handle)?;
 
-    let add_output = deps
-        .crypto
-        .add_member(&context_id_bytes, did, None)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+    // Bind the supplied KeyPackage to the target DID BEFORE the add: the KP's
+    // MLS credential DID MUST equal `did`, or a caller could add a member under
+    // one DID using a KeyPackage minted for a different identity. Under
+    // `cfg(test)`/`testing` with `None` this is a no-op (matches the mock
+    // fixture); in production a mismatched or malformed KP is rejected here.
+    //
+    // ADR-049 §15 / SCP-CRYPTOMOVE-000c: the stateless validation routes through
+    // the stateless `MlsBackend` (`deps.mls`) — the provider `validate_key_package`
+    // copy is retired from the production call path (§15 grants no carve-out; the
+    // symbol is retained only as a test-exercised copy at `crypto/mls/provider.rs`).
+    // `validate_key_package` runs the full validation (signature / hardened-clock
+    // lifetime / ciphersuite) ONCE and returns the authenticated `credential_did`
+    // extracted from the same validated leaf, so the DID binding is preserved
+    // here as a single validate-and-bind under the same hardened clock the MLS
+    // add uses — no second parse or re-validation.
+    match key_package {
+        Some(bytes) => {
+            let validated = deps
+                .mls
+                .validate_key_package(bytes, deps.clock.as_ref())
+                .await
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let owner_did: &str = did.as_ref();
+            if validated.credential_did.as_str() != owner_did {
+                return Err(ContextError::MembershipFailed(
+                    "key package credential DID does not match target DID".to_string(),
+                ));
+            }
+        }
+        None => {
+            if !cfg!(any(test, feature = "testing")) {
+                return Err(ContextError::MembershipFailed(
+                    "production add_member requires MLS key package bytes".to_string(),
+                ));
+            }
+        }
+    }
+
+    // The invitee's KeyPackage is carried on the command envelope (`Some` on
+    // the invitation path). Under `cfg(test)`/`testing` with `None` the actor
+    // returns an empty `AddMemberOutput`, preserving the non-crypto pipeline
+    // tests. This is what makes `GovernanceAction::AddMember` do a REAL MLS add
+    // in production (§5.12.3) rather than erroring on a missing KP.
+    //
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the MLS add runs on the ACTOR-OWNED
+    // crypto (`PerContextState::add_member`), not the provider — after the
+    // create/welcome take, `deps.crypto.add_member` fails closed
+    // ("context state owned by actor"). `add_member` is §9 Class-S (the epoch
+    // bump is durably persisted fail-closed before ack), reached only through
+    // `rest_mut()` inside `commit_class_s_keep`, mirroring the `join_context`
+    // add path. On add failure NO MLS rollback is needed (no member was added),
+    // matching the prior provider disposition; the error propagates unchanged.
+    let add_output = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            v.rest_mut()
+                .add_member(did.as_ref(), key_package, deps.clock.as_ref())
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))
+        })
+        .await?;
+
+    // Clone the Welcome + Commit for the return value (the invitation-sealing
+    // caller needs the Welcome to seal the bundle; the Commit is surfaced for
+    // observability) and for the existing-member broadcast below, BEFORE the
+    // originals are moved into the `WelcomeGenerated` emit.
+    let welcome_bytes_out = add_output.welcome_bytes.clone();
+    let commit_bytes_out = add_output.commit_bytes.clone();
+    let commit_for_broadcast = add_output.commit_bytes.clone();
+
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) — join-time sender-key PUSH. Enqueue the
+    // inviter's CURRENT sender key for the newly-added member, mirroring the
+    // `join_context` add path (`lifecycle_helpers`, §9.16.2). The deleted provider
+    // `distribute_sender_key` used to do this on the invitation path; here we run
+    // its actor replacement on the actor-OWNED crypto: `distribute_sender_key`
+    // HPKE-seals the local sender key to the member's wrapping pubkey (extracted
+    // from the just-added KeyPackage's 0xFF01 leaf) and queues it onto
+    // `pending_distributions`; the async `drain_and_deliver_sender_keys` below
+    // MLS-wraps + delivers it over the management channel. Class-S — the enqueue
+    // touches the same actor crypto the add advanced, reached only through
+    // `rest_mut()` inside `commit_class_s_keep` (parity with the join add path).
+    // Best-effort disposition (M23, parity with the remove/revoke governance
+    // paths): a failure is warned and the add proceeds — the new member recovers
+    // the key via `SenderKeyRequest`. Gated on a non-empty Welcome so the
+    // `cfg(test)`/`testing` no-crypto pipeline (empty `AddMemberOutput`, no MLS
+    // group) skips it exactly as the broadcast + `WelcomeGenerated` emit below do.
+    let local_did = deps.crypto.local_did().to_owned();
+    if !welcome_bytes_out.is_empty()
+        && let Err(e) = cell
+            .commit_class_s_keep(deps, context_id, |mut v| {
+                v.rest_mut().distribute_sender_key(&local_did, did.as_ref())
+            })
+            .await
+    {
+        tracing::warn!(
+            context_id = %context_id,
+            member_did = %did,
+            error = %e,
+            "distribute_sender_key failed after member add — new member will \
+             recover via SenderKeyRequest"
+        );
+    }
 
     // The fallible role assignment + structural member insert run through the
     // field-granular Class-C role view (ADR-049 §9): `system_assign_role` mints +
@@ -1226,23 +1413,98 @@ pub fn execute_add_member(
                 deps.event_tx.as_ref(),
             );
         }
-    });
+    })
+    .await;
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberJoined,
-        actor_did,
-        timestamp_secs,
-    )?;
+    // ROOT FIX (parity with `execute_remove_member` / `execute_reset_member`):
+    // broadcast the MLS Commit to the EXISTING members. An MLS Add advances the
+    // group epoch exactly like a Remove, so without this the add's Commit was only
+    // buffered into the (broadcast-suppressed) `WelcomeGenerated` event and NEVER
+    // reached the group — every existing member desynced from the admin after any
+    // add. Routed through the same persistent retry queue (`try_broadcast_commit`
+    // + `apply_broadcast_failure`) as the remove/reset commits. A no-op when
+    // `commit_for_broadcast` is empty (the `cfg(test)` no-crypto pipeline).
+    //
+    // Hoisted AFTER the best-effort persist above (ADR-049 Decision 7 — transport
+    // is async and cannot be awaited inside the sync closure). The broadcast is
+    // async; on failure the retry-queue bookkeeping is applied Class-C (coalesced
+    // — picked up by the actor's persist tick), which is this add's correct class
+    // (member-add is not a downward-authorization transition — parity with the
+    // pre-async `commit_class_c_best_effort` shape).
+    if !commit_for_broadcast.is_empty()
+        && let Some(failure) = try_broadcast_commit(
+            deps,
+            context_id,
+            commit_for_broadcast,
+            &CommitOperation::AddMember {
+                target_did: did.clone(),
+            },
+        )
+        .await
+    {
+        apply_broadcast_failure(
+            cell.class_c_view().commit_broadcast_borrows(),
+            deps,
+            context_id,
+            failure,
+        );
+    }
+
+    // ADR-049 PR-7: deliver the queued join-time sender-key distribution to the
+    // newly-added member over the MLS management channel (§9.16.2). Drains the
+    // actor-owned `pending_distributions` the `distribute_sender_key` above
+    // populated (same crypto state), MLS-wraps each entry, and sends it — the
+    // MLS-wrap is mandatory (see `drain_and_deliver_sender_keys`). Runs AFTER the
+    // best-effort persist (transport is async — ADR-049 Decision 7), matching the
+    // remove/revoke drain call sites. Best-effort: a per-target send failure is
+    // warned; the member recovers via `SenderKeyRequest`. `&mut` view scoped so
+    // `cell` is free afterward. No-op on the `cfg(test)` no-crypto pipeline (the
+    // queue is empty — `distribute_sender_key` was skipped above).
+    {
+        let mut view = cell.class_c_view();
+        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            view.mode_mut().crypto_mut(),
+            context_id,
+        )
+        .await
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                member_did = %did,
+                error = %e,
+                "failed to deliver join-time sender key after member add"
+            );
+        }
+    }
+
+    // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
+    // (`did`) in the payload, not just `actor_did` (which on this admin-driven
+    // add is the executing admin). Participation `participation_duration_secs`
+    // (§7.3.2) attributes the join interval to this subject.
+    deps.event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberJoined,
+            actor_did,
+            did.as_ref(),
+            role,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
-    Ok(())
+    Ok(scp_protocol::context::builder::AddMemberOutput {
+        welcome_bytes: welcome_bytes_out,
+        commit_bytes: commit_bytes_out,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // execute_remove_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_remove_member(
+#[allow(clippy::too_many_lines)]
+pub async fn execute_remove_member(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1266,105 +1528,176 @@ pub fn execute_remove_member(
     // where the fail-close `commit_fault` marker is set but NOT persisted before
     // the early return). All structural mutations + emit + broadcast + sender-
     // key drain ride the SAME fail-closed persist via `view.rest_mut()`.
-    cell.commit_class_s_keep(deps, context_id, |mut view| {
-        let state = view.rest_mut();
+    let (removed_role_name, remove_commit_bytes) = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
+            let state = view.rest_mut();
 
-        require_active(&state.handle)?;
+            require_active(&state.handle)?;
 
-        if !state.membership.contains(did) {
-            return Err(ContextError::MemberNotFound(did.to_string()));
-        }
+            if !state.membership.contains(did) {
+                return Err(ContextError::MemberNotFound(did.to_string()));
+            }
 
-        // H9: MLS group removal FIRST (hard security boundary).
-        let remove_output = deps
-            .crypto
-            .remove_member(&context_id_bytes, did)
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            // Role at departure, captured BEFORE the strip below for the
+            // subject-bearing MemberLeft leaf (ADR-011 amendment; §7.3.2).
+            let removed_role_name = state
+                .membership
+                .get(did.as_ref())
+                .map_or_else(String::new, |info| info.role_name.clone());
 
-        if let Err(e) = deps
-            .crypto
-            .remove_member_sender_key(&context_id_bytes, did.as_ref())
-        {
-            return fail_close_remove_member(
-                state,
+            // H9: MLS group removal FIRST (hard security boundary). ADR-049 PR-7:
+            // the whole in-closure crypto orchestration (MLS remove, per-member
+            // sender-key prune, sender-key rotation) is driven on the actor's
+            // `state` — all riding this ONE `commit_class_s_keep` fail-closed
+            // persist (Class-S), so the epoch bump is durable. `local_did` is
+            // sourced from the retained `deps.crypto.local_did()`.
+            let remove_output = state
+                .remove_member(deps.crypto.local_did(), did.as_ref())
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+            if let Err(e) = state.remove_member_sender_key(did.as_ref()) {
+                return fail_close_remove_member(
+                    state,
+                    deps,
+                    context_id,
+                    did,
+                    "remove_member_sender_key",
+                    &e.to_string(),
+                )
+                .map(|()| (String::new(), None));
+            }
+            // ADR-049 PR-6: prune the departed member's Class-M registry floors
+            // (member-granular; siblings + the local scalar retained). See
+            // `Supervisor::remove_member_floors` for why no membership sweep.
+            deps.supervisor
+                .remove_member_floors(&context_id_bytes, did.as_ref());
+
+            if let Err(e) = state.rotate_sender_key(deps.crypto.local_did()) {
+                return fail_close_remove_member(
+                    state,
+                    deps,
+                    context_id,
+                    did,
+                    "rotate_sender_key",
+                    &e.to_string(),
+                )
+                .map(|()| (String::new(), None));
+            }
+            // ADR-049 PR-6/PR-7: rotate succeeded (the Err arm returns above) —
+            // advance the durably-bumped local epoch (read from the actor `state`,
+            // which the rotate above advanced) in the authoritative floor registry
+            // (fail-closed anti-replay backstop). Read-authority follows
+            // write-authority.
+            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
                 deps,
-                context_id,
-                did,
-                "remove_member_sender_key",
-                &e.to_string(),
-            );
-        }
+                &context_id_bytes,
+                state.local_sender_key_epoch(),
+            )?;
 
-        if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-            return fail_close_remove_member(
+            state.membership.remove_member(did);
+            // Clean teardown of ALL per-DID role state (spec §5.6.1): members,
+            // assignments, member_capabilities, AND suspended_capabilities. Replaces
+            // the prior strip that left the removed DID's suspension dangling, so a
+            // re-admitted same-DID member no longer inherits a phantom suspension.
+            // Inside `commit_class_s_keep`, so the downward-auth suspension drop
+            // persists fail-closed (ADR-049 §9).
+            state.role_state.remove_member(did.as_ref());
+
+            state
+                .access
+                .access_key_store
+                .remove(context_id, did.as_ref());
+
+            // Drop the removed member's CEK-exclusion entry (spec §5.6.1, §9.17) —
+            // per-DID content-access state outside the role state. Mirrors
+            // `execute_restore_access`. Without this, a re-admitted same-DID member
+            // would inherit a phantom read exclusion.
+            state.access.read_exclusion_list.remove(did);
+
+            // §9.10.4: drop the removed member's pseudonym routing ID. No-op on a
+            // broadcast context (which carries no peer registry).
+            if let Some(reg) = state.routing.peer_registry_mut() {
+                reg.remove(did);
+            }
+
+            emit(
                 state,
-                deps,
+                ContextEvent::MemberLeft {
+                    member_did: did.clone(),
+                },
                 context_id,
-                did,
-                "rotate_sender_key",
-                &e.to_string(),
+                deps,
             );
-        }
 
-        state.membership.remove_member(did);
-        state.role_state.members.remove(did.as_ref());
-        state.role_state.assignments.remove(did.as_ref());
-        state.role_state.member_capabilities.remove(did.as_ref());
+            // Capture the removal Commit bytes; the ASYNC broadcast + sender-key
+            // delivery run AFTER the fail-closed persist, outside this sync
+            // `_keep` closure (ADR-049 Decision 7 — transport is async). `None`
+            // on the fail-close paths above, which skip the broadcast/drain
+            // exactly as the pre-hoist early returns did.
+            Ok((removed_role_name, Some(remove_output.commit_bytes)))
+        })
+        .await?;
 
-        state
-            .access
-            .access_key_store
-            .remove(context_id, did.as_ref());
-
-        // §9.10.4: drop the removed member's pseudonym routing ID. No-op on a
-        // broadcast context (which carries no peer registry).
-        if let Some(reg) = state.routing.peer_registry_mut() {
-            reg.remove(did);
-        }
-
-        emit(
-            state,
-            ContextEvent::MemberLeft {
-                member_did: did.clone(),
-            },
-            context_id,
-            deps,
-        );
-
-        try_broadcast_commit_or_enqueue(
-            CommitBroadcastBorrows {
-                pending_commits: &mut state.pending_commits,
-                commit_fault: &mut state.commit_fault,
-                receive_buffer: &mut state.receive_buffer,
-            },
+    // Async transport ops AFTER the Class-S removal persist (ADR-049 Decision 7:
+    // `ContextTransportProvider` is async and cannot be awaited inside the sync
+    // `_keep` closure above). The membership removal is already
+    // fail-closed-persisted; the sender-key delivery is best-effort.
+    // `remove_commit_bytes` is `Some` only on the success path (the fail-close
+    // paths return `None` and skip both, matching pre-hoist ordering); it is the
+    // removal Commit already produced under the crypto `Arc` (Class-M) inside the
+    // closure.
+    if let Some(remove_commit_bytes) = remove_commit_bytes {
+        // Broadcast async (Decision 7); on FAILURE the retry-queue bookkeeping is
+        // persisted FAIL-CLOSED via `keep_broadcast_failure` (removal Commit is a
+        // safety-gated site — see that helper's doc for why the second persist).
+        if let Some(failure) = try_broadcast_commit(
             deps,
             context_id,
-            remove_output.commit_bytes,
+            remove_commit_bytes,
             &CommitOperation::RemoveMember {
                 target_did: did.clone(),
             },
-        );
-
-        // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
-        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            deps,
-            context_id,
-            &context_id_bytes,
-        ) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to deliver rotated sender keys after member removal"
-            );
+        )
+        .await
+        {
+            keep_broadcast_failure(cell, deps, context_id, failure).await?;
         }
-        Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberLeft,
-        actor_did,
-        timestamp_secs,
-    )?;
+
+        // ADR-049 PR-7: drain through the actor's crypto state (same one the
+        // in-closure `rotate_sender_key` above populated); `&mut` view scoped so
+        // `cell` is free afterward.
+        {
+            let mut view = cell.class_c_view();
+            if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+                deps,
+                view.mode_mut().crypto_mut(),
+                context_id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to deliver rotated sender keys after member removal"
+                );
+            }
+        }
+    }
+
+    // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
+    // (`did`) and the role it held at departure, not just `actor_did` (the
+    // executing admin). Participation `participation_duration_secs` (§7.3.2)
+    // attributes the leave interval to this subject.
+    deps.event_log
+        .append_membership_change_leaf(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberLeft,
+            actor_did,
+            did.as_ref(),
+            &removed_role_name,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1373,7 +1706,7 @@ pub fn execute_remove_member(
 // execute_change_role (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_change_role(
+pub async fn execute_change_role(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1411,26 +1744,35 @@ pub fn execute_change_role(
             info.tokens = tokens;
         }
         Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::RoleAssigned,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await?;
+    // Subject-bearing leaf (ADR-011 amendment): carry the *affected member*
+    // (`did`) and the newly-assigned role, not just `actor_did` (which on this
+    // admin-driven change is the executing admin). Participation
+    // `role_progression_count` (§7.3.2) attributes the role transition to this
+    // subject.
+    deps.event_log
+        .append_role_assigned_leaf(
+            &context_id_bytes,
+            actor_did,
+            did.as_ref(),
+            new_role,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// execute_register_tool (per-action leaf helper)
+// execute_register_outlet (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_register_tool(
+pub async fn execute_register_outlet(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    registration: &ToolRegistration,
+    registration: &OutletRegistration,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
     let CommitMeta {
@@ -1440,51 +1782,54 @@ pub fn execute_register_tool(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    // Tool registration is an UPWARD grant (Class-C governance config). The
+    // Outlet registration is an UPWARD grant (Class-C governance config). The
     // fallible guards read through the cell's `Deref` (no mutation); the
-    // `registered_tools` push (Class-C) rides `commit_class_c_best_effort`,
+    // `registered_outlets` push (Class-C) rides `commit_class_c_best_effort`,
     // preserving the prior best-effort persist exactly.
     require_active(&cell.handle)?;
 
     if !cell
         .role_state
         .ceiling()
-        .contains(&Capability::ToolRegister)
+        .contains(&Capability::OutletRegister)
     {
         return Err(ContextError::PermissionDenied(
-            "context ceiling does not include tool registration capability".into(),
+            "context ceiling does not include outlet registration capability".into(),
         ));
     }
 
-    if cell.governance.registered_tools.len() >= MAX_REGISTERED_TOOLS {
+    if cell.governance.registered_outlets.len() >= MAX_REGISTERED_OUTLETS {
         return Err(ContextError::LimitExceeded(format!(
-            "registered tool limit of {MAX_REGISTERED_TOOLS} exceeded"
+            "registered outlet limit of {MAX_REGISTERED_OUTLETS} exceeded"
         )));
     }
     cell.commit_class_c_best_effort(deps, context_id, |mut view| {
         view.governance_class_c_mut()
-            .registered_tools_mut()
+            .registered_outlets_mut()
             .push(registration.clone());
-    });
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ToolRegistered,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::OutletRegistered,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// execute_remove_tool (per-action leaf helper)
+// execute_remove_outlet (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_remove_tool(
+pub async fn execute_remove_outlet(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
     let CommitMeta {
@@ -1494,30 +1839,33 @@ pub fn execute_remove_tool(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    // ADR-049 §9 Class S: removing a registered tool revokes the authority to
+    // ADR-049 §9 Class S: removing a registered outlet revokes the authority to
     // invoke it — a downward-authorization transition (the inverse of
-    // `execute_register_tool`'s upward grant). Route through `commit_class_s_keep`
+    // `execute_register_outlet`'s upward grant). Route through `commit_class_s_keep`
     // so the removal persists fail-closed (keep-direction: on persist failure the
-    // tool STAYS removed — re-granting invocation of a tool the caller was told
+    // outlet STAYS removed — re-granting invocation of a outlet the caller was told
     // was removed is the unsafe direction). The reject-before-mutate guard
     // returns `Err` from inside the closure (no persist runs); the
-    // `registered_tools` retain (Class-C) rides the SAME fail-closed persist via
+    // `registered_outlets` retain (Class-C) rides the SAME fail-closed persist via
     // `view.rest_mut()`.
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         require_active(&view.handle)?;
 
         view.rest_mut()
             .governance
-            .registered_tools
-            .retain(|t| t.tool_id != tool_id);
+            .registered_outlets
+            .retain(|t| t.outlet_id != outlet_id);
         Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ToolRemoved,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::OutletRemoved,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1526,7 +1874,7 @@ pub fn execute_remove_tool(
 // execute_modify_ceiling (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_modify_ceiling(
+pub async fn execute_modify_ceiling(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1625,13 +1973,16 @@ pub fn execute_modify_ceiling(
             deps,
         );
         Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::CeilingModificationPending,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::CeilingModificationPending,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1640,6 +1991,11 @@ pub fn execute_modify_ceiling(
 // execute_close_context (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
+// ADR-049 §Decision 12: `state`/`transition_to` are now synchronous lock-free
+// ArcSwap ops. Async is retained as the ContextManager helper API contract —
+// callers await uniformly, and provider-trait calls regain await points under
+// ADR-049 Decision 7 (async-provider-trait conversion).
+#[allow(clippy::unused_async)]
 pub async fn execute_close_context(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -1663,7 +2019,6 @@ pub async fn execute_close_context(
     // `state`-field mutation or persist.
     handle
         .transition_to(&ContextState::Closing)
-        .await
         .map_err(|_| ContextError::PermissionDenied("cannot transition to Closing".to_owned()))?;
 
     // ADR-049 §9 Class S: the lifecycle close transition is security-critical
@@ -1674,18 +2029,27 @@ pub async fn execute_close_context(
     // cleanup (Class-C) rides the fail-closed persist via `view.rest_mut()`.
     cell.commit_class_s_keep(deps, context_id, |mut view| {
         let state = view.rest_mut();
-        state.ttl.timer.cancel();
-        state.governance.timeout_task.cancel();
+        // TTL + governance timers are actor-owned arms (ADR-049 finding A3):
+        // this close leaves the context non-Active so `reconcile_timers`
+        // clears the governance interval and disarms the TTL arm. Clear the
+        // recorded TTL deadline HERE (durably, in the fail-closed snapshot) so a
+        // stale absolute deadline cannot fire against the closed context on a
+        // later restore and despawn it (BUG-1) — mirroring
+        // `execute_promote_context`.
+        state.ttl.timer.deadline_unix_secs = None;
         state.broadcast_context = None;
         state.governance.decay_participation();
         Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ContextClosing,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextClosing,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1729,13 +2093,15 @@ pub async fn execute_extend_ttl(
             },
         )
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-        deps.event_log.append_context_event_with_payload(
-            &context_id_bytes,
-            scp_event_log::EventType::TtlExtensionRejected,
-            actor_did,
-            rejected_payload,
-            timestamp_secs,
-        )?;
+        deps.event_log
+            .append_context_event_with_payload(
+                &context_id_bytes,
+                scp_event_log::EventType::TtlExtensionRejected,
+                actor_did,
+                rejected_payload,
+                timestamp_secs,
+            )
+            .await?;
         let missing_len = missing.len();
         let member_count = member_dids.len();
         // Drop the `member_dids` / `missing` borrows of `cell` (held via
@@ -1752,71 +2118,33 @@ pub async fn execute_extend_ttl(
     drop(approval_dids);
     drop(member_dids);
 
-    let now = deps.clock.now_secs();
-    // Snapshot the context handle for the re-armed timer BEFORE taking the
-    // Class-C view (read via `Deref`).
-    let handle = cell.handle.clone();
-
-    // Coalesced TTL-timer re-arm: the timer fields are Class-C / structural
-    // (SCP-021). A single non-persisting Class-C view borrow holds `&mut ttl`
-    // across the `start_ttl_timer(...).await`, then drops before the best-effort
-    // persist — no fail-closed strengthening, no extra persist injected.
-    let (old_dl, new_dl) = {
-        let mut view = cell.class_c_view();
-        let ttl = view.ttl_mut();
-        ttl.timer.cancel();
-        let old_dl = ttl.timer.deadline_unix_secs.unwrap_or(0);
-        let remaining_secs = ttl.timer.deadline_unix_secs.as_mut().map(|deadline| {
-            *deadline = deadline.saturating_add(additional_secs);
-            deadline.saturating_sub(now)
-        });
-        let new_dl = ttl.timer.deadline_unix_secs.unwrap_or(0);
-        ttl.timer.cancel = Arc::new(tokio::sync::Notify::new());
-        ttl.timer.task = None;
-
-        // Phase 2A.6 Option B: actor-shape ttl_close_helpers::start_ttl_timer
-        // exists. Call it if a remaining duration is set.
-        if let Some(secs) = remaining_secs {
-            crate::context::ttl_close_helpers::start_ttl_timer(
-                // ADR-049 §9: `start_ttl_timer` was narrowed from
-                // `&mut PerContextState` to `&mut TtlTimer` so the ttl_close actor
-                // handler can reach it through the non-persisting Class-C view; the
-                // governance path passes the same timer directly. Behaviour
-                // unchanged — the helper only ever touched `state.ttl.timer`.
-                &mut ttl.timer,
-                deps,
-                context_id,
-                std::time::Duration::from_secs(secs),
-                // The extended deadline `new_dl` was computed convergently above as
-                // `old_deadline + additional_secs` (anchored on the prior
-                // convergent deadline). Pass it through as the override so the
-                // re-armed timer records that convergent value — not the local
-                // arm-time `now + remaining` — on the `ContextExpired` leaf.
-                Some(new_dl),
-                handle,
-            )
-            .await;
-        }
-        (old_dl, new_dl)
-    };
-
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
-
-    let extended_payload =
-        scp_event_log::payload::encode_payload(&scp_event_log::payload::TtlExtendedPayload {
-            old_deadline_unix: old_dl,
-            new_deadline_unix: new_dl,
-            proposal_id,
-            consenting_members: consenting,
-        })
-        .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
+    // Leaf-atomic TTL extension (ADR-049 §9, B3): raise the log-derived
+    // convergent deadline by `additional_secs`, mutate the recorded (actor-owned,
+    // §A3) timer AND append the matching `TtlExtended` leaf from the SAME
+    // resolved value, via the shared `extend_ttl_deadline_and_record` combinator
+    // (also used by the bilateral `reset_ttl_timer` path) so a deadline mutation
+    // can never drift from its convergent leaf. The combinator derives the
+    // current deadline from the single authoritative source (the log), extends
+    // it (`old_deadline + additional_secs`, convergent across members), and
+    // stamps the leaf with the committer-assigned `timestamp_secs`
+    // (`proposal.created_at`). A context whose log yields no convergent deadline
+    // has no TTL to extend ⇒ no-op, no leaf. The append is best-effort/fail-safe
+    // (a lost leaf re-derives the shorter un-extended base on restore).
+    crate::context::ttl_close_helpers::extend_ttl_deadline_and_record(
+        cell,
+        deps.event_log.as_ref(),
         &context_id_bytes,
-        scp_event_log::EventType::TtlExtended,
         actor_did,
-        extended_payload,
-        timestamp_secs,
-    )?;
+        additional_secs,
+        crate::context::ttl_close_helpers::ExtensionLeaf::Governance {
+            proposal_id,
+            committer_timestamp_secs: timestamp_secs,
+            consenting_members: consenting,
+        },
+    )
+    .await;
+
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1825,7 +2153,7 @@ pub async fn execute_extend_ttl(
 // execute_transfer_admin (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_transfer_admin(
+pub async fn execute_transfer_admin(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1877,13 +2205,16 @@ pub fn execute_transfer_admin(
             info.tokens = tokens;
         }
         Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::AdminTransferred,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::AdminTransferred,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1892,7 +2223,7 @@ pub fn execute_transfer_admin(
 // execute_create_child_context (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_create_child_context(
+pub async fn execute_create_child_context(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1921,12 +2252,14 @@ pub fn execute_create_child_context(
         ));
     }
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ChildContextCreated,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ChildContextCreated,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -1935,7 +2268,7 @@ pub fn execute_create_child_context(
 // execute_modify_pruning_policy (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_modify_pruning_policy(
+pub async fn execute_modify_pruning_policy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -1993,13 +2326,16 @@ pub fn execute_modify_pruning_policy(
     require_active(&cell.handle)?;
     cell.commit_class_c_best_effort(deps, context_id, |mut view| {
         *view.governance_class_c_mut().pruning_policy_mut() = Some(new_policy.clone());
-    });
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::PruningPolicyModified,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::PruningPolicyModified,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2008,7 +2344,7 @@ pub fn execute_modify_pruning_policy(
 // execute_add_signer (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_add_signer(
+pub async fn execute_add_signer(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2076,13 +2412,16 @@ pub fn execute_add_signer(
             }
         }
         Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::SignerAdded,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::SignerAdded,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2091,7 +2430,7 @@ pub fn execute_add_signer(
 // execute_remove_signer (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_remove_signer(
+pub async fn execute_remove_signer(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2156,13 +2495,16 @@ pub fn execute_remove_signer(
             });
         }
         Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::SignerRemoved,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::SignerRemoved,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2171,7 +2513,7 @@ pub fn execute_remove_signer(
 // execute_modify_threshold (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_modify_threshold(
+pub async fn execute_modify_threshold(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2202,26 +2544,29 @@ pub fn execute_modify_threshold(
         }
         view.governance_class_s_mut().threshold_value = new_threshold;
         Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ThresholdModified,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ThresholdModified,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// execute_establish_tool_interface (per-action leaf helper)
+// execute_establish_outlet_interface (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_establish_tool_interface(
+pub async fn execute_establish_outlet_interface(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
-    interface: &ToolInterface,
+    interface: &OutletInterface,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
     let CommitMeta {
@@ -2231,8 +2576,8 @@ pub fn execute_establish_tool_interface(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    // Establishing a tool interface is Class-C governance config. The fallible
-    // guards read through the cell's `Deref`; the `tool_interfaces` push
+    // Establishing a outlet interface is Class-C governance config. The fallible
+    // guards read through the cell's `Deref`; the `outlet_interfaces` push
     // (Class-C) rides `commit_class_c_best_effort`, preserving the prior
     // best-effort persist exactly.
     require_active(&cell.handle)?;
@@ -2240,29 +2585,32 @@ pub fn execute_establish_tool_interface(
     if !cell
         .role_state
         .ceiling()
-        .contains(&Capability::ToolInterface)
+        .contains(&Capability::OutletInterface)
     {
         return Err(ContextError::PermissionDenied(
-            "context ceiling does not include tool interface capability".into(),
+            "context ceiling does not include outlet interface capability".into(),
         ));
     }
 
-    if cell.governance.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
+    if cell.governance.outlet_interfaces.len() >= MAX_OUTLET_INTERFACES {
         return Err(ContextError::LimitExceeded(format!(
-            "tool interface limit of {MAX_TOOL_INTERFACES} exceeded"
+            "outlet interface limit of {MAX_OUTLET_INTERFACES} exceeded"
         )));
     }
     cell.commit_class_c_best_effort(deps, context_id, |mut view| {
         view.governance_class_c_mut()
-            .tool_interfaces_mut()
+            .outlet_interfaces_mut()
             .push(interface.clone());
-    });
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ToolInterfaceEstablished,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::OutletInterfaceEstablished,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2271,14 +2619,26 @@ pub fn execute_establish_tool_interface(
 // execute_reset_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_reset_member(
-    view: &mut crate::context::actor::class_s::ClassCMut<'_>,
+#[allow(
+    clippy::too_many_lines,
+    reason = "single-pipeline member-reset orchestration (remove+add+broadcast+rotate+drain) with the detailed §9 residual-of-coalescing rationale inline"
+)]
+pub async fn execute_reset_member(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     did: &DID,
     _reason: &str,
     meta: CommitMeta<'_>,
 ) -> Result<(), ContextError> {
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): reset now takes the whole `ClassSCell`
+    // (was a `ClassCMut` view) so the sender-key ROTATION can go through
+    // `commit_class_s_keep`→`rest_mut` — §9 classifies rotation as Class-S (the
+    // epoch bump must be durable), exactly as leave/revoke. The membership
+    // remove+add and the broadcast/retry bookkeeping remain the coalesced Class-C
+    // work they were (reset is a same-member key REFRESH, net-neutral on authority
+    // — see the residual-of-coalescing note below); those reach their fields
+    // through short-lived `cell.class_c_view()` borrows.
     let CommitMeta {
         pid: _,
         actor_did,
@@ -2286,24 +2646,61 @@ pub fn execute_reset_member(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    require_active(view.handle_mut())?;
-
-    if !view.membership_class_c_mut().contains(did.as_ref()) {
-        return Err(ContextError::MemberNotFound(did.to_string()));
+    {
+        let mut view = cell.class_c_view();
+        require_active(view.handle_mut())?;
+        if !view.membership_class_c_mut().contains(did.as_ref()) {
+            return Err(ContextError::MemberNotFound(did.to_string()));
+        }
     }
 
     // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
-    let remove_output = deps
-        .crypto
-        .remove_member(&context_id_bytes, did)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-    let add_output = deps
-        .crypto
-        .add_member(&context_id_bytes, did, None)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the MLS group is actor-owned, so the
+    // remove+add mutate the actor's OWNED group via `rest_mut()`. The whole
+    // `&mut PerContextState` these MLS ops require is reachable ONLY through a
+    // Class-S combinator (the coalesced Class-C view is field-granular by
+    // construction and cannot hand out `rest_mut()`), so the net-neutral
+    // remove+add pair is persisted fail-closed via `commit_class_s_keep` — a safe
+    // over-persist versus the former provider path's coalesced write (reset is a
+    // rare governance op, not the hot send path; the membership effect is
+    // net-neutral, so nothing security-critical rides on the persist class). The
+    // two commit-byte outputs drive the async broadcasts below. `local_did` is
+    // node-resident (retained `deps.crypto.local_did()`), read once here and
+    // reused by the rotation block below.
+    let local_did = deps.crypto.local_did().to_owned();
+    let (remove_output, add_output) = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            let s = v.rest_mut();
+            let remove_output = s
+                .remove_member(&local_did, did.as_ref())
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            let add_output = s
+                .add_member(did.as_ref(), None, deps.clock.as_ref())
+                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            Ok((remove_output, add_output))
+        })
+        .await?;
 
-    try_broadcast_commit_or_enqueue(
-        view.commit_broadcast_borrows(),
+    // Member reset operates on a coalesced `ClassCMut` view (best-effort). The
+    // broadcasts are async; on failure the retry-queue bookkeeping is applied
+    // through the same coalesced view (`view.commit_broadcast_borrows()`), so a
+    // crash before the ≤50 ms persist tick can drop the `commit_fault`/retry
+    // bookkeeping. RESIDUAL of coalescing here (be honest): a lost reset Commit
+    // leaves remaining members on an epoch where the reset member's OLD
+    // (rotated-out, possibly compromised) keys still decrypt until the Commit is
+    // re-delivered — the same desync class the safety-gated sites fail-close
+    // against. Coalesced is nonetheless the correct/defensible class for reset,
+    // for three reasons: (1) reset is a same-member key REFRESH — the member is
+    // removed and IMMEDIATELY re-added in the same operation and remains
+    // authorized throughout, so it is net-neutral versus a true `RemoveMember`
+    // (no authority is being withdrawn from anyone); (2) §9 classifies the
+    // membership effect as Class-M, not a downward-authorization Class-S
+    // transition, so it carries no §9 fail-closed obligation; and (3) it matches
+    // the pre-async coalesced `ClassCMut` shape exactly — coalescing here is
+    // parity, NOT a regression introduced by the async-transport hoist. (The
+    // fail-closed sites — remove/rotate/leave/recovery — genuinely withdraw
+    // authority or re-key away from a compromised party, which reset does not.)
+    if let Some(failure) = try_broadcast_commit(
         deps,
         context_id,
         remove_output.commit_bytes,
@@ -2311,9 +2708,17 @@ pub fn execute_reset_member(
             target_did: did.clone(),
             is_remove: true,
         },
-    );
-    try_broadcast_commit_or_enqueue(
-        view.commit_broadcast_borrows(),
+    )
+    .await
+    {
+        apply_broadcast_failure(
+            cell.class_c_view().commit_broadcast_borrows(),
+            deps,
+            context_id,
+            failure,
+        );
+    }
+    if let Some(failure) = try_broadcast_commit(
         deps,
         context_id,
         add_output.commit_bytes,
@@ -2321,11 +2726,28 @@ pub fn execute_reset_member(
             target_did: did.clone(),
             is_remove: false,
         },
-    );
+    )
+    .await
+    {
+        apply_broadcast_failure(
+            cell.class_c_view().commit_broadcast_borrows(),
+            deps,
+            context_id,
+            failure,
+        );
+    }
 
-    if let Err(e) = deps
-        .crypto
-        .remove_member_sender_key(&context_id_bytes, did.as_ref())
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): remove the reset member's stale sender
+    // key from the actor-owned store. Routed through `commit_class_s_keep` because
+    // the sender-key store lives behind the whole-`&mut PerContextState` reachable
+    // only via a Class-S combinator; the persist is fail-closed but the outcome is
+    // swallowed to preserve the prior best-effort disposition (the anti-replay
+    // backstop is the never-regressing registry floor pruned just below).
+    if let Err(e) = cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            v.rest_mut().remove_member_sender_key(did.as_ref())
+        })
+        .await
     {
         tracing::warn!(
             context_id,
@@ -2335,37 +2757,81 @@ pub fn execute_reset_member(
              sender key layer may retain stale key"
         );
     }
-    if let Err(e) = deps.crypto.rotate_sender_key(&context_id_bytes) {
-        tracing::warn!(
+    // ADR-049 PR-6: prune the departed member's Class-M registry floors
+    // (member-granular; siblings + the local scalar retained).
+    deps.supervisor
+        .remove_member_floors(&context_id_bytes, did.as_ref());
+    // ADR-049 PR-7 (RESET-SITE ruling a): the sender-key ROTATION is Class-S per
+    // §9 — the epoch bump is sync-persisted fail-closed via `commit_class_s_keep`
+    // (treated exactly like leave/revoke), NOT the coalesced best-effort it was
+    // when this site only held a `ClassCMut` view. Swallow-and-log disposition
+    // preserved on failure (rotation + distribution best-effort, M23); anti-replay
+    // backstop is the never-regressing registry floor (`mirror_forward`,
+    // `?`-propagated). `local_did` was read once above and is reused here.
+    match cell
+        .commit_class_s_keep(deps, context_id, |mut v| {
+            let s = v.rest_mut();
+            s.rotate_sender_key(&local_did)?;
+            Ok(s.local_sender_key_epoch())
+        })
+        .await
+    {
+        Ok(epoch) => {
+            // ADR-049 PR-6/PR-7: advance the durably-bumped local epoch (read from
+            // the actor state the rotate above advanced) in the authoritative floor
+            // registry (fail-closed backstop).
+            crate::context::messaging_helpers::mirror_forward_local_sender_epoch(
+                deps,
+                &context_id_bytes,
+                epoch,
+            )?;
+        }
+        Err(e) => {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "rotate_sender_key failed after MLS reset"
+            );
+        }
+    }
+
+    // ADR-049 PR-7: drain through the actor's crypto state (same one the rotation
+    // populated — reset has no separate `distribute_sender_key`, so `rotate` is the
+    // sole producer of the pending queue). `&mut` view scoped so `cell` is free.
+    {
+        let mut view = cell.class_c_view();
+        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            deps,
+            view.mode_mut().crypto_mut(),
             context_id,
-            error = %e,
-            "rotate_sender_key failed after MLS reset"
-        );
+        )
+        .await
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to deliver rotated sender keys after member reset"
+            );
+        }
     }
 
-    // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
-    if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-        deps,
-        context_id,
-        &context_id_bytes,
-    ) {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to deliver rotated sender keys after member reset"
-        );
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::MemberReset,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
+    // Coalesced Class-C bookkeeping through a short-lived view (the checkpoint
+    // counter + the pending epoch-reset queue are Class-C, ride the next persist).
+    {
+        let mut view = cell.class_c_view();
+        *view.checkpoint_events_since_mut() += 1;
+        view.governance_class_c_mut()
+            .pending_epoch_resets_mut()
+            .push(did.clone());
     }
-
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::MemberReset,
-        actor_did,
-        timestamp_secs,
-    )?;
-    *view.checkpoint_events_since_mut() += 1;
-    view.governance_class_c_mut()
-        .pending_epoch_resets_mut()
-        .push(did.clone());
 
     Ok(())
 }
@@ -2379,7 +2845,7 @@ pub fn execute_reset_member(
     reason = "single-pipeline conflict-resolution scope"
 )]
 #[allow(clippy::too_many_arguments)]
-pub fn execute_resolve_conflict(
+pub async fn execute_resolve_conflict(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2484,13 +2950,16 @@ pub fn execute_resolve_conflict(
 
         view.rest_mut().governance.freeze = None;
         Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::GovernanceConflictResolved,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::GovernanceConflictResolved,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2499,7 +2968,7 @@ pub fn execute_resolve_conflict(
 // execute_promote_context (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_promote_context(
+pub async fn execute_promote_context(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2513,11 +2982,28 @@ pub fn execute_promote_context(
     } = meta;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    // Promotion clears the TTL timer + promotes the handle's memory scope —
-    // both Class-C structural state. The active-state + promotable-policy +
-    // unanimity guards read through the cell's `Deref`; the `ttl` / `handle`
-    // mutations ride `commit_class_c_best_effort`, preserving the prior
-    // best-effort persist exactly.
+    // Promotion clears the TTL timer + applies the §5.10 params mutation
+    // (memory scope → Full AND `params.ttl` → None). Clearing `params.ttl` is the
+    // SOLE prune-immune promotion authority for the single-source TTL-deadline
+    // invariant (ADR-049 §9): the deadline reader derives "promoted ⇒ no arm" from
+    // `params.ttl == None` and does NOT read the `ContextPromoted` leaf for the
+    // arm. That makes the params mutation SECURITY-CRITICAL: if a best-effort
+    // persist of it silently fails and the actor crashes before a later
+    // re-persist, a respawn reads a stale `params.ttl = Some` snapshot, re-arms
+    // the TTL, and destroys the keys of a context members unanimously voted
+    // permanent (the fail-DANGEROUS direction §9 names). Route the mutation
+    // through the FAIL-CLOSED Class-S combinator `commit_class_s_keep` (the same
+    // tier `execute_close_context` uses; the two now genuinely mirror each other)
+    // so a persist failure surfaces as an error rather than leaving a re-armable
+    // stale snapshot. Keep-direction: on persist failure the promotion STAYS
+    // (re-arming a context voted permanent is the unsafe direction). The
+    // active-state + promotable-policy + unanimity guards read through the cell's
+    // `Deref` before the commit; the `ttl` / `handle` mutations ride the
+    // fail-closed persist via `view.rest_mut()`. The `ContextPromoted` leaf is
+    // appended AFTER the durable persist succeeds, and remains only a RECORD (it
+    // is NOT read back to disarm the TTL — re-adding a leaf-fallback read would
+    // let a forged/spurious leaf make a finite context never expire, the other
+    // fail-dangerous direction pass-4e closed).
     require_active(&cell.handle)?;
 
     if !matches!(
@@ -2544,18 +3030,25 @@ pub fn execute_promote_context(
     drop(member_dids);
     drop(approval_dids);
 
-    cell.commit_class_c_best_effort(deps, context_id, |mut view| {
-        let ttl = view.ttl_mut();
-        ttl.timer.cancel();
-        ttl.timer.deadline_unix_secs = None;
-        view.handle_mut().promote_memory_scope();
-    });
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ContextPromoted,
-        actor_did,
-        timestamp_secs,
-    )?;
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        let state = view.rest_mut();
+        // Clear the recorded deadline so the actor-owned TTL arm disarms on the
+        // next `reconcile_timers` (ADR-049 finding A3; no task to cancel).
+        state.ttl.timer.deadline_unix_secs = None;
+        // §5.10 params mutation: memory scope → Full AND `params.ttl` → None (the
+        // prune-immune promotion authority the deadline reader consults).
+        state.handle.promote_params();
+        Ok(())
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextPromoted,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2565,7 +3058,7 @@ pub fn execute_promote_context(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
-pub fn execute_rotate_content_keys(
+pub async fn execute_rotate_content_keys(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2584,84 +3077,111 @@ pub fn execute_rotate_content_keys(
     // through `commit_class_s_keep` so it persists fail-closed (keep-direction:
     // on persist failure the rotation STAYS — reverting to the pre-rotation key
     // state after the rotation was acknowledged is the unsafe direction). The
-    // crypto/access-key mutations + emit + broadcast enqueue (Class-C) ride the
-    // SAME fail-closed persist via `view.rest_mut()`. The closure returns the
-    // optional broadcast snapshot so its separate best-effort persist can run
-    // AFTER the fail-closed persist, exactly as before.
-    let bc_snap = cell.commit_class_s_keep(deps, context_id, |mut view| {
-        let state = view.rest_mut();
-        require_active(&state.handle)?;
+    // crypto/access-key mutations + emit ride the fail-closed persist via
+    // `view.rest_mut()`. The MLS-Commit broadcast ENQUEUE (Class-C) is hoisted to
+    // AFTER the persist (ADR-049 Decision 7 — transport is async and cannot be
+    // awaited inside the sync closure); it is coalesced, not fail-closed, which is
+    // its correct class. Broadcast per-author key epochs still ride the Class-S
+    // `ContextSnapshot`, so the all-author key-epoch advance persists fail-closed
+    // atomically inside the combinator — the prior trailing best-effort
+    // `persist_broadcast_snapshot` is gone (§5.14.8).
+    let rotate_commit_bytes = cell
+        .commit_class_s_keep(deps, context_id, |mut view| {
+            let state = view.rest_mut();
+            require_active(&state.handle)?;
 
-        let (epoch_output, bc_snap) = if let Some(ref mut bc) = state.broadcast_context {
-            bc.rotate_all_author_keys()?;
-            let snap = Some(bc.to_snapshot());
-            (None, snap)
-        } else {
-            let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
+            let epoch_output = if let Some(ref mut bc) = state.broadcast_context {
+                // NOTE: `rotate_all_author_keys` returns `Ok(())` — no per-author
+                // (author_did, new_epoch) data is surfaced to the caller. Emitting
+                // `KeyEpochAdvance` leaves for each rotated author would require
+                // changing `rotate_all_author_keys` to return that data AND
+                // threading it out of this sync closure, since async event-log
+                // appends cannot happen inside `commit_class_s_keep`. The
+                // `unsubscribe_broadcast` path (which receives per-author
+                // `BlockResult` data from `bc.unsubscribe`) does emit
+                // `KeyEpochAdvance` leaves correctly — see #1847.
+                bc.rotate_all_author_keys()?;
+                None
+            } else {
+                // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): advance the MLS epoch on the
+                // actor state (already inside this fail-closed `commit_class_s_keep`
+                // closure — §9 Class-S). `wrapping_public_key` from the retained
+                // `deps.crypto.wrapping_keypair()`. Behavior otherwise unchanged
+                // (content-key rotation does not touch the `mls_epoch` mirror).
+                let epoch_out = state.advance_epoch(deps.crypto.wrapping_keypair().0)?;
 
-            let member_dids: Vec<String> = state
-                .membership
-                .member_dids()
-                .map(|d| d.0.clone())
-                .collect();
-            let current_epoch = state
-                .access
-                .access_key_store
-                .get_all(context_id)
-                .values()
-                .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
-                .max()
-                .unwrap_or(0);
-            let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
-            let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
-                context_id,
-                &did_refs,
-                current_epoch,
-            )
-            .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            for new_key in rotation.new_keys {
-                let did = new_key.member_did().to_owned();
-                state.access.access_key_store.set(context_id, &did, new_key);
-            }
-            (Some(epoch_out), None)
-        };
+                let member_dids: Vec<String> = state
+                    .membership
+                    .member_dids()
+                    .map(|d| d.0.clone())
+                    .collect();
+                let current_epoch = state
+                    .access
+                    .access_key_store
+                    .get_all(context_id)
+                    .values()
+                    .map(scp_protocol::crypto::access_keys::AccessKey::epoch)
+                    .max()
+                    .unwrap_or(0);
+                let did_refs: Vec<&str> = member_dids.iter().map(String::as_str).collect();
+                let rotation = crate::crypto::access_keys::lifecycle::rotate_all_access_keys(
+                    context_id,
+                    &did_refs,
+                    current_epoch,
+                )
+                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+                for new_key in rotation.new_keys {
+                    let did = new_key.member_did().to_owned();
+                    state.access.access_key_store.set(context_id, &did, new_key);
+                }
+                Some(epoch_out)
+            };
 
-        emit(
-            state,
-            ContextEvent::ContentKeysRotated {
-                reason: reason.map(String::from),
-            },
-            context_id,
-            deps,
-        );
-
-        if let Some(epoch_out) = epoch_output {
-            try_broadcast_commit_or_enqueue(
-                CommitBroadcastBorrows {
-                    pending_commits: &mut state.pending_commits,
-                    commit_fault: &mut state.commit_fault,
-                    receive_buffer: &mut state.receive_buffer,
-                },
-                deps,
-                context_id,
-                epoch_out.commit_bytes,
-                &CommitOperation::RotateContentKeys {
+            emit(
+                state,
+                ContextEvent::ContentKeysRotated {
                     reason: reason.map(String::from),
                 },
+                context_id,
+                deps,
             );
-        }
-        Ok(bc_snap)
-    })?;
-    if let Some(ref snap) = bc_snap {
-        persist_broadcast_snapshot(deps, context_id, snap);
+
+            // Capture the epoch-advance Commit bytes (non-broadcast path); the ASYNC
+            // Commit broadcast runs AFTER the fail-closed persist, outside this sync
+            // `_keep` closure (ADR-049 Decision 7 — transport is async). `None` on
+            // the broadcast path (no MLS Commit) or when no epoch advance occurred.
+            Ok(epoch_output.map(|epoch_out| epoch_out.commit_bytes))
+        })
+        .await?;
+
+    // Async transport op AFTER the Class-S rotation persist (ADR-049 Decision 7).
+    // The key rotation is fail-closed-persisted; the commit bytes were produced
+    // under the crypto `Arc` (Class-M) inside the closure. Broadcast async
+    // (Decision 7); on FAILURE the retry-queue bookkeeping is persisted
+    // FAIL-CLOSED via `keep_broadcast_failure` (epoch-advance is a safety-gated
+    // site — see that helper's doc for why the second persist).
+    if let Some(commit_bytes) = rotate_commit_bytes
+        && let Some(failure) = try_broadcast_commit(
+            deps,
+            context_id,
+            commit_bytes,
+            &CommitOperation::RotateContentKeys {
+                reason: reason.map(String::from),
+            },
+        )
+        .await
+    {
+        keep_broadcast_failure(cell, deps, context_id, failure).await?;
     }
 
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::ContentKeysRotated,
-        actor_did,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::ContentKeysRotated,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2669,9 +3189,15 @@ pub fn execute_rotate_content_keys(
 // ---------------------------------------------------------------------------
 // execute_reconfigure_governance (per-action leaf helper)
 // ---------------------------------------------------------------------------
+//
+// INVARIANT: This function is exclusively called from the `ReconfigureGovernance`
+// deadlock-resolution action. It always emits a `GovernanceDeadlockRecovery`
+// companion leaf (the justification evidence) paired with `GovernanceReconfigured`.
+// Do NOT reuse this function for non-deadlock governance reconfigurations — it
+// would emit a spurious `GovernanceDeadlockRecovery` leaf with no real justification.
 
 #[allow(clippy::too_many_arguments)]
-pub fn execute_reconfigure_governance(
+pub async fn execute_reconfigure_governance(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2745,13 +3271,52 @@ pub fn execute_reconfigure_governance(
             }
         }
         Ok(())
-    })?;
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::GovernanceReconfigured,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await?;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::GovernanceReconfigured,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
+
+    // Append the companion GovernanceDeadlockRecovery leaf carrying the
+    // structured recovery justification (issue #1847).  The two leaves share
+    // the same actor_did and timestamp so verifiers can correlate them.
+    // Fail-closed (error-surfaced, not atomically co-present): the signer
+    // removal and the GovernanceReconfigured leaf above are already durable
+    // by this point, so an append failure here does not roll back the
+    // reconfiguration.  Fail-closed is still preferred over best-effort
+    // because it surfaces the failure to the caller rather than swallowing
+    // it silently, giving operators a concrete error signal to investigate.
+    let recovery_payload = scp_event_log::payload::encode_payload(
+        &scp_event_log::payload::GovernanceDeadlockRecoveryPayload {
+            unavailable_dids: justification
+                .unavailable_dids
+                .iter()
+                .map(|d| d.0.clone())
+                .collect(),
+            missed_windows: justification
+                .missed_windows
+                .iter()
+                .map(|(d, n)| (d.0.clone(), *n))
+                .collect(),
+            detected_at: justification.detected_at,
+        },
+    )
+    .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::GovernanceDeadlockRecovery,
+            actor_did,
+            recovery_payload,
+            timestamp_secs,
+        )
+        .await?;
+
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2760,7 +3325,7 @@ pub fn execute_reconfigure_governance(
 // execute_set_economic_policy (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_set_economic_policy(
+pub async fn execute_set_economic_policy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2843,13 +3408,16 @@ pub fn execute_set_economic_policy(
             context_id,
             deps.event_tx.as_ref(),
         );
-    });
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::EconomicPolicyChanged,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::EconomicPolicyChanged,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2859,7 +3427,7 @@ pub fn execute_set_economic_policy(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-pub fn execute_approve_spend(
+pub async fn execute_approve_spend(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2889,7 +3457,8 @@ pub fn execute_approve_spend(
         view.governance_class_c_mut()
             .budget_tracker_mut()
             .grant(spender, amount);
-    });
+    })
+    .await;
     let spend_payload =
         scp_event_log::payload::encode_payload(&scp_event_log::payload::SpendApprovedPayload {
             spender: spender.as_ref().to_owned(),
@@ -2897,13 +3466,15 @@ pub fn execute_approve_spend(
             purpose: purpose.to_owned(),
         })
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::SpendApproved,
-        actor_did,
-        spend_payload,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::SpendApproved,
+            actor_did,
+            spend_payload,
+            timestamp_secs,
+        )
+        .await?;
     Ok(())
 }
 
@@ -2911,7 +3482,7 @@ pub fn execute_approve_spend(
 // execute_lock_economic_policy (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_lock_economic_policy(
+pub async fn execute_lock_economic_policy(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -2950,13 +3521,16 @@ pub fn execute_lock_economic_policy(
         if let Some(policy) = view.governance_class_c_mut().economic_policy_mut() {
             policy.locked = true;
         }
-    });
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::EconomicPolicyLocked,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::EconomicPolicyLocked,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -2965,7 +3539,7 @@ pub fn execute_lock_economic_policy(
 // execute_modify_hard_rate_limit (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub fn execute_modify_hard_rate_limit(
+pub async fn execute_modify_hard_rate_limit(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -3012,13 +3586,16 @@ pub fn execute_modify_hard_rate_limit(
                 new_config.clone(),
                 preserved_state,
             );
-    });
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        scp_event_log::EventType::HardRateLimitModified,
-        actor_did,
-        timestamp_secs,
-    )?;
+    })
+    .await;
+    deps.event_log
+        .append_context_event(
+            &context_id_bytes,
+            scp_event_log::EventType::HardRateLimitModified,
+            actor_did,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
@@ -3103,7 +3680,6 @@ pub fn execute_propose_context_migration<'a>(
 
         cell.handle
             .transition_to(&ContextState::MigratingOut)
-            .await
             .map_err(|_| {
                 ContextError::PermissionDenied("cannot transition to MigratingOut".to_owned())
             })?;
@@ -3171,7 +3747,7 @@ pub fn execute_propose_context_migration<'a>(
             // `transition_to` await runs with no view borrow live; the Class-C
             // rollback (clear migration state + truncate the buffered events)
             // then runs in a short view borrow.
-            let _ = cell.handle.transition_to(&ContextState::Active).await;
+            let _ = cell.handle.transition_to(&ContextState::Active);
             {
                 let mut view = cell.class_c_view();
                 *view.migration_state_mut() = None;
@@ -3189,13 +3765,16 @@ pub fn execute_propose_context_migration<'a>(
             let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
         }
 
-        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
-        deps.event_log.append_context_event(
-            &context_id_bytes,
-            scp_event_log::EventType::ContextMigrationStarted,
-            actor_did,
-            timestamp_secs,
-        )?;
+        crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id)
+            .await;
+        deps.event_log
+            .append_context_event(
+                &context_id_bytes,
+                scp_event_log::EventType::ContextMigrationStarted,
+                actor_did,
+                timestamp_secs,
+            )
+            .await?;
         *cell.class_c_view().checkpoint_events_since_mut() += 1;
 
         Ok(MigrationProposedResult {
@@ -3209,6 +3788,11 @@ pub fn execute_propose_context_migration<'a>(
 // execute_cancel_context_migration (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
+// ADR-049 §Decision 12: `state`/`transition_to` are now synchronous lock-free
+// ArcSwap ops. Async is retained as the ContextManager helper API contract —
+// callers await uniformly, and provider-trait calls regain await points under
+// ADR-049 Decision 7 (async-provider-trait conversion).
+#[allow(clippy::unused_async)]
 pub async fn execute_cancel_context_migration(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -3223,10 +3807,7 @@ pub async fn execute_cancel_context_migration(
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Reads via the cell's `Deref`; `transition_to` takes `&self`.
-    let s = cell
-        .handle
-        .try_read_state()
-        .ok_or(ContextError::ContextNotActive)?;
+    let s = cell.handle.state();
     if s != ContextState::MigratingOut {
         return Err(ContextError::PermissionDenied(
             "context is not in MigratingOut state — cannot cancel migration".to_owned(),
@@ -3235,7 +3816,6 @@ pub async fn execute_cancel_context_migration(
 
     cell.handle
         .transition_to(&ContextState::Active)
-        .await
         .map_err(|_| {
             ContextError::PermissionDenied(
                 "cannot transition from MigratingOut to Active".to_owned(),
@@ -3262,26 +3842,28 @@ pub async fn execute_cancel_context_migration(
         original_proposal_id
     };
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
     let cancel_payload = scp_event_log::payload::encode_payload(
         &scp_event_log::payload::ContextMigrationCancelledPayload {
             original_proposal_id,
         },
     )
     .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        scp_event_log::EventType::ContextMigrationCancelled,
-        actor_did,
-        cancel_payload,
-        timestamp_secs,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            scp_event_log::EventType::ContextMigrationCancelled,
+            actor_did,
+            cancel_payload,
+            timestamp_secs,
+        )
+        .await?;
     *cell.class_c_view().checkpoint_events_since_mut() += 1;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// try_broadcast_commit_or_enqueue (transitive helper, actor-shape)
+// try_broadcast_commit / apply_broadcast_failure (transitive helpers, actor-shape)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -3297,7 +3879,7 @@ pub async fn execute_cancel_context_migration(
 /// When `check_propose_capability` is `true`, the `GovernancePropose`
 /// capability is verified under the same path as the proposal
 /// submission (actor-owned state — no TOCTOU window).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn propose_governance_action_inner(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
@@ -3306,6 +3888,11 @@ pub async fn propose_governance_action_inner(
     action: GovernanceAction,
     signing_key: &ed25519_dalek::SigningKey,
     check_propose_capability: bool,
+    // The invitee's MLS `KeyPackage` for an `AddMember` auto-execute, carried on
+    // the actor command envelope by `Supervisor::invite_member` and threaded to
+    // `execute_add_member`. `None` on every path that is not a real invitation
+    // add (governed-context invite is issue #2027).
+    key_package: Option<&[u8]>,
 ) -> Result<
     (
         GovernanceProposal,
@@ -3374,12 +3961,14 @@ pub async fn propose_governance_action_inner(
         let freeze_ts = freeze_expiry_deadline.unwrap_or(0);
         for event in &freeze_events {
             if let GovernanceEvent::ConflictResolved { .. } = event {
-                deps.event_log.append_context_event(
-                    &cid_bytes,
-                    scp_event_log::EventType::GovernanceFreezeExpired,
-                    proposer_did.as_ref(),
-                    freeze_ts,
-                )?;
+                deps.event_log
+                    .append_context_event(
+                        &cid_bytes,
+                        scp_event_log::EventType::GovernanceFreezeExpired,
+                        proposer_did.as_ref(),
+                        freeze_ts,
+                    )
+                    .await?;
                 *cell.class_c_view().checkpoint_events_since_mut() += 1;
             }
         }
@@ -3433,24 +4022,28 @@ pub async fn propose_governance_action_inner(
         for event in &conflict_events {
             match event {
                 GovernanceEvent::ConflictDetected { .. } => {
-                    deps.event_log.append_context_event(
-                        &context_id_bytes,
-                        scp_event_log::EventType::GovernanceConflictDetected,
-                        proposer_did.as_ref(),
-                        // Conflict detected deterministically while processing
-                        // this proposal: the convergent leaf timestamp is the
-                        // proposal's signed `created_at` (§7.3.1, §9.9.3).
-                        proposal.created_at,
-                    )?;
+                    deps.event_log
+                        .append_context_event(
+                            &context_id_bytes,
+                            scp_event_log::EventType::GovernanceConflictDetected,
+                            proposer_did.as_ref(),
+                            // Conflict detected deterministically while processing
+                            // this proposal: the convergent leaf timestamp is the
+                            // proposal's signed `created_at` (§7.3.1, §9.9.3).
+                            proposal.created_at,
+                        )
+                        .await?;
                     conflict_event_count += 1;
                 }
                 GovernanceEvent::ConflictResolved { .. } => {
-                    deps.event_log.append_context_event(
-                        &context_id_bytes,
-                        scp_event_log::EventType::GovernanceConflictResolved,
-                        proposer_did.as_ref(),
-                        proposal.created_at,
-                    )?;
+                    deps.event_log
+                        .append_context_event(
+                            &context_id_bytes,
+                            scp_event_log::EventType::GovernanceConflictResolved,
+                            proposer_did.as_ref(),
+                            proposal.created_at,
+                        )
+                        .await?;
                     conflict_event_count += 1;
                 }
                 _ => {}
@@ -3477,6 +4070,7 @@ pub async fn propose_governance_action_inner(
                 context_id,
                 &proposal.proposal_id,
                 Some(proposer_did),
+                key_package,
             ))
             .await?,
         )
@@ -3484,7 +4078,7 @@ pub async fn propose_governance_action_inner(
         None
     };
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
 
     Ok((proposal, events, execution_result))
 }
@@ -3543,6 +4137,12 @@ fn actor_check_proposer_eligibility(
                 &context_id,
                 merkle_root,
                 now,
+                // attestation_count is a credential-layer, verifier-relative
+                // fact (§7.3.2); proposer eligibility gates only on
+                // participation_count and has no attestation-cache access, so it
+                // passes an empty accessible-attestation set (count 0) by
+                // design — NOT a stub.
+                &[],
             ) {
                 Err(e) => {
                     tracing::warn!(
@@ -3644,6 +4244,10 @@ pub async fn propose_governance_action_checked(
     proposer_did: &DID,
     action: GovernanceAction,
     signing_key: &ed25519_dalek::SigningKey,
+    // The invitee's MLS `KeyPackage` for an `AddMember` auto-execute, carried on
+    // the actor command envelope by `Supervisor::invite_member`. `None` for the
+    // generic FFI governance path (which never invites a member here).
+    key_package: Option<&[u8]>,
 ) -> Result<ProposalOutcome, ContextError> {
     let (proposal, _events, execution_result) = propose_governance_action_inner(
         cell,
@@ -3653,6 +4257,7 @@ pub async fn propose_governance_action_checked(
         action,
         signing_key,
         true,
+        key_package,
     )
     .await?;
 
@@ -3749,21 +4354,25 @@ pub async fn vote_on_proposal_inner(
         for event in &conflict_events {
             match event {
                 GovernanceEvent::ConflictDetected { .. } => {
-                    deps.event_log.append_context_event(
-                        &context_id_bytes,
-                        scp_event_log::EventType::GovernanceConflictDetected,
-                        voter_did.as_ref(),
-                        conflict_ts,
-                    )?;
+                    deps.event_log
+                        .append_context_event(
+                            &context_id_bytes,
+                            scp_event_log::EventType::GovernanceConflictDetected,
+                            voter_did.as_ref(),
+                            conflict_ts,
+                        )
+                        .await?;
                     conflict_event_count += 1;
                 }
                 GovernanceEvent::ConflictResolved { .. } => {
-                    deps.event_log.append_context_event(
-                        &context_id_bytes,
-                        scp_event_log::EventType::GovernanceConflictResolved,
-                        voter_did.as_ref(),
-                        conflict_ts,
-                    )?;
+                    deps.event_log
+                        .append_context_event(
+                            &context_id_bytes,
+                            scp_event_log::EventType::GovernanceConflictResolved,
+                            voter_did.as_ref(),
+                            conflict_ts,
+                        )
+                        .await?;
                     conflict_event_count += 1;
                 }
                 _ => {}
@@ -3788,7 +4397,7 @@ pub async fn vote_on_proposal_inner(
             // whose approval crossed quorum and therefore committed the action
             // (ADR-031 §7.3.1 "committing member"). This is the divergence-
             // causing path: stamping the proposer here (the old behavior) made
-            // native disagree with WASM whenever proposer != quorum-crossing
+            // the leaf diverge whenever proposer != quorum-crossing
             // voter.
             Box::pin(execute_governance_action(
                 cell,
@@ -3796,12 +4405,15 @@ pub async fn vote_on_proposal_inner(
                 context_id,
                 &proposal.proposal_id,
                 Some(voter_did),
+                // The quorum-approval path never carries an invitee KeyPackage
+                // (deferred governed invite is issue #2027).
+                None,
             ))
             .await?;
         }
     }
 
-    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id);
+    crate::context::messaging_helpers::persist_state_best_effort(&*cell, deps, context_id).await;
 
     Ok((status, events))
 }
@@ -3881,7 +4493,7 @@ pub async fn reject_governance_proposal(
 /// Dispatches content access, structural, and reconfiguration governance
 /// actions. Companion to [`dispatch_context_governance_action`].
 #[allow(clippy::too_many_lines)]
-pub fn dispatch_content_governance_action(
+pub async fn dispatch_content_governance_action(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
@@ -3905,7 +4517,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::SignerAdded)
         }
         GovernanceAction::RemoveSigner { did } => {
@@ -3919,7 +4532,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::SignerRemoved)
         }
         GovernanceAction::ModifyThreshold { new_threshold } => {
@@ -3933,11 +4547,12 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ThresholdModified)
         }
-        GovernanceAction::EstablishToolInterface { interface } => {
-            execute_establish_tool_interface(
+        GovernanceAction::EstablishOutletInterface { interface } => {
+            execute_establish_outlet_interface(
                 cell,
                 deps,
                 context_id,
@@ -3947,12 +4562,13 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
-            Ok(GovernanceActionResult::ToolInterfaceEstablished)
+            )
+            .await?;
+            Ok(GovernanceActionResult::OutletInterfaceEstablished)
         }
         GovernanceAction::ResetMember { did, reason } => {
             execute_reset_member(
-                &mut cell.class_c_view(),
+                cell,
                 deps,
                 context_id,
                 did,
@@ -3962,7 +4578,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::MemberReset)
         }
         GovernanceAction::ResolveConflict {
@@ -3982,7 +4599,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ConflictResolved)
         }
         GovernanceAction::RotateContentKeys { reason } => {
@@ -3996,7 +4614,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ContentKeysRotated(
                 ContentKeysRotatedResult {
                     reason: reason.clone(),
@@ -4018,7 +4637,8 @@ pub fn dispatch_content_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::GovernanceReconfigured(
                 GovernanceReconfiguredResult {
                     changes_applied: changes.len(),
@@ -4039,8 +4659,8 @@ pub fn dispatch_content_governance_action(
         | GovernanceAction::AddMember { .. }
         | GovernanceAction::RemoveMember { .. }
         | GovernanceAction::ChangeRole { .. }
-        | GovernanceAction::RegisterTool { .. }
-        | GovernanceAction::RemoveTool { .. }
+        | GovernanceAction::RegisterOutlet { .. }
+        | GovernanceAction::RemoveOutlet { .. }
         | GovernanceAction::ModifyCeiling { .. }
         | GovernanceAction::CloseContext { .. }
         | GovernanceAction::TransferAdmin { .. }
@@ -4078,6 +4698,11 @@ pub async fn dispatch_context_governance_action(
     deps: &ActorDeps,
     context_id: &str,
     action: &GovernanceAction,
+    // The invitee's MLS `KeyPackage`, threaded from the propose/execute entry
+    // for the `AddMember` action only (the invitation path carries it on the
+    // command envelope). `None` for every other action and for the paths that
+    // never carried a real add (issue #2029).
+    key_package: Option<&[u8]>,
     meta: CommitMeta<'_>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let CommitMeta {
@@ -4087,19 +4712,28 @@ pub async fn dispatch_context_governance_action(
     } = meta;
     match action {
         GovernanceAction::AddMember { did, role } => {
-            execute_add_member(
+            let add_output = execute_add_member(
                 cell,
                 deps,
                 context_id,
                 did,
                 role,
+                key_package,
                 CommitMeta {
                     pid,
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
-            Ok(GovernanceActionResult::MemberAdded)
+            )
+            .await?;
+            Ok(GovernanceActionResult::MemberAdded {
+                welcome_bytes: scp_protocol::context::membership::RedactedBytes(
+                    add_output.welcome_bytes,
+                ),
+                commit_bytes: scp_protocol::context::membership::RedactedBytes(
+                    add_output.commit_bytes,
+                ),
+            })
         }
         GovernanceAction::RemoveMember { did, .. } => {
             execute_remove_member(
@@ -4112,7 +4746,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::MemberRemoved)
         }
         GovernanceAction::ChangeRole { did, new_role } => {
@@ -4127,11 +4762,12 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::RoleChanged)
         }
-        GovernanceAction::RegisterTool { registration } => {
-            execute_register_tool(
+        GovernanceAction::RegisterOutlet { registration } => {
+            execute_register_outlet(
                 cell,
                 deps,
                 context_id,
@@ -4141,22 +4777,24 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
-            Ok(GovernanceActionResult::ToolRegistered)
+            )
+            .await?;
+            Ok(GovernanceActionResult::OutletRegistered)
         }
-        GovernanceAction::RemoveTool { tool_id } => {
-            execute_remove_tool(
+        GovernanceAction::RemoveOutlet { outlet_id } => {
+            execute_remove_outlet(
                 cell,
                 deps,
                 context_id,
-                tool_id,
+                outlet_id,
                 CommitMeta {
                     pid,
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
-            Ok(GovernanceActionResult::ToolRemoved)
+            )
+            .await?;
+            Ok(GovernanceActionResult::OutletRemoved)
         }
         GovernanceAction::ModifyCeiling { new_ceiling } => {
             execute_modify_ceiling(
@@ -4169,7 +4807,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::CeilingModified)
         }
         GovernanceAction::CloseContext { reason } => {
@@ -4198,7 +4837,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::AdminTransferred)
         }
         GovernanceAction::CreateChildContext { params } => {
@@ -4212,7 +4852,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ChildContextCreated)
         }
         GovernanceAction::ModifyPruningPolicy { new_policy } => {
@@ -4226,7 +4867,8 @@ pub async fn dispatch_context_governance_action(
                     actor_did,
                     timestamp_secs,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::PruningPolicyModified)
         }
         GovernanceAction::ProposeContextMigration {
@@ -4274,21 +4916,24 @@ pub async fn dispatch_context_governance_action(
         GovernanceAction::AddSigner { .. }
         | GovernanceAction::RemoveSigner { .. }
         | GovernanceAction::ModifyThreshold { .. }
-        | GovernanceAction::EstablishToolInterface { .. }
+        | GovernanceAction::EstablishOutletInterface { .. }
         | GovernanceAction::ResetMember { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::RotateContentKeys { .. }
-        | GovernanceAction::ReconfigureGovernance { .. } => dispatch_content_governance_action(
-            cell,
-            deps,
-            context_id,
-            action,
-            CommitMeta {
-                pid,
-                actor_did,
-                timestamp_secs,
-            },
-        ),
+        | GovernanceAction::ReconfigureGovernance { .. } => {
+            dispatch_content_governance_action(
+                cell,
+                deps,
+                context_id,
+                action,
+                CommitMeta {
+                    pid,
+                    actor_did,
+                    timestamp_secs,
+                },
+            )
+            .await
+        }
         GovernanceAction::PromoteContext
         | GovernanceAction::ExtendTtl { .. }
         | GovernanceAction::SuspendCapability { .. }
@@ -4330,6 +4975,10 @@ pub async fn dispatch_governance_action(
     // `GovernanceActionExecuted` leaf and spec-correct per ADR-031 §8 /
     // §7.3.1 / ADR-051 §6.
     executor_did: &DID,
+    // The invitee's MLS `KeyPackage` for an `AddMember` auto-execute — carried
+    // on the actor command envelope by `Supervisor::invite_member` and threaded
+    // to `execute_add_member`. `None` on every non-invite execute path.
+    key_package: Option<&[u8]>,
 ) -> Result<GovernanceActionResult, ContextError> {
     let pid = proposal.proposal_id;
     let actor = executor_did.as_ref();
@@ -4353,7 +5002,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::MemberSuspended(
                 SuspendMemberResult {
                     did: did.clone(),
@@ -4397,14 +5047,17 @@ pub async fn dispatch_governance_action(
                     deps,
                 );
                 Ok(())
-            })?;
+            })
+            .await?;
             let context_id_bytes = context_id_to_bytes(context_id);
-            deps.event_log.append_context_event(
-                &context_id_bytes,
-                scp_event_log::EventType::MemberSuspendedAll,
-                actor,
-                ts,
-            )?;
+            deps.event_log
+                .append_context_event(
+                    &context_id_bytes,
+                    scp_event_log::EventType::MemberSuspendedAll,
+                    actor,
+                    ts,
+                )
+                .await?;
             *cell.class_c_view().checkpoint_events_since_mut() += 1;
             Ok(GovernanceActionResult::Executed)
         }
@@ -4420,7 +5073,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::AccessRevoked(RevokeResult {
                 did: did.clone(),
                 access: *access,
@@ -4439,7 +5093,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::AccessRestored(
                 RestoreAccessResult {
                     did: did.clone(),
@@ -4458,7 +5113,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::ContextPromoted)
         }
         GovernanceAction::ExtendTtl { additional_secs } => {
@@ -4488,7 +5144,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::ApproveSpend {
@@ -4508,7 +5165,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::LockEconomicPolicy => {
@@ -4521,7 +5179,8 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::ModifyHardRateLimit { new_config } => {
@@ -4535,15 +5194,16 @@ pub async fn dispatch_governance_action(
                     actor_did: actor,
                     timestamp_secs: ts,
                 },
-            )?;
+            )
+            .await?;
             Ok(GovernanceActionResult::Executed)
         }
         // Remaining actions dispatched to context-level handler.
         GovernanceAction::AddMember { .. }
         | GovernanceAction::RemoveMember { .. }
         | GovernanceAction::ChangeRole { .. }
-        | GovernanceAction::RegisterTool { .. }
-        | GovernanceAction::RemoveTool { .. }
+        | GovernanceAction::RegisterOutlet { .. }
+        | GovernanceAction::RemoveOutlet { .. }
         | GovernanceAction::ModifyCeiling { .. }
         | GovernanceAction::CloseContext { .. }
         | GovernanceAction::TransferAdmin { .. }
@@ -4552,7 +5212,7 @@ pub async fn dispatch_governance_action(
         | GovernanceAction::AddSigner { .. }
         | GovernanceAction::RemoveSigner { .. }
         | GovernanceAction::ModifyThreshold { .. }
-        | GovernanceAction::EstablishToolInterface { .. }
+        | GovernanceAction::EstablishOutletInterface { .. }
         | GovernanceAction::ResetMember { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::RotateContentKeys { .. }
@@ -4564,6 +5224,7 @@ pub async fn dispatch_governance_action(
                 deps,
                 context_id,
                 &proposal.action,
+                key_package,
                 CommitMeta {
                     pid,
                     actor_did: actor,
@@ -4585,7 +5246,7 @@ pub async fn dispatch_governance_action(
 /// (PRD SCP-269/SCP-270), checkpoint cosignature triggering (ADR-031 §9),
 /// and cleanup of approved proposals (ADR-031 §7).
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
-pub fn finalize_governance_action(
+pub async fn finalize_governance_action(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -4651,18 +5312,20 @@ pub fn finalize_governance_action(
         },
     )
     .map_err(|e| ContextError::EventLogFailed(e.to_string()))?;
-    deps.event_log.append_context_event_with_payload(
-        &context_id_bytes,
-        governance_event_label(&executed_event),
-        executor_did.as_ref(),
-        executed_payload,
-        // Committer-assigned timestamp: the proposal's signed `created_at` —
-        // identical and tamper-evident for every member that processes the
-        // signed proposal (convergent-by-construction), never local `now()`.
-        // The leaf is currently committer-appended-only; cross-member leaf
-        // replication is the forward step under ADR-051 (§7.3.1, §9.9.3).
-        proposal.created_at,
-    )?;
+    deps.event_log
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            governance_event_label(&executed_event),
+            executor_did.as_ref(),
+            executed_payload,
+            // Committer-assigned timestamp: the proposal's signed `created_at` —
+            // identical and tamper-evident for every member that processes the
+            // signed proposal (convergent-by-construction), never local `now()`.
+            // The leaf is currently committer-appended-only; cross-member leaf
+            // replication is the forward step under ADR-051 (§7.3.1, §9.9.3).
+            proposal.created_at,
+        )
+        .await?;
 
     let action_summary = proposal.action.variant_name().to_owned();
     let target_did = proposal.action.target_did().cloned();
@@ -4769,7 +5432,8 @@ pub fn finalize_governance_action(
                     event_tx: deps.event_tx.as_ref(),
                 },
                 &mut downward_auth_sink,
-            );
+            )
+            .await;
             if let Some((target, triggered)) = triggered_target {
                 let mut split = ConsequenceStateSplit::from_state(state);
                 let _ = enforce_triggered_consequences(
@@ -4785,7 +5449,8 @@ pub fn finalize_governance_action(
                         event_tx: deps.event_tx.as_ref(),
                     },
                     &mut downward_auth_sink,
-                );
+                )
+                .await;
             }
             // Covered fail-closed by the caller's `discharge_with` commit (above):
             // subsume any armed obligation so EXACTLY ONE persist is owed.
@@ -4816,6 +5481,12 @@ pub fn finalize_governance_action(
                 context_id,
                 gov_merkle,
                 now,
+                // attestation_count is a credential-layer, verifier-relative
+                // fact (§7.3.2); proposer eligibility gates only on
+                // participation_count and has no attestation-cache access, so it
+                // passes an empty accessible-attestation set (count 0) by
+                // design — NOT a stub.
+                &[],
             )
             && record.participation_count > 0
         {
@@ -4873,10 +5544,16 @@ pub async fn execute_governance_action(
     // - `None` on the direct-execute FFI path, where there is no
     //   quorum-crossing voter: the executor is resolved from the *tracked*
     //   proposal's `proposer_did` (never a caller-supplied DID), preserving the
-    //   convention and the native↔WASM leaf convergence established for the
+    //   convention and the cross-implementation leaf convergence established for the
     //   direct path. Spec: ADR-031 §8 "executor DID" / §7.3.1 "committing
     //   member" / ADR-051 §6.
     executor_did: Option<&DID>,
+    // The invitee's MLS `KeyPackage` for an `AddMember` auto-execute, carried on
+    // the actor command envelope by `Supervisor::invite_member` and threaded to
+    // `execute_add_member`. `None` on the vote-approval and direct-execute
+    // paths — those never carry a real KeyPackage (governed-context invite is
+    // issue #2027).
+    key_package: Option<&[u8]>,
 ) -> Result<GovernanceActionResult, ContextError> {
     // ADR-049 §9 Class-S cell seam: this entry holds the cell. The pre-dispatch
     // gate is READ-ONLY (commit-fault gate, authoritative-proposal resolution,
@@ -4910,8 +5587,8 @@ pub async fn execute_governance_action(
 
     // Resolve the committing member. The direct-execute path (`None`) attributes
     // to the TRACKED proposal's proposer — never a caller-supplied DID — so the
-    // `GovernanceActionExecuted` leaf actor_did is convergent with WASM and the
-    // quorum path's own attribution.
+    // `GovernanceActionExecuted` leaf actor_did is convergent across honest
+    // members and with the quorum path's own attribution.
     let executor_did: &DID = executor_did.unwrap_or(&proposal.proposer_did);
 
     // The engine's own status — set to `Approved` only at genuine quorum.
@@ -4965,29 +5642,39 @@ pub async fn execute_governance_action(
         Ok(())
     })?;
 
-    let result =
-        match dispatch_governance_action(cell, deps, context_id, proposal, executor_did).await {
-            Ok(r) => r,
-            Err(e) => {
-                // Roll back the executed marker on dispatch failure so the proposal
-                // can be retried (e.g. after a transient crypto error). The removal
-                // is itself a Class-S transition that must be durable fail-closed
-                // (keep-direction: a crash must not resurrect the marker and block
-                // the retry). It is staged through the deferred-persist token's own
-                // ClassSMut flow — `discharge_with` runs the removal closure
-                // (`ClassSMut::governance_class_s_mut().executed_proposals.remove`)
-                // and then performs the SINGLE fail-closed persist the token already
-                // owed, so the removed-marker state is what lands durably (no
-                // `state_mut`, exactly one persist — the one the token deferred).
-                token.discharge_with(cell, deps, context_id, |mut view| {
+    let result = match dispatch_governance_action(
+        cell,
+        deps,
+        context_id,
+        proposal,
+        executor_did,
+        key_package,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Roll back the executed marker on dispatch failure so the proposal
+            // can be retried (e.g. after a transient crypto error). The removal
+            // is itself a Class-S transition that must be durable fail-closed
+            // (keep-direction: a crash must not resurrect the marker and block
+            // the retry). It is staged through the deferred-persist token's own
+            // ClassSMut flow — `discharge_with` runs the removal closure
+            // (`ClassSMut::governance_class_s_mut().executed_proposals.remove`)
+            // and then performs the SINGLE fail-closed persist the token already
+            // owed, so the removed-marker state is what lands durably (no
+            // `state_mut`, exactly one persist — the one the token deferred).
+            token
+                .discharge_with(cell, deps, context_id, |mut view| {
                     view.governance_class_s_mut()
                         .executed_proposals
                         .remove(&proposal.proposal_id);
                     Ok(())
-                })?;
-                return Err(e);
-            }
-        };
+                })
+                .await?;
+            return Err(e);
+        }
+    };
 
     // STRENGTHENING (ADR-049 §9, authorized): `finalize_governance_action`'s
     // own persist was best-effort; the executed-marker durability now rides the
@@ -4997,28 +5684,49 @@ pub async fn execute_governance_action(
     // deferred persist the token owed — no whole-state `state_mut`. On a finalize
     // error the persist STILL runs (keep-direction — the executed marker stays
     // set and must persist) and `discharge_with` surfaces the finalize error.
-    token.discharge_with(cell, deps, context_id, |mut view| {
-        finalize_governance_action(view.rest_mut(), deps, context_id, proposal, executor_did)
-    })?;
+    // Deferred fail-closed discharge with an ASYNC finalize body (ADR-049
+    // Decision 7): `finalize_governance_action` appends to the async
+    // `EventLogPersistence`-backed Merkle log while mutating the state,
+    // interleaved, so it runs inside the RAII `begin_discharge` guard (which hands
+    // out the `ClassSMut` view held across the finalize awaits) rather than a
+    // synchronous `discharge_with` closure. Keep-direction: the SINGLE persist runs
+    // REGARDLESS of the finalize result; the finalize error is surfaced after.
+    let mut discharge = token.begin_discharge(cell);
+    let finalize_result = finalize_governance_action(
+        discharge.view().rest_mut(),
+        deps,
+        context_id,
+        proposal,
+        executor_did,
+    )
+    .await;
+    // Keep-direction: the fail-closed persist runs REGARDLESS of the finalize
+    // result. Error priority matches the former `discharge_with` `match`: a
+    // finalize error is surfaced BEFORE a persist error when both fail.
+    let persist_result = discharge.commit_fail_closed(deps, context_id).await;
+    finalize_result?;
+    persist_result?;
 
     Ok(result)
 }
 
 // ---------------------------------------------------------------------------
-// try_broadcast_commit_or_enqueue (transitive helper, actor-shape)
+// try_broadcast_commit / apply_broadcast_failure (transitive helpers, actor-shape)
 // ---------------------------------------------------------------------------
 
-/// The three disjoint Class-C `&mut` fields
-/// [`try_broadcast_commit_or_enqueue`] mutates, threaded as ONE struct so the
-/// caller holds all three at once (they are distinct fields of
-/// [`PerContextState`], so the borrow checker accepts the simultaneous `&mut`).
+/// The three disjoint Class-C `&mut` fields [`apply_broadcast_failure`] mutates,
+/// threaded as ONE struct so the caller holds all three at once (they are
+/// distinct fields of [`PerContextState`], so the borrow checker accepts the
+/// simultaneous `&mut`).
 ///
-/// Replaces the prior whole `&mut PerContextState` parameter: the broadcast
-/// helper touches ONLY the MLS Commit retry queue (`pending_commits`), the
+/// Replaces the prior whole `&mut PerContextState` parameter: the broadcast-
+/// failure apply touches ONLY the MLS Commit retry queue (`pending_commits`), the
 /// queue-full fail-close marker (`commit_fault`), and the local receive buffer
-/// (`receive_buffer`). All three are Class-C / structural / best-effort (no
-/// fail-closed persist; see the function's doc), so the field-granular borrow is
-/// sound — there is no whole-state `&mut` and no reach to any Class-S sub-struct.
+/// (`receive_buffer`). The borrow is field-granular and reaches no Class-S
+/// sub-struct; the DURABILITY class is the caller's choice — the safety-gated
+/// sites supply these from a `commit_class_s_keep` `rest_mut()` view (fail-closed
+/// persist of `pending_commits`/`commit_fault`), the best-effort sites from a
+/// coalesced `ClassCMut` view (see [`apply_broadcast_failure`]).
 pub struct CommitBroadcastBorrows<'a> {
     /// `&mut` to the MLS Commit retry queue (Class-C / §9.9.3).
     pub pending_commits: &'a mut std::collections::VecDeque<PendingCommit>,
@@ -5028,8 +5736,40 @@ pub struct CommitBroadcastBorrows<'a> {
     pub receive_buffer: &'a mut ReceiveBuffer,
 }
 
-/// Attempts to broadcast an MLS Commit and, on transport failure,
-/// enqueues the commit in the persistent retry queue (PR #1606 C6).
+/// The retry-queue bookkeeping an MLS-Commit broadcast requires when its
+/// transport send FAILS, returned by [`try_broadcast_commit`] so the CALLER
+/// applies it (via [`apply_broadcast_failure`]) in the correct durability class.
+///
+/// Splitting the failure bookkeeping OUT of the async transport send is what
+/// lets the safety-gated Class-S sites — `execute_remove_member`,
+/// `execute_rotate_content_keys` (this module) and `leave_context`
+/// (`lifecycle_helpers`) — persist the `commit_fault` marker + `pending_commits`
+/// enqueue FAIL-CLOSED even though the broadcast itself, being async under
+/// ADR-049 Decision 7, cannot run inside their synchronous `commit_class_s_keep`
+/// closure. The best-effort sites (`execute_add_member`, `execute_reset_member`)
+/// apply the identical value coalesced through a `ClassCMut` view.
+///
+/// Why fail-closed matters here: `commit_fault` is a SAFETY GATE
+/// ([`check_commit_fault`] blocks send/lifecycle/governance) and the
+/// `pending_commits` entry is the ONLY re-delivery of the epoch-advancing
+/// Commit. If a crash lands between a broadcast failure and the ≤50 ms coalesced
+/// persist tick, a coalesced-only write loses BOTH — the context respawns
+/// "healthy" while members are stuck on a stale MLS epoch with no retry queued:
+/// silent, permanent group desync (ADR-049 §9 / §9.9.3).
+pub struct BroadcastFailure {
+    /// The retry record to enqueue (or, when the queue is full at apply time,
+    /// the source of the fail-close [`CommitFaultMarker`]).
+    pending: PendingCommit,
+    /// Operation label for the surfaced local `ContextEvent`.
+    label: String,
+    /// Transport error string for the surfaced local `ContextEvent`.
+    error: String,
+}
+
+/// Attempts to broadcast an MLS Commit. Returns `None` on success (or an empty
+/// commit — the `cfg(test)` no-crypto pipeline); on transport failure returns
+/// `Some(BroadcastFailure)` describing the retry-queue bookkeeping the caller
+/// must persist via [`apply_broadcast_failure`].
 ///
 /// Per the phase-2.md ADR-011-amendment exclusion taxonomy (per-committer
 /// broadcast-retry bookkeeping), the commit-broadcast lifecycle events
@@ -5039,42 +5779,33 @@ pub struct CommitBroadcastBorrows<'a> {
 /// surfaced as local `ContextEvent`s only (first-attempt success is not
 /// surfaced); no durable consumer reads them.
 ///
-/// Infallible: a transport-send failure is absorbed into the persistent
-/// retry queue (or a `commit_fault` marker when the queue is full) rather
-/// than propagated. Dropping the durable commit-lifecycle appends removed the
-/// function's only `Result`-returning path.
+/// # No state mutation (ADR-049 §9 / Decision 7)
 ///
-/// # Field-granular borrows (ADR-049 §9)
-///
-/// Takes a [`CommitBroadcastBorrows`] — the THREE disjoint Class-C `&mut`
-/// fields it actually touches (`pending_commits`, `commit_fault`,
-/// `receive_buffer`) — rather than a whole `&mut PerContextState`. A cell holder
-/// supplies them from a non-persisting [`crate::context::actor::class_s::ClassCMut`]
-/// view (`view.commit_broadcast_borrows()`); a bare-`&mut state` caller supplies
-/// them by disjoint field borrow. All three fields are Class-C / structural and
-/// best-effort: the enqueue is a retry-queue bookkeeping insert, the
-/// `commit_fault` marker is the queue-full fail-close surfaced LOCALLY only
-/// (never a durable Merkle leaf — see the §9.9.3 note above), and the
-/// `receive_buffer` emit is a local `ContextEvent`. None requires a fail-closed
-/// persist, so the field-granular best-effort shape is sound.
-pub fn try_broadcast_commit_or_enqueue(
-    borrows: CommitBroadcastBorrows<'_>,
+/// This function performs ONLY the async transport send and builds the retry
+/// payload; it touches NO `PerContextState` field. Applying that payload —
+/// enqueue into `pending_commits`, set the `commit_fault` marker, emit the local
+/// event — is deferred to the synchronous [`apply_broadcast_failure`] so the
+/// CALLER picks the durability class (fail-closed at the safety-gated Class-S
+/// sites, coalesced at the best-effort sites). This is the decoupling that
+/// restores fail-closed durability of the `commit_fault` safety gate after the
+/// transport became async and the broadcast could no longer live inside the
+/// sync `commit_class_s_keep` closure.
+pub async fn try_broadcast_commit(
     deps: &ActorDeps,
     context_id: &str,
     commit_bytes: Vec<u8>,
     operation: &CommitOperation,
-) {
+) -> Option<BroadcastFailure> {
     if commit_bytes.is_empty() {
-        return;
+        return None;
     }
-    let CommitBroadcastBorrows {
-        pending_commits,
-        commit_fault,
-        receive_buffer,
-    } = borrows;
     let routing_id = scp_protocol::context::context_routing_id(context_id);
-    match deps.transport.send_message(&routing_id, &commit_bytes) {
-        Ok(()) => {}
+    match deps
+        .transport
+        .send_message(&routing_id, &commit_bytes)
+        .await
+    {
+        Ok(()) => None,
         Err(e) => {
             let now = deps.clock.now_secs();
             let error_str = e.to_string();
@@ -5088,48 +5819,132 @@ pub fn try_broadcast_commit_or_enqueue(
                 last_error: Some(error_str.clone()),
                 next_attempt_at: now.saturating_add(backoff),
             };
-            let label = operation.label();
-
-            // N2: Cap the pending commits queue.
-            if pending_commits.len() >= MAX_PENDING_COMMITS {
-                *commit_fault = Some(CommitFaultMarker {
-                    operation: operation.clone(),
-                    reason: format!("pending commit queue full ({MAX_PENDING_COMMITS} entries)"),
-                    retry_count: 1,
-                    failed_at: now,
-                });
-                emit_event_into(
-                    receive_buffer,
-                    ContextEvent::CommitBroadcastFailed {
-                        operation: label,
-                        reason: format!("queue full ({MAX_PENDING_COMMITS}): {error_str}"),
-                        attempts: 1,
-                    },
-                    context_id,
-                    deps.event_tx.as_ref(),
-                );
-                return;
-            }
-            pending_commits.push_back(pending);
-            let label_for_event = label.clone();
-            emit_event_into(
-                receive_buffer,
-                ContextEvent::CommitBroadcastPending {
-                    operation: label_for_event,
-                    error: error_str.clone(),
-                    attempt: 1,
-                },
-                context_id,
-                deps.event_tx.as_ref(),
-            );
-            tracing::warn!(
-                context_id = %context_id,
-                operation = %label,
-                error = %error_str,
-                "MLS commit broadcast failed; enqueued for persistent retry (PR #1606 C6)"
-            );
+            Some(BroadcastFailure {
+                pending,
+                label: operation.label(),
+                error: error_str,
+            })
         }
     }
+}
+
+/// Applies the retry-queue bookkeeping from a failed [`try_broadcast_commit`] to
+/// the three disjoint Class-C fields it touches (`pending_commits`,
+/// `commit_fault`, `receive_buffer`) and emits the surfaced local event.
+///
+/// SYNCHRONOUS by design: a caller runs it INSIDE a `commit_class_s_keep`
+/// closure (via `view.rest_mut()`) to persist the fields FAIL-CLOSED at the
+/// safety-gated sites, or against a coalesced `class_c_view()` / `ClassCMut` at
+/// the best-effort sites. The durability class is the CALLER's choice; this
+/// helper only mutates the borrowed fields.
+///
+/// # Field-granular borrows (ADR-049 §9)
+///
+/// Takes a [`CommitBroadcastBorrows`] — the THREE disjoint Class-C `&mut` fields
+/// rather than a whole `&mut PerContextState`.
+///
+/// Preserves the exact `MAX_PENDING_COMMITS` cap semantics: the length check
+/// runs HERE, holding the live `&mut pending_commits`, so a full queue converts
+/// the enqueue into a fail-close [`CommitFaultMarker`] instead — identical to the
+/// pre-async single-function behavior (§9.9.3).
+pub fn apply_broadcast_failure(
+    borrows: CommitBroadcastBorrows<'_>,
+    deps: &ActorDeps,
+    context_id: &str,
+    failure: BroadcastFailure,
+) {
+    let CommitBroadcastBorrows {
+        pending_commits,
+        commit_fault,
+        receive_buffer,
+    } = borrows;
+    let BroadcastFailure {
+        pending,
+        label,
+        error,
+    } = failure;
+
+    // N2: Cap the pending commits queue.
+    if pending_commits.len() >= MAX_PENDING_COMMITS {
+        *commit_fault = Some(CommitFaultMarker {
+            operation: pending.operation.clone(),
+            reason: format!("pending commit queue full ({MAX_PENDING_COMMITS} entries)"),
+            retry_count: 1,
+            failed_at: pending.first_attempt_at,
+        });
+        emit_event_into(
+            receive_buffer,
+            ContextEvent::CommitBroadcastFailed {
+                operation: label,
+                reason: format!("queue full ({MAX_PENDING_COMMITS}): {error}"),
+                attempts: 1,
+            },
+            context_id,
+            deps.event_tx.as_ref(),
+        );
+        return;
+    }
+    pending_commits.push_back(pending);
+    let label_for_event = label.clone();
+    emit_event_into(
+        receive_buffer,
+        ContextEvent::CommitBroadcastPending {
+            operation: label_for_event,
+            error: error.clone(),
+            attempt: 1,
+        },
+        context_id,
+        deps.event_tx.as_ref(),
+    );
+    tracing::warn!(
+        context_id = %context_id,
+        operation = %label,
+        error = %error,
+        "MLS commit broadcast failed; enqueued for persistent retry (PR #1606 C6)"
+    );
+}
+
+/// Applies a failed MLS-Commit broadcast's retry-queue bookkeeping FAIL-CLOSED,
+/// inside a second [`commit_class_s_keep`](crate::context::actor::class_s::ClassSCell::commit_class_s_keep)
+/// so it survives a crash before the actor's ≤50 ms coalesced persist tick.
+///
+/// The single call the safety-gated commit-broadcast sites —
+/// [`execute_remove_member`], [`execute_rotate_content_keys`] (this module),
+/// [`recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch)
+/// (§9.12 post-compromise recovery), and
+/// [`leave_context`](crate::context::lifecycle_helpers::leave_context) —
+/// make after [`try_broadcast_commit`] returns `Some(BroadcastFailure)`.
+///
+/// # Why the second fail-closed persist (ADR-049 §9 / §9.9.3)
+///
+/// The transport became async under ADR-049 Decision 7, so the broadcast can no
+/// longer be awaited inside the primary `commit_class_s_keep` closure that
+/// fail-closed-persisted the underlying mutation; it now runs AFTER it. Its
+/// failure bookkeeping, however — the `commit_fault` safety-gate marker
+/// ([`check_commit_fault`] blocks send/lifecycle/governance) and the
+/// `pending_commits` entry that is the ONLY re-delivery of the epoch-advancing
+/// Commit — is synchronous ([`apply_broadcast_failure`]) and DOES ride a second
+/// `commit_class_s_keep`. If instead it were only coalesced (a plain `ClassCMut`
+/// write), a crash between the broadcast failure and the next persist tick would
+/// drop BOTH: the context respawns "healthy" while remaining members are stuck on
+/// a stale MLS epoch with no retry queued — silent, permanent group desync. The
+/// success path persists nothing (there is no `BroadcastFailure` to apply).
+///
+/// `pub` (not `pub(crate)`) is the private-module convention here —
+/// `clippy::redundant_pub_crate` forbids `pub(crate)` in this non-`pub` module;
+/// the helper is not FFI-exported (reconciled via the cross-layer PR-body marker,
+/// like the sibling async transport helpers).
+pub async fn keep_broadcast_failure(
+    cell: &mut crate::context::actor::class_s::ClassSCell,
+    deps: &ActorDeps,
+    context_id: &str,
+    failure: BroadcastFailure,
+) -> Result<(), ContextError> {
+    cell.commit_class_s_keep(deps, context_id, |mut view| {
+        apply_broadcast_failure(view.commit_broadcast_borrows(), deps, context_id, failure);
+        Ok(())
+    })
+    .await
 }
 
 // ===========================================================================
@@ -5169,11 +5984,12 @@ pub fn try_broadcast_commit_or_enqueue(
 /// replied or its mailbox is gone.
 ///
 /// First bulk-iterator caller lands in Phase 2B per ADR-049 — the
-/// per-context governance-timeout task's tick closure already
-/// dispatches the per-actor variant directly via the actor mailbox
-/// (see `start_governance_timeout_task_legacy`'s Phase 4), so the
-/// supervisor-scope sweep is only needed for FFI bridge "evaluate
-/// now" operations or test fixtures that drive deterministic ticks.
+/// per-actor `EvaluatePeriodicConsequences` body is also invoked
+/// directly (Phase 4) by the ACTOR-OWNED governance-timeout sweep
+/// ([`handlers::governance::evaluate_governance_timeouts`](crate::context::actor::handlers::governance),
+/// ADR-049 finding A3), so this supervisor-scope bulk sweep is only
+/// needed for FFI bridge "evaluate now" operations or test fixtures that
+/// drive deterministic ticks.
 #[allow(
     dead_code,
     reason = "first bulk-iterator caller lands in Phase 2B per ADR-049 — \
@@ -5239,169 +6055,6 @@ pub async fn process_pending_commits(supervisor: &crate::context::supervisor::Su
             continue;
         }
         let _ = rx.await;
-    }
-}
-
-/// Sweep entry point: run one tick of the governance timeout pipeline
-/// for a single context (target supplied by the caller — the
-/// supervisor's spawn-time per-context timer task).
-///
-/// This is the per-tick body that the spawn-time governance-timeout
-/// task invokes. Unlike the bulk sweeps above, this entry point
-/// targets a single named context (the timer's own); the
-/// supervisor-iterating shape is reserved for the bulk consequence /
-/// commit sweeps.
-///
-/// Dispatches
-/// [`GovernanceCommand::EvaluateTimeouts`](crate::context::actor::commands::GovernanceCommand::EvaluateTimeouts)
-/// to the named actor and returns whether the timer loop should
-/// continue (`true`) or stop (`false`). Matches the legacy timer
-/// closure's `bool` return.
-///
-/// Returns `false` if the actor cannot be reached (mailbox closed or
-/// no actor registered for `context_id`) — the timer loop stops in
-/// that case, matching the legacy `contexts.get(ctx_id) = None ->
-/// return false` semantics (registry-based replacement for the
-/// stale-generation gate).
-async fn tick_governance_timeout(
-    supervisor: &crate::context::supervisor::handle::SupervisorHandle,
-    context_id: &str,
-) -> bool {
-    use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
-
-    let Some(actor) = supervisor.lookup(context_id) else {
-        return false;
-    };
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = ContextCommand::Governance(GovernanceCommand::EvaluateTimeouts { reply: tx });
-    if actor
-        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
-        .await
-        .is_err()
-    {
-        return false;
-    }
-    match rx.await {
-        Ok(Ok(b)) => b,
-        _ => false,
-    }
-}
-
-/// Spawn (or respawn) THIS context's governance-timeout interval task on
-/// actor-owned state.
-///
-/// Replaces `start_governance_timeout_task_legacy`: the new interval
-/// loop holds no `&Supervisor` and reads no `contexts` `DashMap`. On each
-/// 60-second wake it resolves the owning actor via
-/// [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
-/// and mailboxes
-/// [`GovernanceCommand::EvaluateTimeouts`](crate::context::actor::commands::GovernanceCommand::EvaluateTimeouts),
-/// whose actor handler runs all five timeout phases (proposal
-/// resolution, deadlock detection, event writeback, consequence
-/// evaluation, commit-retry drain) on the actor's owned `&mut state`. A
-/// `lookup → None` / mailbox failure stops the loop — the registry-based
-/// replacement for the legacy stale-generation gate.
-///
-/// The loop is spawned onto the supervisor's tracked `task_set` via
-/// [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn);
-/// its cancel `Notify` + `AbortHandle` are installed on
-/// `state.governance.timeout_task` via
-/// [`GovernanceTimeoutTask::install`](crate::context::governance::timeout::GovernanceTimeoutTask::install),
-/// which aborts any prior task first (cancel/reset semantics preserved).
-///
-/// `tracked_spawn` is awaited (it acquires the `task_set` mutex) so the
-/// abort handle is available to install before returning. Called from
-/// the actor handler for
-/// [`GovernanceCommand::StartTimeoutTask`](crate::context::actor::commands::GovernanceCommand::StartTimeoutTask).
-pub async fn spawn_governance_timeout_task(
-    cell: &mut crate::context::actor::class_s::ClassSCell,
-    deps: &ActorDeps,
-) {
-    use crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS;
-
-    // Reads of the context id go through the cell's `Deref`; no whole-state
-    // `&mut` is taken across the spawn `.await`.
-    let context_id = cell.handle.context_id().to_owned();
-    let supervisor = deps.supervisor.clone();
-    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
-
-    let loop_cancel = std::sync::Arc::clone(&cancel);
-    let loop_fut = async move {
-        loop {
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(
-                    TIMEOUT_CHECK_INTERVAL_SECS,
-                )) => {
-                    if !tick_governance_timeout(&supervisor, &context_id).await {
-                        break;
-                    }
-                }
-                () = loop_cancel.notified() => {
-                    break;
-                }
-            }
-        }
-    };
-
-    // Spawn onto the supervisor's tracked task_set and install the
-    // cancel signal + abort handle on actor-owned state. In the degraded
-    // no-task-set config `tracked_spawn` returns `None`; nothing to
-    // install (matches the legacy `task_set_ref() == None` early-return).
-    // Coalesced: the timeout-task handle is Class-C / structural (a transient
-    // abort handle, not durable authorization state) — installed through the
-    // non-persisting Class-C view AFTER the spawn `.await` resolves, with no
-    // per-site persist injected.
-    if let Some(abort) = deps.supervisor.tracked_spawn(loop_fut).await {
-        cell.class_c_view()
-            .governance_class_c_mut()
-            .timeout_task_mut()
-            .install(cancel, abort);
-    }
-}
-
-/// Sweep entry point retained as the non-legacy module surface for the
-/// lifecycle bootstrap. Mailboxes
-/// [`GovernanceCommand::StartTimeoutTask`](crate::context::actor::commands::GovernanceCommand::StartTimeoutTask)
-/// to the freshly-spawned actor, which installs the interval task on its
-/// owned `state.governance.timeout_task` via
-/// [`spawn_governance_timeout_task`].
-///
-/// Best-effort: a `lookup → None` (actor not yet registered) or
-/// mailbox-send failure is logged and skipped — the governance-timeout
-/// task is a background facility, not part of the create/restore success
-/// contract.
-pub async fn start_governance_timeout_task(
-    supervisor: &crate::context::supervisor::handle::SupervisorHandle,
-    context_id: &str,
-) {
-    use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
-
-    let Some(actor) = supervisor.lookup(context_id) else {
-        tracing::warn!(
-            context_id,
-            "start_governance_timeout_task: no actor registered — timeout task not installed"
-        );
-        return;
-    };
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = ContextCommand::Governance(GovernanceCommand::StartTimeoutTask { reply: tx });
-    if actor
-        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            context_id,
-            "start_governance_timeout_task: mailbox send failed — timeout task not installed"
-        );
-        return;
-    }
-    if let Ok(Err(e)) = rx.await {
-        tracing::warn!(
-            context_id,
-            error = %e,
-            "start_governance_timeout_task: actor reported timeout-task install failure"
-        );
     }
 }
 
@@ -5481,4 +6134,727 @@ pub fn translate_timeout_events(
     }
 
     ctx_events
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    // Test-only capturing persistence: the `Mutex<Option<ContextSnapshot>>` is
+    // never held across `.await` (the write is a synchronous store inside the
+    // trait method), so a plain `std::sync::Mutex` is the right outlet. The
+    // runtime's actor path bans it (ADR-049); test fixtures are exempt, mirroring
+    // the sibling `CapturingPersistence` in `lifecycle_helpers.rs`.
+    clippy::disallowed_types
+)]
+mod commit_broadcast_retry_tests {
+    //! ADR-049 Decision 7, PR-3: pins the retry-queue bookkeeping split out of
+    //! the (now async) MLS-Commit broadcast.
+    //!
+    //! [`try_broadcast_commit`] performs ONLY the async transport send and, on
+    //! failure, builds a [`BroadcastFailure`] payload (it touches no state); the
+    //! synchronous [`apply_broadcast_failure`] applies that payload to the three
+    //! disjoint Class-C fields, preserving the `MAX_PENDING_COMMITS` cap →
+    //! `commit_fault` fail-close conversion; [`keep_broadcast_failure`] rides a
+    //! second `commit_class_s_keep` so the safety-gated call sites persist the
+    //! marker + retry entry FAIL-CLOSED (§9 / §9.9.3).
+    //!
+    //! NOTE (coverage boundary): the full call sites
+    //! ([`execute_remove_member`], [`execute_rotate_content_keys`],
+    //! [`recovery_advance_epoch`], [`leave_context`]) cannot be driven end-to-end
+    //! here — under the `cfg(test)` no-crypto pipeline the MLS Commit serializes
+    //! to EMPTY bytes, so `try_broadcast_commit` short-circuits to `None` and
+    //! never reaches the fail-closed enqueue. These tests therefore exercise the
+    //! extracted helpers directly with a manufactured `BroadcastFailure` (the
+    //! payload a real failed broadcast produces) plus a real failing transport,
+    //! and drive `keep_broadcast_failure` against a real `ClassSCell` +
+    //! failing/succeeding persistence to pin the fail-closed durability.
+    //!
+    //! This is an ACCEPTED boundary, stated honestly: the surrounding
+    //! governance/remove/rotate/leave suites run under the SAME `cfg(test)`
+    //! no-crypto pipeline, so their Commits also serialize to empty bytes and
+    //! `try_broadcast_commit` short-circuits to `None` — they exercise only the
+    //! happy-path invocation of the broadcast helper, NOT the
+    //! failure→`keep_broadcast_failure` routing. Consequently the fail-closed
+    //! HELPER semantics (enqueue, cap→`commit_fault`, fail-closed persist) are
+    //! FULLY pinned by these unit tests, but each safety-gated SITE's CHOICE of
+    //! `keep_broadcast_failure` over the coalesced
+    //! `apply_broadcast_failure(class_c_view())` on the failure path is guarded
+    //! by CODE REVIEW — not structurally by a test — because the no-crypto
+    //! pipeline cannot manufacture the non-empty Commit those sites would need to
+    //! reach the failure branch.
+
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use scp_did::DID;
+    use scp_protocol::context::builder::ContextCreationError;
+    use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
+    use scp_protocol::context::{ContextError, ContextParams};
+
+    use super::{
+        CommitBroadcastBorrows, apply_broadcast_failure, keep_broadcast_failure,
+        try_broadcast_commit,
+    };
+    use crate::context::actor::class_s::ClassSCell;
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::actor::state::PerContextState;
+    use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
+    use crate::context::persistence::ContextPersistence;
+    use crate::context::state::{
+        CommitFaultMarker, CommitOperation, MAX_PENDING_COMMITS, PendingCommit,
+    };
+
+    const ADMIN: &str = "did:dht:z6MkAdminBroadcastRetry";
+    const TARGET: &str = "did:dht:z6MkTargetBroadcastRetry";
+    const CTX_BYTE: u8 = 0x7d;
+
+    /// 64-hex context id matching `[CTX_BYTE; 32]` (the form the code under test
+    /// hashes for the routing id and keys the persisted snapshot under).
+    fn ctx_hex() -> String {
+        hex::encode([CTX_BYTE; 32])
+    }
+
+    /// A transport that records every `send_message` call and either fails or
+    /// succeeds it, deterministically. `fail == true` mirrors an unreachable
+    /// relay (the case that produces a `BroadcastFailure`).
+    struct RecordingTransport {
+        sends: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ContextTransportProvider for RecordingTransport {
+        fn is_connected(&self) -> bool {
+            !self.fail
+        }
+        async fn publish_context(
+            &self,
+            _: &[u8; 32],
+            _: &ContextParams,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn delete_published(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn send_message(&self, _: &[u8; 32], _: &[u8]) -> Result<(), ContextError> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(ContextError::TransportFailed("induced send failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Minimal event-log provider whose reads are empty (mirrors the sibling
+    /// `TestEventLog` fixtures).
+    struct TestEventLog;
+    #[async_trait::async_trait]
+    impl ContextEventLogProvider for TestEventLog {
+        async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn append_event(
+            &self,
+            _: &[u8; 32],
+            _event_type: scp_event_log::EventType,
+            _actor_did: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Persistence whose every `persist_context` SUCCEEDS, counting calls and
+    /// capturing the LAST persisted snapshot — lets the fail-closed keep test
+    /// assert the marker was actually persisted before `keep_broadcast_failure`
+    /// returned `Ok`, and that the retry entry is IN the persisted snapshot (not
+    /// merely that a persist happened).
+    struct CountingOkPersistence {
+        persists: Arc<AtomicUsize>,
+        last_snapshot: Arc<Mutex<Option<crate::context::state::ContextSnapshot>>>,
+    }
+    #[async_trait::async_trait]
+    impl ContextPersistence for CountingOkPersistence {
+        async fn persist_context(
+            &self,
+            _: &str,
+            snapshot: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.persists.fetch_add(1, Ordering::SeqCst);
+            *self.last_snapshot.lock().unwrap() = Some(snapshot.clone());
+            Ok(())
+        }
+        async fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Persistence whose every `persist_context` FAILS — the fail-closed path.
+    struct FailPersistence;
+    #[async_trait::async_trait]
+    impl ContextPersistence for FailPersistence {
+        async fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::state::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Err("induced persist failure".into())
+        }
+        async fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::state::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        async fn delete_context(
+            &self,
+            _: &str,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        async fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Assemble an `ActorDeps` wired with the supplied transport and persistence
+    /// (and the minimal in-memory event log + MLS storage), mirroring the
+    /// `class_s`/`governance` fail-closed test fixtures.
+    async fn build_deps(
+        transport: Box<dyn ContextTransportProvider>,
+        persistence: Box<dyn ContextPersistence>,
+    ) -> ActorDeps {
+        use crate::context::supervisor::supervisor::Supervisor;
+        use scp_platform::in_memory::InMemoryStorage;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            ADMIN.to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let event_log: Box<dyn ContextEventLogProvider> = Box::new(TestEventLog);
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_, _| None);
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let clock: Arc<dyn scp_clock::Clock> = Arc::new(scp_clock::TestClock::new(1_700_000_000));
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            Some(persistence),
+            None,
+            None,
+            Some(clock),
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID(ADMIN.to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// A fresh encrypted test state with an empty pending-commit queue.
+    fn fresh_state() -> PerContextState {
+        PerContextState::new_for_test_encrypted(
+            [CTX_BYTE; 32],
+            1_700_000_000,
+            DID(ADMIN.to_owned()),
+        )
+    }
+
+    fn remove_op() -> CommitOperation {
+        CommitOperation::RemoveMember {
+            target_did: DID(TARGET.to_owned()),
+        }
+    }
+
+    /// Produce a real `BroadcastFailure` by driving `try_broadcast_commit`
+    /// against a failing transport — the exact payload a failed broadcast hands
+    /// the caller to apply.
+    async fn make_failure(deps: &ActorDeps, op: &CommitOperation) -> super::BroadcastFailure {
+        try_broadcast_commit(deps, &ctx_hex(), b"commit-bytes".to_vec(), op)
+            .await
+            .expect("failing transport yields Some(BroadcastFailure)")
+    }
+
+    // -- Test 1: normal enqueue -------------------------------------------
+
+    /// At normal capacity `apply_broadcast_failure` pushes exactly one retry
+    /// entry, leaves `commit_fault` clear, and surfaces the local
+    /// `CommitBroadcastPending` event.
+    #[tokio::test]
+    async fn apply_broadcast_failure_enqueues_at_normal_capacity() {
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let op = remove_op();
+        let failure = make_failure(&deps, &op).await;
+
+        let mut pending: VecDeque<PendingCommit> = VecDeque::new();
+        let mut commit_fault: Option<CommitFaultMarker> = None;
+        let mut receive_buffer = ReceiveBuffer::new();
+
+        apply_broadcast_failure(
+            CommitBroadcastBorrows {
+                pending_commits: &mut pending,
+                commit_fault: &mut commit_fault,
+                receive_buffer: &mut receive_buffer,
+            },
+            &deps,
+            &ctx_hex(),
+            failure,
+        );
+
+        assert_eq!(pending.len(), 1, "exactly one retry entry enqueued");
+        assert_eq!(
+            pending[0].operation, op,
+            "the enqueued entry carries the source operation"
+        );
+        assert_eq!(pending[0].retry_count, 1, "first failure ⇒ retry_count 1");
+        assert!(
+            commit_fault.is_none(),
+            "commit_fault stays clear below the queue cap"
+        );
+        assert!(
+            receive_buffer
+                .drain()
+                .iter()
+                .any(|e| matches!(e, ContextEvent::CommitBroadcastPending { .. })),
+            "a local CommitBroadcastPending event is surfaced"
+        );
+    }
+
+    // -- Test 2: queue-full → commit_fault --------------------------------
+
+    /// A full queue converts the enqueue into a fail-close `CommitFaultMarker`
+    /// (queue-full reason) WITHOUT growing the queue — pins the cap logic that
+    /// moved into `apply_broadcast_failure`.
+    #[tokio::test]
+    async fn apply_broadcast_failure_full_queue_sets_commit_fault() {
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let failure = make_failure(&deps, &remove_op()).await;
+
+        // Pre-fill the queue to exactly the cap. The fillers carry a DIFFERENT
+        // operation variant (`RotateContentKeys`) than the injected failure
+        // (`RemoveMember`), so the `commit_fault` marker's `operation` assertion
+        // below actually proves provenance — that the marker carries the DROPPED
+        // operation, not a filler.
+        let filler = PendingCommit {
+            commit_bytes: vec![0x01, 0x02, 0x03],
+            routing_id: [0u8; 32],
+            operation: CommitOperation::RotateContentKeys { reason: None },
+            first_attempt_at: 1_700_000_000,
+            retry_count: 1,
+            last_error: None,
+            next_attempt_at: 1_700_000_001,
+        };
+        let mut pending: VecDeque<PendingCommit> = VecDeque::new();
+        for _ in 0..MAX_PENDING_COMMITS {
+            pending.push_back(filler.clone());
+        }
+        assert_eq!(
+            pending.len(),
+            MAX_PENDING_COMMITS,
+            "queue seeded at the cap"
+        );
+
+        let mut commit_fault: Option<CommitFaultMarker> = None;
+        let mut receive_buffer = ReceiveBuffer::new();
+
+        apply_broadcast_failure(
+            CommitBroadcastBorrows {
+                pending_commits: &mut pending,
+                commit_fault: &mut commit_fault,
+                receive_buffer: &mut receive_buffer,
+            },
+            &deps,
+            &ctx_hex(),
+            failure,
+        );
+
+        assert_eq!(
+            pending.len(),
+            MAX_PENDING_COMMITS,
+            "a full queue must NOT grow past the cap"
+        );
+        let marker = commit_fault.expect("a full queue converts the enqueue to a commit_fault");
+        assert!(
+            marker.reason.contains("queue full"),
+            "the fault records the queue-full reason; got {:?}",
+            marker.reason
+        );
+        assert_eq!(
+            marker.operation,
+            remove_op(),
+            "the fault carries the DROPPED operation (RemoveMember), not a filler \
+             (RotateContentKeys) — proving marker provenance"
+        );
+        assert!(
+            receive_buffer
+                .drain()
+                .iter()
+                .any(|e| matches!(e, ContextEvent::CommitBroadcastFailed { .. })),
+            "a local CommitBroadcastFailed event is surfaced on queue-full"
+        );
+    }
+
+    // -- Test 3: try_broadcast_commit outcomes ----------------------------
+
+    /// A transport-send error yields `Some(BroadcastFailure)` whose label
+    /// matches the operation, after exactly one send attempt.
+    #[tokio::test]
+    async fn try_broadcast_commit_returns_failure_on_transport_error() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::clone(&sends),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let op = CommitOperation::RotateContentKeys { reason: None };
+
+        let failure = try_broadcast_commit(&deps, &ctx_hex(), b"bytes".to_vec(), &op)
+            .await
+            .expect("transport error yields Some(BroadcastFailure)");
+
+        assert_eq!(
+            failure.label,
+            op.label(),
+            "the surfaced label matches operation.label()"
+        );
+        assert_eq!(
+            failure.pending.operation, op,
+            "the retry payload carries the source operation"
+        );
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "exactly one send attempted"
+        );
+    }
+
+    /// A successful send yields `None` after exactly one send attempt.
+    #[tokio::test]
+    async fn try_broadcast_commit_returns_none_on_success() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::clone(&sends),
+                fail: false,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+
+        let out = try_broadcast_commit(
+            &deps,
+            &ctx_hex(),
+            b"bytes".to_vec(),
+            &CommitOperation::RecoveryAdvanceEpoch,
+        )
+        .await;
+
+        assert!(out.is_none(), "a successful broadcast yields None");
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "exactly one send attempted"
+        );
+    }
+
+    /// Empty commit bytes short-circuit to `None` WITHOUT attempting any send
+    /// (the `cfg(test)` no-crypto pipeline).
+    #[tokio::test]
+    async fn try_broadcast_commit_skips_empty_bytes_without_sending() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::clone(&sends),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+
+        let out = try_broadcast_commit(&deps, &ctx_hex(), Vec::new(), &remove_op()).await;
+
+        assert!(out.is_none(), "empty commit bytes is a no-op");
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            0,
+            "no send is attempted for empty commit bytes"
+        );
+    }
+
+    // -- Test 4: keep_broadcast_failure fail-closed durability ------------
+
+    /// `keep_broadcast_failure` persists the retry entry FAIL-CLOSED: when the
+    /// persist succeeds it returns `Ok`, the marker is durable (persist ran),
+    /// and the entry is enqueued in the cell's `pending_commits`.
+    #[tokio::test]
+    async fn keep_broadcast_failure_persists_retry_entry_before_ok() {
+        let persists = Arc::new(AtomicUsize::new(0));
+        let last_snapshot = Arc::new(Mutex::new(None));
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            Box::new(CountingOkPersistence {
+                persists: Arc::clone(&persists),
+                last_snapshot: Arc::clone(&last_snapshot),
+            }),
+        )
+        .await;
+        let failure = make_failure(&deps, &remove_op()).await;
+        let mut cell = ClassSCell::new(fresh_state());
+
+        let result = keep_broadcast_failure(&mut cell, &deps, &ctx_hex(), failure).await;
+
+        assert!(
+            result.is_ok(),
+            "a successful fail-closed persist returns Ok"
+        );
+        assert_eq!(
+            persists.load(Ordering::SeqCst),
+            1,
+            "the retry entry was persisted (fail-closed) before returning Ok"
+        );
+        let snapshot = last_snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a snapshot was captured by the persist");
+        assert_eq!(
+            snapshot.pending_commits.len(),
+            1,
+            "the retry entry is actually IN the persisted snapshot, not merely \
+             that a persist happened"
+        );
+        assert_eq!(
+            cell.pending_commits.len(),
+            1,
+            "the retry entry is enqueued in the cell"
+        );
+        assert!(
+            cell.commit_fault.is_none(),
+            "a normal enqueue leaves commit_fault clear"
+        );
+    }
+
+    /// A FAILING persist inside `keep_broadcast_failure` surfaces
+    /// `PersistenceFailed` (never a silent `Ok`) AND retains the retry entry in
+    /// memory (keep-direction) so the coalesced tick re-attempts the write —
+    /// the fail-closed guarantee the async-broadcast split had to restore.
+    #[tokio::test]
+    async fn keep_broadcast_failure_surfaces_persist_error_and_retains_entry() {
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let failure = make_failure(&deps, &remove_op()).await;
+        let mut cell = ClassSCell::new(fresh_state());
+
+        let result = keep_broadcast_failure(&mut cell, &deps, &ctx_hex(), failure).await;
+
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "a failing fail-closed persist must surface PersistenceFailed, not Ok; got {result:?}"
+        );
+        assert_eq!(
+            cell.pending_commits.len(),
+            1,
+            "the retry entry is RETAINED in memory (keep-direction) after the persist failure"
+        );
+        assert!(
+            cell.commit_fault.is_none(),
+            "a persist failure must NOT spuriously trip the safety gate — only a \
+             full retry queue or retry exhaustion sets commit_fault (parity with \
+             the normal-capacity path)"
+        );
+    }
+
+    // -- Test 5 (unit-level recovery fail-close) --------------------------
+
+    /// The §9.12 post-compromise recovery epoch-advance commit rides the SAME
+    /// retry queue: a failed `RecoveryAdvanceEpoch` broadcast enqueues a pending
+    /// entry tagged `RecoveryAdvanceEpoch`. (The full `recovery_advance_epoch`
+    /// call site cannot be driven under the `cfg(test)` no-crypto pipeline — the
+    /// Commit serializes to empty bytes and short-circuits before the enqueue;
+    /// see the module NOTE. This pins the operation-tag invariant on the path
+    /// that IS reachable.)
+    #[tokio::test]
+    async fn recovery_advance_epoch_failure_enqueues_recovery_tagged_entry() {
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: true,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+        let failure = try_broadcast_commit(
+            &deps,
+            &ctx_hex(),
+            b"recovery-commit".to_vec(),
+            &CommitOperation::RecoveryAdvanceEpoch,
+        )
+        .await
+        .expect("failing transport yields Some(BroadcastFailure)");
+
+        let mut pending: VecDeque<PendingCommit> = VecDeque::new();
+        let mut commit_fault: Option<CommitFaultMarker> = None;
+        let mut receive_buffer = ReceiveBuffer::new();
+
+        apply_broadcast_failure(
+            CommitBroadcastBorrows {
+                pending_commits: &mut pending,
+                commit_fault: &mut commit_fault,
+                receive_buffer: &mut receive_buffer,
+            },
+            &deps,
+            &ctx_hex(),
+            failure,
+        );
+
+        assert_eq!(
+            pending.len(),
+            1,
+            "the recovery commit is enqueued for retry"
+        );
+        assert_eq!(
+            pending[0].operation,
+            CommitOperation::RecoveryAdvanceEpoch,
+            "the enqueued retry entry is tagged RecoveryAdvanceEpoch"
+        );
+        assert!(
+            commit_fault.is_none(),
+            "commit_fault stays clear below the queue cap"
+        );
+    }
+
+    // -- F1: promotion persists FAIL-CLOSED, keep-direction -----------------
+
+    /// F1 (promotion persists FAIL-CLOSED): a promotion whose durable persist
+    /// FAILS must SURFACE the error to the caller (not swallow it best-effort),
+    /// while KEEPING the promotion in memory (keep-direction). The retired
+    /// best-effort path returned `Ok` on a silent persist failure, leaving a
+    /// stale `params.ttl = Some` snapshot on disk that a crash+restart would
+    /// re-arm — destroying the keys of a context members unanimously voted
+    /// permanent (ADR-049 §9 fail-DANGEROUS direction). Routing the mutation
+    /// through `commit_class_s_keep` makes the failure observable AND retains the
+    /// disarmed/promoted in-memory state so a successful re-persist carries it.
+    #[tokio::test]
+    async fn promote_context_persist_failure_is_fail_closed_and_kept() {
+        use scp_protocol::context::ContextState;
+        use scp_protocol::context::params::{MemoryScope, PromotionPolicy};
+
+        let deps = build_deps(
+            Box::new(RecordingTransport {
+                sends: Arc::new(AtomicUsize::new(0)),
+                fail: false,
+            }),
+            Box::new(FailPersistence),
+        )
+        .await;
+
+        // Active, Promotable, finite ttl with an armed absolute deadline — the
+        // exact shape whose promotion, if lost, would re-arm on restart.
+        let mut state = fresh_state();
+        state.handle = crate::context::ContextHandle::new(
+            ctx_hex(),
+            ContextParams {
+                promotion_policy: PromotionPolicy::Promotable,
+                ttl: Some(std::time::Duration::from_secs(500)),
+                ..Default::default()
+            },
+        );
+        state
+            .handle
+            .transition_to(&ContextState::Active)
+            .expect("Creating → Active is a valid transition");
+        state.ttl.timer.deadline_unix_secs = Some(1_700_000_500);
+        let mut cell = ClassSCell::new(state);
+
+        let meta = super::CommitMeta {
+            pid: [0u8; 32],
+            actor_did: ADMIN,
+            timestamp_secs: 1_700_000_000,
+        };
+        // Empty membership ⇒ unanimity is trivially satisfied with no approvals.
+        let result = super::execute_promote_context(&mut cell, &deps, &ctx_hex(), &[], meta).await;
+
+        assert!(
+            matches!(result, Err(ContextError::PersistenceFailed(_))),
+            "a promotion whose persist fails must surface fail-closed (F1), got {result:?}"
+        );
+        // Keep-direction: the promotion is RETAINED in memory so a re-persist
+        // carries it — it is NOT rolled back to a re-armable `ttl = Some` state.
+        assert_eq!(
+            cell.handle.params().ttl,
+            None,
+            "promotion kept: params.ttl cleared (the SOLE prune-immune disarm authority)"
+        );
+        assert_eq!(
+            cell.handle.params().memory_scope,
+            MemoryScope::Full,
+            "promotion kept: memory_scope → Full"
+        );
+        assert_eq!(
+            cell.ttl.timer.deadline_unix_secs, None,
+            "promotion kept: the armed absolute deadline is disarmed in memory"
+        );
+    }
 }

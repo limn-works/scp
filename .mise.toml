@@ -6,10 +6,13 @@ kotlin = "2.3.10"
 gradle = "8.14.4"
 rust = { version = "stable", targets = "wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android,x86_64-apple-darwin,aarch64-apple-darwin" }
 "cargo:cargo-nextest" = "latest"
-"cargo:wasm-pack" = "latest"
 "cargo:maturin" = "latest"
 "cargo:cargo-deny" = "latest"
 "cargo:cargo-fuzz" = "latest"
+# wasm-pack builds the `@limn-works/scp-ts-wasm` browser SDK's wasm artifact
+# (ADR-057 Slice 3). Pinned so the release-only build guard has a reproducible
+# toolchain (`wasm-pack build --release --target web`, never `--dev`).
+"cargo:wasm-pack" = "0.14.0"
 "npm:@napi-rs/cli" = "latest"
 
 [env]

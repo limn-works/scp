@@ -15,7 +15,7 @@
 //! - [`scp_core::context::supervisor::Supervisor::with_providers`] — the
 //!   exact wiring point used by `UniffiBridgeInstance::with_storage_uniffi`
 //!   and its `PyO3`/NAPI siblings (see `crates/scp-ffi/**/runtime.rs`).
-//!   ADR-049 commit 12 deleted the legacy `ContextManager` builder; tests
+//!   ADR-049 §15 deleted the legacy `ContextManager` builder; tests
 //!   now compose providers directly through `Supervisor::with_providers`.
 //!
 //! Issues exercised:
@@ -53,7 +53,7 @@ use scp_core::context::{
     Capability, ContextMode, ContextParams, ContextState, context_id_bytes, context_routing_id,
 };
 #[cfg(feature = "sqlite")]
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
+use scp_core::crypto::mls::provider::NodeMlsFactory;
 #[cfg(feature = "sqlite")]
 use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
 #[cfg(feature = "sqlite")]
@@ -61,9 +61,9 @@ use scp_core::store::ProtocolRepository;
 #[cfg(feature = "sqlite")]
 use scp_core::store::context::ProtocolRepositoryContextBridge;
 #[cfg(feature = "sqlite")]
-use scp_identity::DID;
+use scp_did::DID;
 #[cfg(feature = "sqlite")]
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 
 #[cfg(feature = "sqlite")]
 use scp_platform::sqlite::SqliteStorage;
@@ -89,7 +89,7 @@ const SQLITE_KEY: [u8; 32] = [0x42; 32];
 /// lifecycle — we only need the `ContextManager` to be constructible.
 #[cfg(feature = "sqlite")]
 fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| None)
+    Arc::new(|_did: &DID, _kid: scp_did::SigningKeyId| None)
 }
 
 /// Returns `ContextParams` for an encrypted context with the capability
@@ -177,7 +177,7 @@ async fn sqlite_storage_rejects_mismatched_key() {
 /// `SqliteStorage::new(dir, key)` → `ProtocolRepository::new(Arc<SqliteStorage>)`
 /// → `ProtocolRepositoryContextBridge::new(repo)` → attached to a
 /// `Supervisor` via `Supervisor::with_providers(.., persistence, ..)`.
-/// ADR-049 commit 12 deleted `ContextManager`; the bridges and tests now
+/// ADR-049 §15 deleted `ContextManager`; the bridges and tests now
 /// compose providers directly through this constructor.
 #[cfg(feature = "sqlite")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -198,10 +198,13 @@ async fn context_create_persists_membership_to_sqlite() {
         let repo = Arc::new(ProtocolRepository::new(storage));
         let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo)));
 
-        // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+        // ADR-049 §15 — `Supervisor::with_providers` replaces the
         // deleted `ContextManager::builder().storage(..).build()` chain.
         let manager = Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+            Arc::new(NodeMlsFactory::new(
+                ALICE_DID.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
             Box::new(NotConfiguredTransportProvider),
             Box::new(MerkleEventLogProvider::new()),
             permissive_key_resolver(),
@@ -224,7 +227,7 @@ async fn context_create_persists_membership_to_sqlite() {
             .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
             .await
             .expect("context_create must succeed with sqlite-backed persistence");
-        assert_eq!(handle.state().await, ContextState::Active);
+        assert_eq!(handle.state(), ContextState::Active);
         // Flush snapshots before drop.
         manager.flush_all_contexts_sync().unwrap();
     }
@@ -277,7 +280,7 @@ async fn context_create_persists_membership_to_sqlite() {
 ///    `CoreFields::restore_all_persisted_contexts`.
 /// 7. Verify membership survived and the context handle is restored.
 ///
-/// The new supervisor uses a NEW `MlsCryptoProvider`, so the MLS group
+/// The new supervisor uses a NEW `NodeMlsFactory`, so the MLS group
 /// itself does not survive (`OpenMLS` key material lives in the provider
 /// and is not persisted through this path — MLS state persistence is
 /// tracked separately under SCP-PERSIST-050). This test asserts what
@@ -297,10 +300,13 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         let repo = Arc::new(ProtocolRepository::new(storage));
         let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo)));
 
-        // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+        // ADR-049 §15 — `Supervisor::with_providers` replaces the
         // deleted `ContextManager::builder().storage(..).build()` chain.
         let manager = Supervisor::with_providers(
-            Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+            Arc::new(NodeMlsFactory::new(
+                ALICE_DID.to_owned(),
+                std::sync::Arc::new(scp_clock::SystemClock),
+            )),
             Box::new(NotConfiguredTransportProvider),
             Box::new(MerkleEventLogProvider::new()),
             permissive_key_resolver(),
@@ -363,10 +369,13 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     let repo2 = Arc::new(ProtocolRepository::new(storage2));
     let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo2)));
 
-    // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+    // ADR-049 §15 — `Supervisor::with_providers` replaces the
     // deleted `ContextManager::with_persistence(..)` constructor.
     let manager2 = Supervisor::with_providers(
-        Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+        Arc::new(NodeMlsFactory::new(
+            ALICE_DID.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(NotConfiguredTransportProvider),
         Box::new(MerkleEventLogProvider::new()),
         permissive_key_resolver(),

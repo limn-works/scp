@@ -49,8 +49,8 @@ GovernanceAction::ResetMember { reason, .. } => {
 
 ## Why normalize at the validator, not the FFI bridge
 
-- **Consistency across 4 bridges.** Putting the normalization in `scp-ffi/common/src/validate.rs`
-  means PyO3, UniFFI, NAPI, and WASM all get the same behavior for free. Normalizing per-bridge
+- **Consistency across 3 bridges.** Putting the normalization in `scp-ffi/common/src/validate.rs`
+  means PyO3, UniFFI, and NAPI all get the same behavior for free. Normalizing per-bridge
   invites drift.
 - **Required-field callers unchanged.** The validator itself still rejects `""` for callers
   that pass a non-optional reason. Only the "treat Some('') like None" behavior lives in the

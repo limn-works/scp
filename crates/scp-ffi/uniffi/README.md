@@ -6,14 +6,26 @@ proc-macros (`#[uniffi::export]`). Consumed by the Swift SDK
 
 ## Architecture
 
-**Shared ContextManager**: Same pattern as PyO3 and NAPI -- a single
-`Arc<ContextManager>` in `OnceLock` owns all context lifecycle, membership,
-governance, broadcast, and TTL state. Bridge functions access it via
-`crate::runtime::context_manager()`.
+**`Scp` object + shared Supervisor**: Same per-instance pattern as PyO3 and
+NAPI. The `#[derive(uniffi::Object)] Scp` (in `scp.rs`) is the caller-owned
+handle exposed to Swift/Kotlin; its sole `#[uniffi::constructor] with_storage`
+takes a typed `StorageConfig` and is fail-closed (spec §17.6) -- there is no
+zero-argument constructor. `Scp` wraps a `UniffiBridgeInstance` that holds a
+shared `Arc<Supervisor>` in its `BridgeInstanceCore.supervisor` slot; the
+Supervisor owns all context lifecycle, membership, governance, broadcast, and
+TTL state. It is built by `build_supervisor` in `runtime.rs` via
+`Supervisor::with_providers_and_journal(...)` (durable saga journal) and reached
+through `self.core.try_supervisor()` / `has_supervisor()`. This replaced the
+previously-shared `Arc<ContextManager>`, now deleted (see
+[ADR-049](../../../.docs/adrs/ADR-049-actor-per-context.md)); there is no
+`context_manager()` accessor. See
+[construction.md](../../../.docs/standards/construction.md) (ADR-052) for the
+mandatory-config API rule.
 
-**Single bridge module**: All exports live in `bridge.rs` -- function groups
-for identity, context lifecycle, membership queries, governance, broadcast,
-TTL, tools, UCAN, event log, transport, discovery, provenance, trust, and sync.
+**Single bridge module**: All `#[uniffi::export]` free functions live in
+`bridge.rs` -- function groups for identity, context lifecycle, membership
+queries, governance, broadcast, TTL, outlets, UCAN, event log, transport,
+discovery, provenance, trust, and sync.
 
 **Callback interfaces**: Platform-specific operations are injected from
 Swift/Kotlin via `#[uniffi::export(callback_interface)]` traits:
@@ -33,15 +45,17 @@ futures.
 counter. `scp_shutdown(timeout_secs)` blocks until all handles are released.
 
 **Error mapping**: `ScpError` enum with variants (`Identity`, `Context`,
-`Permission`, `Crypto`, `Transport`, `Tool`, `Validation`), each carrying a
+`Permission`, `Crypto`, `Transport`, `Outlet`, `Validation`), each carrying a
 `message` and structured `code` (`SCP-{CATEGORY}-{NUMBER}`).
 
 ## Modules
 
 | File | Contents |
 |------|----------|
-| `bridge.rs` | All `#[uniffi::export]` functions and types |
-| `runtime.rs` | ContextManager initialization, UCAN state |
+| `scp.rs` | The `Scp` UniFFI object -- caller-owned handle; sole fail-closed `with_storage(StorageConfig)` constructor |
+| `bridge.rs` | All `#[uniffi::export]` free functions and types |
+| `runtime.rs` | `UniffiBridgeInstance`: supervisor slot + `build_supervisor`, storage selection, UCAN state |
+| `server.rs` | Relay / application-node server startup (wraps `scp-ffi-common::server`) |
 | `lib.rs` | Tokio runtime, handle counting, callback interface traits, UDL scaffolding |
 
 ## Build
@@ -70,6 +84,8 @@ functions are defined via proc-macros.
 
 ## Feature flags
 
-`allow_in_memory_custody` -- gates the `"in_memory"` path in `identity_create`.
-Stores keys in unprotected heap memory. Suitable for testing and desktop; must
-NOT be enabled in production mobile builds.
+`testing` -- gates the `"in_memory"` custody path in `identity_create` (via the
+folded-in `scp-platform/testing`), storing keys in unprotected heap memory
+(ADR-062 §Decision 6). Also compiles the in-memory DHT/attestation/pre-rotation
+nullifier doubles. Test/desktop harness only; must NOT be enabled in production
+mobile builds — the G1 shipped-feature-graph gate proves it never ships.

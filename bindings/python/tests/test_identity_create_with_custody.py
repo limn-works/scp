@@ -13,9 +13,9 @@ real Ed25519 keys: ``DidDht::create`` self-certifies the document, so a fake
 signature would fail document validation. This proves the full delegation
 contract (generate → public_key → sign), not just argument plumbing.
 
-Requires the native extension built with ``allow_in_memory_custody``::
+Requires the native extension built with ``testing``::
 
-    maturin develop --release --features allow_in_memory_custody
+    maturin develop --release --features testing
 """
 
 from __future__ import annotations

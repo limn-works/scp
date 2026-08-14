@@ -1,0 +1,25 @@
+---
+name: saga-2c-full-feature-merge-pass-54f937e0f
+description: FULL feature merge-readiness pass for saga-2c branch (§17.16.4 restore-then-replay + §5.14.13 broadcast handshake leaf types) at HEAD 54f937e0f — ALIGNED, ship, zero merge-blockers
+metadata:
+  type: project
+---
+
+# saga-2c FULL feature merge-readiness pass (worktree saga-2c, HEAD 54f937e0f, 2026-06-23) — ALIGNED / SHIP, ZERO merge-blockers
+
+Distinct from the prior [[saga-2c-final-comment-accuracy-54f937e0f]] (comment-only) and [[saga-2c-restore-then-replay-d0c57bd75]] (witness type-encoding) entries: this pass reviewed the WHOLE `git diff origin/main...54f937e0f` (10 commits, 33 files, +3220/-168), including the broadcast-handshake LEAF TYPES and bridge-bootstrap behavioral enforcement those earlier passes did NOT deeply cover.
+
+**TWO workstreams, both spec-grounded:**
+
+1. **§17.16.4 restore-then-replay ordering** (commits a784ca50d→d4f7a7aea + comment fixes). `restore_on_startup` (supervisor.rs:8088) runs `restore_all_contexts().await?` THEN `replay_unresolved_sagas(&restored).await?` — enforced BY CONSTRUCTION via `RestoredContexts` witness (private `ids`, module-private `new`, `for_test` behind dedicated `saga-witness-test-mint` feature NOT implied by `testing` — VERIFIED Cargo.toml [features] + the two actor_saga test targets' required-features:130/134). All 3 FFI bridges route through `restore_on_startup` (PyO3 context.rs:4046, UniFFI bridge.rs:10265, napi context.rs:3803 via `context_restore_all_on`) + shared core bridge_instance.rs:1708. Deleted-caller reaping `caller_context_deleted_from_persistence` (supervisor.rs:6106) reaps ONLY on confirmed `Ok(None)`; `Ok(Some)`→false, `Err`→false (conservative, treat as still-present) — matches new normative §6.2.4/§17.16.4 "Permanently-deleted caller" paragraph byte-for-byte. Behavioral bootstrap test `bridge_restore_entry_runs_restore_and_replay_legs` (saga_bridge_bootstrap.rs:206) is REAL: persists ctx → drops sup (crash) → appends orphaned Initiated journal entry over durable ProtocolRepositorySagaJournal → drives shared bridge entry → asserts BOTH legs (ctx restored Active + saga reconciled out of load_unresolved).
+
+2. **§5.14.13 broadcast-hosting handshake LEAF TYPES** (commit b001f49a6) — new file scp-protocol/src/context/broadcast/hosting_handshake.rs (1201 lines), §5.14.13 already on main in 05-contexts.md:1587. Sub-agent verified: all fields present (BroadcastHostConfig/Request/Grant/AcceptedHostSnapshotEntry), domain separators `SCP-BCAST-HOST-REQ-V1:` / `SCP-BCAST-HOST-GRANT-V1:` match spec verbatim, §9.5.1 domain-separated preimage (NOT SHA(prefix‖JCS)), all ints fixed-width u32/u64 (no f64), expiry rule SCP-SAGA-13102 fires on `expires_at_ms==0`, error codes 13100-13102 in registered range. ZERO scope creep, ZERO missing fields.
+
+**Spec lockstep CONFIRMED:** §17.16.4:963 + §6.2.4:294 reworded together ("NEXT process start", explicit "NO within-restart post-restore sweep", "the only later sweep is a subsequent restart"); both carry the restore-before-reconcile ordering + permanently-deleted-caller reap-once clause. ADR-049 note accurate (prod-inert: `with_providers` hardcodes NoopSagaJournal; goes live when bridges switch to `with_providers_and_journal`). sdk-common.md error-registry split 13100-13199 (broadcast) / 13200-13999 (reserved) — ADDITIVE.
+
+**The one deferral is PRE-EXISTING, not a scope cut:** runtime `BroadcastCommand::InitiateBroadcastHostingHandshake` returns `ContextError::NotImplemented` ("saga wiring deferred to commit 11.5 ... DEFERRED-commit-11-saga-use-cases.md gap 3") at supervisor.rs:4781. VERIFIED this exact deferral EXISTS ON origin/main (6 occurrences) and the two-dot diff shows it is NOT touched by this branch. This PR adds only the LEAF types the future commit 11.5 runtime saga will consume — a legitimate forward step, governed by the DEFERRED ADR (.docs/adrs/DEFERRED-commit-11-saga-use-cases.md, 16KB, on disk). So NO No-deferral/No-stub builder-tenet violation attributable to THIS branch.
+
+**CI workflow diffs benign/required:** added `scp-runtime/saga-witness-test-mint` to clippy/nextest/build-matrix feature sets so the two new required-features test targets actually compile+run under `--all-targets` (else silently skipped). Coverage-additive, not enforcement-weakening.
+
+LESSON: a two-workstream branch may carry a scary-looking `NotImplemented` in the runtime layer — before flagging it as a builder-tenet (no-deferral/no-stub) violation, check `git show origin/main:<file> | grep` to see if it's PRE-EXISTING + governed by a DEFERRED ADR. A leaf-type PR that lands the signed wire types ahead of the runtime saga FSM is a legitimate forward step, NOT a partial implementation, when the deferral is spec/ADR-sanctioned and not introduced/expanded by the branch under review.
+LESSON: prior memory entries focused on the comment-fix commits made the diff LOOK small; the actual `origin/main...HEAD` was +3220 lines incl a 1201-line new file + 863 supervisor lines + 338-line bootstrap test. Re-derive the full diff stat every pass; don't let a narrow prior entry shrink the perceived scope.

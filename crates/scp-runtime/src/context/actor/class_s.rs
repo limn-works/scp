@@ -48,7 +48,7 @@
 //! [`ClassSCell`] owns the [`PerContextState`] and exposes:
 //!
 //! - **Reads** via [`Deref`] — `&*cell` / `cell.<field>` yields `&PerContextState`.
-//!   There is deliberately **no [`DerefMut`]**: you cannot obtain a
+//!   There is deliberately **no [`DerefMut`](std::ops::DerefMut)**: you cannot obtain a
 //!   `&mut PerContextState` by writing `&mut cell.<field>` or `*cell = …`. That is
 //!   the compile-time hook, and it is now in force for the THREE privatized
 //!   Class-S fields (`PerContextState.class_s`, `GovernanceState.class_s`, and
@@ -59,7 +59,7 @@
 //!   `suspended_capabilities` Class-S pair is now privatized to `pub(crate)` and
 //!   GROW-confined to the consequence-only view — see the dedicated section below.)
 //! - **Mutation through a combinator** — every combinator hands `f` a *view*
-//!   ([`ClassSMut`] for the Class-S-capable combinators, [`ClassCMut`] for the
+//!   (`ClassSMut` for the Class-S-capable combinators, `ClassCMut` for the
 //!   Class-C best-effort combinator) rather than the bare `&mut PerContextState`.
 //!   The view chooses which slice of the state `f` can reach `&mut`. The
 //!   Class-S-capable combinators ([`commit_class_s_keep`](ClassSCell::commit_class_s_keep),
@@ -120,7 +120,7 @@
 //! whole-struct `&mut` if one were ever handed out — but none is). Field
 //! privatization (`PerContextState.class_s` / `GovernanceState.class_s` are now
 //! `pub(in crate::context)`) closes the LAST whole-`&mut` reach that DID exist —
-//! the deleted [`ClassSCell::state_mut`] escape hatch and [`ClassSMut`]'s
+//! the deleted `ClassSCell::state_mut` escape hatch and `ClassSMut`'s
 //! `pub(crate)` reach — NOT this view, which was already airtight.
 //! - `*_then_append` — persist fail-closed AFTER `f`, then run an async `after`
 //!   step that appends a derived record to an EXTERNAL durable sink (the event
@@ -192,7 +192,7 @@
 //!   [`crate::context::governance_logic::enforce_triggered_consequences`] returns a
 //!   downward-auth flag and the cell-holding caller persists the already-applied
 //!   mutation **fail-closed** (keep-direction) before acking, in every production
-//!   consequence site (send / receive / tool-settle / periodic sweep; governance
+//!   consequence site (send / receive / outlet-settle / periodic sweep; governance
 //!   execution was already fail-closed via its `ClassSCommitToken`). Consequence
 //!   EVALUATION stays best-effort / coalesced — only the rare downward-auth OUTCOME
 //!   is fail-closed.
@@ -217,14 +217,14 @@
 //!   §9-safe by the OBLIGATION of the combinator/caller that reaches it (NOT by
 //!   impossibility):
 //!   - **(A) the consequence-only view.** [`ClassCMut::consequence_split`] (itself
-//!     reachable from the best-effort [`ClassCMut::class_c_view`]) yields a
+//!     reachable from the best-effort `ClassSCell::class_c_view`) yields a
 //!     [`ConsequenceRoleStateMut`], the role view that DOES expose
 //!     `suspend_capabilities` / `suspend_all`. A `ClassCMut` holder CAN therefore
 //!     reach a GROW — and the §9 guarantee is that the consequence caller persists
 //!     the applied GROW FAIL-CLOSED (RED-CS3), not that the GROW is unreachable.
 //!   - **(B) the inherent `pub` GROW.** `ContextRoleState::suspend_capabilities` /
 //!     `suspend_all` are inherent `pub` methods reachable through ANY whole
-//!     `&mut ContextRoleState` — e.g. [`ClassSMut::rest_mut`], used by the
+//!     `&mut ContextRoleState` — e.g. `ClassSMut::rest_mut`, used by the
 //!     governance helpers. That whole-`&mut` is handed out only by a
 //!     fail-closed-PERSISTING combinator, so the GROW it can reach is persisted
 //!     fail-closed by construction.
@@ -292,7 +292,7 @@ use super::state::{
     WelcomeProcessing,
 };
 use crate::context::ContextHandle;
-use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+use crate::context::governance::timeout::DeadlockDetectionState;
 use crate::context::messaging_helpers::{persist_state_best_effort, persist_state_fail_closed};
 use crate::context::state::{
     AccessControlState, CommitFaultMarker, EpochState, GovernanceClassS, GovernanceState,
@@ -300,20 +300,24 @@ use crate::context::state::{
     TtlState,
 };
 use crate::economy::adapter::PaymentReceipt;
+use scp_did::DID;
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
-use scp_identity::DID;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::broadcast::BroadcastContext as ProtocolBroadcastContext;
+use scp_protocol::context::broadcast::{
+    BroadcastContext as ProtocolBroadcastContext, BroadcastContextClassCParts,
+    BroadcastPublishMetadata, BroadcastPublishReservation, ReservedPublishApply,
+    SubscriptionResult, UnblockResult, UnsubscribeResult,
+};
 use scp_protocol::context::governance::{
     GovernanceEngine, GovernanceProposal, ProposalId, PruningPolicy,
 };
 use scp_protocol::context::membership::{MemberInfo, MembershipState, ReceiveBuffer};
-use scp_protocol::context::params::ToolRegistration;
+use scp_protocol::context::outlets::interface::OutletInterface;
+use scp_protocol::context::params::OutletRegistration;
 use scp_protocol::context::roles::{
     Capability, CapabilityCeiling, ContextRoleClassCParts, ContextRoleState, RoleAssignment,
     RoleDefinition, RoleError, UcanToken,
 };
-use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::crypto::ucan::validate::InMemoryProofResolver;
 use scp_protocol::economy::antispam::{
     ContextMessagePricingConfig, SenderVelocityTracker, TokenBucketLimiter,
@@ -427,6 +431,28 @@ impl<'a> ClassSMut<'a> {
     pub(crate) const fn rest_mut(&mut self) -> &mut PerContextState {
         self.state
     }
+
+    /// The three disjoint Class-C `&mut` fields the MLS-Commit broadcast-failure
+    /// apply ([`crate::context::governance_helpers::apply_broadcast_failure`])
+    /// mutates, bundled so a caller can pass all three at once. The MIRROR of
+    /// [`ClassCMut::commit_broadcast_borrows`], but supplied from this
+    /// Class-S-capable view so the apply rides the owning combinator's
+    /// **fail-closed** persist: the safety-gated commit-broadcast sites
+    /// ([`crate::context::governance_helpers::keep_broadcast_failure`]) build the
+    /// borrows HERE — inside a `commit_class_s_keep` closure — rather than through
+    /// the coalesced `ClassCMut` view, so the `commit_fault` safety gate and the
+    /// `pending_commits` retry entry survive a crash before the ≤50 ms persist
+    /// tick. Each is a distinct field of the underlying `PerContextState`, so the
+    /// simultaneous `&mut` is sound by construction.
+    pub(crate) const fn commit_broadcast_borrows(
+        &mut self,
+    ) -> crate::context::governance_helpers::CommitBroadcastBorrows<'_> {
+        crate::context::governance_helpers::CommitBroadcastBorrows {
+            pending_commits: &mut self.state.pending_commits,
+            commit_fault: &mut self.state.commit_fault,
+            receive_buffer: &mut self.state.receive_buffer,
+        }
+    }
 }
 
 impl Deref for ClassSMut<'_> {
@@ -442,7 +468,7 @@ impl Deref for ClassSMut<'_> {
 ///
 /// Holds the actor's Class-S sub-struct as a PRIVATE shared reference. It exposes
 /// ONLY [`Self::get`] (a `&ClassSState` read) — there is NO `&mut` accessor and
-/// NO [`DerefMut`]. [`ClassCMut`] stores its Class-S reach as a `SharedClassS`
+/// NO [`DerefMut`](std::ops::DerefMut). [`ClassCMut`] stores its Class-S reach as a `SharedClassS`
 /// rather than a bare `&'a ClassSState` so that re-arming a `&mut` to Class-S on
 /// the best-effort view requires THREE conspicuous central edits — the
 /// `ClassCMut.class_s` field type, this wrapper's private field, AND
@@ -513,7 +539,7 @@ impl<'a> SharedClassS<'a> {
 /// # The Class-S reach is the read-only [`SharedClassS`] wrapper (BLACK-CS-01)
 ///
 /// `ClassCMut.class_s` is a [`SharedClassS`] — a wrapper holding a PRIVATE
-/// `&ClassSState`, with NO `&mut` accessor and NO [`DerefMut`]. So the only Class-S
+/// `&ClassSState`, with NO `&mut` accessor and NO [`DerefMut`](std::ops::DerefMut). So the only Class-S
 /// reach on this best-effort view is the shared read [`Self::class_s`]
 /// (`self.class_s.get()`); there is no `&mut` to the actor's `ClassSState`
 /// anywhere, and a Class-S mutation from this view is a COMPILE error by
@@ -591,7 +617,7 @@ pub(crate) struct ClassCMut<'a> {
     /// `&mut` to the per-sender receive-sequence high-water marks (Class-C).
     recv_tracker: &'a mut RecvSequenceTracker,
     /// `&mut` to the reconstructable cross-context UCAN proof store (Class-C /
-    /// §6.2.4). Interface state repopulated when the tool interface is
+    /// §6.2.4). Interface state repopulated when the outlet interface is
     /// re-established — explicitly NOT the Class-S freshness/replay witness.
     xctx_ucan_proofs: &'a mut InMemoryProofResolver,
     /// `&mut` to the in-flight broadcast-publish reservations (Class-C).
@@ -621,6 +647,185 @@ pub(crate) struct ClassCMut<'a> {
     /// Field-granular Class-C governance sub-view (holds no whole
     /// `&mut GovernanceState`, no `class_s` reach).
     governance: GovernanceClassCMut<'a>,
+}
+
+/// FIELD-GRANULAR best-effort view over a [`ProtocolBroadcastContext`]'s Class-C
+/// publish / roster surface (ADR-049 §9, §5.14.8 mutation-surface confinement).
+///
+/// Produced by [`ClassCMut::broadcast_class_c_mut`]. Mirrors [`RoleStateClassCMut`]:
+/// it holds the [`BroadcastContextClassCParts`] DISJOINT field refs (NOT a whole
+/// `&mut BroadcastContext`) and forwards ONLY the benign publish-path / roster
+/// methods. The downward-authorization security mutators (`block_subscriber`,
+/// `block_author`, `governance_ban_subscriber`, `rotate_all_author_keys`) are
+/// inherent `&mut self` on `BroadcastContext` and are deliberately NOT forwarded
+/// here — they are reachable only through a whole `&mut BroadcastContext` a
+/// fail-closed combinator hands out via [`ClassSMut::rest_mut`]. Because this view
+/// holds no whole `&mut`, a future "convenience" accessor returning one CANNOT be
+/// written; the load-bearing guarantee is the PRIVATE [`AuthorState`] security
+/// fields plus `ClassSCell: !DerefMut`.
+///
+/// Precision: "benign" here means SAFE-DIRECTION, NOT "never touches the security
+/// fields". Two forwarded methods DO write them: `unsubscribe(rotate_keys = true)`
+/// advances `epoch` and installs a fresh `broadcast_key` (forward-only rotation; a
+/// coalesce-window rollback returns to "subscriber present under the old key",
+/// never a re-grant), and `unblock_subscriber` clears an entry from `block_list`
+/// (UPWARD re-grant; a rollback re-instates the block). Both are persisted
+/// BEST-EFFORT and are safe precisely because a lost write only leaves authority
+/// NARROWER than the caller observed. The fail-closed, must-survive-crash
+/// guarantee (via the `n` keep-direction combinator) covers only the
+/// REVOCATION-direction mutators (`block_subscriber` / `block_author` /
+/// `governance_ban_subscriber` / `rotate_all_author_keys`), which are NOT
+/// forwarded here. What this view structurally prevents is a *direct* private-
+/// field write (the `#[F.2]` compile-fail witness) and any reach to that
+/// revocation surface.
+///
+/// [`AuthorState`]: scp_protocol::context::broadcast::AuthorState
+#[allow(
+    dead_code,
+    reason = "ADR-049 §9 / §5.14.8: the benign publish-path / roster forwards (`subscribe`, `unsubscribe`, `unblock_subscriber`, `reserve_publish`, `apply_reserved_publish`, `rollback_reserved_publish`, `publish`, `publish_metadata`, `context_id`) are exercised by the broadcast publish/roster helpers and this module's unit tests; the remainder gain callers as the broadcast handlers migrate fully onto the field-granular view."
+)]
+pub(crate) struct BroadcastContextClassCMut<'a> {
+    /// The disjoint Class-C parts. PRIVATE: no accessor hands out `&mut authors`
+    /// / `&mut subscribers` (either would re-open the `block_author` /
+    /// registry-clear surface), so the only reach is the benign forwards below.
+    parts: BroadcastContextClassCParts<'a>,
+}
+
+impl<'a> BroadcastContextClassCMut<'a> {
+    /// Build the field-granular view by destructuring a `&mut BroadcastContext`
+    /// through [`BroadcastContext::class_c_parts`](ProtocolBroadcastContext::class_c_parts).
+    fn new(bc: &'a mut ProtocolBroadcastContext) -> Self {
+        Self {
+            parts: bc.class_c_parts(),
+        }
+    }
+
+    /// Context identifier (structural identity).
+    pub(crate) const fn context_id(&self) -> &str {
+        self.parts.context_id()
+    }
+
+    /// Benign roster ADD. Forwards to [`BroadcastContextClassCParts::subscribe`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::subscribe`].
+    pub(crate) fn subscribe<D, N, R, P, S>(
+        &mut self,
+        subscriber_did: &str,
+        ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        timestamp: u64,
+        validation_ctx: Option<
+            &mut scp_protocol::crypto::ucan::validate::ValidationContext<'_, D, N, R, P, S>,
+        >,
+    ) -> Result<SubscriptionResult, ContextError>
+    where
+        D: scp_protocol::crypto::ucan::validate::DidResolver,
+        N: scp_protocol::crypto::ucan::validate::NonceTracker,
+        R: scp_protocol::crypto::ucan::validate::RevocationChecker,
+        P: scp_protocol::crypto::ucan::validate::ProofResolver,
+        S: std::hash::BuildHasher,
+    {
+        self.parts
+            .subscribe(subscriber_did, ucan, timestamp, validation_ctx)
+    }
+
+    /// Benign roster REMOVE (+ optional forward-secrecy rotation). Forwards to
+    /// [`BroadcastContextClassCParts::unsubscribe`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::unsubscribe`].
+    pub(crate) fn unsubscribe(
+        &mut self,
+        subscriber_did: &str,
+        rotate_keys: bool,
+    ) -> Result<UnsubscribeResult, ContextError> {
+        self.parts.unsubscribe(subscriber_did, rotate_keys)
+    }
+
+    /// UPWARD (re-grant) unblock — best-effort by design. Forwards to
+    /// [`BroadcastContextClassCParts::unblock_subscriber`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::unblock_subscriber`].
+    pub(crate) fn unblock_subscriber(
+        &mut self,
+        author_did: &str,
+        unblocked_did: &str,
+    ) -> Result<UnblockResult, ContextError> {
+        self.parts.unblock_subscriber(author_did, unblocked_did)
+    }
+
+    /// Benign publish signing metadata. Forwards to
+    /// [`BroadcastContextClassCParts::publish_metadata`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::publish_metadata`].
+    pub(crate) fn publish_metadata(
+        &self,
+        author_did: &str,
+    ) -> Result<BroadcastPublishMetadata<'_>, ContextError> {
+        self.parts.publish_metadata(author_did)
+    }
+
+    /// Benign single-phase publish. Forwards to
+    /// [`BroadcastContextClassCParts::publish`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::publish`].
+    pub(crate) fn publish(
+        &mut self,
+        author_did: &str,
+        payload: &[u8],
+        timestamp: u64,
+        signature: ed25519_dalek::Signature,
+        nonce: &[u8; 12],
+        provenance: Option<scp_protocol::provenance::DataProvenance>,
+    ) -> Result<scp_protocol::crypto::sender_keys::BroadcastEnvelope, ContextError> {
+        self.parts
+            .publish(author_did, payload, timestamp, signature, nonce, provenance)
+    }
+
+    /// Benign phase-1 reservation. Forwards to
+    /// [`BroadcastContextClassCParts::reserve_publish`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::reserve_publish`].
+    pub(crate) fn reserve_publish(
+        &mut self,
+        author_did: &str,
+    ) -> Result<BroadcastPublishReservation, ContextError> {
+        self.parts.reserve_publish(author_did)
+    }
+
+    /// Benign phase-2 seal. Forwards to
+    /// [`BroadcastContextClassCParts::apply_reserved_publish`].
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContextClassCParts::apply_reserved_publish`].
+    pub(crate) fn apply_reserved_publish(
+        &mut self,
+        author_did: &str,
+        payload: &[u8],
+        nonce: &[u8; 12],
+        apply: ReservedPublishApply,
+    ) -> Result<scp_protocol::crypto::sender_keys::BroadcastEnvelope, ContextError> {
+        self.parts
+            .apply_reserved_publish(author_did, payload, nonce, apply)
+    }
+
+    /// Benign reservation rollback. Forwards to
+    /// [`BroadcastContextClassCParts::rollback_reserved_publish`].
+    pub(crate) fn rollback_reserved_publish(&mut self, author_did: &str, reserved_sequence: u64) {
+        self.parts
+            .rollback_reserved_publish(author_did, reserved_sequence);
+    }
 }
 
 /// Simultaneously-held borrows for the §19 economy pre-check.
@@ -722,18 +927,16 @@ pub(crate) struct GovernanceClassCMut<'a> {
     next_proposal_seq: &'a mut u64,
     /// `&mut` to the governance freeze state (ADR-031 §7).
     freeze: &'a mut Option<(ProposalId, ProposalId, u64)>,
-    /// `&mut` to the governance timeout task handle (SCP-271, ADR-031 §5).
-    timeout_task: &'a mut GovernanceTimeoutTask,
     /// `&mut` to the per-context deadlock detection state (ADR-031 §10).
     deadlock: &'a mut DeadlockDetectionState,
     /// `&mut` to the pending ceiling modification (M7, §5.3.2).
     pending_ceiling_modification: &'a mut Option<PendingCeilingModification>,
     /// `&mut` to the pending economic policy change (§19.3).
     pending_economic_policy_change: &'a mut Option<PendingEconomicPolicyChange>,
-    /// `&mut` to the dynamically registered tools list (§5.9).
-    registered_tools: &'a mut Vec<ToolRegistration>,
-    /// `&mut` to the cross-context tool interfaces list (§6.2).
-    tool_interfaces: &'a mut Vec<ToolInterface>,
+    /// `&mut` to the dynamically registered outlets list (§5.9).
+    registered_outlets: &'a mut Vec<OutletRegistration>,
+    /// `&mut` to the cross-context outlet interfaces list (§6.2).
+    outlet_interfaces: &'a mut Vec<OutletInterface>,
     /// `&mut` to the pruning policy override (ADR-030 §6).
     pruning_policy: &'a mut Option<PruningPolicy>,
     /// `&mut` to the last-known-member set for departure detection.
@@ -754,7 +957,7 @@ pub(crate) struct GovernanceClassCMut<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `timeout_task_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_tools_mut`, `tool_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `proposal_timestamps_mut`, `evict_stale_entries`, `detection_borrows`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C governance accessors (`velocity_tracker_mut`, `budget_tracker_mut`, `cooldown_until_mut`, `economic_policy_mut`, `next_proposal_seq`, `next_proposal_seq_mut`, `engine_mut`, `approved_proposals_mut`, `freeze_mut`, `deadlock_mut`, `pending_ceiling_modification_mut`, `pending_economic_policy_change_mut`, `registered_outlets_mut`, `outlet_interfaces_mut`, `pruning_policy_mut`, `last_known_members_mut`, `pending_epoch_resets_mut`, `consequence_rules_mut`, `participation_cache_mut`, `message_pricing_mut`, `hard_rate_limit_mut`, `proposal_timestamps_mut`, `evict_stale_entries`, `detection_borrows`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` / economy-compensation paths migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> GovernanceClassCMut<'a> {
     /// Wrap a borrowed [`GovernanceState`] by DESTRUCTURING it into the
@@ -787,12 +990,11 @@ impl<'a> GovernanceClassCMut<'a> {
             approved_proposals,
             next_proposal_seq,
             freeze,
-            timeout_task,
             deadlock,
             pending_ceiling_modification,
             pending_economic_policy_change,
-            registered_tools,
-            tool_interfaces,
+            registered_outlets,
+            outlet_interfaces,
             pruning_policy,
             last_known_members,
             pending_epoch_resets,
@@ -817,12 +1019,11 @@ impl<'a> GovernanceClassCMut<'a> {
             approved_proposals,
             next_proposal_seq,
             freeze,
-            timeout_task,
             deadlock,
             pending_ceiling_modification,
             pending_economic_policy_change,
-            registered_tools,
-            tool_interfaces,
+            registered_outlets,
+            outlet_interfaces,
             pruning_policy,
             last_known_members,
             pending_epoch_resets,
@@ -897,12 +1098,6 @@ impl<'a> GovernanceClassCMut<'a> {
         self.freeze
     }
 
-    /// `&mut` access to the governance timeout task handle (SCP-271, ADR-031 §5).
-    /// Class-C: a transient task handle, not durable authorization state.
-    pub(crate) const fn timeout_task_mut(&mut self) -> &mut GovernanceTimeoutTask {
-        self.timeout_task
-    }
-
     /// `&mut` access to the per-context deadlock detection state (ADR-031 §10).
     /// Class-C structural liveness state.
     pub(crate) const fn deadlock_mut(&mut self) -> &mut DeadlockDetectionState {
@@ -925,16 +1120,16 @@ impl<'a> GovernanceClassCMut<'a> {
         self.pending_economic_policy_change
     }
 
-    /// `&mut` access to the dynamically registered tools list (§5.9). Class-C
+    /// `&mut` access to the dynamically registered outlets list (§5.9). Class-C
     /// structural governance configuration.
-    pub(crate) const fn registered_tools_mut(&mut self) -> &mut Vec<ToolRegistration> {
-        self.registered_tools
+    pub(crate) const fn registered_outlets_mut(&mut self) -> &mut Vec<OutletRegistration> {
+        self.registered_outlets
     }
 
-    /// `&mut` access to the cross-context tool interfaces list (§6.2). Class-C
+    /// `&mut` access to the cross-context outlet interfaces list (§6.2). Class-C
     /// structural governance configuration.
-    pub(crate) const fn tool_interfaces_mut(&mut self) -> &mut Vec<ToolInterface> {
-        self.tool_interfaces
+    pub(crate) const fn outlet_interfaces_mut(&mut self) -> &mut Vec<OutletInterface> {
+        self.outlet_interfaces
     }
 
     /// `&mut` access to the pruning policy override (ADR-030 §6). Class-C
@@ -1061,12 +1256,11 @@ impl<'a> GovernanceClassCMut<'a> {
             approved_proposals: &mut *self.approved_proposals,
             next_proposal_seq: &mut *self.next_proposal_seq,
             freeze: &mut *self.freeze,
-            timeout_task: &mut *self.timeout_task,
             deadlock: &mut *self.deadlock,
             pending_ceiling_modification: &mut *self.pending_ceiling_modification,
             pending_economic_policy_change: &mut *self.pending_economic_policy_change,
-            registered_tools: &mut *self.registered_tools,
-            tool_interfaces: &mut *self.tool_interfaces,
+            registered_outlets: &mut *self.registered_outlets,
+            outlet_interfaces: &mut *self.outlet_interfaces,
             pruning_policy: &mut *self.pruning_policy,
             last_known_members: &mut *self.last_known_members,
             pending_epoch_resets: &mut *self.pending_epoch_resets,
@@ -1361,7 +1555,7 @@ impl<'a> RoleStateClassCMut<'a> {
         &mut self,
         member_did: &str,
         role_name: &str,
-        clock: &dyn scp_primitives::Clock,
+        clock: &dyn scp_clock::Clock,
     ) -> Result<Vec<UcanToken>, RoleError> {
         // Build a transient `ContextRoleClassCParts` from REBORROWS of this view's
         // own disjoint fields and delegate to the protocol seam (which owns the
@@ -1603,7 +1797,7 @@ impl<'a> ConsequenceRoleStateMut<'a> {
         &mut self,
         member_did: &str,
         role_name: &str,
-        clock: &dyn scp_primitives::Clock,
+        clock: &dyn scp_clock::Clock,
         obligation: &mut Option<ClassSCommitToken>,
         context_id: &str,
     ) -> Result<Vec<UcanToken>, RoleError> {
@@ -1935,7 +2129,7 @@ pub(crate) struct ConsequenceStateSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 / RED-CS3: cell-free + cell-holding builders for the consequence split. `from_state` is the cell-free governance-helper path; `ClassCMut::consequence_split` is the cell-holding receive/send/tool/sweep path."
+    reason = "ADR-049 §9 / RED-CS3: cell-free + cell-holding builders for the consequence split. `from_state` is the cell-free governance-helper path; `ClassCMut::consequence_split` is the cell-holding receive/send/outlet/sweep path."
 )]
 impl<'a> ConsequenceStateSplit<'a> {
     /// Build a [`ConsequenceStateSplit`] DIRECTLY from a `&mut PerContextState`,
@@ -1966,7 +2160,7 @@ impl<'a> ConsequenceStateSplit<'a> {
 
 #[allow(
     dead_code,
-    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_context_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`, `consequence_split`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
+    reason = "ADR-049 §9 scaffolding: the field-granular Class-C view accessors (`governance_class_c_mut`, `members_mut`, `receive_buffer_mut`, `emit_event`, `role_state_class_c_mut`, `membership_class_c_mut`, `checkpoint_events_since_mut`, `generation_mut`, `handle_mut`, `event_log_mut`, `payment_receipts_mut`, `broadcast_class_c_mut`, `migration_state_mut`, `epoch_mut`, `access_mut`, `ttl_mut`, `routing_mut`, `sequence_tracker_mut`, `reorder_buffer_mut`, `pending_commits_mut`, `commit_fault_mut`, `checkpoint_last_time_secs_mut`, `checkpoints_mut`, `last_seen_remote_checkpoint_mut`, `send_tracker_mut`, `recv_tracker_mut`, `xctx_ucan_proofs_mut`, `pending_broadcast_publishes_mut`, `welcome_scratchpad_mut`, `lifecycle_state_mut`, `mode_mut`, `class_s`, `split_class_c`, `consequence_split`) get their first PRODUCTION callers when the best-effort handlers + `ConsequenceStateSplit` migrate onto the combinators. Exercised by this module's unit tests now."
 )]
 impl<'a> ClassCMut<'a> {
     /// Wrap a borrowed [`PerContextState`] by DESTRUCTURING it into the disjoint
@@ -2208,10 +2402,23 @@ impl<'a> ClassCMut<'a> {
         self.payment_receipts
     }
 
-    /// `&mut` access to the optional broadcast-mode metadata (Class-C / §5.14).
-    /// Best-effort rollback acceptable.
-    pub(crate) const fn broadcast_context_mut(&mut self) -> &mut Option<ProtocolBroadcastContext> {
+    /// FIELD-GRANULAR best-effort broadcast view (ADR-049 §9, §5.14.8
+    /// mutation-surface confinement). Returns [`None`] for a non-broadcast
+    /// context. Exposes ONLY the benign publish-path / roster methods
+    /// (`subscribe` / `unsubscribe` / `unblock_subscriber` / `reserve_publish` /
+    /// `apply_reserved_publish` / `rollback_reserved_publish` / `publish` /
+    /// `publish_metadata`). It holds the [`BroadcastContextClassCParts`] disjoint
+    /// refs — NOT a whole `&mut BroadcastContext` — so the downward-authorization
+    /// security mutators (`block_subscriber`, `block_author`,
+    /// `governance_ban_subscriber`, `rotate_all_author_keys`) are UNREACHABLE
+    /// through this view: they are inherent `&mut self` on `BroadcastContext`,
+    /// reachable only through a whole `&mut BroadcastContext` a fail-closed
+    /// combinator hands out via [`ClassSMut::rest_mut`]. Mirrors
+    /// [`ClassCMut::role_state_class_c_mut`] → [`RoleStateClassCMut`].
+    pub(crate) fn broadcast_class_c_mut(&mut self) -> Option<BroadcastContextClassCMut<'_>> {
         self.broadcast_context
+            .as_mut()
+            .map(BroadcastContextClassCMut::new)
     }
 
     /// `&mut` access to the optional active migration state (Class-C / §5.11A).
@@ -2286,11 +2493,13 @@ impl<'a> ClassCMut<'a> {
         self.commit_fault
     }
 
-    /// The three disjoint Class-C `&mut` fields the MLS-Commit broadcast helper
-    /// ([`crate::context::governance_helpers::try_broadcast_commit_or_enqueue`])
+    /// The three disjoint Class-C `&mut` fields the MLS-Commit broadcast-failure
+    /// apply ([`crate::context::governance_helpers::apply_broadcast_failure`])
     /// mutates, bundled so a cell holder can pass all three at once. Each is a
     /// distinct field of this view, so the simultaneous `&mut` is sound by
-    /// construction; all three are Class-C / structural / best-effort.
+    /// construction. This view supplies them COALESCED (best-effort); the
+    /// safety-gated sites instead supply them from a `commit_class_s_keep`
+    /// `rest_mut()` view for a fail-closed persist.
     pub(crate) const fn commit_broadcast_borrows(
         &mut self,
     ) -> crate::context::governance_helpers::CommitBroadcastBorrows<'_> {
@@ -2336,7 +2545,7 @@ impl<'a> ClassCMut<'a> {
     }
 
     /// `&mut` access to the reconstructable cross-context UCAN proof store
-    /// (Class-C / §6.2.4). Interface state repopulated when the tool interface is
+    /// (Class-C / §6.2.4). Interface state repopulated when the outlet interface is
     /// re-established — explicitly NOT the Class-S freshness/replay witness
     /// (`class_s.xctx_nonce_dedup`), so best-effort rollback is acceptable.
     pub(crate) const fn xctx_ucan_proofs_mut(&mut self) -> &mut InMemoryProofResolver {
@@ -2415,7 +2624,7 @@ impl<'a> ClassCMut<'a> {
     /// Produce the CONSEQUENCE-ENGINE split (ADR-049 §9 / RED-CS3 / R1): identical
     /// disjoint borrows to [`Self::split_class_c`], but `role_state` is the
     /// GROW-capable [`ConsequenceRoleStateMut`]. Used by the consequence sites
-    /// (receive / send / tool-settle / periodic sweep), whose cell-holding caller
+    /// (receive / send / outlet-settle / periodic sweep), whose cell-holding caller
     /// persists any applied downward-auth GROW / demotion FAIL-CLOSED.
     ///
     /// NOTE — this method, like [`Self::split_class_c`], is on the best-effort
@@ -2480,7 +2689,7 @@ pub(crate) struct AppendOutcomeError {
 /// Owns one [`PerContextState`] and gates every mutation behind a
 /// persistence combinator (ADR-049 §9 Class S).
 ///
-/// Reads go through [`Deref`]; there is intentionally no [`DerefMut`] (see the
+/// Reads go through [`Deref`]; there is intentionally no [`DerefMut`](std::ops::DerefMut) (see the
 /// module docs). Mutations go through the view-typed combinators
 /// ([`Self::commit_class_s_keep`] / `_restore` / `_compensating` /
 /// `_keep_compensating` / `_then_append` for fail-closed persist,
@@ -2580,14 +2789,16 @@ impl ClassSCell {
     ///
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`].
     ///
-    pub(crate) fn commit_class_s_keep<T>(
+    pub(crate) async fn commit_class_s_keep<T>(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
         f: impl FnOnce(ClassSMut) -> Result<T, ContextError>,
     ) -> Result<T, ContextError> {
         let value = f(ClassSMut::new(&mut self.state))?;
-        persist_state_fail_closed(&self.state, deps, context_id).map(|()| value)
+        persist_state_fail_closed(&self.state, deps, context_id)
+            .await
+            .map(|()| value)
     }
 
     /// Pure-Class-S rollback on persist failure (snapshot covers ONLY the
@@ -2638,7 +2849,7 @@ impl ClassSCell {
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after
     /// restoring the snapshot).
     ///
-    pub(crate) fn commit_class_s_restore<T>(
+    pub(crate) async fn commit_class_s_restore<T>(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
@@ -2647,7 +2858,7 @@ impl ClassSCell {
         let class_s_snap = self.state.class_s.snapshot();
         let gov_snap = self.state.governance.class_s.snapshot();
         let value = f(ClassSMut::new(&mut self.state))?;
-        match persist_state_fail_closed(&self.state, deps, context_id) {
+        match persist_state_fail_closed(&self.state, deps, context_id).await {
             Ok(()) => Ok(value),
             Err(persist_err) => {
                 self.restore_class_s(class_s_snap, gov_snap, deps);
@@ -2698,9 +2909,6 @@ impl ClassSCell {
     ///
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after the
     /// in-state restore + async compensation).
-    ///
-    /// `dead_code` allow: scaffolding — see [`Self::commit_class_s_keep`].
-    #[allow(dead_code)]
     pub(crate) async fn commit_class_s_compensating<T, X>(
         &mut self,
         deps: &ActorDeps,
@@ -2719,7 +2927,7 @@ impl ClassSCell {
         let class_s_snap = self.state.class_s.snapshot();
         let gov_snap = self.state.governance.class_s.snapshot();
         let (value, external) = f(ClassSMut::new(&mut self.state))?;
-        match persist_state_fail_closed(&self.state, deps, context_id) {
+        match persist_state_fail_closed(&self.state, deps, context_id).await {
             Ok(()) => Ok(value),
             Err(persist_err) => {
                 self.restore_class_s(class_s_snap, gov_snap, deps);
@@ -2750,7 +2958,7 @@ impl ClassSCell {
     /// - charges an in-memory Class-C / external reservation that DID NOT
     ///   durably land and so must be reversed.
     ///
-    /// This is the shape of `reserve_tool_economy`: it consumes a spending-UCAN
+    /// This is the shape of `reserve_outlet_economy`: it consumes a spending-UCAN
     /// nonce (Class-S — kept) while charging the `budget_tracker` /
     /// `velocity_tracker` / `hard_rate_limit` (Class-C — reversed on persist
     /// failure, because the reservation the caller is being charged for did not
@@ -2802,7 +3010,7 @@ impl ClassSCell {
         // No Class-S snapshot: keep-direction leaves the Class-S mutation in
         // place on persist failure, so there is nothing to restore.
         let (value, external) = f(ClassSMut::new(&mut self.state))?;
-        match persist_state_fail_closed(&self.state, deps, context_id) {
+        match persist_state_fail_closed(&self.state, deps, context_id).await {
             Ok(()) => Ok(value),
             Err(persist_err) => {
                 on_persist_failure(external, ClassCMut::new(&mut self.state), deps).await;
@@ -2817,10 +3025,10 @@ impl ClassSCell {
     /// and report the outcome (ADR-049 §9).
     ///
     /// For a Class-S mutation that must be paired with a follow-on durable append
-    /// which can itself fail. This is the shape of the cross-context tool-invoke
+    /// which can itself fail. This is the shape of the cross-context outlet-invoke
     /// "Commit" path (spec §6.2.4): `f` captures the committed output into Class-S
     /// (`xctx_committed_outputs`) and persists it; `after` then appends a
-    /// `ToolInvoked` record to the EVENT LOG. That append targets the event-log
+    /// `OutletInvoked` record to the EVENT LOG. That append targets the event-log
     /// adapter on [`ActorDeps`] (`deps.event_log`) — an EXTERNAL durable sink. It
     /// is NOT an in-state [`PerContextState`] mutation: the live persist snapshot
     /// (`build_snapshot_from_state`) hard-codes `event_log_merkle_root` to zero
@@ -2889,13 +3097,15 @@ impl ClassSCell {
                 durability_diverged: false,
                 err,
             })?;
-        persist_state_fail_closed(&self.state, deps, context_id).map_err(|err| {
-            AppendOutcomeError {
-                // `f`'s mutation is in memory but did not durably land.
-                durability_diverged: true,
-                err,
-            }
-        })?;
+        persist_state_fail_closed(&self.state, deps, context_id)
+            .await
+            .map_err(|err| {
+                AppendOutcomeError {
+                    // `f`'s mutation is in memory but did not durably land.
+                    durability_diverged: true,
+                    err,
+                }
+            })?;
         match after(&append_input, &self.state, deps).await {
             // `after` appended to an external sink (e.g. the event log); the
             // Class-S mutation is already durable from the persist above and
@@ -2903,7 +3113,7 @@ impl ClassSCell {
             Ok(()) => Ok(value),
             Err(after_err) => {
                 self.restore_class_s(class_s_snap, gov_snap, deps);
-                match persist_state_fail_closed(&self.state, deps, context_id) {
+                match persist_state_fail_closed(&self.state, deps, context_id).await {
                     // Rollback made durable: in-memory matches the pre-`f` value.
                     Ok(()) => Err(AppendOutcomeError {
                         durability_diverged: false,
@@ -2929,14 +3139,14 @@ impl ClassSCell {
     /// The [`ClassCMut`] view exposes no Class-S mutator, so a best-effort `f`
     /// cannot stage a Class-S transition.
     ///
-    pub(crate) fn commit_class_c_best_effort(
+    pub(crate) async fn commit_class_c_best_effort(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
         f: impl FnOnce(ClassCMut),
     ) {
         f(ClassCMut::new(&mut self.state));
-        persist_state_best_effort(&self.state, deps, context_id);
+        persist_state_best_effort(&self.state, deps, context_id).await;
     }
 
     /// NON-PERSISTING Class-C view (ADR-049 §9): construct a [`ClassCMut`]
@@ -3034,7 +3244,7 @@ impl ClassSCell {
     /// Returns `f`'s error, or [`ContextError::PersistenceFailed`] (after running
     /// `restore_on_failure`, with the KEPT field retained).
     ///
-    pub(crate) fn commit_class_s_keep_restore_split<T, S>(
+    pub(crate) async fn commit_class_s_keep_restore_split<T, S>(
         &mut self,
         deps: &ActorDeps,
         context_id: &str,
@@ -3046,7 +3256,7 @@ impl ClassSCell {
         // deliberately NOT snapshotted — keep-direction has nothing to restore).
         let restore_snap = snapshot_restore_field(&self.state.class_s);
         let value = f(ClassSMut::new(&mut self.state))?;
-        match persist_state_fail_closed(&self.state, deps, context_id) {
+        match persist_state_fail_closed(&self.state, deps, context_id).await {
             Ok(()) => Ok(value),
             Err(persist_err) => {
                 // Roll back JUST the restore-targeted field; the kept field stays
@@ -3185,7 +3395,7 @@ impl ClassSCell {
 /// reversal (escrow void, economy-ticket rollback, sequence rollback) while the
 /// consume stays consumed.
 ///
-/// # The `#[must_use]` + `Drop` backstop is parity with [`EconomyTicket`]
+/// # The `#[must_use]` + `Drop` backstop is parity with [`EconomyTicket`](crate::context::economy_logic::EconomyTicket)
 ///
 /// Like [`crate::context::economy_logic::EconomyTicket`], this handle carries a
 /// `consumed` flag set true by [`Self::commit`], and a [`Drop`] guard that
@@ -3303,12 +3513,28 @@ impl ClassSCommitToken {
     ///
     /// Returns [`ContextError::PersistenceFailed`] when the durable write fails
     /// (the in-memory Class-S mutation is retained — keep-direction).
-    pub(crate) fn commit(
+    ///
+    /// # Not `async fn` — `Send` discipline (ADR-049 Decision 7)
+    ///
+    /// This is a SYNC fn that returns a future, NOT an `async fn`. It delegates to
+    /// the shared [`persist_state_fail_closed`], whose synchronous prelude consumes
+    /// the `&PerContextState` (building the owned snapshot) so it is NOT captured by
+    /// the returned future — which holds only the owned snapshot plus
+    /// `deps` / `context_id`.
+    /// An `async fn` would keep the `&PerContextState` parameter in the future's
+    /// captured state across the `.await`; `PerContextState` is `!Sync` (it
+    /// holds a `dyn FnMut` sink), so that would make the actor's `run()` future
+    /// `!Send` and fail `tokio::spawn`. `ClassSCell` intentionally has no
+    /// `DerefMut`, so the `&mut`-capture escape hatch the combinators use is not
+    /// available here — hence the sync-prelude shape. `use<'d, 'c>` precisely
+    /// captures only the `deps` / `context_id` lifetimes (edition 2024), not the
+    /// `state` borrow.
+    pub(crate) fn commit<'d, 'c>(
         mut self,
         state: &PerContextState,
-        deps: &ActorDeps,
-        context_id: &str,
-    ) -> Result<(), ContextError> {
+        deps: &'d ActorDeps,
+        context_id: &'c str,
+    ) -> impl std::future::Future<Output = Result<(), ContextError>> + Send + use<'d, 'c> {
         debug_assert_eq!(
             self.context_id, context_id,
             "ClassSCommitToken committed against the wrong context",
@@ -3317,6 +3543,13 @@ impl ClassSCommitToken {
         // counts as committed (keep-direction: the consume stays, the error
         // propagates to the caller's reversal).
         self.consumed = true;
+        // Delegate the single deferred fail-closed persist to the shared
+        // [`persist_state_fail_closed`] helper — the canonical sync-prelude form
+        // (its prelude builds the owned snapshot and drops the `&PerContextState`
+        // borrow before the returned future, which then captures only the owned
+        // snapshot + `deps`/`context_id`, keeping it `Send`). Sharing the one
+        // helper keeps the keep-direction/fail-closed core identical across this
+        // terminal and the deferred terminals `discharge_with` / `commit_fail_closed`.
         persist_state_fail_closed(state, deps, context_id)
     }
 
@@ -3368,7 +3601,7 @@ impl ClassSCommitToken {
     /// Returns `f`'s error (after the keep-direction persist still ran), or
     /// [`ContextError::PersistenceFailed`] when the durable write fails (the
     /// in-memory mutation `f` made is retained — keep-direction).
-    pub(crate) fn discharge_with<T>(
+    pub(crate) async fn discharge_with<T>(
         mut self,
         cell: &mut ClassSCell,
         deps: &ActorDeps,
@@ -3386,7 +3619,14 @@ impl ClassSCommitToken {
         // durable; un-doing it is the unsafe direction).
         let f_result = f(ClassSMut::new(&mut cell.state));
         self.consumed = true;
-        let persist_result = persist_state_fail_closed(&cell.state, deps, context_id);
+        // The SINGLE deferred fail-closed persist, routed through the shared
+        // [`persist_state_fail_closed`] helper so the keep-direction/fail-closed
+        // core stays identical to `ClassSDischargeGuard::commit_fail_closed`, the
+        // read-only `commit`, and the combinators. Its sync prelude builds the
+        // owned snapshot and drops the `&cell.state` borrow off the await point —
+        // keeps the actor future `Send` (`PerContextState` is `!Sync`; ADR-049
+        // Decision 7).
+        let persist_result = persist_state_fail_closed(&cell.state, deps, context_id).await;
         match (f_result, persist_result) {
             // `f` failed: the persist still ran (keep); surface `f`'s error.
             (Err(f_err), _) => Err(f_err),
@@ -3394,6 +3634,35 @@ impl ClassSCommitToken {
             (Ok(_), Err(persist_err)) => Err(persist_err),
             // Both succeeded.
             (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
+    /// Begin an `async`-body deferred discharge (ADR-049 Decision 7).
+    ///
+    /// RAII counterpart to [`Self::discharge_with`] for a finalize body that must
+    /// `.await` while holding the `&mut PerContextState` view — e.g.
+    /// `finalize_governance_action`, which appends to the async
+    /// `EventLogPersistence`-backed Merkle event log AND mutates the state,
+    /// interleaved, so it cannot be expressed as a synchronous `discharge_with`
+    /// closure. A closure returning a borrowing future would need an
+    /// `for<'a> Fn(..) -> BoxFuture<'a>` bound that (via the boxed trait-object
+    /// lifetime) demands `'static` captures — hence this guard shape, which keeps
+    /// a single ordinary borrow lifetime.
+    ///
+    /// The returned [`ClassSDischargeGuard`] hands out the `ClassSMut` view via
+    /// [`ClassSDischargeGuard::view`] (held across the finalize awaits — a
+    /// `&mut PerContextState` across an await is `Send`), then performs the SINGLE
+    /// deferred fail-closed persist via
+    /// [`ClassSDischargeGuard::commit_fail_closed`]. Semantics match
+    /// `discharge_with` exactly: the `Drop` obligation is discharged BEFORE the
+    /// persist, and the persist runs REGARDLESS of the finalize result
+    /// (keep-direction). If the guard is dropped WITHOUT `commit_fail_closed`
+    /// (e.g. the finalize body panics), the owned token's `Drop` obligation fires,
+    /// exactly as an un-committed `ClassSCommitToken` would.
+    pub(crate) const fn begin_discharge(self, cell: &mut ClassSCell) -> ClassSDischargeGuard<'_> {
+        ClassSDischargeGuard {
+            token: self,
+            state: &mut cell.state,
         }
     }
 
@@ -3483,13 +3752,59 @@ impl Drop for ClassSCommitToken {
     }
 }
 
+/// RAII discharge guard for an `async`-body deferred Class-S persist (ADR-049
+/// Decision 7). Minted by [`ClassSCommitToken::begin_discharge`].
+///
+/// Holds the owed [`ClassSCommitToken`] AND the `&mut PerContextState` view for
+/// the finalize body's duration, so the finalize can `.await` (its interleaved
+/// async Merkle-event-log appends) while mutating the state. The SINGLE deferred
+/// fail-closed persist is performed by [`Self::commit_fail_closed`]; dropping the
+/// guard without committing lets the owned token's `Drop` obligation fire — so a
+/// panicking finalize does not silently skip the owed persist.
+pub(crate) struct ClassSDischargeGuard<'a> {
+    token: ClassSCommitToken,
+    state: &'a mut PerContextState,
+}
+
+impl ClassSDischargeGuard<'_> {
+    /// The `ClassSMut` view over the guarded state. Called for the finalize body
+    /// (via `view().rest_mut()`); the returned view may be held across the
+    /// finalize awaits — a `&mut PerContextState` across an await is `Send`.
+    pub(crate) const fn view(&mut self) -> ClassSMut<'_> {
+        ClassSMut::new(&mut *self.state)
+    }
+
+    /// Perform the SINGLE deferred fail-closed persist and discharge the token.
+    ///
+    /// Mirrors [`ClassSCommitToken::discharge_with`]: the `Drop` obligation is
+    /// marked discharged BEFORE the persist (so a persist `Err` still counts as
+    /// committed — keep-direction), and the owned snapshot is built off the await
+    /// point. Consumes the guard.
+    pub(crate) async fn commit_fail_closed(
+        mut self,
+        deps: &ActorDeps,
+        context_id: &str,
+    ) -> Result<(), ContextError> {
+        debug_assert_eq!(
+            self.token.context_id, context_id,
+            "ClassSDischargeGuard committed against the wrong context",
+        );
+        self.token.consumed = true;
+        // Single deferred fail-closed persist via the shared
+        // [`persist_state_fail_closed`] helper — identical keep-direction core to
+        // `ClassSCommitToken::discharge_with`. Its sync prelude builds the owned
+        // snapshot off the await point, keeping the actor future `Send`.
+        persist_state_fail_closed(self.state, deps, context_id).await
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::context::persistence::ContextPersistence;
-    use scp_identity::DID;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_did::DID;
+    use scp_platform::in_memory::InMemoryStorage;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4930,14 +5245,15 @@ impl ClassSCell
     /// Minimal event log provider — accepts every call (the combinator paths do
     /// not touch the event log).
     struct TestEventLog;
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             _event_type: scp_event_log::EventType,
@@ -4947,7 +5263,7 @@ impl ClassSCell
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -4967,15 +5283,16 @@ impl ClassSCell
 
     macro_rules! impl_persistence {
         ($ty:ty, $persist_result:expr) => {
+            #[async_trait::async_trait]
             impl ContextPersistence for $ty {
-                fn persist_context(
+                async fn persist_context(
                     &self,
                     _: &str,
                     _: &crate::context::state::ContextSnapshot,
                 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     $persist_result
                 }
-                fn load_context(
+                async fn load_context(
                     &self,
                     _: &str,
                 ) -> Result<
@@ -4984,29 +5301,13 @@ impl ClassSCell
                 > {
                     Ok(None)
                 }
-                fn persist_broadcast(
-                    &self,
-                    _: &str,
-                    _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-                ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                    Ok(())
-                }
-                fn load_broadcast(
-                    &self,
-                    _: &str,
-                ) -> Result<
-                    Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-                    Box<dyn std::error::Error + Send + Sync>,
-                > {
-                    Ok(None)
-                }
-                fn delete_context(
+                async fn delete_context(
                     &self,
                     _: &str,
                 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     Ok(())
                 }
-                fn list_persisted_contexts(
+                async fn list_persisted_contexts(
                     &self,
                 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
                     Ok(Vec::new())
@@ -5018,8 +5319,9 @@ impl ClassSCell
     impl_persistence!(OkPersistence, Ok(()));
     impl_persistence!(FailPersistence, Err("induced persist failure".into()));
 
+    #[async_trait::async_trait]
     impl ContextPersistence for SpyPersistence {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
@@ -5027,7 +5329,7 @@ impl ClassSCell
             self.persist_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -5036,26 +5338,13 @@ impl ClassSCell
         > {
             Ok(None)
         }
-        fn persist_broadcast(
+        async fn delete_context(
             &self,
             _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -5069,8 +5358,9 @@ impl ClassSCell
     struct SucceedThenFail {
         calls: Arc<AtomicUsize>,
     }
+    #[async_trait::async_trait]
     impl ContextPersistence for SucceedThenFail {
-        fn persist_context(
+        async fn persist_context(
             &self,
             _: &str,
             _: &crate::context::state::ContextSnapshot,
@@ -5082,7 +5372,7 @@ impl ClassSCell
                 Err("re-persist failure".into())
             }
         }
-        fn load_context(
+        async fn load_context(
             &self,
             _: &str,
         ) -> Result<
@@ -5091,26 +5381,13 @@ impl ClassSCell
         > {
             Ok(None)
         }
-        fn persist_broadcast(
+        async fn delete_context(
             &self,
             _: &str,
-            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
-        fn load_broadcast(
-            &self,
-            _: &str,
-        ) -> Result<
-            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-            Box<dyn std::error::Error + Send + Sync>,
-        > {
-            Ok(None)
-        }
-        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
-        }
-        fn list_persisted_contexts(
+        async fn list_persisted_contexts(
             &self,
         ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(Vec::new())
@@ -5135,8 +5412,9 @@ impl ClassSCell
     ) -> ActorDeps {
         use crate::context::supervisor::supervisor::Supervisor;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestClassSCell".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
@@ -5203,16 +5481,16 @@ impl ClassSCell
         crate::context::supervisor::saga_journal::SagaId(id.to_owned())
     }
 
-    /// Build a `CrossContextToolInvocation` prepared-state for `saga_pending`.
+    /// Build a `CrossContextOutletInvocation` prepared-state for `saga_pending`.
     fn prepared_invocation() -> crate::context::supervisor::saga_prepared_state::SagaPreparedState {
         use crate::context::supervisor::saga_prepared_state::{
-            CrossContextToolInvocationPrepared, SagaPreparedState,
+            CrossContextOutletInvocationPrepared, SagaPreparedState,
         };
-        SagaPreparedState::CrossContextToolInvocation(CrossContextToolInvocationPrepared {
+        SagaPreparedState::CrossContextOutletInvocation(CrossContextOutletInvocationPrepared {
             caller_context_id: [0x1Au8; 32],
             target_context_id: [0x2Bu8; 32],
             caller_did: DID("did:example:caller".to_owned()),
-            tool_registration_id: "tool-v1".to_owned(),
+            outlet_registration_id: "outlet-v1".to_owned(),
             ucan_proof_id: "ucan-1".to_owned(),
             recorded_timestamp_ms: 1_700_000_000_123,
             recorded_nonce: [0x3Cu8; 16],
@@ -5226,7 +5504,7 @@ impl ClassSCell
     /// `clear_committed_reservation_idempotent` straggler-cleanup path can be
     /// exercised on a pre-seeded reservation WITHOUT the `state_mut()` escape
     /// hatch. Returns nothing; panics if the seed persist does not land.
-    fn seed_caller_reservation_for_test(
+    async fn seed_caller_reservation_for_test(
         cell: &mut ClassSCell,
         deps: &ActorDeps,
         context_id: &str,
@@ -5239,6 +5517,7 @@ impl ClassSCell
                 .insert(saga_id, record);
             Ok::<(), ContextError>(())
         })
+        .await
         .expect("seed caller reservation persists");
     }
 
@@ -5281,6 +5560,7 @@ impl ClassSCell
         // The deferred commit persists fail-closed (exactly once).
         token
             .commit(&cell, &deps, &ctx)
+            .await
             .expect("commit persists fail-closed ⇒ Ok");
         assert_eq!(
             persist_calls.load(Ordering::SeqCst),
@@ -5331,6 +5611,7 @@ impl ClassSCell
             .expect("f Ok");
         let err = token
             .commit(&cell, &deps, &ctx)
+            .await
             .expect_err("FailPersistence ⇒ commit Err");
         assert!(matches!(err, ContextError::PersistenceFailed(_)));
         assert!(
@@ -5359,7 +5640,7 @@ impl ClassSCell
             .expect("Ok");
         assert_eq!(v, 1);
         let token = token.expect("did_mutate=true ⇒ Some(token)");
-        token.commit(&cell, &deps, &ctx).expect("commit Ok");
+        token.commit(&cell, &deps, &ctx).await.expect("commit Ok");
 
         // No mutation ⇒ None (free/best-effort path stays token-free).
         let (v2, token2) = cell
@@ -5472,6 +5753,7 @@ impl ClassSCell
             .expect("the cascade armed exactly one obligation");
         token
             .commit(&cell, &deps, &ctx)
+            .await
             .expect("the single armed obligation commits fail-closed (SpyPersistence Ok)");
         assert_eq!(
             persist_calls.load(Ordering::SeqCst),
@@ -5514,6 +5796,7 @@ impl ClassSCell
             .discharge_with(&mut cell, &deps, &ctx, |_view| {
                 Err::<(), _>(ContextError::PermissionDenied("abort".into()))
             })
+            .await
             .expect_err("f Err ⇒ discharge_with surfaces it");
         assert!(matches!(err, ContextError::PermissionDenied(_)));
         assert_eq!(
@@ -5609,6 +5892,7 @@ impl ClassSCell
                 },
                 &mut obligation,
             )
+            .await
         };
         assert!(
             downward_auth_applied,
@@ -5627,7 +5911,7 @@ impl ClassSCell
 
         // Discharging the armed obligation IS the §9 fail-closed persist. Under
         // FailPersistence it must surface the durability error (not a silent ack).
-        let persist = token.commit(&cell, &deps, &ctx);
+        let persist = token.commit(&cell, &deps, &ctx).await;
         let err = persist.expect_err("FailPersistence ⇒ fail-closed persist Err");
         assert!(
             matches!(err, ContextError::PersistenceFailed(_)),
@@ -5692,11 +5976,13 @@ impl ClassSCell
         let event_log = crate::context::providers::event_log::MerkleEventLogProvider::new();
         let ctx_byte = 0x73u8;
         let ctx = ctx_hex(ctx_byte);
-        // The event-log key the consequence reader derives from the context-id
-        // STRING is `SHA-256(context_id)` (NOT the raw bytes), so the seeded
-        // governance leaf must be stored under that same hashed key to be visible to
+        // ADR-056: the event-log key the consequence reader derives from the
+        // context-id STRING is the canonical digest — for a real 64-hex id
+        // (`ctx_hex` = `hex([ctx_byte; 32])`) that is the DECODED digest
+        // `[ctx_byte; 32]`, NOT `SHA-256(ctx)`. The seeded governance leaf must
+        // be stored under that same digest to be visible to
         // `event_log_entries_for_consequences`.
-        let ctx_id_bytes = scp_protocol::context::context_id_bytes(&ctx);
+        let ctx_id_bytes = crate::context::state::context_id_to_bytes(&ctx);
         let sender = DID("did:example:paid-suspend-sender".to_owned());
 
         // Seed a convergent `WarningCount` evidence leaf: a `GovernanceAction`
@@ -5707,6 +5993,7 @@ impl ClassSCell
         // convergence.
         event_log
             .init_event_log(&ctx_id_bytes)
+            .await
             .expect("init event log");
         let warning_payload = scp_event_log::EventPayload {
             data: serde_json::to_vec(&serde_json::json!({ "target_did": sender.as_ref() }))
@@ -5720,6 +6007,7 @@ impl ClassSCell
                 warning_payload,
                 1_700_000_050,
             )
+            .await
             .expect("seed governance warning leaf");
 
         // FailPersistence ⇒ the single nonce-token commit must surface the §9
@@ -5732,7 +6020,6 @@ impl ClassSCell
         cell.class_c_view()
             .handle_mut()
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
 
         // The sender must be a present member for the suspension GROW to apply.
@@ -5771,7 +6058,8 @@ impl ClassSCell
             None,
             Some(ClassSCommitToken::new_for_test(&ctx)),
             /* is_broadcast = */ false,
-        );
+        )
+        .await;
 
         // The single nonce-token commit covers BOTH the burned nonce and the armed
         // suspension; under FailPersistence it surfaces the §9 durability error
@@ -5813,6 +6101,10 @@ impl ClassSCell
     /// §9 durability error (`PersistenceFailed`), and (c) the demotion is RETAINED
     /// in memory (keep-direction) — the member's `member_capabilities` reflect the
     /// LOWER role even when the persist failed.
+    // `.await` continuation lines from the ADR-049 Decision 7 async-event-log
+    // conversion pushed this test one line over the heuristic; the body is a
+    // single cohesive fail-closed-persist scenario, not separable work.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn consequence_assign_role_demotion_owes_fail_closed_persist() {
         use crate::context::governance_logic::{
@@ -5908,6 +6200,7 @@ impl ClassSCell
                 },
                 &mut obligation,
             )
+            .await
         };
         assert!(
             downward_auth_applied,
@@ -5927,7 +6220,7 @@ impl ClassSCell
         // Discharging the armed obligation IS the §9 fail-closed persist. Under
         // FailPersistence it must surface the durability error rather than a silent
         // coalesced ack.
-        let persist = token.commit(&cell, &deps, &ctx);
+        let persist = token.commit(&cell, &deps, &ctx).await;
         let err = persist.expect_err("FailPersistence ⇒ fail-closed persist Err");
         assert!(
             matches!(err, ContextError::PersistenceFailed(_)),
@@ -5966,6 +6259,7 @@ impl ClassSCell
                 view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
                 Ok("kept")
             })
+            .await
             .expect("persist succeeds ⇒ Ok");
 
         assert_eq!(returned, "kept");
@@ -5991,10 +6285,12 @@ impl ClassSCell
         let mut cell = ClassSCell::new(fresh_state(0x12));
         let ctx = ctx_hex(0x12);
 
-        let result = cell.commit_class_s_keep(&deps, &ctx, |mut view| {
-            view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
-            Ok(())
-        });
+        let result = cell
+            .commit_class_s_keep(&deps, &ctx, |mut view| {
+                view.class_s_mut().xctx_nonce_dedup.record([0x3Cu8; 16], 0);
+                Ok(())
+            })
+            .await;
 
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
@@ -6020,9 +6316,11 @@ impl ClassSCell
         let mut cell = ClassSCell::new(fresh_state(0x13));
         let ctx = ctx_hex(0x13);
 
-        let result: Result<(), ContextError> = cell.commit_class_s_keep(&deps, &ctx, |_view| {
-            Err(ContextError::PermissionDenied("rejected".to_owned()))
-        });
+        let result: Result<(), ContextError> = cell
+            .commit_class_s_keep(&deps, &ctx, |_view| {
+                Err(ContextError::PermissionDenied("rejected".to_owned()))
+            })
+            .await;
 
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
@@ -6055,6 +6353,7 @@ impl ClassSCell
                     .insert(saga_a.clone(), prepared_invocation());
                 Ok(99u32)
             })
+            .await
             .expect("persist succeeds ⇒ Ok");
 
         assert_eq!(value, 99);
@@ -6074,16 +6373,18 @@ impl ClassSCell
         let ctx = ctx_hex(0x22);
         let saga_a = saga("saga-restore-rollback");
 
-        let result = cell.commit_class_s_restore(&deps, &ctx, |mut view| {
-            // Mutate Class-S: saga_pending + nonce dedup …
-            let cs = view.class_s_mut();
-            cs.saga_pending
-                .insert(saga_a.clone(), prepared_invocation());
-            cs.xctx_nonce_dedup.record([0x3Cu8; 16], 1_700_000_000);
-            // … and governance Class-S (threshold).
-            view.governance_class_s_mut().threshold_value = 7;
-            Ok(())
-        });
+        let result = cell
+            .commit_class_s_restore(&deps, &ctx, |mut view| {
+                // Mutate Class-S: saga_pending + nonce dedup …
+                let cs = view.class_s_mut();
+                cs.saga_pending
+                    .insert(saga_a.clone(), prepared_invocation());
+                cs.xctx_nonce_dedup.record([0x3Cu8; 16], 1_700_000_000);
+                // … and governance Class-S (threshold).
+                view.governance_class_s_mut().threshold_value = 7;
+                Ok(())
+            })
+            .await;
 
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
@@ -6118,9 +6419,11 @@ impl ClassSCell
         let mut cell = ClassSCell::new(fresh_state(0x23));
         let ctx = ctx_hex(0x23);
 
-        let result: Result<(), ContextError> = cell.commit_class_s_restore(&deps, &ctx, |_view| {
-            Err(ContextError::PermissionDenied("rejected".to_owned()))
-        });
+        let result: Result<(), ContextError> = cell
+            .commit_class_s_restore(&deps, &ctx, |_view| {
+                Err(ContextError::PermissionDenied("rejected".to_owned()))
+            })
+            .await;
 
         assert!(matches!(result, Err(ContextError::PermissionDenied(_))));
         assert_eq!(persist_calls.load(Ordering::SeqCst), 0);
@@ -6686,7 +6989,8 @@ impl ClassSCell
 
         cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
             view.members_mut().insert(member_for_closure);
-        });
+        })
+        .await;
 
         assert!(
             cell.members.contains(&member),
@@ -6727,7 +7031,8 @@ impl ClassSCell
             let _ = &split.role_state;
             let _ = split.membership.count();
             let _ = split.receive_buffer.len();
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.checkpoint_events_since, 3,
@@ -6764,7 +7069,8 @@ impl ClassSCell
             // no `&mut self.gov` / `class_s` accessor to reach Class-S, and the
             // whole-bucket Deref was removed.
             let _ = gov.next_proposal_seq();
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.governance.cooldown_until.get(&3usize),
@@ -6793,7 +7099,8 @@ impl ClassSCell
             let gov = view.governance_class_c_mut();
             let vt = gov.velocity_tracker_mut();
             vt.record_message(&sender_for_closure, 1_700_000_000);
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.governance
@@ -6821,7 +7128,8 @@ impl ClassSCell
             view.governance_class_c_mut()
                 .budget_tracker_mut()
                 .grant(&member_for_closure, Amount(500));
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.governance.budget_tracker.remaining(&member),
@@ -6846,7 +7154,7 @@ impl ClassSCell
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("USD"),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -6859,7 +7167,8 @@ impl ClassSCell
 
         cell.commit_class_c_best_effort(&deps, &ctx, move |mut view| {
             *view.governance_class_c_mut().economic_policy_mut() = Some(policy);
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.governance.economic_policy,
@@ -6884,7 +7193,8 @@ impl ClassSCell
             view.receive_buffer_mut().push(ContextEvent::MemberLeft {
                 member_did: DID("did:example:left".to_owned()),
             });
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.receive_buffer.len(),
@@ -6908,7 +7218,8 @@ impl ClassSCell
             view.role_state_class_c_mut()
                 .members_mut()
                 .insert(member_did);
-        });
+        })
+        .await;
 
         assert!(
             cell.role_state.members.contains(&member_for_assert),
@@ -6984,7 +7295,8 @@ impl ClassSCell
             // `member_capabilities` is READ-ONLY on this best-effort view (the F2
             // whole-`&mut` shrink accessor is deleted).
             let _ = rs.member_capabilities().len();
-        });
+        })
+        .await;
 
         assert!(
             cell.role_state.members.contains(&member),
@@ -7022,7 +7334,8 @@ impl ClassSCell
             assert!(m.get_mut(member_for_f.0.as_str()).is_some());
             let _ = m.get(member_for_f.0.as_str());
             let _ = m.count();
-        });
+        })
+        .await;
 
         assert!(
             cell.membership.contains(member.0.as_str()),
@@ -7072,6 +7385,7 @@ impl ClassSCell
                     class_s.saga_pending.retain(|k, _| keys_before.contains(k));
                 },
             )
+            .await
             .expect("persist succeeds ⇒ Ok");
 
         assert_eq!(value, 42);
@@ -7103,20 +7417,22 @@ impl ClassSCell
         let ctx = ctx_hex(0x75);
         let saga_for_f = saga("saga-split-fail");
 
-        let result = cell.commit_class_s_keep_restore_split(
-            &deps,
-            &ctx,
-            |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
-            move |mut view| {
-                let cs = view.class_s_mut();
-                cs.xctx_nonce_dedup.record([0x3Cu8; 16], 0); // keep
-                cs.saga_pending.insert(saga_for_f, prepared_invocation()); // restore
-                Ok(())
-            },
-            |class_s, keys_before| {
-                class_s.saga_pending.retain(|k, _| keys_before.contains(k));
-            },
-        );
+        let result = cell
+            .commit_class_s_keep_restore_split(
+                &deps,
+                &ctx,
+                |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
+                move |mut view| {
+                    let cs = view.class_s_mut();
+                    cs.xctx_nonce_dedup.record([0x3Cu8; 16], 0); // keep
+                    cs.saga_pending.insert(saga_for_f, prepared_invocation()); // restore
+                    Ok(())
+                },
+                |class_s, keys_before| {
+                    class_s.saga_pending.retain(|k, _| keys_before.contains(k));
+                },
+            )
+            .await;
 
         assert!(
             matches!(result, Err(ContextError::PersistenceFailed(_))),
@@ -7148,15 +7464,17 @@ impl ClassSCell
         let restore_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let restore_flag = Arc::clone(&restore_ran);
 
-        let result: Result<(), ContextError> = cell.commit_class_s_keep_restore_split(
-            &deps,
-            &ctx,
-            |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
-            |_view| Err(ContextError::PermissionDenied("rejected".to_owned())),
-            move |_class_s, _snap: Vec<_>| {
-                restore_flag.store(true, Ordering::SeqCst);
-            },
-        );
+        let result: Result<(), ContextError> = cell
+            .commit_class_s_keep_restore_split(
+                &deps,
+                &ctx,
+                |class_s| class_s.saga_pending.keys().cloned().collect::<Vec<_>>(),
+                |_view| Err(ContextError::PermissionDenied("rejected".to_owned())),
+                move |_class_s, _snap: Vec<_>| {
+                    restore_flag.store(true, Ordering::SeqCst);
+                },
+            )
+            .await;
 
         assert!(
             matches!(result, Err(ContextError::PermissionDenied(_))),
@@ -7192,6 +7510,7 @@ impl ClassSCell
                 .insert(saga_a.clone(), prepared_invocation());
             Ok(())
         })
+        .await
         .expect("persist succeeds");
         // Read through Deref before unwrap.
         assert!(cell.saga_pending().contains_key(&saga_a));
@@ -7238,7 +7557,8 @@ impl ClassSCell
             borrows
                 .budget_tracker
                 .grant(&member_for_closure, Amount(700));
-        });
+        })
+        .await;
 
         assert_eq!(
             cell.governance.budget_tracker.remaining(&member),
@@ -7276,7 +7596,7 @@ impl ClassSCell
             recorded_at_secs: 1_700_000_000,
             escrow_authorization: None,
         };
-        seed_caller_reservation_for_test(&mut cell, &deps, &ctx, saga_a.clone(), record);
+        seed_caller_reservation_for_test(&mut cell, &deps, &ctx, saga_a.clone(), record).await;
 
         // Snapshot the persist count AFTER the seed (the seed's combinator
         // persisted once, fail-closed); the clears below must add ZERO.
@@ -7343,7 +7663,8 @@ impl ClassSCell
                 !m.remove_subscriber(&sub_for_f),
                 "remove_subscriber returns false for an absent subscriber"
             );
-        });
+        })
+        .await;
 
         assert!(
             !cell.membership.contains(sub.0.as_str()),
@@ -7378,7 +7699,7 @@ impl ClassSCell
     /// Build an ACTIVE, `Governed`-ceiling-policy cell so `execute_modify_ceiling`
     /// reaches its staging logic. The default `ContextParams` ceiling policy is
     /// `Immutable`; ceiling modification requires `Governed`.
-    async fn active_governed_cell(ctx_byte: u8) -> ClassSCell {
+    fn active_governed_cell(ctx_byte: u8) -> ClassSCell {
         let mut state = fresh_state(ctx_byte);
         let params = scp_protocol::context::params::ContextParams {
             ceiling_policy: scp_protocol::context::params::CeilingPolicy::Governed,
@@ -7389,7 +7710,6 @@ impl ClassSCell
         state
             .handle
             .transition_to(&crate::context::ContextState::Active)
-            .await
             .expect("transition to Active");
         ClassSCell::new(state)
     }
@@ -7415,7 +7735,7 @@ impl ClassSCell
             Capability::Custom("*:*".to_owned()),      // stray wildcard resource
             Capability::Custom("a:b:c".to_owned()),    // multi-colon (3 segments)
         ] {
-            let mut cell = active_governed_cell(0xC1).await;
+            let mut cell = active_governed_cell(0xC1);
             let new_ceiling = vec![Capability::MessagesRead, malformed.clone()];
             let res = crate::context::governance_helpers::execute_modify_ceiling(
                 &mut cell,
@@ -7423,7 +7743,8 @@ impl ClassSCell
                 &ctx_id,
                 &new_ceiling,
                 ceiling_commit_meta(),
-            );
+            )
+            .await;
             assert!(
                 matches!(res, Err(ContextError::InvalidState(_))),
                 "malformed proposed ceiling entry {malformed:?} must be rejected at \
@@ -7444,7 +7765,7 @@ impl ClassSCell
 
         let deps = build_deps(Box::new(OkPersistence)).await;
         let ctx_id = ctx_hex(0xC2);
-        let mut cell = active_governed_cell(0xC2).await;
+        let mut cell = active_governed_cell(0xC2);
 
         let new_ceiling = vec![
             Capability::MessagesRead,
@@ -7457,7 +7778,8 @@ impl ClassSCell
             &ctx_id,
             &new_ceiling,
             ceiling_commit_meta(),
-        );
+        )
+        .await;
         assert!(
             res.is_ok(),
             "well-formed ceiling proposal must stage: {res:?}"
@@ -7470,126 +7792,6 @@ impl ClassSCell
         assert_eq!(
             pending.new_capabilities, new_ceiling,
             "staged pending modification carries the proposed capabilities verbatim"
-        );
-    }
-
-    /// End-to-end: a governed `ModifyCeiling` that LOWERS the ceiling, once the
-    /// notification window elapses and `apply_pending_ceiling_modification` runs,
-    /// must PRUNE every member's now-out-of-ceiling cached capability (spec §5.3.2
-    /// step 5 eager reconciliation) so the local Tier-2 gate
-    /// (`member_has_capability`) denies it — while an in-ceiling capability is still
-    /// served. The apply routes through the shared `ContextRoleState::set_ceiling`
-    /// reconcile, so this exercises the production seam, not the unit-level mutator.
-    #[tokio::test]
-    async fn apply_pending_ceiling_modification_prunes_out_of_ceiling_member_capability() {
-        use scp_protocol::context::roles::Capability;
-
-        let deps = build_deps(Box::new(OkPersistence)).await;
-        let ctx_id = ctx_hex(0xC3);
-
-        // Seed a member who holds MessagesRead + MessagesWrite within a ceiling that
-        // permits both, BEFORE wrapping in the `!DerefMut` `ClassSCell` (ADR-049 §9
-        // gives the cell no post-construction whole-state mutator). Build the state,
-        // seat the Governed ceiling policy + activate, then wrap.
-        let alice = "did:example:alice";
-        let mut state = fresh_state(0xC3);
-        state
-            .role_state
-            .set_ceiling(scp_protocol::context::roles::CapabilityCeiling::new([
-                Capability::MessagesRead,
-                Capability::MessagesWrite,
-            ]))
-            .expect("well-formed initial ceiling");
-        state.role_state.members.insert(alice.to_owned());
-        state.role_state.member_capabilities.insert(
-            alice.to_owned(),
-            [Capability::MessagesRead, Capability::MessagesWrite]
-                .into_iter()
-                .collect(),
-        );
-        let params = scp_protocol::context::params::ContextParams {
-            ceiling_policy: scp_protocol::context::params::CeilingPolicy::Governed,
-            ..scp_protocol::context::params::ContextParams::default()
-        };
-        state.handle = crate::context::ContextHandle::new(ctx_hex(0xC3), params);
-        state
-            .handle
-            .transition_to(&crate::context::ContextState::Active)
-            .await
-            .expect("transition to Active");
-        let mut cell = ClassSCell::new(state);
-        // Precondition: the local gate serves MessagesWrite.
-        assert!(
-            cell.role_state
-                .member_has_capability(alice, &Capability::MessagesWrite),
-            "precondition: member holds MessagesWrite before the ceiling lowers"
-        );
-
-        // Stage a governed ModifyCeiling that LOWERS to read-only (drops
-        // MessagesWrite).
-        let lowered = vec![Capability::MessagesRead];
-        crate::context::governance_helpers::execute_modify_ceiling(
-            &mut cell,
-            &deps,
-            &ctx_id,
-            &lowered,
-            ceiling_commit_meta(),
-        )
-        .expect("well-formed ceiling lowering stages");
-
-        // Before the notification window elapses, apply is a no-op (returns false)
-        // and the capability is still served.
-        let applied_early = crate::context::governance_helpers::apply_pending_ceiling_modification(
-            &mut cell, &deps, &ctx_id, 0,
-        )
-        .await
-        .expect("early apply is Ok");
-        assert!(
-            !applied_early,
-            "apply before the notification period must be a no-op"
-        );
-        assert!(
-            cell.role_state
-                .member_has_capability(alice, &Capability::MessagesWrite),
-            "before activation the existing ceiling remains in effect (§5.3.2 step 2)"
-        );
-
-        // Advance the clock well past the convergent effective_at AND the
-        // non-backdatable observed_at + notification-period floor, then apply.
-        let far_future = u64::from(u32::MAX);
-        let applied = crate::context::governance_helpers::apply_pending_ceiling_modification(
-            &mut cell, &deps, &ctx_id, far_future,
-        )
-        .await
-        .expect("apply after the notification period is Ok");
-        assert!(
-            applied,
-            "the pending modification must apply after the window"
-        );
-
-        // Post-apply: the lowered ceiling is installed and the cached MessagesWrite
-        // has been reconciled away — the local gate now DENIES it, while the
-        // in-ceiling MessagesRead is still served.
-        assert_eq!(
-            cell.role_state.ceiling(),
-            &scp_protocol::context::roles::CapabilityCeiling::new([Capability::MessagesRead]),
-            "the lowered ceiling is installed"
-        );
-        assert!(
-            !cell
-                .role_state
-                .member_has_capability(alice, &Capability::MessagesWrite),
-            "the out-of-ceiling cached capability must be pruned and denied at the gate"
-        );
-        assert!(
-            cell.role_state
-                .member_has_capability(alice, &Capability::MessagesRead),
-            "an in-ceiling capability is still served after the lowering"
-        );
-        // The pending record is cleared on a successful apply.
-        assert!(
-            cell.governance.pending_ceiling_modification.is_none(),
-            "a successful apply clears the pending ceiling modification"
         );
     }
 }

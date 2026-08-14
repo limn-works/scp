@@ -15,14 +15,14 @@
 //!
 //! See GitHub issue #363.
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::state::ContextSnapshot;
 use crate::store::StoredValue;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 
 // ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ use scp_protocol::context::ContextError;
 ///   could forge membership/roles/params. Distinguished from a signature
 ///   failure by a dedicated `version` error.
 /// - `2`: signed export over an **enumerated subset** of the snapshot
-///   (membership / role-definitions / params / tool-names + Merkle root +
+///   (membership / role-definitions / params / outlet-names + Merkle root +
 ///   exporter DID + version), the §23.16.4 sync-delta hash recipe.
 ///   **Rejected on import** — the subset left the trusted governance,
 ///   economic, access-key, and ceiling fields that `import_context` restores
@@ -67,16 +67,6 @@ use scp_protocol::context::ContextError;
 ///   it to `Full`; binding the scope byte makes that tamper fail signature
 ///   verification by construction. SCP is pre-release with no deployed exports,
 ///   so v3 is **not** accepted on import — the correct end state ships directly.
-///
-/// # Relationship to the WASM export version
-///
-/// This native version line (`MessagePack`-encoded `StoredValue` payload) is
-/// **intentionally independent** of the WASM bridge's `WASM_EXPORT_VERSION`
-/// (JSON envelope, currently 5). The two serializations are disjoint and
-/// mutually non-importable by construction (ADR-034): a WASM export fed to a
-/// native bridge is rejected at the version gate, never silently parsed. The
-/// two numbers are therefore **not** expected to match and must **not** be
-/// "reconciled" — only the signing construction converges, not the bytes.
 pub const CURRENT_EXPORT_VERSION: u32 = 4;
 
 /// Maximum accepted serialized byte length of an incoming `ContextExport`
@@ -126,8 +116,7 @@ pub const CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR: &str = "SCP-CONTEXT-SNAPSHOT-V1:";
 ///
 /// Registered in spec §9.18.2 and used by [`ContextExport::canonical_snapshot_hash`]:
 /// prefixed (no separator byte) to the JCS bytes of the snapshot before the
-/// SHA-256 digest. This is the single source of truth for the literal; the WASM
-/// reference bridge (`crates/scp-ffi/wasm/src/manager.rs`) uses the same literal.
+/// SHA-256 digest. This is the single source of truth for the literal.
 ///
 /// This is deliberately DISTINCT from [`CONTEXT_SNAPSHOT_DOMAIN_SEPARATOR`] (the
 /// §23.16.4 sync-delta separator). Both the signed-export digest and the
@@ -276,8 +265,8 @@ impl ExportScope {
     ///
     /// The byte values are the shared
     /// [`scp_protocol::context::EXPORT_SCOPE_TAG_FULL`] /
-    /// [`scp_protocol::context::EXPORT_SCOPE_TAG_PUBLIC`] constants, so the
-    /// native runtime and the WASM reference bridge use the identical mapping.
+    /// [`scp_protocol::context::EXPORT_SCOPE_TAG_PUBLIC`] constants, so all
+    /// honest members use the identical mapping.
     ///
     /// **MUST NEVER change once shipped:** the byte is part of the signed
     /// preimage; altering it would silently invalidate every previously
@@ -312,15 +301,13 @@ impl ContextExport {
     /// Scheme) canonical-JSON serialization of the **entire** embedded
     /// [`ContextSnapshot`] — every field, not a subset (ADR-050). The domain
     /// separator is prefixed to the snapshot bytes with no separator byte.
-    /// This is the construction shared with the WASM reference bridge
-    /// (`crates/scp-ffi/wasm/src/manager.rs`).
     ///
     /// Signing the whole snapshot is total by construction: every field the
     /// importer restores verbatim — membership, role definitions, ceiling,
     /// per-member and suspended capabilities, threshold set/value, governance
     /// model configuration, economic policy, consequence rules,
     /// read-exclusion list, access-key store, pending ceiling modification,
-    /// and tool registrations — is in the signed preimage, so none of them is
+    /// and outlet registrations — is in the signed preimage, so none of them is
     /// forgeable. The earlier v2 enumerated-subset recipe (§23.16.4) left
     /// those fields unsigned; it is no longer used for export.
     ///
@@ -453,7 +440,7 @@ pub fn deserialize_export(bytes: &[u8]) -> Result<ContextExport, ContextError> {
 /// the full log, so the caller's constant-time compare against the signed
 /// `snapshot.event_log_merkle_root` (in `import_context` /
 /// `validate_export_for_import`) rejects it. A legitimately pruned log is
-/// accepted because [`MerkleEventLogProvider::prune_before_checkpoint`]
+/// accepted because [`MerkleEventLogProvider::prune_before_checkpoint`](crate::context::providers::event_log::MerkleEventLogProvider::prune_before_checkpoint)
 /// re-anchors the retained tail to genesis and renumbers sequences from 0, so
 /// the exported pruned log is itself a valid genesis-rooted prefix.
 ///
@@ -713,7 +700,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         snapshot.role_state.creator_did.as_str(),
         ceiling,
         Vec::new(),
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .map_err(|e| {
         ContextError::MembershipFailed(format!(
@@ -734,10 +721,10 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         role_state,
         event_log_merkle_root: [0u8; 32],
         executed_proposals: HashSet::new(),
-        ttl_remaining_secs: snapshot.ttl_remaining_secs,
-        registered_tools: Vec::new(),
+        ttl_deadline_secs: snapshot.ttl_deadline_secs,
+        registered_outlets: Vec::new(),
         read_exclusion_list: HashSet::new(),
-        tool_interfaces: Vec::new(),
+        outlet_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
         threshold_value: 0,
         pruning_policy: None,
@@ -811,6 +798,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // ALWAYS dropped from the public export.
         saga_pending: HashMap::new(),
         xctx_committed_outputs: HashMap::new(),
+        xctx_committed_stream_outputs: HashMap::new(),
         xctx_committed_invocations: std::collections::HashSet::new(),
         // Caller-side reservation reversal records are local-instance economy
         // state with no authority on any other node — ALWAYS dropped from the
@@ -819,6 +807,21 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> Result<ContextSnapsh
         // B's freshness/replay cache has no authority on a foreign node and a
         // fresh node starts its own replay window — dropped from the export.
         xctx_nonce_dedup: HashMap::new(),
+        // §7.3.8 value-caveat counters are local-instance economic accounting
+        // with no authority on a foreign node — ALWAYS dropped from the public
+        // export (like the budget tracker and the xctx witnesses). A public
+        // snapshot is never imported back into a live encrypted context, so no
+        // spend/rate window is re-opened by stripping them here.
+        caveat_counters: HashMap::new(),
+        // Fix-D: streaming reservation recovery records are local invoker-economy
+        // state with no authority on a foreign node — ALWAYS dropped from the
+        // public export (like the budget tracker and the caveat counters). A
+        // foreign node must never drive a local escrow refund / counter release.
+        stream_reservations: HashMap::new(),
+        // Broadcast per-author keys and block lists are sensitive access-control
+        // state; a public-scope export is for pre-join observers, so it is
+        // redacted here (mirrors the empty `read_exclusion_list` / `membership`).
+        broadcast: None,
     })
 }
 
@@ -954,7 +957,7 @@ mod tests {
             TEST_CREATOR_DID,
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -967,9 +970,9 @@ mod tests {
             role_state,
             event_log_merkle_root: [0u8; 32],
             executed_proposals: HashSet::new(),
-            ttl_remaining_secs: None,
-            registered_tools: Vec::new(),
-            tool_interfaces: Vec::new(),
+            ttl_deadline_secs: None,
+            registered_outlets: Vec::new(),
+            outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
@@ -1008,6 +1011,7 @@ mod tests {
             routing: crate::context::actor::state::ContextRouting::Broadcast,
             saga_pending: HashMap::new(),
             xctx_committed_outputs: HashMap::new(),
+            xctx_committed_stream_outputs: HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
             // Caller-side reservation reversal records are local-instance
             // economy state — dropped from the export (no foreign authority).
@@ -1015,12 +1019,16 @@ mod tests {
             // B's freshness/replay cache has no authority on a foreign node and
             // a fresh node starts its own replay window — dropped from export.
             xctx_nonce_dedup: HashMap::new(),
+            caveat_counters: HashMap::new(),
+            // Fix-D: local invoker-economy recovery records — dropped from export.
+            stream_reservations: HashMap::new(),
+            broadcast: None,
         }
     }
 
     #[test]
     fn ensure_importer_is_member_accepts_members_rejects_non_members() {
-        use scp_identity::DID;
+        use scp_did::DID;
 
         let mut snapshot = test_snapshot("member-check-ctx");
         // A real snapshot carries the creator in its membership; mirror that, plus
@@ -1060,7 +1068,7 @@ mod tests {
     /// All test events use [`scp_event_log::EventType::MessageSent`]; their
     /// leaf hashes still differ because the per-event `sequence`, `timestamp`,
     /// and payload bytes vary.
-    fn append_test_event(
+    async fn append_test_event(
         provider: &MerkleEventLogProvider,
         context_id_bytes: &[u8; 32],
         label: &str,
@@ -1075,6 +1083,7 @@ mod tests {
                 },
                 1_700_000_000,
             )
+            .await
             .unwrap();
     }
 
@@ -1084,11 +1093,11 @@ mod tests {
     }
 
     /// Helper to create event log entries via the provider.
-    fn create_event_log_data(context_id_bytes: &[u8; 32], event_names: &[&str]) -> Vec<u8> {
+    async fn create_event_log_data(context_id_bytes: &[u8; 32], event_names: &[&str]) -> Vec<u8> {
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(context_id_bytes).unwrap();
+        provider.init_event_log(context_id_bytes).await.unwrap();
         for name in event_names {
-            append_test_event(&provider, context_id_bytes, name);
+            append_test_event(&provider, context_id_bytes, name).await;
         }
         provider.export_event_log_entries(context_id_bytes).unwrap()
     }
@@ -1180,7 +1189,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1199,13 +1208,14 @@ mod tests {
         assert!(decoded.snapshot.mls_crypto_state.is_empty());
     }
 
-    #[test]
-    fn roundtrip_export_with_events() {
+    #[tokio::test]
+    async fn roundtrip_export_with_events() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-roundtrip-2");
         let event_log_data = create_event_log_data(
             &ctx_id_bytes,
             &["ContextCreated", "MemberJoined", "MessageSent"],
-        );
+        )
+        .await;
 
         let mut snapshot = test_snapshot("ctx-roundtrip-2");
         // MLS group state rides inside the SIGNED snapshot, not the envelope.
@@ -1216,7 +1226,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1236,13 +1246,14 @@ mod tests {
         assert!(!decoded.event_log_data.is_empty());
     }
 
-    #[test]
-    fn roundtrip_preserves_all_fields() {
+    #[tokio::test]
+    async fn roundtrip_preserves_all_fields() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-roundtrip-3");
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &["E1", "E2", "E3", "E4", "E5"]);
+        let event_log_data =
+            create_event_log_data(&ctx_id_bytes, &["E1", "E2", "E3", "E4", "E5"]).await;
 
         let mut snapshot = test_snapshot("ctx-roundtrip-3");
-        snapshot.ttl_remaining_secs = Some(3600);
+        snapshot.ttl_deadline_secs = Some(3600);
         snapshot.threshold_value = 42;
 
         let export = create_export(
@@ -1250,7 +1261,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1258,7 +1269,7 @@ mod tests {
         let bytes = serialize_export(&export).unwrap();
         let decoded = deserialize_export(&bytes).unwrap();
 
-        assert_eq!(decoded.snapshot.ttl_remaining_secs, Some(3600));
+        assert_eq!(decoded.snapshot.ttl_deadline_secs, Some(3600));
         assert_eq!(decoded.snapshot.threshold_value, 42);
         assert_eq!(decoded.scope, ExportScope::Full);
         assert_eq!(decoded.exporter_did.as_ref(), TEST_CREATOR_DID);
@@ -1274,25 +1285,26 @@ mod tests {
         assert_eq!(root, [0u8; 32]);
     }
 
-    #[test]
-    fn recompute_event_log_root_valid_entries() {
+    #[tokio::test]
+    async fn recompute_event_log_root_valid_entries() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-1");
         let data = create_event_log_data(
             &ctx_id_bytes,
             &["ContextCreated", "MemberJoined", "MessageSent"],
-        );
+        )
+        .await;
 
         let root = recompute_event_log_root(&data).unwrap();
         assert_ne!(root, [0u8; 32]);
     }
 
-    #[test]
-    fn recompute_event_log_root_detects_tampered_chain_link() {
+    #[tokio::test]
+    async fn recompute_event_log_root_detects_tampered_chain_link() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-2");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
         // Tamper the second entry's prev_hash chain link so the substrate
@@ -1309,14 +1321,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recompute_event_log_root_detects_removed_entry() {
+    #[tokio::test]
+    async fn recompute_event_log_root_detects_removed_entry() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-3");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
         // Remove the middle entry: the surviving tail now carries stale
@@ -1329,8 +1341,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn recompute_event_log_root_rejects_suffix_truncated_log() {
+    #[tokio::test]
+    async fn recompute_event_log_root_rejects_suffix_truncated_log() {
         // Truncation-forgery-closed property: dropping trailing events from a
         // signed export must be detected. `recompute_event_log_root` recomputes the
         // RFC 6962 root over whatever events it receives; a suffix-truncated
@@ -1339,10 +1351,10 @@ mod tests {
         // against the signed `snapshot.event_log_merkle_root` rejects it.
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-trunc");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         let full_root = provider.merkle_root(&ctx_id_bytes).unwrap();
         let full_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
@@ -1364,17 +1376,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recompute_event_log_root_rejects_prefix_truncated_log() {
+    #[tokio::test]
+    async fn recompute_event_log_root_rejects_prefix_truncated_log() {
         // Prefix truncation (dropping leading events) is rejected outright:
         // the new first event carries a non-zero `sequence`, so the substrate
         // replay's sequence check fails closed inside `recompute_event_log_root`.
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-merkle-prefix");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         // Drop the leading event (prefix truncation).
         let mut entries = provider.entries(&ctx_id_bytes).unwrap();
@@ -1392,11 +1404,11 @@ mod tests {
     // Import validation tests
     // -------------------------------------------------------------------
 
-    #[test]
-    fn validate_export_succeeds_for_valid_export() {
+    #[tokio::test]
+    async fn validate_export_succeeds_for_valid_export() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-1");
         let event_log_data =
-            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]);
+            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]).await;
 
         let snapshot = test_snapshot("ctx-validate-1");
         let export = create_export(
@@ -1404,7 +1416,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1431,8 +1443,8 @@ mod tests {
         assert!(err_msg.contains("unsupported export version"));
     }
 
-    #[test]
-    fn validate_export_rejects_substituted_event_log() {
+    #[tokio::test]
+    async fn validate_export_rejects_substituted_event_log() {
         // The signature-coverage attack the signed merkle-root binding closes:
         // an attacker holds a VALID signed snapshot but swaps in a DIFFERENT,
         // internally-consistent event log. Because the true root is bound into
@@ -1443,19 +1455,21 @@ mod tests {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
 
         // Legitimate export over the real event log.
-        let real_log = create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]);
+        let real_log =
+            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "MemberJoined"]).await;
         let export = create_export(
             test_snapshot(ctx_id),
             real_log,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
 
         // Build a DIFFERENT but internally-consistent event log and its root.
-        let substitute_log = create_event_log_data(&ctx_id_bytes, &["ContextCreated", "Evicted"]);
+        let substitute_log =
+            create_event_log_data(&ctx_id_bytes, &["ContextCreated", "Evicted"]).await;
         let substitute_root = recompute_event_log_root(&substitute_log).unwrap();
         assert_ne!(
             substitute_root, export.snapshot.event_log_merkle_root,
@@ -1489,18 +1503,18 @@ mod tests {
     /// "no genuinely-unsigned envelope field affects authoritative state" — if a
     /// future change started deriving trusted state from `exported_at`, this
     /// test (or a sibling step) would need to fail it.
-    #[test]
-    fn mutating_unsigned_envelope_fields_does_not_change_validation() {
+    #[tokio::test]
+    async fn mutating_unsigned_envelope_fields_does_not_change_validation() {
         let ctx_id = "ctx-unsigned-envelope-inert";
         let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]).await;
 
         let export = create_export(
             test_snapshot(ctx_id),
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1638,14 +1652,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_export_rejects_tampered_event_log() {
+    #[tokio::test]
+    async fn validate_export_rejects_tampered_event_log() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-4");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         let _original_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
 
@@ -1683,8 +1697,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_export_rejects_suffix_truncated_event_log() {
+    #[tokio::test]
+    async fn validate_export_rejects_suffix_truncated_event_log() {
         // Full-pipeline truncation-forgery-closed property: an attacker takes a
         // legitimately signed export and drops trailing events from the
         // `event_log_data`. The signed `snapshot.event_log_merkle_root` commits
@@ -1693,10 +1707,10 @@ mod tests {
         // without the signing key the attacker cannot re-bind the snapshot.
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-validate-trunc");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         let full_data = provider.export_event_log_entries(&ctx_id_bytes).unwrap();
 
@@ -1707,7 +1721,7 @@ mod tests {
             full_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1743,7 +1757,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Public,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1758,10 +1772,10 @@ mod tests {
         assert_eq!(export.snapshot.membership.count(), 0);
     }
 
-    #[test]
-    fn full_export_includes_all_data() {
+    #[tokio::test]
+    async fn full_export_includes_all_data() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-full-1");
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]).await;
 
         let mut snapshot = test_snapshot("ctx-full-1");
         // MLS group state rides inside the signed snapshot; full scope keeps it.
@@ -1771,7 +1785,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1786,8 +1800,8 @@ mod tests {
     // Integration: export -> serialize -> deserialize -> validate -> import
     // -------------------------------------------------------------------
 
-    #[test]
-    fn full_export_import_pipeline() {
+    #[tokio::test]
+    async fn full_export_import_pipeline() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-pipeline-1");
         let event_log_data = create_event_log_data(
             &ctx_id_bytes,
@@ -1796,9 +1810,10 @@ mod tests {
                 "MemberJoined",
                 "RoleAssigned",
                 "MessageSent",
-                "ToolInvoked",
+                "OutletInvoked",
             ],
-        );
+        )
+        .await;
 
         let snapshot = test_snapshot("ctx-pipeline-1");
         let export = create_export(
@@ -1806,7 +1821,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1838,7 +1853,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1899,10 +1914,10 @@ mod tests {
     /// distinct from the Merkle-chain error. This is the gap the signature
     /// closes — `validate_export_for_import` previously verified only the
     /// event-log Merkle chain, leaving membership/roles/params forgeable.
-    #[test]
-    fn tampered_membership_rejected_with_signature_error() {
+    #[tokio::test]
+    async fn tampered_membership_rejected_with_signature_error() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-tamper-membership");
-        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+        let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]).await;
 
         let mut snapshot = test_snapshot("ctx-tamper-membership");
         // Legitimate membership at export time: a single member.
@@ -1917,7 +1932,7 @@ mod tests {
             event_log_data,
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -1952,21 +1967,21 @@ mod tests {
     /// verifier recomputes `SHA-256(domain || [scope.tag_byte()] || JCS(...))`
     /// from the *received* envelope scope, which no longer matches the digest
     /// the creator signed. Tests both flip directions.
-    #[test]
-    fn tampered_scope_rejected_with_signature_error() {
+    #[tokio::test]
+    async fn tampered_scope_rejected_with_signature_error() {
         for original in [ExportScope::Full, ExportScope::Public] {
             let ctx_id = "ctx-tamper-scope";
             let ctx_id_bytes = scp_protocol::context::context_id_bytes(ctx_id);
             // Public exports carry no event log; Full does. Build the log
             // unconditionally — create_export discards it for Public scope.
-            let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]);
+            let event_log_data = create_event_log_data(&ctx_id_bytes, &["ContextCreated"]).await;
 
             let mut export = create_export(
                 test_snapshot(ctx_id),
                 event_log_data,
                 DID::from(TEST_CREATOR_DID),
                 original,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
                 sign_with_test_key,
             )
             .unwrap();
@@ -2023,7 +2038,7 @@ mod tests {
                 Vec::new(),
                 DID::from(TEST_CREATOR_DID),
                 scope,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
                 sign_with_test_key,
             )
             .unwrap();
@@ -2045,7 +2060,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2061,14 +2076,14 @@ mod tests {
     // Event log provider round-trip
     // -------------------------------------------------------------------
 
-    #[test]
-    fn event_log_export_import_roundtrip() {
+    #[tokio::test]
+    async fn event_log_export_import_roundtrip() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-el-roundtrip");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
-        append_test_event(&provider, &ctx_id_bytes, "Event1");
-        append_test_event(&provider, &ctx_id_bytes, "Event2");
-        append_test_event(&provider, &ctx_id_bytes, "Event3");
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
+        append_test_event(&provider, &ctx_id_bytes, "Event1").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event2").await;
+        append_test_event(&provider, &ctx_id_bytes, "Event3").await;
 
         let original_entries = provider.entries(&ctx_id_bytes).unwrap();
         let original_root = provider.merkle_root(&ctx_id_bytes).unwrap();
@@ -2080,6 +2095,7 @@ mod tests {
         let new_provider = MerkleEventLogProvider::new();
         new_provider
             .import_event_log_entries(&ctx_id_bytes, &data)
+            .await
             .unwrap();
 
         let imported_entries = new_provider.entries(&ctx_id_bytes).unwrap();
@@ -2116,13 +2132,13 @@ mod tests {
     // Pruned event log round-trip (#705)
     // -------------------------------------------------------------------
 
-    #[test]
-    fn pruned_event_log_export_import_roundtrip() {
+    #[tokio::test]
+    async fn pruned_event_log_export_import_roundtrip() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-prune-roundtrip");
         let provider = MerkleEventLogProvider::new();
-        provider.init_event_log(&ctx_id_bytes).unwrap();
+        provider.init_event_log(&ctx_id_bytes).await.unwrap();
         for i in 0..10 {
-            append_test_event(&provider, &ctx_id_bytes, &format!("Event{i}"));
+            append_test_event(&provider, &ctx_id_bytes, &format!("Event{i}")).await;
         }
 
         // Prune, keeping only the last 3 entries via a size-based policy.
@@ -2137,6 +2153,7 @@ mod tests {
         };
         let removed = provider
             .prune_before_checkpoint(&ctx_id_bytes, 10, &policy)
+            .await
             .unwrap();
         assert_eq!(removed, 7);
 
@@ -2162,7 +2179,7 @@ mod tests {
             data.clone(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2175,6 +2192,7 @@ mod tests {
         let new_provider = MerkleEventLogProvider::new();
         new_provider
             .import_event_log_entries(&ctx_id_bytes, &data)
+            .await
             .unwrap();
 
         let imported_entries = new_provider.entries(&ctx_id_bytes).unwrap();
@@ -2196,7 +2214,7 @@ mod tests {
 
         // Appending after import should chain correctly: the new event's
         // prev_hash equals the canonical leaf hash of the prior tail entry.
-        append_test_event(&new_provider, &ctx_id_bytes, "Event10");
+        append_test_event(&new_provider, &ctx_id_bytes, "Event10").await;
         let final_entries = new_provider.entries(&ctx_id_bytes).unwrap();
         assert_eq!(final_entries.len(), 4);
         assert_eq!(
@@ -2233,7 +2251,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2270,7 +2288,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2369,7 +2387,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign,
         )
         .unwrap();
@@ -2378,7 +2396,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign,
         )
         .unwrap();
@@ -2406,7 +2424,7 @@ mod tests {
             Vec::new(),
             DID::from("did:key:not-the-creator"),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2438,7 +2456,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2478,7 +2496,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2632,6 +2650,143 @@ mod tests {
         assert_eq!(decoded_record, &record);
     }
 
+    /// §7.3.8 value-caveat counters (Class S) are declared "durable across
+    /// restarts by riding the context snapshot (ADR-049 §9)". That durability
+    /// crosses the SERIALIZATION boundary — the on-disk `MessagePack` bytes,
+    /// not just an in-memory `ClassSState::snapshot()` clone — so this test
+    /// exercises the actual persistence codec (`rmp_serde::to_vec_named` /
+    /// `from_slice`, the path `ContextPersistence::persist_context` / `load`
+    /// use). A populated per-`ucan_cid` counter record MUST round-trip
+    /// value-stable, or a crash+respawn would silently reset a consumed cap and
+    /// re-open the spend / rate window the counter exists to close.
+    #[test]
+    fn caveat_counters_persistence_roundtrips_value_stable() {
+        use crate::trust::caveat_counters::CaveatCounters;
+
+        let mut snapshot = test_snapshot("ctx-caveat-counters-roundtrip");
+        snapshot.caveat_counters.insert(
+            "bafy-invocation-ucan-cid".to_owned(),
+            CaveatCounters {
+                max_calls_used: 3,
+                amount_cumulative_used: 42,
+                rate_window_timestamps: vec![1, 2, 3],
+            },
+        );
+
+        // MessagePack persistence round-trip (the path used by
+        // ContextPersistence::persist_context / load).
+        let bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+        let decoded: ContextSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(decoded.caveat_counters.len(), 1);
+        let decoded_record = decoded
+            .caveat_counters
+            .get("bafy-invocation-ucan-cid")
+            .expect("the caveat-counter record survives the persistence round-trip");
+        // Value-stable: every field (including the sorted rate-window vector)
+        // is byte-for-byte equal via the derived `PartialEq`.
+        assert_eq!(decoded_record.max_calls_used, 3);
+        assert_eq!(decoded_record.amount_cumulative_used, 42);
+        assert_eq!(decoded_record.rate_window_timestamps, vec![1, 2, 3]);
+    }
+
+    /// §7.3.8 caveat counters are LOCAL-instance economic accounting with no
+    /// authority on a foreign node, so `strip_snapshot_for_public` MUST drop
+    /// them from a public-scope export (identical to the budget tracker and the
+    /// xctx witnesses) — a public snapshot is never imported back into a live
+    /// encrypted context, so stripping re-opens no spend/rate window. This
+    /// pins the redaction so a future field addition cannot silently leak a
+    /// caller's consumed-capacity accounting to a pre-join observer.
+    #[test]
+    fn strip_snapshot_for_public_drops_caveat_counters() {
+        use crate::trust::caveat_counters::CaveatCounters;
+
+        let mut snapshot = test_snapshot("ctx-caveat-counters-strip");
+        snapshot.caveat_counters.insert(
+            "bafy-invocation-ucan-cid".to_owned(),
+            CaveatCounters {
+                max_calls_used: 7,
+                amount_cumulative_used: 100,
+                rate_window_timestamps: vec![10, 20],
+            },
+        );
+
+        let stripped =
+            strip_snapshot_for_public(&snapshot).expect("public strip builds a minimal snapshot");
+        assert!(
+            stripped.caveat_counters.is_empty(),
+            "a public export must never carry local caveat-counter accounting"
+        );
+    }
+
+    /// Fix-D: a populated streaming reservation recovery record MUST round-trip
+    /// value-stable through the ACTUAL persistence codec
+    /// (`rmp_serde::to_vec_named` / `from_slice`), or a crash+respawn would
+    /// silently reset it and strand the open-time escrow hold + cumulative
+    /// counter reserve it exists to release.
+    #[test]
+    fn stream_reservations_persistence_roundtrips_value_stable() {
+        use crate::context::outlets::invoke::StreamReservationRecord;
+        use scp_protocol::economy::types::Amount;
+
+        let expected = StreamReservationRecord {
+            invoker_did: DID::from("did:key:stream-invoker"),
+            ucan_cid: "bafy-open-ucan-cid".to_owned(),
+            cost_per_chunk: Amount::new(7),
+            amount_cumulative_reserved: 350,
+            reserved_escrow: Amount::new(210),
+            generation: 4,
+        };
+        let mut snapshot = test_snapshot("ctx-stream-reservations-roundtrip");
+        snapshot
+            .stream_reservations
+            .insert("deadbeef-request-id".to_owned(), expected.clone());
+
+        // MessagePack persistence round-trip (the path used by
+        // ContextPersistence::persist_context / load).
+        let bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
+        let decoded: ContextSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+
+        assert_eq!(decoded.stream_reservations.len(), 1);
+        let decoded_record = decoded
+            .stream_reservations
+            .get("deadbeef-request-id")
+            .expect("the streaming reservation record survives the persistence round-trip");
+        // Value-stable via the derived `PartialEq` — every field byte-for-byte.
+        assert_eq!(*decoded_record, expected);
+    }
+
+    /// Fix-D: streaming reservation recovery records are LOCAL invoker-economy
+    /// state with no authority on a foreign node, so `strip_snapshot_for_public`
+    /// MUST drop them from a public-scope export (identical to the caveat
+    /// counters and the budget tracker) — a foreign node must never be handed the
+    /// means to drive a local escrow refund / counter release.
+    #[test]
+    fn strip_snapshot_for_public_drops_stream_reservations() {
+        use crate::context::outlets::invoke::StreamReservationRecord;
+        use scp_protocol::economy::types::Amount;
+
+        let mut snapshot = test_snapshot("ctx-stream-reservations-strip");
+        snapshot.stream_reservations.insert(
+            "deadbeef-request-id".to_owned(),
+            StreamReservationRecord {
+                invoker_did: DID::from("did:key:stream-invoker"),
+                ucan_cid: "bafy-open-ucan-cid".to_owned(),
+                cost_per_chunk: Amount::new(7),
+                amount_cumulative_reserved: 350,
+                reserved_escrow: Amount::new(210),
+                generation: 4,
+            },
+        );
+
+        let stripped =
+            strip_snapshot_for_public(&snapshot).expect("public strip builds a minimal snapshot");
+        assert!(
+            stripped.stream_reservations.is_empty(),
+            "a public export must never carry local streaming reservation records"
+        );
+    }
+
     /// Caller-side reservation records are LOCAL-node economy state with no
     /// authority on a foreign node, so `strip_snapshot_for_public` MUST drop
     /// them — a public observer / importer must never be handed the means to
@@ -2698,7 +2853,7 @@ mod tests {
             Vec::new(),
             DID::from(TEST_CREATOR_DID),
             ExportScope::Full,
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
             sign_with_test_key,
         )
         .unwrap();
@@ -2805,8 +2960,9 @@ mod tests {
     /// TTL expiry deadline from the SAME convergent `creation_timestamp_secs`
     /// carried in the snapshot — i.e. the deadline is a function of the signed
     /// creation time and the TTL only, never of importer-local `now()`. This is
-    /// the convergence the import/restore arming (`anchor_deadline_to_creation =
-    /// true`) relies on.
+    /// the convergence the import/restore arming (the resolved absolute
+    /// `deadline_override`, `creation + ttl` when no persisted deadline exists)
+    /// relies on.
     #[test]
     fn skewed_importers_derive_identical_ttl_deadline_from_snapshot() {
         use crate::context::ttl_close_helpers::convergent_ttl_deadline_secs;
@@ -2828,63 +2984,44 @@ mod tests {
             "importers reading the same convergent creation time must agree on the deadline"
         );
         assert_eq!(
-            alice_deadline,
+            alice_deadline.map(crate::context::ttl_close_helpers::ConvergentDeadline::as_secs),
             Some(1_700_000_000 + 86_400),
             "the deadline must be creation_timestamp_secs + ttl, not a local-clock value"
         );
     }
 
-    /// Cross-bridge convergence with a FUTURE-dated creation time: when the
-    /// signed snapshot's `creation_timestamp_secs` is strictly GREATER than the
-    /// importer's local `now` (legitimate clock skew within the ±5-min tolerance,
-    /// or a creator that stamped a slightly-future creation), the native importer
-    /// consumes the field VERBATIM (it does NOT clamp to importer-`now`) and arms
-    /// `creation + ttl`. This mirrors the WASM importer's post-fix verbatim path
-    /// (`handle_ttl_expiry` stamps `creation.saturating_add(ttl)` with no `now`
-    /// clamp), so a mixed native/WASM context records the IDENTICAL
-    /// `ContextExpired` leaf and converges its event-log root at equal event
-    /// count. A residual importer-`now` clamp on either side would stamp the
-    /// SHORTER `now + ttl`, diverging the leaf (§7.3.1, §9.9.3).
+    /// The create-base PRIMITIVE (`convergent_ttl_deadline_secs`) consumes its
+    /// creation-time argument VERBATIM (`creation + ttl`) — the prune-immune base
+    /// of the partitioned single-source deadline (ADR-049 §9), used both at
+    /// context creation and inside `convergent_ttl_deadline`. On the UNTRUSTED
+    /// cross-node IMPORT path the same `snapshot.creation_timestamp_secs` feeds the
+    /// base, but a future-dated creation is REJECTED at the import boundary (E3),
+    /// so no clamp is needed here. This test pins ONLY the create-base primitive.
     #[test]
-    fn future_dated_creation_is_consumed_verbatim_and_matches_wasm() {
+    fn create_base_primitive_is_verbatim() {
         use crate::context::ttl_close_helpers::convergent_ttl_deadline_secs;
 
-        // Importer's local clock; the snapshot creation is 2 minutes in its
-        // future (well within the ±5-min skew tolerance).
-        let importer_now = 1_700_000_000_u64;
-        let creation = importer_now + 120;
+        let creation = 1_700_000_120_u64;
         let ttl = 86_400_u64;
-        assert!(
-            creation > importer_now,
-            "test precondition: snapshot creation must be in the importer's future"
-        );
 
-        let mut snapshot = test_snapshot("ctx-future-creation-verbatim");
+        let mut snapshot = test_snapshot("ctx-create-base-verbatim");
         snapshot.creation_timestamp_secs = creation;
 
-        // Native deadline from the verbatim snapshot field. There is no
-        // importer-`now` clamp anywhere on this path.
-        let native_deadline =
-            convergent_ttl_deadline_secs(snapshot.creation_timestamp_secs, Some(ttl));
+        // Create-base primitive: `creation + ttl` verbatim, no clamp.
+        let base = convergent_ttl_deadline_secs(snapshot.creation_timestamp_secs, Some(ttl));
         assert_eq!(
-            native_deadline,
+            base.map(crate::context::ttl_close_helpers::ConvergentDeadline::as_secs),
             Some(creation + ttl),
-            "native must arm creation + ttl verbatim, NOT a clamped importer_now + ttl"
-        );
-        assert_ne!(
-            native_deadline,
-            Some(importer_now + ttl),
-            "a clamp to importer_now would have produced this SHORTER deadline — the bug FIX 1 closes"
+            "the create-base primitive arms creation + ttl verbatim"
         );
 
-        // WASM importer math for the SAME field (mirrors `handle_ttl_expiry`'s
-        // `creation.saturating_add(ttl)` post-fix verbatim consumption).
-        let wasm_deadline = creation.saturating_add(ttl);
+        // Independent verbatim deadline math for the SAME field.
+        let verbatim_deadline = creation.saturating_add(ttl);
         assert_eq!(
-            native_deadline,
-            Some(wasm_deadline),
-            "native and WASM importers of the same future-dated signed snapshot \
-             must derive the IDENTICAL TTL deadline"
+            base.map(crate::context::ttl_close_helpers::ConvergentDeadline::as_secs),
+            Some(verbatim_deadline),
+            "every member computing the create base from the same convergent \
+             creation time derives the IDENTICAL deadline"
         );
     }
 }

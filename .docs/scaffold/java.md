@@ -77,7 +77,7 @@ public interface NativeLib extends Library {
     int scp_context_send(Pointer handle, byte[] payload, int payloadLen, PointerByReference outError);
     int scp_context_receive(Pointer handle, PointerByReference outEnvelope, PointerByReference outError);
 
-    int scp_tool_invoke(Pointer contextHandle, String toolId, String inputJson, PointerByReference outResult, PointerByReference outError);
+    int scp_outlet_invoke(Pointer contextHandle, String outletId, String inputJson, PointerByReference outResult, PointerByReference outError);
 
     int scp_ucan_validate(Pointer contextHandle, String token, String capability, PointerByReference outError);
 }
@@ -291,12 +291,12 @@ public final class Context implements AutoCloseable {
             // Bridge from native callback to subscriber
         };
     }
-    public CompletableFuture<Map<String, Object>> invokeTool(String toolId, Map<String, Object> input) {
+    public CompletableFuture<Map<String, Object>> invokeOutlet(String outletId, Map<String, Object> input) {
         return CompletableFuture.supplyAsync(() -> {
             String json = new Gson().toJson(input);
             var result = new PointerByReference();
             var err = new PointerByReference();
-            int rc = NativeLib.INSTANCE.scp_tool_invoke(handle, toolId, json, result, err);
+            int rc = NativeLib.INSTANCE.scp_outlet_invoke(handle, outletId, json, result, err);
             if (rc != 0) throw extractException(err);
             return new Gson().fromJson(extractString(result), Map.class);
         });

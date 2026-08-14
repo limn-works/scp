@@ -56,8 +56,9 @@ use scp_core::provenance::DataProvenance;
 use scp_core::sync::{
     OfflineTier, TIER_1_THRESHOLD_SECS, TIER_2_THRESHOLD_SECS, classify_offline_duration,
 };
-use scp_identity::DID;
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryPush};
+use scp_did::DID;
+use scp_platform::in_memory::InMemoryPush;
+use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::{KeyCustody, KeyType, Push};
 
 // ---------------------------------------------------------------------------
@@ -223,7 +224,8 @@ fn conf_004_agent_binding_attestation() {
     let agent_did = format!("did:key:{}", hex(&agent_key.verifying_key().to_bytes()));
 
     let claim = serde_json::json!({"platform": "agent-binding"});
-    let claim_bytes = rmp_serde::to_vec_named(&claim).expect("claim msgpack serialization");
+    // Claim is compact JSON (RFC 8785 JCS) per §9.5.2 Attestation row 5.
+    let claim_bytes = scp_core::jcs::to_vec(&claim).expect("claim compact-JSON serialization");
 
     print_step(1, "Create identity attestation binding agent to human");
     // RevocationStatus::Active serialized as MessagePack (named keys).
@@ -279,7 +281,7 @@ fn conf_004_agent_binding_attestation() {
         signature: signature.to_bytes().to_vec(),
     };
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::TestClock::new(1_700_000_000);
+    let clock = scp_clock::TestClock::new(1_700_000_000);
     scp_core::trust::verify_attestation(&attestation, &resolver, &clock)
         .expect("cross-verification: manual bytes must match canonical_attestation_bytes()");
 
@@ -359,11 +361,11 @@ async fn conf_006_create_context() {
 
     print_step(2, "Initialize context handle");
     let handle = ContextHandle::new("conf-006-ctx".to_owned(), params);
-    assert_eq!(handle.state().await, ContextState::Creating);
+    assert_eq!(handle.state(), ContextState::Creating);
 
     print_step(3, "Transition to Active (MLS group established)");
-    handle.transition_to(&ContextState::Active).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Active);
+    handle.transition_to(&ContextState::Active).unwrap();
+    assert_eq!(handle.state(), ContextState::Active);
 
     println!("  PASS: Context created and activated");
 }
@@ -529,7 +531,7 @@ async fn conf_011_context_parameter_update() {
     print_step(1, "Create context with default params");
     let params = ContextParams::default();
     let handle = ContextHandle::new("conf-011-ctx".to_owned(), params);
-    handle.transition_to(&ContextState::Active).await.unwrap();
+    handle.transition_to(&ContextState::Active).unwrap();
 
     print_step(2, "Verify ChangeRole is a valid governance action");
     let action = GovernanceAction::ChangeRole {
@@ -592,7 +594,7 @@ fn conf_012_nested_context() {
     assert!(intersection.contains(&Capability::MessagesRead));
     assert!(intersection.contains(&Capability::MessagesWrite));
     assert!(
-        !intersection.contains(&Capability::ToolInvokeAll),
+        !intersection.contains(&Capability::OutletCallAll),
         "child cannot exceed parent ceiling"
     );
 
@@ -606,19 +608,19 @@ async fn conf_013_context_close_lifecycle() {
     println!("=== CONF-013: Context Close Lifecycle ===");
 
     let handle = ContextHandle::new("conf-013-ctx".to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await.unwrap();
+    handle.transition_to(&ContextState::Active).unwrap();
 
     print_step(1, "Initiate context close");
-    handle.transition_to(&ContextState::Closing).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Closing);
+    handle.transition_to(&ContextState::Closing).unwrap();
+    assert_eq!(handle.state(), ContextState::Closing);
 
     print_step(2, "Complete close");
-    handle.transition_to(&ContextState::Closed).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Closed);
+    handle.transition_to(&ContextState::Closed).unwrap();
+    assert_eq!(handle.state(), ContextState::Closed);
 
     print_step(3, "Verify no further transitions from Closed");
-    assert!(handle.transition_to(&ContextState::Active).await.is_err());
-    assert!(handle.transition_to(&ContextState::Creating).await.is_err());
+    assert!(handle.transition_to(&ContextState::Active).is_err());
+    assert!(handle.transition_to(&ContextState::Creating).is_err());
 
     println!("  PASS: Context close lifecycle verified");
 }
@@ -1040,7 +1042,7 @@ async fn conf_023_ucan_issuance() {
         signing_key_id: None,
         ceiling: None,
     };
-    let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
         .await
         .expect("mint_ucan");
 
@@ -1104,7 +1106,7 @@ async fn conf_024_ucan_delegation_chain() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .expect("mint root UCAN A→B");
@@ -1129,7 +1131,7 @@ async fn conf_024_ucan_delegation_chain() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .expect("mint delegated UCAN B→C");
@@ -1180,7 +1182,7 @@ async fn conf_025_ucan_revocation() {
             ceiling: None,
         },
         &custody,
-        &scp_primitives::SystemClock,
+        &scp_clock::SystemClock,
     )
     .await
     .expect("mint UCAN");
@@ -1371,7 +1373,7 @@ fn conf_030_handle_registration_lookup() {
         target: HandleTarget::Identity { did: did.clone() },
         metadata: None,
     };
-    let result = registry.register(&params, &did, &scp_primitives::SystemClock);
+    let result = registry.register(&params, &did, &scp_clock::SystemClock);
     assert!(
         result.entry_id.is_some(),
         "registration must return entry_id"
@@ -1416,7 +1418,7 @@ fn conf_031_agent_capability_search() {
         target: HandleTarget::Identity { did: did.clone() },
         metadata: None,
     };
-    registry.register(&params, &did, &scp_primitives::SystemClock);
+    registry.register(&params, &did, &scp_clock::SystemClock);
 
     print_step(2, "Lookup finds agent");
     let result = registry.lookup(&HandleLookupParams {
@@ -1475,7 +1477,7 @@ fn conf_033_cost_schedule() {
     let schedule = CostSchedule {
         currency: CurrencyCode::from("USD"),
         per_message: Some(Amount::new(100)),
-        per_tool_invoke: Some(Amount::new(500)),
+        per_outlet_call: Some(Amount::new(500)),
         per_join: Some(Amount::new(1000)),
         per_period: None,
         per_byte_stored: None,
@@ -1798,7 +1800,7 @@ async fn conf_040_cross_implementation_join() {
 
     print_step(1, "Implementation A creates context");
     let handle = ContextHandle::new("conf-040-ctx".to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await.unwrap();
+    handle.transition_to(&ContextState::Active).unwrap();
 
     let mut membership = MembershipState::new();
     membership.add_member(DID::from("did:dht:z6MkImplA"), "admin".to_owned(), vec![]);

@@ -1,0 +1,185 @@
+{
+  "version": "1.0",
+  "vectors": [
+    {
+      "name": "non_streaming",
+      "outlet_kind": "action",
+      "open": {
+        "request_id": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        "outlet_id": "outlet-non-streaming",
+        "input": { "a": 1, "b": 2 },
+        "invoker_did": "did:key:z6MkStreamVectorInvokerReference",
+        "credit_window": 32,
+        "estimated_chunk_count": 1,
+        "ucan_cid": "cid-non_streaming",
+        "expected_caveats_binding": "92888ab89b4b02190bb4f961a6b21fa6930a0798f639b73669e09b9e7af5897d",
+        "session_id": null,
+        "timeout_ms": 30000
+      },
+      "chunks": [
+        { "sequence": 0, "payload": { "@type": "data", "value": { "sum": 3 } } },
+        { "sequence": 1, "payload": { "@type": "end", "aggregate": { "sum": 3 }, "execution_time_ms": 1 } }
+      ],
+      "credits": [],
+      "expected_end_status": "Ok",
+      "expected_error_code": null
+    },
+    {
+      "name": "multi_chunk",
+      "outlet_kind": "query",
+      "open": {
+        "request_id": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+        "outlet_id": "outlet-multi-chunk",
+        "input": {},
+        "invoker_did": "did:key:z6MkStreamVectorInvokerReference",
+        "credit_window": 32,
+        "estimated_chunk_count": 10,
+        "ucan_cid": "cid-multi_chunk",
+        "expected_caveats_binding": "fe3a0bf5b7605475cde3f493a79b2415d930b55811a096cd1947514818a78a23",
+        "session_id": null,
+        "timeout_ms": 30000
+      },
+      "chunks": [
+        { "sequence": 0, "payload": { "@type": "data", "value": { "n": 0 } } },
+        { "sequence": 1, "payload": { "@type": "data", "value": { "n": 1 } } },
+        { "sequence": 2, "payload": { "@type": "data", "value": { "n": 2 } } },
+        { "sequence": 3, "payload": { "@type": "data", "value": { "n": 3 } } },
+        { "sequence": 4, "payload": { "@type": "data", "value": { "n": 4 } } },
+        { "sequence": 5, "payload": { "@type": "progress", "pct": 50, "note": "halfway" } },
+        { "sequence": 6, "payload": { "@type": "data", "value": { "n": 5 } } },
+        { "sequence": 7, "payload": { "@type": "data", "value": { "n": 6 } } },
+        { "sequence": 8, "payload": { "@type": "data", "value": { "n": 7 } } },
+        { "sequence": 9, "payload": { "@type": "data", "value": { "n": 8 } } },
+        { "sequence": 10, "payload": { "@type": "data", "value": { "n": 9 } } },
+        { "sequence": 11, "payload": { "@type": "end", "aggregate": { "total": 10 }, "execution_time_ms": 5 } }
+      ],
+      "credits": [],
+      "expected_end_status": "Ok",
+      "expected_error_code": null
+    },
+    {
+      "name": "cancellation",
+      "outlet_kind": "query",
+      "open": {
+        "request_id": [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
+        "outlet_id": "outlet-cancellation",
+        "input": {},
+        "invoker_did": "did:key:z6MkStreamVectorInvokerReference",
+        "credit_window": 32,
+        "estimated_chunk_count": 4,
+        "ucan_cid": "cid-cancellation",
+        "expected_caveats_binding": "d180c6bf8fca3bdae98afa81b36b63909f83fb342e017c87d0dbce28a8e1aba7",
+        "session_id": null,
+        "timeout_ms": 30000
+      },
+      "chunks": [
+        { "sequence": 0, "payload": { "@type": "data", "value": { "n": 0 } } },
+        { "sequence": 1, "payload": { "@type": "data", "value": { "n": 1 } } },
+        { "sequence": 2, "payload": { "@type": "data", "value": { "n": 2 } } },
+        { "sequence": 3, "payload": { "@type": "end", "aggregate": { "cancelled": true }, "execution_time_ms": 3 } }
+      ],
+      "credits": [
+        { "after_chunk_index": -1, "grant": 8, "monotonic_seq": 1 }
+      ],
+      "cancel_after_chunk_index": 1,
+      "expected_end_status": "Cancelled",
+      "expected_error_code": null
+    },
+    {
+      "name": "error_terminal",
+      "outlet_kind": "action",
+      "open": {
+        "request_id": [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
+        "outlet_id": "outlet-error-terminal",
+        "input": {},
+        "invoker_did": "did:key:z6MkStreamVectorInvokerReference",
+        "credit_window": 32,
+        "estimated_chunk_count": 1,
+        "ucan_cid": "cid-error_terminal",
+        "expected_caveats_binding": "5939e9c1a923c7ca1eb68578b6313d2e4124a717397728f7c6347354843e7955",
+        "session_id": null,
+        "timeout_ms": 30000
+      },
+      "chunks": [
+        { "sequence": 0, "payload": { "@type": "data", "value": { "n": 0 } } },
+        { "sequence": 1, "payload": { "@type": "error", "code": "SCP-OUTLET-6130", "message": "handler fault", "terminal": true } }
+      ],
+      "credits": [],
+      "expected_end_status": "Error",
+      "expected_error_code": "SCP-OUTLET-6130"
+    },
+    {
+      "name": "error_recoverable",
+      "outlet_kind": "query",
+      "open": {
+        "request_id": [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
+        "outlet_id": "outlet-error-recoverable",
+        "input": {},
+        "invoker_did": "did:key:z6MkStreamVectorInvokerReference",
+        "credit_window": 32,
+        "estimated_chunk_count": 4,
+        "ucan_cid": "cid-error_recoverable",
+        "expected_caveats_binding": "440f076cddc2a09da389195456db7cfbcfb9722dd09117f8c1f4ac6dd605b679",
+        "session_id": null,
+        "timeout_ms": 30000
+      },
+      "chunks": [
+        { "sequence": 0, "payload": { "@type": "data", "value": { "n": 0 } } },
+        { "sequence": 1, "payload": { "@type": "error", "code": "SCP-OUTLET-6160", "message": "transient", "terminal": false } },
+        { "sequence": 2, "payload": { "@type": "data", "value": { "n": 2 } } },
+        { "sequence": 3, "payload": { "@type": "data", "value": { "n": 3 } } },
+        { "sequence": 4, "payload": { "@type": "end", "aggregate": { "recovered": true }, "execution_time_ms": 4 } }
+      ],
+      "credits": [],
+      "expected_end_status": "Ok",
+      "expected_error_code": null
+    },
+    {
+      "name": "sequence_gap",
+      "outlet_kind": "query",
+      "open": {
+        "request_id": [6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6],
+        "outlet_id": "outlet-sequence-gap",
+        "input": {},
+        "invoker_did": "did:key:z6MkStreamVectorInvokerReference",
+        "credit_window": 32,
+        "estimated_chunk_count": 3,
+        "ucan_cid": "cid-sequence_gap",
+        "expected_caveats_binding": "e8080ce8c630d328878fcb7cdae304e89148af50bd6c649c591bbbaf9114cff9",
+        "session_id": null,
+        "timeout_ms": 30000
+      },
+      "chunks": [
+        { "sequence": 0, "payload": { "@type": "data", "value": { "n": 0 } } },
+        { "sequence": 1, "payload": { "@type": "data", "value": { "n": 1 } } },
+        { "sequence": 3, "payload": { "@type": "data", "value": { "n": 3 } } }
+      ],
+      "credits": [],
+      "expected_end_status": "Cancelled",
+      "expected_error_code": "SCP-OUTLET-6131"
+    },
+    {
+      "name": "credit_stall",
+      "outlet_kind": "query",
+      "open": {
+        "request_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+        "outlet_id": "outlet-credit-stall",
+        "input": {},
+        "invoker_did": "did:key:z6MkStreamVectorInvokerReference",
+        "credit_window": 1,
+        "estimated_chunk_count": 1,
+        "ucan_cid": "cid-credit_stall",
+        "expected_caveats_binding": "9d64021a32f434d7dc8139e71d97587c9ecce62686a150670791f68877ec063d",
+        "session_id": null,
+        "timeout_ms": 30000
+      },
+      "chunks": [
+        { "sequence": 0, "payload": { "@type": "data", "value": { "n": 0 } } },
+        { "sequence": 1, "payload": { "@type": "error", "code": "SCP-OUTLET-6133", "message": "credit stall", "terminal": true } }
+      ],
+      "credits": [],
+      "expected_end_status": "Error",
+      "expected_error_code": "SCP-OUTLET-6133"
+    }
+  ]
+}

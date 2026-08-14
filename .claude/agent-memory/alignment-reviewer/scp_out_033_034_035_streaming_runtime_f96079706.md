@@ -1,0 +1,28 @@
+---
+name: scp-out-033-034-035-streaming-runtime-f96079706
+description: Alignment review of SCP-OUT-033/034/035 same-context streaming runtime completion @ f96079706 (cancel-boundary billing, G4 code fix, cancel_ack_seq field, cost:None). ALIGNED w/ 1 MED + 2 LOW.
+metadata:
+  type: project
+---
+
+# SCP-OUT-033/034/035 same-context streaming runtime @ f96079706 (feat/outlet-xctx-streaming-saga, worktree scp-wt-slice3, 2026-07-14) — ALIGNED, 1 MED + 2 LOW + obs
+
+Flips 033/034/035 pending→done (resolves the 037/038/039-done-over-pending inversion). Five focus areas ALL substantively aligned.
+
+**Q1 cancel-boundary billing = ALIGNED (faithful).** Pump gate `apply_stream_chunk_gate` (invoke.rs:2533) drops non-terminal Data at `sequence >= cancel_ack_seq` (`>=` boundary, invoke.rs:2551), terminal occupies cancel_ack_seq per §5.4.5:530(3); inclusive `compute_chunks_billed_ref` (i<=cancel_ack_seq) correctly reduces to Data at seq<cancel_ack_seq because the slot holds the non-Data terminal. Rejecting "Data-at-cancel_ack_seq" alt was CORRECT (§5.4.5:530(1) in-flight-at-that-seq NOT billable). Over-bill-by-one fix legit. AC24 (uncancelled→u64::MAX ceiling), AC25 (cancel@5, 8 Data→billed=5) hold. NOTE: AC22/23 verifier test uses synthetic manifest w/ Data@cancel_ack_seq=5 (inclusive count=6) — that's a GENERIC verifier unit test of the inclusive formula, NOT a pump manifest; no contradiction (verifier spec-faithful to inclusive predicate, pump guarantees terminal-in-slot).
+
+**Q2 G4 (§5.4.5:521 6100→6101) = ALIGNED, legit spec-internal typo fix.** §5.4.4 taxonomy (05-contexts.md:305/318/319) = 6100 protocol.violation, 6101 protocol.session (session-lifecycle, houses context-closed-mid-stream). error_codes.rs CODE_PROTOCOL_SESSION=6101 matches §5.4.4. §5.4.5:521 typo'd 6100, contradicting §5.4.4. Fix reconciles spec→spec (§5.4.4 authoritative); code already matched. NOT code-informs-spec.
+
+**Q3 cancel_ack_seq: Option<u64> on OutletInvokedEvent = ALIGNED.** Some=ceiling, None=u64::MAX ceiling; `skip_serializing_if=Option::is_none` keeps non-cancel wire bytes byte-identical (KAT-safe). Faithful to §5.4.5:558-566 prose. Populated from CancelAckTracker read BEFORE record_terminal (dispatch.rs:3164).
+
+**Q4 033/034/035 vs ACs + roadmap = ALIGNED (1 MED caveat).** invoke_outlet rewritten to mpsc stream (033 AC1); one-shot→2-chunk event proven (035 AC5/AC6 test invoke_outlet_one_shot_emits_two_chunk_event_035_ac5, stream_chunk_count==2 via one_shot_to_stream+pump). Serves slice-3 seal-phase FSM (cancel_ack_seq + manifest chunks_billed integrity recorded).
+
+**Q5 cost:None on streaming event = ALIGNED.** §5.4.5:570-579 event shape omits cost; §5.4.5:555+§19.15.5 put billed amount in close-time PaymentReceipt. build_streaming_outlet_event (invoke.rs:3838) sets cost:None w/ explicit spec-cited rationale (recording it would duplicate receipt's authoritative amount = divergence). CORRECT.
+
+## FINDINGS
+- **MEDIUM (§5.4.5:566 wire-rejection locus / claim accuracy):** `append_outlet_invoked_verified` (event_log.rs:~264, the dedicated log-insert wire-rejection appender) has ZERO production callers — all 3 call sites are in `mod tests` (event_log.rs:1158/1185/1224, mod tests @934). Commit msg frames it as live "wire-rejection at log-insert (Sequence for one-shot/xctx/import, Frontier for pump)". Reality: production streaming pump (dispatch.rs:3291) runs `verify_outlet_invoked_event_manifest` INLINE with Frontier + DROPS on mismatch, then `sink.record` (append_event runs only weak <=count backstop). So the same-context streaming economic invariant IS upheld (inline drop-on-mismatch — money-safe for 033/034/035), but the Sequence-source log-insert appender is unwired ahead of its xctx/import production callers (slice-3 future). Inline check is self-consistency (event built from frontier, verified vs frontier — payload set dropped per ADR-061, so no independent re-derivation possible same-context). Either scope the claim or wire the appender when xctx lands.
+- **LOW (incorrect comment):** `CancelAckTracker::cancel_ack_seq()` (runtime stream.rs:1076) doc says "Returns Some(cancel_ack_seq) when Pending or Closed" but code returns None for Closed (Closed variant doesn't retain the value). Cosmetic: every close-path read precedes record_terminal() (state=Pending), so functionally correct; comment is wrong.
+- **LOW (spec struct-sketch incomplete):** §5.4.5 "Event log shape" OutletInvokedEvent block lists only 4 stream fields; prose §5.4.5:558-566 mandates recording the cancel-ack seq and code adds cancel_ack_seq. Sketch should list `cancel_ack_seq: Option<u64>` for spec-code parity. Provenance holds via prose.
+- **OBSERVATION (two event shapes / roadmap coherence):** streaming path (cost:None, manifest, stream_chunk_count>=2) coexists w/ pre-existing unary "aggregating" path (build_outlet_event invoke.rs:725 → cost:Some, stream_chunk_count:0, no manifest; callers invoke_outlet_aggregating/with_cancellation_aggregating/with_economy — the ADR-061 unary-delivery mode). §5.4.5:607 mandates streaming wire form universally ("non-streaming = 2-chunk stream"). This commit only mechanically adds cancel_ack_seq:None default to build_outlet_event (untouched otherwise). The unary path's stream_chunk_count:0 events don't match §5.4.5's 2-chunk degenerate shape — confirm intended ADR-061 end-state vs transitional. Also: since all same-context invokes now stream, OutletInvokedEvent.cost is None on that path; consumers derive economics from chunks_billed×registered-cost or PaymentReceipt.
+
+VERDICT: ALIGNED. No blocker; MED is wiring/claim-accuracy (invariant still upheld inline), LOWs are cosmetic/spec-completeness.

@@ -12,12 +12,34 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 default = ["server"]
-allow_in_memory_custody = ["scp-platform/testing", "dep:scp-testing"]
 # Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
 server = ["scp-ffi-common/server", "dep:scp-node"]
 # Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
 # be enabled in production builds; the parity harness (ADR-046) enables it.
-testing = ["scp-core/testing"]
+# Single test-harness feature (ADR-062 §Decision 6): folds in every in-memory
+# nullifier double. `scp-platform/testing` compiles `InMemoryKeyCustody`/
+# `InMemoryDeviceAttestation`/`InMemoryPreRotationCustody` (the §17.17.2 security
+# nullifiers, formerly behind the deleted custody switch); `scp-dht/testing`
+# makes the `InMemoryDhtClient` resolve nullifier nameable (ADR-062 §Decision 1);
+# `scp-ffi-common/testing` makes the shared `FfiDhtClient::InMemory` arm nameable
+# so the test/parity DHT seam (`build_shared_dht_client`) compiles without
+# `--tests` (dev-deps absent); `dep:scp-testing` pulls the full-stack harness.
+# `scp-platform/testing` and `scp-dht/testing` appear ONLY in this `testing`
+# list — never in default/server/other lists (G1 proves absence from shipped).
+testing = [
+    "scp-core/testing",
+    "scp-dht/testing",
+    "scp-ffi-common/testing",
+    "scp-platform/testing",
+    "dep:scp-testing",
+]
+# §5.4.5 live-stream outlet test authorization seam
+# (`Supervisor::test_grant_member_capability`). An AUTHORITY-ESCALATION
+# primitive, so it is a DEDICATED leaf feature — deliberately NOT implied by
+# `testing` (which leaks into every bridge test build) — mirroring
+# scp-ffi's `outlet-capability-test-grant`. Enabled ONLY by the outlet-stream
+# live-flow test lane. See scp-runtime/Cargo.toml and SCP-OUT-037 (C8a).
+outlet-capability-test-grant = ["scp-core/outlet-capability-test-grant"]
 
 [dependencies]
 napi = { version = "3", default-features = false, features = ["napi9", "tokio_rt", "async", "error_anyhow"] }
@@ -39,18 +61,24 @@ ed25519-dalek = { workspace = true }
 tls_codec = "0.4"
 scp-core = { path = "../../scp-core" }
 scp-media = { path = "../../scp-media" }
-scp-primitives = { path = "../../scp-primitives" }
+scp-clock = { path = "../../scp-clock" }
+scp-did = { path = "../../scp-did" }
 scp-identity = { path = "../../scp-identity" }
+# `production-dht` compiles the real Mainline `PkarrDhtClient` — the single
+# shipped DHT backend the bridge fails closed onto (ADR-062 §Decision 1). The
+# in-memory nullifier is NOT enabled here (only under the `testing` feature).
+scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common", features = ["custody"] }
 scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
-# `testing` is enabled unconditionally (matching the PyO3 bridge) so the
-# identity registry, retained-custody state, and the cold-storage
-# `InMemoryPreRotationCustody` are available in production builds. These types
-# back the production callback-custody path (`identityCreateWithCustody`) —
-# `allow_in_memory_custody` remains a pure code-level gate over the in-memory
-# custody *backend* only, not over the registry/retention machinery. See ADR-006.
-scp-platform = { path = "../../scp-platform", features = ["testing", "encrypting", "filesystem", "sqlite"] }
+# Production dep line: durability-only `in-memory-storage` (the shippable
+# `{"type":"in_memory"}` storage affordance, SCP-CAPSEL-8011) plus
+# `software_platform` for the crypto primitives — NEVER `testing` (ADR-062
+# §Decision 6). The in-memory custody/attestation/pre-rotation nullifiers are
+# NOT reachable in production: production pre-rotation create FAILS CLOSED with a
+# typed `IdentityError` (SCP-IDENT-1059) rather than mint `InMemoryPreRotationCustody`.
+# The `testing` crate-feature adds `scp-platform/testing` on top for test builds.
+scp-platform = { path = "../../scp-platform", features = ["software_platform", "in-memory-storage", "encrypting", "filesystem", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-testing = { path = "../../scp-testing", optional = true }
 scp-transport = { path = "../../scp-transport" }
@@ -60,6 +88,11 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 scp-ffi-common = { path = "../common", features = ["testing", "custody"] }
+# This bridge constructs `InMemoryDhtClient` in its own tests (identity.rs,
+# scp.rs) which is gated behind `scp-dht/testing`; activate it for this crate's
+# test build (ADR-062 §Decision 1). `scp-dht/testing` never appears in a
+# non-testing feature list.
+scp-dht = { path = "../../scp-dht", features = ["testing"] }
 tempfile = "3"
 # Provides weak C stubs for napi runtime symbols so the test binary
 # can link without a Node.js runtime. Kept as a dev-dependency so

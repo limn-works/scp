@@ -17,10 +17,7 @@
 //! `#[napi]` wrapper and maps the structured errors below to its own error type
 //! and code (ADR-048 §7 per-SDK idiom — only the value-shape logic is shared).
 //!
-//! The WASM bridge does NOT depend on `scp-ffi-common` (ADR-034) and keeps its
-//! own inline copy.
-//!
-//! Requires the `resolvers` feature (scp-core). Not available for WASM.
+//! Requires the `resolvers` feature (scp-core).
 
 use scp_core::context::broadcast::{KeyRequestDecision, SealedBroadcastKey};
 use scp_core::crypto::sender_keys::broadcast::open_broadcast_key;

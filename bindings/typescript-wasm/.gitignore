@@ -1,0 +1,10 @@
+node_modules/
+dist/
+bun.lock
+bun.lockb
+*.tsbuildinfo
+# wasm-pack output — generated into the source tree by `bun run build:wasm`
+# (tsup bundles it into dist/). Regenerated on every build; never committed.
+src/wasm/
+# Test-only wasm build (`--features testing`) driven by the real-wasm e2e suite.
+tests/.wasm-test/

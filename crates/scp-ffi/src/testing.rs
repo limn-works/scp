@@ -20,16 +20,15 @@
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice E (#1549).
 //!
-//! Feature-gated behind `allow_in_memory_custody` -- never compiled into
+//! Feature-gated behind `testing` -- never compiled into
 //! production builds.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use scp_core::context::governance::KeyResolver;
-use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, context_id_bytes};
+use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 
 use crate::runtime::PyBridgeInstance;
@@ -66,11 +65,6 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let network = guard.get_or_insert_with(FullStackNetwork::new);
     f(network)
-}
-
-/// Returns a permissive key resolver that always returns `None`.
-fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &scp_identity::DID, _kid: scp_identity::SigningKeyId| None)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +115,7 @@ impl PyFullStackNode {
 fn fullstack_create_node_impl(bi: &PyBridgeInstance, did: String) -> PyFullStackNode {
     let instance_id = bi.core.instance_id();
     with_network(bi, |network| {
-        let node = network.create_node(&did, permissive_key_resolver());
+        let node = network.create_node(&did);
         PyFullStackNode {
             inner: node,
             handles: Mutex::new(HashMap::new()),
@@ -166,7 +160,7 @@ fn fullstack_create_context_impl(
             |arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
-                    .map(Capability::new)
+                    .filter_map(Capability::new)
                     .collect::<Vec<_>>()
             },
         );
@@ -222,88 +216,68 @@ fn fullstack_add_member_impl(
         })
 }
 
-/// Joins a context by retrieving the Welcome from the shared `KeyExchange`.
+/// Joins a context from the sealed invitation the creator deposited in the
+/// shared `KeyExchange`, standing up a live, send-capable per-context ACTOR via
+/// `Supervisor::spawn_actor_from_welcome` (ADR-049 §9 2F-residual).
 ///
-/// The joiner's `E2eCryptoProvider` processes the Welcome and picks up the
-/// access/sender keys so it can DECRYPT messages from the creator. It does
-/// NOT register a per-context send `ContextHandle`: the actor-per-context
-/// model has no spawn-from-Welcome entrypoint yet (the separate
-/// Welcome-Delivery work item), so a subsequent `fullstack_send_message` on a
-/// Welcome-joined node fails closed with "context not found in node's
-/// handles". The unidirectional path (creator sends, joiner decrypts) is
-/// fully supported.
+/// The joiner opens the creator-signed, HPKE-sealed bundle under its #active
+/// split custody, installs the joined MLS group, spawns the actor, and picks up
+/// the inviter-minted access keys + HPKE-sealed sender-key distribution. The
+/// joiner IS now a registered, send-capable participant — a subsequent
+/// `fullstack_send_message` on a Welcome-joined node succeeds (bidirectional).
 fn fullstack_join_from_welcome_impl(
     bi: &PyBridgeInstance,
     node: &PyFullStackNode,
     context_id: String,
 ) -> PyResult<()> {
     crate::pyscp_check_handle!(&bi.core, node);
-    let ctx_bytes = context_id_bytes(&context_id);
+    let rt = crate::runtime()?;
+    // ADR-056: key the shared crypto under the canonical digest via the
+    // chokepoint, never the raw routing primitive (which double-hashes a real
+    // 64-hex id and would diverge from the creator's deposit slot).
+    let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
 
-    // ADR-049 commit 12c.9f: the joiner's MLS group, sender keys, and access
-    // keys live directly in its `E2eCryptoProvider` (the joiner has no context
-    // actor). `join_from_welcome` forms the group from the captured Welcome,
-    // picks up the inviter-minted access keys, processes the inviter's
-    // HPKE-sealed sender-key distribution, and applies any epoch-advance
-    // Commits — all real crypto.
-    node.inner
-        .join_from_welcome(&context_id, &ctx_bytes)
+    // The joiner reserves its own KeyPackage, the creator's `invite_member`
+    // seals the Welcome, and `spawn_actor_from_welcome` opens it under split
+    // custody, installs the joined group, and registers a live actor. The
+    // returned `ContextHandle` is stored in the node's handle map so a
+    // subsequent `fullstack_send_message` on this joiner resolves it — the
+    // joiner is now a bidirectional, send-capable participant.
+    let handle = rt
+        .block_on(node.inner.join_from_welcome(&context_id, &ctx_bytes))
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to join from Welcome: {e}"))
-        })
+        })?;
+    node.handles
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(context_id, handle);
+    Ok(())
 }
 
 /// Synchronises sender keys between two nodes for a given context.
 ///
-/// Each node distributes its own sender key to the other via the shared
-/// `KeyExchange`, then picks up the other's key. After this call, both
-/// nodes can encrypt and decrypt messages from each other.
+/// ADR-049 PR-7 (SCP-CRYPTOMOVE-001): sender keys are no longer shuffled by an
+/// explicit provider `distribute` / `pickup`. The inviter's in-actor MLS add
+/// pushes its MLS-wrapped sender key onto the transport during
+/// `fullstack_add_member`, and the joiner ingests it through the REAL actor
+/// receive path during `fullstack_join_from_welcome` — so both nodes can
+/// encrypt and decrypt each other's traffic by the time they finish joining,
+/// with no manual key shuffle.
+///
+/// This call is retained as a no-op beyond the per-instance handle-affinity
+/// guard so existing harness scripts and the ADR-048 handle-affinity
+/// conformance test keep a stable API surface.
 fn fullstack_sync_sender_keys_impl(
     bi: &PyBridgeInstance,
     node_a: &PyFullStackNode,
     node_b: &PyFullStackNode,
-    context_id: String,
+    _context_id: String,
 ) -> PyResult<()> {
     // Both nodes must have been minted by this bridge — mixing nodes
     // from two different `SCP` instances would cross-wire the shared
     // `KeyExchange` used for sender key distribution.
     crate::pyscp_check_handle!(&bi.core, node_a, node_b);
-    let ctx_bytes = context_id_bytes(&context_id);
-    let did_a = node_a.inner.did.to_string();
-    let did_b = node_b.inner.did.to_string();
-
-    // A distributes to B, B distributes to A.
-    node_a
-        .inner
-        .crypto
-        .distribute_sender_key(&ctx_bytes, &did_b)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to distribute sender key from A to B: {e}"
-            ))
-        })?;
-    node_b
-        .inner
-        .crypto
-        .distribute_sender_key(&ctx_bytes, &did_a)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to distribute sender key from B to A: {e}"
-            ))
-        })?;
-
-    // Both pick up the other's key.
-    node_a.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "failed to pick up sender keys for A: {e}"
-        ))
-    })?;
-    node_b.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "failed to pick up sender keys for B: {e}"
-        ))
-    })?;
-
     Ok(())
 }
 
@@ -357,10 +331,15 @@ fn fullstack_decrypt_message_impl<'py>(
     sender_did: String,
 ) -> PyResult<Bound<'py, PyBytes>> {
     crate::pyscp_check_handle!(&bi.core, node);
-    let ctx_bytes = context_id_bytes(&context_id);
-    let plaintext = node
-        .inner
-        .decrypt_message(&context_id, &ctx_bytes, ciphertext, &sender_did)
+    // ADR-056: key decryption under the canonical digest via the chokepoint,
+    // never the raw routing primitive.
+    let ctx_bytes = scp_core::context::state::context_id_to_bytes(&context_id);
+    let rt = crate::runtime()?;
+    let plaintext = rt
+        .block_on(
+            node.inner
+                .decrypt_message(&context_id, &ctx_bytes, ciphertext, &sender_did),
+        )
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("failed to decrypt message: {e}"))
         })?;
@@ -392,7 +371,7 @@ fn fullstack_remove_member_impl(
     rt.block_on(node.inner.manager.leave_context(
         &handle,
         &node.inner.did,
-        &scp_identity::DID::from(member_did.as_str()),
+        &scp_did::DID::from(member_did.as_str()),
     ))
     .map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("failed to remove member: {e}"))
@@ -438,7 +417,7 @@ fn fullstack_seed_peer_pseudonym_impl(
     let rt = crate::runtime()?;
     rt.block_on(node.inner.manager.seed_peer_pseudonym(
         &context_id,
-        scp_identity::DID::from(peer_did.as_str()),
+        scp_did::DID::from(peer_did.as_str()),
         arr,
     ))
     .map_err(|e| {
@@ -625,7 +604,7 @@ mod handle_affinity_tests {
     /// The fix adds `pyscp_check_handle!` as the first statement; this
     /// test would regress if a future refactor removes it.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn fullstack_helpers_reject_cross_instance_node() {
         // Two separate bridge instances with distinct ids. `new_py()`
         // assigns monotonic, process-unique ids so the instances have
@@ -753,7 +732,7 @@ mod handle_affinity_tests {
     /// affinity check runs BEFORE any of that). A deliberate mismatch
     /// sanity-checks that the test is actually testing what it claims.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn fullstack_helpers_accept_same_instance_node() {
         let bi_arc = std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py());
         let bi = &*bi_arc;

@@ -53,10 +53,10 @@ use crate::context::queries_helpers;
 /// run loop owns it; a `&mut` referent keeps the spawned dispatch future
 /// `Send`, which a shared `&ClassSCell` would not because `ClassSCell` is
 /// not `Sync`). The body only READS the owned state through
-/// [`Deref`](std::ops::Deref) — no [`ClassSCell::state_mut`] escape hatch
+/// [`Deref`](std::ops::Deref) — no `ClassSCell::state_mut` escape hatch
 /// (ADR-049 §9). Every helper called here takes `&PerContextState`; the
-/// only async read ([`queries_helpers::read_context_state`]) drives
-/// `handle.state()`, which is itself `&self`, so a shared borrow suffices.
+/// lifecycle-state read is the lock-free `handle.state()` atomic load,
+/// which takes `&self`, so a shared borrow suffices.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch(
     cell: &mut ClassSCell,
@@ -69,7 +69,7 @@ pub(crate) async fn dispatch(
             context_id: _,
             reply,
         } => {
-            let answer = queries_helpers::read_context_state(state.handle.clone()).await;
+            let answer = state.handle.state();
             let _ = reply.send(Ok(answer));
             Outcome::ok(())
         }
@@ -161,18 +161,18 @@ pub(crate) async fn dispatch(
             Outcome::ok(())
         }
 
-        QueriesCommand::HasEstablishedToolInterface {
+        QueriesCommand::HasEstablishedOutletInterface {
             context_id: _,
             source_context_hex,
             target_context_hex,
-            tool_registration_id,
+            outlet_registration_id,
             reply,
         } => {
-            let answer = queries_helpers::has_established_tool_interface(
+            let answer = queries_helpers::has_established_outlet_interface(
                 state,
                 &source_context_hex,
                 &target_context_hex,
-                &tool_registration_id,
+                &outlet_registration_id,
             );
             let _ = reply.send(Ok(answer));
             Outcome::ok(())

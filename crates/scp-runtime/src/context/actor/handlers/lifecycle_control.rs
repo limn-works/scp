@@ -8,18 +8,18 @@
 //! plan section titles in quoted form.
 #![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
 //!
-//! These handlers respond to supervisor-originated Pause / Resume /
-//! Shutdown / PersistSync commands. Commit 6 lands the dispatch stub
-//! that ACKS with `Ok(())` for the lifecycle control commands — the
-//! `BridgeInstanceCore::suspend()` default trait method sends `Pause`
-//! and `PersistSync` against the actor handle and expects an ack so
-//! the suspend flow completes.
+//! These handlers respond to supervisor-originated Pause / Shutdown /
+//! PersistSync / PrepareForReplace commands, running on actor-owned
+//! state: `Pause` flips `lifecycle_state` to `Closing` and `Shutdown`
+//! flips it to `Closed` through the actor's Class-C view (ADR-049 §9).
 //!
-//! The ack-with-`Ok` (rather than `NotImplemented`) keeps the suspend
-//! path from erroring out during commit 6. Actual persist-sync logic
-//! migrates in commit 11; before that, the handler has no persist
-//! buffer to flush because no state mutation has happened through the
-//! actor path yet.
+//! `PersistSync` acks with `Ok(())` (rather than `NotImplemented`) so
+//! the `BridgeInstanceCore::suspend()` default trait method — which
+//! sends `Pause` then `PersistSync` against the actor handle and
+//! expects acks — can complete its suspend sequence. That arm is a
+//! no-op today: handler mutations persist synchronously through the
+//! per-handler persistence helpers, so there is no separate actor-side
+//! persist buffer for `PersistSync` to flush.
 
 use scp_protocol::context::{ContextError, ContextState};
 
@@ -31,10 +31,10 @@ use crate::context::actor::state::ContextLifecycleState;
 
 /// Dispatch a [`LifecycleControlCommand`] against actor state.
 ///
-/// Commit 6 handles lifecycle control commands synchronously and with
-/// an `Ok` reply so the bridge's `suspend()` default body can complete.
-/// The state mutations (e.g. flipping `lifecycle_state` to `Closing`)
-/// are minimal and locally-owned — no persistence, no transport.
+/// Handles lifecycle control commands synchronously and with an `Ok`
+/// reply so the bridge's `suspend()` default body can complete. The
+/// state mutations (e.g. flipping `lifecycle_state` to `Closing`) are
+/// minimal and locally-owned — no persistence, no transport.
 pub(crate) async fn dispatch(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
@@ -50,9 +50,10 @@ pub(crate) async fn dispatch(
             Outcome::ok_mutated(())
         }
         LifecycleControlCommand::PersistSync { reply } => {
-            // Commit 6: nothing to persist through the actor path yet
-            // because the legacy `ContextManager` still owns mutating
-            // paths. Acking with Ok matches the eventual semantics —
+            // Nothing to persist through a dedicated actor-side buffer:
+            // handler mutations persist synchronously via the
+            // per-handler persistence helpers, so no pending buffer
+            // remains to flush. Acking with Ok matches the semantics —
             // "persist buffer is empty, sync returns immediately".
             let _ = reply.send(Ok(()));
             Outcome::ok(())
@@ -114,16 +115,14 @@ fn handle_prepare_for_replace(
     // and is no longer serving the context — so it is replaceable, exactly
     // like the terminal states. Including it here lets an import / replace
     // recover a poisoned id without first requiring an operator `clear_poison`.
-    let replaceable = cell.handle.try_read_state().is_some_and(|s| {
-        matches!(
-            s,
-            ContextState::Closing
-                | ContextState::Closed
-                | ContextState::Expired
-                | ContextState::Tombstoned
-                | ContextState::Poisoned
-        )
-    });
+    let replaceable = matches!(
+        cell.handle.state(),
+        ContextState::Closing
+            | ContextState::Closed
+            | ContextState::Expired
+            | ContextState::Tombstoned
+            | ContextState::Poisoned
+    );
     if !replaceable {
         let _ = reply.send(Err(ContextError::MembershipFailed(
             "context already exists — cannot import".to_owned(),
@@ -131,23 +130,35 @@ fn handle_prepare_for_replace(
         return Outcome::ok(());
     }
 
-    // §23.17 Invariant 3/4: capture-before-teardown + restore + validate/merge
-    // the per-sender epoch floors (replay-regression guard), via the SINGLE
-    // floor-guarded helper shared with the supervisor-side import branches so
-    // no path can bypass the guard. On any failure (e.g. a
-    // `SnapshotFloorRegression` replay rejection) the helper has already rolled
-    // back the crypto; surface the error and leave the actor live (NO terminal
-    // claim) so a rejected/replayed import cannot terminate a live context.
-    // `PrepareForReplace` is driven by `import_context` — an UNTRUSTED peer
-    // snapshot. Use Invariant 3 (reject-on-regression): `trusted_local = false`.
-    if let Err(e) = crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
+    // §23.17 Invariant 3/4: run the per-sender epoch-floor validate/merge GATE
+    // (replay-regression guard) via the SINGLE floor-guarded helper shared with
+    // the supervisor-side import flow so no path can bypass the guard. On any
+    // failure (e.g. a `SnapshotFloorRegression` replay rejection) surface the
+    // error and leave the actor live (NO terminal claim) so a rejected/replayed
+    // import cannot terminate this context. `PrepareForReplace` is driven by
+    // `import_context` — an UNTRUSTED peer snapshot. Use Invariant 3
+    // (reject-on-regression): `trusted_local = false`.
+    //
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001) C3 seed-vs-terminal: this actor is
+    // TERMINATING (it claims itself `Closed` and exits just below), so it SEEDS
+    // NOTHING — the OWNED crypto material the helper rebuilds here is DROPPED
+    // immediately (the `Ok(_owned)` arm), zeroizing on drop. Its ONLY purpose on
+    // this path is to run the floor gate as the reject-before-terminal barrier.
+    // `import_context` rebuilds + SEEDS the owned crypto onto the fresh
+    // replacement actor after this actor is despawned; the floor merge is
+    // idempotent, so running it here (gate) and there (seed) is safe, and no two
+    // live copies ever seal (the dropped copy never encrypts anything).
+    match crate::context::lifecycle_helpers::restore_crypto_state_with_floor_guard(
         deps,
         &ctx_id_bytes,
         mls_state,
         false,
     ) {
-        let _ = reply.send(Err(e));
-        return Outcome::ok(());
+        Ok(_owned) => { /* terminal actor seeds nothing — drop the owned material */ }
+        Err(e) => {
+            let _ = reply.send(Err(e));
+            return Outcome::ok(());
+        }
     }
 
     // Claim the slot terminal (rejects a racing second PrepareForReplace)

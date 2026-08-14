@@ -1,7 +1,7 @@
 //! Context nesting: parent-child relationships for SCP contexts (spec section 5.13).
 //!
 //! A child context is a full context -- its own MLS group, event log, governance,
-//! roles, tools, ceiling, and membership -- that is structurally and
+//! roles, outlets, ceiling, and membership -- that is structurally and
 //! cryptographically linked to one or more parent contexts. The parent
 //! relationship constrains the child:
 //!
@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::roles::{Capability, CapabilityCeiling};
-use scp_primitives::DID;
+use scp_did::DID;
 
 /// Context identifier (string alias used throughout the context module).
 pub type ContextId = String;
@@ -75,8 +75,8 @@ pub enum OnSeverPolicy {
 pub enum ApprovalRequirement {
     /// Changes to the child's governance model.
     GovernanceChange,
-    /// New tools registered in the child.
-    ToolRegistration,
+    /// New outlets registered in the child.
+    OutletRegistration,
     /// Modifications to the child's capability ceiling (only applicable
     /// if the child has `Governed` ceiling policy).
     CeilingChange,
@@ -251,62 +251,12 @@ pub enum SeverAction {
     Orphaned,
 }
 
-// ---------------------------------------------------------------------------
-// MlsGroupContextExtension
-// ---------------------------------------------------------------------------
-
-/// Data for the MLS `group_context` extensions field that binds parent lineage
-/// into the child's cryptographic group identity.
-///
-/// Includes parent context IDs and the content hash of each parent's governance
-/// config. This makes lineage unforgeable -- claiming different parents after
-/// creation would require a new MLS group with a different `group_id`.
-///
-/// See spec section 5.13.3 (Cryptographic binding).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MlsGroupContextExtension {
-    /// Parent context IDs in deterministic order (sorted).
-    pub parent_context_ids: Vec<ContextId>,
-    /// Content hash of the combined parent governance configurations.
-    /// SHA-256 over the concatenation of individual config hashes (sorted by
-    /// parent context ID).
-    pub governance_config_hash: [u8; 32],
-}
-
-impl MlsGroupContextExtension {
-    /// Constructs the extension from parent references.
-    ///
-    /// Parent IDs are sorted to ensure deterministic ordering. The governance
-    /// config hash is computed over the concatenation of individual config
-    /// content hashes (sorted by parent context ID).
-    /// # Errors
-    ///
-    /// Returns [`NestingError::SerializationFailed`] if any parent's governance
-    /// configuration cannot be serialized.
-    pub fn from_parents(parents: &[ParentRef]) -> Result<Self, NestingError> {
-        let mut sorted_parents: Vec<&ParentRef> = parents.iter().collect();
-        sorted_parents.sort_by(|a, b| a.context_id.cmp(&b.context_id));
-
-        let parent_context_ids: Vec<ContextId> = sorted_parents
-            .iter()
-            .map(|p| p.context_id.clone())
-            .collect();
-
-        // Hash concatenation of individual governance config hashes.
-        let mut hasher = Sha256::new();
-        for parent in &sorted_parents {
-            hasher.update(parent.governance_config.content_hash()?);
-        }
-        let result = hasher.finalize();
-        let mut governance_config_hash = [0u8; 32];
-        governance_config_hash.copy_from_slice(&result);
-
-        Ok(Self {
-            parent_context_ids,
-            governance_config_hash,
-        })
-    }
-}
+// The MLS `group_context` extension that binds context parameters (including
+// parent lineage) into the child's cryptographic group identity is defined by
+// [`ScpContextExtension`](super::group_context_extension::ScpContextExtension)
+// (spec §5.13.3). Its parent-governance hash is computed via
+// [`ScpContextExtension::parent_governance_hash`], which supersedes the earlier
+// `MlsGroupContextExtension` type that lived here.
 
 // ---------------------------------------------------------------------------
 // ContextNesting
@@ -581,18 +531,15 @@ impl ContextNesting {
         }
     }
 
-    /// Constructs the MLS `group_context` extension for this nesting relationship.
+    /// Returns the parent references for this nesting relationship.
     ///
-    /// Includes parent context IDs and governance config content hash. This
-    /// makes the parent lineage part of the child's cryptographic group
-    /// identity.
-    /// # Errors
-    ///
-    /// Returns [`NestingError::SerializationFailed`] if governance config
-    /// serialization fails.
-    pub fn mls_group_context_extension(&self) -> Result<MlsGroupContextExtension, NestingError> {
-        let refs: Vec<ParentRef> = self.parents.values().cloned().collect();
-        MlsGroupContextExtension::from_parents(&refs)
+    /// Used by the runtime to assemble the child's
+    /// [`ScpContextExtension`](super::group_context_extension::ScpContextExtension)
+    /// (spec §5.13.3): the parent-governance hash is derived from these via
+    /// [`ScpContextExtension::parent_governance_hash`](super::group_context_extension::ScpContextExtension::parent_governance_hash).
+    #[must_use]
+    pub fn parent_refs(&self) -> Vec<ParentRef> {
+        self.parents.values().cloned().collect()
     }
 
     /// Marks the child context as closed.
@@ -751,7 +698,7 @@ mod tests {
         let intersection = compute_ceiling_intersection(&[parent]);
         assert!(intersection.contains(&Capability::MessagesRead));
         assert!(intersection.contains(&Capability::MessagesWrite));
-        assert!(!intersection.contains(&Capability::ToolInvokeAll));
+        assert!(!intersection.contains(&Capability::OutletCallAll));
     }
 
     #[test]
@@ -761,7 +708,7 @@ mod tests {
             &[
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
-                Capability::ToolInvokeAll,
+                Capability::OutletCallAll,
             ],
             &[],
             OnSeverPolicy::EvictUniqueMembers,
@@ -776,8 +723,8 @@ mod tests {
         assert!(intersection.contains(&Capability::MessagesRead));
         assert!(intersection.contains(&Capability::MessagesWrite));
         assert!(
-            !intersection.contains(&Capability::ToolInvokeAll),
-            "ToolInvokeAll is only in parent A, not in intersection"
+            !intersection.contains(&Capability::OutletCallAll),
+            "OutletCallAll is only in parent A, not in intersection"
         );
     }
 
@@ -1352,11 +1299,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // MLS group_context extension
+    // Parent references (used to assemble ScpContextExtension, spec §5.13.3)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn mls_extension_includes_parent_ids_sorted() {
+    fn parent_refs_returns_all_parents() {
         let alice = did("Alice");
         let parent_b = make_parent(
             "B",
@@ -1382,82 +1329,13 @@ mod tests {
         )
         .unwrap();
 
-        let ext = nesting.mls_group_context_extension().unwrap();
-        assert_eq!(ext.parent_context_ids, vec!["A", "B"]);
-    }
-
-    #[test]
-    fn mls_extension_governance_hash_is_deterministic() {
-        let alice = did("Alice");
-        let parent = make_parent(
-            "A",
-            &[Capability::MessagesRead, Capability::ChildContextCreate],
-            &[alice.clone()],
-            OnSeverPolicy::EvictUniqueMembers,
-        );
-
-        let nesting = ContextNesting::new(
-            "child-1".to_owned(),
-            vec![parent.clone()],
-            make_ceiling(&[Capability::MessagesRead]),
-            &alice,
-            &approvals(&["A"]),
-            1,
-            None,
-        )
-        .unwrap();
-
-        let ext1 = nesting.mls_group_context_extension().unwrap();
-
-        // Create another identical nesting to verify hash determinism.
-        let nesting2 = ContextNesting::new(
-            "child-2".to_owned(),
-            vec![parent],
-            make_ceiling(&[Capability::MessagesRead]),
-            &alice,
-            &approvals(&["A"]),
-            1,
-            None,
-        )
-        .unwrap();
-
-        let ext2 = nesting2.mls_group_context_extension().unwrap();
-        assert_eq!(ext1.governance_config_hash, ext2.governance_config_hash);
-    }
-
-    #[test]
-    fn mls_extension_different_config_produces_different_hash() {
-        let alice = did("Alice");
-
-        let parent_a = ParentRef {
-            context_id: "A".to_owned(),
-            ceiling: make_ceiling(&[Capability::MessagesRead, Capability::ChildContextCreate]),
-            governance_config: ParentGovernanceConfig {
-                can_close_child: true,
-                can_evict_members: false,
-                can_restrict_ceiling: false,
-                requires_approval_for: BTreeSet::new(),
-                on_sever: OnSeverPolicy::CascadeClose,
-            },
-            members: [alice.clone()].into_iter().collect(),
-        };
-
-        let parent_a_different = ParentRef {
-            context_id: "A".to_owned(),
-            ceiling: make_ceiling(&[Capability::MessagesRead, Capability::ChildContextCreate]),
-            governance_config: ParentGovernanceConfig {
-                can_close_child: false,
-                can_evict_members: true,
-                can_restrict_ceiling: false,
-                requires_approval_for: BTreeSet::new(),
-                on_sever: OnSeverPolicy::EvictUniqueMembers,
-            },
-            members: [alice].into_iter().collect(),
-        };
-
-        let ext1 = MlsGroupContextExtension::from_parents(&[parent_a]).unwrap();
-        let ext2 = MlsGroupContextExtension::from_parents(&[parent_a_different]).unwrap();
-        assert_ne!(ext1.governance_config_hash, ext2.governance_config_hash);
+        let mut ids: Vec<String> = nesting
+            .parent_refs()
+            .into_iter()
+            .map(|p| p.context_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["A", "B"]);
     }
 
     // -----------------------------------------------------------------------
@@ -1472,7 +1350,7 @@ mod tests {
             can_restrict_ceiling: true,
             requires_approval_for: [
                 ApprovalRequirement::GovernanceChange,
-                ApprovalRequirement::ToolRegistration,
+                ApprovalRequirement::OutletRegistration,
             ]
             .into_iter()
             .collect(),
@@ -1503,7 +1381,7 @@ mod tests {
     fn approval_requirement_variants_are_distinct() {
         let variants = [
             ApprovalRequirement::GovernanceChange,
-            ApprovalRequirement::ToolRegistration,
+            ApprovalRequirement::OutletRegistration,
             ApprovalRequirement::CeilingChange,
             ApprovalRequirement::MembershipChange,
         ];

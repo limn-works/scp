@@ -1,6 +1,6 @@
 // Module-level allow — `dead_code` is allowed module-wide because this
 // module is the authoritative home for query-domain free functions
-// consumed by FFI bridges (PyO3 / NAPI / UniFFI / WASM) and by external
+// consumed by FFI bridges (PyO3 / NAPI / UniFFI) and by external
 // test crates behind `feature = "testing"`. Several of the actor-shape
 // helpers wired here have no in-tree caller until the supervisor's
 // `dispatch_query` shim is deleted in Phase 2A finalization; until then
@@ -17,9 +17,8 @@
 //! This module hosts query-domain helpers that operate on actor-owned
 //! [`PerContextState`](crate::context::actor::state::PerContextState) and
 //! capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps).
-//! The legacy `&Supervisor` lock-and-call bodies live in
-//! [`crate::context::queries_helpers_legacy`] until Phase 2A
-//! finalization removes the shim fallback.
+//! The pre-migration `&Supervisor` lock-and-call bodies have been removed
+//! (Phase 2A finalization); this module is the sole home for these helpers.
 //!
 //! # Pipeline shape
 //!
@@ -52,9 +51,9 @@
 //! - [`generate_context_access_key`], [`revoke_context_access_key`],
 //!   [`restore_context_access_key`], [`set_access_key`],
 //!   [`remove_access_key`] — access-key store mutations.
-//! - [`inject_access_key`], [`get_access_key`], [`get_all_access_keys`],
-//!   [`grant_budget_for_test`], [`remaining_budget_for_test`],
-//!   [`velocity_for_test`] — `#[cfg(feature = "testing")]` accessors.
+//! - `inject_access_key`, `get_access_key`, `get_all_access_keys`,
+//!   `grant_budget_for_test`, `remaining_budget_for_test`,
+//!   `velocity_for_test` — `#[cfg(feature = "testing")]` accessors.
 //! - [`compare_remote_checkpoint`] — equivocation detection (§9.9.3).
 //!   Reads membership and mutates `last_seen_remote_checkpoint` +
 //!   `receive_buffer` (via a `ClassCMut` view) on divergent compare.
@@ -88,14 +87,13 @@
 //! finalization; the `_legacy` suffix is dropped because there is no
 //! per-context actor-shape twin to disambiguate against.
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::membership::{ContextEvent, ReceiveBuffer};
 use scp_protocol::context::roles::{Capability, ContextRoleState, RoleAssignment};
 use scp_protocol::context::{ContextError, ContextParams};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::context::ContextHandle;
 use crate::context::actor::class_s::ClassCMut;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
@@ -162,8 +160,8 @@ pub fn get_broadcast_key_for_local_author(
         .get_author(author_did)
         .ok_or_else(|| ContextError::MemberNotFound(format!("author not found: {author_did}")))?;
 
-    let key_bytes = Zeroizing::new(*author.broadcast_key.as_bytes());
-    Ok((key_bytes, author.epoch))
+    let key_bytes = Zeroizing::new(*author.broadcast_key().as_bytes());
+    Ok((key_bytes, author.epoch()))
 }
 
 /// Returns the current member count for a context.
@@ -215,41 +213,6 @@ pub const fn clear_needs_reconnect(epoch: &mut EpochState) {
     epoch.needs_reconnect = false;
 }
 
-/// Reads this actor's current lifecycle
-/// [`ContextState`](scp_protocol::context::ContextState).
-///
-/// Read-only — borrows the owned `state.handle` and awaits its interior
-/// read lock. The actor's dispatch loop owns `state` exclusively, so the
-/// only writer of the handle's interior state is the actor itself (via a
-/// lifecycle transition processed on the same single-threaded mailbox).
-/// No concurrent writer can be mid-transition while this read runs, so
-/// the definitive async `state()` read is used rather than the
-/// non-blocking `try_read_state()` the legacy `per-context-state Mutex`
-/// path required to dodge a cross-task TOCTOU.
-///
-/// `state` is taken as `&mut` even though the read only borrows the
-/// handle immutably, so the resulting future is `Send`: an
-/// `&PerContextState` borrow makes the captured future non-`Send`
-/// because `PerContextState` is not `Sync` (its event callback is `dyn
-/// FnMut + Send`, not `Send + Sync`). The actor's run loop owns `state`
-/// exclusively so the upgraded borrow does not race — this matches the
-/// `&mut` convention every read helper on the [`queries`](crate::context::actor::handlers::queries)
-/// dispatch path already uses.
-#[allow(clippy::needless_pass_by_ref_mut)]
-pub(in crate::context) async fn read_context_state(
-    handle: ContextHandle,
-) -> scp_protocol::context::ContextState {
-    // Takes an OWNED (Arc-backed, cheap to clone) handle rather than
-    // borrowing `&PerContextState` across the await: a borrowed
-    // `&PerContextState` future is not `Send` (`PerContextState` is
-    // intentionally `Send` + `!Sync` — its event callback is `dyn FnMut +
-    // Send`, not `Sync`), and the spawned actor run loop requires `Send`.
-    // The prior `&mut PerContextState` signature obtained `Send` via the
-    // `&mut` referent; a Class-C read site must not take a whole `&mut`, so
-    // the caller clones `state.handle` (Deref read) and hands it in by value.
-    handle.state().await
-}
-
 /// Returns `true` if the given DID is a member of the context.
 #[must_use]
 pub fn is_member(state: &PerContextState, did: &str) -> bool {
@@ -285,8 +248,8 @@ pub fn get_role_state(state: &PerContextState) -> ContextRoleState {
 }
 
 /// Returns `true` iff this context holds a bidirectionally-approved
-/// [`ToolInterface`](scp_protocol::context::tools::interface::ToolInterface)
-/// from `source_context_hex` to `target_context_hex` for `tool_registration_id`
+/// [`OutletInterface`](scp_protocol::context::outlets::interface::OutletInterface)
+/// from `source_context_hex` to `target_context_hex` for `outlet_registration_id`
 /// (spec §6.2.0.1 standing consent / §6.2.4 target-side authorize-before-reserve).
 ///
 /// Both `approved_by_source` AND `approved_by_target` must be set — a one-sided
@@ -295,18 +258,18 @@ pub fn get_role_state(state: &PerContextState) -> ContextRoleState {
 /// fields are compared on the raw 64-hex digest form the establishing flow
 /// stored (spec §6.2.4 id-form rule).
 #[must_use]
-pub fn has_established_tool_interface(
+pub fn has_established_outlet_interface(
     state: &PerContextState,
     source_context_hex: &str,
     target_context_hex: &str,
-    tool_registration_id: &str,
+    outlet_registration_id: &str,
 ) -> bool {
-    state.governance.tool_interfaces.iter().any(|i| {
+    state.governance.outlet_interfaces.iter().any(|i| {
         i.approved_by_source
             && i.approved_by_target
             && i.source_context == source_context_hex
             && i.target_context == target_context_hex
-            && i.tool_id == tool_registration_id
+            && i.outlet_id == outlet_registration_id
     })
 }
 
@@ -841,16 +804,13 @@ fn verify_remote_checkpoint_authenticity(
 
     // Consistency checkpoints are sent under `#active` (ADR-039); resolve the
     // human signing key to verify the checkpoint signature.
-    let sender_pk = (deps.key_resolver)(
-        &remote.sender_did,
-        scp_protocol::identity::SigningKeyId::Active,
-    )
-    .ok_or_else(|| {
-        ContextError::CryptoFailed(format!(
-            "cannot resolve public key for checkpoint sender {}",
-            remote.sender_did
-        ))
-    })?;
+    let sender_pk = (deps.key_resolver)(&remote.sender_did, scp_did::SigningKeyId::Active)
+        .ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "cannot resolve public key for checkpoint sender {}",
+                remote.sender_did
+            ))
+        })?;
     scp_event_log::checkpoint::verify_checkpoint_signature(remote, &sender_pk).map_err(|reason| {
         ContextError::CryptoFailed(format!(
             "checkpoint signature verification failed: {reason}"
@@ -862,7 +822,7 @@ fn verify_remote_checkpoint_authenticity(
 /// membership + signature gate and the Merkle-root/count comparison WITHOUT
 /// touching per-context state. `sender_is_member` is read by the caller (so the
 /// caller chooses how it borrows the roster — a [`ClassCMut`] view accessor or a
-/// bare-state field). Returns the [`CheckpointComparison`] plus
+/// bare-state field). Returns the [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison) plus
 /// `Some(local_root)` when the result is `Divergent` (the caller then applies
 /// the two Class-C field mutations — dedup + receive-buffer emit — in whatever
 /// borrow shape it holds). This split is what lets BOTH the actor handler
@@ -1249,7 +1209,7 @@ mod equivocation_dedup_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use scp_identity::DID;
+    use scp_did::DID;
 
     use super::record_equivocation_if_fresh;
     use crate::context::actor::deps::ActorDeps;
@@ -1265,15 +1225,16 @@ mod equivocation_dedup_tests {
         appends: Arc<AtomicUsize>,
     }
 
+    #[async_trait::async_trait]
     impl crate::context::builder::ContextEventLogProvider for CountingEventLog {
-        fn init_event_log(
+        async fn init_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
             Ok(())
         }
 
-        fn append_event(
+        async fn append_event(
             &self,
             _id: &[u8; 32],
             _event: scp_event_log::EventType,
@@ -1285,7 +1246,7 @@ mod equivocation_dedup_tests {
             Ok(())
         }
 
-        fn destroy_event_log(
+        async fn destroy_event_log(
             &self,
             _id: &[u8; 32],
         ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
@@ -1298,17 +1259,18 @@ mod equivocation_dedup_tests {
     /// `actor::mod` test-deps assembly but threads the counting log so the
     /// dedup gate's append behavior is observable.
     async fn deps_with_counting_log(appends: Arc<AtomicUsize>) -> (ActorDeps, PerContextState) {
-        use scp_platform::testing::InMemoryStorage;
+        use scp_platform::in_memory::InMemoryStorage;
 
-        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
             "did:dht:z6MktestEquivDedup".to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(CountingEventLog { appends });
         let key_resolver: scp_protocol::context::governance::KeyResolver =
-            Arc::new(|_: &scp_identity::DID, _: scp_protocol::identity::SigningKeyId| None);
+            Arc::new(|_: &scp_did::DID, _: scp_did::SigningKeyId| None);
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
                 crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(

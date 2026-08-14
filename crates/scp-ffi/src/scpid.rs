@@ -25,7 +25,7 @@ use scp_core::identity::{
     ScpIdChallenge, ScpIdResponse, scpid_challenge as core_scpid_challenge, scpid_sign,
     scpid_verify,
 };
-use scp_identity::SigningKeyId;
+use scp_did::SigningKeyId;
 
 use crate::error::ScpPyError;
 use crate::runtime::with_identity;
@@ -49,7 +49,7 @@ use crate::runtime::with_identity;
 /// Raises `ValidationError` if `audience` is empty, exceeds 2048 bytes,
 /// or `ttl_seconds` is 0 or exceeds 300.
 // ttl_seconds is u64 to match the `Duration::from_secs` parameter type.
-// NAPI/WASM bridges use u32 (idiomatic for JS/WASM; max valid TTL is 300s).
+// The NAPI bridge uses u32 (idiomatic for JS; max valid TTL is 300s).
 #[pyfunction]
 pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> PyResult<String> {
     let challenge =
@@ -300,8 +300,9 @@ mod tests {
     use scp_ffi_common::error_codes as codes;
     use std::sync::Arc;
 
+    use scp_dht::InMemoryDhtClient;
     use scp_identity::resolver::DualLayerResolver;
-    use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier};
+    use scp_identity::{DidCache, NoOpRelayQuerier};
 
     fn default_scp() -> crate::scp::PyScp {
         crate::scp::PyScp::new_in_memory_for_test()
@@ -410,7 +411,10 @@ mod tests {
         let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
 
         // Create a DidDht with a signer so we can publish the DID document.
-        let sign_fn = scp_identity::DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(Arc::clone(&custody));
+        let sign_fn =
+            scp_identity::DidDht::<InMemoryDhtClient, scp_clock::SystemClock>::make_sign_fn(
+                Arc::clone(&custody),
+            );
         let dht = scp_identity::DidDht::with_client_and_signer(
             Arc::clone(&dht_client),
             Arc::new(DidCache::new()),

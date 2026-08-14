@@ -41,7 +41,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use scp_core::context::broadcast::BroadcastContextSnapshot;
 use scp_core::context::builder::ContextCreationError;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::governance::KeyResolver;
@@ -51,11 +50,11 @@ use scp_core::context::supervisor::{
     JournalEntry, ProtocolRepositorySagaJournal, SagaId, SagaJournal, SagaState, Supervisor,
 };
 use scp_core::context::{ContextMode, ContextParams, ContextState, LocalTransportProvider};
-use scp_core::crypto::mls::provider::MlsCryptoProvider;
+use scp_core::crypto::mls::provider::NodeMlsFactory;
 use scp_core::crypto::mls::storage_adapter::{OpenMlsStorageAdapter, SpawnBlockingStorageAdapter};
+use scp_did::DID;
 use scp_ffi_common::bridge_instance::CoreFields;
-use scp_identity::DID;
-use scp_platform::testing::InMemoryStorage;
+use scp_platform::in_memory::InMemoryStorage;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -71,8 +70,9 @@ struct SharedPersistence {
     contexts: Mutex<HashMap<String, ContextSnapshot>>,
 }
 
+#[async_trait::async_trait]
 impl ContextPersistence for SharedPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -84,24 +84,16 @@ impl ContextPersistence for SharedPersistence {
         Ok(())
     }
 
-    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
         Ok(self.contexts.lock().unwrap().get(context_id).cloned())
     }
 
-    fn persist_broadcast(&self, _: &str, _: &BroadcastContextSnapshot) -> Result<(), BoxError> {
-        Ok(())
-    }
-
-    fn load_broadcast(&self, _: &str) -> Result<Option<BroadcastContextSnapshot>, BoxError> {
-        Ok(None)
-    }
-
-    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
         self.contexts.lock().unwrap().remove(context_id);
         Ok(())
     }
 
-    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
         Ok(self.contexts.lock().unwrap().keys().cloned().collect())
     }
 }
@@ -109,45 +101,38 @@ impl ContextPersistence for SharedPersistence {
 /// `Box<dyn ContextPersistence>` newtype sharing the `Arc` backing map between
 /// the two supervisors (the constructor takes an owned `Box`).
 struct SharedPersistenceArc(Arc<SharedPersistence>);
+#[async_trait::async_trait]
 impl ContextPersistence for SharedPersistenceArc {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
     ) -> Result<(), BoxError> {
-        self.0.persist_context(context_id, snapshot)
+        self.0.persist_context(context_id, snapshot).await
     }
-    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
-        self.0.load_context(context_id)
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+        self.0.load_context(context_id).await
     }
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &BroadcastContextSnapshot,
-    ) -> Result<(), BoxError> {
-        self.0.persist_broadcast(context_id, snapshot)
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+        self.0.delete_context(context_id).await
     }
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<BroadcastContextSnapshot>, BoxError> {
-        self.0.load_broadcast(context_id)
-    }
-    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
-        self.0.delete_context(context_id)
-    }
-    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
-        self.0.list_persisted_contexts()
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+        self.0.list_persisted_contexts().await
     }
 }
 
 // Minimal no-op event-log provider (mirrors the bridge_instance test harness).
 struct NoOpEventLog;
+// `unused_async`: these no-op test-double methods have no await, but the
+// ADR-049 Decision-7 async `ContextEventLogProvider` trait requires the
+// `async fn` signature.
+#[async_trait::async_trait]
+#[allow(clippy::unused_async)]
 impl ContextEventLogProvider for NoOpEventLog {
-    fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(
+    async fn append_event(
         &self,
         _: &[u8; 32],
         _: scp_event_log::EventType,
@@ -157,7 +142,7 @@ impl ContextEventLogProvider for NoOpEventLog {
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_event_log(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 }
@@ -178,9 +163,12 @@ fn journal_supervisor(
     journal: Arc<dyn SagaJournal>,
     mls_storage: Arc<dyn OpenMlsStorageAdapter>,
 ) -> Arc<Supervisor> {
-    let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_identity::SigningKeyId| None);
+    let key_resolver: KeyResolver = Arc::new(|_: &DID, _: scp_did::SigningKeyId| None);
     Supervisor::with_providers_and_journal(
-        Arc::new(MlsCryptoProvider::new(creator_did.to_owned())),
+        Arc::new(NodeMlsFactory::new(
+            creator_did.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
+        )),
         Box::new(LocalTransportProvider) as Box<dyn ContextTransportProvider>,
         Box::new(NoOpEventLog) as Box<dyn ContextEventLogProvider>,
         key_resolver,
@@ -271,7 +259,12 @@ async fn journal_swap_runs_restore_and_replay_legs_over_real_journal() {
             .expect("create_context");
         sup1.flush_all_contexts().await.expect("flush_all_contexts");
         assert_eq!(
-            persistence.load_context(ctx_id).unwrap().unwrap().state,
+            persistence
+                .load_context(ctx_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             ContextState::Active,
             "the flushed snapshot must be Active for the restore leg to rehydrate it"
         );

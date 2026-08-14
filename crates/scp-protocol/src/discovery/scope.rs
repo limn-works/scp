@@ -1,7 +1,7 @@
-//! Scope tools: register, lookup, and deregister namespace-to-context mappings.
+//! Scope outlets: register, lookup, and deregister namespace-to-context mappings.
 //!
-//! Implements §22.3.5 Scope Tools: three standard tool schemas for contexts that
-//! serve as namespace registries. Scope tools map human-readable scope names
+//! Implements §22.3.5 Scope Outlets: three standard outlet schemas for contexts that
+//! serve as namespace registries. Scope outlets map human-readable scope names
 //! (e.g., `cooking-community`) to context IDs with relay URLs.
 //!
 //! All scope types are independent structs (ADR-043). `ScopeRegistry` uses
@@ -15,8 +15,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::Clock;
-use scp_primitives::DID;
+use scp_clock::Clock;
+use scp_did::DID;
 
 use super::ContextId;
 use super::addressing::AddressingError;
@@ -25,14 +25,14 @@ use super::addressing::AddressingError;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Standard tool name for scope registration.
-pub const TOOL_SCOPE_REGISTER: &str = "scope_register";
+/// Standard outlet name for scope registration.
+pub const OUTLET_SCOPE_REGISTER: &str = "scope_register";
 
-/// Standard tool name for scope lookup.
-pub const TOOL_SCOPE_LOOKUP: &str = "scope_lookup";
+/// Standard outlet name for scope lookup.
+pub const OUTLET_SCOPE_LOOKUP: &str = "scope_lookup";
 
-/// Standard tool name for scope deregistration.
-pub const TOOL_SCOPE_DEREGISTER: &str = "scope_deregister";
+/// Standard outlet name for scope deregistration.
+pub const OUTLET_SCOPE_DEREGISTER: &str = "scope_deregister";
 
 /// Maximum length for a scope name (§22.3.5).
 const MAX_SCOPE_NAME_LENGTH: usize = 64;
@@ -56,12 +56,12 @@ const MAX_SCOPE_ENTRIES: usize = 10_000;
 // ScopeRegisterParams / ScopeRegisterResult (§22.3.5)
 // ---------------------------------------------------------------------------
 
-/// Input parameters for the `scope_register` tool.
+/// Input parameters for the `scope_register` outlet.
 ///
 /// Registers a scope name (namespace) pointing to a context. The registrant's
 /// DID is authenticated via the DID-signed request at the transport layer.
 ///
-/// See §22.3.5 Scope Tools and ADR-043.
+/// See §22.3.5 Scope Outlets and ADR-043.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeRegisterParams {
@@ -84,7 +84,7 @@ pub struct ScopeMetadata {
     pub tags: Option<Vec<String>>,
 }
 
-/// Output of the `scope_register` tool.
+/// Output of the `scope_register` outlet.
 ///
 /// Returns an unambiguous status: `Registered` on success, `Conflict` when
 /// another DID already holds the scope name, `Updated` when the same owner
@@ -114,12 +114,12 @@ pub enum ScopeRegisterStatus {
 // ScopeLookupParams / ScopeLookupResult (§22.3.5)
 // ---------------------------------------------------------------------------
 
-/// Input parameters for the `scope_lookup` tool.
+/// Input parameters for the `scope_lookup` outlet.
 ///
 /// Looks up a scope name in a scope registry. Available to readers
 /// (DID-authenticated, unbounded tier).
 ///
-/// See §22.3.5 Scope Tools.
+/// See §22.3.5 Scope Outlets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeLookupParams {
@@ -127,7 +127,7 @@ pub struct ScopeLookupParams {
     pub name: String,
 }
 
-/// Output of the `scope_lookup` tool.
+/// Output of the `scope_lookup` outlet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeLookupResult {
@@ -140,12 +140,12 @@ pub struct ScopeLookupResult {
 // ScopeDeregisterParams / ScopeDeregisterResult (§22.3.5)
 // ---------------------------------------------------------------------------
 
-/// Input parameters for the `scope_deregister` tool.
+/// Input parameters for the `scope_deregister` outlet.
 ///
 /// Removes a scope registration. The `did` field is explicit (not inferred
 /// from request signature) so the ownership check is visible in the interface.
 ///
-/// See §22.3.5 Scope Tools.
+/// See §22.3.5 Scope Outlets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeDeregisterParams {
@@ -155,7 +155,7 @@ pub struct ScopeDeregisterParams {
     pub did: DID,
 }
 
-/// Output of the `scope_deregister` tool.
+/// Output of the `scope_deregister` outlet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeDeregisterResult {
@@ -387,7 +387,7 @@ fn validate_scope_metadata(metadata: &ScopeMetadata) -> Result<(), ScopeRegistry
 /// Production implementations would back this with a persistent store and
 /// event log recording.
 ///
-/// See §22.3.5 Scope Tools and ADR-043.
+/// See §22.3.5 Scope Outlets and ADR-043.
 #[derive(Debug)]
 pub struct ScopeRegistry {
     /// The context ID this registry belongs to.
@@ -872,7 +872,7 @@ mod tests {
             .register(
                 &params,
                 &DID::from("did:dht:zAdmin"),
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .unwrap();
         assert_eq!(result.status, ScopeRegisterStatus::Registered);
@@ -893,7 +893,7 @@ mod tests {
         };
 
         let r1 = registry
-            .register(&params, &admin_did, &scp_primitives::SystemClock)
+            .register(&params, &admin_did, &scp_clock::SystemClock)
             .unwrap();
         assert_eq!(r1.status, ScopeRegisterStatus::Registered);
 
@@ -903,7 +903,7 @@ mod tests {
             metadata: None,
         };
         let r2 = registry
-            .register(&params2, &eve_did, &scp_primitives::SystemClock)
+            .register(&params2, &eve_did, &scp_clock::SystemClock)
             .unwrap();
         assert_eq!(r2.status, ScopeRegisterStatus::Conflict);
         assert!(r2.entry_id.is_none());
@@ -922,7 +922,7 @@ mod tests {
             metadata: None,
         };
         let r1 = registry
-            .register(&params, &admin_did, &scp_primitives::SystemClock)
+            .register(&params, &admin_did, &scp_clock::SystemClock)
             .unwrap();
         assert_eq!(r1.status, ScopeRegisterStatus::Registered);
         let original_entry_id = r1.entry_id.unwrap();
@@ -936,7 +936,7 @@ mod tests {
             }),
         };
         let r2 = registry
-            .register(&params2, &admin_did, &scp_primitives::SystemClock)
+            .register(&params2, &admin_did, &scp_clock::SystemClock)
             .unwrap();
         assert_eq!(r2.status, ScopeRegisterStatus::Updated);
         assert_eq!(r2.entry_id.as_deref(), Some(original_entry_id.as_str()));
@@ -970,7 +970,7 @@ mod tests {
             metadata: None,
         };
         registry
-            .register(&params, &admin_did, &scp_primitives::SystemClock)
+            .register(&params, &admin_did, &scp_clock::SystemClock)
             .unwrap();
 
         // Try to register same name — should return Updated (same owner)
@@ -980,7 +980,7 @@ mod tests {
             metadata: None,
         };
         let r = registry
-            .register(&params2, &admin_did, &scp_primitives::SystemClock)
+            .register(&params2, &admin_did, &scp_clock::SystemClock)
             .unwrap();
         assert_eq!(r.status, ScopeRegisterStatus::Updated);
     }
@@ -995,7 +995,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -1013,7 +1013,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1033,7 +1033,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1054,7 +1054,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1074,7 +1074,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1094,7 +1094,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1117,7 +1117,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_ok());
     }
@@ -1135,7 +1135,7 @@ mod tests {
                 metadata: None,
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -1153,7 +1153,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -1172,7 +1172,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -1190,7 +1190,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -1210,7 +1210,7 @@ mod tests {
                     metadata: None,
                 },
                 &admin_did,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .unwrap();
 
@@ -1251,7 +1251,7 @@ mod tests {
                     metadata: None,
                 },
                 &admin_did,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .unwrap();
 
@@ -1279,7 +1279,7 @@ mod tests {
                     metadata: None,
                 },
                 &admin_did,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .unwrap();
 
@@ -1321,7 +1321,7 @@ mod tests {
                     metadata: None,
                 },
                 &admin_did,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .unwrap();
 
@@ -1340,7 +1340,7 @@ mod tests {
                     metadata: None,
                 },
                 &bob_did,
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .unwrap();
         assert_eq!(result.status, ScopeRegisterStatus::Registered);
@@ -1360,7 +1360,7 @@ mod tests {
                     metadata: None,
                 },
                 &DID::from("did:dht:zAdmin"),
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .unwrap();
 
@@ -1372,7 +1372,7 @@ mod tests {
                     metadata: None,
                 },
                 &DID::from("did:dht:zAdmin"),
-                &scp_primitives::SystemClock,
+                &scp_clock::SystemClock,
             )
             .unwrap();
 
@@ -1410,7 +1410,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_ok());
     }
@@ -1429,7 +1429,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_ok());
     }
@@ -1447,7 +1447,7 @@ mod tests {
                 }),
             },
             &DID::from("did:dht:zAdmin"),
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_ok());
     }

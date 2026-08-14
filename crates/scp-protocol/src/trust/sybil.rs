@@ -47,7 +47,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 use super::AttestationType;
 use super::attestation::{AttestorInfo, ThresholdRequirement, check_threshold_attestation};
@@ -318,12 +318,12 @@ pub struct EarnedCapacityPolicy {
     /// Limits the damage surface of a Sybil identity.
     pub max_participation_slots: u32,
 
-    /// Maximum tool invocations per sliding window (`window_secs`).
+    /// Maximum outlet invocations per sliding window (`window_secs`).
     /// Constrains the operational throughput of shallow identities.
-    pub max_tool_invocations_per_window: u32,
+    pub max_outlet_invocations_per_window: u32,
 
-    /// Sliding window duration (seconds) for tool invocation rate limiting.
-    pub tool_invocation_window_secs: u64,
+    /// Sliding window duration (seconds) for outlet invocation rate limiting.
+    pub outlet_invocation_window_secs: u64,
 
     /// Maximum governance proposals per sliding window.
     /// Prevents shallow identities from flooding governance.
@@ -339,15 +339,15 @@ impl EarnedCapacityPolicy {
     /// Allows basic participation but limits amplification vectors:
     /// - 2 context creations (enough to get started)
     /// - 5 participation slots
-    /// - 100 tool invocations per hour
+    /// - 100 outlet invocations per hour
     /// - 5 governance proposals per day
     #[must_use]
     pub const fn new_identity_default() -> Self {
         Self {
             max_context_creation: 2,
             max_participation_slots: 5,
-            max_tool_invocations_per_window: 100,
-            tool_invocation_window_secs: 3600, // 1 hour
+            max_outlet_invocations_per_window: 100,
+            outlet_invocation_window_secs: 3600, // 1 hour
             max_governance_proposals_per_window: 5,
             governance_proposal_window_secs: 86400, // 24 hours
         }
@@ -362,8 +362,8 @@ impl EarnedCapacityPolicy {
         Self {
             max_context_creation: u32::MAX,
             max_participation_slots: u32::MAX,
-            max_tool_invocations_per_window: u32::MAX,
-            tool_invocation_window_secs: 3600,
+            max_outlet_invocations_per_window: u32::MAX,
+            outlet_invocation_window_secs: 3600,
             max_governance_proposals_per_window: u32::MAX,
             governance_proposal_window_secs: 86400,
         }
@@ -943,16 +943,16 @@ pub fn evaluate_earned_capacity(
         EarnedCapacityLevel::Developing => EarnedCapacityPolicy {
             max_context_creation: 10,
             max_participation_slots: 20,
-            max_tool_invocations_per_window: 500,
-            tool_invocation_window_secs: 3600,
+            max_outlet_invocations_per_window: 500,
+            outlet_invocation_window_secs: 3600,
             max_governance_proposals_per_window: 20,
             governance_proposal_window_secs: 86400,
         },
         EarnedCapacityLevel::Established => EarnedCapacityPolicy {
             max_context_creation: 100,
             max_participation_slots: 200,
-            max_tool_invocations_per_window: 5000,
-            tool_invocation_window_secs: 3600,
+            max_outlet_invocations_per_window: 5000,
+            outlet_invocation_window_secs: 3600,
             max_governance_proposals_per_window: 100,
             governance_proposal_window_secs: 86400,
         },
@@ -1297,7 +1297,7 @@ mod tests {
         let policy = EarnedCapacityPolicy::new_identity_default();
         assert_eq!(policy.max_context_creation, 2);
         assert_eq!(policy.max_participation_slots, 5);
-        assert_eq!(policy.max_tool_invocations_per_window, 100);
+        assert_eq!(policy.max_outlet_invocations_per_window, 100);
     }
 
     #[test]

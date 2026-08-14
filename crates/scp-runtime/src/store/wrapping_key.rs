@@ -193,7 +193,7 @@ impl<S: Storage> ProtocolRepository<S> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
 

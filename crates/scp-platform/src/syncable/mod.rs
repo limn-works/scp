@@ -336,7 +336,7 @@ impl<S: Storage> Storage for SyncableStorage<S> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::testing::InMemoryStorage;
+    use crate::in_memory::InMemoryStorage;
 
     // Required so that `scp_testing::storage_conformance!` can resolve
     // `scp_platform::Storage` when invoked from within this crate.

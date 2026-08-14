@@ -23,10 +23,12 @@
  * deleted — callers construct an explicit `new SCP()` and invoke methods
  * directly (e.g. `scp.identityCreate("in_memory")`).
  *
- * NOTE: `SCP` is a NAPI-only feature. The WASM bridge
- * does not expose a multi-instance class surface; attempting to
- * construct `SCP` in a browser environment throws `ValidationError`
- * with `SCP-VALID-7005`.
+ * NOTE: `SCP` requires a Node.js or Bun runtime with the native addon.
+ * Browser clients run the full protocol in-tab (keys on-device) via the
+ * sibling `@limn-works/scp-ts-wasm` package over `scp-client-wasm` (ADR-057,
+ * which amends ADR-055's remote-thin-client browser model); constructing
+ * `SCP` outside a Node.js/Bun runtime throws `ValidationError` with
+ * `SCP-VALID-7005`.
  */
 
 // Deferred imports of opaque classes. The classes import `SCP` for
@@ -37,10 +39,63 @@
 // methods via dynamic `import()` calls.
 import type { BridgeCredential } from "./bridge";
 import type { Context } from "./context";
-import { ValidationError } from "./errors";
+import type { PaymentReceiptVerificationResult } from "./economy";
+import { ContextError, mapBridgeError, mapSagaError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
+import { type BridgeContextHandle, getBridge, toCapabilityValidation } from "./internal/bridge";
 import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
+import { assertTestEnvironment } from "./internal/test-guard";
+import type { StreamingSagaNative, StreamingSagaOptions } from "./outlets";
+import { StreamingSagaHandle } from "./outlets";
+import { decodeProvenanceRecord, type ProvenanceRecord } from "./provenance";
 import type { Node, Relay } from "./server";
+import type {
+  AttestationType,
+  AttestorInfo,
+  BehavioralRecord,
+  CachedAttestation,
+  CachedAttestationEnvelope,
+  CapabilityRequirement,
+  CapabilityValidation,
+  ChallengeRequest,
+  ChallengeResponse,
+  ChallengeVerification,
+  ConsequenceRule,
+  EventLogEntry,
+  InviteMemberOutcome,
+  OutletDefinition,
+  ParticipationProfile,
+  RequireParticipation,
+  SagaResult,
+  SealedInvitation,
+  ThresholdRequirement,
+  TrustEvaluation,
+} from "./types";
+import {
+  encodeAttestation,
+  encodeAttestorSets,
+  encodeCachedAttestations,
+  encodeCapabilityRequirements,
+  encodeChallengeRequest,
+  encodeChallengeResponse,
+  encodeChallengeVerifications,
+  encodeConsequenceRules,
+  encodeEventLogEntries,
+  encodeMerkleRoot,
+  encodeParticipationProfile,
+  encodeRequireParticipation,
+  encodeThresholdRequirements,
+} from "./types";
+
+/**
+ * Stable error code (spec §7.3.2) the core surfaces when a context has no
+ * recorded participation facts yet (an empty event log). {@link
+ * SCP.evaluateTrust} branches Layer 2 on this structured code — NOT on error
+ * prose — folding "no facts yet" into a zeroed behavioral record while letting
+ * every other failure propagate. Maps from `ContextError::NoParticipationFacts`
+ * across all bridges.
+ */
+const NO_PARTICIPATION_FACTS_CODE = "SCP-CTX-2076";
 
 /**
  * Refined view of the native addon used by this module. The shared
@@ -106,7 +161,7 @@ interface NativeScpInstance {
  * `internal/native.ts` so this module and the bridge factory share a
  * single frozen addon reference. The shared loader throws
  * `TransportError` (`SCP-TRANS-5001`) on platform-package missing or
- * load failure; this wrapper layers an additional WASM-runtime check
+ * load failure; this wrapper layers an additional runtime check
  * and a stale-addon (no `SCP` class) check, both surfaced as
  * `ValidationError` (`SCP-VALID-7005`) — the public-API code that
  * SDK consumers see when they call `new SCP(...)`.
@@ -114,9 +169,9 @@ interface NativeScpInstance {
 function loadAddon(): NativeAddon {
   if (typeof process === "undefined" || !process.versions?.node) {
     throw new ValidationError(
-      "SCP class is not available in WASM runtime — the browser build of " +
-        "@limn-works/scp-ts does not expose a multi-instance class (ADR-034 / " +
-        "ADR-048). Use @limn-works/scp-sdk-napi in a Node.js or Bun process.",
+      "SCP class requires a Node.js or Bun runtime — @limn-works/scp-ts is a " +
+        "native (napi-rs) SDK. Browser clients run the full protocol in-tab via " +
+        "@limn-works/scp-ts-wasm (ADR-057, keys on-device).",
       "SCP-VALID-7005",
     );
   }
@@ -379,6 +434,30 @@ export interface ReconnectReport {
 }
 
 /**
+ * The opaque `(reservationId, keyPackagePublic)` pair returned by
+ * {@link SCP.reserveKeyPackage} (ADR-049 Phase 2J).
+ *
+ * The joiner's private signer state never leaves the native core — only the
+ * PUBLIC `KeyPackage` bytes cross the FFI boundary. Hand `keyPackagePublic` to
+ * the context creator (out of band) so it can mint a Welcome addressed to this
+ * reservation, then pass `reservationId` back to
+ * {@link SCP.contextJoinFromWelcome}.
+ */
+export interface KeyPackageReservation {
+  /**
+   * Opaque reservation id — a lookup key, not a capability. Pass back to
+   * {@link SCP.contextJoinFromWelcome} for the Welcome this `KeyPackage`
+   * addresses.
+   */
+  readonly reservationId: string;
+  /**
+   * PUBLIC MLS `KeyPackage` bytes to hand (out of band) to the context creator,
+   * who adds them to its MLS group to mint the addressed Welcome.
+   */
+  readonly keyPackagePublic: Uint8Array;
+}
+
+/**
  * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
  *
  * Implement this to back a DID's key material with a platform keystore (OS
@@ -393,8 +472,9 @@ export interface ReconnectReport {
  * your implementation assigns in {@link generateKeypair}. Byte values are
  * passed and returned as `Uint8Array`.
  *
- * Only available on the NAPI (Node.js / Bun) backend — the browser/WASM build
- * does not expose the multi-instance `SCP` class (ADR-034 / ADR-048).
+ * Only available on the NAPI (Node.js / Bun) backend — the SDK requires the
+ * native addon (ADR-048). The browser tier (`@limn-works/scp-ts-wasm`, ADR-057)
+ * runs the full protocol in-tab and does not use this native custody callback.
  */
 export interface KeyCustodyProvider {
   /** Generate a keypair (`"ed25519"` or `"x25519"`); return its opaque id. */
@@ -583,7 +663,11 @@ export class SCP {
    * Transport-dependent operations fail until `resume()` is called.
    */
   suspend(): void {
-    this.#native.suspend();
+    try {
+      this.#native.suspend();
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -591,7 +675,11 @@ export class SCP {
    * and persisted context-snapshot restoration (#1678).
    */
   async resume(): Promise<void> {
-    await this.#native.resume();
+    try {
+      await this.#native.resume();
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -600,8 +688,12 @@ export class SCP {
    * @param timeoutSecs Maximum seconds to wait. Defaults to 5.
    */
   async shutdown(timeoutSecs: number = 5): Promise<void> {
-    const millis = __clampShutdownMillisForTests(timeoutSecs);
-    await this.#native.shutdown(BigInt(millis));
+    try {
+      const millis = __clampShutdownMillisForTests(timeoutSecs);
+      await this.#native.shutdown(BigInt(millis));
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -609,17 +701,25 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async identityCreate(custody: string = "in_memory"): Promise<Identity> {
-    const raw = await (this.#native.identityCreate as (c: string) => Promise<unknown>)(custody);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await (this.#native.identityCreate as (c: string) => Promise<unknown>)(custody);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityCreateWithAgentKey(custody: string = "in_memory"): Promise<Identity> {
-    const raw = await (this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>)(
-      custody,
-    );
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await (
+        this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>
+      )(custody);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -629,9 +729,9 @@ export class SCP {
    * private key material never crosses into the native core (ADR-006). Use this
    * to back a DID with an OS keychain, hardware token, or HSM wrapper.
    *
-   * Node.js / Bun only: the browser (WASM) build of `@limn-works/scp-ts` does
-   * not expose the `SCP` class (ADR-034 / ADR-048), so calling `new SCP(...)`
-   * there already throws before this method is reachable.
+   * Node.js / Bun only: the SDK requires the native addon (ADR-048), so calling
+   * `new SCP(...)` outside a Node.js/Bun runtime already throws before this
+   * method is reachable. Browser callers use `@limn-works/scp-ts-wasm` (ADR-057).
    *
    * @throws ValidationError if the provider is missing required methods, or
    *   IdentityError if key/DID creation fails inside the provider.
@@ -711,39 +811,179 @@ export class SCP {
       },
       custodyType: (keyId: string): string => provider.custodyType(keyId),
     };
-    const raw = await (
-      this.#native.identityCreateWithCustody as (p: typeof adapter) => Promise<unknown>
-    )(adapter);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await (
+        this.#native.identityCreateWithCustody as (p: typeof adapter) => Promise<unknown>
+      )(adapter);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityLoad(did: string): Promise<Identity> {
-    const raw = await (this.#native.identityLoad as (d: string) => Promise<unknown>)(did);
-    const { Identity: IdentityCls } = await import("./identity");
-    return IdentityCls._fromHandle(this, raw);
+    try {
+      const raw = await (this.#native.identityLoad as (d: string) => Promise<unknown>)(did);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  // The five identity-lifecycle operations below act on the identity HANDLE,
+  // not on the `Scp` class: the NAPI bridge implements them as methods on the
+  // `NapiIdentity` handle (`handle.rotateKey()`, `handle.migrate()`, …) and the
+  // WASM bridge as `identity_*` free functions. Both are surfaced uniformly
+  // through the per-instance `Bridge` (`getBridge(this)`), so these wrappers
+  // route through the bridge rather than `this.#native` (which is the `Scp`
+  // class and does not expose them). The returned `BridgeIdentityHandle` is
+  // re-wrapped into an {@link Identity}.
+
+  /**
+   * Rotates the `#active` signing key for an identity, publishing the updated
+   * DID document (spec §9.12, ADR-003). The old key is retired; the returned
+   * {@link Identity} carries the same DID with the rotated key material.
+   *
+   * @param identity The identity whose `#active` key to rotate.
+   * @returns The updated {@link Identity} (same DID, new key).
+   */
+  async identityRotateKey(identity: Identity): Promise<Identity> {
+    try {
+      const bridge = await getBridge(this);
+      const raw = await bridge.identityRotateKey(identity._rawHandle);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Migrates an identity across a custody or device boundary (spec §9.12,
+   * ADR-003 §4b). Migration reveals the pre-rotation key and publishes
+   * a new DID document, creating an identity with a **NEW DID** — the
+   * returned {@link Identity} has a different DID from the input.
+   *
+   * The returned handle carries a `rotationEventJson` field (a serialized
+   * `scp_identity::DidRotationEvent`). Callers **MUST** distribute this
+   * rotation event to all active context members (spec §9.12, ADR-003 §4b)
+   * so peers can update their routing tables. Access it via
+   * `identity.rotationEventJson` on the returned `Identity`.
+   *
+   * Use {@link identityRotateKey} instead when you need to renew the
+   * `#active` signing key while preserving the same DID.
+   *
+   * @param identity The identity to migrate.
+   * @returns The migrated {@link Identity} with a NEW DID.
+   */
+  async identityMigrate(identity: Identity): Promise<Identity> {
+    try {
+      const bridge = await getBridge(this);
+      const raw = await bridge.identityMigrate(identity._rawHandle);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Adds an `#agent` delegation key to an identity's DID document (spec §9.12,
+   * ADR-003), enabling agent-scoped capability delegation distinct from the
+   * human-bound `#active` key.
+   *
+   * @param identity The identity to add an agent key to.
+   * @returns The updated {@link Identity}.
+   */
+  async identityAddAgentKey(identity: Identity): Promise<Identity> {
+    try {
+      const bridge = await getBridge(this);
+      const raw = await bridge.identityAddAgentKey(identity._rawHandle);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Rotates the `#agent` delegation key for an identity, retiring the prior
+   * agent key and publishing the updated DID document (spec §9.12, ADR-003).
+   *
+   * @param identity The identity whose `#agent` key to rotate.
+   * @returns The updated {@link Identity}.
+   */
+  async identityRotateAgentKey(identity: Identity): Promise<Identity> {
+    try {
+      const bridge = await getBridge(this);
+      const raw = await bridge.identityRotateAgentKey(identity._rawHandle);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Removes the `#agent` delegation key from an identity's DID document
+   * (spec §9.12, ADR-003), revoking agent-scoped delegation for this DID.
+   *
+   * @param identity The identity whose `#agent` key to remove.
+   * @returns The updated {@link Identity}.
+   */
+  async identityRemoveAgentKey(identity: Identity): Promise<Identity> {
+    try {
+      const bridge = await getBridge(this);
+      const raw = await bridge.identityRemoveAgentKey(identity._rawHandle);
+      const { Identity: IdentityCls } = await import("./identity");
+      return IdentityCls._fromHandle(this, raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityResolve(did: string): Promise<unknown> {
-    return await (this.#native.identityResolve as (d: string) => Promise<unknown>)(did);
+    try {
+      return await (this.#native.identityResolve as (d: string) => Promise<unknown>)(did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   identityRemove(did: string): void {
-    (this.#native.identityRemove as (d: string) => void)(did);
+    try {
+      (this.#native.identityRemove as (d: string) => void)(did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   identityRemoveIfPresent(did: string): boolean {
-    return (this.#native.identityRemoveIfPresent as (d: string) => boolean)(did);
+    try {
+      return (this.#native.identityRemoveIfPresent as (d: string) => boolean)(did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityAttestDevice(did: string): Promise<string> {
-    return await (this.#native.identityAttestDevice as (d: string) => Promise<string>)(did);
+    try {
+      return await (this.#native.identityAttestDevice as (d: string) => Promise<string>)(did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
-    return await (
-      this.#native.identityVerifyDeviceAttestation as (d: string, t: string) => Promise<boolean>
-    )(did, tokenBase64);
+    try {
+      return await (
+        this.#native.identityVerifyDeviceAttestation as (d: string, t: string) => Promise<boolean>
+      )(did, tokenBase64);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityCreateLinkAttestation(
@@ -754,27 +994,39 @@ export class SCP {
     verificationMethod: string,
     platformId?: string | null,
   ): Promise<string> {
-    return await (
-      this.#native.identityCreateLinkAttestation as (
-        d: string,
-        p: string,
-        h: string,
-        pr: string,
-        vm: string,
-        pid: string | null | undefined,
-      ) => Promise<string>
-    )(did, platform, handle, proof, verificationMethod, platformId ?? null);
+    try {
+      return await (
+        this.#native.identityCreateLinkAttestation as (
+          d: string,
+          p: string,
+          h: string,
+          pr: string,
+          vm: string,
+          pid: string | null | undefined,
+        ) => Promise<string>
+      )(did, platform, handle, proof, verificationMethod, platformId ?? null);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   identityLinkAttestations(did: string): string {
-    return (this.#native.identityLinkAttestations as (d: string) => string)(did);
+    try {
+      return (this.#native.identityLinkAttestations as (d: string) => string)(did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   identityRemoveLinkAttestation(did: string, attestationId: string): boolean {
-    return (this.#native.identityRemoveLinkAttestation as (d: string, a: string) => boolean)(
-      did,
-      attestationId,
-    );
+    try {
+      return (this.#native.identityRemoveLinkAttestation as (d: string, a: string) => boolean)(
+        did,
+        attestationId,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async identityVerifyLinkAttestation(
@@ -787,13 +1039,25 @@ export class SCP {
     // gate-defang). Surface stays async for SDK ABI stability; the underlying
     // call is sync.
     const fn = nativeFreeFn<(j: string, k: string) => boolean>("identityVerifyLinkAttestation");
-    return fn(attestationJson, issuerPublicKeyHex);
+    try {
+      return fn(attestationJson, issuerPublicKeyHex);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   identityExecuteRecovery(did: string, tier: string, contextIds: readonly string[]): string {
-    return (
-      this.#native.identityExecuteRecovery as (d: string, t: string, c: readonly string[]) => string
-    )(did, tier, contextIds);
+    try {
+      return (
+        this.#native.identityExecuteRecovery as (
+          d: string,
+          t: string,
+          c: readonly string[],
+        ) => string
+      )(did, tier, contextIds);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   identityExecuteCustodyMigration(
@@ -801,13 +1065,17 @@ export class SCP {
     target: string,
     contextIds: readonly string[],
   ): string {
-    return (
-      this.#native.identityExecuteCustodyMigration as (
-        d: string,
-        t: string,
-        c: readonly string[],
-      ) => string
-    )(did, target, contextIds);
+    try {
+      return (
+        this.#native.identityExecuteCustodyMigration as (
+          d: string,
+          t: string,
+          c: readonly string[],
+        ) => string
+      )(did, target, contextIds);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -815,61 +1083,108 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   petnameSet(ownerDid: string, targetDid: string, name: string): void {
-    (this.#native.petnameSet as (o: string, t: string, n: string) => void)(
-      ownerDid,
-      targetDid,
-      name,
-    );
+    try {
+      (this.#native.petnameSet as (o: string, t: string, n: string) => void)(
+        ownerDid,
+        targetDid,
+        name,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   petnameRemove(ownerDid: string, targetDid: string): void {
-    (this.#native.petnameRemove as (o: string, t: string) => void)(ownerDid, targetDid);
+    try {
+      (this.#native.petnameRemove as (o: string, t: string) => void)(ownerDid, targetDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   petnameSetContext(ownerDid: string, contextId: string, name: string): void {
-    (this.#native.petnameSetContext as (o: string, c: string, n: string) => void)(
-      ownerDid,
-      contextId,
-      name,
-    );
+    try {
+      (this.#native.petnameSetContext as (o: string, c: string, n: string) => void)(
+        ownerDid,
+        contextId,
+        name,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   petnameRemoveContext(ownerDid: string, contextId: string): void {
-    (this.#native.petnameRemoveContext as (o: string, c: string) => void)(ownerDid, contextId);
+    try {
+      (this.#native.petnameRemoveContext as (o: string, c: string) => void)(ownerDid, contextId);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   petnameResolveDid(ownerDid: string, name: string): string {
-    return (this.#native.petnameResolveDid as (o: string, n: string) => string)(ownerDid, name);
+    try {
+      return (this.#native.petnameResolveDid as (o: string, n: string) => string)(ownerDid, name);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   petnameResolveContext(ownerDid: string, name: string): string {
-    return (this.#native.petnameResolveContext as (o: string, n: string) => string)(ownerDid, name);
+    try {
+      return (this.#native.petnameResolveContext as (o: string, n: string) => string)(
+        ownerDid,
+        name,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   petnameGetForDid(ownerDid: string, targetDid: string): string | null {
-    return (this.#native.petnameGetForDid as (o: string, t: string) => string | null)(
-      ownerDid,
-      targetDid,
-    );
+    try {
+      return (this.#native.petnameGetForDid as (o: string, t: string) => string | null)(
+        ownerDid,
+        targetDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   petnameGetForContext(ownerDid: string, contextId: string): string | null {
-    return (this.#native.petnameGetForContext as (o: string, c: string) => string | null)(
-      ownerDid,
-      contextId,
-    );
+    try {
+      return (this.#native.petnameGetForContext as (o: string, c: string) => string | null)(
+        ownerDid,
+        contextId,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   petnameApplyEvent(ownerDid: string, eventJson: string): void {
-    (this.#native.petnameApplyEvent as (o: string, e: string) => void)(ownerDid, eventJson);
+    try {
+      (this.#native.petnameApplyEvent as (o: string, e: string) => void)(ownerDid, eventJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   petnameDidCount(ownerDid: string): number {
-    return (this.#native.petnameDidCount as (o: string) => number)(ownerDid);
+    try {
+      return (this.#native.petnameDidCount as (o: string) => number)(ownerDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   petnameContextCount(ownerDid: string): number {
-    return (this.#native.petnameContextCount as (o: string) => number)(ownerDid);
+    try {
+      return (this.#native.petnameContextCount as (o: string) => number)(ownerDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -884,32 +1199,44 @@ export class SCP {
     description?: string,
     tags?: readonly string[],
   ): string {
-    return (
-      this.#native.handleRegister as (
-        d: string,
-        h: string,
-        t: string,
-        r: string,
-        desc: string | undefined,
-        tags: readonly string[] | undefined,
-      ) => string
-    )(discoveryContextId, handle, targetJson, registrantDid, description, tags);
+    try {
+      return (
+        this.#native.handleRegister as (
+          d: string,
+          h: string,
+          t: string,
+          r: string,
+          desc: string | undefined,
+          tags: readonly string[] | undefined,
+        ) => string
+      )(discoveryContextId, handle, targetJson, registrantDid, description, tags);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   handleLookup(discoveryContextId: string, handle: string, typeFilter?: string): string {
-    return (this.#native.handleLookup as (d: string, h: string, f: string | undefined) => string)(
-      discoveryContextId,
-      handle,
-      typeFilter,
-    );
+    try {
+      return (this.#native.handleLookup as (d: string, h: string, f: string | undefined) => string)(
+        discoveryContextId,
+        handle,
+        typeFilter,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   handleDeregister(discoveryContextId: string, handle: string, did: string): string {
-    return (this.#native.handleDeregister as (d: string, h: string, did: string) => string)(
-      discoveryContextId,
-      handle,
-      did,
-    );
+    try {
+      return (this.#native.handleDeregister as (d: string, h: string, did: string) => string)(
+        discoveryContextId,
+        handle,
+        did,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   scopeRegister(
@@ -921,29 +1248,41 @@ export class SCP {
     description?: string,
     tags?: readonly string[],
   ): string {
-    return (
-      this.#native.scopeRegister as (
-        sc: string,
-        n: string,
-        tc: string,
-        r: readonly string[],
-        rd: string,
-        d: string | undefined,
-        t: readonly string[] | undefined,
-      ) => string
-    )(scopeContextId, name, targetContextId, relayUrls, registrantDid, description, tags);
+    try {
+      return (
+        this.#native.scopeRegister as (
+          sc: string,
+          n: string,
+          tc: string,
+          r: readonly string[],
+          rd: string,
+          d: string | undefined,
+          t: readonly string[] | undefined,
+        ) => string
+      )(scopeContextId, name, targetContextId, relayUrls, registrantDid, description, tags);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   scopeLookup(scopeContextId: string, name: string): string {
-    return (this.#native.scopeLookup as (sc: string, n: string) => string)(scopeContextId, name);
+    try {
+      return (this.#native.scopeLookup as (sc: string, n: string) => string)(scopeContextId, name);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   scopeDeregister(scopeContextId: string, name: string, did: string): string {
-    return (this.#native.scopeDeregister as (sc: string, n: string, d: string) => string)(
-      scopeContextId,
-      name,
-      did,
-    );
+    try {
+      return (this.#native.scopeDeregister as (sc: string, n: string, d: string) => string)(
+        scopeContextId,
+        name,
+        did,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async addressResolve(
@@ -951,13 +1290,17 @@ export class SCP {
     address: string,
     knownContextsJson?: string,
   ): Promise<string> {
-    return await (
-      this.#native.addressResolve as (
-        o: string,
-        a: string,
-        k: string | undefined,
-      ) => Promise<string>
-    )(ownerDid, address, knownContextsJson);
+    try {
+      return await (
+        this.#native.addressResolve as (
+          o: string,
+          a: string,
+          k: string | undefined,
+        ) => Promise<string>
+      )(ownerDid, address, knownContextsJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -965,12 +1308,205 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async contextCreate(identity: Identity, paramsJson: string): Promise<Context> {
-    const raw = await (this.#native.contextCreate as (id: unknown, p: string) => Promise<unknown>)(
-      identity._rawHandle,
-      paramsJson,
-    );
+    try {
+      const raw = await (
+        this.#native.contextCreate as (id: unknown, p: string) => Promise<unknown>
+      )(identity._rawHandle, paramsJson);
+      const { Context: ContextCls } = await import("./context");
+      return ContextCls._fromHandle(this, raw as never, identity.did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Reserves a pooled MLS `KeyPackage` under the joiner's own identity for a
+   * spawn-from-Welcome join (ADR-049 Phase 2J).
+   *
+   * The join-side peer of {@link contextCreate}: a node that intends to JOIN by
+   * receiving a Welcome first reserves a single-use `KeyPackage` under its own
+   * identity. The returned PUBLIC bytes are handed (out of band) to the context
+   * creator, who mints a Welcome addressed to this reservation; the
+   * `reservationId` is passed back to {@link contextJoinFromWelcome}. The
+   * joiner's private signer state never leaves the native core.
+   *
+   * @param owningDid The joiner's own DID. MUST be a locally-custodied identity
+   *   (same trust model as {@link contextCreate}); a non-custodied DID fails
+   *   closed with `SCP-IDENT-1001`.
+   * @returns The opaque `{ reservationId, keyPackagePublic }` pair.
+   *
+   * @example
+   * const reservation = await scp.reserveKeyPackage(joiner.did);
+   * // Hand reservation.keyPackagePublic to the creator out of band; it seals a
+   * // signed invitation bundle addressed to this reservation via
+   * // `scp.inviteMember(...)`, which you then open:
+   * const ctx = await scp.contextJoinFromWelcome(
+   *   joiner.did,
+   *   sealed, // the SealedInvitation from the creator's `inviteMember`
+   *   reservation.reservationId,
+   * );
+   */
+  async reserveKeyPackage(owningDid: string): Promise<KeyPackageReservation> {
+    const raw = await (
+      this.#native.reserveKeyPackage as (
+        d: string,
+      ) => Promise<{ reservationId: string; keyPackagePublic: ArrayLike<number> }>
+    )(owningDid);
+    return {
+      reservationId: raw.reservationId,
+      keyPackagePublic: new Uint8Array(raw.keyPackagePublic),
+    };
+  }
+
+  /**
+   * Joins an existing SCP context by opening a received sealed, signed
+   * invitation bundle, standing the local (joiner) identity up as a send-capable
+   * participant (ADR-049 Phase 2J; FFI-02 Option A).
+   *
+   * Completes the reserve → invite → join handshake begun by
+   * {@link reserveKeyPackage}: given the {@link SealedInvitation} the creator
+   * produced with {@link inviteMember}, this opens and AUTHENTICATES the bundle,
+   * installs the joined MLS group, derives the joiner's §9.10.4 routing pseudonym
+   * from its locally-custodied identity (never caller-supplied), and returns an
+   * active {@link Context} rebuilt from the AUTHENTICATED bundle params. Without
+   * it a Welcome-joined node can DECRYPT but cannot SEND. A non-custodied joiner
+   * hard-fails before the single-use `KeyPackage` is consumed.
+   *
+   * The joiner supplies NO loose `params`/`welcomeBytes`: the authoritative
+   * genesis params + MLS Welcome travel INSIDE the signed `sealed` bundle, which
+   * the native core opens and verifies. `sealed.contextId` / `sealed.creatorDid`
+   * are UNTRUSTED binding hints only — authority derives from the signed bundle.
+   *
+   * @param owningDid The joiner's own DID (the reservation holder).
+   * @param sealed The {@link SealedInvitation} bundle produced by the creator's
+   *   {@link inviteMember} and delivered to this joiner.
+   * @param reservationId The id returned by {@link reserveKeyPackage} for the
+   *   `KeyPackage` this bundle addresses.
+   * @returns An active {@link Context} for the joined context.
+   *
+   * @example
+   * const ctx = await scp.contextJoinFromWelcome(
+   *   joiner.did,
+   *   outcome.bundle, // the SealedInvitation from the creator's `inviteMember`
+   *   reservation.reservationId,
+   * );
+   */
+  async contextJoinFromWelcome(
+    owningDid: string,
+    sealed: SealedInvitation,
+    reservationId: string,
+  ): Promise<Context> {
+    // napi surfaces the bundle's `enc`/`ciphertext` as Rust `Vec<u8>` fields;
+    // marshal them to plain number[] on the wire (the same normalization the
+    // reserve/import byte paths use), never a Uint8Array the napi Vec<u8>
+    // deserializer would reject.
+    const nativeSealed = {
+      contextId: sealed.contextId,
+      creatorDid: sealed.creatorDid,
+      enc: Array.from(sealed.enc),
+      ciphertext: Array.from(sealed.ciphertext),
+    };
+    const raw = await (
+      this.#native.contextJoinFromWelcome as (
+        o: string,
+        s: {
+          contextId: string;
+          creatorDid: string;
+          enc: readonly number[];
+          ciphertext: readonly number[];
+        },
+        r: string,
+      ) => Promise<unknown>
+    )(owningDid, nativeSealed, reservationId);
     const { Context: ContextCls } = await import("./context");
-    return ContextCls._fromHandle(this, raw as never, identity.did);
+    return ContextCls._fromHandle(this, raw as never, owningDid);
+  }
+
+  /**
+   * Invites a member to an existing context, producing a sealed, signed
+   * invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+   *
+   * The creator (or admin) seals the context's genesis params + MLS Welcome for
+   * the invitee under RFC 9180 HPKE, binding them to the invitee's `KeyPackage`.
+   * Only a `SingleAdmin` context is supported today: the invite is unilateral
+   * and returns an {@link InviteMemberOutcome} whose `bundle` is the sealed
+   * {@link SealedInvitation} — pass it straight to the invitee's
+   * {@link contextJoinFromWelcome} (no re-assembly). A voting-governed context
+   * THROWS (governed-context invitations are not yet implemented).
+   *
+   * The invite routes through the actor governance gate, which requires the
+   * inviter to hold the `governance:propose` capability. A normally-created
+   * `SingleAdmin` context grants its admin that capability at genesis, so it
+   * works out of the box; a context with a custom ceiling must grant
+   * `governance:propose` to the inviter.
+   *
+   * `creatorDid` MUST be a locally-custodied identity; the invite is signed
+   * under its `#active` key.
+   *
+   * @param contextId The context to invite the member into.
+   * @param creatorDid The inviting creator/admin DID (locally custodied).
+   * @param inviteeDid The DID of the member being invited.
+   * @param inviteeKeyPackage The invitee's PUBLIC MLS `KeyPackage` bytes (from
+   *   the invitee's {@link reserveKeyPackage}).
+   * @param relayUrls Relay URLs the runtime may publish the sealed bundle to.
+   * @returns The {@link InviteMemberOutcome} — the sealed `bundle` plus the
+   *   `delivered` flag.
+   *
+   * @example
+   * const outcome = await scp.inviteMember(
+   *   ctx.contextId,
+   *   creator.did,
+   *   invitee.did,
+   *   reservation.keyPackagePublic,
+   *   [],
+   * );
+   * // `outcome.bundle` is directly usable — no manual re-assembly:
+   * const joined = await joinerScp.contextJoinFromWelcome(
+   *   invitee.did,
+   *   outcome.bundle,
+   *   reservationId,
+   * );
+   */
+  async inviteMember(
+    contextId: string,
+    creatorDid: string,
+    inviteeDid: string,
+    inviteeKeyPackage: Uint8Array | readonly number[],
+    relayUrls: readonly string[],
+  ): Promise<InviteMemberOutcome> {
+    const keyPackageArray = ArrayBuffer.isView(inviteeKeyPackage)
+      ? Array.from(inviteeKeyPackage as Uint8Array)
+      : (inviteeKeyPackage as readonly number[]);
+    const raw = await (
+      this.#native.inviteMember as (
+        ctx: string,
+        c: string,
+        i: string,
+        kp: readonly number[],
+        r: readonly string[],
+      ) => Promise<{
+        bundle: {
+          contextId: string;
+          creatorDid: string;
+          enc: ArrayLike<number>;
+          ciphertext: ArrayLike<number>;
+        };
+        delivered: boolean;
+      }>
+    )(contextId, creatorDid, inviteeDid, keyPackageArray, relayUrls);
+
+    // Project the flat napi object into the SDK outcome. The `bundle` is a
+    // SealedInvitation directly usable as the join input. A voting-governed
+    // context does not reach here — the native bridge throws for it.
+    return {
+      bundle: {
+        contextId: raw.bundle.contextId,
+        creatorDid: raw.bundle.creatorDid,
+        enc: new Uint8Array(raw.bundle.enc),
+        ciphertext: new Uint8Array(raw.bundle.ciphertext),
+      },
+      delivered: raw.delivered,
+    };
   }
 
   async contextJoin(
@@ -978,11 +1514,13 @@ export class SCP {
     identityDid: string,
     spendingUcanJwt?: string | null,
   ): Promise<void> {
-    await (this.#native.contextJoin as (h: unknown, d: string, s: string | null) => Promise<void>)(
-      handle,
-      identityDid,
-      spendingUcanJwt ?? null,
-    );
+    try {
+      await (
+        this.#native.contextJoin as (h: unknown, d: string, s: string | null) => Promise<void>
+      )(handle, identityDid, spendingUcanJwt ?? null);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -990,7 +1528,7 @@ export class SCP {
    * this bridge's supervisor, simulating a delivered pseudonym announcement so
    * multi-member encrypted sends do not fail closed with `SCP-CTX-2095`.
    *
-   * Only available on builds compiled with the `allow_in_memory_custody`
+   * Only available on builds compiled with the `testing`
    * feature; never present in production builds.
    */
   async contextSeedPeerPseudonym(
@@ -998,27 +1536,39 @@ export class SCP {
     peerDid: string,
     pseudonym: Uint8Array | Buffer,
   ): Promise<void> {
-    await (
-      this.#native.contextSeedPeerPseudonym as (
-        h: unknown,
-        p: string,
-        ps: Uint8Array | Buffer,
-      ) => Promise<void>
-    )(handle, peerDid, pseudonym);
+    try {
+      await (
+        this.#native.contextSeedPeerPseudonym as (
+          h: unknown,
+          p: string,
+          ps: Uint8Array | Buffer,
+        ) => Promise<void>
+      )(handle, peerDid, pseudonym);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextLeave(handle: unknown, identityDid: string): Promise<void> {
-    await (this.#native.contextLeave as (h: unknown, d: string) => Promise<void>)(
-      handle,
-      identityDid,
-    );
+    try {
+      await (this.#native.contextLeave as (h: unknown, d: string) => Promise<void>)(
+        handle,
+        identityDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextClose(handle: unknown, identityDid: string): Promise<void> {
-    await (this.#native.contextClose as (h: unknown, d: string) => Promise<void>)(
-      handle,
-      identityDid,
-    );
+    try {
+      await (this.#native.contextClose as (h: unknown, d: string) => Promise<void>)(
+        handle,
+        identityDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -1036,17 +1586,16 @@ export class SCP {
     payload: Uint8Array | readonly number[],
     spendingUcanJwt?: string | null,
   ): Promise<void> {
-    const payloadArray = ArrayBuffer.isView(payload)
-      ? Array.from(payload as Uint8Array)
-      : (payload as readonly number[]);
-    await (
-      this.#native.contextSend as (
-        h: unknown,
-        d: string,
-        p: readonly number[],
-        s: string | null,
-      ) => Promise<void>
-    )(handle, identityDid, payloadArray, spendingUcanJwt ?? null);
+    const payloadUint8 = ArrayBuffer.isView(payload)
+      ? (payload as Uint8Array)
+      : new Uint8Array(payload as readonly number[]);
+    const bridge = await getBridge(this);
+    return bridge.contextSend(
+      handle as BridgeContextHandle,
+      identityDid,
+      payloadUint8,
+      spendingUcanJwt ?? null,
+    );
   }
 
   async contextSubscribe(
@@ -1054,71 +1603,116 @@ export class SCP {
     identityDid: string,
     onMessage: (message: unknown) => void,
   ): Promise<void> {
-    await (
-      this.#native.contextSubscribe as (
-        h: unknown,
-        d: string,
-        cb: (m: unknown) => void,
-      ) => Promise<void>
-    )(handle, identityDid, onMessage);
+    try {
+      await (
+        this.#native.contextSubscribe as (
+          h: unknown,
+          d: string,
+          cb: (m: unknown) => void,
+        ) => Promise<void>
+      )(handle, identityDid, onMessage);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   contextCancelSubscription(handle: unknown): void {
-    (this.#native.contextCancelSubscription as (h: unknown) => void)(handle);
+    try {
+      (this.#native.contextCancelSubscription as (h: unknown) => void)(handle);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextMemberCount(handle: unknown): Promise<number> {
-    return await (this.#native.contextMemberCount as (h: unknown) => Promise<number>)(handle);
+    const bridge = await getBridge(this);
+    return (await bridge.contextMemberCount(handle as BridgeContextHandle)) ?? 0;
   }
 
   async contextIsMember(handle: unknown, did: string): Promise<boolean> {
-    return await (this.#native.contextIsMember as (h: unknown, d: string) => Promise<boolean>)(
-      handle,
-      did,
-    );
+    try {
+      return await (this.#native.contextIsMember as (h: unknown, d: string) => Promise<boolean>)(
+        handle,
+        did,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextMemberDids(handle: unknown): Promise<readonly string[]> {
-    return await (this.#native.contextMemberDids as (h: unknown) => Promise<readonly string[]>)(
-      handle,
-    );
+    try {
+      return await (this.#native.contextMemberDids as (h: unknown) => Promise<readonly string[]>)(
+        handle,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextMemberRole(handle: unknown, did: string): Promise<string | null> {
-    return await (
-      this.#native.contextMemberRole as (h: unknown, d: string) => Promise<string | null>
-    )(handle, did);
+    try {
+      return await (
+        this.#native.contextMemberRole as (h: unknown, d: string) => Promise<string | null>
+      )(handle, did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextDrainEvents(handle: unknown): Promise<readonly string[]> {
-    return await (this.#native.contextDrainEvents as (h: unknown) => Promise<readonly string[]>)(
-      handle,
-    );
+    try {
+      return await (this.#native.contextDrainEvents as (h: unknown) => Promise<readonly string[]>)(
+        handle,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextRestore(contextId: string): Promise<void> {
-    await (this.#native.contextRestore as (id: string) => Promise<void>)(contextId);
+    try {
+      await (this.#native.contextRestore as (id: string) => Promise<void>)(contextId);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextRestoreAll(): Promise<string> {
-    return await (this.#native.contextRestoreAll as () => Promise<string>)();
+    try {
+      return await (this.#native.contextRestoreAll as () => Promise<string>)();
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextTombstoneMigrated(handle: unknown): Promise<void> {
-    await (this.#native.contextTombstoneMigrated as (h: unknown) => Promise<void>)(handle);
+    try {
+      await (this.#native.contextTombstoneMigrated as (h: unknown) => Promise<void>)(handle);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextMigrationState(handle: unknown): Promise<string | null> {
-    return await (this.#native.contextMigrationState as (h: unknown) => Promise<string | null>)(
-      handle,
-    );
+    try {
+      return await (this.#native.contextMigrationState as (h: unknown) => Promise<string | null>)(
+        handle,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextExport(handle: unknown): Promise<Uint8Array> {
-    const raw = await (this.#native.contextExport as (h: unknown) => Promise<Uint8Array | Buffer>)(
-      handle,
-    );
-    return new Uint8Array(raw);
+    try {
+      const raw = await (
+        this.#native.contextExport as (h: unknown) => Promise<Uint8Array | Buffer>
+      )(handle);
+      return new Uint8Array(raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -1135,20 +1729,35 @@ export class SCP {
    * @returns The imported context's id.
    */
   async contextImport(data: Uint8Array | readonly number[], importerDid: string): Promise<string> {
-    const dataArray = ArrayBuffer.isView(data)
-      ? Array.from(data as Uint8Array)
-      : (data as readonly number[]);
-    return await (
-      this.#native.contextImport as (d: readonly number[], did: string) => Promise<string>
-    )(dataArray, importerDid);
+    try {
+      const dataArray = ArrayBuffer.isView(data)
+        ? Array.from(data as Uint8Array)
+        : (data as readonly number[]);
+      return await (
+        this.#native.contextImport as (d: readonly number[], did: string) => Promise<string>
+      )(dataArray, importerDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   contextSetEconomicPolicy(handle: unknown, policyJson: string): void {
-    (this.#native.contextSetEconomicPolicy as (h: unknown, p: string) => void)(handle, policyJson);
+    try {
+      (this.#native.contextSetEconomicPolicy as (h: unknown, p: string) => void)(
+        handle,
+        policyJson,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   contextGetEconomicPolicy(handle: unknown): string | null {
-    return (this.#native.contextGetEconomicPolicy as (h: unknown) => string | null)(handle);
+    try {
+      return (this.#native.contextGetEconomicPolicy as (h: unknown) => string | null)(handle);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -1156,52 +1765,91 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async accessKeyGenerate(contextId: string, memberDid: string, callerDid: string): Promise<void> {
-    await (this.#native.accessKeyGenerate as (c: string, m: string, k: string) => Promise<void>)(
-      contextId,
-      memberDid,
-      callerDid,
-    );
+    try {
+      await (this.#native.accessKeyGenerate as (c: string, m: string, k: string) => Promise<void>)(
+        contextId,
+        memberDid,
+        callerDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async accessKeyRevoke(contextId: string, memberDid: string, callerDid: string): Promise<void> {
-    await (this.#native.accessKeyRevoke as (c: string, m: string, k: string) => Promise<void>)(
-      contextId,
-      memberDid,
-      callerDid,
-    );
+    try {
+      await (this.#native.accessKeyRevoke as (c: string, m: string, k: string) => Promise<void>)(
+        contextId,
+        memberDid,
+        callerDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async accessKeyRestore(contextId: string, memberDid: string, callerDid: string): Promise<void> {
-    await (this.#native.accessKeyRestore as (c: string, m: string, k: string) => Promise<void>)(
-      contextId,
-      memberDid,
-      callerDid,
-    );
+    try {
+      await (this.#native.accessKeyRestore as (c: string, m: string, k: string) => Promise<void>)(
+        contextId,
+        memberDid,
+        callerDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextBroadcastSubscriberCount(handle: unknown): Promise<number | null> {
-    return await (
-      this.#native.contextBroadcastSubscriberCount as (h: unknown) => Promise<number | null>
-    )(handle);
+    try {
+      return await (
+        this.#native.contextBroadcastSubscriberCount as (h: unknown) => Promise<number | null>
+      )(handle);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextIsBroadcastSubscriber(handle: unknown, did: string): Promise<boolean> {
-    return await (
-      this.#native.contextIsBroadcastSubscriber as (h: unknown, d: string) => Promise<boolean>
-    )(handle, did);
+    try {
+      return await (
+        this.#native.contextIsBroadcastSubscriber as (h: unknown, d: string) => Promise<boolean>
+      )(handle, did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextBroadcastAdmission(handle: unknown): Promise<string | null> {
-    return await (this.#native.contextBroadcastAdmission as (h: unknown) => Promise<string | null>)(
-      handle,
-    );
+    try {
+      return await (
+        this.#native.contextBroadcastAdmission as (h: unknown) => Promise<string | null>
+      )(handle);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
-  async broadcastSubscribe(handle: unknown, subscriberDid: string): Promise<void> {
-    await (this.#native.broadcastSubscribe as (h: unknown, d: string) => Promise<void>)(
-      handle,
-      subscriberDid,
-    );
+  /**
+   * Subscribe a DID to a broadcast context.
+   *
+   * For a GATED broadcast context, `messagesReadUcanJwt` must carry the
+   * `messages:read` UCAN JWT issued to `subscriberDid` by the context
+   * admin/creator (spec §5.14.4); the full UCAN validation pipeline runs on it.
+   * It is unused for an OPEN context.
+   */
+  async broadcastSubscribe(
+    handle: unknown,
+    subscriberDid: string,
+    messagesReadUcanJwt?: string,
+  ): Promise<void> {
+    try {
+      await (
+        this.#native.broadcastSubscribe as (h: unknown, d: string, u?: string) => Promise<void>
+      )(handle, subscriberDid, messagesReadUcanJwt);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async broadcastUnsubscribe(
@@ -1209,13 +1857,17 @@ export class SCP {
     subscriberDid: string,
     rotateKeys?: boolean,
   ): Promise<void> {
-    await (
-      this.#native.broadcastUnsubscribe as (
-        h: unknown,
-        d: string,
-        r: boolean | undefined,
-      ) => Promise<void>
-    )(handle, subscriberDid, rotateKeys);
+    try {
+      await (
+        this.#native.broadcastUnsubscribe as (
+          h: unknown,
+          d: string,
+          r: boolean | undefined,
+        ) => Promise<void>
+      )(handle, subscriberDid, rotateKeys);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async broadcastPublish(
@@ -1223,16 +1875,20 @@ export class SCP {
     authorDid: string,
     payload: Uint8Array | readonly number[],
   ): Promise<void> {
-    const payloadArray = ArrayBuffer.isView(payload)
-      ? Array.from(payload as Uint8Array)
-      : (payload as readonly number[]);
-    await (
-      this.#native.broadcastPublish as (
-        h: unknown,
-        d: string,
-        p: readonly number[],
-      ) => Promise<void>
-    )(handle, authorDid, payloadArray);
+    try {
+      const payloadArray = ArrayBuffer.isView(payload)
+        ? Array.from(payload as Uint8Array)
+        : (payload as readonly number[]);
+      await (
+        this.#native.broadcastPublish as (
+          h: unknown,
+          d: string,
+          p: readonly number[],
+        ) => Promise<void>
+      )(handle, authorDid, payloadArray);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async broadcastPublishAsset(
@@ -1241,14 +1897,18 @@ export class SCP {
     asset: { path: string; contentType: string; body: readonly number[] },
     deployId?: string | null,
   ): Promise<unknown> {
-    return await (
-      this.#native.broadcastPublishAsset as (
-        h: unknown,
-        d: string,
-        a: { path: string; contentType: string; body: readonly number[] },
-        did: string | null,
-      ) => Promise<unknown>
-    )(handle, authorDid, asset, deployId ?? null);
+    try {
+      return await (
+        this.#native.broadcastPublishAsset as (
+          h: unknown,
+          d: string,
+          a: { path: string; contentType: string; body: readonly number[] },
+          did: string | null,
+        ) => Promise<unknown>
+      )(handle, authorDid, asset, deployId ?? null);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async broadcastPublishAssets(
@@ -1257,14 +1917,18 @@ export class SCP {
     assets: readonly { path: string; contentType: string; body: readonly number[] }[],
     deployId?: string | null,
   ): Promise<unknown> {
-    return await (
-      this.#native.broadcastPublishAssets as (
-        h: unknown,
-        d: string,
-        a: readonly { path: string; contentType: string; body: readonly number[] }[],
-        did: string | null,
-      ) => Promise<unknown>
-    )(handle, authorDid, assets, deployId ?? null);
+    try {
+      return await (
+        this.#native.broadcastPublishAssets as (
+          h: unknown,
+          d: string,
+          a: readonly { path: string; contentType: string; body: readonly number[] }[],
+          did: string | null,
+        ) => Promise<unknown>
+      )(handle, authorDid, assets, deployId ?? null);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async broadcastBlockSubscriber(
@@ -1272,9 +1936,13 @@ export class SCP {
     subscriberDid: string,
     blockerDid: string,
   ): Promise<void> {
-    await (
-      this.#native.broadcastBlockSubscriber as (h: unknown, s: string, b: string) => Promise<void>
-    )(handle, subscriberDid, blockerDid);
+    try {
+      await (
+        this.#native.broadcastBlockSubscriber as (h: unknown, s: string, b: string) => Promise<void>
+      )(handle, subscriberDid, blockerDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async broadcastUnblockSubscriber(
@@ -1282,9 +1950,17 @@ export class SCP {
     subscriberDid: string,
     unblockerDid: string,
   ): Promise<void> {
-    await (
-      this.#native.broadcastUnblockSubscriber as (h: unknown, s: string, u: string) => Promise<void>
-    )(handle, subscriberDid, unblockerDid);
+    try {
+      await (
+        this.#native.broadcastUnblockSubscriber as (
+          h: unknown,
+          s: string,
+          u: string,
+        ) => Promise<void>
+      )(handle, subscriberDid, unblockerDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -1307,16 +1983,20 @@ export class SCP {
     requesterDid: string,
     wrappingPubkey: Uint8Array,
   ): Promise<string | null> {
-    // NAPI Vec<u8> IN params map to number[] in JS, not Uint8Array.
-    const wrappingArray = Array.from(wrappingPubkey) as unknown as number[];
-    return await (
-      this.#native.broadcastHandleKeyRequest as (
-        h: unknown,
-        a: string,
-        r: string,
-        w: number[],
-      ) => Promise<string | null>
-    )(handle, authorDid, requesterDid, wrappingArray);
+    try {
+      // NAPI Vec<u8> IN params map to number[] in JS, not Uint8Array.
+      const wrappingArray = Array.from(wrappingPubkey) as unknown as number[];
+      return await (
+        this.#native.broadcastHandleKeyRequest as (
+          h: unknown,
+          a: string,
+          r: string,
+          w: number[],
+        ) => Promise<string | null>
+      )(handle, authorDid, requesterDid, wrappingArray);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -1342,7 +2022,11 @@ export class SCP {
     // Buffer (a Uint8Array).
     const secretArray = Array.from(wrappingSecret) as unknown as number[];
     const fn = nativeFreeFn<(s: string, w: number[]) => Uint8Array>("broadcastOpenKey");
-    return fn(sealedJson, secretArray);
+    try {
+      return fn(sealedJson, secretArray);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -1362,25 +2046,22 @@ export class SCP {
    * actions (`RemoveMember`) the JSON includes a `commit` field: a hex-encoded
    * MLS Commit that evicts the removed member from the group key schedule.
    *
-   * Commit distribution differs by backend:
-   * - **Native (NAPI) backend — this method.** This call routes through the
-   *   native addon, which has an internal transport and **auto-broadcasts** the
-   *   eviction `commit` to the other context members. The caller does not need
-   *   to relay it.
-   * - **Browser (WASM) backend.** The WASM bridge has no internal transport
-   *   (ADR-034) and performs no automatic broadcast or retry, so a WASM caller
-   *   **MUST relay the `commit`** it receives to the other context members. If
-   *   it does not, the MLS group silently forks: the remaining members never
-   *   advance their epoch and never learn of the eviction.
+   * This call routes through the native addon, which has an internal
+   * transport and **auto-broadcasts** the eviction `commit` to the other
+   * context members. The caller does not need to relay it.
    *
-   * Either way, an empty `commit` string means no MLS commit was produced
+   * An empty `commit` string means no MLS commit was produced
    * (broadcast/unencrypted context, or the removed member held no MLS leaf) and
    * there is nothing to distribute.
    */
   async contextExecuteGovernanceAction(handle: unknown, proposalIdHex: string): Promise<string> {
-    return await (
-      this.#native.contextExecuteGovernanceAction as (h: unknown, p: string) => Promise<string>
-    )(handle, proposalIdHex);
+    try {
+      return await (
+        this.#native.contextExecuteGovernanceAction as (h: unknown, p: string) => Promise<string>
+      )(handle, proposalIdHex);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextGovernancePropose(
@@ -1388,9 +2069,8 @@ export class SCP {
     actionJson: string,
     proposerDid: string,
   ): Promise<string> {
-    return await (
-      this.#native.contextGovernancePropose as (h: unknown, a: string, p: string) => Promise<string>
-    )(handle, actionJson, proposerDid);
+    const bridge = await getBridge(this);
+    return bridge.contextGovernancePropose(handle as BridgeContextHandle, actionJson, proposerDid);
   }
 
   async contextGovernanceApprove(
@@ -1398,9 +2078,17 @@ export class SCP {
     proposalIdHex: string,
     voterDid: string,
   ): Promise<string> {
-    return await (
-      this.#native.contextGovernanceApprove as (h: unknown, p: string, v: string) => Promise<string>
-    )(handle, proposalIdHex, voterDid);
+    try {
+      return await (
+        this.#native.contextGovernanceApprove as (
+          h: unknown,
+          p: string,
+          v: string,
+        ) => Promise<string>
+      )(handle, proposalIdHex, voterDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextGovernanceReject(
@@ -1408,9 +2096,17 @@ export class SCP {
     proposalIdHex: string,
     voterDid: string,
   ): Promise<string> {
-    return await (
-      this.#native.contextGovernanceReject as (h: unknown, p: string, v: string) => Promise<string>
-    )(handle, proposalIdHex, voterDid);
+    try {
+      return await (
+        this.#native.contextGovernanceReject as (
+          h: unknown,
+          p: string,
+          v: string,
+        ) => Promise<string>
+      )(handle, proposalIdHex, voterDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextGovernanceWithdraw(
@@ -1418,41 +2114,61 @@ export class SCP {
     proposalIdHex: string,
     voterDid: string,
   ): Promise<string> {
-    return await (
-      this.#native.contextGovernanceWithdraw as (
-        h: unknown,
-        p: string,
-        v: string,
-      ) => Promise<string>
-    )(handle, proposalIdHex, voterDid);
+    try {
+      return await (
+        this.#native.contextGovernanceWithdraw as (
+          h: unknown,
+          p: string,
+          v: string,
+        ) => Promise<string>
+      )(handle, proposalIdHex, voterDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextGovernanceGetProposal(handle: unknown, proposalIdHex: string): Promise<string> {
-    return await (
-      this.#native.contextGovernanceGetProposal as (h: unknown, p: string) => Promise<string>
-    )(handle, proposalIdHex);
+    try {
+      return await (
+        this.#native.contextGovernanceGetProposal as (h: unknown, p: string) => Promise<string>
+      )(handle, proposalIdHex);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextGovernanceListProposals(handle: unknown): Promise<string> {
-    return await (this.#native.contextGovernanceListProposals as (h: unknown) => Promise<string>)(
-      handle,
-    );
+    try {
+      return await (this.#native.contextGovernanceListProposals as (h: unknown) => Promise<string>)(
+        handle,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextApplyPendingCeilingModification(
     handle: unknown,
     currentTimestamp: number,
   ): Promise<boolean> {
-    return await (
-      this.#native.contextApplyPendingCeilingModification as (
-        h: unknown,
-        t: number,
-      ) => Promise<boolean>
-    )(handle, currentTimestamp);
+    try {
+      return await (
+        this.#native.contextApplyPendingCeilingModification as (
+          h: unknown,
+          t: number,
+        ) => Promise<boolean>
+      )(handle, currentTimestamp);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextFinalizeClose(handle: unknown): Promise<void> {
-    await (this.#native.contextFinalizeClose as (h: unknown) => Promise<void>)(handle);
+    try {
+      await (this.#native.contextFinalizeClose as (h: unknown) => Promise<void>)(handle);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextCreateGovernanceCheckpoint(
@@ -1465,27 +2181,31 @@ export class SCP {
     creatorDid: string,
     creatorSignatureHex: string,
   ): Promise<string> {
-    return await (
-      this.#native.contextCreateGovernanceCheckpoint as (
-        h: unknown,
-        seq: number,
-        root: string,
-        count: number,
-        lastHash: string,
-        stateHash: string,
-        creator: string,
-        sig: string,
-      ) => Promise<string>
-    )(
-      handle,
-      checkpointSeq,
-      merkleRootHex,
-      eventCount,
-      lastEventHashHex,
-      stateSnapshotHashHex,
-      creatorDid,
-      creatorSignatureHex,
-    );
+    try {
+      return await (
+        this.#native.contextCreateGovernanceCheckpoint as (
+          h: unknown,
+          seq: number,
+          root: string,
+          count: number,
+          lastHash: string,
+          stateHash: string,
+          creator: string,
+          sig: string,
+        ) => Promise<string>
+      )(
+        handle,
+        checkpointSeq,
+        merkleRootHex,
+        eventCount,
+        lastEventHashHex,
+        stateSnapshotHashHex,
+        creatorDid,
+        creatorSignatureHex,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextAddCheckpointCosignature(
@@ -1494,14 +2214,18 @@ export class SCP {
     signerDid: string,
     signatureHex: string,
   ): Promise<string> {
-    return await (
-      this.#native.contextAddCheckpointCosignature as (
-        h: unknown,
-        c: string,
-        s: string,
-        sig: string,
-      ) => Promise<string>
-    )(handle, checkpointJson, signerDid, signatureHex);
+    try {
+      return await (
+        this.#native.contextAddCheckpointCosignature as (
+          h: unknown,
+          c: string,
+          s: string,
+          sig: string,
+        ) => Promise<string>
+      )(handle, checkpointJson, signerDid, signatureHex);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -1509,7 +2233,11 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async contextHandleTtlExpiry(handle: unknown): Promise<void> {
-    await (this.#native.contextHandleTtlExpiry as (h: unknown) => Promise<void>)(handle);
+    try {
+      await (this.#native.contextHandleTtlExpiry as (h: unknown) => Promise<void>)(handle);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextProposeTtlExtension(
@@ -1517,20 +2245,28 @@ export class SCP {
     proposerDid: string,
     extensionSecs: number,
   ): Promise<boolean> {
-    return await (
-      this.#native.contextProposeTtlExtension as (
-        h: unknown,
-        d: string,
-        s: number,
-      ) => Promise<boolean>
-    )(handle, proposerDid, extensionSecs);
+    try {
+      return await (
+        this.#native.contextProposeTtlExtension as (
+          h: unknown,
+          d: string,
+          s: number,
+        ) => Promise<boolean>
+      )(handle, proposerDid, extensionSecs);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async contextResetTtlTimer(handle: unknown, newDurationSecs: number): Promise<void> {
-    await (this.#native.contextResetTtlTimer as (h: unknown, s: number) => Promise<void>)(
-      handle,
-      newDurationSecs,
-    );
+    try {
+      await (this.#native.contextResetTtlTimer as (h: unknown, s: number) => Promise<void>)(
+        handle,
+        newDurationSecs,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -1570,13 +2306,17 @@ export class SCP {
     contextIds: readonly string[],
     lastRelayContacts?: Readonly<Record<string, number>>,
   ): Promise<ReconnectReport> {
-    return await (
-      this.#native.contextReconnect as (
-        did: string,
-        ids: readonly string[],
-        contacts: Readonly<Record<string, number>> | undefined,
-      ) => Promise<ReconnectReport>
-    )(identityDid, contextIds, lastRelayContacts);
+    try {
+      return await (
+        this.#native.contextReconnect as (
+          did: string,
+          ids: readonly string[],
+          contacts: Readonly<Record<string, number>> | undefined,
+        ) => Promise<ReconnectReport>
+      )(identityDid, contextIds, lastRelayContacts);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -1588,13 +2328,17 @@ export class SCP {
     ceilingCapabilities: readonly string[],
     roleCapabilities: readonly string[],
   ): string {
-    return (
-      this.#native.validateCapabilityDeclaration as (
-        d: string,
-        c: readonly string[],
-        r: readonly string[],
-      ) => string
-    )(declarationJson, ceilingCapabilities, roleCapabilities);
+    try {
+      return (
+        this.#native.validateCapabilityDeclaration as (
+          d: string,
+          c: readonly string[],
+          r: readonly string[],
+        ) => string
+      )(declarationJson, ceilingCapabilities, roleCapabilities);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   checkScopedCapability(
@@ -1604,7 +2348,11 @@ export class SCP {
     // ADR-048 §1: pure helper, routed to the addon's module-level free fn
     // (the `SCP::check_scoped_capability` method was deleted in PR-E #28).
     const fn = nativeFreeFn<(g: string[], r: string) => boolean>("checkScopedCapability");
-    return fn([...grantedCapabilities], requiredCapability);
+    try {
+      return fn([...grantedCapabilities], requiredCapability);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -1619,15 +2367,19 @@ export class SCP {
     policyJson?: string | null,
     spendingJson?: string | null,
   ): unknown {
-    return (
-      this.#native.evaluateInvitation as (
-        p: string,
-        i: string,
-        id: string,
-        pol: string | null,
-        sp: string | null,
-      ) => unknown
-    )(paramsJson, inviterDid, identityDid, policyJson ?? null, spendingJson ?? null);
+    try {
+      return (
+        this.#native.evaluateInvitation as (
+          p: string,
+          i: string,
+          id: string,
+          pol: string | null,
+          sp: string | null,
+        ) => unknown
+      )(paramsJson, inviterDid, identityDid, policyJson ?? null, spendingJson ?? null);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   metadataRecordToJson(
@@ -1639,17 +2391,21 @@ export class SCP {
     operationalJson: string,
     signatureHex: string,
   ): string {
-    return (
-      this.#native.metadataRecordToJson as (
-        c: string,
-        s: number,
-        sd: string,
-        t: number,
-        st: string,
-        op: string,
-        sig: string,
-      ) => string
-    )(contextId, sequence, signerDid, timestamp, structuralJson, operationalJson, signatureHex);
+    try {
+      return (
+        this.#native.metadataRecordToJson as (
+          c: string,
+          s: number,
+          sd: string,
+          t: number,
+          st: string,
+          op: string,
+          sig: string,
+        ) => string
+      )(contextId, sequence, signerDid, timestamp, structuralJson, operationalJson, signatureHex);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // The four pure protocol helpers below are method-shaped on `SCP` for
@@ -1661,114 +2417,369 @@ export class SCP {
 
   metadataRecordFromJson(jsonStr: string): string {
     const fn = nativeFreeFn<(j: string) => string>("metadataRecordFromJson");
-    return fn(jsonStr);
+    try {
+      return fn(jsonStr);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   templateGetParams(templateId: string): string {
     const fn = nativeFreeFn<(t: string) => string>("templateGetParams");
-    return fn(templateId);
+    try {
+      return fn(templateId);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   validateAgainstTemplate(paramsJson: string): string | null {
     const fn = nativeFreeFn<(p: string) => string | null>("validateAgainstTemplate");
-    return fn(paramsJson);
+    try {
+      return fn(paramsJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   validateContextParams(paramsJson: string): string | null {
     const fn = nativeFreeFn<(p: string) => string | null>("validateContextParams");
-    return fn(paramsJson);
+    try {
+      return fn(paramsJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
-  // Domain: Tool
+  // Domain: Outlet
   // ───────────────────────────────────────────────────────────────────────
 
-  async toolRegister(handle: unknown, definition: unknown): Promise<string> {
-    return await (this.#native.toolRegister as (h: unknown, d: unknown) => Promise<string>)(
-      handle,
-      definition,
-    );
+  async outletRegister(handle: unknown, definition: OutletDefinition): Promise<string> {
+    try {
+      // `#native` is the raw napi addon, whose `NapiOutletDefinition` uses
+      // different field names than the public `OutletDefinition` (JSON-string
+      // schemas, `operatorDid`). Convert here — mirrors `internal/native.ts`.
+      const napiDef = {
+        name: definition.name,
+        description: definition.description,
+        kind: definition.kind,
+        inputSchemaJson: JSON.stringify(definition.inputSchema),
+        outputSchemaJson: JSON.stringify(definition.outputSchema),
+        operatorDid: definition.operator,
+        testVectorsJson: definition.testVectors
+          ? JSON.stringify(definition.testVectors)
+          : undefined,
+        implementationHash: definition.implementationHash
+          ? Array.from(definition.implementationHash)
+          : undefined,
+        cost: definition.cost
+          ? {
+              amount: definition.cost.amount,
+              currency: definition.cost.currency,
+              payee: definition.cost.payee,
+              costFormula: definition.cost.costFormula,
+            }
+          : undefined,
+      };
+      return await (
+        this.#native.outletRegister as (h: unknown, d: typeof napiDef) => Promise<string>
+      )(handle, napiDef);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
-  async toolInvoke(
+  async outletInvoke(
     handle: unknown,
-    toolId: string,
+    outletId: string,
     inputJson: string,
     identityDid: string,
     ucanToken: string,
     proofTokens?: readonly string[],
     spendingUcanJwt?: string,
   ): Promise<string> {
-    return await (
-      this.#native.toolInvoke as (
-        h: unknown,
-        t: string,
-        i: string,
-        d: string,
-        u: string,
-        p: readonly string[] | undefined,
-        s: string | undefined,
-      ) => Promise<string>
-    )(handle, toolId, inputJson, identityDid, ucanToken, proofTokens, spendingUcanJwt);
-  }
-
-  async toolVerify(handle: unknown, toolId: string): Promise<unknown> {
-    return await (this.#native.toolVerify as (h: unknown, t: string) => Promise<unknown>)(
-      handle,
-      toolId,
+    const bridge = await getBridge(this);
+    return bridge.outletInvoke(
+      handle as BridgeContextHandle,
+      outletId,
+      inputJson,
+      identityDid,
+      ucanToken,
+      proofTokens,
+      spendingUcanJwt,
     );
   }
 
-  async toolInvokeCrossContext(
+  async outletVerify(handle: unknown, outletId: string): Promise<unknown> {
+    return await (this.#native.outletVerify as (h: unknown, t: string) => Promise<unknown>)(
+      handle,
+      outletId,
+    );
+  }
+
+  async outletInvokeCrossContext(
     sourceHandle: unknown,
     targetHandle: unknown,
-    toolId: string,
+    outletId: string,
     inputJson: string,
     invokerDid: string,
     ucanToken: string,
     chainDepth: number,
     proofTokens?: readonly string[],
   ): Promise<string> {
-    return await (
-      this.#native.toolInvokeCrossContext as (
-        s: unknown,
-        t: unknown,
-        tool: string,
-        input: string,
-        did: string,
-        ucan: string,
-        depth: number,
-        proofs: readonly string[] | undefined,
-      ) => Promise<string>
-    )(
-      sourceHandle,
-      targetHandle,
-      toolId,
-      inputJson,
-      invokerDid,
-      ucanToken,
-      chainDepth,
-      proofTokens,
-    );
+    try {
+      return await (
+        this.#native.outletInvokeCrossContext as (
+          s: unknown,
+          t: unknown,
+          outlet: string,
+          input: string,
+          did: string,
+          ucan: string,
+          depth: number,
+          proofs: readonly string[] | undefined,
+        ) => Promise<string>
+      )(
+        sourceHandle,
+        targetHandle,
+        outletId,
+        inputJson,
+        invokerDid,
+        ucanToken,
+        chainDepth,
+        proofTokens,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
-  async toolSessionCreate(
+  /**
+   * Runs the §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a).
+   *
+   * The saga either commits — resolving to a {@link SagaResult} carrying the
+   * supervisor-minted `sagaId` plus the target's signed receipt and captured
+   * output bytes — or reaches a typed terminal, which rejects as one of the
+   * saga errors:
+   *
+   * - {@link SagaAbortedError} — a Prepare-phase abort: a PERMANENT rejection
+   *   OR a RETRYABLE transient (rate limit / participant actor unavailable),
+   *   distinguished by the `SCP-SAGA-*` code; carries `retryAfterMs` (`null`,
+   *   never `0`, when no precise back-off exists).
+   * - {@link SagaNeedsRepairError} — Commit retries exhausted; carries the
+   *   durable `sagaId` repair handle.
+   * - {@link SagaBusyError} — the participant context set overlapped an
+   *   in-flight saga; carries `contendedContext`.
+   *
+   * `timestampMs` is a JS `bigint` (the bridge's `u64` freshness field) and
+   * must be non-negative. `chainDepth` is the caller-asserted inbound
+   * provenance depth and must be an integer in the closed range `0..255` (the
+   * bridge's `u8`). Both are validated before the native dispatch (fail-fast).
+   *
+   * See spec §6.2.4 and ADR-049 §3a.
+   */
+  async outletInvokeCrossContextSaga(
+    sourceHandle: unknown,
+    targetHandle: unknown,
+    callerDid: string,
+    outletRegistrationId: string,
+    inputJson: string,
+    assertedNonceHex: string,
+    timestampMs: bigint,
+    chainDepth: number,
+    ucanProofId?: string,
+  ): Promise<SagaResult> {
+    if (typeof timestampMs !== "bigint" || timestampMs < 0n) {
+      throw new ValidationError(
+        `timestampMs must be a non-negative bigint, got ${String(timestampMs)}`,
+        "SCP-VALID-7002",
+      );
+    }
+    if (!Number.isInteger(chainDepth) || chainDepth < 0 || chainDepth > 255) {
+      throw new ValidationError(
+        `chainDepth must be an integer in range 0-255, got ${String(chainDepth)}`,
+        "SCP-VALID-7002",
+      );
+    }
+
+    let raw: { sagaId: string; receipt?: Uint8Array; output?: Uint8Array };
+    try {
+      raw = await (
+        this.#native.outletInvokeCrossContextSaga as (
+          s: unknown,
+          t: unknown,
+          caller: string,
+          outlet: string,
+          input: string,
+          nonce: string,
+          ts: bigint,
+          depth: number,
+          proof: string | undefined,
+        ) => Promise<{ sagaId: string; receipt?: Uint8Array; output?: Uint8Array }>
+      )(
+        sourceHandle,
+        targetHandle,
+        callerDid,
+        outletRegistrationId,
+        inputJson,
+        assertedNonceHex,
+        timestampMs,
+        chainDepth,
+        ucanProofId,
+      );
+    } catch (e) {
+      throw mapSagaError(e);
+    }
+    return {
+      sagaId: raw.sagaId,
+      receipt: raw.receipt ?? null,
+      output: raw.output ?? null,
+    };
+  }
+
+  /**
+   * Opens the §5.4.5 / §6.2.4 cross-context STREAMING outlet-invocation saga
+   * (SCP-OUT-047) and returns its {@link StreamingSagaHandle}.
+   *
+   * The STREAMING sibling of {@link outletInvokeCrossContextSaga}. Where the
+   * unary saga BLOCKS until `Committed` (≤~95s) and returns the result inline,
+   * the streaming saga returns its chunk receiver PROMPTLY at the
+   * Commit-transition and reaches `Committed` ASYNCHRONOUSLY at seal-close (the
+   * ADR-049 §3a streaming wait-model amendment) — an LLM stream can exceed the
+   * unary bound, so the credit ceiling bounds chunk COUNT, not wall-clock.
+   *
+   * The returned handle is both `AsyncIterable<OutletStreamChunk>`
+   * (`for await (const chunk of handle)`) and `PromiseLike<Aggregate>`
+   * (`await handle`); its FIRST pull opens the saga
+   * (`outletStreamingSagaOpen` mints the durable `sagaId` at the
+   * Commit-transition) and its iteration drains chunks via
+   * `outletStreamingSagaPollNext`. This method performs NO I/O and does not block
+   * — the saga opens lazily on the first `await` / iteration, matching the
+   * same-context `ctx.outlets.invoke(...)`.
+   *
+   * There is NO live control plane (grantCredit / cancel) for the cross-context
+   * saga stream — per §6.2.5 / SCP-OUT-046 the credit window is fixed at open via
+   * `estimatedChunkCount` (cancel_ack_ceiling = u64::MAX). An open rejection — the
+   * §6.2.4 caller-principal binding (a `callerDid` this instance does not host /
+   * not a member of the source context), a Prepare/Commit saga terminal, or an
+   * input/UCAN rejection — surfaces on the first `await` / iteration as the
+   * matching typed SDK error ({@link "./errors".SagaAbortedError} /
+   * {@link "./errors".SagaBusyError} / {@link "./errors".SagaNeedsRepairError} /
+   * {@link ValidationError} / {@link "./errors".UcanPermissionError}), and the
+   * receiver is never handed out.
+   *
+   * `options.timestampMs` is a `bigint` (the bridge's `u64` freshness field) and
+   * must be non-negative. `options.chainDepth` must be an integer in the closed
+   * range `0..255` (the bridge's `u8`). Both are validated synchronously before
+   * the handle is returned (fail-fast).
+   *
+   * See spec §6.2.4, §5.4.5, and ADR-049 §3a.
+   *
+   * @param options Named invocation options (a flat config object — the two
+   *   leading `sourceHandle` / `targetHandle` fields are NAMED to prevent a
+   *   silent caller/target handle-swap).
+   */
+  outletInvokeCrossContextStreamingSaga(options: StreamingSagaOptions): StreamingSagaHandle {
+    if (typeof options.timestampMs !== "bigint" || options.timestampMs < 0n) {
+      throw new ValidationError(
+        `timestampMs must be a non-negative bigint, got ${String(options.timestampMs)}`,
+        "SCP-VALID-7002",
+      );
+    }
+    if (
+      !Number.isInteger(options.chainDepth) ||
+      options.chainDepth < 0 ||
+      options.chainDepth > 255
+    ) {
+      throw new ValidationError(
+        `chainDepth must be an integer in range 0-255, got ${String(options.chainDepth)}`,
+        "SCP-VALID-7002",
+      );
+    }
+    return new StreamingSagaHandle(this.#native as unknown as StreamingSagaNative, {
+      sourceHandle: options.sourceHandle,
+      targetHandle: options.targetHandle,
+      callerDid: options.callerDid,
+      outletRegistrationId: options.outletRegistrationId,
+      input: options.input,
+      assertedNonceHex: options.assertedNonceHex,
+      timestampMs: options.timestampMs,
+      chainDepth: options.chainDepth,
+      ucanToken: options.ucanToken,
+      proofTokens: options.proofTokens,
+      ucanProofId: options.ucanProofId,
+      timeoutMs: options.timeoutMs,
+      estimatedChunkCount: options.estimatedChunkCount,
+    });
+  }
+
+  /**
+   * Drives the key-bearing in-session reconnect/repair truncated-close for a
+   * cross-context streaming saga (SCP-OUT-046 #136 AC7, SCP-OUT-047).
+   *
+   * This is IN-SESSION reconnect/repair of a seal that stalled or went
+   * `NeedsRepair` while THIS bridge process is still alive (e.g. a client
+   * reconnects to the same live node). The saga registry is per-instance and
+   * in-memory, so this does NOT survive a process/node restart — cross-restart
+   * recovery replays the durable saga journal via a separate operator path, not
+   * this surface.
+   *
+   * On FFI reconnect this authenticates the caller, surfaces the target
+   * context's Active Signing Key (resolved per-call from custody, never
+   * envelope-asserted), and calls the bridge recover op to seal a witness-absent
+   * durable prefix and resolve the saga `Committed` — WITHOUT re-opening the
+   * stream or re-invoking the outlet executor. Resolves with `void` on a
+   * successful `Committed` resolution.
+   *
+   * `callerDid` MUST be an identity hosted by this bridge instance (the §6.2.4
+   * channel-authenticated principal) AND the invoker pinned at open — recovery is
+   * money-moving (it bills the invoker / credits the operator over B's durable
+   * prefix), so a hosted-but-non-invoker caller is rejected with `SCP-PERM-3001`
+   * (the SAME invoker gate the same-context grant/cancel/terminate siblings
+   * enforce) BEFORE the signing key is resolved.
+   *
+   * Rejects with {@link ContextError} if `callerDid` is not hosted by this
+   * instance or `sagaId` is unknown; with {@link "./errors".UcanPermissionError}
+   * whose `.code` is `SCP-PERM-3001` when `callerDid` is hosted but is not the
+   * pinned invoker (branch on `.code` for this money-moving gate, not only a
+   * substring match); or {@link "./errors".SagaNeedsRepairError} if the seal
+   * cannot complete (the saga stays unresolved for a later retry).
+   */
+  async recoverStreamingSagaTruncatedClose(sagaId: string, callerDid: string): Promise<void> {
+    try {
+      await (
+        this.#native.outletStreamingSagaRecoverTruncatedClose as (
+          id: string,
+          did: string,
+        ) => Promise<void>
+      )(sagaId, callerDid);
+    } catch (e) {
+      throw mapSagaError(e);
+    }
+  }
+
+  async outletSessionCreate(
     handle: unknown,
-    toolId: string,
+    outletId: string,
     sourceContextId: string,
     ttlSeconds?: number,
   ): Promise<string> {
-    return await (
-      this.#native.toolSessionCreate as (
-        h: unknown,
-        t: string,
-        s: string,
-        ttl: number | undefined,
-      ) => Promise<string>
-    )(handle, toolId, sourceContextId, ttlSeconds);
+    try {
+      return await (
+        this.#native.outletSessionCreate as (
+          h: unknown,
+          t: string,
+          s: string,
+          ttl: number | undefined,
+        ) => Promise<string>
+      )(handle, outletId, sourceContextId, ttlSeconds);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
-  async toolSessionInvoke(
+  async outletSessionInvoke(
     handle: unknown,
     sessionId: string,
     inputJson: string,
@@ -1777,7 +2788,7 @@ export class SCP {
     proofTokens?: readonly string[],
   ): Promise<string> {
     return await (
-      this.#native.toolSessionInvoke as (
+      this.#native.outletSessionInvoke as (
         h: unknown,
         sid: string,
         input: string,
@@ -1788,63 +2799,151 @@ export class SCP {
     )(handle, sessionId, inputJson, invokerDid, ucanToken, proofTokens);
   }
 
-  async toolSessionClose(handle: unknown, sessionId: string): Promise<void> {
-    await (this.#native.toolSessionClose as (h: unknown, sid: string) => Promise<void>)(
+  async outletSessionClose(handle: unknown, sessionId: string): Promise<void> {
+    await (this.#native.outletSessionClose as (h: unknown, sid: string) => Promise<void>)(
       handle,
       sessionId,
     );
   }
 
-  async toolInterfaceExpose(
+  async outletInterfaceExpose(
     handle: unknown,
-    toolId: string,
+    outletId: string,
     targetContextId: string,
     rateLimitJson?: string,
   ): Promise<string> {
     return await (
-      this.#native.toolInterfaceExpose as (
+      this.#native.outletInterfaceExpose as (
         h: unknown,
         t: string,
         tc: string,
         rl: string | undefined,
       ) => Promise<string>
-    )(handle, toolId, targetContextId, rateLimitJson);
+    )(handle, outletId, targetContextId, rateLimitJson);
   }
 
-  async toolInterfaceAccept(handle: unknown, interfaceJson: string): Promise<string> {
-    return await (this.#native.toolInterfaceAccept as (h: unknown, ij: string) => Promise<string>)(
-      handle,
-      interfaceJson,
-    );
+  async outletInterfaceAccept(handle: unknown, interfaceJson: string): Promise<string> {
+    return await (
+      this.#native.outletInterfaceAccept as (h: unknown, ij: string) => Promise<string>
+    )(handle, interfaceJson);
   }
 
-  async toolInterfaceRevoke(handle: unknown, interfaceIdHex: string): Promise<string> {
-    return await (this.#native.toolInterfaceRevoke as (h: unknown, id: string) => Promise<string>)(
-      handle,
-      interfaceIdHex,
-    );
+  async outletInterfaceRevoke(handle: unknown, interfaceIdHex: string): Promise<string> {
+    return await (
+      this.#native.outletInterfaceRevoke as (h: unknown, id: string) => Promise<string>
+    )(handle, interfaceIdHex);
   }
 
   // ───────────────────────────────────────────────────────────────────────
   // Domain: UCAN
   // ───────────────────────────────────────────────────────────────────────
 
+  /**
+   * Enforcing UCAN gate: runs the full 11-step ADR-016 pipeline and throws a
+   * typed {@link "./errors".ScpError} at the first failing stage (use
+   * {@link ucanEvaluate} for the non-throwing diagnostic).
+   *
+   * FAIL CLOSED: `presentingAgentDid` is required by the bridge (no silent
+   * security default). Omitting it makes the bridge reject the call rather than
+   * defaulting the presenting agent to the token's own `aud` — defaulting would
+   * make the step-5 audience check a tautology (`aud == aud`) that does NOT bind
+   * the token to any external subject, passing a token addressed to someone else
+   * (trust inflation). Pass the agent the token must be addressed to.
+   *
+   * @param handle The context handle to validate against.
+   * @param token The UCAN token string to validate.
+   * @param capability The required capability URI (mandatory on this gate).
+   * @param presentingAgentDid The DID the token must be addressed to. Required —
+   *   an absent or empty value is rejected by the bridge.
+   * @param proofTokens Optional delegation-chain proof tokens.
+   */
   async ucanValidate(
     handle: unknown,
     token: string,
     capability: string,
-    presentingAgentDid?: string,
+    presentingAgentDid: string,
     proofTokens?: readonly string[],
   ): Promise<void> {
-    await (
-      this.#native.ucanValidate as (
-        h: unknown,
-        t: string,
-        c: string,
-        pa: string | undefined,
-        pt: readonly string[] | undefined,
-      ) => Promise<void>
-    )(handle, token, capability, presentingAgentDid, proofTokens);
+    const bridge = await getBridge(this);
+    return bridge.ucanValidate(
+      handle as BridgeContextHandle,
+      token,
+      capability,
+      presentingAgentDid,
+      proofTokens,
+    );
+  }
+
+  /**
+   * Read-only, structured counterpart to {@link ucanValidate}.
+   *
+   * Runs the same 11-step ADR-016 validation pipeline but, instead of
+   * throwing at the first failing stage, resolves to a
+   * {@link CapabilityValidation} of six per-stage booleans (spec §7.2.4,
+   * ADR-059). The probe never records the token's nonce, so calling it does
+   * not consume the token. Capability/signature/expiry outcomes are reported
+   * via the booleans; only malformed FFI inputs (bad handle / token /
+   * capability) reject.
+   *
+   * The six booleans cross the FFI already camelCased, so consumers read the
+   * per-check breakdown directly and never reverse-engineer *which* check
+   * failed by parsing error prose.
+   *
+   * NOT AN AUTHORIZATION DECISION: this is a diagnostic, never a gate. Only
+   * {@link ucanValidate} (with its mandatory challenge capability) authorizes
+   * an action. A no-capability (intrinsic-validity) result skips the
+   * invoked-capability grant-match, so an all-`true` result does NOT establish
+   * the token grants any particular capability — re-run {@link ucanValidate}
+   * with the concrete capability to authorize (spec §7.2.4).
+   *
+   * FAIL CLOSED: `presentingAgentDid` is required by the bridge (no silent
+   * security default). Omitting it makes the bridge reject the call rather than
+   * defaulting the presenting agent to the token's own `aud` — defaulting would
+   * make the step-5 audience check a tautology (`aud == aud`) that inflates
+   * trust. It precedes `capability` in the signature because it is mandatory
+   * while `capability` is optional.
+   *
+   * @param handle The context handle to evaluate against.
+   * @param token The UCAN token string to evaluate.
+   * @param presentingAgentDid The DID under assessment — the agent the token
+   *   must be addressed to. Required; an absent or empty value is rejected by
+   *   the bridge.
+   * @param capability Optional challenge capability URI. Omit it (or pass
+   *   `null`/`undefined`) to evaluate the token's INTRINSIC validity with no
+   *   invoked-capability grant-match challenge — the mode {@link evaluateTrust}
+   *   uses. Pass a capability to additionally require the token grants it. (The
+   *   enforcing {@link ucanValidate} gate keeps a mandatory capability.)
+   * @param proofTokens Optional delegation-chain proof tokens.
+   */
+  async ucanEvaluate(
+    handle: unknown,
+    token: string,
+    presentingAgentDid: string,
+    capability?: string | null,
+    proofTokens?: readonly string[],
+  ): Promise<CapabilityValidation> {
+    // Route the native dispatch through the single error chokepoint
+    // (`mapBridgeError`) so a raw NAPI throw or rejection surfaces as a
+    // typed `ScpError` keyed on its `[SCP-CAT-NNNN]` code, per ADR-059
+    // Decision 4 (error typing routes through one mapping site, not per-call
+    // prose inspection). `mapBridgeError` is idempotent on already-typed errors.
+    let raw: CapabilityValidation;
+    try {
+      raw = await (
+        this.#native.ucanEvaluate as (
+          h: unknown,
+          t: string,
+          c: string | null,
+          pa: string,
+          pt: readonly string[] | null,
+        ) => Promise<CapabilityValidation>
+      )(handle, token, capability ?? null, presentingAgentDid, proofTokens ?? null);
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+    // Shared six-field projection — pins the canonical CapabilityValidation
+    // shape in one place (mirrors the same call in `internal/native.ts`).
+    return toCapabilityValidation(raw);
   }
 
   async ucanMint(
@@ -1853,14 +2952,18 @@ export class SCP {
     capabilities: readonly string[],
     proofs?: readonly string[],
   ): Promise<unknown> {
-    return await (
-      this.#native.ucanMint as (
-        h: unknown,
-        d: string,
-        c: readonly string[],
-        p: readonly string[] | undefined,
-      ) => Promise<unknown>
-    )(handle, memberDid, capabilities, proofs);
+    try {
+      return await (
+        this.#native.ucanMint as (
+          h: unknown,
+          d: string,
+          c: readonly string[],
+          p: readonly string[] | undefined,
+        ) => Promise<unknown>
+      )(handle, memberDid, capabilities, proofs);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async ucanDelegate(
@@ -1870,23 +2973,31 @@ export class SCP {
     parentToken: string,
     capabilities: readonly string[],
   ): Promise<unknown> {
-    return await (
-      this.#native.ucanDelegate as (
-        h: unknown,
-        from: string,
-        to: string,
-        parent: string,
-        caps: readonly string[],
-      ) => Promise<unknown>
-    )(handle, delegatorDid, delegateeDid, parentToken, capabilities);
+    try {
+      return await (
+        this.#native.ucanDelegate as (
+          h: unknown,
+          from: string,
+          to: string,
+          parent: string,
+          caps: readonly string[],
+        ) => Promise<unknown>
+      )(handle, delegatorDid, delegateeDid, parentToken, capabilities);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async ucanRevoke(handle: unknown, token: string, revokerDid: string): Promise<void> {
-    await (this.#native.ucanRevoke as (h: unknown, t: string, r: string) => Promise<void>)(
-      handle,
-      token,
-      revokerDid,
-    );
+    try {
+      await (this.#native.ucanRevoke as (h: unknown, t: string, r: string) => Promise<void>)(
+        handle,
+        token,
+        revokerDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -1894,35 +3005,49 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async eventLogQuery(handle: unknown, filterJson?: string): Promise<readonly unknown[]> {
-    return await (
-      this.#native.eventLogQuery as (
-        h: unknown,
-        f: string | undefined,
-      ) => Promise<readonly unknown[]>
-    )(handle, filterJson);
+    try {
+      return await (
+        this.#native.eventLogQuery as (
+          h: unknown,
+          f: string | undefined,
+        ) => Promise<readonly unknown[]>
+      )(handle, filterJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async eventLogVerify(handle: unknown, claimJson: string): Promise<unknown> {
-    return await (this.#native.eventLogVerify as (h: unknown, c: string) => Promise<unknown>)(
-      handle,
-      claimJson,
-    );
+    try {
+      return await (this.#native.eventLogVerify as (h: unknown, c: string) => Promise<unknown>)(
+        handle,
+        claimJson,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   eventLogCheckpoint(handle: unknown, identity: Identity, epoch: number): unknown {
-    return (this.#native.eventLogCheckpoint as (h: unknown, i: unknown, e: number) => unknown)(
-      handle,
-      identity._rawHandle,
-      epoch,
-    );
+    try {
+      return (this.#native.eventLogCheckpoint as (h: unknown, i: unknown, e: number) => unknown)(
+        handle,
+        identity._rawHandle,
+        epoch,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   eventLogCheckpointByDid(handle: unknown, did: string, epoch: number): unknown {
-    return (this.#native.eventLogCheckpointByDid as (h: unknown, d: string, e: number) => unknown)(
-      handle,
-      did,
-      epoch,
-    );
+    try {
+      return (
+        this.#native.eventLogCheckpointByDid as (h: unknown, d: string, e: number) => unknown
+      )(handle, did, epoch);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -1930,162 +3055,272 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async transportConnect(relayUrl: string): Promise<unknown> {
-    return await (this.#native.transportConnect as (u: string) => Promise<unknown>)(relayUrl);
+    try {
+      return await (this.#native.transportConnect as (u: string) => Promise<unknown>)(relayUrl);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async transportStatus(manager: unknown): Promise<unknown> {
-    return await (this.#native.transportStatus as (m: unknown) => Promise<unknown>)(manager);
+    try {
+      return await (this.#native.transportStatus as (m: unknown) => Promise<unknown>)(manager);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async transportDisconnect(manager: unknown): Promise<void> {
-    await (this.#native.transportDisconnect as (m: unknown) => Promise<void>)(manager);
+    try {
+      await (this.#native.transportDisconnect as (m: unknown) => Promise<void>)(manager);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   configureLocalTransport(localDid: string): void {
-    (this.#native.configureLocalTransport as (d: string) => void)(localDid);
+    try {
+      (this.#native.configureLocalTransport as (d: string) => void)(localDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async configureRelayTransport(relayUrl: string, localDid: string): Promise<void> {
-    await (this.#native.configureRelayTransport as (u: string, d: string) => Promise<void>)(
-      relayUrl,
-      localDid,
-    );
+    try {
+      await (this.#native.configureRelayTransport as (u: string, d: string) => Promise<void>)(
+        relayUrl,
+        localDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async transportAddRelay(relayUrl: string): Promise<number> {
-    return await (this.#native.transportAddRelay as (u: string) => Promise<number>)(relayUrl);
+    try {
+      return await (this.#native.transportAddRelay as (u: string) => Promise<number>)(relayUrl);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   transportAssignRelaySet(contextId: string): readonly number[] {
-    return (this.#native.transportAssignRelaySet as (c: string) => readonly number[])(contextId);
+    try {
+      return (this.#native.transportAssignRelaySet as (c: string) => readonly number[])(contextId);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   transportAdapterCount(): number {
-    return (this.#native.transportAdapterCount as () => number)();
+    try {
+      return (this.#native.transportAdapterCount as () => number)();
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   transportReliability(adapterIndex: number): unknown {
-    return (this.#native.transportReliability as (i: number) => unknown)(adapterIndex);
+    try {
+      return (this.#native.transportReliability as (i: number) => unknown)(adapterIndex);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
   // Domain: Economy
   // ───────────────────────────────────────────────────────────────────────
 
-  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): number {
-    return (this.#native.economyEstimateCost as (p: string, a: string, m: string) => number)(
-      policyJson,
-      actionType,
-      metricsJson,
-    );
+  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): bigint | null {
+    try {
+      // The napi bridge returns a `bigint` cost, signalling "no result / overflow"
+      // with the sentinel `-1n`. Map that to `null` at the wrapper boundary so the
+      // TS surface matches Python's `int | None` (ADR-060).
+      const cost = (
+        this.#native.economyEstimateCost as (p: string, a: string, m: string) => bigint
+      )(policyJson, actionType, metricsJson);
+      return cost === -1n ? null : cost;
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   economyPolicyRequiresPayment(policyJson: string): boolean {
-    return (this.#native.economyPolicyRequiresPayment as (p: string) => boolean)(policyJson);
+    try {
+      return (this.#native.economyPolicyRequiresPayment as (p: string) => boolean)(policyJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   economyAutoAcceptBlocked(policyJson: string): boolean {
-    return (this.#native.economyAutoAcceptBlocked as (p: string) => boolean)(policyJson);
+    try {
+      return (this.#native.economyAutoAcceptBlocked as (p: string) => boolean)(policyJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   economyCheckPolicyLock(policyJson: string): boolean {
-    return (this.#native.economyCheckPolicyLock as (p: string) => boolean)(policyJson);
+    try {
+      return (this.#native.economyCheckPolicyLock as (p: string) => boolean)(policyJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   economyValidatePolicyChange(currentJson: string, proposedJson: string): boolean {
-    return (this.#native.economyValidatePolicyChange as (c: string, p: string) => boolean)(
-      currentJson,
-      proposedJson,
-    );
+    try {
+      return (this.#native.economyValidatePolicyChange as (c: string, p: string) => boolean)(
+        currentJson,
+        proposedJson,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
-  economyEvaluateFormula(formulaJson: string, metricsJson: string): number {
-    return (this.#native.economyEvaluateFormula as (f: string, m: string) => number)(
-      formulaJson,
-      metricsJson,
-    );
+  economyEvaluateFormula(formulaJson: string, metricsJson: string): bigint | null {
+    try {
+      // As with `economyEstimateCost`, the napi bridge signals "no result /
+      // overflow" with the sentinel `-1n`; normalize it to `null` so the TS
+      // surface matches Python's `int | None` (ADR-060).
+      const cost = (this.#native.economyEvaluateFormula as (f: string, m: string) => bigint)(
+        formulaJson,
+        metricsJson,
+      );
+      return cost === -1n ? null : cost;
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
-  economyBudgetRemaining(contextId: string, did: string): number {
-    return (this.#native.economyBudgetRemaining as (c: string, d: string) => number)(
+  economyBudgetRemaining(contextId: string, did: string): bigint {
+    return (this.#native.economyBudgetRemaining as (c: string, d: string) => bigint)(
       contextId,
       did,
     );
   }
 
-  economyBudgetGrant(contextId: string, did: string, amount: number): void {
-    (this.#native.economyBudgetGrant as (c: string, d: string, a: number) => void)(
+  economyBudgetGrant(contextId: string, did: string, amount: bigint): void {
+    (this.#native.economyBudgetGrant as (c: string, d: string, a: bigint) => void)(
       contextId,
       did,
       amount,
     );
   }
 
-  economyBudgetRecordSpend(contextId: string, did: string, amount: number): void {
-    (this.#native.economyBudgetRecordSpend as (c: string, d: string, a: number) => void)(
-      contextId,
-      did,
-      amount,
-    );
+  economyBudgetRecordSpend(contextId: string, did: string, amount: bigint): void {
+    try {
+      (this.#native.economyBudgetRecordSpend as (c: string, d: string, a: bigint) => void)(
+        contextId,
+        did,
+        amount,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   economyAntispamRecord(contextId: string, senderDid: string, timestamp: number): void {
-    (this.#native.economyAntispamRecord as (c: string, s: string, t: number) => void)(
-      contextId,
-      senderDid,
-      timestamp,
-    );
+    try {
+      (this.#native.economyAntispamRecord as (c: string, s: string, t: number) => void)(
+        contextId,
+        senderDid,
+        timestamp,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   economyAntispamVelocity(contextId: string, senderDid: string, now: number): number {
-    return (this.#native.economyAntispamVelocity as (c: string, s: string, n: number) => number)(
-      contextId,
-      senderDid,
-      now,
-    );
+    try {
+      return (this.#native.economyAntispamVelocity as (c: string, s: string, n: number) => number)(
+        contextId,
+        senderDid,
+        now,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   economyAntispamEscalatedCost(
     contextId: string,
     senderDid: string,
     now: number,
-    baseCost: number,
+    baseCost: bigint,
     thresholdsJson: string,
-    floor?: number | null,
-    cap?: number | null,
-  ): number {
-    return (
-      this.#native.economyAntispamEscalatedCost as (
-        c: string,
-        s: string,
-        n: number,
-        b: number,
-        t: string,
-        f: number | null,
-        cp: number | null,
-      ) => number
-    )(contextId, senderDid, now, baseCost, thresholdsJson, floor ?? null, cap ?? null);
+    floor?: bigint | null,
+    cap?: bigint | null,
+  ): bigint {
+    try {
+      return (
+        this.#native.economyAntispamEscalatedCost as (
+          c: string,
+          s: string,
+          n: number,
+          b: bigint,
+          t: string,
+          f: bigint | null,
+          cp: bigint | null,
+        ) => bigint
+      )(contextId, senderDid, now, baseCost, thresholdsJson, floor ?? null, cap ?? null);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
    * Verifies a batch of payment receipts against the configured payment
    * adapter. Maximum 10,000 receipts per call.
    *
-   * Returns a JSON object `{"all_valid": <bool>, "results": [...]}`.
-   * `all_valid` is `true` iff every entry both reached the adapter
-   * (`ok === true`) and the adapter reported the receipt valid
-   * (`result.valid === true`); it is vacuously `true` for an empty batch.
-   * Each `results` entry is either `{"receipt_id", "ok": true, "valid",
-   * "result": <structured VerificationResult>}` on success or
-   * `{"ok": false, "error"}` on failure. `ok` means the adapter *responded*
-   * — NOT that the payment is valid; scan `valid`/`all_valid` for validity.
+   * `allValid` is `true` iff every entry both reached the adapter and the
+   * adapter reported the receipt valid; it is vacuously `true` for an empty
+   * batch. `ok` means the adapter *responded* — NOT that the payment is valid;
+   * check `valid` / `allValid` for validity.
    *
-   * @throws EconomicPolicyUnsupportedOnWasm on the WASM bridge — receipt
-   *   verification requires a native client whose bridge runs the payment
-   *   adapter (ADR-034).
+   * @param receipts Array of receipt objects to verify. Each object shape is
+   *   adapter-specific; the bridge serializes the array to JSON internally.
+   * @returns Typed {@link PaymentReceiptVerificationResult} with `allValid`
+   *   and per-receipt `results`.
    */
-  economyVerifyPaymentReceipts(receiptsJson: string): string {
-    return (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(receiptsJson);
+  economyVerifyPaymentReceipts(
+    receipts: readonly Record<string, unknown>[],
+  ): PaymentReceiptVerificationResult {
+    try {
+      const raw = (this.#native.economyVerifyPaymentReceipts as (r: string) => string)(
+        JSON.stringify(receipts),
+      );
+      // The Rust bridge emits snake_case keys; map to the SDK's camelCase convention.
+      const parsed = JSON.parse(raw) as {
+        all_valid: boolean;
+        results: Array<{
+          ok: boolean;
+          receipt_id?: string;
+          valid?: boolean;
+          result?: unknown;
+          error?: string;
+        }>;
+      };
+      return {
+        allValid: parsed.all_valid,
+        results: parsed.results.map((entry) => {
+          const mapped: import("./economy").PaymentReceiptVerificationEntry = { ok: entry.ok };
+          if (entry.receipt_id !== undefined) mapped.receiptId = entry.receipt_id;
+          if (entry.valid !== undefined) mapped.valid = entry.valid;
+          if (entry.result !== undefined)
+            mapped.result = entry.result as Readonly<Record<string, unknown>>;
+          if (entry.error !== undefined) mapped.error = entry.error;
+          return mapped;
+        }),
+      };
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2093,65 +3328,451 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   trustQueryScore(did: string, contextId: string): unknown {
-    return (this.#native.trustQueryScore as (d: string, c: string) => unknown)(did, contextId);
+    try {
+      return (this.#native.trustQueryScore as (d: string, c: string) => unknown)(did, contextId);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
-  trustVerifyAttestation(attestationJson: string): unknown {
-    return (this.#native.trustVerifyAttestation as (j: string) => unknown)(attestationJson);
+  /**
+   * Verify an attestation's Ed25519 signature, evidence, expiry, and
+   * revocation status (ADR-017, §7.4).
+   *
+   * Takes the typed attestation envelope ({@link CachedAttestationEnvelope})
+   * and serializes it to the serde wire shape internally (ADR-058) before
+   * crossing FFI.
+   */
+  trustVerifyAttestation(attestation: CachedAttestationEnvelope): unknown {
+    try {
+      return (this.#native.trustVerifyAttestation as (j: string) => unknown)(
+        encodeAttestation(attestation),
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   trustCreateChallenge(targetDid: string): unknown {
-    return (this.#native.trustCreateChallenge as (d: string) => unknown)(targetDid);
+    try {
+      return (this.#native.trustCreateChallenge as (d: string) => unknown)(targetDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
-  trustVerifyResponse(challengeJson: string, responseJson: string): boolean {
-    return (this.#native.trustVerifyResponse as (c: string, r: string) => boolean)(
-      challengeJson,
-      responseJson,
+  /**
+   * Verify a challenge response against its original challenge request
+   * (ADR-017, §7.3.4).
+   *
+   * Takes the typed {@link ChallengeRequest} / {@link ChallengeResponse} and
+   * serializes them to the serde wire shapes internally (ADR-058) before
+   * crossing FFI. Returns `true` if the response is valid (correct
+   * responder, within timeout, valid signature), `false` otherwise.
+   */
+  trustVerifyResponse(challenge: ChallengeRequest, response: ChallengeResponse): boolean {
+    try {
+      return (this.#native.trustVerifyResponse as (c: string, r: string) => boolean)(
+        encodeChallengeRequest(challenge),
+        encodeChallengeResponse(response),
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Verify participation profiles against admission requirements.
+   *
+   * Returns normally when all requirements are satisfied; throws on any
+   * failed requirement or malformed JSON.
+   *
+   * Security caveat — authenticity is not authorization: this verifies
+   * signatures over the subject binding, not signer *legitimacy*. Because
+   * `signerPublicKey` is self-certifying, a subject can present
+   * genuinely-signed profiles from signers it controls (inflating
+   * `minContexts`). Callers MUST establish signer legitimacy separately
+   * (a trusted-signer set, a context-membership proof, or the §7.3.5
+   * threshold/independence path) and MUST NOT treat success as authorization.
+   *
+   * @param expectedSubject DID of the agent being admitted. Profiles for any
+   *   other subject are ignored (fail-closed).
+   * @param requirements Typed {@link RequireParticipation} values. Serialized
+   *   internally to the serde wire shape (ADR-058).
+   * @param profiles Typed {@link ParticipationProfile} values. Serialized
+   *   internally to the serde wire shape (ADR-058).
+   */
+  verifyParticipationRequirements(
+    expectedSubject: string,
+    requirements: readonly RequireParticipation[],
+    profiles: readonly ParticipationProfile[],
+  ): void {
+    (this.#native.verifyParticipationRequirements as (s: string, r: string, p: string) => void)(
+      expectedSubject,
+      encodeRequireParticipation(requirements),
+      encodeParticipationProfile(profiles),
     );
   }
 
-  verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean {
-    return (this.#native.verifyParticipationRequirements as (p: string, r: string) => boolean)(
-      profileJson,
-      requirementsJson,
-    );
-  }
-
-  aggregateTrustInput(
+  /**
+   * Verify that an agent meets a context's capability requirements for
+   * admission (spec §7.3.4.4).
+   *
+   * `subjectDid`/`contextId` bind challenge verifications to the agent and
+   * context being admitted: a `ChallengeVerification` only satisfies a
+   * requirement when its signed `subject_did`/`context_id` equal these values,
+   * closing cross-subject and cross-context attribution.
+   *
+   * Returns normally when all requirements are satisfied; throws on any unmet
+   * requirement or malformed JSON.
+   *
+   * Security caveat — authenticity is not authorization: a passing
+   * `ChallengeVerified` check proves the verifier's signature is authentic and
+   * bound to this subject/context, not that the verifier is *trusted*. Because
+   * `verifierDid` is self-certifying, a subject can present a genuinely-signed
+   * result from a verifier it controls. Establish verifier legitimacy
+   * separately and do NOT treat success as authorization.
+   *
+   * @param contextId The context the agent is being admitted to.
+   * @param subjectDid DID of the agent being admitted.
+   * @param requirements Typed {@link CapabilityRequirement} values. Serialized
+   *   internally to the serde wire shape (ADR-058).
+   * @param agentCapabilities The agent's self-attested capability URIs.
+   * @param challengeVerifications Typed {@link ChallengeVerification} records.
+   *   Serialized internally to the serde wire shape (ADR-058).
+   */
+  checkCapabilityRequirements(
     contextId: string,
     subjectDid: string,
-    eventsJson: string,
-    merkleRootJson: string,
-    consequenceRulesJson: string,
-    thresholdRequirementsJson: string,
-    attestorSetsJson: string,
-    cachedAttestationsJson: string,
-    challengeResultsJson: string,
-  ): string {
-    return (
-      this.#native.aggregateTrustInput as (
-        ctx: string,
-        subj: string,
-        ev: string,
-        mr: string,
-        cr: string,
-        tr: string,
-        as: string,
-        ca: string,
-        cres: string,
-      ) => string
+    requirements: readonly CapabilityRequirement[],
+    agentCapabilities: readonly string[],
+    challengeVerifications: readonly ChallengeVerification[],
+  ): void {
+    (
+      this.#native.checkCapabilityRequirements as (
+        c: string,
+        s: string,
+        r: string,
+        a: string,
+        v: string,
+      ) => void
     )(
       contextId,
       subjectDid,
-      eventsJson,
-      merkleRootJson,
-      consequenceRulesJson,
-      thresholdRequirementsJson,
-      attestorSetsJson,
-      cachedAttestationsJson,
-      challengeResultsJson,
+      encodeCapabilityRequirements(requirements),
+      JSON.stringify(agentCapabilities),
+      encodeChallengeVerifications(challengeVerifications),
     );
+  }
+
+  /**
+   * Evaluate the trustworthiness of a participant within a context.
+   *
+   * Composes the structured trust model (spec §7.2.4, ADR-059). The protocol
+   * provides the data, not the verdict — the caller decides what to do with it:
+   *
+   * - **Layer 1 — protocol enforcement.** Each supplied capability token is run
+   *   through the read-only {@link ucanEvaluate} diagnostic, yielding six
+   *   per-stage booleans. The booleans are AND-combined across the token set,
+   *   so one token failing a stage makes that aggregate field `false`. This
+   *   never inspects error prose — it reads the structured
+   *   {@link CapabilityValidation} directly. With no tokens supplied, every
+   *   field stays `false` (no stage was observed to pass).
+   * - **Layer 2 — behavioral validation.** RECEIVES the subject's verifiable
+   *   participation facts (§7.3.2) from the shared Rust core via
+   *   {@link participationRecord} — the core gathers the full event log and
+   *   flattens the facts ONCE, so the SDK never re-aggregates event-log
+   *   collections (no cross-binding divergence). A context with no convergent
+   *   events yet (an empty event log) is not an error here: the behavioral
+   *   record is reported with all counts zeroed (the subject simply has no
+   *   recorded facts), so a Layer-1-only caller never has to populate the log
+   *   first. Use {@link participationRecord} directly when the empty-log case
+   *   should surface as an error instead.
+   *
+   * The capability outcome is non-throwing (it reads booleans); only malformed
+   * FFI inputs (bad context handle / token / capability) propagate as a typed
+   * {@link "./errors".ScpError}.
+   *
+   * SECURITY: the behavioral record's `attestationCount` (and any challenge
+   * results, where consumed) are authentic-but-self-mintable signals — an
+   * issuer/verifier is self-certifying, so a subject can mint them from DIDs it
+   * controls. They MUST NOT be a sole trust or admission factor; use the
+   * threshold/independence path (§7.3.5) for Sybil resistance.
+   *
+   * The evaluation is labeled with — and the Layer-2 lookup is keyed by — the
+   * context the `handle` resolves to (`handle.contextId`), so the result is
+   * never silently mislabeled. There is no separate context-id argument
+   * (matching the Swift and Kotlin SDKs, which resolve from the handle).
+   *
+   * @param handle The context handle to evaluate within.
+   * @param subjectDid The DID of the participant being evaluated.
+   * @param capabilityTokens Optional UCAN token strings to evaluate for Layer 1.
+   * @returns A structured {@link TrustEvaluation} with Layers 1 and 2 populated.
+   */
+  async evaluateTrust(
+    handle: unknown,
+    subjectDid: string,
+    capabilityTokens?: readonly string[],
+  ): Promise<TrustEvaluation> {
+    // Layer 1: AND-combine the structured per-stage booleans across tokens.
+    // Start from the all-true identity element of the boolean AND when at least
+    // one token is present; with no tokens, every field stays false (the
+    // dataclass default — no stage was observed to pass).
+    let capabilityValidation: CapabilityValidation = {
+      tokensValid: false,
+      signaturesValid: false,
+      withinCeiling: false,
+      nonceValid: false,
+      notRevoked: false,
+      timeBoundsValid: false,
+    };
+    if (capabilityTokens !== undefined && capabilityTokens.length > 0) {
+      let tokensValid = true;
+      let signaturesValid = true;
+      let withinCeiling = true;
+      let nonceValid = true;
+      let notRevoked = true;
+      let timeBoundsValid = true;
+      for (const token of capabilityTokens) {
+        // Read-only diagnostic — does NOT throw on capability outcomes; only
+        // malformed FFI input rejects (and propagates). Pass the subject as the
+        // presenting agent so the audience check evaluates against the DID under
+        // assessment.
+        //
+        // No challenge capability is supplied: trust evaluation assesses each
+        // token's GENERAL (intrinsic) validity — signatures, ceiling, nonce,
+        // revocation, time bounds — not whether it grants one specific
+        // capability. Passing a concrete URI (or the old `"*"` sentinel, which
+        // the real bridge rejects) would wrongly impose an invoked-capability
+        // grant-match the caller never asked for. See ADR-059 / spec §7.2.4:
+        // the diagnostic's challenge capability is optional, and omitting it
+        // means intrinsic-validity.
+        const perToken = await this.ucanEvaluate(handle, token, subjectDid);
+        tokensValid &&= perToken.tokensValid;
+        signaturesValid &&= perToken.signaturesValid;
+        withinCeiling &&= perToken.withinCeiling;
+        nonceValid &&= perToken.nonceValid;
+        notRevoked &&= perToken.notRevoked;
+        timeBoundsValid &&= perToken.timeBoundsValid;
+      }
+      // This is a per-FIELD AND ACROSS tokens (every token must pass each
+      // stage), NOT the six-field collapse the `allValid` accessor performs on a
+      // single record — so the accessor does not apply here. Consumers call
+      // `allValid(capabilityValidation)` afterward to collapse the result.
+      capabilityValidation = {
+        tokensValid,
+        signaturesValid,
+        withinCeiling,
+        nonceValid,
+        notRevoked,
+        timeBoundsValid,
+      };
+    }
+
+    // Layer 2: behavioral record RECEIVED from the shared Rust core. The core
+    // gathers the FULL event log and flattens the participation facts (§7.3.2)
+    // ONCE in `Supervisor::participation_record`; the SDK never re-aggregates
+    // event-log collections, so every binding observes identical facts for the
+    // same context/subject (the divergence the old client-side classify
+    // suffered).
+    //
+    // No cached attestations are supplied: `evaluateTrust` takes no attestation
+    // set, so `attestationCount` reflects only what the bridge can source from
+    // its own persistent trust store (verifier-relative, §7.3.2). This honestly
+    // passes nothing rather than fabricating attestations.
+    //
+    // A context with no convergent events yet makes the core return
+    // `NoParticipationFacts` (surfaced as a `ContextError` with the structured
+    // code `SCP-CTX-2076`). That is not a failure for
+    // a trust evaluation — it means "no recorded facts" — so it is folded into a
+    // zeroed behavioral record rather than thrown, keeping `evaluateTrust`
+    // usable on activity-free contexts (e.g. a Layer-1-only check). Any other
+    // error (malformed input, provider failure) still propagates.
+    // The native participation-record op keys the event log by the context's
+    // canonical id — the 64-char hex `contextId` the handle carries, the same
+    // value `eventLogQuery` derives from the handle. Resolve it from the handle
+    // (matching Swift/Kotlin, which read `handle.contextId()`), so both the
+    // Layer-2 lookup and the returned label come from the one authoritative
+    // source and can never disagree.
+    const resolvedContextId = (handle as { readonly contextId: string }).contextId;
+    let behavioralRecord: BehavioralRecord;
+    try {
+      behavioralRecord = await this.participationRecord(resolvedContextId, subjectDid);
+    } catch (error) {
+      // Branch on the STRUCTURED code (`SCP-CTX-2076`), never error prose: the
+      // typed `ContextError` carries the stable code the core assigned to
+      // `NoParticipationFacts` (ADR-059 — structured, not prose, classification).
+      // Anything else (NotInitialized, a provider failure, malformed input) is a
+      // genuine error and propagates unchanged.
+      if (error instanceof ContextError && error.code === NO_PARTICIPATION_FACTS_CODE) {
+        behavioralRecord = {
+          subjectDid,
+          participationDurationSecs: 0,
+          governanceActionsAgainst: 0,
+          governanceActionsBy: 0,
+          outletInvocationCount: 0,
+          outletInvocationCountAnchored: false,
+          contextCreationCount: 0,
+          roleProgressionCount: 0,
+          attestationCount: 0,
+          attestationCountAnchored: false,
+          computedAt: 0,
+          eventLogRoot: "",
+        };
+      } else {
+        throw error;
+      }
+    }
+
+    return {
+      subjectDid,
+      // Label the evaluation with the SAME context the layers were computed
+      // against (the handle's resolved context id) — the single source of truth.
+      contextId: resolvedContextId,
+      capabilityValidation,
+      behavioralRecord,
+      attestations: [],
+    };
+  }
+
+  /**
+   * Computes the structured participation record (§7.3.2) for `subjectDid` in
+   * `contextId`.
+   *
+   * The shared Rust core gathers the FULL context event log and flattens the
+   * participation facts ONCE (`Supervisor::participation_record`), and the NAPI
+   * bridge sources the subject's accessible, currently-valid attestations from
+   * its own persistent trust store (seeded by `cachedAttestations`). The
+   * SDK RECEIVES the flattened {@link BehavioralRecord} — it never re-aggregates
+   * event-log collections, so every binding observes identical facts for the
+   * same context/subject.
+   *
+   * `attestationCount` is a credential-layer fact (§7.4): it is NOT a
+   * context-event count and NOT Merkle-anchored, and is verifier-relative
+   * (computed from the attestations the bridge can access). Pass the subject's
+   * accessible attestations as `cachedAttestations` to populate it; the default
+   * `[]` honestly reports only what the bridge's trust store already holds.
+   *
+   * THREAT MODEL: `attestationCount` is Sybil-inflatable by self-issuance — one
+   * operator can self-issue (or co-issue across DIDs it controls) arbitrarily
+   * many *authentic* attestations. It is a credential-layer claim count, NOT a
+   * standalone trust score; Sybil resistance comes from the threshold/
+   * independence path (§7.3.5) and DeviceAttestation binding (§9.3), not the
+   * count itself. Separately, the membership/role-derived facts (participation
+   * duration, governance actions, role progression) are committer-local —
+   * verifier-relative, not independently Merkle-verifiable — until ADR-051
+   * receive-side replication lands. In particular, `participationDurationSecs`
+   * for the context creator (founder) is derived from the creator-assigned
+   * context-creation timestamp — it is creator-timestamp-trusting and
+   * committer-local until that replication lands (no independent receiver
+   * corroborates the creator's clock).
+   *
+   * @param contextId The context the participation is scoped to.
+   * @param subjectDid The DID whose participation facts are computed.
+   * @param cachedAttestations Typed cached attestations to seed the bridge's
+   *   trust store before sourcing the subject's verified set. Serialized to JSON
+   *   internally — matching the Python SDK's `cached_attestations: list[dict]`.
+   *   Defaults to `[]` (source only what is already persisted).
+   * @returns The flattened participation facts as a {@link BehavioralRecord}.
+   * @throws {@link "./errors".ScpError} on malformed FFI input or a behavioral
+   *   compute failure (e.g. an empty event log → `SCP-CTX-2076`).
+   */
+  async participationRecord(
+    contextId: string,
+    subjectDid: string,
+    cachedAttestations: readonly CachedAttestation[] = [],
+  ): Promise<BehavioralRecord> {
+    let record: BehavioralRecord;
+    try {
+      record = (
+        this.#native.participationRecord as (
+          ctx: string,
+          subj: string,
+          ca: string,
+        ) => BehavioralRecord
+      )(contextId, subjectDid, encodeCachedAttestations(cachedAttestations));
+    } catch (error) {
+      throw mapBridgeError(error);
+    }
+    // Project an explicit, documented SDK shape rather than passing the native
+    // object through — the field set is stable and matches the Python SDK /
+    // Rust `ParticipationFacts` 1:1.
+    return {
+      subjectDid: record.subjectDid,
+      participationDurationSecs: record.participationDurationSecs,
+      governanceActionsAgainst: record.governanceActionsAgainst,
+      governanceActionsBy: record.governanceActionsBy,
+      outletInvocationCount: record.outletInvocationCount,
+      outletInvocationCountAnchored: record.outletInvocationCountAnchored,
+      contextCreationCount: record.contextCreationCount,
+      roleProgressionCount: record.roleProgressionCount,
+      attestationCount: record.attestationCount,
+      attestationCountAnchored: record.attestationCountAnchored,
+      computedAt: record.computedAt,
+      eventLogRoot: record.eventLogRoot,
+    };
+  }
+
+  /**
+   * Aggregate all trust engine layers into a single `TrustInput` (§7.3).
+   *
+   * Every structured input is typed; the SDK serializes to the serde wire
+   * shapes internally before crossing FFI (ADR-058). An empty collection is
+   * a real value ("no rules apply"), never a request for defaults — the
+   * bridge receives `[]` / `{}` exactly as passed.
+   *
+   * @param contextId The context to aggregate trust inputs for.
+   * @param subjectDid The DID of the subject to evaluate.
+   * @param events Full signed event-log entries ({@link EventLogEntry}).
+   * @param merkleRoot 32-byte Merkle root as a number array.
+   * @param consequenceRules Typed {@link ConsequenceRule} values.
+   * @param thresholdRequirements Typed {@link ThresholdRequirement} values
+   *   keyed by {@link AttestationType}.
+   * @param attestorSets Typed {@link AttestorInfo} lists keyed by
+   *   {@link AttestationType}.
+   * @param cachedAttestations Typed {@link CachedAttestation} values to seed
+   *   the bridge's trust store.
+   * @param challengeResults Typed {@link ChallengeVerification} records.
+   * @returns The aggregated `TrustInput` as a JSON string.
+   */
+  aggregateTrustInput(
+    contextId: string,
+    subjectDid: string,
+    events: readonly EventLogEntry[],
+    merkleRoot: readonly number[],
+    consequenceRules: readonly ConsequenceRule[] = [],
+    thresholdRequirements: Readonly<Partial<Record<AttestationType, ThresholdRequirement>>> = {},
+    attestorSets: Readonly<Partial<Record<AttestationType, readonly AttestorInfo[]>>> = {},
+    cachedAttestations: readonly CachedAttestation[] = [],
+    challengeResults: readonly ChallengeVerification[] = [],
+  ): string {
+    try {
+      return (
+        this.#native.aggregateTrustInput as (
+          ctx: string,
+          subj: string,
+          ev: string,
+          mr: string,
+          cr: string,
+          tr: string,
+          as: string,
+          ca: string,
+          cres: string,
+        ) => string
+      )(
+        contextId,
+        subjectDid,
+        encodeEventLogEntries(events),
+        encodeMerkleRoot(merkleRoot),
+        encodeConsequenceRules(consequenceRules),
+        encodeThresholdRequirements(thresholdRequirements),
+        encodeAttestorSets(attestorSets),
+        encodeCachedAttestations(cachedAttestations),
+        encodeChallengeVerifications(challengeResults),
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2159,23 +3780,35 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async relayStartInMemory(): Promise<Relay> {
-    const raw = await (this.#native.relayStartInMemory as () => Promise<unknown>)();
-    const { Relay: RelayCls } = await import("./server");
-    return RelayCls._fromHandle(raw, this);
+    try {
+      const raw = await (this.#native.relayStartInMemory as () => Promise<unknown>)();
+      const { Relay: RelayCls } = await import("./server");
+      return RelayCls._fromHandle(raw, this);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async relayStartLocal(dataDir: string): Promise<Relay> {
-    const raw = await (this.#native.relayStartLocal as (d: string) => Promise<unknown>)(dataDir);
-    const { Relay: RelayCls } = await import("./server");
-    return RelayCls._fromHandle(raw, this);
+    try {
+      const raw = await (this.#native.relayStartLocal as (d: string) => Promise<unknown>)(dataDir);
+      const { Relay: RelayCls } = await import("./server");
+      return RelayCls._fromHandle(raw, this);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async nodeStartInMemory(identityDid?: string | null): Promise<Node> {
-    const raw = await (this.#native.nodeStartInMemory as (d: string | null) => Promise<unknown>)(
-      identityDid ?? null,
-    );
-    const { Node: NodeCls } = await import("./server");
-    return NodeCls._fromHandle(raw, this);
+    try {
+      const raw = await (this.#native.nodeStartInMemory as (d: string | null) => Promise<unknown>)(
+        identityDid ?? null,
+      );
+      const { Node: NodeCls } = await import("./server");
+      return NodeCls._fromHandle(raw, this);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async nodeStartLocal(
@@ -2183,15 +3816,19 @@ export class SCP {
     identityDid?: string | null,
     passphrase?: string | null,
   ): Promise<Node> {
-    const raw = await (
-      this.#native.nodeStartLocal as (
-        d: string,
-        id: string | null,
-        p: string | null,
-      ) => Promise<unknown>
-    )(dataDir, identityDid ?? null, passphrase ?? null);
-    const { Node: NodeCls } = await import("./server");
-    return NodeCls._fromHandle(raw, this);
+    try {
+      const raw = await (
+        this.#native.nodeStartLocal as (
+          d: string,
+          id: string | null,
+          p: string | null,
+        ) => Promise<unknown>
+      )(dataDir, identityDid ?? null, passphrase ?? null);
+      const { Node: NodeCls } = await import("./server");
+      return NodeCls._fromHandle(raw, this);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2199,11 +3836,19 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   async mcpServerCreate(config: unknown): Promise<unknown> {
-    return await (this.#native.mcpServerCreate as (c: unknown) => Promise<unknown>)(config);
+    try {
+      return await (this.#native.mcpServerCreate as (c: unknown) => Promise<unknown>)(config);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async mcpServerStop(handle: unknown): Promise<void> {
-    await (this.#native.mcpServerStop as (h: unknown) => Promise<void>)(handle);
+    try {
+      await (this.#native.mcpServerStop as (h: unknown) => Promise<void>)(handle);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -2216,45 +3861,71 @@ export class SCP {
    * {@link mcpGetStdioAllowlist} to inspect the current state.
    */
   async mcpClientConnectStdio(command: readonly string[]): Promise<unknown> {
-    return await (this.#native.mcpClientConnectStdio as (c: readonly string[]) => Promise<unknown>)(
-      command,
-    );
+    try {
+      return await (
+        this.#native.mcpClientConnectStdio as (c: readonly string[]) => Promise<unknown>
+      )(command);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async mcpClientConnectSse(url: string): Promise<unknown> {
-    return await (this.#native.mcpClientConnectSse as (u: string) => Promise<unknown>)(url);
+    try {
+      return await (this.#native.mcpClientConnectSse as (u: string) => Promise<unknown>)(url);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async mcpClientDisconnect(handle: unknown): Promise<void> {
-    await (this.#native.mcpClientDisconnect as (h: unknown) => Promise<void>)(handle);
+    try {
+      await (this.#native.mcpClientDisconnect as (h: unknown) => Promise<void>)(handle);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async mcpClientListTools(handle: unknown): Promise<readonly unknown[]> {
-    return await (this.#native.mcpClientListTools as (h: unknown) => Promise<readonly unknown[]>)(
-      handle,
-    );
+    try {
+      return await (this.#native.mcpClientListTools as (h: unknown) => Promise<readonly unknown[]>)(
+        handle,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   async mcpClientInvoke(
     handle: unknown,
-    toolName: string,
+    outletName: string,
     inputJson: string,
     contextId: string,
     invokerDid: string,
   ): Promise<unknown> {
-    return await (
-      this.#native.mcpClientInvoke as (
-        h: unknown,
-        t: string,
-        i: string,
-        c: string,
-        d: string,
-      ) => Promise<unknown>
-    )(handle, toolName, inputJson, contextId, invokerDid);
+    try {
+      return await (
+        this.#native.mcpClientInvoke as (
+          h: unknown,
+          t: string,
+          i: string,
+          c: string,
+          d: string,
+        ) => Promise<unknown>
+      )(handle, outletName, inputJson, contextId, invokerDid);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mcpConfigureStdioAllowlist(additionalBinaries: readonly string[]): void {
-    (this.#native.mcpConfigureStdioAllowlist as (b: readonly string[]) => void)(additionalBinaries);
+    try {
+      (this.#native.mcpConfigureStdioAllowlist as (b: readonly string[]) => void)(
+        additionalBinaries,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -2276,15 +3947,27 @@ export class SCP {
       "[scp] MCP stdio allowlist enforcement disabled — arbitrary subprocess " +
         "spawning is now permitted on this instance",
     );
-    (this.#native.mcpDisableStdioAllowlist as () => void)();
+    try {
+      (this.#native.mcpDisableStdioAllowlist as () => void)();
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mcpResetStdioAllowlist(): void {
-    (this.#native.mcpResetStdioAllowlist as () => void)();
+    try {
+      (this.#native.mcpResetStdioAllowlist as () => void)();
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mcpGetStdioAllowlist(): McpAllowlistState {
-    return (this.#native.mcpGetStdioAllowlist as () => McpAllowlistState)();
+    try {
+      return (this.#native.mcpGetStdioAllowlist as () => McpAllowlistState)();
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2292,50 +3975,78 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   fullstackCreateNode(did: string): unknown {
-    return (this.#native.fullstackCreateNode as (d: string) => unknown)(did);
+    try {
+      return (this.#native.fullstackCreateNode as (d: string) => unknown)(did);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   fullstackResetNetwork(): void {
-    (this.#native.fullstackResetNetwork as () => void)();
+    try {
+      (this.#native.fullstackResetNetwork as () => void)();
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   fullstackCreateContext(node: unknown, contextId: string, ceilingJson: string): string {
-    return (this.#native.fullstackCreateContext as (n: unknown, c: string, j: string) => string)(
-      node,
-      contextId,
-      ceilingJson,
-    );
+    try {
+      return (this.#native.fullstackCreateContext as (n: unknown, c: string, j: string) => string)(
+        node,
+        contextId,
+        ceilingJson,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   fullstackAddMember(node: unknown, contextId: string, memberDid: string): void {
-    (this.#native.fullstackAddMember as (n: unknown, c: string, m: string) => void)(
-      node,
-      contextId,
-      memberDid,
-    );
+    try {
+      (this.#native.fullstackAddMember as (n: unknown, c: string, m: string) => void)(
+        node,
+        contextId,
+        memberDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   fullstackJoinFromWelcome(node: unknown, contextId: string): void {
-    (this.#native.fullstackJoinFromWelcome as (n: unknown, c: string) => void)(node, contextId);
+    try {
+      (this.#native.fullstackJoinFromWelcome as (n: unknown, c: string) => void)(node, contextId);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   fullstackSyncSenderKeys(nodeA: unknown, nodeB: unknown, contextId: string): void {
-    (this.#native.fullstackSyncSenderKeys as (a: unknown, b: unknown, c: string) => void)(
-      nodeA,
-      nodeB,
-      contextId,
-    );
+    try {
+      (this.#native.fullstackSyncSenderKeys as (a: unknown, b: unknown, c: string) => void)(
+        nodeA,
+        nodeB,
+        contextId,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   fullstackSendMessage(node: unknown, contextId: string, payload: Uint8Array | Buffer): Uint8Array {
-    const raw = (
-      this.#native.fullstackSendMessage as (
-        n: unknown,
-        c: string,
-        p: Uint8Array | Buffer,
-      ) => Uint8Array | Buffer
-    )(node, contextId, payload);
-    return new Uint8Array(raw);
+    try {
+      const raw = (
+        this.#native.fullstackSendMessage as (
+          n: unknown,
+          c: string,
+          p: Uint8Array | Buffer,
+        ) => Uint8Array | Buffer
+      )(node, contextId, payload);
+      return new Uint8Array(raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   fullstackDecryptMessage(
@@ -2344,23 +4055,31 @@ export class SCP {
     ciphertext: Uint8Array | Buffer,
     senderDid: string,
   ): Uint8Array {
-    const raw = (
-      this.#native.fullstackDecryptMessage as (
-        n: unknown,
-        c: string,
-        ct: Uint8Array | Buffer,
-        s: string,
-      ) => Uint8Array | Buffer
-    )(node, contextId, ciphertext, senderDid);
-    return new Uint8Array(raw);
+    try {
+      const raw = (
+        this.#native.fullstackDecryptMessage as (
+          n: unknown,
+          c: string,
+          ct: Uint8Array | Buffer,
+          s: string,
+        ) => Uint8Array | Buffer
+      )(node, contextId, ciphertext, senderDid);
+      return new Uint8Array(raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   fullstackRemoveMember(node: unknown, contextId: string, memberDid: string): void {
-    (this.#native.fullstackRemoveMember as (n: unknown, c: string, m: string) => void)(
-      node,
-      contextId,
-      memberDid,
-    );
+    try {
+      (this.#native.fullstackRemoveMember as (n: unknown, c: string, m: string) => void)(
+        node,
+        contextId,
+        memberDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /**
@@ -2375,14 +4094,18 @@ export class SCP {
     peerDid: string,
     pseudonym: Uint8Array | Buffer,
   ): void {
-    (
-      this.#native.fullstackSeedPeerPseudonym as (
-        n: unknown,
-        c: string,
-        p: string,
-        ps: Uint8Array | Buffer,
-      ) => void
-    )(node, contextId, peerDid, pseudonym);
+    try {
+      (
+        this.#native.fullstackSeedPeerPseudonym as (
+          n: unknown,
+          c: string,
+          p: string,
+          ps: Uint8Array | Buffer,
+        ) => void
+      )(node, contextId, peerDid, pseudonym);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2390,10 +4113,14 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   mediaCheckCapability(ceiling: readonly string[], capability: string): boolean {
-    return (this.#native.mediaCheckCapability as (c: readonly string[], cap: string) => boolean)(
-      ceiling,
-      capability,
-    );
+    try {
+      return (this.#native.mediaCheckCapability as (c: readonly string[], cap: string) => boolean)(
+        ceiling,
+        capability,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mediaInitiateSession(
@@ -2403,49 +4130,73 @@ export class SCP {
     participants: readonly string[],
     timestamp: number,
   ): string {
-    return (
-      this.#native.mediaInitiateSession as (
-        c: string,
-        cl: readonly string[],
-        caps: readonly string[],
-        p: readonly string[],
-        t: number,
-      ) => string
-    )(contextId, ceiling, capabilities, participants, timestamp);
+    try {
+      return (
+        this.#native.mediaInitiateSession as (
+          c: string,
+          cl: readonly string[],
+          caps: readonly string[],
+          p: readonly string[],
+          t: number,
+        ) => string
+      )(contextId, ceiling, capabilities, participants, timestamp);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mediaActivateSession(sessionJson: string): string {
-    return (this.#native.mediaActivateSession as (s: string) => string)(sessionJson);
+    try {
+      return (this.#native.mediaActivateSession as (s: string) => string)(sessionJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mediaJoinSession(sessionJson: string, participantDid: string): string {
-    return (this.#native.mediaJoinSession as (s: string, p: string) => string)(
-      sessionJson,
-      participantDid,
-    );
+    try {
+      return (this.#native.mediaJoinSession as (s: string, p: string) => string)(
+        sessionJson,
+        participantDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mediaEndSession(sessionJson: string, timestamp: number): string {
-    return (this.#native.mediaEndSession as (s: string, t: number) => string)(
-      sessionJson,
-      timestamp,
-    );
+    try {
+      return (this.#native.mediaEndSession as (s: string, t: number) => string)(
+        sessionJson,
+        timestamp,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mediaCreateOffer(sessionId: string, sdp: string, senderDid: string): string {
-    return (this.#native.mediaCreateOffer as (s: string, sdp: string, d: string) => string)(
-      sessionId,
-      sdp,
-      senderDid,
-    );
+    try {
+      return (this.#native.mediaCreateOffer as (s: string, sdp: string, d: string) => string)(
+        sessionId,
+        sdp,
+        senderDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mediaCreateAnswer(sessionId: string, sdp: string, senderDid: string): string {
-    return (this.#native.mediaCreateAnswer as (s: string, sdp: string, d: string) => string)(
-      sessionId,
-      sdp,
-      senderDid,
-    );
+    try {
+      return (this.#native.mediaCreateAnswer as (s: string, sdp: string, d: string) => string)(
+        sessionId,
+        sdp,
+        senderDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mediaCreateIceCandidate(
@@ -2455,33 +4206,49 @@ export class SCP {
     sdpMid?: string,
     sdpMlineIndex?: number,
   ): string {
-    return (
-      this.#native.mediaCreateIceCandidate as (
-        s: string,
-        c: string,
-        d: string,
-        m: string | undefined,
-        i: number | undefined,
-      ) => string
-    )(sessionId, candidate, senderDid, sdpMid, sdpMlineIndex);
+    try {
+      return (
+        this.#native.mediaCreateIceCandidate as (
+          s: string,
+          c: string,
+          d: string,
+          m: string | undefined,
+          i: number | undefined,
+        ) => string
+      )(sessionId, candidate, senderDid, sdpMid, sdpMlineIndex);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mediaCreateSessionEnd(sessionId: string, senderDid: string): string {
-    return (this.#native.mediaCreateSessionEnd as (s: string, d: string) => string)(
-      sessionId,
-      senderDid,
-    );
+    try {
+      return (this.#native.mediaCreateSessionEnd as (s: string, d: string) => string)(
+        sessionId,
+        senderDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mediaSendSignaling(signalingJson: string): string {
-    return (this.#native.mediaSendSignaling as (s: string) => string)(signalingJson);
+    try {
+      return (this.#native.mediaSendSignaling as (s: string) => string)(signalingJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   mediaVerifySenderAttribution(signalingJson: string, envelopeSenderDid: string): boolean {
-    return (this.#native.mediaVerifySenderAttribution as (s: string, e: string) => boolean)(
-      signalingJson,
-      envelopeSenderDid,
-    );
+    try {
+      return (this.#native.mediaVerifySenderAttribution as (s: string, e: string) => boolean)(
+        signalingJson,
+        envelopeSenderDid,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2494,14 +4261,18 @@ export class SCP {
     contextState: string,
     counterparties?: readonly string[],
   ): Promise<number> {
-    return await (
-      this.#native.evaluateProvenanceQuality as (
-        sc: string | undefined,
-        st: string,
-        cs: string,
-        cp: readonly string[] | undefined,
-      ) => Promise<number>
-    )(sourceContext, sourceType, contextState, counterparties);
+    try {
+      return await (
+        this.#native.evaluateProvenanceQuality as (
+          sc: string | undefined,
+          st: string,
+          cs: string,
+          cp: readonly string[] | undefined,
+        ) => Promise<number>
+      )(sourceContext, sourceType, contextState, counterparties);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   provenanceAttach(
@@ -2515,56 +4286,78 @@ export class SCP {
     discoveryMethod?: string,
     purpose?: string,
     counterpartyPolicy?: string,
-  ): string {
-    return (
-      this.#native.provenanceAttach as (
-        sc: string,
-        st: string,
-        ms: string,
-        m: readonly string[],
-        tc: string,
-        ad: string,
-        e: number | undefined,
-        dm: string | undefined,
-        p: string | undefined,
-        cp: string | undefined,
-      ) => string
-    )(
-      sourceContextId,
-      sourceType,
-      memoryScope,
-      members,
-      targetContextId,
-      actorDid,
-      existingChainDepth,
-      discoveryMethod,
-      purpose,
-      counterpartyPolicy,
-    );
+  ): ProvenanceRecord {
+    try {
+      const raw = (
+        this.#native.provenanceAttach as (
+          sc: string,
+          st: string,
+          ms: string,
+          m: readonly string[],
+          tc: string,
+          ad: string,
+          e: number | undefined,
+          dm: string | undefined,
+          p: string | undefined,
+          cp: string | undefined,
+        ) => string
+      )(
+        sourceContextId,
+        sourceType,
+        memoryScope,
+        members,
+        targetContextId,
+        actorDid,
+        existingChainDepth,
+        discoveryMethod,
+        purpose,
+        counterpartyPolicy,
+      );
+      // The native bridge returns the raw snake_case JSON wire string; decode it
+      // into the SDK's typed camelCase surface (ADR-060 `paymentAmount` bigint).
+      return decodeProvenanceRecord(raw);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   provenanceCheckChainDepth(chainDepth: number, maxDepth?: number): boolean {
-    return (
-      this.#native.provenanceCheckChainDepth as (c: number, m: number | undefined) => boolean
-    )(chainDepth, maxDepth);
+    try {
+      return (
+        this.#native.provenanceCheckChainDepth as (c: number, m: number | undefined) => boolean
+      )(chainDepth, maxDepth);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   provenanceRedactCounterparties(provenanceJson: string): string {
-    return (this.#native.provenanceRedactCounterparties as (j: string) => string)(provenanceJson);
+    try {
+      return (this.#native.provenanceRedactCounterparties as (j: string) => string)(provenanceJson);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   provenancePseudonymizeCounterparties(provenanceJson: string, pseudonymKeyHex: string): string {
-    return (this.#native.provenancePseudonymizeCounterparties as (j: string, k: string) => string)(
-      provenanceJson,
-      pseudonymKeyHex,
-    );
+    try {
+      return (
+        this.#native.provenancePseudonymizeCounterparties as (j: string, k: string) => string
+      )(provenanceJson, pseudonymKeyHex);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   provenanceUpdateSourceType(provenanceJson: string, newState: string): string {
-    return (this.#native.provenanceUpdateSourceType as (j: string, s: string) => string)(
-      provenanceJson,
-      newState,
-    );
+    try {
+      return (this.#native.provenanceUpdateSourceType as (j: string, s: string) => string)(
+        provenanceJson,
+        newState,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2572,14 +4365,22 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   syncClassifyOffline(lastRelayContact: number, now: number): string {
-    return (this.#native.syncClassifyOffline as (l: number, n: number) => string)(
-      lastRelayContact,
-      now,
-    );
+    try {
+      return (this.#native.syncClassifyOffline as (l: number, n: number) => string)(
+        lastRelayContact,
+        now,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   syncGetPolicy(): unknown {
-    return (this.#native.syncGetPolicy as () => unknown)();
+    try {
+      return (this.#native.syncGetPolicy as () => unknown)();
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   syncClassifyOfflineCustom(
@@ -2588,14 +4389,18 @@ export class SCP {
     tier1ThresholdSecs: number,
     tier2ThresholdSecs: number,
   ): string {
-    return (
-      this.#native.syncClassifyOfflineCustom as (
-        l: number,
-        n: number,
-        t1: number,
-        t2: number,
-      ) => string
-    )(lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs);
+    try {
+      return (
+        this.#native.syncClassifyOfflineCustom as (
+          l: number,
+          n: number,
+          t1: number,
+          t2: number,
+        ) => string
+      )(lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2608,14 +4413,18 @@ export class SCP {
     bridgeMode: string,
     contextId?: string,
   ): unknown {
-    return (
-      this.#native.bridgeCreateShadow as (
-        b: string,
-        p: string,
-        m: string,
-        c: string | undefined,
-      ) => unknown
-    )(bridgeId, platformHandle, bridgeMode, contextId);
+    try {
+      return (
+        this.#native.bridgeCreateShadow as (
+          b: string,
+          p: string,
+          m: string,
+          c: string | undefined,
+        ) => unknown
+      )(bridgeId, platformHandle, bridgeMode, contextId);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2623,9 +4432,7 @@ export class SCP {
   //
   // Per-instance credential store ops. Each routes through `this.#native`
   // (the NAPI SCP handle) — credentials are isolated to THIS instance's
-  // store (ADR-048 §1). The SCP class is native-only by construction (the
-  // WASM build throws at `new SCP(...)`), so there is no WASM path here;
-  // the credential store lives only in scp-runtime (ADR-034).
+  // store (ADR-048 §1). The credential store lives only in scp-runtime.
   // ───────────────────────────────────────────────────────────────────────
 
   /** Provisions (stores) an encrypted credential for a bridge instance. */
@@ -2635,22 +4442,26 @@ export class SCP {
     plaintext: Uint8Array | readonly number[],
     bridgeCredentialKey: Uint8Array | readonly number[],
   ): BridgeCredential {
-    // NAPI marshals Rust `Vec<u8>` as a JS `Array<number>`, not `Uint8Array`;
-    // convert byte inputs before crossing the boundary (cf. `broadcastPublish`).
-    const plaintextArray = ArrayBuffer.isView(plaintext)
-      ? Array.from(plaintext as Uint8Array)
-      : (plaintext as readonly number[]);
-    const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
-      ? Array.from(bridgeCredentialKey as Uint8Array)
-      : (bridgeCredentialKey as readonly number[]);
-    return (
-      this.#native.bridgeCredentialProvision as (
-        b: string,
-        t: string,
-        p: readonly number[],
-        k: readonly number[],
-      ) => BridgeCredential
-    )(bridgeId, credentialType, plaintextArray, keyArray);
+    try {
+      // NAPI marshals Rust `Vec<u8>` as a JS `Array<number>`, not `Uint8Array`;
+      // convert byte inputs before crossing the boundary (cf. `broadcastPublish`).
+      const plaintextArray = ArrayBuffer.isView(plaintext)
+        ? Array.from(plaintext as Uint8Array)
+        : (plaintext as readonly number[]);
+      const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
+        ? Array.from(bridgeCredentialKey as Uint8Array)
+        : (bridgeCredentialKey as readonly number[]);
+      return (
+        this.#native.bridgeCredentialProvision as (
+          b: string,
+          t: string,
+          p: readonly number[],
+          k: readonly number[],
+        ) => BridgeCredential
+      )(bridgeId, credentialType, plaintextArray, keyArray);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /** Retrieves and decrypts a credential for a bridge instance. */
@@ -2659,17 +4470,21 @@ export class SCP {
     credentialType: string,
     bridgeCredentialKey: Uint8Array | readonly number[],
   ): Uint8Array {
-    const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
-      ? Array.from(bridgeCredentialKey as Uint8Array)
-      : (bridgeCredentialKey as readonly number[]);
-    const raw = (
-      this.#native.bridgeCredentialRetrieve as (
-        b: string,
-        t: string,
-        k: readonly number[],
-      ) => number[]
-    )(bridgeId, credentialType, keyArray);
-    return Uint8Array.from(raw as readonly number[]);
+    try {
+      const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
+        ? Array.from(bridgeCredentialKey as Uint8Array)
+        : (bridgeCredentialKey as readonly number[]);
+      const raw = (
+        this.#native.bridgeCredentialRetrieve as (
+          b: string,
+          t: string,
+          k: readonly number[],
+        ) => number[]
+      )(bridgeId, credentialType, keyArray);
+      return Uint8Array.from(raw as readonly number[]);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /** Rotates (replaces) a credential for a bridge instance. */
@@ -2679,52 +4494,76 @@ export class SCP {
     newPlaintext: Uint8Array | readonly number[],
     bridgeCredentialKey: Uint8Array | readonly number[],
   ): BridgeCredential {
-    const newPlaintextArray = ArrayBuffer.isView(newPlaintext)
-      ? Array.from(newPlaintext as Uint8Array)
-      : (newPlaintext as readonly number[]);
-    const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
-      ? Array.from(bridgeCredentialKey as Uint8Array)
-      : (bridgeCredentialKey as readonly number[]);
-    return (
-      this.#native.bridgeCredentialRotate as (
-        b: string,
-        t: string,
-        p: readonly number[],
-        k: readonly number[],
-      ) => BridgeCredential
-    )(bridgeId, credentialType, newPlaintextArray, keyArray);
+    try {
+      const newPlaintextArray = ArrayBuffer.isView(newPlaintext)
+        ? Array.from(newPlaintext as Uint8Array)
+        : (newPlaintext as readonly number[]);
+      const keyArray = ArrayBuffer.isView(bridgeCredentialKey)
+        ? Array.from(bridgeCredentialKey as Uint8Array)
+        : (bridgeCredentialKey as readonly number[]);
+      return (
+        this.#native.bridgeCredentialRotate as (
+          b: string,
+          t: string,
+          p: readonly number[],
+          k: readonly number[],
+        ) => BridgeCredential
+      )(bridgeId, credentialType, newPlaintextArray, keyArray);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /** Revokes all credentials for a bridge instance. */
   bridgeCredentialRevoke(bridgeId: string): void {
-    (this.#native.bridgeCredentialRevoke as (b: string) => void)(bridgeId);
+    try {
+      (this.#native.bridgeCredentialRevoke as (b: string) => void)(bridgeId);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /** Lists all credential types stored for a bridge instance. */
   bridgeCredentialList(bridgeId: string): string[] {
-    return (this.#native.bridgeCredentialList as (b: string) => string[])(bridgeId);
+    try {
+      return (this.#native.bridgeCredentialList as (b: string) => string[])(bridgeId);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /** Stores a bridge credential key in the custody boundary. */
   bridgeCredentialStoreKey(bridgeId: string, key: Uint8Array | readonly number[]): void {
-    const keyArray = ArrayBuffer.isView(key)
-      ? Array.from(key as Uint8Array)
-      : (key as readonly number[]);
-    (this.#native.bridgeCredentialStoreKey as (b: string, k: readonly number[]) => void)(
-      bridgeId,
-      keyArray,
-    );
+    try {
+      const keyArray = ArrayBuffer.isView(key)
+        ? Array.from(key as Uint8Array)
+        : (key as readonly number[]);
+      (this.#native.bridgeCredentialStoreKey as (b: string, k: readonly number[]) => void)(
+        bridgeId,
+        keyArray,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /** Retrieves a bridge credential key from the custody boundary. */
   bridgeCredentialGetKey(bridgeId: string): Uint8Array {
-    const raw = (this.#native.bridgeCredentialGetKey as (b: string) => number[])(bridgeId);
-    return Uint8Array.from(raw as readonly number[]);
+    try {
+      const raw = (this.#native.bridgeCredentialGetKey as (b: string) => number[])(bridgeId);
+      return Uint8Array.from(raw as readonly number[]);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   /** Deletes and zeroizes a bridge credential key. */
   bridgeCredentialDeleteKey(bridgeId: string): void {
-    (this.#native.bridgeCredentialDeleteKey as (b: string) => void)(bridgeId);
+    try {
+      (this.#native.bridgeCredentialDeleteKey as (b: string) => void)(bridgeId);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2732,22 +4571,90 @@ export class SCP {
   // ───────────────────────────────────────────────────────────────────────
 
   scpidChallenge(audience: string, ttlSeconds: number): string {
-    return (this.#native.scpidChallenge as (a: string, t: number) => string)(audience, ttlSeconds);
+    try {
+      return (this.#native.scpidChallenge as (a: string, t: number) => string)(
+        audience,
+        ttlSeconds,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   scpidSign(did: string, signingKeyId: string, challengeJson: string): string {
-    return (this.#native.scpidSign as (d: string, k: string, c: string) => string)(
-      did,
-      signingKeyId,
-      challengeJson,
-    );
+    try {
+      return (this.#native.scpidSign as (d: string, k: string, c: string) => string)(
+        did,
+        signingKeyId,
+        challengeJson,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   scpidVerify(responseJson: string, challengeJson: string): string {
-    return (this.#native.scpidVerify as (r: string, c: string) => string)(
-      responseJson,
-      challengeJson,
-    );
+    try {
+      return (this.#native.scpidVerify as (r: string, c: string) => string)(
+        responseJson,
+        challengeJson,
+      );
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Binds an app to a context and appends a durable `AppBound` event (tag 74)
+   * to the event log (spec §8.4.1).
+   *
+   * Validates the capability declaration against the context ceiling and the
+   * actor's role capabilities before appending.
+   *
+   * @returns A JSON summary string with `app_did` and `granted_capabilities`.
+   */
+  async contextAppBind(
+    contextId: string,
+    declarationJson: string,
+    actorDid: string,
+    timestampSecs: number,
+  ): Promise<string> {
+    try {
+      return await (
+        this.#native.appBind as (
+          id: string,
+          decl: string,
+          did: string,
+          ts: number,
+        ) => Promise<string>
+      )(contextId, declarationJson, actorDid, timestampSecs);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
+  }
+
+  /**
+   * Unbinds an app from a context and appends a durable `AppUnbound` event
+   * (tag 75) to the event log (spec §8.4.2).
+   */
+  async contextAppUnbind(
+    contextId: string,
+    appDid: string,
+    actorDid: string,
+    timestampSecs: number,
+  ): Promise<void> {
+    try {
+      await (
+        this.#native.appUnbind as (
+          id: string,
+          app: string,
+          did: string,
+          ts: number,
+        ) => Promise<void>
+      )(contextId, appDid, actorDid, timestampSecs);
+    } catch (err) {
+      throw mapBridgeError(err);
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -2775,37 +4682,6 @@ export function __getNativeScp(scp: SCP): NativeScpInstance {
   return native;
 }
 
-/**
- * Production guard for the two test-only native-handle mutators.
- * Throws when the current runtime looks like a production build so
- * that even if a supply-chain attacker deep-imports `dist/scp.js` and
- * reaches these helpers they cannot swap the native bridge behind a
- * user's back (round-3 red-hat RED-PR5-001/007).
- *
- * The gate uses `process.env.NODE_ENV === "production"` — the widely-
- * honoured React/Node build-flag. Apps that ship with
- * `NODE_ENV=production` get the guard; tests run with `NODE_ENV=test`
- * or unset, which passes through. `process` may be undefined in
- * browser/Deno contexts — we treat that as "not production" since the
- * WASM bridge has no `SCP` class at all.
- */
-function assertTestHookAllowed(hookName: string): void {
-  const env: string | undefined = (() => {
-    try {
-      return (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV;
-    } catch {
-      return undefined;
-    }
-  })();
-  if (env === "production") {
-    throw new Error(
-      `${hookName} is a test-only hook and must not be called in a production build ` +
-        `(NODE_ENV=production). If you're seeing this in legitimate code, your build is ` +
-        `mis-configured or a dependency is attempting to swap the SCP native bridge.`,
-    );
-  }
-}
-
 // `__setNativeForTests` + `replaceNativeWithMock` removed in round-3 cleanup:
 // black-hat finding BLACK-PR5-003 noted that post-construction swaps via the
 // `nativeTestOverrides` WeakMap were invisible to the ~180 class methods
@@ -2821,14 +4697,15 @@ function assertTestHookAllowed(hookName: string): void {
  * Proxy-backed mock without requiring `@limn-works/scp-ts-napi-*` to
  * be installed for the host platform.
  *
- * Guarded by `NODE_ENV === "production"` throw to close the
- * round-3 red-hat RED-PR5-007 attack chain (smuggled-native SCP
- * injection into a downstream library).
+ * Guarded: throws in production — only allowed when NODE_ENV is "test" or
+ * "development", or when BUN_TEST is set. Closes the round-3 red-hat
+ * RED-PR5-007 attack chain (smuggled-native SCP injection into a downstream
+ * library).
  *
  * @internal
  */
 export function __constructScpWithNativeForTests(native: unknown): SCP {
-  assertTestHookAllowed("__constructScpWithNativeForTests");
+  assertTestEnvironment("__constructScpWithNativeForTests");
   return new SCP({
     [NATIVE_OVERRIDE]: native as NativeScpInstance,
   } as unknown as ScpOptions);

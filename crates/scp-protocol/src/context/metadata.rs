@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 use super::params::{
     CeilingPolicy, ContextMode, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
@@ -82,7 +82,7 @@ pub struct MetadataRecord {
 /// to join a context. Hiding them would undermine informed consent.
 ///
 /// See spec §5.7.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuralMetadata {
     /// Template ID, if created from a well-known template (§5.12).
     pub template_id: Option<TemplateId>,
@@ -121,7 +121,7 @@ pub struct StructuralMetadata {
 /// metadata through internal context state.
 ///
 /// See spec §5.7.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationalMetadata {
     /// Current member count. Filtered by `visibility_policy.member_count`.
     pub member_count: Option<u64>,
@@ -140,15 +140,40 @@ pub struct OperationalMetadata {
     /// Economic policy summary, if set (§19.3).
     /// Filtered by `visibility_policy.economic_policy`.
     pub economic_policy: Option<String>,
-    /// Number of active tool interfaces (inbound + outbound, §6.2).
-    /// Filtered by `visibility_policy.tool_interface_count`.
-    pub tool_count: Option<u64>,
+    /// Number of active outlet interfaces (inbound + outbound, §6.2).
+    /// Filtered by `visibility_policy.outlet_interface_count`.
+    pub outlet_count: Option<u64>,
     /// Child context IDs, if this is a parent context (§5.13).
     /// Filtered by `visibility_policy.child_context_info`.
     pub child_contexts: Option<Vec<ContextId>>,
 }
 
 // Default derived — all fields are `Option<_>` and default to `None`.
+
+// ---------------------------------------------------------------------------
+// MetadataSnapshot (§5.12.3.1 — invitation bundle metadata view)
+// ---------------------------------------------------------------------------
+
+/// A point-in-time, visibility-filtered VIEW of a context's metadata carried
+/// inside an [`InvitationBundle`](super::invitation_bundle::InvitationBundle)
+/// (spec §5.12.3.1).
+///
+/// Unlike [`MetadataRecord`], a snapshot carries no signature or sequence of
+/// its own — it is authenticated as part of the enclosing bundle's creator
+/// signature over `metadata_snapshot_hash`. Its `structural` fields are derived
+/// from the bundle's `context_params` and MUST agree with them (verified by
+/// [`InvitationBundle::verify_structural_consistency`](super::invitation_bundle::InvitationBundle::verify_structural_consistency));
+/// its `operational` fields carry runtime state (member count, age, name) not
+/// present in `context_params`.
+///
+/// See spec §5.12.3.1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataSnapshot {
+    /// Structural metadata — derived from `context_params`, always visible.
+    pub structural: StructuralMetadata,
+    /// Operational metadata — visibility-filtered runtime state.
+    pub operational: OperationalMetadata,
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -182,7 +207,7 @@ mod tests {
             name: Some("Test Context".to_owned()),
             description: Some("A test context".to_owned()),
             economic_policy: None,
-            tool_count: Some(0),
+            outlet_count: Some(0),
             child_contexts: None,
         }
     }
@@ -231,7 +256,7 @@ mod tests {
         assert!(op.name.is_none());
         assert!(op.description.is_none());
         assert!(op.economic_policy.is_none());
-        assert!(op.tool_count.is_none());
+        assert!(op.outlet_count.is_none());
         assert!(op.child_contexts.is_none());
     }
 
@@ -244,7 +269,7 @@ mod tests {
         assert_eq!(deserialized.context_age_secs, Some(60));
         assert_eq!(deserialized.creator_did, Some(DID::from("did:dht:zAlice")));
         assert_eq!(deserialized.name.as_deref(), Some("Test Context"));
-        assert_eq!(deserialized.tool_count, Some(0));
+        assert_eq!(deserialized.outlet_count, Some(0));
     }
 
     #[test]

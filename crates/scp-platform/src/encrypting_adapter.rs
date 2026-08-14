@@ -16,7 +16,7 @@
 //!
 //! ```rust,ignore
 //! use scp_platform::encrypting_adapter::EncryptingAdapter;
-//! use scp_platform::testing::InMemoryStorage;
+//! use scp_platform::in_memory::InMemoryStorage;
 //! use zeroize::Zeroizing;
 //!
 //! let key = Zeroizing::new([0x42u8; 32]);
@@ -171,7 +171,7 @@ impl<S: Storage> Storage for EncryptingAdapter<S> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::testing::InMemoryStorage;
+    use crate::in_memory::InMemoryStorage;
 
     fn make_adapter() -> EncryptingAdapter<InMemoryStorage> {
         let key = Zeroizing::new([0x42u8; 32]);

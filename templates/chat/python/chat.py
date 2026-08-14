@@ -29,7 +29,9 @@ async def print_incoming(ctx: Context) -> None:
         # Skip messages from ourselves (echo suppression).
         if msg.sender_did == ctx._creator_did:
             continue
-        content = msg.content if isinstance(msg.content, str) else msg.content.decode("utf-8")
+        content = (
+            msg.content if isinstance(msg.content, str) else msg.content.decode("utf-8")
+        )
         print(f"\r[{msg.sender_did[:20]}...] {content}")
         print("> ", end="", flush=True)
 

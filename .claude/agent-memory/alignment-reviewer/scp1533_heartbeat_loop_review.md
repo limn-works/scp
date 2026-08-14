@@ -1,0 +1,22 @@
+---
+name: scp1533-heartbeat-loop-review
+description: "#1533 close §9.9.2 heartbeat send/recv loop — APPROVE; napi-only boundary honest; issue premise stale (monitor already wired by #1540)"
+metadata:
+  type: project
+---
+
+# #1533 Heartbeat Loop Review (2026-06-15) — APPROVE, 0 blocking/0 material
+
+Branch `feat/1533-heartbeat-loop`, worktree `agent-acc9905e51f8cbf75`, off origin/main `53b6f1d47`. 20 files +1157/-72. Closes §9.9.2 (`.docs/specs/09-security-model.md:787`).
+
+**What it does:** adds `MessageType::Heartbeat=5` (appended after ConsistencyCheckpoint=4, discriminator-stability test pins it as wire commitment); `send_heartbeat` core helper (empty payload `&[]`, seq 0, MessageType::Heartbeat through encrypt_and_send — mirrors send_checkpoint exactly); receive-path classifies Heartbeat AFTER verify, BEFORE sequence tracker (never advances per-sender app seq); `DeliverOutcome{Application,Heartbeat,Handled}` replaces deliver_incoming `Option<(Vec<u8>,String)>`; SendHeartbeat cmd+handler+Supervisor::send_heartbeat; TransportAdapter::record_heartbeat_received default no-op + NativeRelayAdapter override (Self:: inherent-priority delegation) + Box blanket + TransportManager fan-out-to-all-adapters; HeartbeatConfig::for_profile single-source-of-truth (Server/Desktop 60s, Mobile 120s, Constrained None) used by BOTH send scheduler and receive monitor; scp-ffi-common/heartbeat_scheduler.rs (run_heartbeat_scheduler driving Supervisor::send_heartbeat on timer, best-effort, consumes first immediate tick); napi context_subscribe_on spawns scheduler in same JoinSet + records on DeliverOutcome::Heartbeat.
+
+**KEY: issue premise was STALE.** #1533 said "HeartbeatMonitor never instantiated." FALSE by branch time — origin/main already had monitor instantiated on connect, gap→SuppressionSuspected emit, scoring drain (likely from #1540). The REAL gap the branch fixes: nothing ever SENT a heartbeat + record_heartbeat_received had zero prod callers. Branch addresses the true gap. ACs 1/4/5/6/7/10 pre-existing (not regressed; b3_heartbeat_monitor_instantiated untouched). ACs 2/3/8/9 implemented+tested.
+
+**napi-only boundary = legitimate close, NOT partial.** Verified: napi context_subscribe_on (context.rs:~1224) = ONLY bridge with live transport_mgr.subscribe + DeliverIncoming loop. uniffi context_subscribe (bridge.rs:9387) = STUB (listener.on_complete() immediately, "full transport wiring... in integration stories", swift subscribe=false). pyo3 = no live loop (drains actor buffer + reconnect driver). wasm = ADR-034 constrained. Scheduler/record can only attach where a loop exists; core surface ready for others. Wiring into non-existent loops is impossible not deferred — the live loop itself is separate unbuilt work. Capability matrix correctly has NO heartbeat row (automatic background behavior of subscribe, not a discrete SDK op). 0 overclaim.
+
+**Two §9.9.2 mechanisms, NOT conflated:** (1) MergedStream multi-relay envelope cross-check (A-delivers/B-doesn't, 30s timeout) = PRE-EXISTING; (2) per-relay HeartbeatMonitor liveness gap = this ticket. AC9 test downgrades suppressing relay via heartbeat-driven reliability scoring (REPLACEMENT_THRESHOLD 0.5); record_heartbeat_received docstring explicitly defers per-relay envelope attribution to MergedStream. Honest about which mechanism each test exercises.
+
+**Enforcement:** b3_heartbeat_send_receive_loop_wired uses REAL fn_body_contains call-site checks (not dead string searches) pinning all 6 links (scheduler→send_heartbeat, subscribe→run_heartbeat_scheduler, send_heartbeat→encrypt_and_send+MessageType::Heartbeat, deliver_incoming→DeliverOutcome::Heartbeat, subscribe→record_heartbeat_received). Ratchet 41→42 (additive). No scope creep (all 20 files in-scope; incidental handle_seed_peer_pseudonym extraction + for_profile consolidation justified). Reconnect driver collapses Heartbeat→None correctly (catch-up ≠ live monitoring).
+
+LESSON: when a "feed the dead component" ticket targets a bridge-lifecycle hook, FIRST verify which bridges actually have the hook — do not assume napi/pyo3/uniffi symmetry. Closing on the only-bridge-with-a-live-loop + ready core surface is a legitimate complete close, not partial, when the other bridges' prerequisite (the live subscribe loop) is itself unbuilt separate work. Also: a stale issue PREMISE ("X never instantiated") can be already-fixed upstream — diff origin/main before trusting the ticket's "what exists" section.

@@ -23,7 +23,7 @@
 
 // Production helper modules + domain logic modules. The legacy
 // `manager/<domain>.rs` submodules and `manager/mod.rs` were deleted
-// in ADR-049 commit 12 — every method body that the pipeline-wiring
+// in ADR-049 §15 — every method body that the pipeline-wiring
 // assertions probe now lives in `<domain>_helpers.rs` (forwarder-free),
 // `<domain>_helpers_legacy.rs` during Phase 2A actor migration windows,
 // or in `<domain>_logic.rs` (the free-function logic that used to share
@@ -36,7 +36,7 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/standing_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/tools_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/outlets_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/queries_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),
@@ -45,6 +45,14 @@ const MANAGER_SRC: &str = concat!(
 );
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
+
+// Actor per-context state source — owns the `ContextCryptoState::{seal,open}`
+// steady-state crypto seam. ADR-049 PR-7 (SCP-CRYPTOMOVE-001) moved the seal /
+// open bodies off the `NodeMlsFactory` (deleted) onto the actor-owned
+// `PerContextState` here, so the seal-internal envelope-pipeline assertions scan
+// this source (the moved code), not `PROVIDER_SRC`. This is a repoint to the new
+// home of the same seal/open pipeline, not a weakening.
+const STATE_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/actor/state.rs");
 
 // Supervisor dispatch source — owns `dispatch_lifecycle_direct`, whose
 // bootstrap arms (Create / Import / Restore) moved to the actor-shape
@@ -56,23 +64,37 @@ const PROVIDER_SRC: &str =
 const SUPERVISOR_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
 
-// WASM bridge sources. Bridge has its own consequence-dispatch path and is
-// asserted separately below — scp-runtime and scp-ffi-wasm are two parallel
-// implementations of the same protocol and both must honor the wiring.
-const WASM_MANAGER_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/manager.rs");
-const WASM_CONSEQUENCE_SRC: &str =
-    include_str!("../../../../crates/scp-ffi/wasm/src/consequence.rs");
+// Outlet invocation source — owns the SCP-OUT-046 off-mailbox streaming-saga
+// seal task (`run_streaming_saga_seal_task`). The `ac8_*` structural assertion
+// below pins the ADR-061 "commit once over the bounded root" invariant: the
+// per-chunk pump loop folds each chunk via `StreamCaptureAppend` but issues NO
+// per-chunk two-phase commit — the single `CommitBStreamSettle` fires once at
+// stream-close, outside the loop.
+const OUTLETS_INVOKE_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/outlets/invoke.rs");
 
-// Non-WASM FFI bridge sources. PR #1606 / C4 wired all 3 of these to
-// `ContextManager::invoke_tool_with_economy` so per-invocation pricing,
+// FFI bridge sources. PR #1606 / C4 wired all 3 of these to
+// `ContextManager::invoke_outlet_with_economy` so per-invocation pricing,
 // spending UCAN, velocity tracking, budget enforcement, and the hard
 // rate limit are enforced for Python / Node / Swift / Kotlin clients.
-// The structural assertions in `c4_tool_invoke_economy_*` below pin
+// The structural assertions in `c4_outlet_invoke_economy_*` below pin
 // the bridge → runtime delegation so a future refactor cannot silently
 // regress to the bypass path.
-const PYO3_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/tools.rs");
-const NAPI_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
+const PYO3_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/outlets.rs");
+// §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C7). The PyO3
+// reference bridge for the streaming open + control plane.
+const PYO3_OUTLET_STREAM_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/src/outlet_stream.rs");
+const NAPI_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/outlets.rs");
+// §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C8a). The NAPI
+// bridge for the streaming open + control plane (mirrors the PyO3 reference).
+const NAPI_OUTLET_STREAM_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/napi/src/outlet_stream.rs");
 const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
+// §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C8b). The UniFFI
+// bridge for the streaming open + control plane (mirrors the PyO3 reference).
+const UNIFFI_OUTLET_STREAM_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/uniffi/src/outlet_stream.rs");
 
 // NAPI context bridge — the only bridge with a live relay subscribe loop
 // (`context_subscribe_on`). The `b3_heartbeat_send_receive_loop_wired`
@@ -131,6 +153,24 @@ const RECONNECT_DRIVER_SRC: &str =
 const HANDLERS_MESSAGING_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/messaging.rs");
 
+// Actor broadcast-handler source — owns `handle_subscribe_broadcast`, the
+// actor-turn body that builds a REAL UCAN `ValidationContext` from actor-owned
+// state and passes it (`Some(&mut validation_ctx)`) into
+// `broadcast_helpers::subscribe_broadcast` so a GATED broadcast context runs the
+// full `messages:read` validation pipeline (spec §5.14.4, §07:70). The
+// `gated_broadcast_subscribe_builds_real_validation_context` assertion below
+// pins this so a refactor cannot silently regress the handler back to passing
+// `None` (which made gated subscribe unreachable — every SDK gated-subscribe
+// died at the protocol's missing-UCAN reject before validation ran).
+const HANDLERS_BROADCAST_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/actor/handlers/broadcast.rs");
+
+// ContextActor run-loop source — owns `run()`, `reconcile_timers`,
+// `on_ttl_tick`, `on_governance_timeout` (the ACTOR-OWNED timer arms,
+// ADR-049 Decision-1 / finding A3). Pinned by
+// `actor_owned_timer_arms_reconcile_from_state`.
+const ACTOR_MOD_SRC: &str = include_str!("../../../../crates/scp-runtime/src/context/actor/mod.rs");
+
 // UCAN validation pipeline source — owns `validate_ucan`, the 11-step
 // capability authorization gate. The `ucan_step8_enforces_ceiling_over_all_att`
 // assertion below pins step 8 to checking the FULL parsed attestation set
@@ -148,28 +188,62 @@ const UCAN_VALIDATE_SRC: &str =
 // the diagnostic and the enforcing `validate_ucan` gate silently diverge).
 const PYO3_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs");
 
-// The other three FFI bridges' UCAN sources. Each owns its own `ucan_evaluate`
+// The other two FFI bridges' UCAN sources. Each owns its own `ucan_evaluate`
 // entry point and MUST route to the shared core `evaluate_ucan` pipeline rather
 // than re-implementing capability evaluation locally (which would let the
 // read-only diagnostic and the enforcing `validate_ucan` gate silently diverge).
-// NAPI's body lives in the `ucan_evaluate_on` per-instance helper; WASM's lives
-// in the `run_evaluate_ucan` free function; UniFFI's lives in the
-// `ucan_evaluate` bridge method.
+// NAPI's body lives in the `ucan_evaluate_on` per-instance helper; UniFFI's
+// lives in the `ucan_evaluate` bridge method.
 const NAPI_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/ucan.rs");
-const WASM_UCAN_SRC: &str = include_str!("../../../../crates/scp-ffi/wasm/src/ucan.rs");
+
+// Trust-engine bridge sources for the typed `participation_record` op (§7.3.2).
+// Each native bridge owns its own participation entry point and MUST route to
+// the shared `Supervisor::participation_record` (which itself calls core
+// `compute_participation_record`) rather than re-deriving facts locally — that
+// is the whole point of the typed op: SDKs RECEIVE the facts, never recompute
+// them. PyO3's body lives in `participation_record_impl`, NAPI's in
+// `participation_record_on`, UniFFI's in the `participation_record` bridge
+// method.
+const PYO3_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/src/trust.rs");
+const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/trust.rs");
 
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
 // Raised 46 -> 49 when the `ucan_evaluate` routing assertion was extended from
-// PyO3-only to all four bridges (PyO3 + NAPI + WASM + UniFFI), adding three new
-// per-bridge routing tests.
+// PyO3-only to the bridges, adding per-bridge routing tests.
 // Raised 49 -> 50 when the production saga-journal swap added
 // `prod_supervisor_construction_wires_durable_saga_journal` — pinning that every
 // production seam constructs the durable `ProtocolRepositorySagaJournal` rather
 // than `NoopSagaJournal` — locking that assertion into the ratchet floor.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 50;
+// Lowered 50 -> 41 when the WASM bridge was deleted (ADR-055): the 9 WASM-bridge
+// structural assertions (consequence dispatch, governance trust boundary,
+// C2 economy fail-closed gate, ucan_evaluate routing) lost their subject and
+// were removed. This is a deleted-target cleanup, not a weakening of the
+// remaining native/PyO3/NAPI/UniFFI assertions.
+// Raised 41 -> 44 when the §6.2.4 cross-context outlet-invocation saga export
+// (ADR-049 §3a) was wired through all three native bridges: one per-bridge
+// structural assertion (PyO3 / NAPI / UniFFI) pins each export body to the
+// caller-principal binding, the ADR-056 `context_id_to_bytes` keying chokepoint,
+// AND the `start_cross_context_outlet_invocation_saga` producer. Pure coverage
+// expansion locking the new export wiring into the ratchet floor.
+// Raised 44 -> 48 when the typed `participation_record` op (§7.3.2) added four
+// routing assertions: `Supervisor::participation_record` → core
+// `compute_participation_record`, plus PyO3/NAPI/UniFFI bridge ops → the shared
+// `Supervisor::participation_record` (Phase 2C-1).
+// Raised 48 -> 52 when the ADR-049 Phase 2J joiner handshake wired the two FFI
+// joiner ops through the PyO3 + NAPI bridges: per-bridge structural assertions
+// pin `reserve_key_package` → `Supervisor::reserve_key_package` and
+// `context_join_from_welcome` → `Supervisor::spawn_actor_from_welcome`. Pure
+// coverage expansion locking the joiner-path seams into the ratchet floor.
+// Raised 52 -> 55 (merge with origin/main) when the capability-admission op
+// `check_capability_requirements` (§7.3.4.4, SCP-ACR-008) was wired through all
+// three native bridges: one per-bridge assertion pins each export body to the
+// core `scp_core::trust::check_capability_requirements` call and the production
+// `IdentityDidPublicKeyResolver`. The 2J joiner (+4) and capability-admission
+// (+3) additions are disjoint, so the merged floor is 48 + 4 + 3 = 55.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 57;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -675,14 +749,60 @@ fn parser_preserves_call_order_through_noncode() {
 // Baseline assertions — currently wired, must pass today
 // ===========================================================================
 
-// Manager level: send_message path calls crypto.seal (full envelope pipeline)
-// seal is in build_encrypted_envelope helper called from send_message
+// Manager level: send_message path calls crypto.seal (full envelope pipeline).
+// ADR-049 PR-7: the seal is invoked from the `build_encrypted_envelope_actor`
+// helper (which calls `crypto_state.seal(...)` on the actor-owned
+// `ContextCryptoState`), reached from `send_message`. Repointed from the deleted
+// `build_encrypted_envelope` provider-twin to its actor successor.
 #[test]
 fn send_message_calls_seal() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", ".seal(")
-            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", ".seal("),
+            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope_actor", ".seal("),
         "send_message path must call crypto.seal (envelope pipeline)"
+    );
+}
+
+// §7.3.8 value-caveat runtime enforcement: the reserve phase of the outlet
+// economy pipeline MUST run the synchronous local caveat check
+// (`check_invocation_local`), consume the counter-bearing caps
+// (`consume_caveat_counters`, which calls `try_consume` on the owned Class-S
+// record), and do so through a fail-closed `commit_class_s_keep`-family
+// combinator so a consumed cap can never un-consume across a crash. This is
+// the wiring-coverage assertion for the caveat gate (adds coverage; it does
+// not weaken any existing check).
+#[test]
+fn reserve_outlet_economy_enforces_value_caveats() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "reserve_outlet_economy",
+            "check_invocation_local"
+        ),
+        "reserve_outlet_economy must run the §7.3.8 synchronous local caveat \
+         check (check_invocation_local) before consuming counter capacity"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "reserve_outlet_economy",
+            "consume_caveat_counters"
+        ),
+        "reserve_outlet_economy must consume the counter-bearing §7.3.8 caveats \
+         (consume_caveat_counters)"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "consume_caveat_counters", "try_consume"),
+        "consume_caveat_counters must call CaveatCounters::try_consume"
+    );
+    // The counter consume rides a fail-closed KEEP combinator on BOTH the paid
+    // path (folded into commit_class_s_keep_compensating) and the free path
+    // (dedicated commit_class_s_keep) — a consumed cap must survive a persist
+    // failure rather than un-consume (ADR-049 §9).
+    assert!(
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "commit_class_s_keep"),
+        "reserve_outlet_economy must consume caveat counters through a \
+         commit_class_s_keep-family combinator (KEEP on persist failure)"
     );
 }
 
@@ -750,6 +870,84 @@ fn broadcast_open_key_calls_open_broadcast_key() {
     );
 }
 
+// Gated broadcast subscribe (spec §5.14.4): the actor `handle_subscribe_broadcast`
+// turn MUST build a real UCAN `ValidationContext` from actor-owned state (the
+// production DID/revocation adapters) and pass it (`Some(&mut validation_ctx)`)
+// into `broadcast_helpers::subscribe_broadcast`, which threads it into the
+// protocol's `bc.subscribe(...)` gated arm so `validate_messages_read_ucan` runs
+// the full pipeline on the presented token (spec §07:70). Before this wiring the
+// handler passed `None`, so the protocol rejected every gated subscribe on the
+// missing-UCAN check BEFORE any validation — the capability was unreachable.
+// These assertions pin the real-`ValidationContext` construction + threading so
+// a refactor cannot silently regress to the unvalidated `None` path.
+#[test]
+fn gated_broadcast_subscribe_builds_real_validation_context() {
+    assert!(
+        fn_body_contains(
+            HANDLERS_BROADCAST_SRC,
+            "handle_subscribe_broadcast",
+            "ValidationContext {"
+        ),
+        "handle_subscribe_broadcast must construct a real ValidationContext for \
+         the gated messages:read UCAN (spec §5.14.4), not pass None"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_BROADCAST_SRC,
+            "handle_subscribe_broadcast",
+            "Some(&mut validation_ctx)"
+        ),
+        "handle_subscribe_broadcast must pass Some(&mut validation_ctx) into \
+         subscribe_broadcast so the gated arm can verify the UCAN — passing None \
+         makes gated subscribe unreachable"
+    );
+    assert!(
+        fn_body_contains(
+            HANDLERS_BROADCAST_SRC,
+            "handle_subscribe_broadcast",
+            "KeyResolverDidResolver::new("
+        ),
+        "handle_subscribe_broadcast must wire the production VM-aware DID→key \
+         resolver into the ValidationContext (same adapter as the saga UCAN \
+         re-validation path), not a no-op resolver"
+    );
+    // The helper must THREAD the validation context through to the protocol's
+    // gated `bc.subscribe(...)` arm (MANAGER_SRC concatenates broadcast_helpers).
+    assert!(
+        fn_body_contains(MANAGER_SRC, "subscribe_broadcast", "validation_ctx"),
+        "broadcast_helpers::subscribe_broadcast must thread validation_ctx into \
+         bc.subscribe so the protocol gated arm reaches validate_messages_read_ucan"
+    );
+    // Durable governance-ban admission gate (#2088): subscribe_broadcast MUST
+    // consult the AUTHORITATIVE durable `banned_subscribers` record via
+    // `is_banned`, so a banned DID cannot launder the ban by self-leaving (which
+    // clears `read_exclusion_list`) and replaying a retained grant. This is the
+    // primary fix; pin it so a refactor cannot silently drop the gate.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "subscribe_broadcast", "is_banned("),
+        "broadcast_helpers::subscribe_broadcast must consult the durable ban record \
+         via bc.is_banned(...) at admission (fail-closed)"
+    );
+    // Defense-in-depth: RETAIN the `read_exclusion_list` consult (the SAME set the
+    // serve path checks) for a still-present read-revoked member.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "subscribe_broadcast", "read_exclusion_list"),
+        "broadcast_helpers::subscribe_broadcast must retain the read_exclusion_list \
+         consult as defense-in-depth"
+    );
+    // BLACK-303: the SECOND broadcast-read grant surface — the key-request SERVE
+    // path — must ALSO consult the durable ban, else a banned author (the creator
+    // is always an author) launders the ban by requesting a broadcast key after
+    // self-leaving. Pin `is_banned` in `handle_broadcast_key_request` so the two
+    // read-grant surfaces (subscribe + serve) stay symmetric and no fourth surface
+    // opens.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "handle_broadcast_key_request", "is_banned("),
+        "broadcast_helpers::handle_broadcast_key_request must consult the durable ban \
+         record via bc.is_banned(...) before granting a broadcast key (BLACK-303)"
+    );
+}
+
 // Supervisor level: the lifecycle bootstrap arms spawn a real per-context
 // actor by delegating to the actor-shape `lifecycle_helpers::*` bodies
 // (each of which spawns an owned-state actor via `spawn_actor_with_state`).
@@ -786,6 +984,141 @@ fn dispatch_lifecycle_direct_bootstrap_arms_call_actor_shape_helpers() {
         ),
         "dispatch_lifecycle_direct RestoreContext arm must delegate to the \
          actor-shape lifecycle_helpers::restore_context (spawns the per-context actor)"
+    );
+}
+
+// Bridge level (ADR-049 Phase 2J joiner handshake): the FFI joiner ops reach
+// the Supervisor seam. `reserve_key_package` (step 1) must reach
+// `Supervisor::reserve_key_package` — where the single-use MLS KeyPackage is
+// minted — and `context_join_from_welcome` (step 2) must reach
+// `Supervisor::spawn_actor_from_welcome` — where the Welcome is consumed and
+// the per-context actor is spawned. Pinned across BOTH already-landed bridges
+// (PyO3 + NAPI) so a future refactor cannot silently sever the joiner path
+// from the actor-per-context lifecycle. Additive assertions.
+#[test]
+fn pyo3_reserve_key_package_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(PYO3_CONTEXT_SRC, "reserve_key_package", "supervisor(")
+            && fn_body_contains(
+                PYO3_CONTEXT_SRC,
+                "reserve_key_package",
+                ".reserve_key_package("
+            ),
+        "PyO3 reserve_key_package must resolve the bridge Supervisor and reach \
+         Supervisor::reserve_key_package (mints the single-use MLS KeyPackage)"
+    );
+}
+
+#[test]
+fn pyo3_context_join_from_welcome_reaches_spawn_actor_from_welcome() {
+    assert!(
+        fn_body_contains(
+            PYO3_CONTEXT_SRC,
+            "context_join_from_welcome",
+            "spawn_actor_from_welcome("
+        ),
+        "PyO3 context_join_from_welcome must reach Supervisor::spawn_actor_from_welcome \
+         (consumes the Welcome + spawns the per-context actor)"
+    );
+}
+
+#[test]
+fn napi_reserve_key_package_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "reserve_key_package_on",
+            ".reserve_key_package("
+        ),
+        "NAPI reserve_key_package_on must reach Supervisor::reserve_key_package \
+         (mints the single-use MLS KeyPackage)"
+    );
+}
+
+#[test]
+fn napi_context_join_from_welcome_reaches_spawn_actor_from_welcome() {
+    assert!(
+        fn_body_contains(
+            NAPI_CONTEXT_SRC,
+            "context_join_from_welcome_on",
+            "spawn_actor_from_welcome("
+        ),
+        "NAPI context_join_from_welcome_on must reach Supervisor::spawn_actor_from_welcome \
+         (consumes the Welcome + spawns the per-context actor)"
+    );
+}
+
+// Bridge level (ADR-049 Phase 2J / FFI-02 Option A creator-side invite): the
+// FFI `invite_member` op reaches `Supervisor::invite_member` — where the MLS
+// add is performed and the sealed, signed InvitationBundle (or the deferred
+// governance outcome) is produced. Pinned across BOTH landed bridges (PyO3 +
+// NAPI, mirroring the reserve/join peers above) so a refactor cannot silently
+// sever the creator-side invite path from the Supervisor seam. Additive
+// assertions.
+#[test]
+fn pyo3_invite_member_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(PYO3_CONTEXT_SRC, "invite_member", "supervisor(")
+            && fn_body_contains(PYO3_CONTEXT_SRC, "invite_member", ".invite_member("),
+        "PyO3 invite_member must resolve the bridge Supervisor and reach \
+         Supervisor::invite_member (performs the MLS add + seals the signed \
+         InvitationBundle)"
+    );
+}
+
+#[test]
+fn napi_invite_member_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(NAPI_CONTEXT_SRC, "invite_member_on", ".invite_member("),
+        "NAPI invite_member_on must reach Supervisor::invite_member \
+         (performs the MLS add + seals the signed InvitationBundle)"
+    );
+}
+
+// Bridge level (ADR-049 Phase 2J / FFI-02 Option A): the UniFFI bridge is the
+// THIRD landed bridge for the joiner handshake + creator-side invite. The
+// capability matrix + bridge-aliases declare uniffi=true for
+// `reserve_key_package` / `context_join_from_welcome` / `invite_member`, so the
+// same Supervisor-seam pins that guard the PyO3 + NAPI bodies above MUST also
+// guard the UniFFI bodies — otherwise a refactor could sever the UniFFI joiner
+// / invite path from the actor-per-context lifecycle while the matrix still
+// advertises coverage. `extract_fn_body` excludes the signature, so the
+// `.reserve_key_package(` / `.invite_member(` call — even though the UniFFI
+// bridge method shares its leaf name with the Supervisor method it calls — is
+// the real runtime call (`sup.<method>(`), not a self-satisfying signature
+// mention. Additive assertions mirroring the NAPI peers over UNIFFI_BRIDGE_SRC.
+#[test]
+fn uniffi_reserve_key_package_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "reserve_key_package",
+            ".reserve_key_package("
+        ),
+        "UniFFI reserve_key_package must reach Supervisor::reserve_key_package \
+         (mints the single-use MLS KeyPackage)"
+    );
+}
+
+#[test]
+fn uniffi_context_join_from_welcome_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "context_join_from_welcome",
+            "spawn_actor_from_welcome("
+        ),
+        "UniFFI context_join_from_welcome must reach Supervisor::spawn_actor_from_welcome \
+         (consumes the Welcome + spawns the per-context actor)"
+    );
+}
+
+#[test]
+fn uniffi_invite_member_reaches_supervisor_seam() {
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "invite_member", ".invite_member("),
+        "UniFFI invite_member must reach Supervisor::invite_member \
+         (performs the MLS add + seals the signed InvitationBundle)"
     );
 }
 
@@ -830,60 +1163,218 @@ fn import_context_is_actor_native_not_dashmap_dual_write() {
     // variant were unhandled), so no string assertion is needed for those.
 }
 
-// Timer level: the actor-shape TTL timer helpers install the timer on
-// actor-owned state via `ttl_close_helpers::spawn_ttl_timer` (registry +
-// `FireTimer` mailbox tick), NOT the legacy `spawn_ttl_timer_legacy`
-// DashMap-reading task. ADR-049 Phase 2A finalization (timer → actor
-// registry + mailbox). Additive assertion — pins the actor-shape call so
-// a future refactor cannot regress the timer back to the legacy
-// `&Supervisor` / `contexts` DashMap path.
+// ADR-049 PR-6 (read-authority switch) — the Supervisor-owned Class-M floor
+// registry is the AUTHORITATIVE home for the Class-M sender-key epoch +
+// recv-sequence anti-replay floors; the provider mirrors are deleted. These
+// additive structural assertions pin the fail-closed wiring so a regression
+// cannot silently reintroduce a log-and-drop seam (fail-OPEN) or re-source the
+// durable floors from the deleted provider twins.
 #[test]
-fn ttl_timer_helpers_call_actor_shape_spawn_not_legacy() {
-    assert!(
-        fn_body_contains(MANAGER_SRC, "start_ttl_timer", "spawn_ttl_timer(")
-            && !fn_body_contains(MANAGER_SRC, "start_ttl_timer", "spawn_ttl_timer_legacy("),
-        "ttl_close_helpers::start_ttl_timer must install via the actor-shape \
-         spawn_ttl_timer (registry + FireTimer tick), not spawn_ttl_timer_legacy"
-    );
-    assert!(
-        fn_body_contains(MANAGER_SRC, "reset_ttl_timer", "spawn_ttl_timer(")
-            && !fn_body_contains(MANAGER_SRC, "reset_ttl_timer", "spawn_ttl_timer_legacy("),
-        "ttl_close_helpers::reset_ttl_timer must install via the actor-shape \
-         spawn_ttl_timer (registry + FireTimer tick), not spawn_ttl_timer_legacy"
-    );
-}
-
-// Timer level: the lifecycle bootstrap paths install timers by mailboxing
-// the freshly-spawned actor (`dispatch_start_ttl_timer` /
-// `start_governance_timeout_task` → StartTimeoutTask), NOT by reaching the
-// legacy `spawn_ttl_timer_legacy` / `start_governance_timeout_task_legacy`
-// `&Supervisor` helpers. ADR-049 Phase 2A finalization. Additive.
-#[test]
-fn lifecycle_bootstrap_installs_timers_via_mailbox_not_legacy() {
-    for fn_name in ["finalize_create", "restore_context", "import_context"] {
-        assert!(
-            !fn_body_contains(MANAGER_SRC, fn_name, "spawn_ttl_timer_legacy("),
-            "lifecycle_helpers::{fn_name} must not reach the legacy \
-             spawn_ttl_timer_legacy — install the TTL timer via the actor \
-             mailbox (dispatch_start_ttl_timer)"
-        );
-    }
-    // The non-legacy governance-timeout entry point installs via the
-    // actor mailbox (StartTimeoutTask), not the legacy DashMap-reading
-    // spawn dance.
+fn adr049_pr6_read_authority_switch_is_wired_fail_closed() {
+    // G1 — the receive seam GATES fail-closed on the registry, never
+    // log-and-drops. `decrypt_and_dispatch` must call the registry recv gate and
+    // install remote keys via the unchecked wrapper (gate-before-install), with
+    // no "non-fatal" mirror-forward drop.
     assert!(
         fn_body_contains(
             MANAGER_SRC,
-            "start_governance_timeout_task",
-            "StartTimeoutTask"
-        ) && !fn_body_contains(
-            MANAGER_SRC,
-            "start_governance_timeout_task",
-            "start_governance_timeout_task_legacy("
+            "decrypt_and_dispatch",
+            "check_and_advance_recv_sequence"
         ),
-        "governance_helpers::start_governance_timeout_task must dispatch \
-         StartTimeoutTask to the actor, not delegate to the legacy \
-         start_governance_timeout_task_legacy DashMap spawn dance"
+        "decrypt_and_dispatch must gate the recv floor on the authoritative registry"
+    );
+    // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): the KeyResponse install moved off the
+    // emptied provider (`deps.crypto.set_sender_key_unchecked`, a no-op on a taken
+    // context) onto the actor-owned store (`cs.sender_key_store.set_unchecked`).
+    // Track the moved install token; the gate-before-install property is unchanged.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "sender_key_store")
+            && fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "set_unchecked"),
+        "the remote-epoch seam must install onto the actor sender_key_store via \
+         set_unchecked AFTER gating"
+    );
+    // P1 (white-hat): the remote-epoch seam-2 D1 gate — the registry epoch gate
+    // — must be present AND must precede the key install (gate-BEFORE-install =
+    // fail-safe: a rejected epoch never reaches the sender-key store).
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "decrypt_and_dispatch",
+            "check_and_advance_sender_epoch"
+        ),
+        "decrypt_and_dispatch must gate the remote sender epoch on the registry"
+    );
+    {
+        let body = extract_fn_body(MANAGER_SRC, "decrypt_and_dispatch")
+            .expect("decrypt_and_dispatch body must be extractable");
+        let gate = body
+            .find("check_and_advance_sender_epoch")
+            .expect("seam-2 gate present");
+        // PR-7: the install is now `cs.sender_key_store.set_unchecked` (actor store).
+        let install = body
+            .find("sender_key_store")
+            .expect("seam-2 actor-store install present");
+        assert!(
+            gate < install,
+            "the seam-2 registry epoch gate must PRECEDE the actor sender_key_store \
+             install (gate-before-install)"
+        );
+    }
+    assert!(
+        !fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "non-fatal in PR-4"),
+        "decrypt_and_dispatch must NOT log-and-drop the floor advance (fail-open)"
+    );
+    // The local-rotation mirror-forward gates fail-closed (returns Result, `?`'d
+    // by callers); its body calls the registry gate and does not log-and-drop.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "mirror_forward_local_sender_epoch",
+            "check_and_advance_sender_epoch"
+        ),
+        "mirror_forward_local_sender_epoch must gate the local epoch on the registry"
+    );
+    assert!(
+        !fn_body_contains(
+            MANAGER_SRC,
+            "mirror_forward_local_sender_epoch",
+            "non-fatal"
+        ),
+        "mirror_forward_local_sender_epoch must be fail-closed, not log-and-drop"
+    );
+
+    // G2 — every production `export_crypto_state` caller sources the durable
+    // floors from the authoritative registry (`deps.supervisor.export_*`). The
+    // NEGATIVE (no `deps.crypto.export_*`) is compiler-enforced — the provider
+    // twins are DELETED, so such a call would not compile — so only the POSITIVE
+    // required clause is asserted here (simplifier E: no redundant weaker
+    // re-check of a type-system guarantee).
+    assert!(
+        MANAGER_SRC.contains("deps.supervisor.export_sender_key_epochs")
+            && MANAGER_SRC.contains("deps.supervisor.export_recv_sequence_floors"),
+        "export callers must source floors from the authoritative registry"
+    );
+
+    // restore-into-registry — the restore/import floor guard merges the snapshot
+    // floors INTO the registry sink under ONE cross-axis validating merge
+    // (`deps.supervisor.validate_and_merge_all_floors`). The NEGATIVE (no
+    // `deps.crypto.validate_and_merge`) is compiler-enforced (provider twins
+    // deleted), so only the POSITIVE is asserted.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "restore_crypto_state_with_floor_guard",
+            "validate_and_merge_all_floors"
+        ) && fn_body_contains(
+            MANAGER_SRC,
+            "restore_crypto_state_with_floor_guard",
+            "deps.supervisor"
+        ),
+        "the restore guard must merge blob floors INTO the registry sink"
+    );
+}
+
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) §9.16.2 — the steady-state sender-key ANSWER
+// half moved off the provider onto the actor. These ADDITIVE structural
+// assertions pin the new INBOUND answer wiring so a regression cannot silently
+// route a received PULL request back through the emptied provider (a no-op on a
+// taken context) or drop the enqueued ephemeral-sealed answer before transmit.
+#[test]
+fn adr049_pr7_sender_key_answer_is_actor_native_and_enqueued_for_transmit() {
+    // A1 — `decrypt_and_dispatch` ANSWERS a received §9.16.2 PULL request on the
+    // actor's OWNED crypto state (`cs.handle_sender_key_request`), NOT through the
+    // provider. The answer HPKE-seals to the requester's ephemeral wrapping key,
+    // so it needs no signing key — a clean receive-side answer.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "decrypt_and_dispatch",
+            "handle_sender_key_request"
+        ),
+        "decrypt_and_dispatch must answer a received sender-key PULL request on the \
+         actor's owned crypto state (cs.handle_sender_key_request)"
+    );
+    // A2 — the ephemeral-sealed answer is ENQUEUED onto the actor's
+    // `pending_distributions` for the existing MLS-wrap + transport drain (a blocked
+    // requester returns None → nothing enqueued, §9.16.2 silent drop).
+    assert!(
+        fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", "pending_distributions"),
+        "decrypt_and_dispatch must enqueue the ephemeral-sealed answer onto the \
+         actor's pending_distributions for transmit"
+    );
+    // A3 — the actor answer method (moved off the provider) records its nonce-dedup
+    // replay entry on the Class-C crypto cache (`nonce_dedup.record`), NOT the
+    // Class-S cross-context `xctx_nonce_dedup` (coalesced persist is sound: a
+    // still-fresh replay re-seals the SAME key to the SAME ephemeral pubkey).
+    {
+        let body = extract_fn_body(STATE_SRC, "handle_sender_key_request")
+            .expect("actor ContextCryptoState::handle_sender_key_request body must exist");
+        assert!(
+            body.contains("nonce_dedup.record"),
+            "the actor answer must record its replay nonce on the Class-C crypto \
+             nonce_dedup cache"
+        );
+        assert!(
+            !body.contains("xctx_nonce_dedup"),
+            "the actor answer must NOT touch the Class-S cross-context xctx_nonce_dedup"
+        );
+    }
+}
+
+// Timer level (ADR-049 Decision-1 / finding A3 — APPROVED enforcement
+// retarget): the TTL + governance timers are ACTOR-OWNED arms reconciled
+// from owned state inside the actor's own `run()` loop, NOT
+// supervisor-driven `task_set` spawns that mailbox a `FireTimer` /
+// `EvaluateTimeouts` tick. This assertion REPLACES the two retired
+// assertions (`ttl_timer_helpers_call_actor_shape_spawn_not_legacy`,
+// `lifecycle_bootstrap_installs_timers_via_mailbox_not_legacy`) that pinned
+// the now-superseded supervisor-mailbox timer mechanism. It pins the REAL
+// new mechanism (body-scoped, not a dead string-match) so a refactor cannot
+// silently regress the arms back to a supervisor-spawned timer task.
+#[test]
+fn actor_owned_timer_arms_reconcile_from_state() {
+    // The run loop reconciles the actor-owned timer arms every turn.
+    assert!(
+        fn_body_contains(ACTOR_MOD_SRC, "run", "reconcile_timers"),
+        "ContextActor::run() must call reconcile_timers() to arm the actor-owned timers"
+    );
+    // reconcile_timers derives the TTL arm from the convergent deadline and
+    // arms BOTH owned timer fields (ttl_timer + governance_timeout).
+    assert!(
+        fn_body_contains(ACTOR_MOD_SRC, "reconcile_timers", "deadline_unix_secs")
+            && fn_body_contains(ACTOR_MOD_SRC, "reconcile_timers", "ttl_timer")
+            && fn_body_contains(ACTOR_MOD_SRC, "reconcile_timers", "governance_timeout"),
+        "reconcile_timers must arm ttl_timer/governance_timeout from \
+         state.ttl.timer.deadline_unix_secs"
+    );
+    // The TTL tick runs the actor-shape expiry pipeline directly on owned
+    // state (no FireTimer mailbox hop).
+    assert!(
+        fn_body_contains(ACTOR_MOD_SRC, "on_ttl_tick", "handle_ttl_expiry"),
+        "on_ttl_tick must run ttl_close_helpers::handle_ttl_expiry on owned state"
+    );
+    // The governance tick runs the shared sweep directly on owned state (no
+    // EvaluateTimeouts mailbox hop).
+    assert!(
+        fn_body_contains(
+            ACTOR_MOD_SRC,
+            "on_governance_timeout",
+            "evaluate_governance_timeouts"
+        ),
+        "on_governance_timeout must run handlers::governance::evaluate_governance_timeouts \
+         on owned state"
+    );
+    // No retired supervisor-driven timer residue: the timer helpers no longer
+    // spawn onto a shared `task_set` via `tracked_spawn`, and the supervisor
+    // no longer exposes the `task_set` accessor.
+    assert!(
+        !MANAGER_SRC.contains("tracked_spawn"),
+        "the retired supervisor-driven timer spawn (tracked_spawn) must be gone from the \
+         timer helpers"
+    );
+    assert!(
+        !SUPERVISOR_SRC.contains("task_set_ref"),
+        "the supervisor's timer task_set accessor (task_set_ref) must be retired"
     );
 }
 
@@ -1005,31 +1496,151 @@ fn bridge_resume_path_routes_through_restore_on_startup() {
     }
 }
 
-// Provider level: seal calls create_outer_envelope (envelope construction)
+// First-occurrence binding pin for the seal/open crypto-pipeline gates below.
+//
+// `extract_fn_body` / `extract_fn_signature` bind to the FIRST `fn seal(` /
+// `fn open(` in STATE_SRC. STATE_SRC now defines each name TWICE: the
+// production `ContextCryptoState::seal`/`open` core (whose bodies call
+// `create_outer_envelope` / `encrypt_sender_layer` / `decrypt_sender_layer` /
+// `strip_padding`) AND a `#[cfg(test)]` `PerContextState` delegating wrapper
+// (whose body only forwards to `crypto.seal(...)` / `crypto.open(...)`). The
+// production core is authored first, so first-occurrence binding is correct
+// TODAY — but a future impl-block reorder that placed a wrapper first would
+// silently rebind the gates below to a delegating body. Pin the assumption by a
+// signature token unique to the production core (`aad_sequence` on `seal`; the
+// raw `context_id: &[u8; 32]` digest on `open`), absent from the wrappers, so a
+// reorder fails HERE loudly instead of masking a downstream regression.
+#[test]
+fn state_seal_open_first_binding_is_production_core() {
+    let seal_sig = extract_fn_signature(STATE_SRC, "seal").expect("STATE_SRC defines a `seal`");
+    assert!(
+        seal_sig.contains("aad_sequence"),
+        "the first `fn seal(` in STATE_SRC must be the production \
+         ContextCryptoState core (takes `aad_sequence`), not the #[cfg(test)] \
+         PerContextState delegating wrapper — else the seal gates below rebind \
+         to the wrapper body"
+    );
+    let open_sig = extract_fn_signature(STATE_SRC, "open").expect("STATE_SRC defines an `open`");
+    assert!(
+        open_sig.contains("context_id: &[u8; 32]"),
+        "the first `fn open(` in STATE_SRC must be the production \
+         ContextCryptoState core (takes the raw `context_id` digest), not the \
+         #[cfg(test)] PerContextState delegating wrapper — else the open gates \
+         below rebind to the wrapper body"
+    );
+}
+
+// Actor-state level: `ContextCryptoState::seal` calls create_outer_envelope
+// (envelope construction). Repointed from the deleted provider `seal` to its
+// actor home in `state.rs` (STATE_SRC) — the moved pipeline, not a weakening.
+// First-occurrence binding to the production core is pinned by
+// `state_seal_open_first_binding_is_production_core` above.
 #[test]
 fn seal_calls_create_outer_envelope() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "seal", "create_outer_envelope"),
-        "seal (provider) must call create_outer_envelope"
+        fn_body_contains(STATE_SRC, "seal", "create_outer_envelope"),
+        "seal (actor ContextCryptoState) must call create_outer_envelope"
     );
 }
 
-// Provider level: seal calls encrypt_sender_layer (sender key encryption)
+// Actor-state level: `ContextCryptoState::seal` calls encrypt_sender_layer
+// (sender key encryption). Repointed from the deleted provider `seal`.
 #[test]
 fn seal_calls_encrypt_sender_layer() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "seal", "encrypt_sender_layer"),
-        "seal (provider) must call encrypt_sender_layer"
+        fn_body_contains(STATE_SRC, "seal", "encrypt_sender_layer"),
+        "seal (actor ContextCryptoState) must call encrypt_sender_layer"
     );
 }
 
-// Provider level: open calls decrypt_sender_layer
+// Actor-state level: `ContextCryptoState::open` calls decrypt_sender_layer.
+// Repointed from the deleted provider `open` to its actor home in STATE_SRC.
 #[test]
 fn open_calls_decrypt_sender_layer() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "open", "decrypt_sender_layer"),
-        "open (provider) must call decrypt_sender_layer"
+        fn_body_contains(STATE_SRC, "open", "decrypt_sender_layer"),
+        "open (actor ContextCryptoState) must call decrypt_sender_layer"
     );
+}
+
+// ADR-049 PR-7 (SCP-CRYPTOMOVE-001) + #2148 (birth-into-actor): the steady-state
+// crypto methods were MOVED off `NodeMlsFactory` onto the actor-owned
+// `PerContextState`, and #2148 additionally DELETED the provider's per-context
+// birth/restore/teardown seam — the `contexts` / `taken_context_ids` /
+// `broadcast_keys` maps and every method that read or wrote them. This asserts
+// the provider retains ZERO definitions of any of them: a one-way dissolution
+// (no dual-home), so a future refactor cannot silently re-add a provider-resident
+// twin that would seal/open/birth behind the actor's back (double-owner,
+// divergent sequence, resurrected sender key, #2167-style cross-map TOCTOU).
+//
+// The RETAINED node-level surface — `create_mls_group_with_context` /
+// `install_joined_group` (owned-return birth), `create_bare_group_owned` (test),
+// `build_restored_owned`, `process_incoming_sender_key`, `validate_key_package`,
+// `wrapping_keypair`(`_snapshot`), `make_credential`, `validate_creator_identity`,
+// `local_did`, backends/clock — is deliberately NOT listed (none carry per-context
+// state). The listed names are ONLY genuinely-deleted symbols; the checks below
+// use `fn NAME(`, which does not match `fn create_mls_group_with_context(` or
+// `fn install_joined_group(`. Closed positive list; additive coverage.
+#[test]
+fn provider_steady_state_crypto_methods_are_deleted() {
+    const DELETED_METHODS: &[&str] = &[
+        // Steady-state crypto seam relocated onto the actor (PR-7).
+        "seal",
+        "open",
+        "advance_epoch",
+        "rotate_sender_key",
+        "remove_member",
+        "remove_member_sender_key",
+        "mls_encrypt_management",
+        "local_sender_key_epoch",
+        "export_crypto_state",
+        "restore_crypto_state",
+        "drain_pending_sender_key_messages",
+        // #2148 per-context birth/restore/teardown seam DELETED with the maps.
+        "take_crypto_state",
+        "with_context",
+        "context_crypto_present",
+        "create_mls_group", // bare; `create_mls_group_with_context` survives (no match)
+        "create_group_into_slot",
+        "generate_sender_key",
+        "init_broadcast_key",
+        "destroy_mls_group",
+        "destroy_sender_key",
+        "add_member", // and add_member_from_bytes — member add mutates the actor group
+        "add_member_from_bytes",
+        "distribute_sender_key",
+        "store_member_sender_key",
+        "set_sender_key_unchecked",
+        "handle_sender_key_request",
+        "group_context_extension", // provider reader deleted; actor twin survives (STATE_SRC)
+    ];
+    for method in DELETED_METHODS {
+        let def = format!("fn {method}(");
+        assert!(
+            !PROVIDER_SRC.contains(&def),
+            "NodeMlsFactory must NOT define `{method}` — the per-context crypto \
+             seam is actor-owned (ADR-049 PR-7 + #2148 birth-into-actor); the provider \
+             holds no per-context state and no dual-home twin"
+        );
+    }
+
+    // #2148: the provider holds NO per-context state fields. The three per-context
+    // maps are DELETED — removing them closes the #2167 cross-map TOCTOU by
+    // construction (there is no check-then-insert to race). Match the FIELD
+    // DECLARATION form (`name: Type`) so prose/comment mentions of the retired
+    // names do not false-positive.
+    for field in [
+        "contexts: DashMap",
+        "taken_context_ids: DashSet",
+        "broadcast_keys: DashMap",
+    ] {
+        assert!(
+            !PROVIDER_SRC.contains(field),
+            "NodeMlsFactory must NOT carry the per-context field `{field}` — #2148 \
+             (birth-into-actor) dissolves the provider's per-context state; the actor's \
+             `PerContextState` is the sole per-context crypto home"
+        );
+    }
 }
 
 // --- Envelope layer (§13) — NOW WIRED ---
@@ -1037,7 +1648,7 @@ fn open_calls_decrypt_sender_layer() {
 #[test]
 fn encrypt_path_calls_create_outer_envelope_or_seal() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "seal", "create_outer_envelope")
+        fn_body_contains(STATE_SRC, "seal", "create_outer_envelope")
             || fn_body_contains(MANAGER_SRC, "send_message", "create_outer_envelope"),
         "send/encrypt path must call create_outer_envelope"
     );
@@ -1049,11 +1660,7 @@ fn encrypt_path_calls_create_outer_envelope_or_seal() {
 fn encrypt_path_calls_create_inner_envelope() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", "create_inner_envelope_raw")
-            || fn_body_contains(
-                MANAGER_SRC,
-                "build_encrypted_envelope",
-                "create_inner_envelope_raw"
-            ),
+            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "create_inner_envelope_raw"),
         "send path must call create_inner_envelope_raw"
     );
 }
@@ -1073,7 +1680,7 @@ fn decrypt_path_calls_verify_inner_signature() {
 fn encrypt_path_calls_wrap_content() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", "wrap_content")
-            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", "wrap_content"),
+            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "wrap_content"),
         "send path must call wrap_content"
     );
 }
@@ -1092,7 +1699,7 @@ fn decrypt_path_calls_unwrap_content() {
 #[test]
 fn decrypt_path_calls_strip_padding() {
     assert!(
-        fn_body_contains(PROVIDER_SRC, "open", "strip_padding")
+        fn_body_contains(STATE_SRC, "open", "strip_padding")
             || fn_body_contains(MANAGER_SRC, "deliver_incoming", "strip_padding")
             || fn_body_contains(MANAGER_SRC, "verify_and_unwrap", "strip_padding"),
         "receive/decrypt path must call strip_padding"
@@ -1100,7 +1707,7 @@ fn decrypt_path_calls_strip_padding() {
 }
 
 // --- Provenance (#1536) — WIRED (conditional on cross-context source) ---
-// attach_provenance is called in build_encrypted_envelope when
+// attach_provenance is called in the `build_inner_wire` helper when
 // source_provenance is Some (cross-context data flow). For intra-context
 // direct messages source_provenance is None and attach_provenance is not
 // invoked. The pipeline test verifies the code path exists.
@@ -1109,7 +1716,7 @@ fn decrypt_path_calls_strip_padding() {
 fn encrypt_path_references_attach_provenance() {
     assert!(
         fn_body_contains(MANAGER_SRC, "send_message", "attach_provenance")
-            || fn_body_contains(MANAGER_SRC, "build_encrypted_envelope", "attach_provenance"),
+            || fn_body_contains(MANAGER_SRC, "build_inner_wire", "attach_provenance"),
         "send path must reference attach_provenance"
     );
 }
@@ -1316,73 +1923,73 @@ fn governance_enforces_economic_policy() {
     );
 }
 
-// --- Per-DID anti-spam escalation for tool invocations (§19.7) ---
+// --- Per-DID anti-spam escalation for outlet invocations (§19.7) ---
 
 #[test]
-fn invoke_tool_with_economy_wires_escalation_and_rollback() {
+fn invoke_outlet_with_economy_wires_escalation_and_rollback() {
     // ADR-049 actor split: the Phase-1 economy reserve runs on actor-owned
-    // state in `reserve_tool_economy`. It must (a) record the new velocity
+    // state in `reserve_outlet_economy`. It must (a) record the new velocity
     // entry so compute_escalated_cost sees it, (b) thread the per-context
-    // velocity_tracker and message_pricing into ToolEconomyContext, and the
-    // Phase-3 `rollback_tool_economy` must roll back the velocity entry on
-    // executor failure. The orchestrator `invoke_tool_with_economy` runs the
-    // tool executor between the two phases.
+    // velocity_tracker and message_pricing into OutletEconomyContext, and the
+    // Phase-3 `rollback_outlet_economy` must roll back the velocity entry on
+    // executor failure. The orchestrator `invoke_outlet_with_economy` runs the
+    // outlet executor between the two phases.
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "record_message"),
-        "reserve_tool_economy must record the invocation for velocity tracking"
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "record_message"),
+        "reserve_outlet_economy must record the invocation for velocity tracking"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "velocity_tracker"),
-        "reserve_tool_economy must thread velocity_tracker into ToolEconomyContext"
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "velocity_tracker"),
+        "reserve_outlet_economy must thread velocity_tracker into OutletEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "message_pricing"),
-        "reserve_tool_economy must thread message_pricing into ToolEconomyContext"
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "message_pricing"),
+        "reserve_outlet_economy must thread message_pricing into OutletEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "rollback_tool_economy", ".rollback("),
-        "rollback_tool_economy must roll back the velocity entry on executor failure \
+        fn_body_contains(MANAGER_SRC, "rollback_outlet_economy", ".rollback("),
+        "rollback_outlet_economy must roll back the velocity entry on executor failure \
          via the F5 identity-based `rollback(token)` API"
     );
-    // The orchestrator runs the tool executor between reserve and settle.
+    // The orchestrator runs the outlet executor between reserve and settle.
     assert!(
         fn_body_contains(
             MANAGER_SRC,
-            "invoke_tool_with_economy",
-            "invoke_tool_execute_and_validate"
+            "invoke_outlet_with_economy",
+            "invoke_outlet_execute_and_validate"
         ),
-        "invoke_tool_with_economy must run the executor via invoke_tool_execute_and_validate \
+        "invoke_outlet_with_economy must run the executor via invoke_outlet_execute_and_validate \
          between the reserve (Phase 1) and settle (Phase 3) mailbox round-trips"
     );
 }
 
-/// D4: the Phase-1 reserve (`reserve_tool_economy`) must reference the
+/// D4: the Phase-1 reserve (`reserve_outlet_economy`) must reference the
 /// hard rate limit. Enforced structurally so a future refactor cannot
 /// silently drop the Matrix Synapse–style defense-in-depth cap on the
-/// tool path.
+/// outlet path.
 #[test]
-fn invoke_tool_with_economy_enforces_hard_rate_limit() {
+fn invoke_outlet_with_economy_enforces_hard_rate_limit() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "hard_rate_limit"),
-        "reserve_tool_economy must reference hard_rate_limit so the Matrix Synapse–style \
-         defense-in-depth cap is enforced on the tool path (D4)"
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "hard_rate_limit"),
+        "reserve_outlet_economy must reference hard_rate_limit so the Matrix Synapse–style \
+         defense-in-depth cap is enforced on the outlet path (D4)"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "reserve_tool_economy", "try_consume"),
-        "reserve_tool_economy must call try_consume on the hard rate limit token bucket \
+        fn_body_contains(MANAGER_SRC, "reserve_outlet_economy", "try_consume"),
+        "reserve_outlet_economy must call try_consume on the hard rate limit token bucket \
          before any Phase 1 bookkeeping — mirrors enforce_send_economy at messaging.rs:346"
     );
 }
 
-/// D4: every Phase 1 failure branch in `reserve_tool_economy` MUST refund
+/// D4: every Phase 1 failure branch in `reserve_outlet_economy` MUST refund
 /// the hard rate limit token. We expect at least 3 inline refund sites:
 /// `economy_pre_check` failure, `record_spend` failure, and
-/// `authorize_tool_payment` failure. Dropping any branch leaks a
+/// `authorize_outlet_payment` failure. Dropping any branch leaks a
 /// rate-limit token on failure.
 #[test]
-fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
-    let body = extract_fn_body(MANAGER_SRC, "reserve_tool_economy")
-        .expect("reserve_tool_economy body must exist");
+fn invoke_outlet_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
+    let body = extract_fn_body(MANAGER_SRC, "reserve_outlet_economy")
+        .expect("reserve_outlet_economy body must exist");
     // The hard-rate-limit token is refunded through the field-granular Class-C
     // governance view (`hard_rate_limit_mut().refund(..)`) on every Phase-1
     // failure branch (ADR-049 §9). Match the accessor form so a renamed bucket
@@ -1390,23 +1997,23 @@ fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
     let refund_sites = body.matches("hard_rate_limit_mut().refund").count();
     assert!(
         refund_sites >= 3,
-        "reserve_tool_economy must have at least 3 inline hard_rate_limit_mut().refund sites \
-         (economy_pre_check failure, record_spend failure, authorize_tool_payment failure); \
+        "reserve_outlet_economy must have at least 3 inline hard_rate_limit_mut().refund sites \
+         (economy_pre_check failure, record_spend failure, authorize_outlet_payment failure); \
          found {refund_sites}. Dropping any branch leaks a rate-limit token on failure."
     );
 }
 
 #[test]
-fn invoke_tool_with_economy_releases_lock_before_executor() {
+fn invoke_outlet_with_economy_releases_lock_before_executor() {
     // ADR-049 actor-split invariant (supersedes the legacy lock_context /
     // relock_context generation-guard mechanism, which is gone with the
     // `contexts` DashMap): the caller-supplied non-Send executor must run
     // OUTSIDE the per-context actor — between the Phase-1 economy reserve and
     // the Phase-3 settle. The economy bookkeeping that mutates per-context
-    // state lives entirely in `reserve_tool_economy` / `settle_tool_economy`
+    // state lives entirely in `reserve_outlet_economy` / `settle_outlet_economy`
     // (which run on `&mut PerContextState` inside the actor); the executor
     // never crosses the actor mailbox and never holds per-context state
-    // exclusively. A mis-behaving tool executor blocked every concurrent
+    // exclusively. A mis-behaving outlet executor blocked every concurrent
     // manager call until the original lock-split landed; the actor split
     // preserves the same off-state-executor guarantee.
     //
@@ -1414,21 +2021,21 @@ fn invoke_tool_with_economy_releases_lock_before_executor() {
     //   (1) hands the reserve closure to the helper (Phase 1),
     //   (2) hands the settle closure to the helper (Phase 3), and
     //   (3) runs the executor (Phase 2) between them.
-    let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
-        .expect("invoke_tool_with_economy body must exist");
+    let body = extract_fn_body(MANAGER_SRC, "invoke_outlet_with_economy")
+        .expect("invoke_outlet_with_economy body must exist");
     assert!(
         body.contains("reserve()")
             && body.contains("settle(")
-            && body.contains("invoke_tool_execute_and_validate"),
-        "invoke_tool_with_economy must run the reserve (Phase 1) and settle (Phase 3) \
-         mailbox round-trips around the off-actor executor (Phase 2) so the non-Send tool \
+            && body.contains("invoke_outlet_execute_and_validate"),
+        "invoke_outlet_with_economy must run the reserve (Phase 1) and settle (Phase 3) \
+         mailbox round-trips around the off-actor executor (Phase 2) so the non-Send outlet \
          executor never holds per-context state exclusively"
     );
     // Defense in depth: the settle path must cover BOTH the success
     // (Capture) and failure (Rollback) branches.
     assert!(
         body.contains("Capture") && body.contains("Rollback"),
-        "invoke_tool_with_economy must settle via Capture on executor success and Rollback \
+        "invoke_outlet_with_economy must settle via Capture on executor success and Rollback \
          on executor failure"
     );
 }
@@ -1445,51 +2052,13 @@ fn rotate_content_keys_calls_propose_update() {
 }
 
 // ---------------------------------------------------------------------------
-// WASM bridge: consequence dispatch wiring
-//
-// The WASM bridge (scp-ffi-wasm) is a parallel implementation of consequence
-// rule enforcement to the scp-runtime path. Both must dispatch consequences at
-// every mutation site the plan identifies so rate- and participation-based
-// rules fire on either bridge. These assertions catch the wiring regression
-// (observed historically as "consequence rules declared but never enforced in
-// WASM") by structurally verifying the dispatch call sites on the WASM manager
-// and the delegation from the dispatcher to the shared scp-protocol evaluator.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn wasm_send_message_dispatches_consequences() {
-    assert!(
-        fn_body_contains(
-            WASM_MANAGER_SRC,
-            "send_message",
-            "dispatch_consequences_for_subject",
-        ),
-        "WASM send_message body must call dispatch_consequences_for_subject \
-         after appending MessageSent so rate-based rules fire on the sender"
-    );
-}
-
-#[test]
-fn wasm_execute_governance_action_dispatches_consequences() {
-    let body = extract_fn_body(WASM_MANAGER_SRC, "execute_governance_action")
-        .expect("WASM execute_governance_action body must exist");
-    let call_count = body.matches("dispatch_consequences_for_subject").count();
-    assert!(
-        call_count >= 2,
-        "WASM execute_governance_action must call dispatch_consequences_for_subject \
-         at least twice (once for the executor DID, once for the action's target \
-         DID); found {call_count}"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Direct-execute governance trust boundary (quorum-bypass fix)
 //
 // `execute_governance_action` must dispatch the action the *engine* tracked for
 // a proposal id — never a caller-supplied proposal/action/status. These
 // positive (closed-by-construction) assertions pin the trust boundary at the
-// AST level on BOTH the native runtime and the WASM bridge so a future refactor
-// cannot reintroduce the bypass by re-accepting caller-trusted governance data.
+// AST level on the native runtime so a future refactor cannot reintroduce the
+// bypass by re-accepting caller-trusted governance data.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1537,128 +2106,14 @@ fn native_execute_governance_action_resolves_proposal_by_id_from_engine() {
     );
 }
 
-#[test]
-fn wasm_execute_governance_action_resolves_action_from_tracked_proposal() {
-    // The WASM bridge entry (`context_execute_governance`) takes no caller
-    // action and no caller identity/subject: the public `#[wasm_bindgen]`
-    // surface carries ONLY (handle, proposal_id_hex). No `action_json` parameter
-    // exists for a caller to populate (action substitution is structurally
-    // impossible), and no `identity_did` parameter exists for a caller to supply
-    // a consequence subject / executor — both are resolved from the tracked
-    // proposal's proposer inside the manager.
-    let wasm_ctx_src: &str = include_str!("../../../../crates/scp-ffi/wasm/src/context.rs");
-    let entry_sig = extract_fn_signature(wasm_ctx_src, "context_execute_governance")
-        .expect("WASM context_execute_governance signature must exist");
-    assert!(
-        !entry_sig.contains("action_json"),
-        "WASM context_execute_governance must NOT take an action_json parameter — \
-         a caller cannot supply an action to substitute; signature was: {entry_sig}"
-    );
-    assert!(
-        !entry_sig.contains("identity_did"),
-        "WASM context_execute_governance must NOT take an identity_did parameter — \
-         the executor and consequence subject are resolved from the tracked \
-         proposal's proposer, never a caller-supplied DID; signature was: {entry_sig}"
-    );
-    assert!(
-        entry_sig.contains("proposal_id_hex"),
-        "WASM context_execute_governance must take the tracked proposal id \
-         (proposal_id_hex); signature was: {entry_sig}"
-    );
-
-    // The WASM manager resolves BOTH the convergent timestamp AND the action to
-    // dispatch from the manager's own tracked proposal state
-    // (pending_proposals / resolved_proposals) — never a caller action.
-    let body = extract_fn_body(WASM_MANAGER_SRC, "execute_governance_action")
-        .expect("WASM execute_governance_action body must exist");
-    assert!(
-        body.contains("pending_proposals") && body.contains("resolved_proposals"),
-        "WASM execute_governance_action must resolve the action from its own \
-         tracked proposal state (pending_proposals / resolved_proposals)"
-    );
-    assert!(
-        body.contains("tracked_action") || body.contains("tracked.action"),
-        "WASM execute_governance_action must dispatch the TRACKED proposal's \
-         action, not a caller-supplied one"
-    );
-    let mgr_sig = extract_fn_signature(WASM_MANAGER_SRC, "execute_governance_action")
-        .expect("WASM manager execute_governance_action signature must exist");
-    assert!(
-        !mgr_sig.contains("action: &GovernanceAction"),
-        "WASM manager execute_governance_action must NOT accept a caller-supplied \
-         action: &GovernanceAction; signature was: {mgr_sig}"
-    );
-}
-
-#[test]
-fn wasm_dispatch_consequences_calls_evaluate_consequence_rules() {
-    assert!(
-        fn_body_contains(
-            WASM_CONSEQUENCE_SRC,
-            "dispatch_consequences_for_subject",
-            "evaluate_consequence_rules",
-        ),
-        "WASM dispatch_consequences_for_subject must delegate to the shared \
-         scp-protocol evaluate_consequence_rules function so rule-matching \
-         logic stays consistent between bridges"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// C2 — WASM economy fail-closed gate (PR #1606 follow-up)
+// C4 (#1606) — Bridge outlet-invoke economy wiring
 //
-// The WASM bridge cannot run scp-runtime's `enforce_economy` pipeline (no
-// payment adapter, no budget tracker, no velocity tracker, no hard rate
-// limit token bucket — see ADR-034). Without a fail-closed gate, paid
-// contexts would silently bypass economic enforcement on every send / join.
-//
-// These assertions verify the gate exists at the AST level so a future
-// refactor cannot silently delete the spending_ucan_jwt parameter wiring
-// or the economic_policy inspection branch.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
-    let body = extract_fn_body(WASM_MANAGER_SRC, "send_message")
-        .expect("WASM send_message body must exist");
-
-    // The parameter must NOT be underscore-prefixed: that name silently
-    // discards the JWT and was the original C2 bug. The C2 fix renames
-    // it to `spending_ucan_jwt` and references it in the rejection
-    // branch so the parameter is no longer dropped.
-    assert!(
-        body.contains("spending_ucan_jwt"),
-        "WASM send_message body must reference `spending_ucan_jwt` so the \
-         parameter is no longer silently discarded (C2 fail-closed gate)"
-    );
-
-    // The body must inspect the context's economic_policy to drive the
-    // fail-closed rejection branch.
-    assert!(
-        body.contains("economic_policy"),
-        "WASM send_message body must reference `economic_policy` to drive \
-         the fail-closed rejection (C2 — paid policies cannot be enforced \
-         on the WASM bridge per ADR-034)"
-    );
-
-    // The reject branch must surface the SCP-ECON-12096 code so the SDK
-    // layer can convert it to a typed `WasmCannotValidateSpendingUcan`
-    // error.
-    assert!(
-        body.contains("SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN")
-            || body.contains("SCP-ECON-12096"),
-        "WASM send_message must emit SCP-ECON-12096 in the C2 rejection branch"
-    );
-}
-
-// C4 (#1606) — Bridge tool-invoke economy wiring
-//
-// All 3 non-WASM FFI bridges (PyO3, NAPI, UniFFI) MUST route tool
-// invocation through `ContextManager::invoke_tool_with_economy`. The
+// All 3 FFI bridges (PyO3, NAPI, UniFFI) MUST route outlet
+// invocation through `ContextManager::invoke_outlet_with_economy`. The
 // previous bypass path called `try_consume_hard_rate_limit_*` directly
-// against the bridge-owned tool registry, which disabled per-invocation
+// against the bridge-owned outlet registry, which disabled per-invocation
 // pricing, spending UCAN AND-composition, velocity tracking, budget
-// enforcement, and the `ToolEconomyTicket` lifecycle for Python /
+// enforcement, and the `OutletEconomyTicket` lifecycle for Python /
 // Node / Swift / Kotlin clients.
 //
 // These structural assertions catch any future regression to the
@@ -1668,20 +2123,20 @@ fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
 // ---------------------------------------------------------------------------
 
 // Phase 4 PR 4 (#1549 façade deletion) renamed the PyO3 free function
-// `py_tool_invoke` → `#[pymethods] impl PyScp { pub fn tool_invoke(&self, ...) }`
-// delegating to the private `tool_invoke_impl` free function that
-// carries the real wiring. The assertion targets `tool_invoke_impl` —
+// `py_outlet_invoke` → `#[pymethods] impl PyScp { pub fn outlet_invoke(&self, ...) }`
+// delegating to the private `outlet_invoke_impl` free function that
+// carries the real wiring. The assertion targets `outlet_invoke_impl` —
 // the implementation body — so a refactor cannot silently regress to a
 // bypass path even if the public method signature is preserved.
 #[test]
-fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
+fn c4_pyo3_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     assert!(
         fn_body_contains(
-            PYO3_TOOLS_SRC,
-            "tool_invoke_impl",
-            "invoke_tool_with_economy"
+            PYO3_OUTLETS_SRC,
+            "outlet_invoke_impl",
+            "invoke_outlet_with_economy"
         ),
-        "PyO3 tool_invoke_impl must call ContextManager::invoke_tool_with_economy \
+        "PyO3 outlet_invoke_impl must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). Calling try_consume_hard_rate_limit_blocking against \
          a bridge-owned registry instead disables per-invocation pricing, \
          spending UCAN, velocity tracking, and budget enforcement for Python \
@@ -1690,165 +2145,297 @@ fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
 }
 
 #[test]
-fn c4_pyo3_tool_invoke_accepts_spending_ucan() {
+fn c4_pyo3_outlet_invoke_accepts_spending_ucan() {
     // The bridge MUST accept the spending UCAN parameter — the
-    // runtime's `invoke_tool_with_economy` requires it for §19.5
+    // runtime's `invoke_outlet_with_economy` requires it for §19.5
     // AND-composition on paid actions.
-    let body = extract_fn_body(PYO3_TOOLS_SRC, "tool_invoke_impl")
-        .expect("tool_invoke_impl body must exist");
+    let body = extract_fn_body(PYO3_OUTLETS_SRC, "outlet_invoke_impl")
+        .expect("outlet_invoke_impl body must exist");
     assert!(
         body.contains("spending_ucan"),
-        "PyO3 tool_invoke_impl must accept and forward a spending UCAN argument \
-         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+        "PyO3 outlet_invoke_impl must accept and forward a spending UCAN argument \
+         (PR #1606 / C4). Without it, paid outlet invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "PyO3 tool_invoke_impl must parse the spending UCAN JWT into a UcanToken \
-         before passing it to invoke_tool_with_economy."
+        "PyO3 outlet_invoke_impl must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_outlet_with_economy."
+    );
+}
+
+// §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C7). The PyO3
+// reference bridge's streaming open MUST (a) validate the invocation UCAN at
+// the bridge (the §5.4.5 "UCAN check locus" — validated exactly ONCE at open)
+// and (b) drive the runtime pump via `Supervisor::open_outlet_stream`. A
+// refactor that skipped either would disable authorization or leave the
+// producer unwired for Python streaming clients.
+#[test]
+fn c7_pyo3_outlet_stream_open_validates_ucan_and_reaches_open_outlet_stream() {
+    let body = extract_fn_body(PYO3_OUTLET_STREAM_SRC, "outlet_stream_open_impl")
+        .expect("outlet_stream_open_impl body must exist");
+    assert!(
+        body.contains("validate_outlet_ucan"),
+        "PyO3 streaming open must validate the invocation UCAN at the bridge \
+         (§5.4.5 UCAN check locus) before opening the stream."
+    );
+    assert!(
+        body.contains("open_outlet_stream"),
+        "PyO3 streaming open must reach Supervisor::open_outlet_stream — the \
+         runtime reserve → off-mailbox pump → settle orchestrator. Without it the \
+         §5.4.5 producer is unwired for Python streaming clients."
+    );
+}
+
+// The streaming cancel MUST use the runtime-derived cursor: the bridge NEVER
+// supplies a `next_seq` (a caller-supplied cursor forges `cancel_ack_seq` to
+// zero-out or over-bill delivered chunks — §5.4.5 CRITICAL #3). The bridge
+// cancel routes through `apply_outlet_cancel_signed`, which reads the live
+// emission cursor and signs internally.
+#[test]
+fn c7_pyo3_outlet_stream_cancel_uses_runtime_derived_cursor() {
+    let body = extract_fn_body(PYO3_OUTLET_STREAM_SRC, "outlet_stream_cancel_impl")
+        .expect("outlet_stream_cancel_impl body must exist");
+    assert!(
+        body.contains("apply_outlet_cancel_signed"),
+        "PyO3 streaming cancel must route through apply_outlet_cancel_signed \
+         (the runtime signs over its OWN live cursor — §5.4.5 CRITICAL #3). A \
+         caller-supplied next_seq would forge cancel_ack_seq."
+    );
+    assert!(
+        !body.contains("next_seq"),
+        "PyO3 streaming cancel must NOT construct or pass a next_seq — the cursor \
+         is runtime-derived (§5.4.5 CRITICAL #3)."
+    );
+}
+
+// §5.4.5 / §6.2.4 cross-context streaming saga (SCP-OUT-047 pass 1). The PyO3
+// reference bridge's streaming-saga OPEN MUST (a) run the §6.2.4 caller-principal
+// binding (`enforce_caller_principal_binding`) BEFORE anything irreversible — so
+// the saga never observes an unauthenticated caller and no receiver is handed out
+// on a mismatch — and (b) drive the runtime producer
+// `start_cross_context_streaming_outlet_invocation_saga`. Its RECOVER export MUST
+// reach the key-bearing truncated-close driver.
+//
+// This is the PyO3-reference assertion and is ENFORCED (not ignored — this file
+// forbids stale `#[ignore]`s): the PyO3 impl exists as of SCP-OUT-047 pass 1, so
+// the gate is live from day one. Pass 3 ADDS the sibling NAPI/UniFFI assertions
+// (mirroring the C7/C8 same-context streaming pattern above) when those bridges
+// gain the operation.
+#[test]
+fn out047_pyo3_streaming_saga_open_binds_caller_and_reaches_start_saga() {
+    let body = extract_fn_body(PYO3_OUTLET_STREAM_SRC, "outlet_streaming_saga_open_impl")
+        .expect("outlet_streaming_saga_open_impl body must exist");
+    assert!(
+        body.contains("enforce_caller_principal_binding"),
+        "PyO3 streaming-saga open must run the §6.2.4 caller-principal binding \
+         BEFORE the saga runs — else an unauthenticated caller could open a \
+         cross-context stream (ADR-049 §3a channel-auth)."
+    );
+    assert!(
+        body.contains("start_cross_context_streaming_outlet_invocation_saga"),
+        "PyO3 streaming-saga open must reach \
+         Supervisor::start_cross_context_streaming_outlet_invocation_saga — the \
+         runtime producer that returns the receiver at the Commit-transition. \
+         Without it the §5.4.5 cross-context streaming producer is unwired."
+    );
+}
+
+// SCP-OUT-047 pass 1: the PyO3 recover export MUST reach the key-bearing
+// truncated-close recovery driver (which reaches
+// `Supervisor::recover_streaming_saga_truncated_close`) and MUST authenticate the
+// reconnect caller. ENFORCED (PyO3 impl exists); pass 3 adds the sibling
+// assertions.
+#[test]
+fn out047_pyo3_streaming_saga_recover_reaches_truncated_close() {
+    let body = extract_fn_body(
+        PYO3_OUTLET_STREAM_SRC,
+        "outlet_streaming_saga_recover_truncated_close_impl",
+    )
+    .expect("outlet_streaming_saga_recover_truncated_close_impl body must exist");
+    assert!(
+        body.contains("drive_recover_truncated_close"),
+        "PyO3 streaming-saga recover must reach the shared \
+         drive_recover_truncated_close driver (which reaches \
+         Supervisor::recover_streaming_saga_truncated_close) — the key-bearing \
+         crash-recovery seal (SCP-OUT-046 #136 AC7)."
+    );
+    assert!(
+        body.contains("identity_registry_contains"),
+        "PyO3 streaming-saga recover must AUTHENTICATE the reconnect caller \
+         (identity-registry check) before sealing — the caller MUST be the \
+         channel-authenticated principal (§6.2.4)."
+    );
+    assert!(
+        body.contains("resolve_context_signing_key"),
+        "PyO3 streaming-saga recover must SURFACE the target context's Active \
+         Signing Key per-call from custody (resolve_context_signing_key) before \
+         sealing — the recovery receipt is signed with a custody-resolved key, \
+         NEVER an envelope-asserted one (§6.2.4). Structurally pins the \
+         FFI-layer key-surfacing, not just the runtime seal."
+    );
+}
+
+// §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C8a). The NAPI
+// bridge's streaming open MUST (a) validate the invocation UCAN at the bridge
+// (the §5.4.5 "UCAN check locus" — validated exactly ONCE at open) and (b)
+// drive the runtime pump via `Supervisor::open_outlet_stream`. A refactor that
+// skipped either would disable authorization or leave the producer unwired for
+// Node/Bun streaming clients. Mirrors the PyO3 C7 assertion.
+#[test]
+fn c8_napi_outlet_stream_open_validates_ucan_and_reaches_open_outlet_stream() {
+    let body = extract_fn_body(NAPI_OUTLET_STREAM_SRC, "outlet_stream_open_on")
+        .expect("outlet_stream_open_on body must exist");
+    assert!(
+        body.contains("validate_ucan_for_outlet"),
+        "NAPI streaming open must validate the invocation UCAN at the bridge \
+         (§5.4.5 UCAN check locus) before opening the stream."
+    );
+    assert!(
+        body.contains("open_outlet_stream"),
+        "NAPI streaming open must reach Supervisor::open_outlet_stream — the \
+         runtime reserve → off-mailbox pump → settle orchestrator. Without it the \
+         §5.4.5 producer is unwired for Node/Bun streaming clients."
+    );
+}
+
+// The NAPI streaming cancel MUST use the runtime-derived cursor: the bridge
+// NEVER supplies a `next_seq` (a caller-supplied cursor forges `cancel_ack_seq`
+// to zero-out or over-bill delivered chunks — §5.4.5 CRITICAL #3). It routes
+// through `apply_outlet_cancel_signed`, which reads the live emission cursor and
+// signs internally. Mirrors the PyO3 C7 assertion.
+#[test]
+fn c8_napi_outlet_stream_cancel_uses_runtime_derived_cursor() {
+    let body = extract_fn_body(NAPI_OUTLET_STREAM_SRC, "outlet_stream_cancel_on")
+        .expect("outlet_stream_cancel_on body must exist");
+    assert!(
+        body.contains("apply_outlet_cancel_signed"),
+        "NAPI streaming cancel must route through apply_outlet_cancel_signed \
+         (the runtime signs over its OWN live cursor — §5.4.5 CRITICAL #3). A \
+         caller-supplied next_seq would forge cancel_ack_seq."
+    );
+    assert!(
+        !body.contains("next_seq"),
+        "NAPI streaming cancel must NOT construct or pass a next_seq — the cursor \
+         is runtime-derived (§5.4.5 CRITICAL #3)."
+    );
+}
+
+// §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C8b). The UniFFI
+// bridge's streaming open MUST (a) validate the invocation UCAN at the bridge
+// (the §5.4.5 "UCAN check locus" — validated exactly ONCE at open) and (b) drive
+// the runtime pump via `Supervisor::open_outlet_stream`. A refactor that skipped
+// either would disable authorization or leave the producer unwired for
+// Swift/Kotlin streaming clients. Mirrors the PyO3 C7 / NAPI C8a assertion.
+#[test]
+fn c8b_uniffi_outlet_stream_open_validates_ucan_and_reaches_open_outlet_stream() {
+    let body = extract_fn_body(UNIFFI_OUTLET_STREAM_SRC, "outlet_stream_open_impl")
+        .expect("outlet_stream_open_impl body must exist");
+    assert!(
+        body.contains("validate_outlet_ucan_uniffi"),
+        "UniFFI streaming open must validate the invocation UCAN at the bridge \
+         (§5.4.5 UCAN check locus) before opening the stream."
+    );
+    assert!(
+        body.contains("open_outlet_stream"),
+        "UniFFI streaming open must reach Supervisor::open_outlet_stream — the \
+         runtime reserve → off-mailbox pump → settle orchestrator. Without it the \
+         §5.4.5 producer is unwired for Swift/Kotlin streaming clients."
+    );
+}
+
+// The UniFFI streaming cancel MUST use the runtime-derived cursor: the bridge
+// NEVER supplies a `next_seq` (a caller-supplied cursor forges `cancel_ack_seq`
+// to zero-out or over-bill delivered chunks — §5.4.5 CRITICAL #3). It routes
+// through `apply_outlet_cancel_signed`, which reads the live emission cursor and
+// signs internally. Mirrors the PyO3 C7 / NAPI C8a assertion.
+#[test]
+fn c8b_uniffi_outlet_stream_cancel_uses_runtime_derived_cursor() {
+    let body = extract_fn_body(UNIFFI_OUTLET_STREAM_SRC, "outlet_stream_cancel_impl")
+        .expect("outlet_stream_cancel_impl body must exist");
+    assert!(
+        body.contains("apply_outlet_cancel_signed"),
+        "UniFFI streaming cancel must route through apply_outlet_cancel_signed \
+         (the runtime signs over its OWN live cursor — §5.4.5 CRITICAL #3). A \
+         caller-supplied next_seq would forge cancel_ack_seq."
+    );
+    assert!(
+        !body.contains("next_seq"),
+        "UniFFI streaming cancel must NOT construct or pass a next_seq — the cursor \
+         is runtime-derived (§5.4.5 CRITICAL #3)."
     );
 }
 
 // Phase 4 PR 4 moved the NAPI free-function export into
-// `impl Scp { pub async fn tool_invoke(&self, ...) }` that delegates to
-// `tool_invoke_on` in `tools.rs`. The wiring (spending_ucan_jwt parse +
-// `invoke_tool_with_economy` call) lives on the `tool_invoke_on` helper,
+// `impl Scp { pub async fn outlet_invoke(&self, ...) }` that delegates to
+// `outlet_invoke_on` in `outlets.rs`. The wiring (spending_ucan_jwt parse +
+// `invoke_outlet_with_economy` call) lives on the `outlet_invoke_on` helper,
 // so that is the function we assert against.
 #[test]
-fn c4_napi_tool_invoke_routes_through_invoke_tool_with_economy() {
+fn c4_napi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     assert!(
-        fn_body_contains(NAPI_TOOLS_SRC, "tool_invoke_on", "invoke_tool_with_economy"),
-        "NAPI tool_invoke_on must call ContextManager::invoke_tool_with_economy \
+        fn_body_contains(
+            NAPI_OUTLETS_SRC,
+            "outlet_invoke_on",
+            "invoke_outlet_with_economy"
+        ),
+        "NAPI outlet_invoke_on must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
-         try_consume_hard_rate_limit against the bridge-owned tool registry, \
+         try_consume_hard_rate_limit against the bridge-owned outlet registry, \
          disabling per-invocation pricing, spending UCAN, velocity tracking, \
          and budget enforcement for Node clients."
     );
 }
 
 #[test]
-fn c4_napi_tool_invoke_accepts_spending_ucan() {
-    let body = extract_fn_body(NAPI_TOOLS_SRC, "tool_invoke_on")
-        .expect("NAPI tool_invoke_on body must exist");
+fn c4_napi_outlet_invoke_accepts_spending_ucan() {
+    let body = extract_fn_body(NAPI_OUTLETS_SRC, "outlet_invoke_on")
+        .expect("NAPI outlet_invoke_on body must exist");
     assert!(
         body.contains("spending_ucan_jwt"),
-        "NAPI tool_invoke_on must accept and forward a spending_ucan_jwt argument \
-         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+        "NAPI outlet_invoke_on must accept and forward a spending_ucan_jwt argument \
+         (PR #1606 / C4). Without it, paid outlet invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "NAPI tool_invoke_on must parse the spending UCAN JWT into a UcanToken \
-         before passing it to invoke_tool_with_economy."
-    );
-}
-
-// The C2 fail-closed economy gate (reject paid-context joins the WASM bridge
-// cannot cryptographically validate, ADR-034) is centralized in the shared
-// `join_context_membership_only` helper, which BOTH `join_context` (unencrypted)
-// and `join_context_encrypted` call before committing membership. Asserting
-// against the helper enforces the gate on both join paths through a single
-// chokepoint — strictly stronger than the prior per-`join_context` check.
-#[test]
-fn wasm_join_context_inspects_spending_ucan_and_economic_policy() {
-    let body = extract_fn_body(WASM_MANAGER_SRC, "join_context_membership_only")
-        .expect("WASM join_context_membership_only body must exist");
-
-    assert!(
-        body.contains("spending_ucan_jwt"),
-        "WASM join_context_membership_only body must reference `spending_ucan_jwt` so the \
-         parameter is no longer silently discarded (C2 fail-closed gate)"
-    );
-
-    assert!(
-        body.contains("economic_policy"),
-        "WASM join_context_membership_only body must reference `economic_policy` to drive \
-         the fail-closed rejection (C2 — paid policies cannot be enforced \
-         on the WASM bridge per ADR-034)"
-    );
-
-    assert!(
-        body.contains("SCP_ECON_WASM_CANNOT_VALIDATE_SPENDING_UCAN")
-            || body.contains("SCP-ECON-12096"),
-        "WASM join_context_membership_only must emit SCP-ECON-12096 in the C2 rejection branch"
+        "NAPI outlet_invoke_on must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_outlet_with_economy."
     );
 }
 
 #[test]
-fn wasm_create_context_rejects_paid_economic_policy() {
-    let body = extract_fn_body(WASM_MANAGER_SRC, "create_context")
-        .expect("WASM create_context body must exist");
-
-    // The gate is implemented via the `stored_policy_requires_payment`
-    // helper so the gate logic can be unit-tested independently. The
-    // create-time gate ALSO references `economic_policy` (because that
-    // is the field whose paid-ness is being checked) and surfaces the
-    // SCP-ECON-12095 code in the rejection.
-    assert!(
-        body.contains("stored_policy_requires_payment"),
-        "WASM create_context must call `stored_policy_requires_payment` to \
-         drive the C2 fail-closed rejection of paid economic policies"
-    );
-
-    assert!(
-        body.contains("SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM")
-            || body.contains("SCP-ECON-12095"),
-        "WASM create_context must emit SCP-ECON-12095 in the C2 rejection branch"
-    );
-}
-
-#[test]
-fn wasm_set_economic_policy_governance_rejects_paid_policy() {
-    // The C2 gate also fires through governance dispatch so a paid
-    // policy cannot enter WASM state via the back door. The dispatch
-    // path was extracted to `dispatch_set_economic_policy` to keep the
-    // parent match arm under `clippy::too_many_lines`.
-    let body = extract_fn_body(WASM_MANAGER_SRC, "dispatch_set_economic_policy")
-        .expect("WASM dispatch_set_economic_policy body must exist");
-
-    assert!(
-        body.contains("policy_requires_payment"),
-        "WASM dispatch_set_economic_policy must call `policy_requires_payment` \
-         to drive the C2 fail-closed rejection of paid economic policies via \
-         governance"
-    );
-
-    assert!(
-        body.contains("SCP_ECON_PAID_POLICY_UNSUPPORTED_ON_WASM")
-            || body.contains("SCP-ECON-12095"),
-        "WASM dispatch_set_economic_policy must emit SCP-ECON-12095 in the \
-         C2 rejection branch"
-    );
-}
-
-#[test]
-fn c4_uniffi_tool_invoke_routes_through_invoke_tool_with_economy() {
+fn c4_uniffi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     // `extract_fn_body` returns the first match, which is the
-    // top-level `tool_invoke` (not `tool_invoke_cross_context`).
+    // top-level `outlet_invoke` (not `outlet_invoke_cross_context`).
     assert!(
-        fn_body_contains(UNIFFI_BRIDGE_SRC, "tool_invoke", "invoke_tool_with_economy"),
-        "UniFFI tool_invoke must call ContextManager::invoke_tool_with_economy \
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "outlet_invoke",
+            "invoke_outlet_with_economy"
+        ),
+        "UniFFI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
-         try_consume_hard_rate_limit against the bridge-owned tool registry, \
+         try_consume_hard_rate_limit against the bridge-owned outlet registry, \
          disabling per-invocation pricing, spending UCAN, velocity tracking, \
          and budget enforcement for Swift / Kotlin clients."
     );
 }
 
 #[test]
-fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
-    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "tool_invoke")
-        .expect("UniFFI tool_invoke body must exist");
+fn c4_uniffi_outlet_invoke_accepts_spending_ucan() {
+    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "outlet_invoke")
+        .expect("UniFFI outlet_invoke body must exist");
     assert!(
         body.contains("spending_ucan_jwt"),
-        "UniFFI tool_invoke must accept and forward a spending_ucan_jwt argument \
-         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+        "UniFFI outlet_invoke must accept and forward a spending_ucan_jwt argument \
+         (PR #1606 / C4). Without it, paid outlet invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "UniFFI tool_invoke must parse the spending UCAN JWT into a UcanToken \
-         before passing it to invoke_tool_with_economy."
+        "UniFFI outlet_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_outlet_with_economy."
     );
 }
 
@@ -2240,7 +2827,7 @@ fn b3_webhook_dispatch_wired() {
          consumer can subscribe (otherwise no events are dispatched)"
     );
 
-    // Every non-WASM bridge (PyO3 reference, NAPI, UniFFI) must independently
+    // Every bridge (PyO3 reference, NAPI, UniFFI) must independently
     // (a) enable the Supervisor event channel at supervisor construction and
     // (b) wire the consumer into the dispatcher at node startup. The original
     // wiring was first fixed only on PyO3; NAPI/UniFFI had structurally
@@ -2321,9 +2908,6 @@ fn b3_webhook_dispatch_wired() {
 /// that feeds `mls_storage` — NOT the bare `with_providers` (which hardcodes
 /// `NoopSagaJournal`). Without this, a process restart loads no journal and the
 /// §17.16.4 crash-recovery replay can never reconcile a crash-orphaned saga.
-///
-/// WASM is N/A: ADR-034 forbids the tokio-backed `Supervisor` in the wasm32
-/// bridge, so there is no `with_providers*` call to wire (no cell to fill).
 ///
 /// This is a source-text presence gate (defense-in-depth, NOT the primary
 /// guarantee — the type system already forces a journal argument on
@@ -2509,19 +3093,6 @@ fn napi_ucan_evaluate_routes_to_core_evaluate_ucan() {
     );
 }
 
-/// WASM's `ucan_evaluate` body lives in the `run_evaluate_ucan` free function;
-/// it must route to the shared core `evaluate_ucan` pipeline. WASM re-uses the
-/// scp-protocol algorithms directly (ADR-034), so this pins that the diagnostic
-/// is the same pipeline, not a wasm-local fork.
-#[test]
-fn wasm_ucan_evaluate_routes_to_core_evaluate_ucan() {
-    assert!(
-        fn_body_contains(WASM_UCAN_SRC, "run_evaluate_ucan", "evaluate_ucan("),
-        "WASM ucan_evaluate (run_evaluate_ucan helper) must call the shared core \
-         evaluate_ucan pipeline, not re-implement capability evaluation locally"
-    );
-}
-
 /// UniFFI's `ucan_evaluate` bridge method must route to the shared core
 /// `evaluate_ucan` pipeline. Same rationale as the other three bridges.
 #[test]
@@ -2530,6 +3101,461 @@ fn uniffi_ucan_evaluate_routes_to_core_evaluate_ucan() {
         fn_body_contains(UNIFFI_BRIDGE_SRC, "ucan_evaluate", "evaluate_ucan("),
         "UniFFI ucan_evaluate must call the shared core evaluate_ucan pipeline, \
          not re-implement capability evaluation locally"
+    );
+}
+
+/// The shared `Supervisor::participation_record` method MUST derive the record
+/// via the pure-core `compute_participation_record` over the FULL event log —
+/// not re-implement participation accounting in the runtime. This is the
+/// single source the three bridges route through; if it forked, every binding's
+/// participation facts would silently diverge from the protocol definition.
+#[test]
+fn supervisor_participation_record_routes_to_core_compute() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "participation_record",
+            "compute_participation_record("
+        ),
+        "Supervisor::participation_record must call core compute_participation_record \
+         over the full event log, not re-derive participation facts locally"
+    );
+}
+
+/// The PyO3 `participation_record` bridge op must route to the shared
+/// `Supervisor::participation_record`, so Python RECEIVES the flattened facts
+/// rather than recomputing them from event-log collections.
+#[test]
+fn pyo3_participation_record_routes_to_supervisor() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "participation_record_impl",
+            ".participation_record("
+        ),
+        "PyO3 participation_record_impl must call Supervisor::participation_record, \
+         not re-aggregate participation facts in the bridge"
+    );
+}
+
+/// The NAPI `participation_record` bridge op (body in `participation_record_on`)
+/// must route to the shared `Supervisor::participation_record`.
+#[test]
+fn napi_participation_record_routes_to_supervisor() {
+    assert!(
+        fn_body_contains(
+            NAPI_TRUST_SRC,
+            "participation_record_on",
+            ".participation_record("
+        ),
+        "NAPI participation_record_on must call Supervisor::participation_record, \
+         not re-aggregate participation facts in the bridge"
+    );
+}
+
+/// The UniFFI `participation_record` bridge method must route to the shared
+/// `Supervisor::participation_record`.
+///
+/// The UniFFI bridge method shares its leaf name (`participation_record`) with
+/// the supervisor method it calls, so a single `.participation_record(`
+/// substring check would be self-satisfying. Pin BOTH the `supervisor` binding
+/// (proving the call targets the runtime, not a bridge-local re-aggregation)
+/// AND the `.participation_record(` call, so a bare self-mention cannot pass.
+#[test]
+fn uniffi_participation_record_routes_to_supervisor() {
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "participation_record", "supervisor")
+            && fn_body_contains(
+                UNIFFI_BRIDGE_SRC,
+                "participation_record",
+                ".participation_record("
+            ),
+        "UniFFI participation_record must call Supervisor::participation_record, \
+         not re-aggregate participation facts in the bridge"
+    );
+}
+
+// ===========================================================================
+// Capability-admission op `check_capability_requirements` (§7.3.4.4, SCP-ACR-008)
+// ===========================================================================
+//
+// Each native bridge's capability-admission export MUST delegate to the shared
+// core `scp_protocol::trust::check_capability_requirements` (re-exported as
+// `scp_core::trust::check_capability_requirements`) rather than re-implementing
+// the admission decision locally, AND MUST wire the production
+// `IdentityDidPublicKeyResolver` so each `ChallengeVerification` is
+// signature/subject/context/expiry verified. Pinning the fully-qualified
+// `scp_core::trust::check_capability_requirements(` call (not the bare leaf,
+// which the bridge fn shares its name with) plus the resolver makes a
+// self-satisfying substring impossible.
+
+/// The PyO3 `check_capability_requirements` bridge op must route to core.
+#[test]
+fn pyo3_check_capability_requirements_routes_to_core() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "py_check_capability_requirements",
+            "scp_core::trust::check_capability_requirements("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "py_check_capability_requirements",
+            "IdentityDidPublicKeyResolver"
+        ),
+        "PyO3 py_check_capability_requirements must call core \
+         check_capability_requirements with the production DID resolver"
+    );
+}
+
+/// The NAPI `check_capability_requirements` bridge op (body in
+/// `check_capability_requirements_on`) must route to core.
+#[test]
+fn napi_check_capability_requirements_routes_to_core() {
+    assert!(
+        fn_body_contains(
+            NAPI_TRUST_SRC,
+            "check_capability_requirements_on",
+            "scp_core::trust::check_capability_requirements("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "check_capability_requirements_on",
+            "IdentityDidPublicKeyResolver"
+        ),
+        "NAPI check_capability_requirements_on must call core \
+         check_capability_requirements with the production DID resolver"
+    );
+}
+
+/// The UniFFI `check_capability_requirements` bridge op must route to core.
+#[test]
+fn uniffi_check_capability_requirements_routes_to_core() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "check_capability_requirements",
+            "scp_core::trust::check_capability_requirements("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "check_capability_requirements",
+            "IdentityDidPublicKeyResolver"
+        ),
+        "UniFFI check_capability_requirements must call core \
+         check_capability_requirements with the production DID resolver"
+    );
+}
+
+// ===========================================================================
+// §6.2.4 cross-context outlet-invocation saga — FFI export wiring (ADR-049 §3a)
+// ===========================================================================
+//
+// Each native bridge's `outlet_invoke_cross_context_saga` export MUST, before the
+// saga can run:
+//   (a) bind the caller principal — `enforce_caller_principal_binding`, which
+//       authenticates the hosted caller via `identity_registry_contains` and
+//       `is_member` (ADR-049 §3a:94 normative: caller_did/caller_context bound
+//       to the authenticated FFI principal, NOT an envelope-asserted value);
+//   (b) convert the caller/target id STRING → [u8; 32] through the canonical
+//       ADR-056 keying chokepoint `context_id_to_bytes` (a raw re-hash would
+//       double-hash a 64-hex id and key a non-existent actor slot); and
+//   (c) dispatch to the merged producer
+//       `start_cross_context_outlet_invocation_saga`.
+//
+// These pin the bridge bodies so a refactor cannot silently sever any of the
+// three from the export — e.g. drop the principal binding (replay/forgery),
+// re-hash the id (spurious ContextNotRegistered), or bypass the saga producer.
+// The principal-binding helper that wraps `identity_registry_contains` +
+// `is_member` is itself pinned (the export → helper edge), so the named tokens
+// cannot be satisfied by an unrelated sibling's substring.
+
+#[test]
+fn pyo3_saga_export_wires_binding_chokepoint_and_producer() {
+    assert!(
+        fn_body_contains(
+            PYO3_OUTLETS_SRC,
+            "outlet_invoke_cross_context_saga_impl",
+            "enforce_caller_principal_binding(",
+        ),
+        "PyO3 cross-context saga export must bind the caller principal via \
+         enforce_caller_principal_binding before invoking the saga (ADR-049 §3a)"
+    );
+    assert!(
+        fn_body_contains(
+            PYO3_OUTLETS_SRC,
+            "outlet_invoke_cross_context_saga_impl",
+            "context_id_to_bytes(",
+        ),
+        "PyO3 cross-context saga export must convert ids via the ADR-056 \
+         context_id_to_bytes keying chokepoint, not re-hash them"
+    );
+    assert!(
+        fn_body_contains(
+            PYO3_OUTLETS_SRC,
+            "outlet_invoke_cross_context_saga_impl",
+            "start_cross_context_outlet_invocation_saga(",
+        ),
+        "PyO3 cross-context saga export must dispatch to the producer \
+         start_cross_context_outlet_invocation_saga"
+    );
+    // The principal-binding helper itself must authenticate the hosted caller
+    // (registry membership + context membership), so the (a) edge is meaningful.
+    assert!(
+        fn_body_contains(
+            PYO3_OUTLETS_SRC,
+            "enforce_caller_principal_binding",
+            "identity_registry_contains",
+        ) && fn_body_contains(
+            PYO3_OUTLETS_SRC,
+            "enforce_caller_principal_binding",
+            "is_member",
+        ),
+        "PyO3 enforce_caller_principal_binding must check identity_registry_contains \
+         AND is_member (authenticated-principal binding, ADR-049 §3a:94)"
+    );
+}
+
+#[test]
+fn napi_saga_export_wires_binding_chokepoint_and_producer() {
+    assert!(
+        fn_body_contains(
+            NAPI_OUTLETS_SRC,
+            "outlet_invoke_cross_context_saga_on",
+            "enforce_caller_principal_binding(",
+        ),
+        "NAPI cross-context saga export must bind the caller principal via \
+         enforce_caller_principal_binding before invoking the saga (ADR-049 §3a)"
+    );
+    assert!(
+        fn_body_contains(
+            NAPI_OUTLETS_SRC,
+            "outlet_invoke_cross_context_saga_on",
+            "context_id_to_bytes(",
+        ),
+        "NAPI cross-context saga export must convert ids via the ADR-056 \
+         context_id_to_bytes keying chokepoint, not re-hash them"
+    );
+    assert!(
+        fn_body_contains(
+            NAPI_OUTLETS_SRC,
+            "outlet_invoke_cross_context_saga_on",
+            "start_cross_context_outlet_invocation_saga(",
+        ),
+        "NAPI cross-context saga export must dispatch to the producer \
+         start_cross_context_outlet_invocation_saga"
+    );
+    assert!(
+        fn_body_contains(
+            NAPI_OUTLETS_SRC,
+            "enforce_caller_principal_binding",
+            "identity_registry_contains",
+        ) && fn_body_contains(
+            NAPI_OUTLETS_SRC,
+            "enforce_caller_principal_binding",
+            "is_member",
+        ),
+        "NAPI enforce_caller_principal_binding must check identity_registry_contains \
+         AND is_member (authenticated-principal binding, ADR-049 §3a:94)"
+    );
+}
+
+#[test]
+fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "outlet_invoke_cross_context_saga",
+            "enforce_caller_principal_binding(",
+        ),
+        "UniFFI cross-context saga export must bind the caller principal via \
+         enforce_caller_principal_binding before invoking the saga (ADR-049 §3a)"
+    );
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "outlet_invoke_cross_context_saga",
+            "context_id_to_bytes(",
+        ),
+        "UniFFI cross-context saga export must convert ids via the ADR-056 \
+         context_id_to_bytes keying chokepoint, not re-hash them"
+    );
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "outlet_invoke_cross_context_saga",
+            "start_cross_context_outlet_invocation_saga(",
+        ),
+        "UniFFI cross-context saga export must dispatch to the producer \
+         start_cross_context_outlet_invocation_saga"
+    );
+    // UniFFI authenticates the hosted caller against the per-instance custody
+    // registry (`identity_custody_registry(bi).contains_key`) rather than the
+    // PyO3/NAPI `identity_registry_contains` helper — a per-SDK idiom difference,
+    // same authenticated-principal property. Both legs (registry presence +
+    // context membership via `is_member`) must be present.
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "enforce_caller_principal_binding",
+            "identity_custody_registry",
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "enforce_caller_principal_binding",
+            "is_member",
+        ),
+        "UniFFI enforce_caller_principal_binding must check the per-instance \
+         identity_custody_registry AND is_member (authenticated-principal \
+         binding, ADR-049 §3a:94)"
+    );
+}
+
+// ===========================================================================
+// SCP-OUT-046 streaming saga — AC8 (commit once, no per-chunk 2PC)
+// ===========================================================================
+
+/// AC8 (SCP-OUT-046; ADR-061) — the streaming-saga seal COMMITS ONCE over the
+/// bounded Merkle root; it performs NO per-chunk two-phase commit. Structural
+/// guard on the off-mailbox seal task `run_streaming_saga_seal_task`:
+///
+/// - the per-chunk pump loop (`while let Some(chunk) = inner_rx.recv().await`)
+///   folds each forwarded chunk into B's durable frontier via
+///   `StreamCaptureAppend` — an O(log n) durable capture, NOT a commit;
+/// - the loop body contains NEITHER `CommitBStreamSettle` NOR `PrepareBStreaming`
+///   (no per-chunk commit, no per-chunk prepare);
+/// - the SINGLE `CommitBStreamSettle` fires exactly once in the whole task, at
+///   stream-close, OUTSIDE the loop.
+///
+/// This is the rejected-alternative tripwire (ADR-061: per-chunk 2PC is
+/// forbidden). Additive assertion — does not weaken any existing pipeline check.
+#[test]
+fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
+    // Bound the seal-task function body: from its `fn` to the next item
+    // (`record_streaming_saga_a_event`, which immediately follows it).
+    let fn_start = OUTLETS_INVOKE_SRC
+        .find("pub(crate) async fn run_streaming_saga_seal_task")
+        .expect("run_streaming_saga_seal_task must exist in invoke.rs");
+    let after_fn = &OUTLETS_INVOKE_SRC[fn_start..];
+    let fn_len = after_fn
+        .find("async fn record_streaming_saga_a_event")
+        .expect("record_streaming_saga_a_event follows the seal task");
+    // Strip `//` line comments (doc/rationale references to the message names are
+    // not code) before matching — mirrors the gating gate's comment-stripping, so
+    // the guard asserts on the actual dispatch code, not prose.
+    let seal_fn_owned: String = after_fn[..fn_len]
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let seal_fn = seal_fn_owned.as_str();
+
+    // (1) Exactly ONE CommitBStreamSettle dispatch in the whole seal task —
+    // commit once over the bounded root (AC8). More than one is a per-chunk 2PC.
+    let commit_count = seal_fn
+        .matches("SagaPhaseMessage::CommitBStreamSettle")
+        .count();
+    assert_eq!(
+        commit_count, 1,
+        "AC8: the seal task must issue CommitBStreamSettle EXACTLY once (commit once over \
+         the bounded root); found {commit_count} — a per-chunk two-phase-commit regression"
+    );
+
+    // (2) Per-chunk capture is present, and Prepare-B is NOT the seal task's job.
+    assert!(
+        seal_fn.contains("StreamCaptureAppend"),
+        "AC8: the seal task must fold each forwarded chunk via StreamCaptureAppend"
+    );
+    assert!(
+        !seal_fn.contains("PrepareBStreaming"),
+        "AC8: the seal task must NOT run Prepare-B (Prepare-B is the driver's one-time job)"
+    );
+
+    // (3) Extract the per-chunk pump loop body via brace matching and assert the
+    // per-chunk fold is inside it but NEITHER commit NOR prepare is (the single
+    // commit fires at stream-close, outside the loop). In-string format
+    // placeholders (`{SLUG_…}`) are balanced, so they net-zero the depth count.
+    let loop_start = seal_fn
+        .find("while let Some(chunk) = inner_rx.recv().await")
+        .expect("the seal task must have a per-chunk pump loop");
+    let open_rel = seal_fn[loop_start..]
+        .find('{')
+        .expect("the pump loop opens a block");
+    let body_start = loop_start + open_rel + 1;
+    let bytes = seal_fn.as_bytes();
+    let mut depth = 1usize;
+    let mut i = body_start;
+    while i < bytes.len() && depth > 0 {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    assert_eq!(depth, 0, "AC8: pump loop body braces must balance");
+    let loop_body = &seal_fn[body_start..i - 1];
+
+    assert!(
+        loop_body.contains("StreamCaptureAppend"),
+        "AC8: the per-chunk pump loop must fold each chunk via StreamCaptureAppend"
+    );
+    assert!(
+        !loop_body.contains("CommitBStreamSettle"),
+        "AC8: the per-chunk pump loop body must NOT commit per chunk — the single \
+         CommitBStreamSettle fires once at stream-close, OUTSIDE the loop"
+    );
+    assert!(
+        !loop_body.contains("PrepareBStreaming"),
+        "AC8: the per-chunk pump loop body must NOT run Prepare-B per chunk"
+    );
+}
+
+// ===========================================================================
+// App Sandboxing (spec §8.4) — AppBound / AppUnbound event log wiring
+// ===========================================================================
+
+/// Verifies that `app_bind` (PyO3), `app_bind_on` (NAPI), and
+/// `app_bind` (UniFFI) all route through the shared `bind_app`
+/// function from `app_sandbox`, which appends the durable `AppBound` (tag 74)
+/// event to the event log (spec §8.4.1 — silent app attachment is not
+/// possible).
+#[test]
+fn app_bind_wired_through_bind_app_all_bridges() {
+    assert!(
+        fn_body_contains(PYO3_CONTEXT_SRC, "app_bind", "bind_app("),
+        "PyO3 app_bind must route through bind_app (spec §8.4.1 — \
+         AppBound event log wiring)"
+    );
+    assert!(
+        fn_body_contains(NAPI_CONTEXT_SRC, "app_bind_on", "bind_app("),
+        "NAPI app_bind_on must route through bind_app (spec §8.4.1 — \
+         AppBound event log wiring)"
+    );
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "app_bind", "bind_app("),
+        "UniFFI app_bind must route through bind_app (spec §8.4.1 — \
+         AppBound event log wiring)"
+    );
+}
+
+/// Verifies that `app_unbind` (PyO3), `app_unbind_on` (NAPI), and
+/// `app_unbind` (UniFFI) all route through the shared `unbind_app`
+/// function from `app_sandbox`, which appends the durable `AppUnbound`
+/// (tag 75) event to the event log (spec §8.4.2 — silent app detachment is
+/// not possible).
+#[test]
+fn app_unbind_wired_through_unbind_app_all_bridges() {
+    assert!(
+        fn_body_contains(PYO3_CONTEXT_SRC, "app_unbind", "unbind_app("),
+        "PyO3 app_unbind must route through unbind_app (spec §8.4.2 — \
+         AppUnbound event log wiring)"
+    );
+    assert!(
+        fn_body_contains(NAPI_CONTEXT_SRC, "app_unbind_on", "unbind_app("),
+        "NAPI app_unbind_on must route through unbind_app (spec §8.4.2 — \
+         AppUnbound event log wiring)"
+    );
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "app_unbind", "unbind_app("),
+        "UniFFI app_unbind must route through unbind_app (spec §8.4.2 — \
+         AppUnbound event log wiring)"
     );
 }
 

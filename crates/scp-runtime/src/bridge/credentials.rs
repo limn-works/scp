@@ -43,14 +43,23 @@
 
 use std::sync::LazyLock;
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use async_trait::async_trait;
 use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
+use scp_platform::EncryptedStorage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use zeroize::{Zeroize, Zeroizing};
+// `Zeroize` (the trait) is only used by the testing-gated
+// `InMemoryCredentialStore`'s in-place `.zeroize()` calls; `Zeroizing` is used
+// unconditionally by the durable path and key derivation.
+#[cfg(any(test, feature = "testing"))]
+use zeroize::Zeroize;
+use zeroize::Zeroizing;
+
+use crate::store::ProtocolRepository;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -417,15 +426,61 @@ pub fn generate_bridge_credential_key() -> Zeroizing<[u8; 32]> {
     key
 }
 
-/// Encrypts plaintext credential data with AES-256-GCM.
+/// Builds the AES-256-GCM Additional Authenticated Data (AAD) that binds a
+/// credential ciphertext to its *slot identity* — its `credential_type` and
+/// `created_at`.
+///
+/// AAD is authenticated-but-not-encrypted: GCM's tag covers it, so a ciphertext
+/// sealed with one AAD cannot be decrypted (tag verification fails) under a
+/// different AAD. Binding the slot's `credential_type` defeats a **slot-swap**
+/// (copying an `OAuthAccessToken` ciphertext into the `ApiKey` slot, past a
+/// defeated at-rest `SQLCipher` layer): retrieval derives the AAD from the slot
+/// being *accessed*, so a mismatched slot fails the tag rather than returning a
+/// misattributed secret. Binding `created_at` authenticates that otherwise
+/// unauthenticated metadata field against tampering (defense-in-depth).
+///
+/// Encoding is domain-separated, length-delimited, and fixed-width so it is
+/// unambiguous — two distinct `(credential_type, created_at)` pairs can never
+/// produce the same bytes:
+///
+/// ```text
+/// AAD = "SCP-BRIDGE-CREDENTIAL-AAD-V1"          // fixed 28-byte domain tag
+///     || u64_le(len(Display(credential_type)))  // 8-byte length prefix
+///     || Display(credential_type)               // exactly that many bytes
+///     || u64_le(created_at)                      // fixed 8 bytes
+/// ```
+///
+/// `Display(credential_type)` is injective across variants (standard variants
+/// are bare identifiers; `Custom(name)` always renders `Custom(<name>)`, which
+/// no standard variant can equal), and the length prefix removes any
+/// concatenation ambiguity between the type field and the trailing timestamp.
+pub(crate) fn credential_aad(credential_type: &CredentialType, created_at: u64) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"SCP-BRIDGE-CREDENTIAL-AAD-V1";
+    let type_str = credential_type.to_string();
+    let type_bytes = type_str.as_bytes();
+    let mut aad = Vec::with_capacity(DOMAIN.len() + 8 + type_bytes.len() + 8);
+    aad.extend_from_slice(DOMAIN);
+    aad.extend_from_slice(&(type_bytes.len() as u64).to_le_bytes());
+    aad.extend_from_slice(type_bytes);
+    aad.extend_from_slice(&created_at.to_le_bytes());
+    aad
+}
+
+/// Encrypts plaintext credential data with AES-256-GCM, binding `aad`.
 ///
 /// Returns a byte vector containing `[12-byte nonce][ciphertext+tag]`.
-/// The nonce is randomly generated via `OsRng`.
+/// The nonce is randomly generated via `OsRng`. `aad` (see [`credential_aad`])
+/// is authenticated but not stored inline — the caller must reconstruct the
+/// identical AAD at decrypt time.
 ///
 /// # Errors
 ///
 /// Returns [`CredentialError::CryptoError`] if AES-256-GCM encryption fails.
-fn encrypt_credential(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CredentialError> {
+pub(crate) fn encrypt_credential(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CredentialError> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| CredentialError::CryptoError {
         reason: format!("invalid key length: {e}"),
     })?;
@@ -434,12 +489,17 @@ fn encrypt_credential(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Crede
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext =
-        cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| CredentialError::CryptoError {
-                reason: format!("encryption failed: {e}"),
-            })?;
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| CredentialError::CryptoError {
+            reason: format!("encryption failed: {e}"),
+        })?;
 
     // Prepend nonce to ciphertext.
     let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
@@ -448,18 +508,22 @@ fn encrypt_credential(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Crede
     Ok(result)
 }
 
-/// Decrypts credential data encrypted by [`encrypt_credential`].
+/// Decrypts credential data encrypted by [`encrypt_credential`], verifying `aad`.
 ///
-/// Expects input in the format `[12-byte nonce][ciphertext+tag]`.
-/// The returned plaintext is wrapped in [`Zeroizing`] for defense-in-depth.
+/// Expects input in the format `[12-byte nonce][ciphertext+tag]`. `aad` MUST be
+/// byte-identical to the AAD used at encrypt time (see [`credential_aad`]); a
+/// mismatch (e.g. a ciphertext moved to a different credential-type slot) fails
+/// the GCM tag and returns [`CredentialError::CryptoError`], never a
+/// misattributed plaintext. The returned plaintext is wrapped in [`Zeroizing`].
 ///
 /// # Errors
 ///
 /// Returns [`CredentialError::CryptoError`] if decryption fails (wrong key,
-/// tampered ciphertext, or malformed input).
-fn decrypt_credential(
+/// tampered ciphertext, AAD mismatch, or malformed input).
+pub(crate) fn decrypt_credential(
     key: &[u8; 32],
     encrypted: &[u8],
+    aad: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
     if encrypted.len() < NONCE_SIZE {
         return Err(CredentialError::CryptoError {
@@ -474,12 +538,17 @@ fn decrypt_credential(
         reason: format!("invalid key length: {e}"),
     })?;
 
-    let plaintext =
-        cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| CredentialError::CryptoError {
-                reason: format!("decryption failed: {e}"),
-            })?;
+    let plaintext = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|e| CredentialError::CryptoError {
+            reason: format!("decryption failed: {e}"),
+        })?;
 
     Ok(Zeroizing::new(plaintext))
 }
@@ -492,36 +561,55 @@ fn decrypt_credential(
 /// development.
 ///
 /// Stores credentials in a `HashMap` keyed by `(bridge_id, credential_type)`.
-/// Thread-safe via `tokio::sync::RwLock`. Tracks bridge suspension status
+/// Thread-safe via `std::sync::RwLock`. Tracks bridge suspension status
 /// via an internal set.
 ///
+/// Every locked region is a synchronous map/set operation — no guard is ever
+/// held across an `.await`, so a blocking `std::sync::RwLock` is correct here
+/// (ADR-049 Decision 12: the async `tokio` read-path `RwLock` is banned).
+///
 /// Not suitable for production -- credentials are not persisted across
-/// restarts. Production implementations should use the `Storage` trait
-/// (spec section 17) with `SQLite` or equivalent.
+/// restarts. Production selects the durable
+/// [`ProtocolRepositoryCredentialStore`] at the FFI bridge construction
+/// boundary instead; this in-memory double is **test-harness-only**, gated
+/// behind `#[cfg(any(test, feature = "testing"))]` so it is provably absent
+/// from every shipped artifact (ADR-062 §Decision 5, SCP-CAPINJECT-009).
+///
+/// Classified **durability-only** (spec §17.17.2): RAM-only tokens are
+/// re-obtainable by re-auth, so losing them fails closed — it nullifies no
+/// security property. The `impl Default` that made it a *default* selection
+/// was the live SCP-CAPSEL-8000/8011 violation and has been deleted; there is
+/// no zero-argument / omit-the-field way to reach it.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug)]
 pub struct InMemoryCredentialStore {
     /// Credentials keyed by `(bridge_id, credential_type)`.
     credentials:
-        tokio::sync::RwLock<std::collections::HashMap<(String, CredentialType), BridgeCredential>>,
+        std::sync::RwLock<std::collections::HashMap<(String, CredentialType), BridgeCredential>>,
 
     /// Set of bridge IDs that are currently suspended.
-    suspended_bridges: tokio::sync::RwLock<std::collections::HashSet<String>>,
+    suspended_bridges: std::sync::RwLock<std::collections::HashSet<String>>,
 
     /// Bridge credential keys keyed by bridge ID.
     ///
     /// Each key is wrapped in [`Zeroizing`] so it is zeroed on drop.
     bridge_credential_keys:
-        tokio::sync::RwLock<std::collections::HashMap<String, Zeroizing<[u8; 32]>>>,
+        std::sync::RwLock<std::collections::HashMap<String, Zeroizing<[u8; 32]>>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryCredentialStore {
     /// Creates a new empty in-memory credential store.
+    // No `Default` impl: a `Default` is a *default selection* of the in-memory
+    // arm, the live SCP-CAPSEL-8000/8011 violation this story deletes
+    // (ADR-062 §Decision 5, SCP-CAPINJECT-009). Callers must select explicitly.
+    #[allow(clippy::new_without_default)]
     #[must_use]
     pub fn new() -> Self {
         Self {
-            credentials: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            suspended_bridges: tokio::sync::RwLock::new(std::collections::HashSet::new()),
-            bridge_credential_keys: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            credentials: std::sync::RwLock::new(std::collections::HashMap::new()),
+            suspended_bridges: std::sync::RwLock::new(std::collections::HashSet::new()),
+            bridge_credential_keys: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -530,10 +618,10 @@ impl InMemoryCredentialStore {
     /// After this call, `retrieve()` will return
     /// [`CredentialError::BridgeSuspended`] for this bridge. Credentials
     /// are retained for potential reactivation.
-    pub async fn suspend_bridge(&self, bridge_id: &str) {
+    pub fn suspend_bridge(&self, bridge_id: &str) {
         self.suspended_bridges
             .write()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(bridge_id.to_owned());
     }
 
@@ -541,18 +629,22 @@ impl InMemoryCredentialStore {
     ///
     /// After this call, `retrieve()` will succeed for this bridge
     /// (assuming credentials exist).
-    pub async fn reactivate_bridge(&self, bridge_id: &str) {
-        self.suspended_bridges.write().await.remove(bridge_id);
+    pub fn reactivate_bridge(&self, bridge_id: &str) {
+        self.suspended_bridges
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(bridge_id);
     }
 }
 
-impl Default for InMemoryCredentialStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// NOTE: the in-memory store's `Default` impl was DELETED (ADR-062 §Decision 5,
+// SCP-CAPINJECT-009). A `Default` impl is a *default selection* of the
+// in-memory arm — the live SCP-CAPSEL-8000/8011 violation this story fixes.
+// Every reachable construction goes through an explicit `::new()` under
+// `#[cfg(any(test, feature = "testing"))]`, never a zero-argument default.
 
-#[allow(clippy::significant_drop_tightening)] // Nursery false positive on async RwLock patterns.
+#[cfg(any(test, feature = "testing"))]
+#[allow(clippy::significant_drop_tightening)] // Nursery false positive: guards are held across the synchronous critical section, then dropped at scope end.
 impl BridgeCredentialStore for InMemoryCredentialStore {
     async fn provision(
         &self,
@@ -561,22 +653,27 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         plaintext: &[u8],
         bridge_credential_key: &[u8; 32],
     ) -> Result<BridgeCredential, CredentialError> {
+        // Bind the credential-type slot + created_at as AES-GCM AAD. Compute
+        // `created_at` BEFORE encrypting so the stored value and the sealed AAD
+        // carry the same timestamp.
+        let created_at = now_secs();
         let key = derive_credential_key(bridge_credential_key, bridge_id)?;
-        let encrypted_data = encrypt_credential(&key, plaintext)?;
+        let aad = credential_aad(&credential_type, created_at);
+        let encrypted_data = encrypt_credential(&key, plaintext, &aad)?;
 
         let credential = BridgeCredential {
             encrypted_data,
             credential_type: credential_type.clone(),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            created_at,
             expires_at: None,
             bridge_id: bridge_id.to_owned(),
         };
 
         let map_key = (bridge_id.to_owned(), credential_type.clone());
-        let mut creds = self.credentials.write().await;
+        let mut creds = self
+            .credentials
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if creds.contains_key(&map_key) {
             return Err(CredentialError::AlreadyExists {
@@ -596,14 +693,22 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         bridge_credential_key: &[u8; 32],
     ) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
         // Check suspension status before retrieval.
-        if self.suspended_bridges.read().await.contains(bridge_id) {
+        if self
+            .suspended_bridges
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(bridge_id)
+        {
             return Err(CredentialError::BridgeSuspended {
                 bridge_id: bridge_id.to_owned(),
             });
         }
 
         let map_key = (bridge_id.to_owned(), credential_type.clone());
-        let creds = self.credentials.read().await;
+        let creds = self
+            .credentials
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let credential = creds
             .get(&map_key)
@@ -613,7 +718,10 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
             })?;
 
         let key = derive_credential_key(bridge_credential_key, bridge_id)?;
-        decrypt_credential(&key, &credential.encrypted_data)
+        // AAD from the SLOT being accessed (`credential_type`) + the stored
+        // `created_at`. A ciphertext moved into the wrong slot fails the tag.
+        let aad = credential_aad(credential_type, credential.created_at);
+        decrypt_credential(&key, &credential.encrypted_data, &aad)
     }
 
     async fn rotate(
@@ -623,11 +731,16 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         new_plaintext: &[u8],
         bridge_credential_key: &[u8; 32],
     ) -> Result<BridgeCredential, CredentialError> {
+        let created_at = now_secs();
         let key = derive_credential_key(bridge_credential_key, bridge_id)?;
-        let new_encrypted = encrypt_credential(&key, new_plaintext)?;
+        let aad = credential_aad(credential_type, created_at);
+        let new_encrypted = encrypt_credential(&key, new_plaintext, &aad)?;
 
         let map_key = (bridge_id.to_owned(), credential_type.clone());
-        let mut creds = self.credentials.write().await;
+        let mut creds = self
+            .credentials
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let existing = creds
             .get_mut(&map_key)
@@ -640,14 +753,12 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         // (defense-in-depth).
         existing.encrypted_data.zeroize();
 
-        // Replace with new credential.
+        // Replace with new credential (same `created_at` bound into the AAD
+        // above).
         let rotated = BridgeCredential {
             encrypted_data: new_encrypted,
             credential_type: credential_type.clone(),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            created_at,
             expires_at: None,
             bridge_id: bridge_id.to_owned(),
         };
@@ -658,7 +769,10 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
 
     async fn revoke(&self, bridge_id: &str) -> Result<(), CredentialError> {
         {
-            let mut creds = self.credentials.write().await;
+            let mut creds = self
+                .credentials
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             // Collect keys for this bridge.
             let keys_to_remove: Vec<(String, CredentialType)> = creds
@@ -680,13 +794,19 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
         self.delete_bridge_credential_key(bridge_id).await?;
 
         // Also remove from suspended set if present.
-        self.suspended_bridges.write().await.remove(bridge_id);
+        self.suspended_bridges
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(bridge_id);
 
         Ok(())
     }
 
     async fn list(&self, bridge_id: &str) -> Result<Vec<CredentialType>, CredentialError> {
-        let creds = self.credentials.read().await;
+        let creds = self
+            .credentials
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let types: Vec<CredentialType> = creds
             .keys()
@@ -704,7 +824,7 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
     ) -> Result<(), CredentialError> {
         self.bridge_credential_keys
             .write()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(bridge_id.to_owned(), key);
         Ok(())
     }
@@ -715,7 +835,7 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
     ) -> Result<Zeroizing<[u8; 32]>, CredentialError> {
         self.bridge_credential_keys
             .read()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(bridge_id)
             .cloned()
             .ok_or_else(|| CredentialError::KeyNotFound {
@@ -725,8 +845,339 @@ impl BridgeCredentialStore for InMemoryCredentialStore {
 
     async fn delete_bridge_credential_key(&self, bridge_id: &str) -> Result<(), CredentialError> {
         // Zeroizing<[u8; 32]> zeros on drop when removed from the HashMap.
-        self.bridge_credential_keys.write().await.remove(bridge_id);
+        self.bridge_credential_keys
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(bridge_id);
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DurableCredentialBackend — object-safe erasure trait
+// ---------------------------------------------------------------------------
+
+/// Object-safe durable credential backend.
+///
+/// [`BridgeCredentialStore`] uses RPITIT (return-position `impl Trait`), so it
+/// is **not** dyn-compatible — the FFI `FfiCredentialStore` seam cannot hold an
+/// `Arc<dyn BridgeCredentialStore>`. This companion trait mirrors the same 8
+/// operations under `#[async_trait]` (boxed, `Send` futures), which **is**
+/// object-safe, so the real durable arm can be type-erased as
+/// `Arc<dyn DurableCredentialBackend>` over whatever `EncryptedStorage` backend
+/// the caller selected at the bridge construction boundary. This is the same
+/// erasure pattern `OpenMlsStorageAdapter` uses to erase a concrete
+/// `S: Storage` (ADR-062 §Dispatch mechanism).
+///
+/// Two [`BridgeCredentialStore`] contract lines are satisfied differently by
+/// the durable production backend than by the in-memory test double, and the
+/// difference is deliberate:
+///
+/// - **Suspension.** `InMemoryCredentialStore::suspend_bridge` is a
+///   test-harness inherent method, not part of [`BridgeCredentialStore`], never
+///   wired by any bridge — so this durable surface has no suspend hook. A
+///   durable store it cannot suspend is never suspended; `retrieve` honors the
+///   "reject when suspended" contract vacuously.
+/// - **Revoke erasure.** The trait's "overwrite with zeros before deletion"
+///   line describes the in-memory (RAM) double. The durable backend instead
+///   crypto-shreds: it deletes the credential *records* (which is what makes
+///   `retrieve` fail, since `retrieve` derives its key from the caller-supplied
+///   `bridge_credential_key`) and the stored root-key custody copy, relying on
+///   the `EncryptedStorage` backend for at-rest confidentiality. This is a
+///   stronger property for durable-at-rest storage than an in-place
+///   zero-overwrite (which `SQLCipher` pages do not reliably provide anyway).
+#[async_trait]
+pub trait DurableCredentialBackend: Send + Sync {
+    /// See [`BridgeCredentialStore::provision`].
+    async fn provision(
+        &self,
+        bridge_id: &str,
+        credential_type: CredentialType,
+        plaintext: &[u8],
+        bridge_credential_key: &[u8; 32],
+    ) -> Result<BridgeCredential, CredentialError>;
+
+    /// See [`BridgeCredentialStore::retrieve`].
+    async fn retrieve(
+        &self,
+        bridge_id: &str,
+        credential_type: &CredentialType,
+        bridge_credential_key: &[u8; 32],
+    ) -> Result<Zeroizing<Vec<u8>>, CredentialError>;
+
+    /// See [`BridgeCredentialStore::rotate`].
+    async fn rotate(
+        &self,
+        bridge_id: &str,
+        credential_type: &CredentialType,
+        new_plaintext: &[u8],
+        bridge_credential_key: &[u8; 32],
+    ) -> Result<BridgeCredential, CredentialError>;
+
+    /// See [`BridgeCredentialStore::revoke`].
+    async fn revoke(&self, bridge_id: &str) -> Result<(), CredentialError>;
+
+    /// See [`BridgeCredentialStore::list`].
+    async fn list(&self, bridge_id: &str) -> Result<Vec<CredentialType>, CredentialError>;
+
+    /// See [`BridgeCredentialStore::store_bridge_credential_key`].
+    async fn store_bridge_credential_key(
+        &self,
+        bridge_id: &str,
+        key: Zeroizing<[u8; 32]>,
+    ) -> Result<(), CredentialError>;
+
+    /// See [`BridgeCredentialStore::get_bridge_credential_key`].
+    async fn get_bridge_credential_key(
+        &self,
+        bridge_id: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, CredentialError>;
+
+    /// See [`BridgeCredentialStore::delete_bridge_credential_key`].
+    async fn delete_bridge_credential_key(&self, bridge_id: &str) -> Result<(), CredentialError>;
+}
+
+/// Lifts a persistence-layer [`StoreError`](crate::store::StoreError) into a
+/// [`CredentialError::StorageError`].
+// Takes the error by value so it can be used directly as a `.map_err(store_err)`
+// function pointer (which passes owned `E`).
+#[allow(clippy::needless_pass_by_value)]
+fn store_err(e: crate::store::StoreError) -> CredentialError {
+    CredentialError::StorageError {
+        reason: e.to_string(),
+    }
+}
+
+/// Current Unix time in whole seconds (credential `created_at`).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ---------------------------------------------------------------------------
+// ProtocolRepositoryCredentialStore — the real durable backend
+// ---------------------------------------------------------------------------
+
+/// The **real** durable [`BridgeCredentialStore`] backend.
+///
+/// Bridge credentials and their per-bridge root keys are persisted through the
+/// existing [`ProtocolRepository`] substrate (spec §17.4) over any
+/// `EncryptedStorage` backend (`SQLCipher` on disk, or an `EncryptingAdapter`
+/// in memory — encrypted at rest either way).
+///
+/// Selected at the FFI bridge construction boundary from the SAME storage
+/// handle the bridge already uses for `mls_storage` and the saga journal, so a
+/// Sqlite selection persists bridge tokens across process restart and an
+/// encrypted-in-memory selection keeps them encrypted at rest — durability
+/// tracks the storage selection, by construction (ADR-062 §Decision 5).
+///
+/// This is a `DurableCredentialBackend` (not a `BridgeCredentialStore`
+/// directly) purely so it can be `Arc<dyn …>`-erased behind the
+/// `FfiCredentialStore` seam; the enum re-implements `BridgeCredentialStore` by
+/// delegating to this trait.
+pub struct ProtocolRepositoryCredentialStore<S: EncryptedStorage> {
+    repo: ProtocolRepository<S>,
+}
+
+impl<S: EncryptedStorage> ProtocolRepositoryCredentialStore<S> {
+    /// Wraps an `EncryptedStorage` handle as a durable credential backend.
+    #[must_use]
+    pub const fn new(storage: S) -> Self {
+        Self {
+            repo: ProtocolRepository::new(storage),
+        }
+    }
+}
+
+#[async_trait]
+impl<S: EncryptedStorage + 'static> DurableCredentialBackend
+    for ProtocolRepositoryCredentialStore<S>
+{
+    async fn provision(
+        &self,
+        bridge_id: &str,
+        credential_type: CredentialType,
+        plaintext: &[u8],
+        bridge_credential_key: &[u8; 32],
+    ) -> Result<BridgeCredential, CredentialError> {
+        // Reject duplicates — mirrors the in-memory store's `AlreadyExists`
+        // contract. Callers use `rotate` to replace.
+        //
+        // Best-effort under concurrency: this is a load-check then store over a
+        // non-transactional KV backend (no compare-and-swap), so unlike the
+        // in-memory store's single `RwLock` critical section, two racing
+        // `provision`s for the same `(bridge_id, credential_type)` can both see
+        // `None` and last-write-wins instead of one getting `AlreadyExists`.
+        // Acceptable for this durability-only, rare admin-path capability;
+        // callers needing strict single-writer semantics must quiesce.
+        if self
+            .repo
+            .load_bridge_credential(bridge_id, &credential_type)
+            .await
+            .map_err(store_err)?
+            .is_some()
+        {
+            return Err(CredentialError::AlreadyExists {
+                bridge_id: bridge_id.to_owned(),
+                credential_type,
+            });
+        }
+
+        // Bind the credential-type slot + created_at as AES-GCM AAD (compute
+        // `created_at` before sealing so the stored value matches the AAD).
+        let created_at = now_secs();
+        let key = derive_credential_key(bridge_credential_key, bridge_id)?;
+        let aad = credential_aad(&credential_type, created_at);
+        let encrypted_data = encrypt_credential(&key, plaintext, &aad)?;
+        let credential = BridgeCredential {
+            encrypted_data,
+            credential_type,
+            created_at,
+            expires_at: None,
+            bridge_id: bridge_id.to_owned(),
+        };
+        self.repo
+            .store_bridge_credential(&credential)
+            .await
+            .map_err(store_err)?;
+        Ok(credential)
+    }
+
+    async fn retrieve(
+        &self,
+        bridge_id: &str,
+        credential_type: &CredentialType,
+        bridge_credential_key: &[u8; 32],
+    ) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
+        let credential = self
+            .repo
+            .load_bridge_credential(bridge_id, credential_type)
+            .await
+            .map_err(store_err)?
+            .ok_or_else(|| CredentialError::NotFound {
+                bridge_id: bridge_id.to_owned(),
+                credential_type: credential_type.clone(),
+            })?;
+
+        let key = derive_credential_key(bridge_credential_key, bridge_id)?;
+        // AAD from the SLOT being accessed + the stored `created_at`: a
+        // ciphertext moved into a different-type slot fails the GCM tag.
+        let aad = credential_aad(credential_type, credential.created_at);
+        decrypt_credential(&key, &credential.encrypted_data, &aad)
+    }
+
+    async fn rotate(
+        &self,
+        bridge_id: &str,
+        credential_type: &CredentialType,
+        new_plaintext: &[u8],
+        bridge_credential_key: &[u8; 32],
+    ) -> Result<BridgeCredential, CredentialError> {
+        // Must already exist — mirrors the in-memory store's `NotFound`. Same
+        // best-effort-under-concurrency caveat as `provision`: the existence
+        // check and the store are separate round-trips (no CAS), so a race with
+        // a concurrent `revoke`/`provision` is last-write-wins rather than
+        // strictly serialized.
+        if self
+            .repo
+            .load_bridge_credential(bridge_id, credential_type)
+            .await
+            .map_err(store_err)?
+            .is_none()
+        {
+            return Err(CredentialError::NotFound {
+                bridge_id: bridge_id.to_owned(),
+                credential_type: credential_type.clone(),
+            });
+        }
+
+        let created_at = now_secs();
+        let key = derive_credential_key(bridge_credential_key, bridge_id)?;
+        let aad = credential_aad(credential_type, created_at);
+        let encrypted_data = encrypt_credential(&key, new_plaintext, &aad)?;
+        let rotated = BridgeCredential {
+            encrypted_data,
+            credential_type: credential_type.clone(),
+            created_at,
+            expires_at: None,
+            bridge_id: bridge_id.to_owned(),
+        };
+        // `store_bridge_credential` overwrites the existing record; the old
+        // ciphertext is superseded at rest.
+        self.repo
+            .store_bridge_credential(&rotated)
+            .await
+            .map_err(store_err)?;
+        Ok(rotated)
+    }
+
+    async fn revoke(&self, bridge_id: &str) -> Result<(), CredentialError> {
+        // Erasure = deletion of the credential *records* (`retrieve` reads them
+        // and derives its AES key from the CALLER-supplied
+        // `bridge_credential_key`, not the stored root key, so record deletion —
+        // not root-key deletion — is what makes `retrieve` return `NotFound`).
+        // Deleting the root key additionally makes `get_bridge_credential_key`
+        // return `KeyNotFound`, tearing down the stored custody copy. At-rest
+        // confidentiality of any not-yet-overwritten pages rests on the
+        // `EncryptedStorage` backend (SQLCipher / `EncryptingAdapter`); this is
+        // crypto-shredding, not in-place zero-overwrite.
+        //
+        // NOTE: these are separate `delete`s with no per-bridge serialization
+        // (the durable store is stateless — unlike the in-memory store's
+        // `RwLock`). A `rotate`/`provision` racing a `revoke` on the same
+        // `bridge_id` could re-materialize a record after `delete_prefix`.
+        // Callers MUST quiesce a bridge's credential operations before revoking.
+        // Acceptable for this durability-only capability (tokens are
+        // re-obtainable by re-auth; same authorized caller, same bridge).
+        self.repo
+            .delete_bridge_credentials(bridge_id)
+            .await
+            .map_err(store_err)?;
+        self.repo
+            .delete_bridge_credential_root_key(bridge_id)
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn list(&self, bridge_id: &str) -> Result<Vec<CredentialType>, CredentialError> {
+        self.repo
+            .list_bridge_credential_types(bridge_id)
+            .await
+            .map_err(store_err)
+    }
+
+    async fn store_bridge_credential_key(
+        &self,
+        bridge_id: &str,
+        key: Zeroizing<[u8; 32]>,
+    ) -> Result<(), CredentialError> {
+        self.repo
+            .store_bridge_credential_root_key(bridge_id, &key)
+            .await
+            .map_err(store_err)
+    }
+
+    async fn get_bridge_credential_key(
+        &self,
+        bridge_id: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, CredentialError> {
+        self.repo
+            .load_bridge_credential_root_key(bridge_id)
+            .await
+            .map_err(store_err)?
+            .ok_or_else(|| CredentialError::KeyNotFound {
+                bridge_id: bridge_id.to_owned(),
+            })
+    }
+
+    async fn delete_bridge_credential_key(&self, bridge_id: &str) -> Result<(), CredentialError> {
+        self.repo
+            .delete_bridge_credential_root_key(bridge_id)
+            .await
+            .map_err(store_err)
     }
 }
 
@@ -744,6 +1195,282 @@ mod tests {
 
     /// A different bridge credential key to verify key isolation.
     const OTHER_BRIDGE_KEY: &[u8; 32] = b"other-bridge-credential-key-32b!";
+
+    // -----------------------------------------------------------------------
+    // ProtocolRepositoryCredentialStore (durable backend) — the SHIPPED path
+    //
+    // Exercises `FfiCredentialStore::Durable`'s backend directly over an
+    // `EncryptedStorage` (`EncryptingAdapter<InMemoryStorage>`, the same
+    // encrypted-at-rest shape the in-memory storage *selection* uses), asserting
+    // the durable arm's provision/retrieve/rotate/revoke/list + root-key
+    // semantics — not just the raw `ProtocolRepository` methods (covered by the
+    // on-disk restart test in `store::credentials`) or the in-memory enum arm
+    // (covered in `scp-ffi-common`). SCP-CAPINJECT-009.
+    // -----------------------------------------------------------------------
+
+    /// Builds a durable credential store over encrypted-at-rest in-memory
+    /// storage (`EncryptedStorage`, so it drives the production
+    /// `ProtocolRepository::new` path — never `new_for_testing`).
+    fn durable_store() -> ProtocolRepositoryCredentialStore<
+        std::sync::Arc<
+            scp_platform::encrypting_adapter::EncryptingAdapter<
+                scp_platform::in_memory::InMemoryStorage,
+            >,
+        >,
+    > {
+        let key = Zeroizing::new([7u8; 32]);
+        let handle = std::sync::Arc::new(scp_platform::encrypting_adapter::EncryptingAdapter::new(
+            scp_platform::in_memory::InMemoryStorage::new(),
+            key,
+        ));
+        ProtocolRepositoryCredentialStore::new(handle)
+    }
+
+    #[tokio::test]
+    async fn durable_provision_and_retrieve_roundtrip() {
+        let store = durable_store();
+        let plaintext = b"oauth-access-token-abc123";
+
+        let cred = store
+            .provision(
+                "bridge-001",
+                CredentialType::OAuthAccessToken,
+                plaintext,
+                TEST_BRIDGE_KEY,
+            )
+            .await
+            .expect("provision");
+        assert_eq!(cred.bridge_id, "bridge-001");
+        assert_eq!(cred.credential_type, CredentialType::OAuthAccessToken);
+        assert!(cred.created_at > 0);
+
+        let retrieved = store
+            .retrieve(
+                "bridge-001",
+                &CredentialType::OAuthAccessToken,
+                TEST_BRIDGE_KEY,
+            )
+            .await
+            .expect("retrieve");
+        assert_eq!(retrieved.as_slice(), plaintext);
+    }
+
+    #[tokio::test]
+    async fn durable_provision_duplicate_returns_already_exists() {
+        let store = durable_store();
+        store
+            .provision(
+                "bridge-001",
+                CredentialType::ApiKey,
+                b"key-1",
+                TEST_BRIDGE_KEY,
+            )
+            .await
+            .expect("first provision");
+
+        let result = store
+            .provision(
+                "bridge-001",
+                CredentialType::ApiKey,
+                b"key-2",
+                TEST_BRIDGE_KEY,
+            )
+            .await;
+        assert!(matches!(result, Err(CredentialError::AlreadyExists { .. })));
+    }
+
+    #[tokio::test]
+    async fn durable_retrieve_nonexistent_returns_not_found() {
+        let store = durable_store();
+        let result = store
+            .retrieve("bridge-001", &CredentialType::ApiKey, TEST_BRIDGE_KEY)
+            .await;
+        assert!(matches!(result, Err(CredentialError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn durable_cross_bridge_access_returns_not_found() {
+        let store = durable_store();
+        store
+            .provision(
+                "bridge-001",
+                CredentialType::ApiKey,
+                b"secret-key",
+                TEST_BRIDGE_KEY,
+            )
+            .await
+            .expect("provision");
+
+        // A different bridge id must not see bridge-001's credential.
+        let result = store
+            .retrieve("bridge-002", &CredentialType::ApiKey, TEST_BRIDGE_KEY)
+            .await;
+        assert!(matches!(result, Err(CredentialError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn durable_rotate_replaces_credential() {
+        let store = durable_store();
+        store
+            .provision(
+                "bridge-001",
+                CredentialType::OAuthAccessToken,
+                b"old-token",
+                TEST_BRIDGE_KEY,
+            )
+            .await
+            .expect("provision");
+
+        store
+            .rotate(
+                "bridge-001",
+                &CredentialType::OAuthAccessToken,
+                b"new-token",
+                TEST_BRIDGE_KEY,
+            )
+            .await
+            .expect("rotate");
+
+        let retrieved = store
+            .retrieve(
+                "bridge-001",
+                &CredentialType::OAuthAccessToken,
+                TEST_BRIDGE_KEY,
+            )
+            .await
+            .expect("retrieve");
+        assert_eq!(retrieved.as_slice(), b"new-token");
+    }
+
+    #[tokio::test]
+    async fn durable_rotate_nonexistent_returns_not_found() {
+        let store = durable_store();
+        let result = store
+            .rotate(
+                "bridge-001",
+                &CredentialType::ApiKey,
+                b"new-value",
+                TEST_BRIDGE_KEY,
+            )
+            .await;
+        assert!(matches!(result, Err(CredentialError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn durable_wrong_key_fails_to_decrypt() {
+        let store = durable_store();
+        store
+            .provision(
+                "bridge-001",
+                CredentialType::ApiKey,
+                b"secret",
+                TEST_BRIDGE_KEY,
+            )
+            .await
+            .expect("provision");
+
+        // Retrieval with a different bridge_credential_key must fail the AEAD.
+        let result = store
+            .retrieve("bridge-001", &CredentialType::ApiKey, OTHER_BRIDGE_KEY)
+            .await;
+        assert!(matches!(result, Err(CredentialError::CryptoError { .. })));
+    }
+
+    #[tokio::test]
+    async fn durable_list_returns_all_credential_types() {
+        let store = durable_store();
+        for ct in [
+            CredentialType::OAuthAccessToken,
+            CredentialType::ApiKey,
+            CredentialType::Custom("discord-bot-token".to_owned()),
+        ] {
+            store
+                .provision("bridge-001", ct, b"v", TEST_BRIDGE_KEY)
+                .await
+                .expect("provision");
+        }
+
+        let mut types = store.list("bridge-001").await.expect("list");
+        types.sort_by_key(std::string::ToString::to_string);
+        assert_eq!(types.len(), 3);
+        assert!(types.contains(&CredentialType::OAuthAccessToken));
+        assert!(types.contains(&CredentialType::ApiKey));
+        assert!(types.contains(&CredentialType::Custom("discord-bot-token".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn durable_revoke_destroys_credentials_and_root_key() {
+        let store = durable_store();
+        let root = generate_bridge_credential_key();
+        let raw = *root;
+
+        store
+            .store_bridge_credential_key("bridge-001", root)
+            .await
+            .expect("store key");
+        store
+            .provision("bridge-001", CredentialType::ApiKey, b"secret", &raw)
+            .await
+            .expect("provision");
+        // A second bridge must survive the revoke of the first.
+        store
+            .provision(
+                "bridge-002",
+                CredentialType::ApiKey,
+                b"keep",
+                TEST_BRIDGE_KEY,
+            )
+            .await
+            .expect("provision bridge-002");
+
+        store.revoke("bridge-001").await.expect("revoke");
+
+        // Records gone → retrieve NotFound; list empty.
+        assert!(matches!(
+            store
+                .retrieve("bridge-001", &CredentialType::ApiKey, &raw)
+                .await,
+            Err(CredentialError::NotFound { .. })
+        ));
+        assert!(store.list("bridge-001").await.expect("list").is_empty());
+        // Stored root-key custody copy destroyed → KeyNotFound.
+        assert!(matches!(
+            store.get_bridge_credential_key("bridge-001").await,
+            Err(CredentialError::KeyNotFound { .. })
+        ));
+        // bridge-002 untouched.
+        let kept = store
+            .retrieve("bridge-002", &CredentialType::ApiKey, TEST_BRIDGE_KEY)
+            .await
+            .expect("retrieve bridge-002");
+        assert_eq!(kept.as_slice(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn durable_store_get_delete_root_key_roundtrip() {
+        let store = durable_store();
+        let root = generate_bridge_credential_key();
+        let expected = *root;
+
+        store
+            .store_bridge_credential_key("bridge-001", root)
+            .await
+            .expect("store key");
+        let got = store
+            .get_bridge_credential_key("bridge-001")
+            .await
+            .expect("get key");
+        assert_eq!(*got, expected);
+
+        store
+            .delete_bridge_credential_key("bridge-001")
+            .await
+            .expect("delete key");
+        assert!(matches!(
+            store.get_bridge_credential_key("bridge-001").await,
+            Err(CredentialError::KeyNotFound { .. })
+        ));
+    }
 
     // -----------------------------------------------------------------------
     // CredentialType tests
@@ -874,14 +1601,15 @@ mod tests {
     #[test]
     fn encrypt_decrypt_roundtrip() {
         let key = derive_credential_key(TEST_BRIDGE_KEY, "bridge-001").expect("derive");
+        let aad = credential_aad(&CredentialType::ApiKey, 1_700_000_000);
 
         let plaintext = b"my-secret-api-key-12345";
-        let encrypted = encrypt_credential(&key, plaintext).expect("encrypt");
+        let encrypted = encrypt_credential(&key, plaintext, &aad).expect("encrypt");
 
         // Encrypted output must be longer than plaintext (nonce + tag).
         assert!(encrypted.len() > plaintext.len());
 
-        let decrypted = decrypt_credential(&key, &encrypted).expect("decrypt");
+        let decrypted = decrypt_credential(&key, &encrypted, &aad).expect("decrypt");
         assert_eq!(decrypted.as_slice(), plaintext);
     }
 
@@ -889,17 +1617,59 @@ mod tests {
     fn decrypt_with_wrong_key_fails() {
         let key1 = derive_credential_key(TEST_BRIDGE_KEY, "bridge-001").expect("derive");
         let key2 = derive_credential_key(OTHER_BRIDGE_KEY, "bridge-001").expect("derive");
+        let aad = credential_aad(&CredentialType::ApiKey, 1_700_000_000);
 
-        let encrypted = encrypt_credential(&key1, b"secret").expect("encrypt");
-        let result = decrypt_credential(&key2, &encrypted);
+        let encrypted = encrypt_credential(&key1, b"secret", &aad).expect("encrypt");
+        let result = decrypt_credential(&key2, &encrypted, &aad);
 
         assert!(result.is_err(), "wrong key must fail decryption");
     }
 
     #[test]
     fn decrypt_truncated_data_fails() {
-        let result = decrypt_credential(&[0u8; 32], &[0u8; 5]);
+        let aad = credential_aad(&CredentialType::ApiKey, 1_700_000_000);
+        let result = decrypt_credential(&[0u8; 32], &[0u8; 5], &aad);
         assert!(result.is_err(), "data shorter than nonce must fail");
+    }
+
+    #[test]
+    fn credential_aad_is_unambiguous_across_type_and_time() {
+        // Distinct (type, created_at) → distinct AAD bytes; the length prefix
+        // prevents a Custom name from spoofing the trailing timestamp bytes.
+        let a = credential_aad(&CredentialType::ApiKey, 1);
+        let b = credential_aad(&CredentialType::ApiKey, 2);
+        let c = credential_aad(&CredentialType::OAuthAccessToken, 1);
+        let d = credential_aad(&CredentialType::Custom("ApiKey".to_owned()), 1);
+        assert_ne!(a, b, "differing created_at must differ");
+        assert_ne!(a, c, "differing type must differ");
+        assert_ne!(a, d, "Custom(\"ApiKey\") must not collide with ApiKey");
+        // Deterministic: same inputs → identical bytes (required for decrypt).
+        assert_eq!(a, credential_aad(&CredentialType::ApiKey, 1));
+    }
+
+    #[test]
+    fn decrypt_with_wrong_slot_aad_fails() {
+        // Slot-swap: seal under credential-type A, attempt to open with the AAD
+        // of a DIFFERENT slot (type B) at the same key/timestamp. GCM tag must
+        // reject it rather than returning misattributed plaintext.
+        let key = derive_credential_key(TEST_BRIDGE_KEY, "bridge-001").expect("derive");
+        let created_at = 1_700_000_000;
+        let aad_a = credential_aad(&CredentialType::OAuthAccessToken, created_at);
+        let aad_b = credential_aad(&CredentialType::ApiKey, created_at);
+
+        let sealed = encrypt_credential(&key, b"token", &aad_a).expect("encrypt");
+        let result = decrypt_credential(&key, &sealed, &aad_b);
+        assert!(
+            matches!(result, Err(CredentialError::CryptoError { .. })),
+            "wrong-slot AAD must fail the GCM tag, not decrypt"
+        );
+        // Sanity: the correct slot AAD still opens it.
+        assert_eq!(
+            decrypt_credential(&key, &sealed, &aad_a)
+                .expect("correct AAD decrypts")
+                .as_slice(),
+            b"token"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1174,7 +1944,7 @@ mod tests {
             .expect("provision");
 
         // Suspend the bridge.
-        store.suspend_bridge("bridge-001").await;
+        store.suspend_bridge("bridge-001");
 
         // Retrieve should fail with BridgeSuspended.
         let result = store
@@ -1187,7 +1957,7 @@ mod tests {
         );
 
         // Reactivate the bridge.
-        store.reactivate_bridge("bridge-001").await;
+        store.reactivate_bridge("bridge-001");
 
         // Retrieve should succeed again.
         let retrieved = store

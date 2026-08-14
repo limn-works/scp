@@ -5,10 +5,10 @@
 //!
 //! Per plan row 11: "assertion scaffolding is sufficient" — commit 11
 //! lands the structure of shuttle-based concurrency tests without the
-//! shuttle crate as a runtime dependency. The tests only compile when
-//! the `shuttle` feature is enabled; until that feature is added and
-//! the shuttle dependency is wired in, this file compiles to an empty
-//! binary. The scaffold records the invariants we intend to check:
+//! shuttle crate as a runtime dependency. The saga-focused scaffolds only
+//! compile when the `shuttle` feature is enabled; until that feature is
+//! added and the shuttle dependency is wired in, they record the invariants
+//! we intend to check:
 //!
 //! 1. Saga concurrency is gated per-participant-context-set: a saga
 //!    reserves the SET of context-actors it spans, two sagas with
@@ -24,6 +24,13 @@
 //!
 //! When the `shuttle` feature lands (future commit), these scaffolds
 //! become real `#[shuttle::test]` invocations.
+//!
+//! # ADR-049 §13 concurrent-writer stress test (active today)
+//!
+//! The `context_handle_cas_stress` module below is NOT gated on the shuttle
+//! feature: it is a real, always-compiled multi-thread stress test for the
+//! Decision-12 `ContextHandle::transition_to` compare-and-swap loop, run
+//! under ordinary `cargo nextest` / `cargo test`.
 
 #![allow(
     clippy::missing_const_for_fn,
@@ -79,12 +86,149 @@ mod shuttle_tests {
     //! # Invariant 3 — crash-recovery replay is idempotent.
 }
 
-// Empty main so the test binary always links.
+// ---------------------------------------------------------------------------
+// ADR-049 §13 concurrent-writer stress test (Decision-12).
+//
+// Unlike the saga invariants above (which still await the `shuttle` feature),
+// the `ContextHandle` lifecycle cell is a plain `Arc<ArcSwap<ContextState>>`
+// with no async surface, so its concurrent-writer invariant can be exercised
+// today with real OS threads under `cargo nextest` / `cargo test`. §13
+// mandates a stress test for any commit that removes a serializing primitive:
+// commit 12 removed the read-path `RwLock` that wrapped the former
+// `ContextInner` and replaced the blind load-validate-store `transition_to`
+// with a compare-and-swap retry loop.
+// ---------------------------------------------------------------------------
 #[cfg(not(feature = "shuttle"))]
-#[test]
-fn shuttle_scaffold_not_enabled() {
-    // Intentionally empty — the scaffold's purpose is to reserve the
-    // file location for future shuttle-feature activation. The real
-    // tests land when `shuttle` is added as a dev-dependency and the
-    // feature flag is wired into Cargo.toml.
+mod context_handle_cas_stress {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use scp_protocol::context::{ContextParams, ContextState};
+    use scp_runtime::context::ContextHandle;
+
+    /// States reachable from `Active` in exactly one FSM step. Crucially, none
+    /// of them is reachable from any of the others (they are all terminal or
+    /// one-way w.r.t. each other), so from a single `Active` cell AT MOST ONE
+    /// concurrent `transition_to` may succeed — every other writer must observe
+    /// the already-committed terminal state and be rejected.
+    const TARGETS_FROM_ACTIVE: [ContextState; 4] = [
+        ContextState::Closing,
+        ContextState::Expired,
+        ContextState::MigratingOut,
+        ContextState::Poisoned,
+    ];
+
+    /// Every state the cell may legitimately hold during the race.
+    fn is_reachable_state(s: &ContextState) -> bool {
+        *s == ContextState::Active || TARGETS_FROM_ACTIVE.contains(s)
+    }
+
+    /// Hammers a single shared `ContextHandle` with several threads all racing
+    /// to move it out of `Active`, plus a concurrent reader, across many
+    /// iterations.
+    ///
+    /// Invariants (all must hold under ANY interleaving):
+    /// (a) EXACTLY ONE writer wins per iteration. Under the old blind-store
+    ///     `transition_to`, every thread validates against `Active`
+    ///     independently and then stores, so two (or more) "succeed" and an
+    ///     update is silently lost — this assertion fails. The CAS loop admits
+    ///     exactly one committer; the losers re-load the fresh terminal state,
+    ///     fail validation, and return `Err` without storing.
+    /// (b) The committed state equals the winner's requested target — no
+    ///     invalid edge (e.g. `Expired -> Closing`) ever lands.
+    /// (c) No torn / invalid read: every value the reader observes is an
+    ///     FSM-reachable state, never garbage.
+    /// (d) A rejected transition leaves the cell unchanged (the loser threads
+    ///     returning `Err` do not perturb the final state, which stays equal to
+    ///     the single winner's target).
+    #[test]
+    fn transition_to_is_atomic_under_concurrent_writers() {
+        const ITERATIONS: usize = 2_000;
+
+        for iter in 0..ITERATIONS {
+            // Fresh handle; drive Creating -> Active before the race.
+            let handle = ContextHandle::new(format!("ctx-{iter}"), ContextParams::default());
+            handle
+                .transition_to(&ContextState::Active)
+                .expect("Creating -> Active must succeed");
+
+            // All writers rendezvous at the barrier so they race the SAME
+            // `Active` cell — maximizing the load-before-store window that the
+            // old blind-store implementation mishandled.
+            let barrier = Arc::new(Barrier::new(TARGETS_FROM_ACTIVE.len()));
+            let mut writers = Vec::with_capacity(TARGETS_FROM_ACTIVE.len());
+            for target in TARGETS_FROM_ACTIVE {
+                // Clone shares the same `Arc<ArcSwap<ContextState>>` cell.
+                let handle = handle.clone();
+                let barrier = Arc::clone(&barrier);
+                writers.push(thread::spawn(move || {
+                    barrier.wait();
+                    // Success yields `Some(target)`; a rejected transition yields
+                    // `None`. (b) a success must land exactly on the requested
+                    // target.
+                    handle.transition_to(&target).ok().map(|new_state| {
+                        assert_eq!(
+                            new_state, target,
+                            "iteration {iter}: committed state must equal the requested target"
+                        );
+                        target
+                    })
+                }));
+            }
+
+            // Concurrent reader: (c) every observed state must be reachable.
+            let reader_handle = handle.clone();
+            let reader = thread::spawn(move || {
+                for _ in 0..512 {
+                    let observed = reader_handle.state();
+                    assert!(
+                        is_reachable_state(&observed),
+                        "iteration {iter}: reader observed unreachable/torn state {observed:?}"
+                    );
+                }
+            });
+
+            let winners: Vec<ContextState> = writers
+                .into_iter()
+                .filter_map(|w| w.join().expect("writer thread panicked"))
+                .collect();
+            reader.join().expect("reader thread panicked");
+
+            // (a) exactly one writer committed.
+            assert_eq!(
+                winners.len(),
+                1,
+                "iteration {iter}: exactly one transition may win the Active cell, got {}",
+                winners.len()
+            );
+
+            // (d) the final cell state equals the sole winner's target — the
+            // rejected losers left it untouched.
+            let final_state = handle.state();
+            assert_eq!(
+                final_state, winners[0],
+                "iteration {iter}: final state must equal the winning transition"
+            );
+        }
+    }
+
+    /// A rejected transition is a pure no-op: it returns `Err` and leaves the
+    /// cell byte-for-byte unchanged (single-threaded direct check of the CAS
+    /// loop's `Err` path).
+    #[test]
+    fn rejected_transition_leaves_state_unchanged() {
+        let handle = ContextHandle::new("ctx-reject".to_owned(), ContextParams::default());
+        handle
+            .transition_to(&ContextState::Active)
+            .expect("Creating -> Active");
+        handle
+            .transition_to(&ContextState::Expired)
+            .expect("Active -> Expired");
+
+        // Expired is terminal: any onward transition must be rejected...
+        assert!(handle.transition_to(&ContextState::Closing).is_err());
+        assert!(handle.transition_to(&ContextState::Active).is_err());
+        // ...and the state must be exactly what it was before the attempts.
+        assert_eq!(handle.state(), ContextState::Expired);
+    }
 }

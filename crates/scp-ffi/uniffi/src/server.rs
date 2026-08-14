@@ -10,8 +10,7 @@
 //! - `relay_start_in_memory` / `relay_start_local` -- relay startup.
 //! - `node_start_in_memory` / `node_start_local` -- node startup.
 //!
-//! Gated behind the `server` feature on `scp-ffi-common`. Not available for
-//! WASM (ADR-034).
+//! Gated behind the `server` feature on `scp-ffi-common`.
 
 use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
@@ -53,9 +52,21 @@ impl From<ServerError> for ScpError {
                 msg: user_msg,
                 code: codes::CTX_2052.to_owned(),
             },
-            ServerError::MissingPassphrase => Self::Validation {
+            // Both are actionable configuration errors surfaced as validation
+            // failures: a missing SQLCipher passphrase, and relay-identity
+            // auto-generation being unavailable in this (non-dev) build.
+            ServerError::MissingPassphrase | ServerError::AutoGenerateUnavailable => {
+                Self::Validation {
+                    msg: user_msg,
+                    code: codes::VALID_7004.to_owned(),
+                }
+            }
+            // The node's production DHT client could not be built (fail-closed,
+            // ADR-062 §Decision 1) — surfaced as an identity/DID-resolution
+            // error since the DHT backs DID resolution.
+            ServerError::DhtInit(_) => Self::Identity {
                 msg: user_msg,
-                code: codes::VALID_7004.to_owned(),
+                code: codes::IDENT_1001.to_owned(),
             },
         }
     }
@@ -114,7 +125,7 @@ impl From<BroadcastKeyError> for ScpError {
 /// node startup.
 ///
 /// Connects to the node's local relay (with bearer token authentication)
-/// and initializes the `ContextManager` with `MlsCryptoProvider` and
+/// and initializes the `ContextManager` with `NodeMlsFactory` and
 /// `RelayTransportProvider` so that context operations (create, join, send)
 /// work immediately. If the `ContextManager` was already initialized
 /// (e.g., by a prior `configure_relay_transport` or `context_create` call),
@@ -617,11 +628,11 @@ pub(crate) async fn relay_start_local_on(
 /// - The identity does not retain a `ScpIdentity` (external/load-only handles)
 /// - The identity does not retain a `DidDocument`
 /// - The identity has no custody provider (no signing capability)
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 #[allow(clippy::type_complexity)]
 fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity, ScpError> {
     use scp_ffi_common::server::ConcreteDidMethod;
-    use scp_identity::{DidCache, IdentityError, InMemoryDhtClient};
+    use scp_identity::{DidCache, IdentityError};
     use scp_platform::traits::KeyCustody;
 
     let core_id = id.core_id.clone().ok_or_else(|| ScpError::Identity {
@@ -675,7 +686,16 @@ fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity
         })
     });
 
-    let dht_client = Arc::new(InMemoryDhtClient::new());
+    // Source the shared per-instance DHT client the identity was minted against
+    // (the one its DID document was published into by `identity_create`), so the
+    // node's DID method resolves against the SAME store — never a throwaway
+    // in-memory client. Falls back to the fail-closed production client if the
+    // instance somehow has none (ADR-062 §Decision 1). The shipped client is the
+    // real Mainline Pkarr client; the in-memory arm exists only under `testing`.
+    let dht_client = match id.bi.core.dht_client() {
+        Some(client) => Arc::clone(client),
+        None => Arc::new(crate::bridge::build_ffi_dht_client()?),
+    };
     let cache = Arc::new(DidCache::new());
     let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
         dht_client, cache, sign_fn,
@@ -688,12 +708,12 @@ fn build_node_identity_from_uniffi(id: &Identity) -> Result<server::NodeIdentity
     })
 }
 
-/// Fallback for builds without `allow_in_memory_custody`: always returns an
+/// Fallback for builds without `testing`: always returns an
 /// error because node identity portability requires custody access.
-#[cfg(not(feature = "allow_in_memory_custody"))]
+#[cfg(not(feature = "testing"))]
 fn build_node_identity_from_uniffi(_id: &Identity) -> Result<server::NodeIdentity, ScpError> {
     Err(ScpError::Identity {
-        msg: "node identity portability requires the \"allow_in_memory_custody\" \
+        msg: "node identity portability requires the \"testing\" \
               feature — production mobile builds should use platform custody \
               with IdentitySource::Persisted on NodeConfig directly"
             .to_owned(),
@@ -965,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn node_in_memory_with_identity_uses_provided_did() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let identity = rt()
@@ -993,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn node_local_with_identity_uses_provided_did() {
         let scp = crate::scp::Scp::new_in_memory_for_test();
         let identity = rt()

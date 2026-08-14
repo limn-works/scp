@@ -13,7 +13,7 @@
 //! | `SCP-PERM-`   | 3000--3999  |
 //! | `SCP-CRYPTO-` | 4000--4999  |
 //! | `SCP-TRANS-`  | 5000--5999  |
-//! | `SCP-TOOL-`   | 6000--6999  |
+//! | `SCP-OUTLET-`   | 6000--6999  |
 //! | `SCP-VALID-`  | 7000--7999  |
 //! | `SCP-STORAGE-`| 8000--8999  |
 //! | `SCP-ATTEST-` | 9000--9999  |
@@ -21,9 +21,22 @@
 //! | `SCP-GOV-`    | 11000--11999|
 //! | `SCP-ECON-`   | 12000--12999|
 //!
-//! All bridges (`PyO3`, napi-rs, `UniFFI`, WASM) import these constants
+//! All FFI bridges (`PyO3`, napi-rs, `UniFFI`) import these constants
 //! instead of defining error code strings locally. This eliminates
 //! cross-bridge divergence and makes error code auditing trivial.
+//!
+//! # Uniqueness rule
+//!
+//! Every code number has exactly ONE meaning, defined by exactly ONE
+//! constant in this file, and the doc-comment on that constant is
+//! normative. Never re-label an existing constant's doc-comment to a new
+//! purpose and never emit an existing code for a different purpose from
+//! any layer (bridge or SDK wrapper) — codes already in this registry are
+//! taken even if no Rust code currently emits them (they may be emitted
+//! from SDK wrappers, e.g. Swift). New purposes get NEW numbers from the
+//! next free run in the band. `scripts/check-error-codes.sh` enforces
+//! that no code literal is defined twice in this file; cross-layer
+//! purpose drift must be caught in review against these doc-comments.
 
 // -------------------------------------------------------------------------
 // Identity (SCP-IDENT- 1000--1999)
@@ -73,18 +86,31 @@ pub const IDENT_1013: &str = "SCP-IDENT-1013";
 /// length wrong for the declared key type, or decoded bytes that fail
 /// curve-point validation.
 pub const IDENT_1014: &str = "SCP-IDENT-1014";
-/// Device attestation feature unavailable.
+/// Device attestation unavailable — no production backend wired yet.
 ///
-/// Surfaced by the Python SDK shim when the `PyO3` extension was built
-/// without the `allow_in_memory_custody` feature: the `identity_attest_device`
-/// method is not exposed on the native bridge.
+/// Surfaced by the shipped (no-`testing`) device-attestation *attest* surface
+/// on every bridge — the `PyO3` `identity_attest_device` method, the NAPI
+/// `identity_attest_device` method, the `UniFFI` `identity_attest_device_impl`
+/// (dispatched from `Scp::identity_attest_device`), and the Python SDK shim.
+/// Each resolves the identity against its instance registry, then fails closed:
+/// no production device-attestation backend is wired yet. Apple App Attest /
+/// Google Play Integrity are hardware/platform-backed and are intentionally
+/// deferred (with hardware keychain custody) until an e2e-driven integration
+/// lands. Per spec §9:187 device attestation is an optional trust signal whose
+/// absence is expected and non-penalizing, so this is an honest-absent error,
+/// not a silently-valid attestation. See ADR-025 and #2171.
 pub const IDENT_1015: &str = "SCP-IDENT-1015";
-/// Device attestation verification feature unavailable.
+/// Device attestation verification unavailable — no production backend wired yet.
 ///
-/// Surfaced by the Python SDK shim when the `PyO3` extension was built
-/// without the `allow_in_memory_custody` feature: the
-/// `identity_verify_device_attestation` method is not exposed on the
-/// native bridge.
+/// Surfaced by the shipped (no-`testing`) device-attestation *verify* surface
+/// on every bridge — the `PyO3` `identity_verify_device_attestation` free
+/// `#[pyfunction]`, the NAPI `identity_verify_device_attestation` method, the
+/// `UniFFI` `identity_verify_device_attestation_impl` (dispatched from the
+/// `identity_verify_device_attestation` free fn), and the Python SDK shim.
+/// Each fails closed: no production device-attestation backend is wired yet
+/// (App Attest / Play Integrity are hardware/platform-backed and intentionally
+/// deferred with hardware keychain custody). Returns this honest-absent error
+/// rather than a silently-valid result (spec §9:187). See ADR-025 and #2171.
 pub const IDENT_1016: &str = "SCP-IDENT-1016";
 /// Operation requires retained signing custody, which this identity/handle
 /// lacks.
@@ -213,6 +239,34 @@ pub const IDENT_1056: &str = "SCP-IDENT-1056";
 /// Pseudonym derivation: derived public key was not 32 bytes.
 pub const IDENT_1057: &str = "SCP-IDENT-1057";
 
+/// Production DHT client initialization failed.
+///
+/// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) when the shipped
+/// Mainline Pkarr DHT client cannot be built — a malformed gateway URL or a
+/// Pkarr build failure (`DhtInitError` from
+/// [`scp_ffi_common::dht::build_ffi_dht_client`]). This is the fail-closed DHT
+/// path (ADR-062 §Decision 1 / spec §17.17.3): construction NEVER substitutes an
+/// in-memory or no-op client. Distinct from `IDENT_1001` (the generic /
+/// registry-miss code) so SDK consumers can tell a DHT-init failure apart from
+/// an identity that was never registered on this bridge.
+pub const IDENT_1058: &str = "SCP-IDENT-1058";
+
+/// No production pre-rotation custody backend is available (FAIL CLOSED).
+///
+/// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) and `scp-node`
+/// when a production identity-creation path is invoked on a shipped (no-`testing`)
+/// build. Every identity commits a pre-rotation commitment at creation (spec
+/// §9.7.4.1 §3 — mandatory), which requires a `PreRotationCustody` backend; the
+/// only implementation that exists today is the in-memory test nullifier
+/// (`InMemoryPreRotationCustody`), now gated to the test harness only (ADR-062
+/// §Decision 6). Rather than silently mint the nullifier (which would ship a
+/// false durability guarantee — CLAUDE.md builder tenet "No dev/test-only
+/// stand-ins in production"), creation fails closed with this typed code. Maps
+/// from [`scp_identity::IdentityError::NoPreRotationBackend`]. A real, persistent
+/// pre-rotation backend is tracked by #1729 / RFC #2130; non-committing creation
+/// (Option A) is out of scope (Discussion #1553).
+pub const IDENT_1059: &str = "SCP-IDENT-1059";
+
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
 // -------------------------------------------------------------------------
@@ -295,19 +349,19 @@ pub const CTX_2037: &str = "SCP-CTX-2037";
 pub const CTX_2038: &str = "SCP-CTX-2038";
 /// Context handle governance timeout.
 pub const CTX_2039: &str = "SCP-CTX-2039";
-/// WASM context operation error.
+/// Context operation error.
 pub const CTX_2040: &str = "SCP-CTX-2040";
-/// WASM context governance error.
+/// Context governance error.
 pub const CTX_2041: &str = "SCP-CTX-2041";
-/// WASM context TTL error.
+/// Context TTL error.
 pub const CTX_2042: &str = "SCP-CTX-2042";
-/// WASM context broadcast error.
+/// Context broadcast error.
 pub const CTX_2043: &str = "SCP-CTX-2043";
-/// WASM context member error.
+/// Context member error.
 pub const CTX_2044: &str = "SCP-CTX-2044";
-/// WASM context drain error.
+/// Context drain error.
 pub const CTX_2045: &str = "SCP-CTX-2045";
-/// WASM context query error.
+/// Context query error.
 pub const CTX_2046: &str = "SCP-CTX-2046";
 /// `UniFFI` context operation error.
 pub const CTX_2050: &str = "SCP-CTX-2050";
@@ -321,6 +375,14 @@ pub const CTX_2053: &str = "SCP-CTX-2053";
 pub const CTX_2054: &str = "SCP-CTX-2054";
 /// `UniFFI` context send error.
 pub const CTX_2055: &str = "SCP-CTX-2055";
+/// App sandbox bind-rejected error (ceiling exceeded, invalid declaration, signature failed).
+pub const CTX_2056: &str = "SCP-CTX-2056";
+/// App sandbox event-log-failed error (durable append failed during bind or unbind).
+pub const CTX_2057: &str = "SCP-CTX-2057";
+/// App sandbox bind-other error (unexpected bind failure).
+pub const CTX_2058: &str = "SCP-CTX-2058";
+/// App sandbox unbind error.
+pub const CTX_2059: &str = "SCP-CTX-2059";
 /// `UniFFI` relay connection error.
 pub const CTX_2060: &str = "SCP-CTX-2060";
 /// `UniFFI` context export error.
@@ -347,6 +409,14 @@ pub const CTX_2073: &str = "SCP-CTX-2073";
 pub const CTX_2074: &str = "SCP-CTX-2074";
 /// `UniFFI` context drain events error.
 pub const CTX_2075: &str = "SCP-CTX-2075";
+/// No recorded participation facts (spec §7.3.2).
+///
+/// The context event log is empty, so there is nothing to summarize for the
+/// subject. A normal, branchable outcome — NOT a failure — so callers can
+/// distinguish "no facts yet" from genuine errors (`NotInitialized`, provider
+/// failures, the generic `CTX_2000` catch-all) without string-matching the
+/// message. Maps from `ContextError::NoParticipationFacts`.
+pub const CTX_2076: &str = "SCP-CTX-2076";
 /// Snapshot import rejected: monotonic floor regression (spec §23.17).
 ///
 /// A per-sender monotonic floor (sender-key epoch, spending nonce, etc.) would
@@ -403,6 +473,17 @@ pub const CTX_2135: &str = "SCP-CTX-2135";
 ///
 /// Maps from `ContextError::KeyPackageReplay`.
 pub const CTX_2136: &str = "SCP-CTX-2136";
+/// Nothing to restore: a `RestoreAccess` governance action requested capabilities
+/// that are not actually suspended for the member, and the member is not
+/// read-excluded with read requested (§5.9).
+///
+/// Distinct from the generic `CTX_2001` catch-all so a caller can detect that a
+/// restore was a no-op (the member already held the requested access) rather
+/// than a generic context error. Mirrors native `execute_restore_access`, which
+/// rejects before mutating when there is nothing to restore.
+///
+/// Maps from `ContextError::NothingToRestore`.
+pub const CTX_2137: &str = "SCP-CTX-2137";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.
@@ -522,14 +603,6 @@ pub const CRYPTO_4010: &str = "SCP-CRYPTO-4010";
 pub const CRYPTO_4011: &str = "SCP-CRYPTO-4011";
 /// MLS commit error.
 pub const CRYPTO_4012: &str = "SCP-CRYPTO-4012";
-/// WASM MLS group create error.
-pub const CRYPTO_4020: &str = "SCP-CRYPTO-4020";
-/// WASM MLS proposal error.
-pub const CRYPTO_4021: &str = "SCP-CRYPTO-4021";
-/// WASM MLS commit error.
-pub const CRYPTO_4022: &str = "SCP-CRYPTO-4022";
-/// WASM sender key error.
-pub const CRYPTO_4023: &str = "SCP-CRYPTO-4023";
 /// `UniFFI` MLS group error.
 pub const CRYPTO_4050: &str = "SCP-CRYPTO-4050";
 /// `UniFFI` MLS encrypt error.
@@ -619,59 +692,59 @@ pub const TRANS_5063: &str = "SCP-TRANS-5063";
 pub const TRANS_5070: &str = "SCP-TRANS-5070";
 
 // -------------------------------------------------------------------------
-// Tool (SCP-TOOL- 6000--6999)
+// Outlet (SCP-OUTLET- 6000--6999)
 // -------------------------------------------------------------------------
 
-/// Generic tool error.
-pub const TOOL_6001: &str = "SCP-TOOL-6001";
-/// Tool not found.
-pub const TOOL_6002: &str = "SCP-TOOL-6002";
-/// Tool registration error.
-pub const TOOL_6003: &str = "SCP-TOOL-6003";
-/// Tool invocation error.
-pub const TOOL_6004: &str = "SCP-TOOL-6004";
-/// Tool verification error.
-pub const TOOL_6005: &str = "SCP-TOOL-6005";
-/// Tool capability error.
-pub const TOOL_6006: &str = "SCP-TOOL-6006";
-/// Tool interface error.
-pub const TOOL_6007: &str = "SCP-TOOL-6007";
-/// Tool schema error.
-pub const TOOL_6008: &str = "SCP-TOOL-6008";
-/// Tool handler error.
-pub const TOOL_6009: &str = "SCP-TOOL-6009";
-/// Tool interface establish error.
-pub const TOOL_6010: &str = "SCP-TOOL-6010";
-/// Tool interface query error.
-pub const TOOL_6011: &str = "SCP-TOOL-6011";
-/// Tool interface list error.
-pub const TOOL_6012: &str = "SCP-TOOL-6012";
-/// Tool signer error.
-pub const TOOL_6013: &str = "SCP-TOOL-6013";
-/// Tool register error.
-pub const TOOL_6014: &str = "SCP-TOOL-6014";
-/// Tool deregister error.
-pub const TOOL_6015: &str = "SCP-TOOL-6015";
-/// Tool invoke capability error.
-pub const TOOL_6017: &str = "SCP-TOOL-6017";
-/// Tool invoke schema validation error.
-pub const TOOL_6018: &str = "SCP-TOOL-6018";
-/// Tool invoke result error.
-pub const TOOL_6019: &str = "SCP-TOOL-6019";
-/// Tool invoke handler error.
-pub const TOOL_6020: &str = "SCP-TOOL-6020";
-/// Tool invoke timeout error.
-pub const TOOL_6021: &str = "SCP-TOOL-6021";
-/// Tool verify register error.
-pub const TOOL_6030: &str = "SCP-TOOL-6030";
-/// Tool verify not found error.
-pub const TOOL_6031: &str = "SCP-TOOL-6031";
-/// Tool verify invoke schema error.
-pub const TOOL_6032: &str = "SCP-TOOL-6032";
-/// Tool verify invoke not found error.
-pub const TOOL_6033: &str = "SCP-TOOL-6033";
-/// Tool verify output schema error.
-pub const TOOL_6035: &str = "SCP-TOOL-6035";
+/// Generic outlet error.
+pub const OUTLET_6001: &str = "SCP-OUTLET-6001";
+/// Outlet not found.
+pub const OUTLET_6002: &str = "SCP-OUTLET-6002";
+/// Outlet registration error.
+pub const OUTLET_6003: &str = "SCP-OUTLET-6003";
+/// Outlet invocation error.
+pub const OUTLET_6004: &str = "SCP-OUTLET-6004";
+/// Outlet verification error.
+pub const OUTLET_6005: &str = "SCP-OUTLET-6005";
+/// Outlet capability error.
+pub const OUTLET_6006: &str = "SCP-OUTLET-6006";
+/// Outlet interface error.
+pub const OUTLET_6007: &str = "SCP-OUTLET-6007";
+/// Outlet schema error.
+pub const OUTLET_6008: &str = "SCP-OUTLET-6008";
+/// Outlet handler error.
+pub const OUTLET_6009: &str = "SCP-OUTLET-6009";
+/// Outlet interface establish error.
+pub const OUTLET_6010: &str = "SCP-OUTLET-6010";
+/// Outlet interface query error.
+pub const OUTLET_6011: &str = "SCP-OUTLET-6011";
+/// Outlet interface list error.
+pub const OUTLET_6012: &str = "SCP-OUTLET-6012";
+/// Outlet signer error.
+pub const OUTLET_6013: &str = "SCP-OUTLET-6013";
+/// Outlet register error.
+pub const OUTLET_6014: &str = "SCP-OUTLET-6014";
+/// Outlet deregister error.
+pub const OUTLET_6015: &str = "SCP-OUTLET-6015";
+/// Outlet invoke capability error.
+pub const OUTLET_6017: &str = "SCP-OUTLET-6017";
+/// Outlet invoke schema validation error.
+pub const OUTLET_6018: &str = "SCP-OUTLET-6018";
+/// Outlet invoke result error.
+pub const OUTLET_6019: &str = "SCP-OUTLET-6019";
+/// Outlet invoke handler error.
+pub const OUTLET_6020: &str = "SCP-OUTLET-6020";
+/// Outlet invoke timeout error.
+pub const OUTLET_6021: &str = "SCP-OUTLET-6021";
+/// Outlet verify register error.
+pub const OUTLET_6030: &str = "SCP-OUTLET-6030";
+/// Outlet verify not found error.
+pub const OUTLET_6031: &str = "SCP-OUTLET-6031";
+/// Outlet verify invoke schema error.
+pub const OUTLET_6032: &str = "SCP-OUTLET-6032";
+/// Outlet verify invoke not found error.
+pub const OUTLET_6033: &str = "SCP-OUTLET-6033";
+/// Outlet verify output schema error.
+pub const OUTLET_6035: &str = "SCP-OUTLET-6035";
 
 // -------------------------------------------------------------------------
 // Validation (SCP-VALID- 7000--7999)
@@ -740,8 +813,33 @@ pub const VALID_7020: &str = "SCP-VALID-7020";
 pub const VALID_7021: &str = "SCP-VALID-7021";
 /// Event log verify validation error.
 pub const VALID_7022: &str = "SCP-VALID-7022";
+/// SDK-wrapper local guard: the in-tab client is not initialized.
+///
+/// The caller must `await initScp()` — or use `ScpBrowserClient.connect`, which
+/// awaits it — before constructing a client. Thrown TS-side by the
+/// `@limn-works/scp-ts-wasm` wrapper, never minted by an FFI bridge.
+pub const VALID_7025: &str = "SCP-VALID-7025";
+/// SDK-wrapper local guard: a managed transport was passed to `create()`.
+///
+/// A `WebSocketRelaySocket` (the managed transport for `connect()`) was passed to
+/// `create()`, leaving it unattached. Thrown TS-side by the
+/// `@limn-works/scp-ts-wasm` wrapper, never minted by an FFI bridge.
+pub const VALID_7026: &str = "SCP-VALID-7026";
 /// Governance action validation error.
 pub const VALID_7027: &str = "SCP-VALID-7027";
+/// SDK-wrapper local guard: a second live `BrowserInvokerStreamSession`.
+///
+/// A second session was constructed on a `(client, contextId)` that already has
+/// one (a session drains the client's whole per-context buffer, so it requires a
+/// dedicated client/context). Thrown TS-side by `@limn-works/scp-ts-wasm`, never
+/// by a bridge.
+pub const VALID_7028: &str = "SCP-VALID-7028";
+/// SDK-wrapper local guard: a stream drain was iterated re-entrantly.
+///
+/// A `BrowserInvokerStreamSession` drain was entered from two async contexts
+/// concurrently — caller misuse, distinct from the lifecycle-closed
+/// `SCP-OUTLET-6100`. Thrown TS-side by `@limn-works/scp-ts-wasm`, never by a bridge.
+pub const VALID_7029: &str = "SCP-VALID-7029";
 /// MCP validation error.
 pub const VALID_7030: &str = "SCP-VALID-7030";
 /// MCP transport validation error.
@@ -750,21 +848,21 @@ pub const VALID_7031: &str = "SCP-VALID-7031";
 pub const VALID_7032: &str = "SCP-VALID-7032";
 /// MCP context validation error.
 pub const VALID_7033: &str = "SCP-VALID-7033";
-/// MCP tool validation error.
+/// MCP outlet validation error.
 pub const VALID_7034: &str = "SCP-VALID-7034";
-/// Tool register input validation error.
+/// Outlet register input validation error.
 pub const VALID_7035: &str = "SCP-VALID-7035";
-/// Tool register schema validation error.
+/// Outlet register schema validation error.
 pub const VALID_7036: &str = "SCP-VALID-7036";
-/// Tool invoke input validation error.
+/// Outlet invoke input validation error.
 pub const VALID_7037: &str = "SCP-VALID-7037";
-/// Tool verify input validation error.
+/// Outlet verify input validation error.
 pub const VALID_7038: &str = "SCP-VALID-7038";
 /// Event log input validation error.
 pub const VALID_7040: &str = "SCP-VALID-7040";
-/// Tool verify register output validation.
+/// Outlet verify register output validation.
 pub const VALID_7041: &str = "SCP-VALID-7041";
-/// Tool verify output validation error.
+/// Outlet verify output validation error.
 pub const VALID_7042: &str = "SCP-VALID-7042";
 /// Transport connect validation error.
 pub const VALID_7043: &str = "SCP-VALID-7043";
@@ -798,6 +896,8 @@ pub const VALID_7056: &str = "SCP-VALID-7056";
 pub const VALID_7057: &str = "SCP-VALID-7057";
 /// Bridge connector import validation error.
 pub const VALID_7058: &str = "SCP-VALID-7058";
+/// Participation record validation error (§7.3.2).
+pub const VALID_7059: &str = "SCP-VALID-7059";
 /// Discovery validation error.
 pub const VALID_7060: &str = "SCP-VALID-7060";
 /// Discovery member validation error.
@@ -818,6 +918,17 @@ pub const VALID_7070: &str = "SCP-VALID-7070";
 pub const VALID_7071: &str = "SCP-VALID-7071";
 /// Webhook operation validation error.
 pub const VALID_7072: &str = "SCP-VALID-7072";
+/// `check_capability_requirements`: malformed capability-requirements JSON.
+pub const VALID_7073: &str = "SCP-VALID-7073";
+/// `check_capability_requirements`: malformed agent-capabilities JSON.
+pub const VALID_7074: &str = "SCP-VALID-7074";
+/// `check_capability_requirements`: malformed challenge-verifications JSON.
+pub const VALID_7075: &str = "SCP-VALID-7075";
+/// `check_capability_requirements`: admission requirement unmet (missing
+/// capability or challenge verification required).
+pub const VALID_7076: &str = "SCP-VALID-7076";
+/// `check_capability_requirements`: empty subject DID.
+pub const VALID_7077: &str = "SCP-VALID-7077";
 /// Attestation validation error.
 pub const VALID_7080: &str = "SCP-VALID-7080";
 /// Discovery announce validation error.
@@ -826,6 +937,25 @@ pub const VALID_7090: &str = "SCP-VALID-7090";
 pub const VALID_7091: &str = "SCP-VALID-7091";
 /// Discovery result validation error.
 pub const VALID_7092: &str = "SCP-VALID-7092";
+/// Trust aggregation result-parse error (Swift-SDK-emitted: the typed
+/// `aggregateTrustInput` wrapper could not parse the bridge's result JSON).
+pub const VALID_7093: &str = "SCP-VALID-7093";
+/// Trust-admission input encoding error (Swift-SDK-emitted: the shared
+/// trust-admission encoder failed to produce UTF-8 JSON).
+pub const VALID_7094: &str = "SCP-VALID-7094";
+/// `ParticipationProfile` byte-length validation error (Swift-SDK-emitted:
+/// `eventLogRoot`/`signerPublicKey` must be 32 bytes, `signature` 64 bytes).
+pub const VALID_7095: &str = "SCP-VALID-7095";
+/// `ChallengeVerification` byte-length validation error (Swift-SDK-emitted:
+/// `verifierSignature` must be 64 bytes).
+pub const VALID_7096: &str = "SCP-VALID-7096";
+/// Aggregate-trust-input byte-length validation error (Swift-SDK-emitted:
+/// `EventLogEntry.prevHash` and the Merkle root must be 32 bytes,
+/// `EventLogEntry.signature` 64 bytes).
+pub const VALID_7097: &str = "SCP-VALID-7097";
+/// Challenge verify-input byte-length validation error (Swift-SDK-emitted:
+/// `ChallengeRequest`/`ChallengeResponse` `signature` must be 64 bytes).
+pub const VALID_7098: &str = "SCP-VALID-7098";
 /// Handle/petname DID validation error.
 pub const VALID_7110: &str = "SCP-VALID-7110";
 /// Handle/petname alias validation error.
@@ -950,6 +1080,13 @@ pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
 
 /// Economy insufficient balance.
 pub const ECON_12061: &str = "SCP-ECON-12061";
+/// Economy amount-display formatting: unknown currency, no decimals override.
+///
+/// Raised by the SDK `format`/`formatAmount` display helpers when a currency
+/// is not in the SDK's known-currency decimals table and no explicit
+/// `decimals` override was supplied (ADR-060 SDK display surface). SDK-side
+/// only — the protocol does not store per-currency decimals.
+pub const ECON_12070: &str = "SCP-ECON-12070";
 /// Economy governance action spending error.
 pub const ECON_12090: &str = "SCP-ECON-12090";
 /// Economy context operation spending error.
@@ -958,3 +1095,29 @@ pub const ECON_12091: &str = "SCP-ECON-12091";
 pub const ECON_12095: &str = "SCP-ECON-12095";
 /// Economy budget exceeded error.
 pub const ECON_12096: &str = "SCP-ECON-12096";
+
+// -------------------------------------------------------------------------
+// Cross-context outlet-invocation saga (SCP-SAGA- 13000--13999)
+// -------------------------------------------------------------------------
+//
+// The §6.2.4 / ADR-049 §3a saga terminal codes the FFI saga surface maps the
+// typed `SagaError` onto. All registered in `.docs/standards/sdk-common.md`;
+// band-validated by `scripts/check-error-codes.sh` (13000--13999). The
+// `Aborted` arm's specific sub-code (e.g. 13050/13062/13067) is formatted
+// inline from the producer's numeric `code` discriminant — these named
+// constants pin the two FIXED terminal codes (`NeedsRepair`, `Busy`) plus the
+// caller-axis authorization code the bridge's channel-auth binding reuses.
+
+/// Saga caller-axis authorize-before-reserve rejection.
+///
+/// The initiator is not authorized to act over the named caller context. The
+/// bridge reuses this for its channel-auth binding (`caller_did` not hosted by
+/// this bridge instance, or not a member of `caller_context_id`) ⇒ a
+/// `Rejected`-flavored `SagaAborted`.
+pub const SAGA_13050: &str = "SCP-SAGA-13050";
+/// Saga `NeedsRepair` terminal — Commit-retry exhausted; the saga diverged and
+/// requires operator repair (carries the durable `saga_id`).
+pub const SAGA_13065: &str = "SCP-SAGA-13065";
+/// Saga `Busy` terminal — the participant context set overlapped an in-flight
+/// saga (per-participant-context-set gating, §5.15.4).
+pub const SAGA_13066: &str = "SCP-SAGA-13066";

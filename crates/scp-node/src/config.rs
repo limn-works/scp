@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use scp_core::store::ProtocolRepository;
-use scp_identity::document::DidDocument;
+use scp_did::DidDocument;
 use scp_identity::{DidMethod, ScpIdentity};
 use scp_platform::EncryptedStorage;
 use scp_platform::traits::{KeyCustody, Storage};
@@ -199,20 +199,42 @@ pub enum TlsMode {
 /// Which DHT client a node (or hosted site) uses to publish (or not publish) its
 /// DID document.
 ///
-/// The default is [`Memory`](DhtMode::Memory) (fail-safe — nothing is
-/// published). Selecting [`Production`](DhtMode::Production) is a deliberate,
-/// explicit opt-in to publishing the node's public address bound to its DID, so
-/// the privacy-worst behavior is never the path of least resistance (ADR-052
-/// M2). Promoted here from `self_host.rs` so the Node ([`NodeConfig`]) and the
+/// The default is [`Disabled`](DhtMode::Disabled) (the fail-safe no-publish
+/// value): the DHT layer is turned off — the node publishes nothing (so it
+/// discloses no address) and its DHT-arm resolution is honestly empty
+/// (`Ok(None)`, never a fabricated or in-memory answer). Selecting
+/// [`Production`](DhtMode::Production) is a deliberate, explicit opt-in to
+/// publishing the node's public address bound to its DID, so the privacy-worst
+/// behavior is never the path of least resistance (ADR-052 M2).
+///
+/// The former default, [`Memory`](DhtMode::Memory), is now **test-harness-only**
+/// (compiled only under `feature = "testing"`): its in-memory client is a
+/// §17.17.3 resolve nullifier — it publishes to and resolves from a process-local
+/// map no peer ever sees, silently emptying the DHT resolution namespace
+/// (ADR-062 §Decision 1, D-B). `Disabled` replaces it as the shipped no-publish
+/// value: same *disclosure* fail-safe (nothing published), but honest on resolve.
+///
+/// Promoted here from `self_host.rs` so the Node ([`NodeConfig`]) and the
 /// hosted-site ([`crate::HostSiteConfig`]) construction surfaces share **one**
 /// definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DhtMode {
-    /// In-memory DHT client: the DID document is NEVER published to the
-    /// network. The fail-safe default — used for local development and offline
-    /// testing, and whenever the caller has not consciously opted into
-    /// publishing.
+    /// DHT layer disabled: the DID document is NEVER published (no address
+    /// disclosed — fail-closed on publish), and the DHT resolution arm
+    /// contributes an honest `Ok(None)`. The **fail-safe default** and the
+    /// shipped no-publish value; DID resolution composes the relay layer around
+    /// the off DHT arm (A2).
     #[default]
+    Disabled,
+    /// **Test-harness-only** in-memory DHT client (a §17.17.3 resolve nullifier).
+    /// Publishes to / resolves from a process-local map — no peer ever sees it.
+    /// Compiled only under `feature = "testing"` — the **single** activation path
+    /// (ADR-062 §Decision 1 / A5; never a bare `#[cfg(test)]` disjunct, which is a
+    /// second path invisible to G1's feature-graph check); never a shipped runtime
+    /// option. In-crate tests activate it via the `scp-dht`/self `testing`
+    /// dev-dependency. Use [`Disabled`](DhtMode::Disabled) for the shipped
+    /// no-publish behavior.
+    #[cfg(feature = "testing")]
     Memory,
     /// Production pkarr client: publishes the node's DID document (and thus its
     /// address) to the global Mainline DHT. This is the correct mode for a
@@ -221,7 +243,7 @@ pub enum DhtMode {
     /// Production mode publishes the host's public address bound to the node DID
     /// to the global Mainline DHT — an approximate-location / IP-to-identity
     /// disclosure. Select it only as a deliberate opt-in to public hosting; use
-    /// [`Memory`](DhtMode::Memory) for local/dev so nothing is published.
+    /// [`Disabled`](DhtMode::Disabled) for local/dev so nothing is published.
     Production,
 }
 
@@ -278,6 +300,7 @@ pub enum NatSlot {
 ///     Reach::Local,
 ///     IdentitySource::Generate { custody, did_method },
 ///     storage,
+///     BlobStorageBackend::in_memory(), // durability-only arm, selected explicitly
 /// )).await?;
 /// ```
 ///
@@ -286,9 +309,9 @@ pub enum NatSlot {
 /// A publicly reachable node on a domain should publish its address so peers can
 /// discover it via `did:dht`, which means opting into `DhtMode::Production`
 /// **explicitly** — publishing your location to the DHT is a deliberate opt-in
-/// (M2), never a silent default. (Leaving the default `DhtMode::Memory` is still
-/// valid — it just means "reachable, but not published to the DHT; share the
-/// address out-of-band" — the more-private choice, never an error.)
+/// (M2), never a silent default. (Leaving the default `DhtMode::Disabled` is
+/// still valid — it just means "reachable, but not published to the DHT; share
+/// the address out-of-band" — the more-private choice, never an error.)
 ///
 /// ```ignore
 /// let node = Node::start(NodeConfig {
@@ -298,6 +321,7 @@ pub enum NatSlot {
 ///         Reach::Domain { domain: "example.com".into() },
 ///         IdentitySource::Generate { custody, did_method },
 ///         storage,
+///         BlobStorageBackend::sqlite(&blob_db)?, // durable backend for a public node
 ///     )
 /// }).await?;
 /// ```
@@ -323,12 +347,23 @@ pub struct NodeConfig<
     pub tls: TlsMode,
     /// Whether the node publishes its DID document to the DHT.
     ///
-    /// Advisory in P1: the actual Memory-vs-Production DHT-client selection
-    /// lives in the concrete `D` (DID method) the caller passes. This field
-    /// records the intent and defaults to the fail-safe [`DhtMode::Memory`]
-    /// (no publish — M2); it is **not** yet wired to a builder setter, because
-    /// the existing builder has no DHT setter. It is carried so the config is
-    /// shape-complete and forward-compatible.
+    /// **Load-bearing** (not advisory): this field drives the publish decision.
+    /// `Node::start` routes every publishing build path — the no-domain reaches
+    /// (`build_no_domain_inner`), the `Reach::Domain` TLS-success path
+    /// (`build_domain_inner`), and the TLS-failure fall-through — through
+    /// `publish_did_document_for_mode(dht, …)`: [`DhtMode::Disabled`] (the
+    /// fail-safe default, M2 — no publish, no address disclosed) SKIPS the
+    /// publish and the node still starts; [`DhtMode::Production`] (and the
+    /// test-only `Memory`) publish FATALLY (a genuine publish failure fails the
+    /// node closed rather than advertising a false discoverability guarantee).
+    ///
+    /// `dht` and the concrete DID-method client `D` the caller passes are **two
+    /// independent knobs** that callers keep consistent: a Pkarr `D` paired with
+    /// `dht: Disabled` builds a real client but never publishes (the publish is
+    /// skipped); a `DisabledDhtClient` `D` paired with `dht: Production` would
+    /// try to publish through a client whose `publish` fails closed — so the two
+    /// must agree (the `host_site` path enforces this by threading one `DhtMode`
+    /// into both, see `dispatch_hosted_site_by_dht_mode` / `build_host_site_node`).
     pub dht: DhtMode,
 
     // --- Defaulted optionals (mirror the builder's Option fields) ---
@@ -342,11 +377,14 @@ pub struct NodeConfig<
     pub cors_origins: Option<Vec<String>>,
     /// DHT gateway URLs.
     ///
-    /// Advisory in P1, paired with [`dht`](Self::dht): the existing builder has
-    /// no `dht_gateways` setter, so this field is carried but inert (the actual
-    /// gateway wiring lives in the concrete `D` the caller passes). Defaults to
-    /// an empty vec.
-    // shape-complete per ADR-052; wired to the DHT method in P3
+    /// Paired with [`dht`](Self::dht): carried but **not yet threaded end-to-end**
+    /// on the `Node::start` path — it is dropped in `split_config` and the actual
+    /// gateway wiring currently lives in the concrete `D` the caller passes (the
+    /// `host_site` path threads its own `dht_gateways` into `build_pkarr_client`,
+    /// validated via the shared `scp_dht::validate_gateway_url` contract).
+    /// End-to-end wiring here + the unified FFI-SDK gateway-config surface are
+    /// tracked follow-up work. Defaults to an empty vec.
+    // shape-complete per ADR-052; end-to-end wiring tracked in — see #2153
     pub dht_gateways: Vec<String>,
     /// Per-IP rate limit for broadcast projection endpoints (`None` = default).
     pub projection_rate_limit: Option<u32>,
@@ -361,34 +399,58 @@ pub struct NodeConfig<
     pub nat: NatSlot,
     /// Network change detector for tier re-evaluation (§10.12.1, SCP-243).
     pub network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    /// Blob storage backend for the relay. `None` preserves the builder's
-    /// in-memory default; `Some` overrides it.
-    pub blob_storage: Option<BlobStorageBackend>,
+    /// Blob storage backend for the relay.
+    ///
+    /// **Required, irreducible selection** (SCP-CAPINJECT-010 / ADR-062
+    /// §Decision 5; spec §17.17.1). This is a non-`Option` field for the same
+    /// reason `reach`/`identity`/`storage` are (M4): the relay's blob backend is
+    /// a provider-capability choice the runtime MUST NOT manufacture
+    /// (SCP-CAPSEL-8002), default (SCP-CAPSEL-8000), or fall back to
+    /// (SCP-CAPSEL-8001). The caller selects it explicitly at this construction
+    /// boundary. [`BlobStorageBackend::in_memory`] is a durability-only
+    /// development arm (SCP-CAPSEL-8010/8011) — legitimately selectable here, but
+    /// only ever by explicit choice, never by omission. Production nodes select a
+    /// durable backend (Sqlite/redb/Postgres/S3; see spec §17.7).
+    pub blob_storage: BlobStorageBackend,
 }
 
 impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
     /// Constructs a [`NodeConfig`] from the irreducible required fields, filling
     /// every other field with its **fail-safe** default (ADR-052 M4).
     ///
-    /// Fail-safe defaults: `tls = TlsMode::SelfSigned`, `dht = DhtMode::Memory`
+    /// Fail-safe defaults: `tls = TlsMode::SelfSigned`, `dht = DhtMode::Disabled`
     /// (no publish), every `Option` = `None`, `dht_gateways = []`,
     /// `nat = NatSlot::Auto`.
     ///
-    /// This enables the spread idiom. Because `reach`/`identity`/`storage` are
-    /// moved into the returned struct, the caller passes *separate* values to
-    /// `defaults(...)` than the fields it overrides:
+    /// This enables the spread idiom. Because `reach`/`identity`/`storage`/
+    /// `blob_storage` are moved into the returned struct, the caller passes
+    /// *separate* values to `defaults(...)` than the fields it overrides:
     ///
     /// ```ignore
-    /// NodeConfig { tls: TlsMode::Acme { email }, ..NodeConfig::defaults(reach2, identity2, storage2) }
+    /// NodeConfig {
+    ///     tls: TlsMode::Acme { email },
+    ///     ..NodeConfig::defaults(reach2, identity2, storage2, blob_storage2)
+    /// }
     /// ```
+    ///
+    /// `blob_storage` is a required argument (not defaulted) because the relay's
+    /// blob backend is an irreducible provider-capability selection the runtime
+    /// must never manufacture (SCP-CAPINJECT-010 / spec §17.17.1). A local demo
+    /// selects the durability-only arm explicitly:
+    /// `NodeConfig::defaults(reach, identity, storage, BlobStorageBackend::in_memory())`.
     #[must_use]
-    pub fn defaults(reach: Reach, identity: IdentitySource<K, D>, storage: S) -> Self {
+    pub fn defaults(
+        reach: Reach,
+        identity: IdentitySource<K, D>,
+        storage: S,
+        blob_storage: BlobStorageBackend,
+    ) -> Self {
         Self {
             reach,
             identity,
             storage,
             tls: TlsMode::SelfSigned,
-            dht: DhtMode::Memory,
+            dht: DhtMode::Disabled,
             bind_addr: None,
             local_api: None,
             http_bind_addr: None,
@@ -400,7 +462,7 @@ impl<K: KeyCustody, D: DidMethod, S: Storage> NodeConfig<K, D, S> {
             http3: None,
             nat: NatSlot::Auto,
             network_detector: None,
-            blob_storage: None,
+            blob_storage,
         }
     }
 }
@@ -448,6 +510,11 @@ impl TlsProvider for SelfSignedTlsProvider {
 struct ConfigTail {
     reach: Reach,
     tls: TlsMode,
+    /// The configured DHT mode, threaded through to the no-domain publish step
+    /// so the publish decision is fail-closed for a publishing node and
+    /// fail-safe (no publish) for a `Disabled` node. See
+    /// [`build_no_domain_inner`](crate::build_no_domain_inner).
+    dht: DhtMode,
     bind_addr: Option<SocketAddr>,
     local_api: Option<SocketAddr>,
     http_bind_addr: Option<SocketAddr>,
@@ -458,7 +525,9 @@ struct ConfigTail {
     http3: Option<scp_transport::http3::Http3Config>,
     nat: NatSlot,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    blob_storage: Option<BlobStorageBackend>,
+    /// The caller's explicit blob backend selection, threaded verbatim to the
+    /// relay build (never defaulted/fallen-back — SCP-CAPINJECT-010).
+    blob_storage: BlobStorageBackend,
 }
 
 /// Validates the config, returning a loud error for contradictory combinations
@@ -490,16 +559,17 @@ struct ConfigTail {
 /// {`SelfSigned`, `Acme`, `Terminated`}; non-`Domain` + {`SelfSigned`,
 /// `Plaintext`, `Terminated`}.
 ///
-/// There is **no** second (DHT) validity axis. `DhtMode::Memory` (do not publish
-/// the DID document to the DHT) is the fail-safe, non-disclosing direction and
-/// is therefore valid for **every** `Reach`, including a publishing-capable
-/// reach (`Reach::Domain` / `Reach::NatTraversal`): "publicly reachable, but the
-/// address is not published to the DHT; share it out-of-band" is a legitimate,
-/// more-private config. Per `.docs/standards/construction.md` M2, the
-/// security-critical direction is *disclosure*, and only `DhtMode::Production`
-/// discloses — which is already a deliberate, explicit opt-in (`Memory` is the
-/// default). Erroring on `Memory` would reject the safe direction and nudge
-/// callers toward the disclosing one, so it is never rejected here.
+/// There is **no** second (DHT) validity axis. `DhtMode::Disabled` (do not
+/// publish the DID document to the DHT) is the fail-safe, non-disclosing
+/// direction and is therefore valid for **every** `Reach`, including a
+/// publishing-capable reach (`Reach::Domain` / `Reach::NatTraversal`): "publicly
+/// reachable, but the address is not published to the DHT; share it
+/// out-of-band" is a legitimate, more-private config. Per
+/// `.docs/standards/construction.md` M2, the security-critical direction is
+/// *disclosure*, and only `DhtMode::Production` discloses — which is already a
+/// deliberate, explicit opt-in (`Disabled` is the default). Erroring on
+/// `Disabled` would reject the safe direction and nudge callers toward the
+/// disclosing one, so it is never rejected here.
 fn validate_config(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
     // TLS axis, rule 1: Domain cannot serve plaintext.
     if matches!(reach, Reach::Domain { .. }) && matches!(tls, TlsMode::Plaintext) {
@@ -533,8 +603,11 @@ fn validate_config(reach: &Reach, tls: &TlsMode) -> Result<(), NodeError> {
 ///
 /// Shared by both entry points ([`Node::start`] / [`Node::start_for_testing`])
 /// so the ~37-line destructure + `ConfigTail` rebuild lives in exactly one place
-/// (DRY). The advisory `dht` / `dht_gateways` fields are dropped here (the
-/// concrete `D` selects Memory vs Production; there is no builder setter yet).
+/// (DRY). The `dht` mode is captured into [`ConfigTail`] and consumed at **every**
+/// publish step — the no-domain reaches AND the `Reach::Domain` TLS-success path
+/// (`build_domain_inner`) — where it decides fail-closed publish vs fail-safe
+/// no-publish. The `dht_gateways` field is still dropped here (not yet threaded
+/// end-to-end on the `Node::start` path — see #2153).
 ///
 /// `validate_config` borrows `config.reach` / `config.tls` and so MUST run
 /// **before** this function moves `config` — callers keep that ordering.
@@ -546,9 +619,11 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
         identity,
         storage,
         tls,
-        // `dht` and `dht_gateways` are advisory in P1 (the concrete `D`
-        // selects Memory vs Production); they have no builder setter yet.
-        dht: _,
+        // `dht` is captured into `ConfigTail` and consumed at every publish step
+        // (fail-closed publish for a publishing node, fail-safe no-publish for
+        // `Disabled`) — the no-domain reaches AND the `Reach::Domain` TLS-success
+        // path. `dht_gateways` is not yet threaded end-to-end here — see #2153.
+        dht,
         dht_gateways: _,
         bind_addr,
         local_api,
@@ -566,6 +641,7 @@ fn split_config<K: KeyCustody, D: DidMethod, S: Storage>(
     let tail = ConfigTail {
         reach,
         tls,
+        dht,
         bind_addr,
         local_api,
         http_bind_addr,
@@ -720,6 +796,7 @@ where
     let ConfigTail {
         reach,
         tls,
+        dht,
         bind_addr,
         local_api,
         http_bind_addr,
@@ -745,6 +822,7 @@ where
                 did_method,
                 reach,
                 tls,
+                dht,
                 bind_addr,
                 local_api,
                 http_bind_addr,
@@ -777,6 +855,7 @@ where
                 identity,
                 document,
                 did_method,
+                dht,
                 bind_addr,
                 local_api,
                 http_bind_addr,
@@ -807,6 +886,7 @@ async fn build_node_domain<D, S>(
     did_method: Arc<D>,
     reach: Reach,
     tls: TlsMode,
+    dht: DhtMode,
     bind_addr: Option<SocketAddr>,
     local_api: Option<SocketAddr>,
     http_bind_addr_opt: Option<SocketAddr>,
@@ -816,7 +896,7 @@ async fn build_node_domain<D, S>(
     #[cfg(feature = "http3")] http3: Option<scp_transport::http3::Http3Config>,
     nat: NatSlot,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    blob_storage_opt: Option<BlobStorageBackend>,
+    blob_storage: BlobStorageBackend,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
     D: DidMethod + 'static,
@@ -866,7 +946,9 @@ where
         ..RelayConfig::default()
     };
 
-    let blob_storage = Arc::new(blob_storage_opt.unwrap_or_default());
+    // The caller's explicit blob-backend selection, threaded verbatim — never
+    // defaulted or fallen-back (SCP-CAPINJECT-010 / SCP-CAPSEL-8002).
+    let blob_storage = Arc::new(blob_storage);
     let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
     let connection_tracker = relay_server.connection_tracker();
     let subscription_registry = relay_server.subscriptions();
@@ -896,6 +978,12 @@ where
                 identity,
                 document,
                 did_method,
+                // Thread the configured `DhtMode` so the TLS-success domain path
+                // honors it: `Disabled` (the legitimate more-private `Domain +
+                // Disabled` config, M2) SKIPS publish and the node still starts;
+                // `Production`/`Memory` publish fatally. Previously this path
+                // published unconditionally + fatally, ignoring `config.dht`.
+                dht,
                 protocol_repository,
                 shutdown_handle,
                 bound_addr,
@@ -928,6 +1016,10 @@ where
                 identity,
                 document,
                 did_method,
+                // A Domain+Production node that falls through here (TLS
+                // provisioning failed) still owes a DHT publish; threading `dht`
+                // keeps that publish fail-closed instead of silently dropped.
+                dht,
                 protocol_repository,
                 shutdown_handle,
                 bound_addr,
@@ -965,6 +1057,7 @@ async fn build_node_no_domain<D, S>(
     identity: ScpIdentity,
     document: DidDocument,
     did_method: Arc<D>,
+    dht: DhtMode,
     bind_addr: Option<SocketAddr>,
     local_api: Option<SocketAddr>,
     http_bind_addr: Option<SocketAddr>,
@@ -973,7 +1066,7 @@ async fn build_node_no_domain<D, S>(
     #[cfg(feature = "http3")] _http3: Option<scp_transport::http3::Http3Config>,
     nat: NatSlot,
     network_detector: Option<Arc<dyn NetworkChangeDetector>>,
-    blob_storage_opt: Option<BlobStorageBackend>,
+    blob_storage: BlobStorageBackend,
     skip_nat_probe: bool,
 ) -> Result<ApplicationNode<S>, NodeError>
 where
@@ -989,7 +1082,9 @@ where
         ..RelayConfig::default()
     };
 
-    let blob_storage = Arc::new(blob_storage_opt.unwrap_or_default());
+    // The caller's explicit blob-backend selection, threaded verbatim — never
+    // defaulted or fallen-back (SCP-CAPINJECT-010 / SCP-CAPSEL-8002).
+    let blob_storage = Arc::new(blob_storage);
     let relay_server = RelayServer::new(relay_config.clone(), Arc::clone(&blob_storage));
     let connection_tracker = relay_server.connection_tracker();
     let subscription_registry = relay_server.subscriptions();
@@ -1009,6 +1104,7 @@ where
         identity,
         document,
         did_method,
+        dht,
         protocol_repository,
         shutdown_handle,
         bound_addr,
@@ -1159,11 +1255,12 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use scp_clock::SystemClock;
+    use scp_dht::InMemoryDhtClient;
     use scp_identity::DidCache;
-    use scp_identity::cache::SystemClock;
     use scp_identity::dht::DidDht;
-    use scp_identity::dht_client::InMemoryDhtClient;
-    use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+    use scp_platform::in_memory::InMemoryStorage;
+    use scp_platform::testing::InMemoryKeyCustody;
 
     use crate::ReachabilityTier;
 
@@ -1239,6 +1336,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1287,6 +1385,7 @@ mod tests {
                     },
                 )),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1324,6 +1423,7 @@ mod tests {
                 Reach::NatTraversal,
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1355,6 +1455,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1380,7 +1481,12 @@ mod tests {
     async fn local_skips_nat_and_builds() {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
         .unwrap();
@@ -1421,6 +1527,7 @@ mod tests {
                     did_method: Arc::clone(&did_method),
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1442,6 +1549,7 @@ mod tests {
                     did_method,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1464,7 +1572,12 @@ mod tests {
             tls: TlsMode::Acme {
                 email: Some("spread@example.com".to_owned()),
             },
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         };
         // The override took effect.
         assert!(matches!(config.tls, TlsMode::Acme { .. }));
@@ -1474,10 +1587,15 @@ mod tests {
 
     #[test]
     fn defaults_are_fail_safe() {
-        let c = NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new());
+        let c = NodeConfig::defaults(
+            Reach::Local,
+            generate_identity(),
+            InMemoryStorage::new(),
+            BlobStorageBackend::in_memory(),
+        );
         assert!(matches!(c.tls, TlsMode::SelfSigned), "tls fail-safe");
         assert!(
-            matches!(c.dht, DhtMode::Memory),
+            matches!(c.dht, DhtMode::Disabled),
             "dht fail-safe (no publish)"
         );
         assert!(matches!(c.nat, NatSlot::Auto), "nat fail-safe");
@@ -1488,7 +1606,12 @@ mod tests {
         assert!(c.projection_rate_limit.is_none());
         assert!(c.dns_provider.is_none());
         assert!(c.network_detector.is_none());
-        assert!(c.blob_storage.is_none());
+        // `blob_storage` is now a required, explicit selection (no default) — it
+        // holds exactly the arm the caller passed (SCP-CAPINJECT-010).
+        assert!(
+            matches!(c.blob_storage, BlobStorageBackend::InMemory(_)),
+            "blob_storage holds the explicitly-selected in-memory arm"
+        );
         assert!(c.dht_gateways.is_empty());
         #[cfg(feature = "http3")]
         assert!(c.http3.is_none());
@@ -1506,6 +1629,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await;
@@ -1516,11 +1640,11 @@ mod tests {
         );
     }
 
-    // --- Test 11: Domain + DhtMode::Memory is VALID (the fail-safe direction) --
+    // --- Test 11: Domain + DhtMode::Disabled is VALID (the fail-safe direction) --
 
     #[tokio::test]
     async fn domain_plus_dht_memory_is_valid() {
-        // `NodeConfig::defaults` yields `dht: DhtMode::Memory`. `DhtMode::Memory`
+        // `NodeConfig::defaults` yields `dht: DhtMode::Disabled`. `DhtMode::Disabled`
         // (do not publish the address to the DHT) is the fail-safe, non-disclosing
         // direction and is valid for EVERY reach, including a publishing-capable
         // `Reach::Domain`: "reachable on the domain, but the address is not
@@ -1536,12 +1660,13 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
-        .expect("Domain + DhtMode::Memory is the fail-safe direction and must be valid");
+        .expect("Domain + DhtMode::Disabled is the fail-safe direction and must be valid");
 
-        // The successful build IS the proof that `DhtMode::Memory` is accepted on
+        // The successful build IS the proof that `DhtMode::Disabled` is accepted on
         // a publishing-capable `Reach::Domain` (it would have returned
         // `InvalidConfig` under the old, inverted rule). The domain still lowers.
         assert_eq!(
@@ -1552,11 +1677,11 @@ mod tests {
         node.shutdown();
     }
 
-    // --- Test 12: NatTraversal + DhtMode::Memory is VALID --------------------
+    // --- Test 12: NatTraversal + DhtMode::Disabled is VALID --------------------
 
     #[tokio::test]
     async fn nat_traversal_plus_dht_memory_is_valid() {
-        // `Reach::NatTraversal` + `DhtMode::Memory` is the first-class
+        // `Reach::NatTraversal` + `DhtMode::Disabled` is the first-class
         // "reachable-but-not-DHT-discoverable" config: publicly reachable via NAT
         // traversal, but the address is NOT published to the DHT (share it
         // out-of-band). `Memory` is the fail-safe, non-disclosing direction and
@@ -1572,12 +1697,13 @@ mod tests {
                 Reach::NatTraversal,
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
-        .expect("NatTraversal + DhtMode::Memory is the reachable-but-unpublished config and must be valid");
+        .expect("NatTraversal + DhtMode::Disabled is the reachable-but-unpublished config and must be valid");
 
-        // The successful build IS the proof that `DhtMode::Memory` is accepted on
+        // The successful build IS the proof that `DhtMode::Disabled` is accepted on
         // the publishing-capable `Reach::NatTraversal` (the old, inverted rule
         // returned `InvalidConfig` here).
         assert!(
@@ -1587,11 +1713,11 @@ mod tests {
         node.shutdown();
     }
 
-    // --- Test 13: Tunnel / Local + DhtMode::Memory is VALID -------------------
+    // --- Test 13: Tunnel / Local + DhtMode::Disabled is VALID -------------------
 
     #[tokio::test]
     async fn tunnel_and_local_with_dht_memory_are_valid() {
-        // `DhtMode::Memory` (the defaults' dht) is the fail-safe, non-disclosing
+        // `DhtMode::Disabled` (the defaults' dht) is the fail-safe, non-disclosing
         // direction and is valid for every reach. Tunnel and Local publish a
         // loopback URL, so Memory is the natural choice there. Together with
         // Tests 11/12 (Domain / NatTraversal + Memory) this covers Memory across
@@ -1604,19 +1730,25 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
-        .expect("Tunnel + DhtMode::Memory is a non-publishing reach and must be valid");
+        .expect("Tunnel + DhtMode::Disabled is a non-publishing reach and must be valid");
         assert!(tunnel.domain().is_none());
         tunnel.shutdown();
 
         let local = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
-        .expect("Local + DhtMode::Memory is a non-publishing reach and must be valid");
+        .expect("Local + DhtMode::Disabled is a non-publishing reach and must be valid");
         assert!(local.domain().is_none());
         local.shutdown();
     }
@@ -1631,7 +1763,7 @@ mod tests {
         // (stun_server / bridge_relay / port_mapper / reachability_probe) are
         // applied to the builder, but `select_tier` is never called → no STUN.
         // A successful build proves all four `apply_nat` Tuned setters lower
-        // without panicking and the builder accepts them. DhtMode::Memory (the
+        // without panicking and the builder accepts them. DhtMode::Disabled (the
         // default) is valid for every reach, including Local.
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -1641,7 +1773,12 @@ mod tests {
                 port_mapper: None,
                 reachability_probe: None,
             },
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
         .expect("NatSlot::Tuned overrides should lower and build offline on a Local reach");
@@ -1653,35 +1790,36 @@ mod tests {
         node.shutdown();
     }
 
-    // --- Test 15: blob_storage Some overrides, None preserves the default -----
+    // --- Test 15: blob_storage is an explicit, required durability-only choice --
 
+    /// SCP-CAPINJECT-010 AC3: `InMemoryBlobStorage` remains a legitimate,
+    /// **explicitly-selected** durability-only backend (SCP-CAPSEL-8010/8011). A
+    /// node built with an explicit `BlobStorageBackend::in_memory()` selection
+    /// still builds and serves — proving the durability-only arm stays reachable
+    /// by explicit choice. There is deliberately no "None preserves default" case
+    /// anymore: `blob_storage` is a required, non-`Option` field, so there is no
+    /// omit-the-field / silent-default shape to test (that shape was the removed
+    /// SCP-CAPSEL-8011 violation).
     #[tokio::test]
-    async fn blob_storage_some_overrides_and_none_preserves_default() {
-        // Some(...) overrides the builder's in-memory default; None preserves it
-        // (the builder's `new()` sets `Some(BlobStorageBackend::default())`, so
-        // the None path must NOT clear the relay's blob storage). Both paths
-        // build on a Local (non-publishing) reach, which is the observable proof:
-        // the None path did not break the build by clearing blob storage. We do
-        // not assert the private backend value — only what is observable.
-        let with_some = Node::start_for_testing(NodeConfig {
+    async fn blob_storage_in_memory_is_explicitly_selectable() {
+        // Build on a Local (non-publishing) reach with an EXPLICIT in-memory blob
+        // backend. A successful build + serve is the observable proof that the
+        // durability-only arm is still selectable; we do not assert the private
+        // backend value — only what is observable.
+        let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            blob_storage: Some(BlobStorageBackend::default()),
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                // The required, explicit durability-only selection.
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
-        .expect("blob_storage: Some(default) should override and build");
-        assert!(with_some.domain().is_none());
-        with_some.shutdown();
-
-        let with_none = Node::start_for_testing(NodeConfig {
-            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            blob_storage: None,
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
-        })
-        .await
-        .expect("blob_storage: None should preserve the builder default and build");
-        assert!(with_none.domain().is_none());
-        with_none.shutdown();
+        .expect("an explicit in-memory blob backend should build and serve");
+        assert!(node.domain().is_none());
+        node.shutdown();
     }
 
     // --- Test 16: Persisted rejects mismatched custody through Node::start -----
@@ -1709,6 +1847,7 @@ mod tests {
                     did_method: did_method_a,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1731,6 +1870,7 @@ mod tests {
                     did_method: did_method_b,
                 },
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await;
@@ -1775,6 +1915,7 @@ mod tests {
                 },
                 generate_identity(),
                 Arc::clone(&storage),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1819,6 +1960,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1861,6 +2003,7 @@ mod tests {
                 },
                 generate_identity(),
                 InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
             )
         })
         .await
@@ -1894,7 +2037,12 @@ mod tests {
             tls: TlsMode::Acme {
                 email: Some("admin@example.com".to_owned()),
             },
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await;
 
@@ -1933,7 +2081,12 @@ mod tests {
                 tls: TlsMode::Acme {
                     email: Some("admin@example.com".to_owned()),
                 },
-                ..NodeConfig::defaults(reach, generate_identity(), InMemoryStorage::new())
+                ..NodeConfig::defaults(
+                    reach,
+                    generate_identity(),
+                    InMemoryStorage::new(),
+                    BlobStorageBackend::in_memory(),
+                )
             })
             .await;
 
@@ -1988,7 +2141,12 @@ mod tests {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             tls: TlsMode::Plaintext,
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
         .expect("Local + Plaintext is a non-Domain no-op TLS build and must succeed");
@@ -2010,7 +2168,12 @@ mod tests {
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             tls: TlsMode::Terminated,
-            ..NodeConfig::defaults(Reach::Local, generate_identity(), InMemoryStorage::new())
+            ..NodeConfig::defaults(
+                Reach::Local,
+                generate_identity(),
+                InMemoryStorage::new(),
+                BlobStorageBackend::in_memory(),
+            )
         })
         .await
         .expect("Local + Terminated is a non-Domain no-op TLS build and must succeed");

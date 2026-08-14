@@ -8,16 +8,18 @@
 //! `(&mut PerContextState, &ActorDeps, TrustRecoveryCommand)` and routes
 //! per-context variants to the migrated state-owning helpers in
 //! [`crate::context::trust_recovery_helpers`]. The cross-context
-//! `RecoveryNotifyContact` variant cannot be handled inside one actor's
-//! mailbox turn because it scans every context for shared membership;
-//! that variant is rejected here with a `NotImplemented` reply (the
-//! supervisor's [`dispatch_trust_recovery_command`] routes it through
-//! [`Supervisor::dispatch_trust_recovery_direct`] before the
-//! per-context mailbox lookup).
+//! `RecoveryNotifyContact` variant drives a shared-context scan and
+//! fan-out through the actor's `ActorDeps` bundle
+//! (see [`handle_recovery_notify_contact`]); the supervisor's
+//! [`dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command)
+//! intercepts it and routes it through the supervisor-side
+//! `Supervisor::dispatch_trust_recovery_direct` before the
+//! per-context mailbox lookup, so the actor arm is the direct-path
+//! twin rather than a rejection stub.
 //!
 //! The handler-side shim (`dispatch_from_shim`) was deleted in Phase 2A
 //! finalization. The no-mailbox-context fallback now lives on
-//! [`Supervisor::dispatch_trust_recovery_direct`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_direct).
+//! `Supervisor::dispatch_trust_recovery_direct`.
 //!
 //! Each per-call invocation is wrapped in a 30-second
 //! [`tokio::time::timeout`] budget per ADR-049 §7.
@@ -41,17 +43,16 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatch a [`TrustRecoveryCommand`] against actor-owned state.
 ///
-/// # `RecoveryNotifyContact` and `Placeholder`
+/// # `RecoveryNotifyContact`
 ///
-/// `RecoveryNotifyContact` requires cross-context fan-out and is not
-/// handled inside an actor's mailbox turn — it is intercepted by
+/// `RecoveryNotifyContact` requires cross-context fan-out. The
+/// supervisor's
 /// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command)
-/// and routed through the cross-context direct path before any
-/// per-context actor lookup. If a caller mistakenly routes it here,
-/// the handler replies [`ContextError::NotImplemented`].
-///
-/// `Placeholder` exists for mailbox-pipe smoke tests and replies
-/// `NotImplemented` by design.
+/// intercepts it and routes it through the cross-context direct path
+/// before any per-context actor lookup; the arm here is the actor-shape
+/// twin that performs the same shared-context scan and fan-out via
+/// [`handle_recovery_notify_contact`] when a command does reach the
+/// mailbox.
 pub(crate) async fn dispatch(
     cell: &mut ClassSCell,
     deps: &ActorDeps,
@@ -66,7 +67,6 @@ async fn dispatch_inner(
     cmd: TrustRecoveryCommand,
 ) -> Outcome<()> {
     match cmd {
-        TrustRecoveryCommand::Placeholder { reply } => reply_not_implemented(reply),
         TrustRecoveryCommand::CreateGovernanceCheckpoint { payload, reply } => {
             handle_create_governance_checkpoint(cell, deps, *payload, reply).await
         }
@@ -127,6 +127,7 @@ async fn handle_create_governance_checkpoint(
             &p.creator_did,
             p.creator_signature,
         )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, create_fut).await {
@@ -206,7 +207,7 @@ async fn handle_recovery_advance_epoch(
     reply: oneshot::Sender<Result<u64, ContextError>>,
 ) -> Outcome<()> {
     let advance_fut = async {
-        crate::context::trust_recovery_helpers::recovery_advance_epoch(cell, deps, context_id)
+        crate::context::trust_recovery_helpers::recovery_advance_epoch(cell, deps, context_id).await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, advance_fut).await {
@@ -255,6 +256,7 @@ async fn handle_recovery_send_notification(
             p.sequence,
             &signing_key,
         )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
@@ -341,11 +343,4 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
-}
-
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "TrustRecoveryCommand::Placeholder — mailbox-pipe smoke target; \
-                       no real work performed";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

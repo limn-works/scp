@@ -2,6 +2,7 @@
   "name": "@limn-works/scp-ts",
   "version": "0.1.0",
   "type": "module",
+  "license": "Apache-2.0",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -27,9 +28,6 @@
   "engines": {
     "node": ">=22",
     "bun": ">=1.0"
-  },
-  "dependencies": {
-    "wa-sqlite": "^1.0.0"
   },
   "optionalDependencies": {
     "@limn-works/scp-ts-napi-linux-x64-gnu": "0.1.0",

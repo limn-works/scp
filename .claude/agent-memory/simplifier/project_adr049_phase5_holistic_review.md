@@ -1,0 +1,21 @@
+---
+name: adr049-phase5-holistic-review
+description: ADR-049 Phase 5 final holistic simplifier review verdict — enforcement gates CLEAN (no reframe), but 2 dead Class-S combinators + a dead wrapping-key custody surface + god-FILE supervisor.rs are real scar tissue.
+metadata:
+  type: project
+---
+
+Final Phase-5 holistic review of the COMPLETE ADR-049 actor refactor (worktree @ f2d4e7d0f). Verdict: **core architecture lean and coherent; findings are dead-weight cleanup, NOT structural rot or a BLOCKER.**
+
+**Hunt 1 — enforcement gates: CLEAN, no BLOCKER, approach does NOT need reframing.** Fewer than 3 gates are non-convergent/redundant. Commit churn per gate is low (1-6, none showing "N commits each adding one more spelling"). `check-block-in-place.py` is a per-file monotonic-*decrease* ratchet (closed-by-construction, converging to zero: scp-transport 16→0, store/context.rs 20→8→0). Panic/block-in-place/construction gates catch classes rustc/clippy do NOT soundly forbid → not redundant. Consistent with prior clean audits [[project_codebase_map_gate_audited_clean]], [[project_adr057_t1_noshim_gate]], [[project_commit12_helpers_logic_split]] (pure-helpers), saga-gating-granularity.
+
+**Hunt 3 — Class-S combinators: MEDIUM, over-built by 2 of SIX (hunt said 5; there are 6).** Prod-caller counts: `commit_class_s_keep` 23, `commit_class_s_restore` 5, `commit_class_s_keep_compensating` 1 (reserve_tool_economy), `commit_class_s_keep_restore_split` 1 (saga.rs:1001), **`commit_class_s_compensating` 0, `commit_class_s_then_append` 0** (all their callsites are in `mod tests`, which starts class_s.rs:3817). `then_append` is **provably dead, not just unused**: `FLAG-COMMIT-B` (saga.rs ~1566-1600) documents why the Commit-B path structurally CANNOT use it — then_append KEEPS on persist-fail but Commit-B must RESTORE, and it drops the non-`Clone` `CrossContextToolInvocationPrepared` slot on its early `?`. Production (`commit_b_first_settle`/`commit_b_settle_finalize`) uses a two-combinator restore+keep decomposition instead. Its `#[allow(dead_code)]` reason string is now FALSE. **Recommend: delete `commit_class_s_then_append` + `AppendOutcomeError` + 6 tests (~370 LOC), and `commit_class_s_compensating` + tests (~72 LOC).**
+
+**Hunt 2 — scar tissue:**
+- **MEDIUM-HIGH: dead wrapping-key custody on Supervisor.** `wrapping_keys` field + `set_wrapping_keys` (sole writer) + `wrapping_public_key_for`/`wrapping_secret_key_for` + `SupervisorHandle::my_wrapping_public_key` + `WrappingKeyPair` are TEST-ONLY across crates/+bindings/ — zero prod callers. `#[allow(dead_code)]` at supervisor.rs:2086/2112 says "first caller lands in Phase 2"; it's Phase 5 and `production_backend.rs:1182/1210` self-admit "supervisor `wrapping_keys` is unwired." Reads as live security surface. **Resolution: wire the Phase-2 capability caller now, or delete.** (Completeness/security-adjacent — likely also a completionist finding.)
+- **MEDIUM: supervisor.rs is a god-FILE, not god-object.** 23,804 lines (largest in repo ~3x); ONE undivided `impl Supervisor` block, ~171 methods / ~11K prod LOC (1529-12759). Ownership is coherent (registry+lifecycle+watchdog+dispatch is canonical supervisor scope; the big `_helpers.rs` are correctly-decomposed free fns). But Rust splits an impl across files at ZERO cost — the monolith just accreted. Recommend splitting the impl by concern (accessors/dispatch/actor-lifecycle/key-custody/watchdog). NOT a coupling/correctness defect.
+- **LOW aggregate: 43 stale `#[allow(dead_code)]` in scp-runtime.** Sampled economy_helpers.rs cluster of 9 = all stale (functions have live prod callers, e.g. `void_paid_action` 8 sites). Mechanical sweep: remove allow where a prod caller exists; delete item where none does.
+
+**Hunt 4 — broadcast-failure split: CLEAN, minimal.** `try_broadcast_commit`(async producer)/`apply_broadcast_failure`(sync applier)/`keep_broadcast_failure`(extracted wrapper) — the dedup I flagged last round [[project_adr049_d7_broadcast_split_convergent]] LANDED. Callers 12/8/6. Forced by async-send-outside-sync-closure discipline.
+
+**Not findings:** `_helpers.rs`/`_logic.rs` split is principled (logic files are pure — no `&Supervisor`); no `_legacy` shim files survive (tools_helpers_legacy/broadcast_helpers_legacy gone).

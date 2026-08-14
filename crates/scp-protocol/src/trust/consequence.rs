@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use scp_did::DID;
 use scp_event_log::{Event, EventType};
-use scp_primitives::DID;
 
 // ---------------------------------------------------------------------------
 // ConsequenceValidationError
@@ -86,22 +86,22 @@ pub enum ConsequenceTrigger {
     /// time window. Counted from `EventType::MessageSent` events.
     MessageVelocity,
 
-    /// The subject invoked tools at a rate exceeding the threshold within the
-    /// time window. Counted from `EventType::ToolInvoked` events.
+    /// The subject invoked outlets at a rate exceeding the threshold within the
+    /// time window. Counted from `EventType::OutletInvoked` events.
     ///
     /// # Currently dormant / non-functional
     ///
-    /// This trigger cannot fire today (native AND WASM). It keys on
-    /// `EventType::ToolInvoked`, but per-author `ToolInvoked` is no longer
-    /// durably logged and there is no corresponding `ContextEvent::ToolInvoked`
-    /// variant, so no convergent tool-invocation signal exists in the interim.
-    /// A configured `ToolRateExceeded` rule is therefore a no-op until a
-    /// convergent tool-rate input arrives with the ADR-051 causal-DAG ordering.
+    /// This trigger cannot fire today. It keys on
+    /// `EventType::OutletInvoked`, but per-author `OutletInvoked` is no longer
+    /// durably logged and there is no corresponding `ContextEvent::OutletInvoked`
+    /// variant, so no convergent outlet-invocation signal exists in the interim.
+    /// A configured `OutletRateExceeded` rule is therefore a no-op until a
+    /// convergent outlet-rate input arrives with the ADR-051 causal-DAG ordering.
     /// The variant is retained (removing it is an API change, out of scope) so
-    /// rules remain expressible against the eventual convergent signal. Tool
+    /// rules remain expressible against the eventual convergent signal. Outlet
     /// flooding remains bounded in the interim by the independent hard rate
     /// limit, which does not depend on this trigger.
-    ToolRateExceeded,
+    OutletRateExceeded,
 
     /// The subject accumulated warnings (governance actions against them)
     /// exceeding the threshold within the time window. Counted from
@@ -128,7 +128,7 @@ pub enum ConsequenceTrigger {
 ///   `Custom` (matched against convergent governance-action events). These
 ///   auto-derive identically on every honest member from the convergent log, so
 ///   their consequence leaf converges and is durable.
-/// - **Non-convergent triggers** — `MessageVelocity` and `ToolRateExceeded`. A
+/// - **Non-convergent triggers** — `MessageVelocity` and `OutletRateExceeded`. A
 ///   *rate* (count ÷ time) needs a convergent clock, which the protocol neither
 ///   has (no operator / transport-independent / offline) nor needs. Rate-limiting
 ///   is local flow control (§23.16.8), not a recorded consequence; a durable
@@ -143,7 +143,7 @@ pub enum ConsequenceTrigger {
 pub const fn is_convergent_trigger(trigger: &ConsequenceTrigger) -> bool {
     match trigger {
         ConsequenceTrigger::WarningCount | ConsequenceTrigger::Custom(_) => true,
-        ConsequenceTrigger::MessageVelocity | ConsequenceTrigger::ToolRateExceeded => false,
+        ConsequenceTrigger::MessageVelocity | ConsequenceTrigger::OutletRateExceeded => false,
     }
 }
 
@@ -154,7 +154,7 @@ pub const fn is_convergent_trigger(trigger: &ConsequenceTrigger) -> bool {
 /// trigger threshold.
 ///
 /// Because the evidence is drawn from the shared convergent event log, every
-/// honest member (native or WASM) derives the identical value, keeping the
+/// honest member derives the identical value, keeping the
 /// durable leaf byte-identical across members for the §9.9.3
 /// equal-count/equal-root equivocation test. Only convergent-trigger
 /// consequences reach a durable leaf ([`is_convergent_trigger`]), so the
@@ -173,8 +173,8 @@ pub fn convergent_consequence_timestamp(consequence: &TriggeredConsequence) -> u
 /// field of a durable consequence Merkle-leaf payload
 /// (`scp_event_log::payload::consequence_event_payload`).
 ///
-/// This is the single source of the label so that the native runtime and the
-/// WASM bridge produce byte-identical leaf payloads (§9.9.3 convergence). Note
+/// This is the single source of the label so that all honest members
+/// produce byte-identical leaf payloads (§9.9.3 convergence). Note
 /// the `Custom(key)` arm emits `"Custom:{key}"` — NOT the `{:?}` Debug form
 /// `Custom("{key}")` — because the durable leaf preimage must be a stable,
 /// implementation-independent string.
@@ -182,7 +182,7 @@ pub fn convergent_consequence_timestamp(consequence: &TriggeredConsequence) -> u
 pub fn trigger_kind_str(trigger: &ConsequenceTrigger) -> String {
     match trigger {
         ConsequenceTrigger::MessageVelocity => "MessageVelocity".to_owned(),
-        ConsequenceTrigger::ToolRateExceeded => "ToolRateExceeded".to_owned(),
+        ConsequenceTrigger::OutletRateExceeded => "OutletRateExceeded".to_owned(),
         ConsequenceTrigger::WarningCount => "WarningCount".to_owned(),
         ConsequenceTrigger::Custom(key) => format!("Custom:{key}"),
     }
@@ -192,7 +192,7 @@ pub fn trigger_kind_str(trigger: &ConsequenceTrigger) -> String {
 /// field of a durable consequence Merkle-leaf payload
 /// (`scp_event_log::payload::consequence_event_payload`).
 ///
-/// Shared by the native runtime and the WASM bridge so both produce
+/// Shared so all honest members produce
 /// byte-identical leaf payloads (§9.9.3 convergence). For an
 /// [`ConsequenceAction::Enforcement`] this delegates to
 /// [`EnforcementSeverity::variant_name`]; an [`ConsequenceAction::AssignRole`]
@@ -435,7 +435,7 @@ pub struct ConsequenceRule {
     /// ([`is_convergent_trigger`]): a **convergent** trigger (`WarningCount`,
     /// `Custom`) anchors on the convergent event-log timestamp so its durable
     /// leaf is byte-identical across skewed members (§9.9.3); a
-    /// **non-convergent** trigger (`MessageVelocity`, `ToolRateExceeded`)
+    /// **non-convergent** trigger (`MessageVelocity`, `OutletRateExceeded`)
     /// anchors on the evaluating member's local clock, as local flow control.
     pub window: Duration,
 }
@@ -590,7 +590,8 @@ fn validate_severity_shape(
                          index {i}",
                     )));
                 }
-                // Validate Custom(name) / ToolInvoke(id) payload strings.
+                // Validate Custom(name) / OutletQuery(id) / OutletCall(id)
+                // payload strings.
                 if let Capability::Custom(name) = cap {
                     if name.is_empty() {
                         return Err(ConsequenceValidationError(format!(
@@ -602,15 +603,26 @@ fn validate_severity_shape(
                         &format!("SuspendCapability[{i}] Custom"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
-                } else if let Capability::ToolInvoke(tool_id) = cap {
-                    if tool_id.is_empty() {
+                } else if let Capability::OutletQuery(outlet_id) = cap {
+                    if outlet_id.is_empty() {
                         return Err(ConsequenceValidationError(format!(
-                            "SuspendCapability[{i}] ToolInvoke has empty tool_id",
+                            "SuspendCapability[{i}] OutletQuery has empty outlet_id",
                         )));
                     }
                     validate_consequence_string(
-                        tool_id,
-                        &format!("SuspendCapability[{i}] ToolInvoke"),
+                        outlet_id,
+                        &format!("SuspendCapability[{i}] OutletQuery"),
+                        MAX_CONSEQUENCE_STRING_LEN,
+                    )?;
+                } else if let Capability::OutletCall(outlet_id) = cap {
+                    if outlet_id.is_empty() {
+                        return Err(ConsequenceValidationError(format!(
+                            "SuspendCapability[{i}] OutletCall has empty outlet_id",
+                        )));
+                    }
+                    validate_consequence_string(
+                        outlet_id,
+                        &format!("SuspendCapability[{i}] OutletCall"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
                 }
@@ -708,15 +720,14 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 /// single event history that [`evaluate_consequence_rules`] (and participation
 /// record computation, ADR-017) reads.
 ///
-/// This is the **single** convergence-critical merge shared by the native
-/// runtime (`scp-runtime`) and the WASM bridge (`scp-ffi-wasm`). The §9.9.3
-/// equivocation-detection guarantee depends on native and WASM producing
-/// byte-identical merged event sets from identical inputs, so both bridges MUST
-/// route through this function rather than re-implementing the projection and
-/// buffer-gate logic. Each caller supplies its own already-acquired sources as
-/// borrowed slices — native reads Source 1 from its `ContextEventLogProvider`,
-/// WASM from its in-memory `EventLog` — so this function is agnostic to how the
-/// sources were obtained.
+/// This is the **single** convergence-critical merge used by the native
+/// runtime (`scp-runtime`). The §9.9.3 equivocation-detection guarantee depends
+/// on all honest members producing byte-identical merged event sets from
+/// identical inputs, so every consumer MUST route through this function rather
+/// than re-implementing the projection and buffer-gate logic. Each caller
+/// supplies its own already-acquired sources as borrowed slices — native reads
+/// Source 1 from its `ContextEventLogProvider` — so this function is agnostic to
+/// how the sources were obtained.
 ///
 /// Combines two sources:
 /// 1. **Event log history** (`log_entries`) — full persisted history with real
@@ -735,16 +746,16 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 ///    [`MAX_FUTURE_TOLERANCE_SECS`], and [`MAX_BUFFER_EVENTS_FOR_EVAL`].
 ///
 /// The merged set is numbered with a single dense, contiguous `sequence`
-/// counter (Source-1 entries first, then accepted Source-2 entries), so the two
-/// bridges agree on every field of every emitted [`Event`]. The `sequence`
+/// counter (Source-1 entries first, then accepted Source-2 entries), so every
+/// member agrees on every field of every emitted [`Event`]. The `sequence`
 /// itself is not consulted by [`matches_trigger`] (which keys on
 /// `event_type` / `actor_did` / `timestamp` / `payload`), but pinning it
 /// deterministically keeps the merged sets identical across implementations.
 ///
-/// Exposed `pub` (not `pub(crate)`) as an internal cross-crate helper: the WASM
-/// FFI bridge (`crates/scp-ffi/wasm`) reimplements the convergent consequence
-/// path and delegates to this shared function across the crate boundary. It is
-/// not part of the SDK surface (see the cross-layer exemption registry).
+/// Exposed `pub` (not `pub(crate)`) as an internal cross-crate helper: the
+/// native runtime (`scp-runtime`) drives the convergent consequence path and
+/// delegates to this shared function across the crate boundary. It is not part
+/// of the SDK surface (see the cross-layer exemption registry).
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn merge_consequence_events(
@@ -762,10 +773,10 @@ pub fn merge_consequence_events(
     for entry in log_entries {
         let event_type = match entry.event_type {
             // DORMANT: per ADR-051 §6 / the phase-2.md ADR-011 amendment
-            // exclusion taxonomy §2, `MessageSent` / `ToolInvoked` are
+            // exclusion taxonomy §2, `MessageSent` / `OutletInvoked` are
             // per-author, non-convergent events no longer appended to the
             // durable log — Source 1 will not yield them in the interim.
-            // Velocity / tool-rate evaluation continues to read them from
+            // Velocity / outlet-rate evaluation continues to read them from
             // the receive buffer (Source 2, below), which is correct and
             // intended (local, per-receiver flow control needs no
             // convergence). These arms re-activate when ADR-051 §2's causal
@@ -774,8 +785,8 @@ pub fn merge_consequence_events(
             EventType::MemberJoined => EventType::MemberJoined,
             EventType::MemberLeft => EventType::MemberLeft,
             EventType::RoleAssigned => EventType::RoleAssigned,
-            EventType::ToolRegistered | EventType::ToolRemoved | EventType::ToolInvoked => {
-                EventType::ToolInvoked
+            EventType::OutletRegistered | EventType::OutletRemoved | EventType::OutletInvoked => {
+                EventType::OutletInvoked
             }
             EventType::GovernanceAction
             | EventType::GovernanceProposalCreated
@@ -897,8 +908,8 @@ pub fn merge_consequence_events(
         // a buffer event is skipped (dedup / age / skew / non-`MessageSent`),
         // contradicting the contiguity the doc promises. The sequence is
         // evidence-only metadata — `matches_trigger` never reads it — so this is
-        // behavior-preserving and keeps the merged sets identical across the
-        // native runtime and the WASM bridge.
+        // behavior-preserving and keeps the merged sets identical across all
+        // honest members.
         events.push(Event {
             event_type,
             actor_did,
@@ -934,7 +945,7 @@ pub fn merge_consequence_events(
 /// - `now` -- The current time as a Unix timestamp in seconds, read from the
 ///   evaluating member's **local** clock. Used to compute the evidence window
 ///   boundary for **non-convergent** triggers ([`is_convergent_trigger`] is
-///   `false`: `MessageVelocity`, `ToolRateExceeded`), which are local flow
+///   `false`: `MessageVelocity`, `OutletRateExceeded`), which are local flow
 ///   control and never mint a durable leaf, so a local-clock window is sound.
 /// - `convergent_now` -- The convergent window anchor (Unix seconds) used for
 ///   **convergent** triggers ([`is_convergent_trigger`] is `true`: `WarningCount`,
@@ -1016,371 +1027,14 @@ pub fn evaluate_consequence_rules(
     triggered
 }
 
-// ---------------------------------------------------------------------------
-// ConsequenceDispatcher — shared enforcement trait
-// ---------------------------------------------------------------------------
-
-/// Abstracts over the mutable context state needed to enforce triggered
-/// consequences, enabling a single shared loop body for both the runtime
-/// (`scp-runtime`) and WASM (`scp-ffi-wasm`) implementations.
-///
-/// Each implementation mutates its own per-context state structure:
-///
-/// - **Runtime**: `ContextManager`'s `PerContextState` (uses `ContextRoleState`
-///   for capability suspension, `ReceiveBuffer` for events, and the governance
-///   `cooldown_until` map).
-/// - **WASM**: `WasmContextManager`'s `PerContextState` (uses a flat
-///   `suspended_capabilities` hash map, an in-memory event ring, and a
-///   flat `cooldown_until` map).
-///
-/// The methods use `&str` for DIDs to avoid cross-crate type dependencies,
-/// and `ContextEvent` from `scp_protocol::context::membership` (which both
-/// implementations already construct).
-///
-/// See Simp-2, ADR-017.
-pub trait ConsequenceDispatcher {
-    /// Returns `true` if `subject_did` is currently a member of the context.
-    fn is_member_present(&self, subject_did: &str) -> bool;
-
-    /// Suspends the listed capabilities for `subject_did`.
-    ///
-    /// Returns `true` if at least one capability was successfully applied.
-    fn suspend_capabilities(
-        &mut self,
-        subject_did: &str,
-        caps: &[crate::context::roles::Capability],
-    ) -> bool;
-
-    /// Suspends ALL capabilities for `subject_did` (full access suspension).
-    ///
-    /// Returns `true` if the suspension was applied.
-    fn suspend_all(&mut self, subject_did: &str) -> bool;
-
-    /// Assigns `to_role` to `subject_did`.
-    ///
-    /// Returns `true` if the subject is a known member and the role was
-    /// updated.
-    fn assign_role(&mut self, subject_did: &str, to_role: &str) -> bool;
-
-    /// Pushes a `ContextEvent` to the context's receive buffer (for SDK
-    /// observability).
-    fn push_event(&mut self, event: crate::context::membership::ContextEvent);
-
-    /// Returns the Unix-second timestamp until which rule `rule_index` is
-    /// on cooldown, or `None` if there is no active cooldown.
-    fn get_cooldown(&self, rule_index: usize) -> Option<u64>;
-
-    /// Records a cooldown for rule `rule_index` that expires at `until`
-    /// (Unix seconds).
-    fn set_cooldown(&mut self, rule_index: usize, until: u64);
-
-    /// Appends a durable consequence-enforcement Merkle leaf to the context's
-    /// canonical event log.
-    ///
-    /// [`enforce_triggered`] calls this — BEFORE the matching
-    /// [`push_event`](Self::push_event) (the H4 ordering invariant) — at each
-    /// emit point, but ONLY for **convergent-trigger** consequences (gated on
-    /// [`is_convergent_trigger`]). Non-convergent (velocity / rate) consequences
-    /// drive local enforcement and `push_event` only, never a durable leaf,
-    /// because a rate leaf would diverge across honest members and break §9.9.3
-    /// equivocation detection.
-    ///
-    /// `event_type` is one of [`ConsequenceTriggered`], [`ConsequenceEnforced`],
-    /// [`ConsequenceEnforcementFailed`], or
-    /// [`ConsequenceEscalatedToSuspendAll`]. `trigger_kind` / `action_type` are
-    /// the shared labels from [`trigger_kind_str`] / [`consequence_action_type`].
-    /// Implementations MUST build the leaf payload with
-    /// `scp_event_log::payload::consequence_event_payload(subject_did, rule_index,
-    /// trigger_kind, action_type)` so native and WASM leaves are byte-identical.
-    ///
-    /// The default body is a no-op: the native runtime mints these leaves in its
-    /// own enforcement loop and does not route through this trait, so only the
-    /// WASM bridge (which uses [`enforce_triggered`]) overrides it.
-    ///
-    /// [`ConsequenceTriggered`]: scp_event_log::EventType::ConsequenceTriggered
-    /// [`ConsequenceEnforced`]: scp_event_log::EventType::ConsequenceEnforced
-    /// [`ConsequenceEnforcementFailed`]: scp_event_log::EventType::ConsequenceEnforcementFailed
-    /// [`ConsequenceEscalatedToSuspendAll`]: scp_event_log::EventType::ConsequenceEscalatedToSuspendAll
-    fn append_durable_consequence_leaf(
-        &mut self,
-        event_type: scp_event_log::EventType,
-        subject_did: &str,
-        rule_index: usize,
-        trigger_kind: &str,
-        action_type: &str,
-        // Convergent leaf timestamp: the triggering event's `created_at` (see
-        // [`convergent_consequence_timestamp`]), copied identically by every
-        // member so native and WASM leaves are byte-identical (§7.3.1, §9.9.3).
-        trigger_timestamp_secs: u64,
-    ) {
-        // Default: no durable leaf. See doc comment — native does not use this
-        // path; WASM overrides it.
-        let _ = (
-            event_type,
-            subject_did,
-            rule_index,
-            trigger_kind,
-            action_type,
-            trigger_timestamp_secs,
-        );
-    }
-}
-
-/// Enforces a pre-evaluated set of triggered consequences using a
-/// [`ConsequenceDispatcher`].
-///
-/// This is the shared enforcement loop used by both the runtime and WASM
-/// bridges. Callers supply:
-///
-/// - `dispatcher` — mutable reference to the per-context state (implements
-///   [`ConsequenceDispatcher`]).
-/// - `context_id` — embedded in emitted `ContextEvent`s.
-/// - `subject_did` — the participant being evaluated.
-/// - `now_secs` — current Unix second (for cooldown arithmetic).
-/// - `triggered` — output of [`evaluate_consequence_rules`].
-/// - `rules` — the same slice that was passed to `evaluate_consequence_rules`
-///   (used to look up each rule's window for cooldown recording).
-///
-/// Returns the count of consequences that were dispatched (i.e., passed
-/// cooldown and ghost-DID guards).
-pub fn enforce_triggered<D: ConsequenceDispatcher>(
-    dispatcher: &mut D,
-    context_id: &str,
-    subject_did: &str,
-    now_secs: u64,
-    triggered: &[TriggeredConsequence],
-    rules: &[ConsequenceRule],
-) -> usize {
-    let mut count = 0usize;
-
-    for consequence in triggered {
-        // Cooldown: skip if this rule fired within its window.
-        if let Some(last_fired) = dispatcher.get_cooldown(consequence.rule_index)
-            && now_secs < last_fired
-        {
-            continue;
-        }
-
-        // Ghost DID guard: if the subject is absent AND there is no evidence
-        // of prior participation, skip entirely.
-        let member_present = dispatcher.is_member_present(subject_did);
-        if !member_present && consequence.evidence.is_empty() {
-            continue;
-        }
-
-        if enforce_one_triggered(
-            dispatcher,
-            context_id,
-            subject_did,
-            now_secs,
-            consequence,
-            rules,
-            member_present,
-        ) {
-            count += 1;
-        }
-    }
-
-    count
-}
-
-/// Bundles the per-consequence leaf labels so [`enforce_one_triggered`] can mint
-/// a durable leaf in one call per branch (keeps the function within the
-/// `clippy::too_many_lines` budget without changing behaviour).
-struct LeafCtx<'a> {
-    durable: bool,
-    subject_did: &'a str,
-    rule_index: usize,
-    trigger_kind: &'a str,
-    /// Convergent leaf timestamp — the triggering event's `created_at` (see
-    /// [`convergent_consequence_timestamp`]), copied identically by every
-    /// member (§7.3.1, §9.9.3).
-    trigger_timestamp_secs: u64,
-}
-
-/// Mints one durable consequence leaf via the dispatcher hook IFF the trigger is
-/// convergent (`ctx.durable`). A no-op otherwise — the gate that keeps
-/// non-convergent (velocity/rate) consequences out of the canonical Merkle log.
-fn mint_leaf<D: ConsequenceDispatcher>(
-    dispatcher: &mut D,
-    ctx: &LeafCtx<'_>,
-    event_type: EventType,
-    action_type: &str,
-) {
-    if ctx.durable {
-        dispatcher.append_durable_consequence_leaf(
-            event_type,
-            ctx.subject_did,
-            ctx.rule_index,
-            ctx.trigger_kind,
-            action_type,
-            ctx.trigger_timestamp_secs,
-        );
-    }
-}
-
-/// Enforces a SINGLE triggered consequence past the cooldown / ghost-DID
-/// guards, minting durable leaves (when convergent) before each buffer push
-/// (H4 ordering). Returns `true` if it counted as dispatched.
-///
-/// Extracted from [`enforce_triggered`] so the public loop stays within the
-/// `clippy::too_many_lines` budget; the branch structure mirrors the native
-/// runtime's `process_one_triggered_consequence`.
-fn enforce_one_triggered<D: ConsequenceDispatcher>(
-    dispatcher: &mut D,
-    context_id: &str,
-    subject_did: &str,
-    now_secs: u64,
-    consequence: &TriggeredConsequence,
-    rules: &[ConsequenceRule],
-    member_present: bool,
-) -> bool {
-    let action_type = consequence_action_type(&consequence.action);
-    let rule = rules.get(consequence.rule_index);
-    let trigger_type = rule.map_or_else(|| "Unknown".to_owned(), |r| format!("{:?}", r.trigger));
-
-    // Durability gate (ADR-051 §6 / phase-2.md ADR-011 amendment, H4): a
-    // consequence leaf is a durable Merkle entry ONLY when its trigger input is
-    // convergent (`WarningCount` / `Custom`), keyed on the enum via
-    // `is_convergent_trigger` — never on a string. A missing or unresolvable
-    // rule is treated as non-durable (fail-safe). The durable-leaf
-    // `trigger_kind` label uses the wire-stable `trigger_kind_str` (`Custom:key`),
-    // NOT the `{:?}` Debug `trigger_type` used for the local `ContextEvent`, so
-    // native and WASM leaf preimages match.
-    let leaf_trigger_kind =
-        rule.map_or_else(|| "Unknown".to_owned(), |r| trigger_kind_str(&r.trigger));
-    let leaf = LeafCtx {
-        durable: rule.is_some_and(|r| is_convergent_trigger(&r.trigger)),
-        subject_did,
-        rule_index: consequence.rule_index,
-        trigger_kind: &leaf_trigger_kind,
-        trigger_timestamp_secs: convergent_consequence_timestamp(consequence),
-    };
-
-    // ConsequenceTriggered: durable leaf (when convergent) BEFORE the local
-    // push (H4 ordering), unconditional buffer push.
-    mint_leaf(
-        dispatcher,
-        &leaf,
-        EventType::ConsequenceTriggered,
-        action_type,
-    );
-    dispatcher.push_event(
-        crate::context::membership::ContextEvent::ConsequenceTriggered {
-            context_id: context_id.to_owned(),
-            member_did: DID::from(subject_did.to_owned()),
-            rule_index: consequence.rule_index,
-            trigger_type,
-            action_type: action_type.to_owned(),
-        },
-    );
-
-    // Emit-and-skip for absent members with evidence: durable
-    // ConsequenceEnforcementFailed (when convergent) then buffer push.
-    if !member_present {
-        mint_leaf(
-            dispatcher,
-            &leaf,
-            EventType::ConsequenceEnforcementFailed,
-            action_type,
-        );
-        push_enforced(dispatcher, context_id, subject_did, action_type, false);
-        return true;
-    }
-
-    let success = match &consequence.action {
-        ConsequenceAction::Enforcement(severity) => match severity {
-            EnforcementSeverity::SuspendCapability { capabilities } => {
-                dispatcher.suspend_capabilities(subject_did, capabilities)
-            }
-            EnforcementSeverity::SuspendAccess => dispatcher.suspend_all(subject_did),
-            EnforcementSeverity::RevokeAccess { .. } | EnforcementSeverity::RemoveMember { .. } => {
-                // Cryptographic tiers must not reach consequence dispatch
-                // without the opt-in flag. Fail here; escalation to
-                // SuspendAll happens below.
-                false
-            }
-        },
-        ConsequenceAction::AssignRole { to_role } => dispatcher.assign_role(subject_did, to_role),
-    };
-
-    if !success {
-        // Escalate to SuspendAll on enforcement failure (H10). The local
-        // enforcement is unconditional. The two audit records (failure then
-        // escalation) are durable Merkle leaves only for convergent triggers —
-        // failure first, then escalation, both BEFORE the buffer push.
-        let _ = dispatcher.suspend_all(subject_did);
-        mint_leaf(
-            dispatcher,
-            &leaf,
-            EventType::ConsequenceEnforcementFailed,
-            action_type,
-        );
-        mint_leaf(
-            dispatcher,
-            &leaf,
-            EventType::ConsequenceEscalatedToSuspendAll,
-            "SuspendAll",
-        );
-        dispatcher.push_event(
-            crate::context::membership::ContextEvent::ConsequenceEnforced {
-                context_id: context_id.to_owned(),
-                member_did: DID::from(subject_did.to_owned()),
-                action_type: "SuspendAll(escalated)".to_owned(),
-                success: true,
-            },
-        );
-        return true;
-    }
-
-    // Record cooldown.
-    if let Some(rule) = rules.get(consequence.rule_index) {
-        dispatcher.set_cooldown(
-            consequence.rule_index,
-            now_secs.saturating_add(rule.window.as_secs()),
-        );
-    }
-
-    // ConsequenceEnforced { success: true }: durable leaf (when convergent)
-    // BEFORE the buffer push.
-    mint_leaf(
-        dispatcher,
-        &leaf,
-        EventType::ConsequenceEnforced,
-        action_type,
-    );
-    push_enforced(dispatcher, context_id, subject_did, action_type, success);
-    true
-}
-
-/// Pushes a `ConsequenceEnforced` buffer event (SDK observability). Extracted to
-/// keep [`enforce_one_triggered`] within the line budget without changing
-/// behaviour.
-fn push_enforced<D: ConsequenceDispatcher>(
-    dispatcher: &mut D,
-    context_id: &str,
-    subject_did: &str,
-    action_type: &str,
-    success: bool,
-) {
-    dispatcher.push_event(
-        crate::context::membership::ContextEvent::ConsequenceEnforced {
-            context_id: context_id.to_owned(),
-            member_did: DID::from(subject_did.to_owned()),
-            action_type: action_type.to_owned(),
-            success,
-        },
-    );
-}
-
 /// Checks whether an event matches a trigger condition for the given subject.
 fn matches_trigger(trigger: &ConsequenceTrigger, event: &Event, subject_did: &str) -> bool {
     match trigger {
         ConsequenceTrigger::MessageVelocity => {
             event.actor_did == subject_did && event.event_type == EventType::MessageSent
         }
-        ConsequenceTrigger::ToolRateExceeded => {
-            event.actor_did == subject_did && event.event_type == EventType::ToolInvoked
+        ConsequenceTrigger::OutletRateExceeded => {
+            event.actor_did == subject_did && event.event_type == EventType::OutletInvoked
         }
         ConsequenceTrigger::WarningCount => {
             // Governance actions targeting the subject (actor is someone else,
@@ -1566,13 +1220,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 2. Tool rate threshold triggers suspension
+    // 2. Outlet rate threshold triggers suspension
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tool_rate_triggers_suspend_all() {
+    fn outlet_rate_triggers_suspend_all() {
         let rules = vec![ConsequenceRule {
-            trigger: ConsequenceTrigger::ToolRateExceeded,
+            trigger: ConsequenceTrigger::OutletRateExceeded,
             action: suspend_all(),
             threshold: 5,
             window: Duration::from_mins(2),
@@ -1581,11 +1235,11 @@ mod tests {
         let events: Vec<Event> = (0..5)
             .map(|i| {
                 make_event(
-                    EventType::ToolInvoked,
+                    EventType::OutletInvoked,
                     "did:key:alice",
                     900 + i,
                     i,
-                    b"some-tool".to_vec(),
+                    b"some-outlet".to_vec(),
                 )
             })
             .collect();
@@ -1914,7 +1568,7 @@ mod tests {
                 window: Duration::from_mins(1),
             },
             ConsequenceRule {
-                trigger: ConsequenceTrigger::ToolRateExceeded,
+                trigger: ConsequenceTrigger::OutletRateExceeded,
                 action: suspend_all(),
                 threshold: 1,
                 window: Duration::from_mins(1),
@@ -1925,11 +1579,11 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:alice", 950, 0, vec![]),
             make_event(EventType::MessageSent, "did:key:alice", 960, 1, vec![]),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 970,
                 2,
-                b"tool-x".to_vec(),
+                b"outlet-x".to_vec(),
             ),
         ];
 
@@ -2209,19 +1863,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_empty_tool_invoke_payload() {
+    fn validate_rejects_empty_outlet_call_payload() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
-                capabilities: vec![Capability::ToolInvoke(String::new())],
+                capabilities: vec![Capability::OutletCall(String::new())],
             }),
             threshold: 1,
             window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
-            err.to_string().contains("ToolInvoke has empty tool_id"),
-            "should reject empty tool_id, got: {err}"
+            err.to_string().contains("OutletCall has empty outlet_id"),
+            "should reject empty outlet_id, got: {err}"
         );
     }
 
@@ -2539,11 +2193,11 @@ mod tests {
     }
 
     #[test]
-    fn b2_suspend_custom_tool_invoke_is_respected() {
+    fn b2_suspend_custom_outlet_call_is_respected() {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
-                capabilities: vec![Capability::ToolInvoke("calculator".to_owned())],
+                capabilities: vec![Capability::OutletCall("calculator".to_owned())],
             }),
             threshold: 1,
             window: Duration::from_mins(1),
@@ -2556,7 +2210,7 @@ mod tests {
         };
         assert_eq!(
             capabilities,
-            &vec![Capability::ToolInvoke("calculator".to_owned())]
+            &vec![Capability::OutletCall("calculator".to_owned())]
         );
     }
 
@@ -2565,7 +2219,7 @@ mod tests {
         let caps = vec![
             Capability::MessagesWrite,
             Capability::GovernanceVote,
-            Capability::ToolInvoke("calculator".to_owned()),
+            Capability::OutletCall("calculator".to_owned()),
             Capability::Custom("rate_limit_bypass".to_owned()),
         ];
         let rule = ConsequenceRule {
@@ -2583,237 +2237,5 @@ mod tests {
             panic!("expected SuspendCapability");
         };
         assert_eq!(capabilities, &caps);
-    }
-
-    // -----------------------------------------------------------------------
-    // enforce_triggered — durable-leaf hook gating, ordering, per-branch
-    // EventType (the WASM-side leaf-minting path; native uses its own loop).
-    // -----------------------------------------------------------------------
-
-    /// Records every interaction so the test can assert the interleaving of
-    /// durable-leaf appends and buffer pushes (the H4 ordering invariant) and
-    /// which `EventType` is minted in each branch.
-    #[derive(Default)]
-    struct RecordingDispatcher {
-        present: bool,
-        suspend_succeeds: bool,
-        /// Ordered trace: `("leaf", EventType)` for a durable append,
-        /// `("push", "<ConsequenceTriggered|ConsequenceEnforced>")` for a buffer push.
-        trace: Vec<(&'static str, String)>,
-        /// Captured `(subject, rule_index, trigger_kind, action_type)` for the
-        /// first leaf, to verify the labels passed to the producer.
-        first_leaf_args: Option<(String, usize, String, String)>,
-    }
-
-    impl ConsequenceDispatcher for RecordingDispatcher {
-        fn is_member_present(&self, _subject_did: &str) -> bool {
-            self.present
-        }
-        fn suspend_capabilities(&mut self, _s: &str, _c: &[Capability]) -> bool {
-            self.suspend_succeeds
-        }
-        fn suspend_all(&mut self, _s: &str) -> bool {
-            true
-        }
-        fn assign_role(&mut self, _s: &str, _r: &str) -> bool {
-            self.suspend_succeeds
-        }
-        fn push_event(&mut self, event: crate::context::membership::ContextEvent) {
-            let label = match event {
-                crate::context::membership::ContextEvent::ConsequenceTriggered { .. } => {
-                    "ConsequenceTriggered"
-                }
-                crate::context::membership::ContextEvent::ConsequenceEnforced { .. } => {
-                    "ConsequenceEnforced"
-                }
-                _ => "Other",
-            };
-            self.trace.push(("push", label.to_owned()));
-        }
-        fn get_cooldown(&self, _rule_index: usize) -> Option<u64> {
-            None
-        }
-        fn set_cooldown(&mut self, _rule_index: usize, _until: u64) {}
-        fn append_durable_consequence_leaf(
-            &mut self,
-            event_type: EventType,
-            subject_did: &str,
-            rule_index: usize,
-            trigger_kind: &str,
-            action_type: &str,
-            _trigger_timestamp_secs: u64,
-        ) {
-            if self.first_leaf_args.is_none() {
-                self.first_leaf_args = Some((
-                    subject_did.to_owned(),
-                    rule_index,
-                    trigger_kind.to_owned(),
-                    action_type.to_owned(),
-                ));
-            }
-            self.trace.push(("leaf", format!("{event_type:?}")));
-        }
-    }
-
-    fn warning_rule(action: ConsequenceAction) -> ConsequenceRule {
-        ConsequenceRule {
-            trigger: ConsequenceTrigger::WarningCount,
-            action,
-            threshold: 1,
-            window: Duration::from_mins(1),
-        }
-    }
-
-    fn velocity_rule(action: ConsequenceAction) -> ConsequenceRule {
-        ConsequenceRule {
-            trigger: ConsequenceTrigger::MessageVelocity,
-            action,
-            threshold: 1,
-            window: Duration::from_mins(1),
-        }
-    }
-
-    fn triggered(rule_index: usize, action: ConsequenceAction) -> TriggeredConsequence {
-        TriggeredConsequence {
-            rule_index,
-            action,
-            evidence: vec![ConsequenceEvidence {
-                event_sequence: 0,
-                timestamp: 100,
-                actor_did: "did:key:gov".into(),
-                event_type: EventType::GovernanceAction,
-            }],
-        }
-    }
-
-    /// Convergent (`WarningCount`) + successful enforcement: durable
-    /// `ConsequenceTriggered` BEFORE its push, then durable `ConsequenceEnforced`
-    /// BEFORE its push (H4 ordering). Labels are the shared producer labels.
-    #[test]
-    fn enforce_triggered_convergent_success_mints_ordered_leaves() {
-        let rules = vec![warning_rule(suspend_all())];
-        let mut d = RecordingDispatcher {
-            present: true,
-            suspend_succeeds: true,
-            ..Default::default()
-        };
-        enforce_triggered(
-            &mut d,
-            "ctx",
-            "did:key:subject",
-            1000,
-            &[triggered(0, suspend_all())],
-            &rules,
-        );
-        assert_eq!(
-            d.trace,
-            vec![
-                ("leaf", "ConsequenceTriggered".to_owned()),
-                ("push", "ConsequenceTriggered".to_owned()),
-                ("leaf", "ConsequenceEnforced".to_owned()),
-                ("push", "ConsequenceEnforced".to_owned()),
-            ],
-            "durable leaf must precede each matching buffer push (H4 ordering)"
-        );
-        assert_eq!(
-            d.first_leaf_args,
-            Some((
-                "did:key:subject".to_owned(),
-                0,
-                "WarningCount".to_owned(),
-                "SuspendAccess".to_owned()
-            )),
-            "leaf must carry the shared trigger_kind / action_type labels"
-        );
-    }
-
-    /// Non-convergent (MessageVelocity): NO durable leaf is minted, only buffer
-    /// pushes — the gate that keeps velocity/rate out of the canonical log.
-    #[test]
-    fn enforce_triggered_non_convergent_mints_no_leaf() {
-        let rules = vec![velocity_rule(suspend_all())];
-        let mut d = RecordingDispatcher {
-            present: true,
-            suspend_succeeds: true,
-            ..Default::default()
-        };
-        enforce_triggered(
-            &mut d,
-            "ctx",
-            "did:key:subject",
-            1000,
-            &[triggered(0, suspend_all())],
-            &rules,
-        );
-        assert!(
-            d.trace.iter().all(|(kind, _)| *kind == "push"),
-            "a non-convergent trigger must mint NO durable leaf, got: {:?}",
-            d.trace
-        );
-        assert!(d.first_leaf_args.is_none());
-    }
-
-    /// Convergent + enforcement FAILURE: durable `ConsequenceTriggered`, then on
-    /// failure durable `ConsequenceEnforcementFailed` THEN
-    /// `ConsequenceEscalatedToSuspendAll`, both before the escalation push.
-    #[test]
-    fn enforce_triggered_convergent_failure_mints_failure_then_escalation() {
-        let rules = vec![warning_rule(suspend_write())];
-        let mut d = RecordingDispatcher {
-            present: true,
-            suspend_succeeds: false, // force enforcement failure -> escalation
-            ..Default::default()
-        };
-        enforce_triggered(
-            &mut d,
-            "ctx",
-            "did:key:subject",
-            1000,
-            &[triggered(0, suspend_write())],
-            &rules,
-        );
-        assert_eq!(
-            d.trace,
-            vec![
-                ("leaf", "ConsequenceTriggered".to_owned()),
-                ("push", "ConsequenceTriggered".to_owned()),
-                ("leaf", "ConsequenceEnforcementFailed".to_owned()),
-                ("leaf", "ConsequenceEscalatedToSuspendAll".to_owned()),
-                ("push", "ConsequenceEnforced".to_owned()),
-            ],
-            "failure path: triggered leaf+push, then failure+escalation leaves \
-             before the escalation push (H4/H10)"
-        );
-    }
-
-    /// Convergent + absent member WITH evidence: durable `ConsequenceTriggered`
-    /// then durable `ConsequenceEnforcementFailed` (no escalation — nothing to
-    /// enforce against), each before its push.
-    #[test]
-    fn enforce_triggered_convergent_absent_member_mints_triggered_then_failed() {
-        let rules = vec![warning_rule(suspend_all())];
-        let mut d = RecordingDispatcher {
-            present: false, // absent, but evidence present (triggered() supplies it)
-            suspend_succeeds: true,
-            ..Default::default()
-        };
-        enforce_triggered(
-            &mut d,
-            "ctx",
-            "did:key:subject",
-            1000,
-            &[triggered(0, suspend_all())],
-            &rules,
-        );
-        assert_eq!(
-            d.trace,
-            vec![
-                ("leaf", "ConsequenceTriggered".to_owned()),
-                ("push", "ConsequenceTriggered".to_owned()),
-                ("leaf", "ConsequenceEnforcementFailed".to_owned()),
-                ("push", "ConsequenceEnforced".to_owned()),
-            ],
-            "absent-with-evidence path mints Triggered then EnforcementFailed, no escalation"
-        );
     }
 }

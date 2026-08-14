@@ -15,7 +15,7 @@ An agent with no prior context should be able to visit the SCP repository, under
 | 3 | Module-level Rust docs | 100% of Rust files have `//!` headers | All crates |
 | 4 | Trait contracts | ~100% documented | Invariants and error conditions |
 | 5 | Standards | `.docs/standards/` | 8 languages, error hierarchy, async patterns, CI tiers |
-| 6 | Inline doc coverage | ~82–100% across all crates (lowest: scp-ffi-wasm ~82%) | See §21.8.1 coverage table |
+| 6 | Inline doc coverage | ~82–100% across all crates | See §21.8.1 coverage table |
 | 7 | SDK binding READMEs | `bindings/{python,typescript,swift,kotlin}/README.md` | Install, quickstart, platform notes |
 | 8 | Architecture guide | `docs/guides/architecture.md` | Reading guide with entry points |
 | 9 | Transport adapter guide | `docs/guides/transport-adapters.md` | Trait requirements, step-by-step, conformance |
@@ -43,8 +43,8 @@ An agent with no prior context should be able to visit the SCP repository, under
 | ~~Testing guide~~ | ~~Commands in standards only~~ | ~~`TESTING.md`~~ | Done |
 | ~~Contributing guide~~ | ~~None~~ | ~~`CONTRIBUTING.md`~~ | Done |
 | Example applications | Pseudocode only | Runnable examples per language | P0 |
-| FFI crate READMEs | In progress | `crates/scp-ffi/{src,napi,wasm,uniffi}/README.md` | P1 |
-| Inline doc coverage | 82% (scp-ffi-wasm lowest) | 100% | P1 |
+| FFI crate READMEs | In progress | `crates/scp-ffi/{src,napi,uniffi}/README.md` | P1 |
+| Inline doc coverage | 82% | 100% | P1 |
 | Generated API reference | None | Hosted rustdoc, typedoc, Dokka, DocC | P1 |
 | Remaining guides | 2 of 5 | Storage backends, relay ops, conformance testing | P2 |
 | Test vector hex outputs | Spec complete, outputs pending | Run reference impl to generate §25.18 | P2 |
@@ -78,20 +78,20 @@ docs/                            Published documentation (agent-facing)
 scaffolds/                       Clonable barebones project setups
 ├── rust-client/                 Minimal Rust binary using scp-core
 ├── python-agent/                Python agent skeleton with async runtime
-├── typescript-web/              Browser app with WASM binding
 ├── typescript-node/             Node.js agent with NAPI binding
+├── typescript-web/              In-tab browser participant over scp-ts-wasm, keys on-device (ADR-057)
 ├── swift-ios/                   iOS app with Keychain custody
 ├── swift-macos/                 macOS app with Secure Enclave custody
 ├── kotlin-android/              Android app with Keystore custody
 └── relay/                       Minimal relay with scp-node, TLS, monitoring
 
 templates/                       Clonable working applications for common use cases
-├── chat/                        Two-party encrypted chat (CLI + web)
-├── agent-tool-provider/         Agent exposing tools via SCP context + MCP
-├── collaborative-workspace/     Multi-party context with roles and tools
+├── chat/                        Two-party encrypted chat (Python CLI)
+├── agent-tool-provider/         Agent exposing outlets via SCP context + MCP
+├── collaborative-workspace/     Multi-party context with roles and outlets
 ├── personal-relay/              Self-hosted relay with auto-TLS
 ├── broadcast-feed/              Broadcast context with subscriber management
-└── cross-context-bridge/        Tool interface bridging two contexts
+└── cross-context-bridge/        Outlet interface bridging two contexts
 
 bindings/python/README.md      ✓ Python SDK: install, quickstart, platform notes
 bindings/swift/README.md       ✓ Swift SDK: install, quickstart, platform notes
@@ -100,7 +100,6 @@ bindings/kotlin/README.md      ✓ Kotlin SDK: install, quickstart, platform not
 
 crates/scp-ffi/README.md        PyO3 bridge: build, architecture, for maintainers
 crates/scp-ffi/napi/README.md    NAPI bridge: build, native addon compilation
-crates/scp-ffi/wasm/README.md    WASM bridge: build, JS callback injection
 crates/scp-ffi/uniffi/README.md  UniFFI bridge: build, XCFramework generation
 
 .docs/                         ✓ Internal project knowledge (27 specs, ADRs, standards)
@@ -136,7 +135,7 @@ Each binding directory gets a README answering:
 1. **What is this** — One sentence (e.g., "Python SDK for SCP, providing identity, contexts, encryption, and transport")
 2. **Install** — `pip install scp-python` / SPM / npm
 3. **Quickstart** — 10-20 lines of working code: create identity, create context, send message
-4. **Platform notes** — Language-specific considerations (Python: async, Swift: Keychain/Secure Enclave, TypeScript: WASM vs NAPI)
+4. **Platform notes** — Language-specific considerations (Python: async, Swift: Keychain/Secure Enclave, TypeScript: NAPI in-process for Node/Bun; browser = in-tab client over scp-client-wasm with keys on-device per ADR-057)
 5. **API overview** — Brief listing of main classes/modules with one-line descriptions
 6. **Link to full docs** — Point to `docs/guides/sdk-quickstart.md` and generated API reference
 
@@ -176,7 +175,7 @@ Minimal, runnable examples in each target language demonstrating:
 1. **Identity creation** — Create a DID, inspect it
 2. **Context creation** — Create a context with governance parameters
 3. **Message exchange** — Two participants send and receive encrypted messages
-4. **Tool invocation** — Register and invoke a tool within a context
+4. **Outlet invocation** — Register and invoke an outlet within a context
 
 Each example should be:
 - Self-contained (single file or minimal project)
@@ -215,8 +214,12 @@ Crates and their enforcement status:
 | `scp-ffi` | not yet | ~99% | 100% |
 | `scp-ffi-napi` | not yet | ~100% | 100% |
 | `scp-ffi-uniffi` | not yet | ~100% | 100% |
-| `scp-ffi-wasm` | not yet | ~82% | 100% |
-| `scp-primitives` | `warn` | ~100% | 100% |
+| `scp-clock` | `warn` | ~100% | 100% |
+| `scp-crypto` | `warn` | ~100% | 100% |
+| `scp-did` | `warn` | ~100% | 100% |
+| `scp-mls` | not yet | ~95% | 100% |
+| `scp-client` | not yet | ~95% | 100% |
+| `scp-client-wasm` | not yet | ~95% | 100% |
 | `scp-testing` | not yet | ~90% | 100% |
 | `scp-node` | `warn` | ~91% | 100% |
 | `scp-mcp` | `warn` | ~100% | 100% |
@@ -233,7 +236,7 @@ Each public item MUST have:
 - **`# Panics`** section if the function can panic (even in debug builds).
 - **`# Safety`** section for any `unsafe` code (SCP uses `#![forbid(unsafe_code)]` so this should not apply).
 - **Spec cross-references** where the item implements a specific spec section. Format: `See §N.M in the SCP specification.`
-- **Example usage** for key entry-point functions (identity creation, context operations, messaging, tool invocation). Use `# Examples` with ```` ```rust ```` code blocks that compile under `cargo test --doc`.
+- **Example usage** for key entry-point functions (identity creation, context operations, messaging, outlet invocation). Use `# Examples` with ```` ```rust ```` code blocks that compile under `cargo test --doc`.
 
 ### 21.8.3 scp-core Documentation Targets
 
@@ -260,7 +263,7 @@ Priority files (most undocumented items):
 
 ### 21.8.5 FFI Crate Targets
 
-All four FFI crates (`scp-ffi`, `napi`, `wasm`, `uniffi`) need README files explaining build process, architecture, and maintenance patterns.
+All three FFI crates (`scp-ffi`, `napi`, `uniffi`) need README files explaining build process, architecture, and maintenance patterns.
 
 ### 21.8.6 Language Binding Documentation
 
@@ -284,7 +287,7 @@ Not a replacement for `.docs/architecture.md` — a reading guide for it:
 1. **Start here** — The 5 concepts you need (contexts, DIDs, UCANs, MLS, relays)
 2. **Crate map** — Which crate does what, dependency graph, where to find things
 3. **Reading order** — Suggested path through specs and ADRs
-4. **Key flows** — Context creation, message send, tool invocation (simplified, with file references)
+4. **Key flows** — Context creation, message send, outlet invocation (simplified, with file references)
 5. **Glossary** — Protocol-specific terms with one-line definitions
 
 ## 21.10 P1: Generated API Reference
@@ -428,8 +431,8 @@ Each scaffold is a minimal, working project structure with:
 |---|---|---|
 | `scaffolds/rust-client/` | Rust | Minimal Rust binary using scp-core directly |
 | `scaffolds/python-agent/` | Python | Python agent with scp-python, async runtime, identity setup |
-| `scaffolds/typescript-web/` | TypeScript | Browser app using WASM binding, identity in IndexedDB |
 | `scaffolds/typescript-node/` | TypeScript | Node.js agent using NAPI binding |
+| `scaffolds/typescript-web/` | TypeScript | In-tab browser participant over `@limn-works/scp-ts-wasm`, keys on-device (ADR-057) |
 | `scaffolds/swift-ios/` | Swift | iOS app with Keychain custody, push notifications |
 | `scaffolds/swift-macos/` | Swift | macOS app with Secure Enclave custody |
 | `scaffolds/kotlin-android/` | Kotlin | Android app with Keystore custody |
@@ -452,12 +455,18 @@ Each template is a complete, running application that demonstrates a real use ca
 
 | Template | Language(s) | What it is |
 |---|---|---|
-| `templates/chat/` | Python + TypeScript | Two-party encrypted chat (CLI + web) |
-| `templates/agent-tool-provider/` | Python | Agent exposing tools via SCP context with MCP bridge |
-| `templates/collaborative-workspace/` | TypeScript | Multi-party context with roles, tools, and governance |
+| `templates/chat/` | Python | Two-party encrypted chat (Python CLI) |
+| `templates/agent-tool-provider/` | Python | Agent exposing outlets via SCP context with MCP bridge |
+| `templates/collaborative-workspace/` | TypeScript | Multi-party context with roles, outlets, and governance |
 | `templates/personal-relay/` | Rust | Self-hosted relay with automatic TLS and DID publishing |
 | `templates/broadcast-feed/` | Python | Broadcast context (§5.14) with subscriber management |
-| `templates/cross-context-bridge/` | Rust | Tool interface bridging two contexts (§6.2) |
+| `templates/cross-context-bridge/` | Rust | Outlet interface bridging two contexts (§6.2) |
+
+> A functional two-party **browser** chat template (`templates/chat/typescript/`) is
+> forthcoming under **#2187**, once relay-mediated invitation-join is available in the
+> wasm tier (its §9.7.1 DID-VM KeyPackage binding). Until then, `scaffolds/typescript-web/`
+> demonstrates the single-tab in-browser client (ADR-057). No TypeScript chat template
+> exists yet — the row is intentionally absent rather than phantom.
 
 Templates are **functional** — they solve a real problem out of the box. An agent studying a template understands not just how SCP works mechanically but how it's used to build real things.
 

@@ -14,12 +14,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rand::RngCore;
 use subtle::ConstantTimeEq;
 
-use scp_identity::decode_multibase_key;
+use scp_crypto::verify_ed25519_signature;
+use scp_did::{SigningKeyId, decode_multibase_key};
 use scp_identity::resolver::DidResolver;
 use scp_platform::traits::{KeyCustody, KeyHandle};
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
-use scp_protocol::crypto::ed25519::verify_ed25519_signature;
-use scp_protocol::identity::SigningKeyId;
 
 // Re-export pure types from scp-protocol for backward compatibility.
 pub use scp_protocol::identity::scpid::{
@@ -172,7 +171,7 @@ pub async fn scpid_sign(
     // client scaffolds) cannot supply it in production builds. The FFI
     // bridges layer their own rejection for defence-in-depth (see
     // `scp-ffi/src/scpid.rs`, `scp-ffi/napi/src/scpid.rs`,
-    // `scp-ffi/uniffi/src/bridge.rs`, `scp-ffi/wasm/src/scpid.rs`).
+    // `scp-ffi/uniffi/src/bridge.rs`).
     #[cfg(not(feature = "testing"))]
     if signed_at_override.is_some() {
         return Err(ScpIdError::InvalidInput(
@@ -1014,13 +1013,13 @@ mod tests {
     /// Test DID resolver that returns a pre-configured `DidDocument` wrapped
     /// in a `ResolvedDidDocument`. Implements `scp_identity::resolver::DidResolver`.
     struct TestDidResolver {
-        document: Option<scp_identity::document::DidDocument>,
+        document: Option<scp_did::DidDocument>,
         /// When `true`, `resolve()` returns `Err(...)` instead of `Ok(...)`.
         fail: bool,
     }
 
     impl TestDidResolver {
-        fn with_document(doc: scp_identity::document::DidDocument) -> Self {
+        fn with_document(doc: scp_did::DidDocument) -> Self {
             Self {
                 document: Some(doc),
                 fail: false,
@@ -1076,7 +1075,7 @@ mod tests {
         did: &str,
         signing_key_id: SigningKeyId,
         challenge: &ScpIdChallenge,
-    ) -> (ScpIdResponse, scp_identity::document::DidDocument) {
+    ) -> (ScpIdResponse, scp_did::DidDocument) {
         use scp_platform::KeyType;
         use scp_platform::testing::InMemoryKeyCustody;
 
@@ -1091,12 +1090,12 @@ mod tests {
 
         // Build a DID document with the signing key in the correct VM slot.
         let doc = match signing_key_id {
-            SigningKeyId::Active => scp_identity::document::DidDocument::new_with_agent_key(
+            SigningKeyId::Active => scp_did::DidDocument::new_with_agent_key(
                 did, &[0u8; 32], // identity key (not used for SCPID)
                 &pk_bytes, &[0u8; 32], // pre-rotation commitment (not used for SCPID)
                 None,
             ),
-            SigningKeyId::Agent => scp_identity::document::DidDocument::new_with_agent_key(
+            SigningKeyId::Agent => scp_did::DidDocument::new_with_agent_key(
                 did,
                 &[0u8; 32],
                 &[1u8; 32], // different active key
@@ -1271,7 +1270,7 @@ mod tests {
         let wrong_active_pk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
             .verifying_key()
             .to_bytes();
-        let wrong_doc = scp_identity::document::DidDocument::new_with_agent_key(
+        let wrong_doc = scp_did::DidDocument::new_with_agent_key(
             did,
             &wrong_identity_pk,
             &wrong_active_pk,

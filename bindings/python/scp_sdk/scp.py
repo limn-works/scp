@@ -43,19 +43,50 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from dataclasses import dataclass
 from types import TracebackType
-from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Protocol,
+    TypeAlias,
+    TypedDict,
+    runtime_checkable,
+)
 
-from scp_sdk.errors import ScpError
+from scp_sdk.errors import ScpError, _coded_bridge_error
 from scp_sdk.types import CustodyType
+
+if TYPE_CHECKING:
+    from scp_sdk.outlets import OutletDefinition, SagaResult, StreamingSagaHandle
+
+    # Imported under TYPE_CHECKING only to annotate ``ucan_evaluate`` /
+    # ``participation_record`` return types without a runtime circular import
+    # (trust.py imports SCP). With ``from __future__ import annotations`` the
+    # annotation is a lazy string, so the name need only resolve for type
+    # checkers, not at import time.
+    from scp_sdk.trust import (
+        AttestorInfo,
+        BehavioralRecord,
+        CachedAttestation,
+        CapabilityValidation,
+        ChallengeVerification,
+        EventLogEntry,
+        ThresholdRequirement,
+        TrustEvaluation,
+    )
 
 logger = logging.getLogger("scp_sdk")
 
 __all__ = [
     "SCP",
     "InMemoryStorage",
+    "InviteMemberOutcome",
     "KeyCustodyProvider",
     "McpAllowlistState",
+    "Sealed",
+    "SealedInvitation",
     "SqliteStorage",
     "StorageConfig",
 ]
@@ -229,6 +260,65 @@ class SqlitePassphraseStorage(TypedDict):
 StorageConfig = InMemoryStorage | SqliteStorage | SqlitePassphraseStorage
 
 
+@dataclass(frozen=True)
+class SealedInvitation:
+    """A sealed, signed invitation bundle (ADR-049 Phase 2J; FFI-02 Option A).
+
+    The wire artifact produced by :meth:`SCP.invite_member` on the creator
+    side and consumed by :meth:`SCP.context_join_from_welcome` on the joiner
+    side. The authoritative genesis params + MLS Welcome travel *inside* the
+    signed bundle; the joiner does not supply them separately — the runtime
+    opens the bundle under the joiner's key material and authenticates it.
+
+    A flat, frozen, named-field object per the agent-first API tenet, mapping
+    1:1 to the native ``_scp_core.PySealedInvitation`` and to the runtime wire
+    type ``scp_core::context::invitation_helpers::SealedInvitation``.
+
+    Attributes:
+        context_id: Binding hint — the context id the bundle was sealed for.
+        creator_did: Binding hint — the creator DID the bundle was sealed by.
+        enc: RFC 9180 HPKE encapsulated key. Exactly 32 bytes (validated at
+            the join boundary, fail-closed).
+        ciphertext: RFC 9180 HPKE ciphertext (``ct = ciphertext || tag``) of
+            the serialized, signed ``InvitationBundle``. Opaque bytes.
+    """
+
+    context_id: str
+    creator_did: str
+    enc: bytes
+    ciphertext: bytes
+
+
+@dataclass(frozen=True)
+class Sealed:
+    """:meth:`SCP.invite_member` outcome — the invitation was sealed.
+
+    The creator (or admin) sealed the context's genesis params + Welcome for
+    the invitee under RFC 9180 HPKE, bound to the invitee's ``KeyPackage``.
+    Pass :attr:`bundle` straight to the invitee's
+    :meth:`SCP.context_join_from_welcome` (no re-assembly); the runtime may
+    already have published it for delivery — see :attr:`delivered`.
+
+    Attributes:
+        bundle: The sealed :class:`SealedInvitation` — the SAME object the
+            joiner passes to :meth:`SCP.context_join_from_welcome`.
+        delivered: ``True`` if the runtime published the sealed bundle to the
+            invitee's routing id; ``False`` if the caller must deliver it.
+    """
+
+    bundle: SealedInvitation
+    delivered: bool
+
+
+# The outcome of :meth:`SCP.invite_member`. Today the only outcome is a sealed
+# bundle (:class:`Sealed`); a voting-governed context RAISES instead
+# (governed-context invitations are not yet implemented). Kept as an alias
+# (rather than bare ``Sealed``) so a future governed-invite outcome is added
+# additively as a union member without breaking callers that annotate against
+# :data:`InviteMemberOutcome`.
+InviteMemberOutcome: TypeAlias = Sealed
+
+
 def _native_mod() -> Any:
     """Return the ``_scp_core`` PyO3 extension module.
 
@@ -269,6 +359,42 @@ def _native_cls() -> Any:
             code="SCP-UNKNOWN-0001",
         )
     return cls
+
+
+def _to_native_sealed(sealed: SealedInvitation) -> Any:
+    """Project an SDK :class:`SealedInvitation` into the native pyclass.
+
+    The PyO3 :meth:`context_join_from_welcome` entry point extracts a typed
+    ``_scp_core.PySealedInvitation`` argument (not a loose dict), so the wrapper
+    reconstructs the native bundle from the SDK dataclass's four wire fields.
+    """
+    mod = _native_mod()
+    return mod.PySealedInvitation(
+        sealed.context_id,
+        sealed.creator_did,
+        sealed.enc,
+        sealed.ciphertext,
+    )
+
+
+def _to_invite_outcome(raw: Any) -> InviteMemberOutcome:
+    """Map the native ``PyInviteMemberOutcome`` to the SDK :class:`Sealed`.
+
+    The native outcome carries a ``bundle`` (a native ``PySealedInvitation``)
+    and a ``delivered`` flag. The bundle is projected into the SDK
+    :class:`SealedInvitation` dataclass so it is directly usable as the
+    ``sealed`` argument to :meth:`SCP.context_join_from_welcome`.
+    """
+    native_bundle = raw.bundle
+    return Sealed(
+        bundle=SealedInvitation(
+            context_id=native_bundle.context_id,
+            creator_did=native_bundle.creator_did,
+            enc=native_bundle.enc,
+            ciphertext=native_bundle.ciphertext,
+        ),
+        delivered=raw.delivered,
+    )
 
 
 class SCP:
@@ -488,6 +614,7 @@ class SCP:
         runs ``block_on`` internally, so the sync path is correct here.
         Async callers should use :meth:`__aexit__` / ``async with``.
         """
+        del exc_type, exc, tb
         self._native.shutdown(self._shutdown_millis(5.0))
 
     async def __aenter__(self) -> SCP:
@@ -505,6 +632,7 @@ class SCP:
         Awaits :meth:`shutdown` so the event loop keeps running while
         the tokio runtime drains in-flight tasks.
         """
+        del exc_type, exc, tb
         await self.shutdown()
 
     # ------------------------------------------------------------------
@@ -535,16 +663,16 @@ class SCP:
         """Create an identity link attestation (§3.5).
 
         Returns an :class:`~scp_sdk.identity.IdentityAttestation` on success.
-        Raises :class:`~scp_sdk.errors.IdentityError` when the bridge does
+        Raises :class:`~scp_sdk.errors.AttestationError` when the bridge does
         not expose attestation creation (missing FFI feature).
         """
         import json
 
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
         from scp_sdk.identity import IdentityAttestation
 
         if not hasattr(self._native, "create_identity_link_attestation"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation creation is not yet available in the bridge",
                 "SCP-ATTEST-9010",
             )
@@ -564,20 +692,31 @@ class SCP:
         """Delegate to ``_scp_core.SCP.identity_add_agent_key`` (returns :class:`Identity`)."""
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_add_agent_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_add_agent_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_attest_device(self, identity_did: str) -> Any:
         """Delegate to ``_scp_core.SCP.identity_attest_device``.
 
-        Raises :class:`~scp_sdk.errors.IdentityError` when the bridge was
-        not built with the ``allow_in_memory_custody`` feature.
+        On a shipped build this fails closed: no production device-attestation
+        backend is wired yet (Apple App Attest / Google Play Integrity are
+        hardware/platform-backed and are intentionally deferred with hardware
+        keychain custody until an e2e-driven integration lands; spec §9:187).
+        Raises :class:`~scp_sdk.errors.IdentityError` (``SCP-IDENT-1015``). See
+        #2171.
         """
         from scp_sdk.errors import IdentityError
 
         if not hasattr(self._native, "identity_attest_device"):
             raise IdentityError(
-                "Device attestation requires the 'allow_in_memory_custody' feature",
+                "device attestation unavailable: no production device-attestation "
+                "backend is wired yet — Apple App Attest / Google Play Integrity are "
+                "hardware/platform-backed and are intentionally deferred (with hardware "
+                "keychain custody) until an e2e-driven integration lands (spec §9:187). "
+                "See #2171.",
                 "SCP-IDENT-1015",
             )
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
@@ -681,25 +820,28 @@ class SCP:
         """
         import json
 
-        result_json = await asyncio.to_thread(
-            self._native.identity_execute_recovery, did, tier, context_ids
-        )
+        try:
+            result_json = await asyncio.to_thread(
+                self._native.identity_execute_recovery, did, tier, context_ids
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return json.loads(result_json) if isinstance(result_json, str) else result_json
 
     async def identity_link_attestations(self, did: str) -> list[Any]:
         """List identity link attestations for *did* (§3.5).
 
         Returns a list of :class:`~scp_sdk.identity.IdentityAttestation`
-        instances. Raises :class:`~scp_sdk.errors.IdentityError` when the
+        instances. Raises :class:`~scp_sdk.errors.AttestationError` when the
         bridge does not expose the endpoint.
         """
         import json
 
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
         from scp_sdk.identity import IdentityAttestation
 
         if not hasattr(self._native, "identity_link_attestations"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation listing is not yet available in the bridge",
                 "SCP-ATTEST-9011",
             )
@@ -719,23 +861,29 @@ class SCP:
 
         The bridge returns a tuple ``(PyIdentity, rotation_event_json)``
         — the JSON-serialized ``DidRotationEvent`` (spec §9.12,
-        ADR-003 §4b/4c) is attached to the returned :class:`Identity`
+        ADR-003 §4b) is attached to the returned :class:`Identity`
         wrapper as ``identity.rotation_event_json`` so SDK callers can
-        distribute the event to active context members per spec
-        §3.2.1 step 4b.
+        distribute the event to active context members (spec §9.12,
+        ADR-003 §4b).
         """
         from scp_sdk.identity import Identity
 
-        raw_handle, rotation_event_json = await asyncio.to_thread(
-            self._native.identity_migrate, identity
-        )
+        try:
+            raw_handle, rotation_event_json = await asyncio.to_thread(
+                self._native.identity_migrate, identity
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw_handle, rotation_event_json=rotation_event_json)
 
     async def identity_remove_agent_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_remove_agent_key`` (returns :class:`Identity`)."""
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_remove(self, did: str) -> None:
@@ -745,7 +893,11 @@ class SCP:
         without error when the DID is not present. Delegates to
         ``_scp_core.SCP.identity_remove``.
         """
-        await asyncio.to_thread(self._native.identity_remove, did)
+
+        try:
+            await asyncio.to_thread(self._native.identity_remove, did)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def identity_remove_if_present(self, did: str) -> bool:
         """Remove a DID from the identity registry if present.
@@ -754,23 +906,27 @@ class SCP:
         the DID was not in the registry. Delegates to
         ``_scp_core.SCP.identity_remove_if_present``.
         """
-        return await asyncio.to_thread(self._native.identity_remove_if_present, did)
+
+        try:
+            return await asyncio.to_thread(self._native.identity_remove_if_present, did)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def identity_renew_attestation(self, did: str, attestation_id: str) -> Any:
         """Renew an identity link attestation (§3.5.2).
 
         Returns an :class:`~scp_sdk.identity.IdentityAttestation` with a
         refreshed ``verified_at`` timestamp. Raises
-        :class:`~scp_sdk.errors.IdentityError` when the bridge does not
+        :class:`~scp_sdk.errors.AttestationError` when the bridge does not
         expose renewal.
         """
         import json
 
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
         from scp_sdk.identity import IdentityAttestation
 
         if not hasattr(self._native, "identity_renew_attestation"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation renewal is not yet available in the bridge",
                 "SCP-ATTEST-9013",
             )
@@ -791,14 +947,20 @@ class SCP:
         """Delegate to ``_scp_core.SCP.identity_rotate_agent_key`` (returns :class:`Identity`)."""
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_rotate_agent_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_rotate_agent_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_rotate_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_rotate_key`` (returns :class:`Identity`)."""
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_rotate_key, identity)
+        try:
+            raw = await asyncio.to_thread(self._native.identity_rotate_key, identity)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return Identity(raw)
 
     async def identity_verify_device_attestation(self, did: str, token_base64: str) -> Any:
@@ -806,15 +968,23 @@ class SCP:
 
         ADR-048 §1: pure helper exposed as a module-level free function.
 
-        Raises :class:`~scp_sdk.errors.IdentityError` when the bridge was
-        not built with the ``allow_in_memory_custody`` feature.
+        On a shipped build this fails closed: no production device-attestation
+        backend is wired yet (Apple App Attest / Google Play Integrity are
+        hardware/platform-backed and are intentionally deferred with hardware
+        keychain custody until an e2e-driven integration lands; spec §9:187).
+        Raises :class:`~scp_sdk.errors.IdentityError` (``SCP-IDENT-1016``). See
+        #2171.
         """
         from scp_sdk.errors import IdentityError
 
         mod = _native_mod()
         if not hasattr(mod, "identity_verify_device_attestation"):
             raise IdentityError(
-                "Device attestation verification requires the 'allow_in_memory_custody' feature",
+                "device attestation verification unavailable: no production "
+                "device-attestation backend is wired yet — Apple App Attest / Google "
+                "Play Integrity are hardware/platform-backed and are intentionally "
+                "deferred (with hardware keychain custody) until an e2e-driven "
+                "integration lands (spec §9:187). See #2171.",
                 "SCP-IDENT-1016",
             )
         return await asyncio.to_thread(mod.identity_verify_device_attestation, did, token_base64)
@@ -825,10 +995,10 @@ class SCP:
         Returns ``True`` if the attestation existed and was removed,
         ``False`` if no attestation with that ID was present.
         """
-        from scp_sdk.errors import IdentityError
+        from scp_sdk.errors import AttestationError
 
         if not hasattr(self._native, "remove_identity_link_attestation"):
-            raise IdentityError(
+            raise AttestationError(
                 "Identity link attestation removal is not yet available in the bridge",
                 "SCP-ATTEST-9012",
             )
@@ -881,7 +1051,7 @@ class SCP:
         from scp_sdk.context import Context
 
         raw = await asyncio.to_thread(self._native.context_create, identity_did, params)
-        return Context(raw, identity_did=identity_did)
+        return Context(raw, identity_did=identity_did, scp=self)
 
     async def context_drain_events(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.context_drain_events``."""
@@ -908,7 +1078,7 @@ class SCP:
         raw = await asyncio.to_thread(self._native.context_import, data, importer_did)
         if raw is None:
             return None
-        return Context(raw, identity_did=importer_did)
+        return Context(raw, identity_did=importer_did, scp=self)
 
     async def context_is_member(self, handle: Any, did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_is_member``."""
@@ -922,13 +1092,210 @@ class SCP:
             self._native.context_join, handle, identity_did, spending_ucan_jwt
         )
 
+    async def reserve_key_package(self, owning_did: str) -> tuple[str, bytes]:
+        """Reserve a single-use MLS ``KeyPackage`` to be invited into a context.
+
+        First step of the reserve -> Welcome -> join handshake (ADR-049 Phase
+        2J). ``owning_did`` MUST be a locally-custodied identity — the same
+        trust model as :meth:`context_create`. Only the PUBLIC ``KeyPackage``
+        bytes cross the FFI boundary; the private signer state never leaves the
+        node's ``KeyPackage`` actor.
+
+        Hand the returned ``key_package_public`` bytes to the context creator
+        (out of band). The creator mints an MLS Welcome addressed to that
+        ``KeyPackage`` and returns it; complete the join by passing the Welcome
+        and the returned ``reservation_id`` to
+        :meth:`context_join_from_welcome`.
+
+        Example::
+
+            reservation_id, key_package_public = await scp.reserve_key_package(
+                joiner.did
+            )
+            # ... hand key_package_public to the creator; the creator calls
+            # invite_member(...) and returns the resulting SealedInvitation ...
+            ctx = await scp.context_join_from_welcome(
+                joiner.did, sealed, reservation_id
+            )
+
+        Args:
+            owning_did: DID of the LOCAL identity reserving the ``KeyPackage``.
+
+        Returns:
+            A ``(reservation_id, key_package_public)`` tuple: the opaque
+            reservation-id string to pass back to
+            :meth:`context_join_from_welcome`, and the public MLS
+            ``KeyPackage`` bytes to hand to the context creator.
+
+        Raises:
+            Exception: If ``owning_did`` is not a locally-custodied identity, or
+                the reservation fails (providers not wired, empty pool).
+
+        Delegates to ``_scp_core.SCP.reserve_key_package``.
+        """
+        return await asyncio.to_thread(self._native.reserve_key_package, owning_did)
+
+    async def context_join_from_welcome(
+        self,
+        owning_did: str,
+        sealed: SealedInvitation,
+        reservation_id: str,
+    ) -> Any:
+        """Join a context from a sealed invitation bundle (returns :class:`Context`).
+
+        Completes the reserve -> invite -> join handshake begun by
+        :meth:`reserve_key_package` (ADR-049 Phase 2J; FFI-02 Option A): given
+        the :class:`SealedInvitation` the creator produced via
+        :meth:`invite_member` for the previously-reserved ``KeyPackage``, the
+        runtime opens the sealed bundle under the joiner's key material,
+        authenticates the creator's signature over the genesis params, installs
+        the joined MLS group, derives the joiner's §9.10.4 routing pseudonym from
+        its locally-custodied identity, and stands the local (joiner) identity up
+        as a send-capable participant with an actor-backed handle. Without it a
+        Welcome-joined node can DECRYPT but cannot SEND.
+
+        The authoritative context params + MLS Welcome travel *inside* the signed
+        bundle — the joiner no longer supplies loose ``params``/``welcome_bytes``.
+        The returned handle reflects the params the creator actually signed, not
+        caller input. ``creator_did`` and ``context_id`` are carried by
+        :class:`SealedInvitation` as binding hints.
+
+        Custody of the JOINER (``owning_did``) is enforced exactly as
+        :meth:`context_create` enforces it for the creator: the routing pseudonym
+        is DERIVED from the joiner's local custody, never caller-supplied, so a
+        non-custodied joiner hard-fails before the single-use ``KeyPackage`` is
+        consumed.
+
+        Example::
+
+            reservation_id, key_package_public = await scp.reserve_key_package(
+                joiner.did
+            )
+            # ... creator calls invite_member(...) → Sealed(bundle, delivered);
+            # hand `outcome.bundle` back to the joiner (no re-assembly) ...
+            ctx = await scp.context_join_from_welcome(
+                joiner.did, outcome.bundle, reservation_id
+            )
+
+        Args:
+            owning_did: DID of the LOCAL (joiner) identity — its custody derives
+                the routing pseudonym.
+            sealed: The :class:`SealedInvitation` bundle (``context_id``,
+                ``creator_did``, ``enc``, ``ciphertext``) produced by the
+                creator's :meth:`invite_member`.
+            reservation_id: The opaque reservation-id string returned by
+                :meth:`reserve_key_package` for the ``KeyPackage`` this bundle's
+                Welcome addresses.
+
+        Returns:
+            A :class:`~scp_sdk.context.Context` in the ``"active"`` state for the
+            joined context, scoped to the joiner (``owning_did``).
+
+        Raises:
+            Exception: If the joiner is not locally custodied, the sealed bundle
+                fails to open or authenticate, the ``enc`` is not 32 bytes, the
+                reservation id is malformed, or the spawn fails (bad/duplicate
+                Welcome, single-use replay, first-writer-wins collision, or
+                fail-closed persist failure).
+
+        Delegates to ``_scp_core.SCP.context_join_from_welcome``.
+        """
+        from scp_sdk.context import Context
+
+        native_sealed = _to_native_sealed(sealed)
+        raw = await asyncio.to_thread(
+            self._native.context_join_from_welcome,
+            owning_did,
+            native_sealed,
+            reservation_id,
+        )
+        return Context(raw, identity_did=owning_did, scp=self)
+
+    async def invite_member(
+        self,
+        context_id: str,
+        creator_did: str,
+        invitee_did: str,
+        invitee_key_package: bytes,
+        relay_urls: list[str],
+    ) -> InviteMemberOutcome:
+        """Invite a member into a context (ADR-049 Phase 2J; FFI-02 Option A).
+
+        The inviting member (``creator_did``, which MUST be locally custodied)
+        seals the context's genesis params + MLS Welcome for the invitee under
+        RFC 9180 HPKE, binding them to the invitee's ``KeyPackage``, and signs
+        the bundle under its ``#active`` key. The invitee reserves its
+        ``KeyPackage`` via :meth:`reserve_key_package` and hands the public bytes
+        to the inviter out of band.
+
+        Only a ``SingleAdmin`` context is supported today: the invite is
+        unilateral and returns a :class:`Sealed` outcome whose :attr:`~Sealed.bundle`
+        is the :class:`SealedInvitation` — pass it straight to the invitee's
+        :meth:`context_join_from_welcome`. A voting-governed context RAISES
+        (governed-context invitations are not yet implemented).
+
+        The invite routes through the actor governance gate, which requires the
+        inviter to hold the ``governance:propose`` capability. A normally-created
+        ``SingleAdmin`` context grants its admin that capability at genesis, so it
+        works out of the box; a context with a custom ceiling must grant
+        ``governance:propose`` to the inviter.
+
+        Example::
+
+            reservation_id, invitee_kp = await joiner_scp.reserve_key_package(
+                invitee.did
+            )
+            outcome = await scp.invite_member(
+                context_id, creator.did, invitee.did, invitee_kp, []
+            )
+            # `outcome.bundle` is directly usable — no manual re-assembly:
+            ctx = await joiner_scp.context_join_from_welcome(
+                invitee.did, outcome.bundle, reservation_id
+            )
+
+        Args:
+            context_id: The context to invite into.
+            creator_did: The inviting member's DID (locally custodied; the invite
+                is signed under its ``#active`` key).
+            invitee_did: The DID being invited.
+            invitee_key_package: The invitee's TLS-serialized MLS ``KeyPackage``
+                (the public bytes from the invitee's :meth:`reserve_key_package`).
+            relay_urls: Relay URLs to include for the invitee's first contact.
+
+        Returns:
+            A :class:`Sealed` outcome carrying the sealed
+            :attr:`~Sealed.bundle` and the :attr:`~Sealed.delivered` flag.
+
+        Raises:
+            Exception: If the supervisor is not initialized, the inviter is not
+                locally custodied / its signing key cannot be resolved, the
+                context is unknown, the context is voting-governed (governed-context
+                invitations are not yet implemented), the inviter is unauthorized,
+                or the ``KeyPackage`` is invalid.
+
+        Delegates to ``_scp_core.SCP.invite_member``.
+        """
+        raw = await asyncio.to_thread(
+            self._native.invite_member,
+            context_id,
+            creator_did,
+            invitee_did,
+            invitee_key_package,
+            relay_urls,
+        )
+        return _to_invite_outcome(raw)
+
     async def context_leave(self, handle: Any, identity_did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_leave``."""
         return await asyncio.to_thread(self._native.context_leave, handle, identity_did)
 
     async def context_member_count(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.context_member_count``."""
-        return await asyncio.to_thread(self._native.context_member_count, handle)
+
+        try:
+            return await asyncio.to_thread(self._native.context_member_count, handle)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def context_member_dids(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.context_member_dids``."""
@@ -1015,8 +1382,56 @@ class SCP:
         event); retry once peers' pseudonym-announcement messages have arrived.
         A lone-member send is a no-op; broadcast contexts are unaffected.
         """
+
+        try:
+            return await asyncio.to_thread(
+                self._native.context_send, handle, identity_did, payload, spending_ucan_jwt
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
+
+    async def context_app_bind(
+        self,
+        context_id: str,
+        declaration_json: str,
+        actor_did: str,
+        timestamp_secs: int,
+    ) -> Any:
+        """Delegate to ``_scp_core.SCP.app_bind``.
+
+        Validates the capability declaration against the context ceiling and
+        the actor's role capabilities, then appends a durable ``AppBound``
+        event (tag 74) to the event log (spec §8.4.1).
+
+        Returns a JSON summary string with ``app_did`` and
+        ``granted_capabilities`` on success.
+        """
         return await asyncio.to_thread(
-            self._native.context_send, handle, identity_did, payload, spending_ucan_jwt
+            self._native.app_bind,
+            context_id,
+            declaration_json,
+            actor_did,
+            timestamp_secs,
+        )
+
+    async def context_app_unbind(
+        self,
+        context_id: str,
+        app_did: str,
+        actor_did: str,
+        timestamp_secs: int,
+    ) -> Any:
+        """Delegate to ``_scp_core.SCP.app_unbind``.
+
+        Removes the app binding and appends a durable ``AppUnbound`` event
+        (tag 75) to the event log (spec §8.4.2).
+        """
+        return await asyncio.to_thread(
+            self._native.app_unbind,
+            context_id,
+            app_did,
+            actor_did,
+            timestamp_secs,
         )
 
     async def get_economic_policy(self, handle: Any) -> Any:
@@ -1084,18 +1499,89 @@ class SCP:
         context_id: str,
         token: str,
         capability: str,
-        presenting_agent_did: str | None = None,
+        presenting_agent_did: str,
         proof_tokens: list[str] | None = None,
-    ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_validate``."""
-        return await asyncio.to_thread(
-            self._native.ucan_validate,
+    ) -> None:
+        """Delegate to ``_scp_core.SCP.ucan_validate``.
+
+        ``presenting_agent_did`` is REQUIRED (no silent security default): the
+        bridge rejects an absent or empty value rather than defaulting the
+        presenting agent to the token's own ``aud`` (which would make the
+        step-5 audience check the tautology ``aud == aud`` and inflate trust).
+        Pass the DID the token must be addressed to.
+        """
+
+        try:
+            return await asyncio.to_thread(
+                self._native.ucan_validate,
+                context_id,
+                token,
+                capability,
+                presenting_agent_did,
+                proof_tokens,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
+
+    async def ucan_evaluate(
+        self,
+        context_id: str,
+        token: str,
+        presenting_agent_did: str,
+        capability: str | None = None,
+        proof_tokens: list[str] | None = None,
+    ) -> CapabilityValidation:
+        """Evaluate a UCAN token and return the structured per-stage result.
+
+        Delegate to ``_scp_core.SCP.ucan_evaluate``, the read-only,
+        side-effect-free diagnostic counterpart to :meth:`ucan_validate`
+        (spec §7.2.4, ADR-059). It runs the same 11-step ADR-016 pipeline
+        but returns a :class:`~scp_sdk.trust.CapabilityValidation` of six
+        per-stage booleans instead of throwing at the first failure, and
+        probes the nonce read-only (never recording it), so it is safe to
+        call repeatedly on the same token. The result is a point-in-time
+        diagnostic snapshot, not a promise that a later ``ucan_validate``
+        will accept the token.
+
+        NOT AN AUTHORIZATION DECISION: this is a diagnostic, never a gate.
+        Only :meth:`ucan_validate` (with its mandatory challenge capability)
+        authorizes an action. A no-capability (intrinsic-validity) result skips
+        the invoked-capability grant-match, so an all-``True`` result does NOT
+        establish the token grants any particular capability — re-run
+        :meth:`ucan_validate` with the concrete capability to authorize.
+
+        ``presenting_agent_did`` is REQUIRED (no silent security default): the
+        bridge rejects an absent or empty value rather than defaulting the
+        presenting agent to the token's own ``aud`` (which would make the
+        step-5 audience check the tautology ``aud == aud`` and inflate trust).
+        It precedes ``capability`` in the signature because it is mandatory
+        while ``capability`` is optional. Pass the DID under assessment.
+
+        ``capability`` is OPTIONAL. Omit it (or pass ``None``) to evaluate the
+        token's INTRINSIC validity — signatures, ceiling, nonce, revocation,
+        time bounds — with no invoked-capability grant-match challenge. This is
+        the mode :func:`scp_sdk.trust.evaluate_trust` uses. Pass a concrete
+        capability URI to additionally require the token grants it. (The
+        enforcing :meth:`ucan_validate` gate keeps a mandatory capability.)
+
+        Raises ``ValidationError`` only for malformed FFI input
+        (e.g. an invalid ``context_id`` / ``token`` / ``capability`` /
+        ``did``); capability/signature/expiry outcomes are reported via the
+        returned booleans, never as exceptions.
+        """
+        from scp_sdk.trust import structured_to_capability_validation
+
+        raw = await asyncio.to_thread(
+            self._native.ucan_evaluate,
             context_id,
             token,
             capability,
             presenting_agent_did,
             proof_tokens,
         )
+        # Shared six-field projection — pins the canonical CapabilityValidation
+        # shape in one place (the same helper Layer 1 of ``evaluate_trust`` uses).
+        return structured_to_capability_validation(raw)
 
     # endregion UCAN
 
@@ -1185,9 +1671,18 @@ class SCP:
             self._native.broadcast_publish_assets, handle, author_did, assets, deploy_id
         )
 
-    async def broadcast_subscribe(self, handle: Any, subscriber_did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.broadcast_subscribe``."""
-        return await asyncio.to_thread(self._native.broadcast_subscribe, handle, subscriber_did)
+    async def broadcast_subscribe(
+        self, handle: Any, subscriber_did: str, messages_read_ucan_jwt: str | None = None
+    ) -> Any:
+        """Delegate to ``_scp_core.SCP.broadcast_subscribe``.
+
+        For a GATED broadcast context, ``messages_read_ucan_jwt`` must carry the
+        ``messages:read`` UCAN JWT issued to ``subscriber_did`` by the context
+        admin/creator (spec §5.14.4). It is unused for an OPEN context.
+        """
+        return await asyncio.to_thread(
+            self._native.broadcast_subscribe, handle, subscriber_did, messages_read_ucan_jwt
+        )
 
     async def broadcast_subscriber_count(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.broadcast_subscriber_count``."""
@@ -1311,9 +1806,13 @@ class SCP:
 
     async def governance_propose(self, handle: Any, identity_did: str, action_json: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_propose``."""
-        return await asyncio.to_thread(
-            self._native.governance_propose, handle, identity_did, action_json
-        )
+
+        try:
+            return await asyncio.to_thread(
+                self._native.governance_propose, handle, identity_did, action_json
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
 
     async def governance_reject(self, handle: Any, identity_did: str, proposal_id_hex: str) -> Any:
         """Delegate to ``_scp_core.SCP.governance_reject``."""
@@ -1401,15 +1900,15 @@ class SCP:
 
         Args:
             i_trust_all_commands: Must be ``True`` to confirm the security
-                bypass. Raises ``ValidationError`` if ``False``.
+                bypass. Raises ``McpError`` if ``False``.
 
         Raises:
-            ValidationError: If *i_trust_all_commands* is not ``True``.
+            McpError: If *i_trust_all_commands* is not ``True``.
         """
-        from scp_sdk.errors import ValidationError
+        from scp_sdk.errors import McpError
 
         if not i_trust_all_commands:
-            raise ValidationError(
+            raise McpError(
                 "You must pass i_trust_all_commands=True to disable the "
                 "stdio allowlist. This allows arbitrary command execution.",
                 code="SCP-MCP-10007",
@@ -1467,7 +1966,12 @@ class SCP:
         return await asyncio.to_thread(self._native.py_mcp_client_info, raw)
 
     async def mcp_client_invoke(
-        self, handle: Any, tool_name: str, input: dict[str, Any], context_id: str, identity_did: str
+        self,
+        handle: Any,
+        outlet_name: str,
+        input: dict[str, Any],
+        context_id: str,
+        identity_did: str,
     ) -> Any:
         """Delegate to ``_scp_core.SCP.py_mcp_client_invoke``.
 
@@ -1480,7 +1984,7 @@ class SCP:
         raw = await asyncio.to_thread(
             self._native.py_mcp_client_invoke,
             raw_handle,
-            tool_name,
+            outlet_name,
             input,
             context_id,
             identity_did,
@@ -1519,10 +2023,12 @@ class SCP:
         """Delegate to ``_scp_core.SCP.py_mcp_load_contexts``."""
         return await asyncio.to_thread(self._native.py_mcp_load_contexts, identity_did, _relay_url)
 
-    async def mcp_register_tool_handler(self, context_id: str, tool_name: str, handler: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.mcp_register_tool_handler``."""
+    async def mcp_register_outlet_handler(
+        self, context_id: str, outlet_name: str, handler: Any
+    ) -> Any:
+        """Delegate to ``_scp_core.SCP.mcp_register_outlet_handler``."""
         return await asyncio.to_thread(
-            self._native.mcp_register_tool_handler, context_id, tool_name, handler
+            self._native.mcp_register_outlet_handler, context_id, outlet_name, handler
         )
 
     async def mcp_serve(
@@ -1683,7 +2189,10 @@ class SCP:
         """
         from scp_sdk.event_log import Event
 
-        raw_events = await asyncio.to_thread(self._native.event_log_query, context_id, filter)
+        try:
+            raw_events = await asyncio.to_thread(self._native.event_log_query, context_id, filter)
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
         return [
             Event(
                 event_type=e.event_type,
@@ -1763,6 +2272,41 @@ class SCP:
         """Delegate to ``_scp_core.SCP.economy_budget_remaining``."""
         return await asyncio.to_thread(self._native.economy_budget_remaining, context_id, did)
 
+    async def economy_verify_payment_receipts(
+        self, receipts: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Delegate to ``_scp_core.SCP.economy_verify_payment_receipts``.
+
+        Verifies a batch of payment receipts against this instance's economy
+        state. The result reports cryptographic validity via the top-level
+        ``all_valid`` flag and a per-receipt ``valid`` flag. Note that an
+        invalid-but-reachable receipt still carries ``ok == True`` — callers
+        scanning for failures MUST inspect ``valid``/``all_valid``, not ``ok``.
+
+        Args:
+            receipts: List of payment receipt dicts to verify. Maximum
+                10,000 receipts per call.
+
+        Returns:
+            A dict with keys ``all_valid`` (bool) and ``results`` (list of
+            per-receipt dicts with ``receipt_id``, ``ok``, ``valid``, and
+            ``result`` keys).
+
+        Raises:
+            ScpError: If the receipts are invalid or the supervisor is
+                not initialized.
+        """
+        import json
+
+        receipts_json = json.dumps(receipts)
+        try:
+            raw = await asyncio.to_thread(
+                self._native.economy_verify_payment_receipts, receipts_json
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
+        return json.loads(raw)
+
     # endregion Economy
 
     # region Trust
@@ -1771,31 +2315,93 @@ class SCP:
         self,
         context_id: str,
         subject_did: str,
-        events_json: str,
-        merkle_root_json: str,
-        consequence_rules_json: str,
-        threshold_requirements_json: str,
-        attestor_sets_json: str,
-        cached_attestations_json: str,
-        challenge_results_json: str,
+        events: list[EventLogEntry] | list[dict[str, Any]],
+        merkle_root: list[int],
+        consequence_rules: list[dict[str, Any]] | None = None,
+        threshold_requirements: dict[str, ThresholdRequirement] | dict[str, Any] | None = None,
+        attestor_sets: dict[str, list[AttestorInfo]] | dict[str, Any] | None = None,
+        cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None = None,
+        challenge_results: list[ChallengeVerification] | list[dict[str, Any]] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.aggregate_trust_input``."""
+        """Aggregate all trust engine layers into a single ``TrustInput`` (§7.3).
+
+        Typed counterpart to ``_scp_core.SCP.aggregate_trust_input``
+        (ADR-058): takes the typed trust-aggregation inputs (the same shapes
+        :func:`scp_sdk.trust.aggregate_trust_input` accepts) and serializes
+        them to the serde wire JSON internally via the shared
+        ``scp_sdk.trust._encode_aggregate_trust_wire`` before crossing FFI.
+
+        Raises:
+            ValueError: If ``merkle_root`` is not exactly 32 elements or a
+                ``threshold_requirements`` / ``attestor_sets`` key is not a
+                valid ``scp_sdk.trust.ATTESTATION_TYPES`` name.
+        """
+        from scp_sdk.trust import _encode_aggregate_trust_wire
+
+        wire = _encode_aggregate_trust_wire(
+            events,
+            merkle_root,
+            consequence_rules,
+            threshold_requirements,
+            attestor_sets,
+            cached_attestations,
+            challenge_results,
+        )
         return await asyncio.to_thread(
             self._native.aggregate_trust_input,
             context_id,
             subject_did,
-            events_json,
-            merkle_root_json,
-            consequence_rules_json,
-            threshold_requirements_json,
-            attestor_sets_json,
-            cached_attestations_json,
-            challenge_results_json,
+            *wire,
         )
 
     async def trust_query_score(self, did: str, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.trust_query_score``."""
         return await asyncio.to_thread(self._native.trust_query_score, did, context_id)
+
+    async def evaluate_trust(
+        self,
+        context_id: str,
+        subject_did: str,
+        capability_tokens: list[str] | None = None,
+    ) -> TrustEvaluation:
+        """Evaluate the trustworthiness of a participant in a context.
+
+        Delegates to :func:`scp_sdk.trust.evaluate_trust` (the canonical
+        four-layer trust evaluation), so Python matches the TypeScript, Swift,
+        and Kotlin SDKs, which all expose ``scp.evaluateTrust(...)``. The
+        module-level function remains the implementation.
+
+        SECURITY: the result is data for the caller's judgment, NEVER an
+        authorization verdict. The behavioral record's ``attestation_count``
+        (and any challenge results) are authentic-but-self-mintable and MUST
+        NOT be a sole trust or admission factor (use the threshold/independence
+        path, §7.3.5).
+        """
+        from scp_sdk.trust import evaluate_trust as _evaluate_trust
+
+        return await _evaluate_trust(self, context_id, subject_did, capability_tokens)
+
+    async def participation_record(
+        self,
+        context_id: str,
+        subject_did: str,
+        cached_attestations: list[CachedAttestation] | list[dict[str, Any]] | None = None,
+    ) -> BehavioralRecord:
+        """Compute the participation record (§7.3.2) for a subject in a context.
+
+        Delegates to :func:`scp_sdk.trust.participation_record`, which calls the
+        typed PyO3 ``participation_record`` op and returns a
+        :class:`~scp_sdk.trust.BehavioralRecord` of the twelve flattened facts.
+        The shared Rust core gathers the full event log and computes the record
+        ONCE; the SDK RECEIVES it rather than recomputing Layer 2 client-side.
+        ``attestation_count`` is a credential-layer fact (§7.4), verifier-
+        relative; pass ``cached_attestations`` to populate it (default: none).
+        """
+        from scp_sdk.trust import participation_record as _participation_record
+
+        return await asyncio.to_thread(
+            _participation_record, self, context_id, subject_did, cached_attestations
+        )
 
     # endregion Trust
 
@@ -1941,70 +2547,74 @@ class SCP:
 
     # endregion Provenance
 
-    # region Tools
+    # region Outlets
 
-    async def tool_interface_accept(self, context_id: str, interface_json: str) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_interface_accept``."""
+    async def outlet_interface_accept(self, context_id: str, interface_json: str) -> Any:
+        """Delegate to ``_scp_core.SCP.outlet_interface_accept``."""
         return await asyncio.to_thread(
-            self._native.tool_interface_accept, context_id, interface_json
+            self._native.outlet_interface_accept, context_id, interface_json
         )
 
-    async def tool_interface_expose(
+    async def outlet_interface_expose(
         self,
         context_id: str,
-        tool_id: str,
+        outlet_id: str,
         target_context_id: str,
         rate_limit_json: str | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_interface_expose``."""
+        """Delegate to ``_scp_core.SCP.outlet_interface_expose``."""
         return await asyncio.to_thread(
-            self._native.tool_interface_expose,
+            self._native.outlet_interface_expose,
             context_id,
-            tool_id,
+            outlet_id,
             target_context_id,
             rate_limit_json,
         )
 
-    async def tool_interface_revoke(self, context_id: str, interface_id_hex: str) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_interface_revoke``."""
+    async def outlet_interface_revoke(self, context_id: str, interface_id_hex: str) -> Any:
+        """Delegate to ``_scp_core.SCP.outlet_interface_revoke``."""
         return await asyncio.to_thread(
-            self._native.tool_interface_revoke, context_id, interface_id_hex
+            self._native.outlet_interface_revoke, context_id, interface_id_hex
         )
 
-    async def tool_invoke(
+    async def outlet_invoke(
         self,
         context_id: str,
-        tool_id: str,
+        outlet_id: str,
         input: dict[str, Any],
         identity_did: str,
         ucan_token: str,
         proof_tokens: list[str] | None = None,
         spending_ucan: str | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_invoke``."""
-        return await asyncio.to_thread(
-            self._native.tool_invoke,
-            context_id,
-            tool_id,
-            input,
-            identity_did,
-            ucan_token,
-            proof_tokens,
-            spending_ucan,
-        )
+        """Delegate to ``_scp_core.SCP.outlet_invoke``."""
 
-    async def tool_invoke_cross_context(
+        try:
+            return await asyncio.to_thread(
+                self._native.outlet_invoke,
+                context_id,
+                outlet_id,
+                input,
+                identity_did,
+                ucan_token,
+                proof_tokens,
+                spending_ucan,
+            )
+        except Exception as exc:
+            raise _coded_bridge_error(exc) from exc
+
+    async def outlet_invoke_cross_context(
         self,
         source_context_id: str,
         target_context_id: str,
-        tool_id: str,
+        outlet_id: str,
         input: dict[str, Any],
         invoker_did: str,
         ucan_token: str,
         chain_depth: int = 0,
         proof_tokens: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_invoke_cross_context``.
+        """Delegate to ``_scp_core.SCP.outlet_invoke_cross_context``.
 
         Validates ``chain_depth`` is an integer in the closed range
         ``0..255`` (u8 on the bridge side). Rejects ``bool`` (Python's
@@ -2025,10 +2635,10 @@ class SCP:
                 code="SCP-VALID-7002",
             )
         return await asyncio.to_thread(
-            self._native.tool_invoke_cross_context,
+            self._native.outlet_invoke_cross_context,
             source_context_id,
             target_context_id,
-            tool_id,
+            outlet_id,
             input,
             invoker_did,
             ucan_token,
@@ -2036,18 +2646,262 @@ class SCP:
             proof_tokens,
         )
 
-    async def tool_register(self, context_id: str, registration: dict[str, Any]) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_register``."""
-        return await asyncio.to_thread(self._native.tool_register, context_id, registration)
+    async def outlet_invoke_cross_context_saga(
+        self,
+        caller_context_id: str,
+        target_context_id: str,
+        caller_did: str,
+        outlet_registration_id: str,
+        input: dict[str, Any],
+        asserted_nonce_hex: str,
+        timestamp_ms: int,
+        chain_depth: int,
+        ucan_proof_id: str | None = None,
+    ) -> SagaResult:
+        """Run the §6.2.4 atomic cross-context outlet-invocation saga.
 
-    async def tool_session_close(self, context_id: str, session_id: str) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_session_close``."""
-        return await asyncio.to_thread(self._native.tool_session_close, context_id, session_id)
+        Delegates to ``_scp_core.SCP.outlet_invoke_cross_context_saga``. The
+        saga either commits — returning a :class:`~scp_sdk.outlets.SagaResult`
+        carrying the supervisor-minted ``saga_id`` plus the target's signed
+        receipt and captured output bytes — or reaches a typed terminal,
+        which is re-raised as one of the SDK saga exceptions:
 
-    async def tool_session_create(
-        self, context_id: str, tool_id: str, source_context_id: str, ttl_seconds: int | None = None
+        - :class:`~scp_sdk.errors.SagaAbortedError` — a Prepare-phase abort:
+          a PERMANENT rejection OR a RETRYABLE transient (rate limit /
+          participant actor unavailable), distinguished by the
+          ``SCP-SAGA-*`` code; carries ``retry_after_ms`` (``None``, never
+          ``0``, when no precise back-off exists).
+        - :class:`~scp_sdk.errors.SagaNeedsRepairError` — Commit retries
+          exhausted; carries the durable ``saga_id`` repair handle.
+        - :class:`~scp_sdk.errors.SagaBusyError` — the participant context
+          set overlapped an in-flight saga; carries ``contended_context``.
+
+        Validates ``chain_depth`` is an integer in the closed range
+        ``0..255`` (u8 on the bridge side) and ``timestamp_ms`` is a
+        non-negative integer. Both reject ``bool`` (Python's ``bool``
+        passes ``isinstance(..., int)``) and floats, matching the bridge's
+        ``u8`` / ``u64`` boundaries. See spec §6.2.4 and ADR-049 §3a.
+        """
+        from scp_sdk.errors import ValidationError, _saga_terminal_from_bridge
+        from scp_sdk.outlets import SagaResult
+
+        if (
+            isinstance(chain_depth, bool)
+            or not isinstance(chain_depth, int)
+            or chain_depth < 0
+            or chain_depth > 255
+        ):
+            raise ValidationError(
+                f"chain_depth must be an integer in range 0-255, got {chain_depth!r}",
+                code="SCP-VALID-7002",
+            )
+        if isinstance(timestamp_ms, bool) or not isinstance(timestamp_ms, int) or timestamp_ms < 0:
+            raise ValidationError(
+                f"timestamp_ms must be a non-negative integer, got {timestamp_ms!r}",
+                code="SCP-VALID-7002",
+            )
+
+        try:
+            native_result = await asyncio.to_thread(
+                self._native.outlet_invoke_cross_context_saga,
+                caller_context_id,
+                target_context_id,
+                caller_did,
+                outlet_registration_id,
+                input,
+                asserted_nonce_hex,
+                timestamp_ms,
+                chain_depth,
+                ucan_proof_id,
+            )
+        except Exception as exc:
+            translated = _saga_terminal_from_bridge(exc)
+            if translated is None:
+                raise
+            raise translated from exc
+
+        return SagaResult(
+            saga_id=native_result.saga_id,
+            receipt=native_result.receipt,
+            output=native_result.output,
+        )
+
+    def outlet_invoke_cross_context_streaming_saga(
+        self,
+        caller_context_id: str,
+        target_context_id: str,
+        caller_did: str,
+        outlet_registration_id: str,
+        input: dict[str, Any],
+        asserted_nonce_hex: str,
+        timestamp_ms: int,
+        chain_depth: int,
+        ucan_token: str,
+        proof_tokens: list[str] | None = None,
+        ucan_proof_id: str | None = None,
+        timeout_ms: int | None = None,
+        estimated_chunk_count: int | None = None,
+    ) -> StreamingSagaHandle:
+        """Open the §5.4.5 / §6.2.4 cross-context STREAMING outlet-invocation saga.
+
+        The STREAMING sibling of :meth:`outlet_invoke_cross_context_saga`. Where
+        the unary saga BLOCKS the FFI worker until ``Committed`` (≤~95s) and
+        returns the result inline, the streaming saga returns its chunk receiver
+        PROMPTLY at the Commit-transition and reaches ``Committed``
+        ASYNCHRONOUSLY at seal-close (the ADR-049 §3a streaming wait-model
+        amendment) — an LLM stream can exceed the unary bound, so the credit
+        ceiling bounds chunk COUNT, not wall-clock.
+
+        Returns a :class:`~scp_sdk.outlets.StreamingSagaHandle` — an
+        async-iterable + awaitable handle whose FIRST pull opens the saga
+        (``outlet_streaming_saga_open`` mints the durable ``saga_id`` at the
+        Commit-transition) and whose iteration drains chunks via
+        ``outlet_streaming_saga_poll_next``. This method performs NO I/O and
+        does NOT block — the saga opens lazily on first ``await`` / iteration,
+        matching the same-context :meth:`~scp_sdk.outlets.Outlets.invoke`.
+
+        There is NO live control plane (grant_credit / cancel) for the
+        cross-context saga stream — per §6.2.5 / SCP-OUT-046 the credit window
+        is fixed at open via ``estimated_chunk_count`` (cancel_ack_ceiling =
+        u64::MAX). An open rejection — the §6.2.4 caller-principal binding
+        (a ``caller_did`` this instance does not host / not a member of
+        ``caller_context_id``), a Prepare/Commit saga terminal, or an
+        input/UCAN rejection — surfaces on the first ``await`` / iteration as
+        the matching SDK type (:class:`~scp_sdk.errors.SagaAbortedError` /
+        :class:`~scp_sdk.errors.SagaBusyError` /
+        :class:`~scp_sdk.errors.SagaNeedsRepairError` /
+        :class:`~scp_sdk.errors.ValidationError` /
+        :class:`~scp_sdk.errors.UcanPermissionError`), and the receiver is
+        never handed out.
+
+        The parameters mirror :meth:`outlet_invoke_cross_context_saga`
+        (``caller_context_id`` / ``target_context_id`` / ``caller_did`` /
+        ``outlet_registration_id`` / ``input`` / the ``asserted_nonce_hex`` /
+        ``timestamp_ms`` / ``chain_depth`` freshness triple / ``ucan_proof_id``)
+        plus the streaming-open extras: the required invocation ``ucan_token``,
+        optional ``proof_tokens`` delegation chain, per-stream ``timeout_ms``,
+        and the invoker-declared ``estimated_chunk_count`` credit ceiling.
+
+        Validates ``chain_depth`` is an integer in the closed range ``0..255``
+        (u8 on the bridge side) and ``timestamp_ms`` is a non-negative integer;
+        both reject ``bool`` and floats. See spec §6.2.4, §5.4.5, and
+        ADR-049 §3a.
+        """
+        from scp_sdk.errors import ValidationError
+        from scp_sdk.outlets import StreamingSagaHandle, _StreamingSagaOpenParams
+
+        if (
+            isinstance(chain_depth, bool)
+            or not isinstance(chain_depth, int)
+            or chain_depth < 0
+            or chain_depth > 255
+        ):
+            raise ValidationError(
+                f"chain_depth must be an integer in range 0-255, got {chain_depth!r}",
+                code="SCP-VALID-7002",
+            )
+        if isinstance(timestamp_ms, bool) or not isinstance(timestamp_ms, int) or timestamp_ms < 0:
+            raise ValidationError(
+                f"timestamp_ms must be a non-negative integer, got {timestamp_ms!r}",
+                code="SCP-VALID-7002",
+            )
+
+        params = _StreamingSagaOpenParams(
+            caller_context_id=caller_context_id,
+            target_context_id=target_context_id,
+            caller_did=caller_did,
+            outlet_registration_id=outlet_registration_id,
+            input=input,
+            asserted_nonce_hex=asserted_nonce_hex,
+            timestamp_ms=timestamp_ms,
+            chain_depth=chain_depth,
+            ucan_token=ucan_token,
+            proof_tokens=proof_tokens,
+            ucan_proof_id=ucan_proof_id,
+            timeout_ms=timeout_ms,
+            estimated_chunk_count=estimated_chunk_count,
+        )
+        return StreamingSagaHandle(self._native, params)
+
+    async def recover_streaming_saga_truncated_close(self, saga_id: str, caller_did: str) -> None:
+        """Drive the key-bearing in-session reconnect/repair truncated-close for
+        a cross-context streaming saga (SCP-OUT-046 #136 AC7, SCP-OUT-047).
+
+        This is IN-SESSION reconnect/repair of a seal that stalled or went
+        ``NeedsRepair`` while THIS bridge process is still alive (e.g. a client
+        reconnects to the same live node). The saga registry is per-instance and
+        in-memory, so this does NOT survive a process/node restart — cross-restart
+        recovery replays the durable saga journal via a separate operator path,
+        not this surface.
+
+        On FFI reconnect this authenticates the caller, surfaces the target
+        context's Active Signing Key (resolved per-call from custody, never
+        envelope-asserted), and calls
+        ``Supervisor::recover_streaming_saga_truncated_close`` to seal a
+        witness-absent durable prefix and resolve the saga ``Committed`` —
+        WITHOUT re-opening the stream or re-invoking the outlet executor. It
+        returns ``None`` on a successful ``Committed`` resolution.
+
+        ``caller_did`` MUST be an identity hosted by this bridge instance (the
+        §6.2.4 channel-authenticated principal) AND the invoker pinned at open —
+        recovery is money-moving (it bills the invoker / credits the operator
+        over B's durable prefix), so a hosted-but-non-invoker caller is rejected
+        with ``SCP-PERM-3001`` (the SAME invoker gate the same-context
+        grant/cancel/terminate siblings enforce) BEFORE the signing key is
+        resolved.
+
+        Raises :class:`~scp_sdk.errors.ContextError` if ``caller_did`` is not
+        hosted by this instance or ``saga_id`` is unknown, or — when
+        ``caller_did`` is hosted but is not the pinned invoker — a
+        :class:`~scp_sdk.errors.ContextError` whose structured ``.code`` is
+        ``SCP-PERM-3001`` (a caller can branch on ``.code`` for this
+        money-moving gate, not only substring-match the message);
+        :class:`~scp_sdk.errors.SagaNeedsRepairError` if the seal cannot
+        complete (the saga stays unresolved for a later retry).
+        """
+        from scp_sdk.errors import _saga_terminal_from_bridge
+        from scp_sdk.outlets import _translate_bridge_error
+
+        try:
+            await asyncio.to_thread(
+                self._native.outlet_streaming_saga_recover_truncated_close,
+                saga_id,
+                caller_did,
+            )
+        except Exception as exc:
+            translated = _saga_terminal_from_bridge(exc)
+            raise (translated if translated is not None else _translate_bridge_error(exc)) from exc
+
+    async def outlet_register(
+        self, context_id: str, registration: OutletDefinition | dict[str, Any]
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_session_create``.
+        """Register an outlet in a context via ``_scp_core.SCP.outlet_register``.
+
+        Accepts a typed :class:`~scp_sdk.outlets.OutletDefinition` (converted to
+        the bridge registration dict via
+        :meth:`~scp_sdk.outlets.OutletDefinition.to_dict`, which emits the
+        required §5.4.2 ``kind`` wire string) or a raw registration ``dict``
+        (passed through unchanged, e.g. for the bridge-parity harness).
+        """
+        from scp_sdk.outlets import OutletDefinition
+
+        payload = (
+            registration.to_dict() if isinstance(registration, OutletDefinition) else registration
+        )
+        return await asyncio.to_thread(self._native.outlet_register, context_id, payload)
+
+    async def outlet_session_close(self, context_id: str, session_id: str) -> Any:
+        """Delegate to ``_scp_core.SCP.outlet_session_close``."""
+        return await asyncio.to_thread(self._native.outlet_session_close, context_id, session_id)
+
+    async def outlet_session_create(
+        self,
+        context_id: str,
+        outlet_id: str,
+        source_context_id: str,
+        ttl_seconds: int | None = None,
+    ) -> Any:
+        """Delegate to ``_scp_core.SCP.outlet_session_create``.
 
         Validates ``ttl_seconds`` is a non-negative integer or ``None``.
         Rejects ``bool`` (which passes ``isinstance(..., int)``) and
@@ -2064,10 +2918,14 @@ class SCP:
                 code="SCP-VALID-7002",
             )
         return await asyncio.to_thread(
-            self._native.tool_session_create, context_id, tool_id, source_context_id, ttl_seconds
+            self._native.outlet_session_create,
+            context_id,
+            outlet_id,
+            source_context_id,
+            ttl_seconds,
         )
 
-    async def tool_session_invoke(
+    async def outlet_session_invoke(
         self,
         context_id: str,
         session_id: str,
@@ -2076,9 +2934,9 @@ class SCP:
         ucan_token: str,
         proof_tokens: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_session_invoke``."""
+        """Delegate to ``_scp_core.SCP.outlet_session_invoke``."""
         return await asyncio.to_thread(
-            self._native.tool_session_invoke,
+            self._native.outlet_session_invoke,
             context_id,
             session_id,
             input,
@@ -2087,11 +2945,11 @@ class SCP:
             proof_tokens,
         )
 
-    async def tool_verify(self, context_id: str, tool_id: str) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_verify``."""
-        return await asyncio.to_thread(self._native.tool_verify, context_id, tool_id)
+    async def outlet_verify(self, context_id: str, outlet_id: str) -> Any:
+        """Delegate to ``_scp_core.SCP.outlet_verify``."""
+        return await asyncio.to_thread(self._native.outlet_verify, context_id, outlet_id)
 
-    # endregion Tools
+    # endregion Outlets
 
     # region Fullstack
 

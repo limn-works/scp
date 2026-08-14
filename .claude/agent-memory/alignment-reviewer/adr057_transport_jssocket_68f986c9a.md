@@ -1,0 +1,18 @@
+---
+name: adr057-transport-jssocket-68f986c9a
+description: ADR-057 #1980-independent relay-transport slice review — T-2 join deferral is unrecorded artifact-flow inversion (BLOCKER)
+metadata:
+  type: project
+---
+
+ADR-057 in-browser relay transport slice, branch `feat/adr057-transport-jssocket` @ `68f986c9a`, base origin/main. Reviewed 2026-07-17. JsSocket outbound port + §9.10.4 zeroed-routing_id pseudonym fan-out + announce/ingest over already-shared MLS group + `ScpMlsGroup::derive_pseudonym` (Option A, MLS-keyed).
+
+**BLOCKER — T-2 join deferral is an UNRECORDED artifact-flow inversion.** ADR-057 Amendment(2026-07-16) T-2 AND planning-session-10 T-2 both MANDATE native↔browser `InvitationBundle`/`hpke_seal/open_invitation` join "in the transport slice, **not deferred**," and each explicitly REJECTS "defer native-context join to a later slice" per no-deferral tenet ("nothing external blocks it — primitives are wasm-reachable"). This slice ships ZERO InvitationBundle usage (grep confirms none in scp-client/scp-client-wasm); join is the pre-existing Slice-2 pending-keypackage path only. The deferral lives ONLY in commit msg + backend agent-memory ("DEFER: invitation join path, HPKE-open custody, #1980") — NOT in ADR or PS-10. Also T-2's premise "nothing external blocks it" was FALSIFIED as-built: HPKE-open needs custody key browser lacks pre-#1980. Fix: amend ADR-057 T-2 + PS-10 to record the #1980-coupled HPKE-open-custody blocker and the human re-slice BEFORE merge. Asymmetry that makes it clear: same PR DID write the A1 pseudonym deviation into ADR+spec (correct) but did NOT record the larger join deferral.
+
+**major — ADR self-contradiction on byte-parity.** Option A amendment line 214 claims "Native and browser run ONE implementation: byte-parity by construction" + #1980 "restores native↔browser byte-parity for the same human" (implies same-human parity intended). A1 note line 222 NEGATES same-human parity (MLS-keyed ≠ identity-keyed). Option A text uncorrected → two contradictory claims. Fix: scope "byte-parity by construction" to cross-target algorithm determinism (still true), distinct from same-human pseudonym equality (false pre-#1980).
+
+**major — provenance of MLS-key ruling.** A1 note asserts "human-ruled" (2026-07-17) but only recorded human ruling (PS-10/Option A 2026-07-16) is the Rust-vs-JS choice and ASSUMED byte-parity. Specific decision to accept MLS-keyed (non-identity) pseudonym breaking same-human parity is not in the decision-record (PS-10 unmodified). Confirm human ruled on THIS weakening; record in PS-10.
+
+**minor** — (4) announce-mesh (no-announce-at-create/forward-secrecy; adder re-announce on add; joiner on join; bystander on add-Commit receive) is load-bearing but only in code comments; ADR documents symmetric T4 sender-key mesh but not this. (5) #1980 switch is a de-facto one-time pseudonym rotation per live context (not DOA — local_pseudonym unpersisted, re-derived; §9.10.4.1 rotation exists).
+
+**POSITIVE / sound:** share-don't-fork honored (classify_pseudonym_announcement, DEFAULT_APP_DATA_BLOB_TTL_SECS moved to scp-protocol behavior-preserving 300s, scp_crypto::pseudonym all shared). §9.10.4.A enumeration-resistance PRESERVED (MLS seed is private/non-publicly-derivable). No dev/test stand-in on prod (loopback Socket #[cfg(test)] unexported; empty-registry fails closed PseudonymRegistryEmpty SCP-CTX-2040; lone-member true no-op = native). Seed extraction fail-closed (non-32B rejected), zeroized, cross-checked vs test-utils private() so upstream serde drift breaks loudly. Snapshot v3→v4 adds peer_pseudonyms (pre-release, no migration).

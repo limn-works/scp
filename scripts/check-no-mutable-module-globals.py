@@ -147,7 +147,9 @@ def _is_immutable_constant(node: ast.AST) -> bool:
         return True
 
     # Unary minus / plus on a literal: `-1`, `+42`
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
+    if isinstance(node, ast.UnaryOp) and isinstance(
+        node.op, (ast.USub, ast.UAdd, ast.Invert)
+    ):
         return _is_immutable_constant(node.operand)
 
     # BinOp between constants: `"0" * 64`, `1 << 8`, `A + B` where both
@@ -260,9 +262,7 @@ def _iter_module_level_statements(tree: ast.Module) -> Iterable[ast.stmt]:
             # runtime when TYPE_CHECKING is False).
             is_type_checking = (
                 isinstance(test, ast.Name) and test.id == "TYPE_CHECKING"
-            ) or (
-                isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
-            )
+            ) or (isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
             if is_type_checking:
                 # The `orelse` branch runs at import; scan it but not the body.
                 yield from stmt.orelse
@@ -413,8 +413,8 @@ def _tty_colors() -> tuple[str, str, str, str, str]:
             "\033[31m",  # red
             "\033[32m",  # green
             "\033[33m",  # yellow
-            "\033[2m",   # dim
-            "\033[0m",   # reset
+            "\033[2m",  # dim
+            "\033[0m",  # reset
         )
     return ("", "", "", "", "")
 
@@ -457,9 +457,15 @@ def main() -> int:
     print(file=sys.stderr)
     print("A new module-level assignment must either:", file=sys.stderr)
     print("  1. live on a class (SCP / Context / a dataclass),", file=sys.stderr)
-    print("     or be passed in via constructor injection (preferred), or", file=sys.stderr)
+    print(
+        "     or be passed in via constructor injection (preferred), or",
+        file=sys.stderr,
+    )
     print("  2. be added to the ALLOWLIST in", file=sys.stderr)
-    print("     scripts/check-no-mutable-module-globals.py with a justifying", file=sys.stderr)
+    print(
+        "     scripts/check-no-mutable-module-globals.py with a justifying",
+        file=sys.stderr,
+    )
     print("     comment, AND a comment on the assignment itself.", file=sys.stderr)
     print(file=sys.stderr)
     print("ALL_CAPS names are assumed to be immutable constants by", file=sys.stderr)

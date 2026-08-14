@@ -13,13 +13,11 @@
 //!
 //! See spec sections 17.3, 17.4, and 23.11.
 
-use std::collections::HashSet;
-
 use hex;
 use scp_platform::traits::Storage;
 use zeroize::Zeroize;
 
-use scp_identity::DID;
+use scp_did::DID;
 
 use super::{ProtocolRepository, StoreError};
 
@@ -105,25 +103,6 @@ fn sender_key_key(context_id: &str, did: &DID) -> Result<String, super::StoreErr
 fn sender_key_prefix(context_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
     Ok(format!("context/{ctx}/sender_key/"))
-}
-
-/// Builds the storage key for broadcast context state.
-///
-/// Format: `context/{context_id}/broadcast_state`
-/// See spec section 5.14.
-fn broadcast_state_key(context_id: &str) -> Result<String, super::StoreError> {
-    let ctx = super::sanitize_key_component(context_id)?;
-    Ok(format!("context/{ctx}/broadcast_state"))
-}
-
-/// Builds the storage key for an author's broadcast block list.
-///
-/// Format: `context/{context_id}/broadcast_block/{author_did}`
-/// See spec section 5.14.8.
-fn broadcast_block_key(context_id: &str, author_did: &str) -> Result<String, super::StoreError> {
-    let ctx = super::sanitize_key_component(context_id)?;
-    let author = super::sanitize_key_component(author_did)?;
-    Ok(format!("context/{ctx}/broadcast_block/{author}"))
 }
 
 /// Builds the storage key for a full context snapshot.
@@ -328,7 +307,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Deletes all stored state for a context.
     ///
     /// Removes all keys under `context/{context_id}/` including state,
-    /// params, memberships, roles, events, tools, etc. Returns the
+    /// params, memberships, roles, events, outlets, etc. Returns the
     /// number of keys deleted.
     ///
     /// See spec section 17.3 on context cleanup via `delete_prefix`.
@@ -669,100 +648,6 @@ impl<S: Storage> ProtocolRepository<S> {
         Ok(())
     }
 
-    /// Stores the full broadcast context state for persistence across restarts.
-    ///
-    /// Serializes the [`scp_protocol::context::broadcast::BroadcastContextSnapshot`] under
-    /// `context/{context_id}/broadcast_state`. The snapshot contains the
-    /// admission policy, subscriber roster, and per-author key state
-    /// (including key material, epochs, and block lists).
-    ///
-    /// Called after each broadcast mutation (subscribe, unsubscribe, block,
-    /// create) to ensure broadcast state survives process restarts.
-    ///
-    /// See spec section 5.14 and §17.3.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
-    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
-    pub async fn store_broadcast_state(
-        &self,
-        context_id: &str,
-        snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-    ) -> Result<(), StoreError> {
-        let key = broadcast_state_key(context_id)?;
-        // Uses store_value_zeroize to clear serialized key material from memory.
-        self.store_value_zeroize(&key, snapshot).await
-    }
-
-    /// Loads the broadcast context state from persistence.
-    ///
-    /// Returns `None` if no broadcast state has been persisted for the given
-    /// context (either the context is not broadcast, or it has not been
-    /// persisted yet). The caller should reconstruct a `BroadcastContext`
-    /// from the returned snapshot using
-    /// [`scp_protocol::context::broadcast::BroadcastContext::from_snapshot`].
-    ///
-    /// See spec section 5.14 and §17.3.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
-    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
-    pub async fn load_broadcast_state(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>, StoreError>
-    {
-        let key = broadcast_state_key(context_id)?;
-        self.load_value(&key).await
-    }
-
-    /// Stores a broadcast block list for an author within a context.
-    ///
-    /// Persists the set of blocked subscriber DIDs under
-    /// `context/{context_id}/broadcast_block/{author_did}`. The caller
-    /// (typically the `ContextManager`) should invoke this after
-    /// `BroadcastContext::block_subscriber` returns, using the
-    /// `block_list` field from `BlockResult`.
-    ///
-    /// See spec section 5.14.8 for blocking semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::SerializationFailed`] if serialization fails.
-    /// Returns [`StoreError::Storage`] if the underlying storage write fails.
-    pub async fn store_broadcast_block_list(
-        &self,
-        context_id: &str,
-        author_did: &str,
-        block_list: &HashSet<String>,
-    ) -> Result<(), StoreError> {
-        let key = broadcast_block_key(context_id, author_did)?;
-        self.store_value(&key, block_list).await
-    }
-
-    /// Loads a broadcast block list for an author within a context.
-    ///
-    /// Returns `None` if no block list has been persisted for the given
-    /// author. The caller should pass the loaded set to
-    /// `BroadcastContext::restore_block_list` during initialization.
-    ///
-    /// See spec section 5.14.8 for blocking semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::DeserializationFailed`] if deserialization fails.
-    /// Returns [`StoreError::Storage`] if the underlying storage read fails.
-    pub async fn load_broadcast_block_list(
-        &self,
-        context_id: &str,
-        author_did: &str,
-    ) -> Result<Option<HashSet<String>>, StoreError> {
-        let key = broadcast_block_key(context_id, author_did)?;
-        self.load_value(&key).await
-    }
-
     /// Stores durable metadata for an ephemeral context after close.
     ///
     /// Per spec §5.11, durable metadata (participants, creation time,
@@ -823,7 +708,7 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn store_grace_entry(
         &self,
         context_id: &str,
-        entry: &crate::crypto::mls::epoch_grace::GraceEntry,
+        entry: &scp_mls::epoch_grace::GraceEntry,
     ) -> Result<(), StoreError> {
         let key = grace_entry_key(context_id, entry.epoch)?;
         self.store_value(&key, entry).await
@@ -849,13 +734,13 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_grace_entries(
         &self,
         context_id: &str,
-    ) -> Result<Vec<crate::crypto::mls::epoch_grace::GraceEntry>, StoreError> {
+    ) -> Result<Vec<scp_mls::epoch_grace::GraceEntry>, StoreError> {
         let prefix = grace_prefix(context_id)?;
         let keys = self.storage.list_keys(&prefix).await?;
         let mut entries = Vec::with_capacity(keys.len());
         for key in &keys {
             if let Some(entry) = self
-                .load_value::<crate::crypto::mls::epoch_grace::GraceEntry>(key)
+                .load_value::<scp_mls::epoch_grace::GraceEntry>(key)
                 .await?
             {
                 entries.push(entry);
@@ -912,11 +797,12 @@ impl<S: Storage> ProtocolRepository<S> {
 /// Canonical bridge from `ContextPersistence` (dyn-compatible) to the generic
 /// `ProtocolRepository<S>`.
 ///
-/// Wraps `Arc<ProtocolRepository<S>>` and implements the synchronous
-/// [`crate::context::persistence::ContextPersistence`] trait by blocking on the async `ProtocolRepository`
-/// methods via `tokio::task::block_in_place` + `Handle::block_on`. This is
-/// safe because `ContextPersistence` methods are always called from within a
-/// tokio runtime context (after the `contexts` mutex is released).
+/// Wraps `Arc<ProtocolRepository<S>>` and implements the async
+/// [`crate::context::persistence::ContextPersistence`] trait by `.await`-ing
+/// the async `ProtocolRepository` methods directly (ADR-049 Decision 7). The
+/// former `tokio::task::block_in_place` + `Handle::block_on` sync→async shim is
+/// gone — the trait is now `#[async_trait]`, so the actor `.await`s persistence
+/// on its own task instead of parking a runtime worker.
 ///
 /// See SCP-PERSIST-021 and spec section 17.4.
 pub struct ProtocolRepositoryContextBridge<S: Storage> {
@@ -930,92 +816,42 @@ impl<S: Storage> ProtocolRepositoryContextBridge<S> {
     }
 }
 
+#[async_trait::async_trait]
 impl<S: Storage + 'static> crate::context::persistence::ContextPersistence
     for ProtocolRepositoryContextBridge<S>
 {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &crate::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let snap = snapshot.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.store_full_snapshot(&ctx_id, &snap).await })
-        })?;
+        self.store.store_full_snapshot(context_id, snapshot).await?;
         Ok(())
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<
         Option<crate::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.load_full_snapshot(&ctx_id).await })
-        })?;
+        let result = self.store.load_full_snapshot(context_id).await?;
         Ok(result)
     }
 
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let snap = snapshot.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.store_broadcast_state(&ctx_id, &snap).await })
-        })?;
-        Ok(())
-    }
-
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<
-        Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.load_broadcast_state(&ctx_id).await })
-        })?;
-        Ok(result)
-    }
-
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.delete_context(&ctx_id).await })
-        })?;
+        self.store.delete_context(context_id).await?;
         Ok(())
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.list_persisted_snapshot_contexts().await })
-        })?;
+        let result = self.store.list_persisted_snapshot_contexts().await?;
         Ok(result)
     }
 }
@@ -1024,12 +860,15 @@ impl<S: Storage + 'static> crate::context::persistence::ContextPersistence
 // ProtocolRepositoryEventLogBridge — event log bridge (#636)
 // ---------------------------------------------------------------------------
 
-/// Canonical bridge from [`crate::context::providers::event_log::EventLogPersistence`] (synchronous) to the async
+/// Canonical bridge from [`crate::context::providers::event_log::EventLogPersistence`] to the async
 /// `ProtocolRepository` event log methods.
 ///
-/// Wraps `Arc<ProtocolRepository<S>>` and implements the synchronous
-/// [`crate::context::providers::event_log::EventLogPersistence`] trait by blocking on async methods via
-/// `tokio::task::block_in_place` + `Handle::block_on`.
+/// Wraps `Arc<ProtocolRepository<S>>` and implements the async
+/// [`crate::context::providers::event_log::EventLogPersistence`] trait by
+/// `.await`-ing the async `ProtocolRepository` methods directly (ADR-049
+/// Decision 7). The former `tokio::task::block_in_place` + `Handle::block_on`
+/// sync→async shim is gone — the trait is now `#[async_trait]`, so the provider
+/// `.await`s persistence on its own task instead of parking a runtime worker.
 ///
 /// See GitHub issue #636.
 pub struct ProtocolRepositoryEventLogBridge<S: Storage> {
@@ -1043,69 +882,48 @@ impl<S: Storage> ProtocolRepositoryEventLogBridge<S> {
     }
 }
 
+#[async_trait::async_trait]
 impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersistence
     for ProtocolRepositoryEventLogBridge<S>
 {
-    fn persist_entry(
+    async fn persist_entry(
         &self,
         context_id: &str,
         seq: usize,
         entry: &scp_event_log::Event,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let entry_owned = entry.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                store
-                    .store_merkle_event_log_entry(&ctx_id, seq, &entry_owned)
-                    .await
-            })
-        })?;
+        self.store
+            .store_merkle_event_log_entry(context_id, seq, entry)
+            .await?;
         Ok(())
     }
 
-    fn persist_entries(
+    async fn persist_entries(
         &self,
         context_id: &str,
         entries: &[scp_event_log::Event],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let entries_owned = entries.to_vec();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                store
-                    .store_merkle_event_log_entries(&ctx_id, &entries_owned)
-                    .await
-            })
-        })?;
+        self.store
+            .store_merkle_event_log_entries(context_id, entries)
+            .await?;
         Ok(())
     }
 
-    fn load_entries(
+    async fn load_entries(
         &self,
         context_id: &str,
     ) -> Result<Option<Vec<scp_event_log::Event>>, Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.load_merkle_event_log_entries(&ctx_id).await })
-        })?;
+        let result = self.store.load_merkle_event_log_entries(context_id).await?;
         Ok(result)
     }
 
-    fn delete_entries(
+    async fn delete_entries(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.delete_merkle_event_log_entries(&ctx_id).await })
-        })?;
+        self.store
+            .delete_merkle_event_log_entries(context_id)
+            .await?;
         Ok(())
     }
 }
@@ -1117,7 +935,7 @@ impl<S: Storage + 'static> crate::context::providers::event_log::EventLogPersist
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
 
@@ -1449,243 +1267,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn broadcast_block_key_follows_convention() {
-        assert_eq!(
-            broadcast_block_key("ctx-123", "did:dht:z6MkAuthor").unwrap(),
-            "context/ctx-123/broadcast_block/did:dht:z6MkAuthor"
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // Broadcast block list persistence
-    // -------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn store_and_load_broadcast_block_list_roundtrip() {
-        let store = make_store();
-        let mut block_list = HashSet::new();
-        block_list.insert("did:dht:z6MkBlocked1".to_owned());
-        block_list.insert("did:dht:z6MkBlocked2".to_owned());
-
-        store
-            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &block_list)
-            .await
-            .unwrap();
-        let loaded = store
-            .load_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor")
-            .await
-            .unwrap();
-
-        assert_eq!(loaded, Some(block_list));
-    }
-
-    #[tokio::test]
-    async fn load_broadcast_block_list_returns_none_for_missing() {
-        let store = make_store();
-        let loaded = store
-            .load_broadcast_block_list("ctx-1", "did:dht:z6MkUnknown")
-            .await
-            .unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn store_broadcast_block_list_overwrites_previous() {
-        let store = make_store();
-        let mut first = HashSet::new();
-        first.insert("did:dht:z6MkBlocked1".to_owned());
-
-        store
-            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &first)
-            .await
-            .unwrap();
-
-        let mut second = HashSet::new();
-        second.insert("did:dht:z6MkBlocked1".to_owned());
-        second.insert("did:dht:z6MkBlocked2".to_owned());
-        second.insert("did:dht:z6MkBlocked3".to_owned());
-
-        store
-            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &second)
-            .await
-            .unwrap();
-
-        let loaded = store
-            .load_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor")
-            .await
-            .unwrap();
-        assert_eq!(loaded, Some(second));
-    }
-
-    #[tokio::test]
-    async fn delete_context_removes_broadcast_block_lists() {
-        let store = make_store();
-        let mut block_list = HashSet::new();
-        block_list.insert("did:dht:z6MkBlocked".to_owned());
-
-        store
-            .store_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor", &block_list)
-            .await
-            .unwrap();
-
-        store.delete_context("ctx-1").await.unwrap();
-
-        let loaded = store
-            .load_broadcast_block_list("ctx-1", "did:dht:z6MkAuthor")
-            .await
-            .unwrap();
-        assert!(loaded.is_none());
-    }
-
-    // -------------------------------------------------------------------
-    // Broadcast state persistence
-    // -------------------------------------------------------------------
-
-    fn make_broadcast_snapshot() -> scp_protocol::context::broadcast::BroadcastContextSnapshot {
-        use scp_protocol::context::broadcast::{
-            AuthorStateSnapshot, BroadcastAdmission, BroadcastContextSnapshot, SubscriberRecord,
-        };
-        use scp_protocol::crypto::sender_keys::generate_sender_key;
-
-        let mut subscribers = std::collections::HashMap::new();
-        subscribers.insert(
-            "did:dht:z6MkSub1".to_owned(),
-            SubscriberRecord {
-                subscriber_did: "did:dht:z6MkSub1".to_owned(),
-                registered_at: 1_700_000_000,
-                has_ucan: false,
-            },
-        );
-        subscribers.insert(
-            "did:dht:z6MkSub2".to_owned(),
-            SubscriberRecord {
-                subscriber_did: "did:dht:z6MkSub2".to_owned(),
-                registered_at: 1_700_000_100,
-                has_ucan: true,
-            },
-        );
-
-        let mut block_list = HashSet::new();
-        block_list.insert("did:dht:z6MkBlocked".to_owned());
-
-        let mut authors = std::collections::HashMap::new();
-        authors.insert(
-            "did:dht:z6MkAuthor1".to_owned(),
-            AuthorStateSnapshot {
-                author_did: "did:dht:z6MkAuthor1".to_owned(),
-                broadcast_key: generate_sender_key(),
-                epoch: 3,
-                next_sequence: 1,
-                block_list,
-            },
-        );
-
-        BroadcastContextSnapshot {
-            context_id: "ctx-broadcast-1".to_owned(),
-            admission: BroadcastAdmission::Open,
-            subscribers,
-            authors,
-        }
-    }
-
-    #[tokio::test]
-    async fn store_and_load_broadcast_state_roundtrip() {
-        let store = make_store();
-        let snapshot = make_broadcast_snapshot();
-
-        store
-            .store_broadcast_state("ctx-broadcast-1", &snapshot)
-            .await
-            .unwrap();
-
-        let loaded = store.load_broadcast_state("ctx-broadcast-1").await.unwrap();
-
-        assert!(loaded.is_some());
-        let loaded = loaded.unwrap();
-        assert_eq!(loaded.context_id, "ctx-broadcast-1");
-        assert_eq!(
-            loaded.admission,
-            scp_protocol::context::broadcast::BroadcastAdmission::Open
-        );
-        assert_eq!(loaded.subscribers.len(), 2);
-        assert!(loaded.subscribers.contains_key("did:dht:z6MkSub1"));
-        assert!(loaded.subscribers.contains_key("did:dht:z6MkSub2"));
-        assert_eq!(loaded.authors.len(), 1);
-        let author = loaded.authors.get("did:dht:z6MkAuthor1").unwrap();
-        assert_eq!(author.epoch, 3);
-        assert!(author.block_list.contains("did:dht:z6MkBlocked"));
-    }
-
-    #[tokio::test]
-    async fn load_broadcast_state_returns_none_for_missing() {
-        let store = make_store();
-        let loaded = store.load_broadcast_state("nonexistent").await.unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
-    async fn store_broadcast_state_overwrites_previous() {
-        use scp_protocol::context::broadcast::BroadcastAdmission;
-
-        let store = make_store();
-        let snapshot1 = make_broadcast_snapshot();
-
-        store
-            .store_broadcast_state("ctx-broadcast-1", &snapshot1)
-            .await
-            .unwrap();
-
-        // Modify snapshot: change admission and add subscriber.
-        let mut snapshot2 = make_broadcast_snapshot();
-        snapshot2.admission = BroadcastAdmission::Gated;
-        snapshot2.subscribers.insert(
-            "did:dht:z6MkSub3".to_owned(),
-            scp_protocol::context::broadcast::SubscriberRecord {
-                subscriber_did: "did:dht:z6MkSub3".to_owned(),
-                registered_at: 1_700_000_200,
-                has_ucan: true,
-            },
-        );
-
-        store
-            .store_broadcast_state("ctx-broadcast-1", &snapshot2)
-            .await
-            .unwrap();
-
-        let loaded = store
-            .load_broadcast_state("ctx-broadcast-1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.admission, BroadcastAdmission::Gated);
-        assert_eq!(loaded.subscribers.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn delete_context_removes_broadcast_state() {
-        let store = make_store();
-        let snapshot = make_broadcast_snapshot();
-
-        store
-            .store_broadcast_state("ctx-broadcast-1", &snapshot)
-            .await
-            .unwrap();
-
-        store.delete_context("ctx-broadcast-1").await.unwrap();
-
-        let loaded = store.load_broadcast_state("ctx-broadcast-1").await.unwrap();
-        assert!(loaded.is_none());
-    }
-
-    #[test]
-    fn broadcast_state_key_follows_convention() {
-        assert_eq!(
-            broadcast_state_key("ctx-123").unwrap(),
-            "context/ctx-123/broadcast_state"
-        );
-    }
-
     // -------------------------------------------------------------------
     // Full snapshot persistence (SCP-PERSIST-021)
     // -------------------------------------------------------------------
@@ -1711,7 +1292,7 @@ mod tests {
             "did:dht:z6MkCreator",
             scp_protocol::context::roles::CapabilityCeiling::new(std::iter::empty()),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -1724,10 +1305,10 @@ mod tests {
             role_state,
             event_log_merkle_root: [0u8; 32],
             executed_proposals: std::collections::HashSet::new(),
-            ttl_remaining_secs: Some(300),
-            registered_tools: Vec::new(),
+            ttl_deadline_secs: Some(300),
+            registered_outlets: Vec::new(),
             read_exclusion_list: std::collections::HashSet::new(),
-            tool_interfaces: Vec::new(),
+            outlet_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
             pruning_policy: None,
@@ -1765,9 +1346,13 @@ mod tests {
             routing: crate::context::actor::state::ContextRouting::Broadcast,
             saga_pending: std::collections::HashMap::new(),
             xctx_committed_outputs: std::collections::HashMap::new(),
+            xctx_committed_stream_outputs: std::collections::HashMap::new(),
             xctx_committed_invocations: std::collections::HashSet::new(),
             xctx_caller_reservations: std::collections::HashMap::new(),
             xctx_nonce_dedup: std::collections::HashMap::new(),
+            caveat_counters: std::collections::HashMap::new(),
+            stream_reservations: std::collections::HashMap::new(),
+            broadcast: None,
         }
     }
 
@@ -1786,7 +1371,7 @@ mod tests {
         let loaded = loaded.unwrap();
         assert_eq!(loaded.context_id, "ctx-snap-1");
         assert_eq!(loaded.state, scp_protocol::context::ContextState::Active);
-        assert_eq!(loaded.ttl_remaining_secs, Some(300));
+        assert_eq!(loaded.ttl_deadline_secs, Some(300));
         assert!(loaded.membership.contains("did:dht:z6MkCreator"));
     }
 
@@ -1826,34 +1411,17 @@ mod tests {
 
         let snapshot = make_context_snapshot();
 
-        bridge.persist_context("ctx-bridge-1", &snapshot).unwrap();
+        bridge
+            .persist_context("ctx-bridge-1", &snapshot)
+            .await
+            .unwrap();
 
-        let loaded = bridge.load_context("ctx-bridge-1").unwrap();
+        let loaded = bridge.load_context("ctx-bridge-1").await.unwrap();
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.context_id, "ctx-snap-1");
         assert_eq!(loaded.state, scp_protocol::context::ContextState::Active);
-        assert_eq!(loaded.ttl_remaining_secs, Some(300));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn protocol_repository_persistence_broadcast_roundtrip() {
-        use crate::context::persistence::ContextPersistence;
-
-        let store = std::sync::Arc::new(make_store());
-        let bridge = super::ProtocolRepositoryContextBridge::new(store);
-
-        let snapshot = make_broadcast_snapshot();
-
-        bridge
-            .persist_broadcast("ctx-bc-bridge", &snapshot)
-            .unwrap();
-
-        let loaded = bridge.load_broadcast("ctx-bc-bridge").unwrap();
-        assert!(loaded.is_some());
-        let loaded = loaded.unwrap();
-        assert_eq!(loaded.context_id, "ctx-broadcast-1");
-        assert_eq!(loaded.subscribers.len(), 2);
+        assert_eq!(loaded.ttl_deadline_secs, Some(300));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1880,12 +1448,12 @@ mod tests {
             .await
             .unwrap();
 
-        let listed = bridge.list_persisted_contexts().unwrap();
+        let listed = bridge.list_persisted_contexts().await.unwrap();
         assert_eq!(listed, vec!["ctx-list-1", "ctx-list-2"]);
 
-        bridge.delete_context("ctx-list-1").unwrap();
+        bridge.delete_context("ctx-list-1").await.unwrap();
 
-        let listed = bridge.list_persisted_contexts().unwrap();
+        let listed = bridge.list_persisted_contexts().await.unwrap();
         assert_eq!(listed, vec!["ctx-list-2"]);
     }
 
@@ -1912,7 +1480,7 @@ mod tests {
 
         let entry0 = scp_event_log::Event {
             event_type: scp_event_log::EventType::ContextCreated,
-            actor_did: scp_event_log::DID(String::new()),
+            actor_did: scp_did::DID(String::new()),
             timestamp: 1_700_000_000,
             sequence: 0,
             payload: scp_event_log::EventPayload::default(),
@@ -1921,7 +1489,7 @@ mod tests {
         };
         let entry1 = scp_event_log::Event {
             event_type: scp_event_log::EventType::MemberJoined,
-            actor_did: scp_event_log::DID(String::new()),
+            actor_did: scp_did::DID(String::new()),
             timestamp: 1_700_000_001,
             sequence: 1,
             payload: scp_event_log::EventPayload::default(),
@@ -1930,10 +1498,16 @@ mod tests {
         };
 
         // O(1) per-entry persist.
-        bridge.persist_entry("ctx-bridge-el", 0, &entry0).unwrap();
-        bridge.persist_entry("ctx-bridge-el", 1, &entry1).unwrap();
+        bridge
+            .persist_entry("ctx-bridge-el", 0, &entry0)
+            .await
+            .unwrap();
+        bridge
+            .persist_entry("ctx-bridge-el", 1, &entry1)
+            .await
+            .unwrap();
 
-        let loaded = bridge.load_entries("ctx-bridge-el").unwrap().unwrap();
+        let loaded = bridge.load_entries("ctx-bridge-el").await.unwrap().unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(
             loaded[0].event_type,
@@ -1941,8 +1515,14 @@ mod tests {
         );
         assert_eq!(loaded[1].event_type, scp_event_log::EventType::MemberJoined);
 
-        bridge.delete_entries("ctx-bridge-el").unwrap();
-        assert!(bridge.load_entries("ctx-bridge-el").unwrap().is_none());
+        bridge.delete_entries("ctx-bridge-el").await.unwrap();
+        assert!(
+            bridge
+                .load_entries("ctx-bridge-el")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1955,7 +1535,7 @@ mod tests {
         let entries = vec![
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 1_700_000_000,
                 sequence: 0,
                 payload: scp_event_log::EventPayload::default(),
@@ -1964,7 +1544,7 @@ mod tests {
             },
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::MemberJoined,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 1_700_000_001,
                 sequence: 1,
                 payload: scp_event_log::EventPayload::default(),
@@ -1973,9 +1553,16 @@ mod tests {
             },
         ];
 
-        bridge.persist_entries("ctx-bridge-bulk", &entries).unwrap();
+        bridge
+            .persist_entries("ctx-bridge-bulk", &entries)
+            .await
+            .unwrap();
 
-        let loaded = bridge.load_entries("ctx-bridge-bulk").unwrap().unwrap();
+        let loaded = bridge
+            .load_entries("ctx-bridge-bulk")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(
             loaded[0].event_type,
@@ -1999,7 +1586,7 @@ mod tests {
 
     #[tokio::test]
     async fn store_and_load_grace_entry_roundtrip() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         let entry = GraceEntry {
@@ -2014,7 +1601,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_grace_entries_returns_sorted_by_epoch() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         // Store out of order.
@@ -2042,7 +1629,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_grace_entry_removes_single_epoch() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         for epoch in 1..=3 {
@@ -2061,7 +1648,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_all_grace_entries_clears_context() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         for epoch in 1..=5 {
@@ -2081,7 +1668,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_context_removes_grace_entries() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         let entry = GraceEntry {
@@ -2100,7 +1687,7 @@ mod tests {
 
     #[tokio::test]
     async fn grace_entries_isolated_per_context() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         let entry1 = GraceEntry {
@@ -2129,7 +1716,7 @@ mod tests {
     /// restart -> load entries -> restore grace store -> verify state.
     #[tokio::test]
     async fn crash_recovery_persist_and_restore() {
-        use crate::crypto::mls::epoch_grace::EpochGraceStore;
+        use scp_mls::epoch_grace::EpochGraceStore;
 
         let store = make_store();
 
@@ -2172,7 +1759,7 @@ mod tests {
     /// Simulates a crash where some grace entries expire during downtime.
     #[tokio::test]
     async fn crash_recovery_with_expired_entries() {
-        use crate::crypto::mls::epoch_grace::{EpochGraceStore, GraceEntry};
+        use scp_mls::epoch_grace::{EpochGraceStore, GraceEntry};
 
         let store = make_store();
         let now = std::time::SystemTime::now()
@@ -2220,7 +1807,7 @@ mod tests {
 
     #[tokio::test]
     async fn grace_entry_key_uses_zero_padded_epoch() {
-        use crate::crypto::mls::epoch_grace::GraceEntry;
+        use scp_mls::epoch_grace::GraceEntry;
 
         let store = make_store();
         let entry = GraceEntry {

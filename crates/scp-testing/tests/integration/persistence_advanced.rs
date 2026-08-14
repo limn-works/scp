@@ -19,15 +19,11 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use scp_core::context::broadcast::{
-    AuthorStateSnapshot, BroadcastAdmission, BroadcastContextSnapshot, SubscriberRecord,
-};
-use scp_core::crypto::sender_keys::generate_sender_key;
 use scp_core::store::ProtocolRepository;
-use scp_identity::DID;
-use scp_platform::testing::InMemoryStorage;
+use scp_did::DID;
+use scp_platform::in_memory::InMemoryStorage;
 use scp_transport::native::storage::{BlobStorage, InMemoryBlobStorage};
 
 // ---------------------------------------------------------------------------
@@ -42,49 +38,6 @@ fn make_store() -> ProtocolRepository<InMemoryStorage> {
 /// Creates a deterministic test DID from a suffix.
 fn test_did(suffix: &str) -> DID {
     DID::from(format!("did:dht:z6Mk{suffix}"))
-}
-
-/// Creates a test [`BroadcastContextSnapshot`] with realistic data.
-fn make_broadcast_snapshot(context_id: &str) -> BroadcastContextSnapshot {
-    let mut subscribers = HashMap::new();
-    subscribers.insert(
-        "did:dht:z6MkSub1".to_owned(),
-        SubscriberRecord {
-            subscriber_did: "did:dht:z6MkSub1".to_owned(),
-            registered_at: 1_700_000_000,
-            has_ucan: false,
-        },
-    );
-    subscribers.insert(
-        "did:dht:z6MkSub2".to_owned(),
-        SubscriberRecord {
-            subscriber_did: "did:dht:z6MkSub2".to_owned(),
-            registered_at: 1_700_000_100,
-            has_ucan: true,
-        },
-    );
-
-    let mut block_list = HashSet::new();
-    block_list.insert("did:dht:z6MkBlocked".to_owned());
-
-    let mut authors = HashMap::new();
-    authors.insert(
-        "did:dht:z6MkAuthor1".to_owned(),
-        AuthorStateSnapshot {
-            author_did: "did:dht:z6MkAuthor1".to_owned(),
-            broadcast_key: generate_sender_key(),
-            epoch: 3,
-            next_sequence: 1,
-            block_list,
-        },
-    );
-
-    BroadcastContextSnapshot {
-        context_id: context_id.to_owned(),
-        admission: BroadcastAdmission::Open,
-        subscribers,
-        authors,
-    }
 }
 
 /// Makes a deterministic `blob_id` from input bytes using SHA-256.
@@ -206,53 +159,6 @@ async fn sync_roundtrip_two_stores_match_after_export_apply() {
     let active_a = store_a.list_active_contexts().await.unwrap();
     let active_b = store_b.list_active_contexts().await.unwrap();
     assert_eq!(active_a, active_b, "active context lists must match");
-}
-
-/// Sync roundtrip with broadcast state: export broadcast snapshot from A,
-/// apply to B, verify the snapshot survives the transfer.
-#[tokio::test]
-async fn sync_roundtrip_broadcast_state_transfers() {
-    let store_a = make_store();
-    let store_b = make_store();
-
-    let ctx_id = "sync-broadcast-1";
-    let snapshot = make_broadcast_snapshot(ctx_id);
-
-    // Store on A.
-    store_a
-        .store_broadcast_state(ctx_id, &snapshot)
-        .await
-        .unwrap();
-
-    // Export from A.
-    let loaded = store_a
-        .load_broadcast_state(ctx_id)
-        .await
-        .unwrap()
-        .expect("broadcast state should exist on A");
-
-    // Apply to B.
-    store_b
-        .store_broadcast_state(ctx_id, &loaded)
-        .await
-        .unwrap();
-
-    // Verify B.
-    let on_b = store_b
-        .load_broadcast_state(ctx_id)
-        .await
-        .unwrap()
-        .expect("broadcast state should exist on B");
-
-    assert_eq!(on_b.context_id, ctx_id);
-    assert_eq!(on_b.admission, BroadcastAdmission::Open);
-    assert_eq!(on_b.subscribers.len(), 2);
-    assert!(on_b.subscribers.contains_key("did:dht:z6MkSub1"));
-    assert!(on_b.subscribers.contains_key("did:dht:z6MkSub2"));
-    assert_eq!(on_b.authors.len(), 1);
-    let author = on_b.authors.get("did:dht:z6MkAuthor1").unwrap();
-    assert_eq!(author.epoch, 3);
-    assert!(author.block_list.contains("did:dht:z6MkBlocked"));
 }
 
 // =========================================================================
@@ -391,13 +297,6 @@ async fn combined_node_client_and_relay_data_coexist() {
         .await
         .unwrap();
 
-    // Store broadcast state.
-    let broadcast = make_broadcast_snapshot(ctx_id);
-    client_store
-        .store_broadcast_state(ctx_id, &broadcast)
-        .await
-        .unwrap();
-
     // --- Populate relay store ---
     let routing_id = [0xDD; 32];
     let blob_data = vec![42, 43, 44, 45];
@@ -436,16 +335,6 @@ async fn combined_node_client_and_relay_data_coexist() {
             .unwrap(),
         Some("owner".to_owned()),
     );
-
-    // Broadcast state.
-    let bc = client_store
-        .load_broadcast_state(ctx_id)
-        .await
-        .unwrap()
-        .expect("broadcast state should exist");
-    assert_eq!(bc.context_id, ctx_id);
-    assert_eq!(bc.subscribers.len(), 2);
-    assert_eq!(bc.authors.len(), 1);
 
     // Active context listing.
     let active = client_store.list_active_contexts().await.unwrap();

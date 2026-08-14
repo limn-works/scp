@@ -27,7 +27,7 @@ use scp_platform::traits::{
     Signature,
 };
 
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 use crate::identity::OpaqueInMemoryKeyCustody;
 
 // ---------------------------------------------------------------------------
@@ -405,7 +405,7 @@ impl KeyCustody for NapiCallbackKeyCustody {
 /// wraps the concrete types and delegates each method to the active variant.
 pub(crate) enum NapiKeyCustody {
     /// Test/dev in-memory custody (feature-gated), wrapped for redacted Debug.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     InMemory(OpaqueInMemoryKeyCustody),
     /// Caller-provided custody backed by JS callbacks.
     Callback(NapiCallbackKeyCustody),
@@ -414,7 +414,7 @@ pub(crate) enum NapiKeyCustody {
 impl fmt::Debug for NapiKeyCustody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(_) => f.write_str("NapiKeyCustody::InMemory([redacted])"),
             Self::Callback(_) => f.write_str("NapiKeyCustody::Callback([js])"),
         }
@@ -432,7 +432,7 @@ impl NapiKeyCustody {
     /// underlying provider declares.
     pub(crate) const fn custody_type_label(&self) -> &'static str {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(_) => "in_memory",
             Self::Callback(_) => "callback",
         }
@@ -452,7 +452,7 @@ impl NapiKeyCustody {
         handle: &KeyHandle,
     ) -> Result<ed25519_dalek::SigningKey, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.export_ed25519_signing_key(handle).await,
             Self::Callback(kc) => kc.export_ed25519_signing_key(handle).await,
         }
@@ -462,7 +462,7 @@ impl NapiKeyCustody {
 impl KeyCustody for NapiKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_keypair(key_type).await,
             Self::Callback(kc) => kc.generate_keypair(key_type).await,
         }
@@ -470,7 +470,7 @@ impl KeyCustody for NapiKeyCustody {
 
     async fn sign(&self, key: &KeyHandle, data: &[u8]) -> Result<Signature, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.sign(key, data).await,
             Self::Callback(kc) => kc.sign(key, data).await,
         }
@@ -478,7 +478,7 @@ impl KeyCustody for NapiKeyCustody {
 
     async fn public_key(&self, key: &KeyHandle) -> Result<PublicKey, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.public_key(key).await,
             Self::Callback(kc) => kc.public_key(key).await,
         }
@@ -486,7 +486,7 @@ impl KeyCustody for NapiKeyCustody {
 
     async fn destroy_key(&self, key: &KeyHandle) -> Result<(), PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.destroy_key(key).await,
             Self::Callback(kc) => kc.destroy_key(key).await,
         }
@@ -498,7 +498,7 @@ impl KeyCustody for NapiKeyCustody {
         peer_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.dh_agree(key, peer_public).await,
             Self::Callback(kc) => kc.dh_agree(key, peer_public).await,
         }
@@ -510,7 +510,7 @@ impl KeyCustody for NapiKeyCustody {
         context_id: &[u8],
     ) -> Result<PseudonymKeypair, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.derive_pseudonym(key, context_id).await,
             Self::Callback(kc) => kc.derive_pseudonym(key, context_id).await,
         }
@@ -523,7 +523,7 @@ impl KeyCustody for NapiKeyCustody {
         pseudonym_epoch: u64,
     ) -> Result<PseudonymKeypair, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => {
                 kc.0.derive_rotatable_pseudonym(key, context_id, pseudonym_epoch)
                     .await
@@ -541,7 +541,7 @@ impl KeyCustody for NapiKeyCustody {
         peer_x25519_public: &[u8; 32],
     ) -> Result<SharedSecret, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => {
                 kc.0.ed25519_to_x25519_agree(ed25519_handle, peer_x25519_public)
                     .await
@@ -555,7 +555,7 @@ impl KeyCustody for NapiKeyCustody {
 
     fn custody_type(&self, key: &KeyHandle) -> CustodyType {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.custody_type(key),
             Self::Callback(kc) => kc.custody_type(key),
         }
@@ -565,7 +565,7 @@ impl KeyCustody for NapiKeyCustody {
         &self,
     ) -> Result<zeroize::Zeroizing<[u8; 32]>, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.generate_ephemeral_ed25519_seed().await,
             Self::Callback(kc) => kc.generate_ephemeral_ed25519_seed().await,
         }
@@ -576,7 +576,7 @@ impl KeyCustody for NapiKeyCustody {
         seed: &zeroize::Zeroizing<[u8; 32]>,
     ) -> Result<KeyHandle, PlatformError> {
         match self {
-            #[cfg(feature = "allow_in_memory_custody")]
+            #[cfg(feature = "testing")]
             Self::InMemory(kc) => kc.0.import_ed25519_signing_key(seed).await,
             Self::Callback(kc) => kc.import_ed25519_signing_key(seed).await,
         }
@@ -584,7 +584,7 @@ impl KeyCustody for NapiKeyCustody {
 }
 
 #[cfg(test)]
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 #[allow(clippy::expect_used)]
 mod tests {
     use scp_platform::testing::InMemoryKeyCustody;

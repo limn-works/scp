@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
 //! Async runtime orchestration for SCP (Shared Context Protocol).
 //!
 //! `scp-runtime` contains the async orchestration and stateful logic that all
@@ -19,6 +20,17 @@
 //! See `.docs/architecture.md` for the full crate layout and build phases.
 
 #![forbid(unsafe_code)]
+
+// scp-runtime test targets require the `testing` feature: numerous `#[cfg(test)]`
+// modules call `#[cfg(feature = "testing")]`-gated helpers. `testing` is normally
+// enabled transitively via the `scp-testing` dev-dependency; this tripwire turns a
+// severed back-edge into a clear message instead of a cryptic E0599 (or silent vanish).
+#[cfg(all(test, not(feature = "testing")))]
+compile_error!(
+    "scp-runtime test targets require the `testing` feature \
+     (enabled transitively via the scp-testing dev-dependency, or pass \
+     `--features scp-runtime/testing` explicitly)."
+);
 
 pub mod bridge;
 pub mod context;

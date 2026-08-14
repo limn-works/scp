@@ -2,13 +2,13 @@
 //!
 //! Exposes MCP server and client operations to Node.js/Bun:
 //!
-//! - `mcp_server_create` — Start an MCP server exposing SCP context tools.
+//! - `mcp_server_create` — Start an MCP server exposing SCP context outlets.
 //! - `mcp_server_stop` — Stop a running MCP server.
 //! - `mcp_client_connect_stdio` — Connect to an external MCP server via stdio.
 //! - `mcp_client_connect_sse` — Connect to an external MCP server via SSE.
 //! - `mcp_client_disconnect` — Disconnect from an external MCP server.
-//! - `mcp_client_list_tools` — List tools from an external MCP server.
-//! - `mcp_client_invoke` — Invoke an external MCP tool with SCP provenance.
+//! - `mcp_client_list_tools` — List outlets from an external MCP server.
+//! - `mcp_client_invoke` — Invoke an external MCP outlet with SCP provenance.
 //!
 //! The MCP bridge uses opaque string handles to track server and client
 //! instances in global registries (matching the `UniFFI` bridge pattern).
@@ -52,25 +52,25 @@ pub struct NapiMcpServerConfig {
     pub transport: String,
 }
 
-/// Tool definition from an external MCP server.
+/// Outlet definition from an external MCP server.
 #[napi(object)]
 pub struct NapiMcpToolInfo {
-    /// Tool name.
+    /// Outlet name.
     pub name: String,
     /// Human-readable description.
     pub description: String,
-    /// JSON Schema for tool input (as a JSON string).
+    /// JSON Schema for outlet input (as a JSON string).
     pub input_schema_json: String,
 }
 
-/// Result of invoking an external MCP tool with SCP provenance.
+/// Result of invoking an external MCP outlet with SCP provenance.
 #[napi(object)]
 pub struct NapiMcpInvokeResult {
-    /// Tool output content as serialized JSON.
+    /// Outlet output content as serialized JSON.
     pub content_json: String,
-    /// Whether the tool call resulted in an error.
+    /// Whether the outlet call resulted in an error.
     pub is_error: bool,
-    /// Source of the result, formatted as `"mcp:{tool_name}"`.
+    /// Source of the result, formatted as `"mcp:{outlet_name}"`.
     pub source: String,
     /// DID of the invoking agent.
     pub invoked_by: String,
@@ -334,7 +334,7 @@ impl McpTransport for SseMcpTransport {
 // ---------------------------------------------------------------------------
 
 /// FFI bridge provider for the MCP server. Implements `ContextProvider` by
-/// delegating to the context manager for tool and state queries.
+/// delegating to the context manager for outlet and state queries.
 struct McpNapiBridgeProvider {
     agent_did: String,
     context_ids: Vec<String>,
@@ -365,7 +365,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         Vec::new()
     }
 
-    fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
+    fn validate_capability(&self, _context_id: &str, _outlet_name: &str) -> Result<(), String> {
         static WARN_ONCE: std::sync::Once = std::sync::Once::new();
         WARN_ONCE.call_once(|| {
             tracing::warn!(
@@ -380,11 +380,11 @@ impl ContextProvider for McpNapiBridgeProvider {
     fn invoke_tool(
         &self,
         _context_id: &str,
-        _tool_name: &str,
+        _outlet_name: &str,
         _arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         Err(
-            "tool invocation through MCP server requires Supervisor tool registry integration"
+            "outlet invocation through MCP server requires Supervisor outlet registry integration"
                 .to_owned(),
         )
     }
@@ -710,14 +710,14 @@ pub(crate) async fn mcp_client_list_tools_on(
         })
     })?;
 
-    let tools = client_guard.list_tools().map_err(|e| {
+    let outlets = client_guard.list_tools().map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
             message: format!("tools/list failed: {e}"),
             code: codes::TRANS_5022.to_owned(),
         })
     })?;
 
-    Ok(tools
+    Ok(outlets
         .into_iter()
         .map(|t| NapiMcpToolInfo {
             name: t.name,
@@ -734,7 +734,7 @@ pub(crate) async fn mcp_client_list_tools_on(
 pub(crate) async fn mcp_client_invoke_on(
     bi: &NapiBridgeInstance,
     handle: &NapiMcpClientHandle,
-    tool_name: String,
+    outlet_name: String,
     input_json: String,
     context_id: String,
     invoker_did: String,
@@ -765,7 +765,7 @@ pub(crate) async fn mcp_client_invoke_on(
     })?;
 
     let result = client_guard
-        .invoke(&tool_name, input, &context_id, &invoker_did)
+        .invoke(&outlet_name, input, &context_id, &invoker_did)
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Transport {
                 message: format!("tools/call failed: {e}"),

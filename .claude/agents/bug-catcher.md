@@ -43,7 +43,7 @@ For each piece of code you review:
 
 #### SCP-specific concurrency checklist (from Phase B audit):
 - **DashMap shard lock across .await**: For every `self.contexts.get()`, `self.contexts.iter()`, verify the returned `Ref`/`RefMut` is dropped BEFORE any `.await`. Pattern: clone Arc, drop entry, then await. `for entry in map.iter() { entry.value().lock().await }` is a DEADLOCK.
-- **ContextHandle RwLock inside Mutex**: `handle.state().await` inside a held per-context Mutex deadlocks against `transition_to()`. Use `try_read_state()` (sync) instead.
+- **ContextHandle lifecycle state (ADR-049 §Decision 12)**: `ContextHandle` holds its lifecycle state in a lock-free `Arc<ArcSwap<ContextState>>`, not an `RwLock`. `handle.state()` is a synchronous, infallible atomic load — no `.await`, no lock, so it cannot deadlock against `transition_to()` (which itself commits via a compare-and-swap retry loop). There is no `try_read_state()`; call `state()` directly. Since the cell is shared cross-thread (actor loop + off-actor FFI finalize both write clones), audit any read-then-transition sequence for the atomicity the CAS provides — a bare load-validate-store outside `transition_to` would race.
 - **Lock ordering**: DashMap shard → per-context Mutex → standing_contexts → local_dids. Any inversion is a deadlock. Check `reconnect_all_standing`, `standing_context`, `deliver_incoming`.
 - **Phase 3 generation check**: Every path that drops a per-context Mutex and reacquires it MUST verify `ctx.generation` matches the token from Phase 1. Use `relock_context()`. Bare `contexts.get()` for reacquire is a confused-deputy vulnerability.
 - **Reentrant Mutex**: tokio Mutex is NOT reentrant. Any method that calls a helper while holding the Mutex, where the helper also acquires the same Mutex, is a deadlock (e.g., `rollback_economy_ticket`).
@@ -139,3 +139,13 @@ Guidelines:
 - Organize memory semantically by topic, not chronologically
 - Use the Write and Edit tools to update your memory files
 - Since this memory is project-scope and shared with your team via version control, tailor your memories to this project
+
+## Mandate: no dev/test-only stand-in masking production (MANDATORY)
+
+Flag as a finding — with the same severity as a correctness bug — any dev/test-only construct reachable on a **shipped production path** that masks an unfinished real implementation or stubs for prod:
+
+- a security **nullifier** — in-memory/plaintext key custody, an always-succeeds attestation/certificate verifier, a non-resolving or in-memory DID/DHT resolver, an in-memory pre-rotation recovery custody;
+- a `#[cfg(test)]`- or `testing`-feature-gated type, an in-memory/no-op adapter, or a `*::testing::*` construct built on a production create/run path;
+- a placeholder value — hardcoded default, empty result, `None`/`null`/`""`, reconstructed-from-args — standing in for data a real implementation would produce.
+
+The correct behavior is **fail closed** (a typed error, or the honest protocol-supported absent state), never a silent fallback to the stand-in. A dev stand-in shipped in production emits a *false guarantee* — callers believe a security property holds when it does not — which is strictly worse than the capability being honestly absent (absence is detectable; a nullifier lies). Deferring the *real backend* to a tracked issue/RFC is legitimate; shipping a stand-in *for it* in the interim is not — the two are independent (sever the nullifier now and fail closed; build the backend on its own schedule). The prove-absence gate allowlists durability-only features and **zero nullifiers, no exceptions** — challenge any "documented," "tracked," or "legible" allowlisted nullifier edge as the exact anti-pattern this rule forbids. See CLAUDE.md builder tenets, `.docs/standards/sdk-common.md` §Stub and Placeholder Policy, and spec §17.17 (durability-only-vs-nullifier classification).

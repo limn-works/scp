@@ -56,11 +56,10 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 if $HAS_RUST; then
   (
-    echo "▸ Rust: clippy + WASM + protocol enforcement"
+    echo "▸ Rust: clippy + protocol enforcement"
     cargo clippy --workspace --all-targets \
-      --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing \
+      --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing \
       -- -D warnings 2>&1 || { echo "  ✗ clippy failed"; exit 1; }
-    cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown -- -D warnings 2>&1 || { echo "  ✗ WASM clippy failed"; exit 1; }
     python3.12 scripts/check-protocol-sync.py 2>&1 || { echo "  ✗ async code in scp-protocol"; exit 1; }
     bash scripts/check-protocol-deps.sh 2>&1 || { echo "  ✗ banned deps in scp-protocol"; exit 1; }
   ) > "$TMPDIR/rust.log" 2>&1 && touch "$TMPDIR/rust.ok" &

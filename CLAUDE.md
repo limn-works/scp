@@ -2,7 +2,7 @@
 
 ## Vision
 
-SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructure for the agentic Internet: cryptographically verifiable identity (DID), governed interaction spaces (contexts), trustworthy communication (MLS encryption), capability-based authorization (UCAN), and transparent provenance. All interaction happens within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography, not infrastructure. Rust core with bindings via PyO3 (Python), UniFFI (Swift, Kotlin), wasm-bindgen (TypeScript). Transport abstracted behind an adapter trait (SCP native relay + 17 adapters). Build phases defined in `.docs/adrs/`.
+SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructure for the agentic Internet: cryptographically verifiable identity (DID), governed interaction spaces (contexts), trustworthy communication (MLS encryption), capability-based authorization (UCAN), and transparent provenance. All interaction happens within contexts — bounded, encrypted, governed spaces where membership is enforced by cryptography, not infrastructure. Rust core with bindings via PyO3 (Python), UniFFI (Swift, Kotlin), napi-rs (TypeScript). Transport abstracted behind an adapter trait (SCP native relay + 17 adapters). Build phases defined in `.docs/adrs/`.
 
 ### Protocol tenets
 
@@ -23,6 +23,7 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 - **Simple over complex.** Never at the expense of functionality, security, or completeness.
 - **No deferral.** Everything gets specced and implemented now. Nothing is "v2" or "future."
 - **No stubs, no partial work.** Stubbing or partial implementations are forbidden. Only ever implement things to completion on the first pass.
+- **No dev/test-only stand-ins in production.** No construct that only works in test or development — an in-memory or no-op backend, an always-succeeds verifier/attestation, a non-resolving resolver, a hardcoded/placeholder/reconstructed-from-args value, a `#[cfg(test)]`/`testing`-gated type, a security nullifier — may EVER be reachable on a shipped production path to mask an unfinished real implementation or stub for prod. If the real backend isn't built, the capability **fails closed** (a typed error, or an honest protocol-supported absent state) — it does NOT silently fall back to the dev stand-in. Masking a missing production backend with a dev construct ships a *false guarantee*, which is strictly worse than the capability being honestly absent (absence is detectable; a nullifier lies). Deferring the *real backend* to a tracked workstream is allowed; shipping a stand-in for it in the meantime is not. Prove absence mechanically — the shipped-feature-graph ⊆-allowlist gate admits durability-only features and **zero nullifiers, no exceptions** (no "documented," "tracked," or "legible" allowlisted nullifier edge). See `.docs/specs/17-persistence-and-storage.md` §17.17 (capability selection / durability-vs-nullifier classification) and `.docs/standards/sdk-common.md` §Stub and Placeholder Policy.
 - **Completeness is the baseline.** Every feature, every edge case, every acceptance criterion — implemented fully or not at all. Maximum breadth. Partial implementations are failures. Every struct field the spec defines must have a real value — never `None` when data exists elsewhere in the system. Never fabricate story references to justify gaps. Never create tracking issues instead of doing the work. Never call an incomplete implementation a "planned deferral." When a gap is caught, fix it immediately — do not rationalize it.
 - **Do the work. All of it.** When an issue has 10 acceptance criteria, implement all 10. Not 4 and call it "partial closing." Not 6 and argue the rest is "separate scope." Read every acceptance criterion as a literal checkbox. Verify every checkbox before reporting done. The plan defines scope — you do not get to reduce it. Subagents will cut corners, hardcode `None`, game string-search tests with dead references, and report success. You MUST verify their output against the actual acceptance criteria, not their self-reports. When you catch yourself thinking "this can be deferred" — that is the signal you are about to fail. Do. The. Work.
 - **You do not make scope decisions.** The plan makes scope decisions. The issues define acceptance criteria. Your job is mechanical execution: read the checklist, implement every line, verify every line. Known failure modes you WILL exhibit and MUST guard against:
@@ -109,7 +110,7 @@ If any cell is empty, the plan is incomplete — expand scope or file dependent 
 **NEVER modify enforcement files to bypass failures.**
 Files: pipeline_wiring.rs, ffi_conformance.rs, sdk-capability-matrix.json,
 scripts/check-sdk-coverage.py,
-check-cross-layer.sh, check-protocol-deps.sh, check-protocol-sync.py,
+check-cross-layer.sh, check-protocol-deps.sh, check-no-shim-reexports.sh, check-protocol-sync.py,
 check-no-bridge-globals.sh, check-no-fallback-registry.sh,
 check-handle-affinity.sh, check_ready_coverage.rs (per-instance handle
 affinity enforcement),
@@ -122,6 +123,9 @@ check-bridge-symmetry.sh, bridge-aliases.json, ffi-export-allowlist.json,
 check-call-invariants.py, call-invariants-baseline.json,
 check-pure-helpers.sh, pure-helpers-allowlist.txt,
 bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
+check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
+feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
+features only, ZERO nullifier exceptions),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 If a check fails, fix the code. The only legitimate modifications are:
@@ -145,6 +149,7 @@ Weakening, removing, or exempting existing assertions requires human approval.
 - Stories marked "done" must have zero stubs against their acceptance criteria
 - CI enforces: Rust (`clippy::todo/unimplemented = "deny"`), Kotlin (detekt `ForbiddenComment`), Python (ruff `FIX`), Swift (SwiftLint `todo`), TypeScript (ESLint `no-warning-comments`)
 - See `.docs/standards/sdk-common.md` §Stub and Placeholder Policy
+- **No dev/test-only stand-in may mask a missing production implementation (see the builder tenet).** A stub returns a documented, story-referenced gap on its own path; it does NOT reach for a test-only nullifier (in-memory custody/DHT/attestation, no-op verifier, placeholder value) to *appear* functional in production. Prod fails closed until the real backend lands. The prove-absence gate allowlists zero nullifiers — deferring a real backend to a tracked issue never authorizes shipping a stand-in for it.
 
 ### Toolchain
 
@@ -156,14 +161,12 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 | **Python** | `bindings/python/` | pip + maturin | `python3.12 -m ruff check .` | `python3.12 -m ruff format .` | `python3.12 -m pytest tests/ -v` | `maturin develop --release` |
 | **TypeScript** | `bindings/typescript/` | **bun** (not npm) | `bun run lint` (biome) | `bun run format` (biome) | `bun test` | `bun run build` (tsup) |
 | **Kotlin** | `bindings/kotlin/` | Gradle 8.x | `./gradlew detekt` | — | `./gradlew test` | `./gradlew assembleRelease` |
-| **WASM** | `crates/scp-ffi/wasm/` | cargo | `cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown` | `cargo fmt` | conformance via `cargo test -p scp-core --test wasm_conformance` | `wasm-pack build crates/scp-ffi/wasm --target bundler` |
 | **Fuzzing** | `fuzz/` (standalone, not workspace) | cargo-fuzz (**nightly only**) | — | — | `cargo +nightly fuzz run <target> --fuzz-dir fuzz` | `cargo +nightly check --manifest-path fuzz/Cargo.toml` |
 
 **Language-specific gotchas:**
 
 - **Rust/Python linkage:** `cargo test -p scp-ffi` and `cargo test --workspace` require `DYLD_LIBRARY_PATH=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")`
 - **Kotlin:** JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise. Run `eval "$(mise env)"` first.
-- **WASM:** Cannot depend on scp-core (tokio multi-thread). Re-implements algorithms locally. See ADR-034.
 - **TypeScript:** `bun run check` runs `tsc --noEmit` for type checking. Biome handles both lint and format.
 - **PRD validation:** `python3.12 scripts/validate-prd.py` — run before committing PRD changes.
 - **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands require `+nightly`. List targets: `cargo +nightly fuzz list --fuzz-dir fuzz`. See ADR-045 and `fuzz/README.md`.
@@ -191,6 +194,15 @@ Default review agents: @"black-hat (agent)", @"red-hat (agent)", @"white-hat (ag
 
 **Guard against over-engineering and non-convergent enforcement.** Mechanical checks (gates, validators, linters) are defense-in-depth, not the primary guarantee. Before adding or growing one, confirm: (a) it is *sound and bounded* — closed by construction (a positive whitelist of permitted shapes), not an ever-expanding denylist chasing "one more spelling"; (b) it does not redundantly re-check, in weaker source-text/AST/runtime form, a property the type system or another compile-time/cryptographic mechanism already enforces soundly — such redundancy is negative value, not defense-in-depth; (c) its cost (lines, complexity, review cycles) is proportionate to its marginal benefit. **Review-pass count is a convergence signal:** if more than ~3 review passes on one artifact keep surfacing "a new spelling of the same bypass," the *approach* is non-convergent — stop and reframe, do not grind. The @"simplifier (agent)" is charged with flagging this class as a BLOCKER; take it as seriously as a correctness finding. See `.docs/lessons/ast-gate-checks-definition-not-name-resolution.md`.
 
+**Scar-tissue defense (MANDATORY — applied by default on every design/architecture artifact, not on request).** Internal consistency is NOT correctness. A documented residue, a perpetuated misnomer, an "out of scope" note, a spec `MUST` weakened with a carve-out, an inherited scope-boundary — every one of these is *internally consistent*, which is exactly why ordinary review passes them. They are scar tissue: locally-reasonable compromises that calcify into an incoherent whole. The reviewer's job is to attack the **design and its premises**, not verify the artifact's coherence. On every design artifact the roster MUST, unprompted, hunt and challenge:
+- **Deferral dressed as a decision** — "document the residue," "known limitation," "out of scope," "follow-up," "tracked separately," "interface-ready future work," "#NNNN handles it." Default answer per the no-deferral tenet: fix it now. A deferral is valid only if a *real* external constraint blocks it (a compiler restriction, a genuinely separate specced feature), stated explicitly.
+- **Inherited premise treated as authorized** — a scope boundary or constraint copied from an issue/ADR/comment that no human actually decided. Trace every load-bearing constraint to its author. "It was in the issue" is not authorization.
+- **Invariant weakened to fit a workaround** — a spec `MUST` carved out, a gate exempted, type-safety relaxed to accommodate a compromise. The workaround is wrong; fix the root cause. Weakening an invariant to fit code is the artifact-flow inversion, generalized.
+- **Misnomer / accidental status-quo perpetuated** — a name that lies about what it gates, a coupling copied because "that's how it's done," a wrong-but-consistent primitive. Challenge the primitive itself (the feature flag, the dependency edge, the trait shape, the taxonomy, the name), not just its internal consistency.
+- **Building on an unsettled upstream** — a story/ADR that depends on a `Proposed` (not `Accepted`) ADR, or that resolves an upstream artifact's open question from downstream. Upstream must be settled first; downstream never decides upstream's open questions.
+
+**Validate contested design against external convention** (primary sources) before accepting an internally-consistent compromise. **Orchestrator rule:** scar-tissue findings are blockers, never "residual notes" — do not demote a premise/design finding to a nit or a follow-up. The inquisitor plus a design-primitive challenge are a *mandatory default* part of the review roster for any architecture artifact, charged against the substance (not process-meta).
+
 ### Orchestration protocol (MANDATORY)
 
 The orchestrator never writes code. It manages execution, maintains plan alignment, and triages review feedback.
@@ -217,7 +229,7 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 - Verify against the PUSHED REMOTE branch (`git show origin/branch:file`), never the local working directory. Local state may be on a different branch.
 - For type deletions: `grep -c "struct TypeName" <file>` must return 0.
 - For imports: `grep -c "scp_protocol::module" <file>` must return >0.
-- Run the exact CI clippy command with ALL features before pushing: `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings`
+- Run the exact CI clippy command with ALL features before pushing: `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/outlet-capability-test-grant -- -D warnings`
 - If a cherry-pick resolves to "nothing to commit," the changes DID NOT LAND. Investigate.
 - Never say "done" without showing verification output.
 
@@ -252,20 +264,27 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 ├── adrs/            # Architecture Decision Records (phase-1 through phase-6)
 ├── lessons/         # Evergreen learnings, grouped by topic
 ├── planning-sessions/
+├── runbooks/        # Operator runbooks (incident diagnosis + remediation)
 ├── scaffold/        # Per-language SDK build blueprints
 ├── specs/           # Product specs — what to build
 └── standards/       # Coding and workflow standards. NON-NEGOTIABLE
 
 crates/              # Rust workspace — the protocol core
 ├── scp-protocol/    # Pure sync protocol types (no tokio, compiles for wasm32)
-├── scp-runtime/     # Async orchestration (ContextManager, MLS, providers)
+├── scp-runtime/     # Async orchestration (Supervisor actor-per-context, MLS, providers)
 ├── scp-core/        # Facade re-exporting scp-protocol + scp-runtime
-├── scp-ffi/         # FFI bridges — 4 targets, one codebase
+├── scp-ffi/         # FFI bridges — 3 targets, one codebase
 │   ├── src/         #   PyO3 (Python) — the REFERENCE bridge (100% coverage target)
 │   ├── uniffi/      #   UniFFI (Swift, Kotlin)
-│   ├── napi/        #   napi-rs (Node.js/Bun → TypeScript)
-│   └── wasm/        #   wasm-bindgen (browser TypeScript) — constrained per ADR-034
-├── scp-identity/    # DID, DHT, document, key management
+│   └── napi/        #   napi-rs (Node.js/Bun → TypeScript)
+├── scp-identity/    # Native DID subsystem — DID-method, resolution/publication/lifecycle
+├── scp-dht/         # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 T1c-a)
+├── scp-clock/       # Clock port (wall-clock time) — wasm-safe capability leaf
+├── scp-crypto/      # Ed25519 signature verification — wasm-safe capability leaf
+├── scp-did/         # DID data model (DID, SigningKeyId, DidDocument, proofs, attestation) — wasm-safe
+├── scp-mls/         # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
+├── scp-client/      # Single-threaded in-browser participant driver over scp-mls (ADR-057)
+├── scp-client-wasm/ # wasm-bindgen browser surface over scp-client (ADR-057)
 ├── scp-transport/   # Relay, adapters, blob storage
 ├── scp-node/        # Application node binary (relay + HTTP + identity)
 ├── scp-platform/    # Platform abstractions (KeyCustody, Storage, DeviceAttestation)
@@ -276,7 +295,7 @@ crates/              # Rust workspace — the protocol core
 
 bindings/            # Language SDK wrappers — the developer-facing API
 ├── python/          # scp_sdk package (wraps PyO3 bridge)
-├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge + WASM fallback)
+├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge; browser = in-browser SCP client over scp-client-wasm, keys on-device per ADR-057)
 ├── swift/           # SCP Swift package (wraps UniFFI bridge)
 └── kotlin/          # scp-kt (wraps UniFFI bridge) — Android extensions
 ```

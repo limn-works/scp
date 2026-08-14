@@ -45,6 +45,22 @@
 // FFI bridge requires targeted unsafe for PyO3 interop. Each usage is documented.
 #![allow(unsafe_code)]
 
+// ADR-049 PR-7 (BLACK-P7-5) — build-time seam-leak guard. The `testing` feature
+// forwards `scp-core/testing` → `scp-runtime/testing`, which compiles the
+// test-only actor handlers (`InspectIncomingInner`, `HandleSenderKeyRequest`,
+// `LandSenderKeyResponse`) and the `signed_at_override` parity seam. These bypass
+// production gating and MUST NEVER reach a shipped artifact. `extension-module`
+// marks the production Python cdylib that maturin builds for the release wheel;
+// it is incompatible with test binaries, so a legitimate build never enables both
+// at once. This turns an accidental co-enable (a release wheel built with
+// `testing`) into a HARD compile error instead of a silently shipped back door.
+#[cfg(all(feature = "testing", feature = "extension-module"))]
+compile_error!(
+    "scp-ffi: the `testing` feature (test-only, gate-bypassing seams) must never be \
+     co-enabled with `extension-module` (the production Python cdylib). Build the \
+     release wheel WITHOUT `testing`. See ADR-049 PR-7 BLACK-P7-5."
+);
+
 pub mod context;
 pub mod economy;
 
@@ -62,12 +78,13 @@ pub mod event_log;
 pub mod identity;
 pub mod mcp;
 pub mod media;
+pub mod outlet_stream;
+pub mod outlets;
 pub mod provenance;
 pub mod runtime;
 pub mod scp;
 pub mod scpid;
 pub mod sync;
-pub mod tools;
 pub mod transport;
 pub mod trust;
 pub mod types;
@@ -75,14 +92,14 @@ pub mod ucan;
 pub mod validate;
 
 // Server startup (relay + application node) — behind the `server` feature on
-// scp-ffi-common. Not available for WASM (ADR-034).
+// scp-ffi-common.
 #[cfg(feature = "server")]
 pub mod server;
 
-// Full-stack E2E testing module — feature-gated behind allow_in_memory_custody.
+// Full-stack E2E testing module — feature-gated behind testing.
 // Exposes FullStackNetwork/FullStackNode from scp-testing for real
 // encrypt→decrypt roundtrip tests from Python.
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 pub mod testing;
 
 /// Global tokio runtime, created once at module import.
@@ -239,7 +256,7 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     context::register_context(m)?;
     discovery::register_discovery(m)?;
     economy::register_economy(m)?;
-    tools::register_tools(m)?;
+    outlets::register_outlets(m)?;
     transport::register_transport(m)?;
     ucan::register_ucan(m)?;
     event_log::register_event_log(m)?;
@@ -256,7 +273,7 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     server::register_server(m)?;
 
     // Full-stack E2E testing module — feature-gated.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     testing::register_testing(m)?;
 
     Ok(())

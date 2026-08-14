@@ -34,6 +34,8 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       python: ${{ steps.filter.outputs.python }}
       typescript: ${{ steps.filter.outputs.typescript }}
+      typescript-wasm: ${{ steps.filter.outputs.typescript-wasm }}
+      scaffold-typescript-web: ${{ steps.filter.outputs.scaffold-typescript-web }}
       kotlin: ${{ steps.filter.outputs.kotlin }}
       swift: ${{ steps.filter.outputs.swift }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
@@ -55,8 +57,29 @@ jobs:
             typescript:
               - 'bindings/typescript/**'
               - 'crates/scp-ffi/napi/**'
-              - 'crates/scp-ffi/wasm/**'
               - 'crates/scp-ffi/common/**'
+            typescript-wasm:
+              # The full path-dep closure of scp-client-wasm (verified via
+              # `cargo tree -p scp-client-wasm -e no-dev`) — a change to any of
+              # these can break the wasm32 compile / real-wasm e2e / guards, so
+              # each must trigger this job.
+              - 'bindings/typescript-wasm/**'
+              - 'bindings/typescript/src/errors.ts'
+              - 'crates/scp-client-wasm/**'
+              - 'crates/scp-client/**'
+              - 'crates/scp-mls/**'
+              - 'crates/scp-crypto/**'
+              - 'crates/scp-did/**'
+              - 'crates/scp-clock/**'
+              - 'crates/scp-protocol/**'
+              - 'crates/scp-event-log/**'
+              - 'crates/scp-relay-client/**'
+            scaffold-typescript-web:
+              # The browser scaffold builds against the local @limn-works/scp-ts-wasm
+              # package (file: link), so a change to the scaffold OR to that package's
+              # surface can break its typecheck / bundle — both must trigger this job.
+              - 'scaffolds/typescript-web/**'
+              - 'bindings/typescript-wasm/**'
             kotlin:
               - 'bindings/kotlin/**'
               - 'crates/scp-ffi/uniffi/**'
@@ -71,7 +94,11 @@ jobs:
               - 'crates/scp-transport/**'
               - 'crates/scp-runtime/**'
               - 'crates/scp-event-log/**'
-              - 'crates/scp-primitives/**'
+              - 'crates/scp-clock/**'
+              - 'crates/scp-crypto/**'
+              - 'crates/scp-did/**'
+              - 'crates/scp-dht/**'
+              - 'crates/scp-mls/**'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
@@ -81,6 +108,45 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-error-codes.sh
+
+  # ── Fail-closed pre-rotation (ADR-062 §Decision 6 / SCP-CAPINJECT-006) ──
+  # Runs the production (no-`testing`) identity-creation paths and asserts they
+  # FAIL CLOSED with the typed IdentityError::NoPreRotationBackend (SCP-IDENT-1059)
+  # rather than minting the severed in-memory pre-rotation nullifier. These tests
+  # are `#[cfg(not(feature = "testing"))]`, so they compile/run ONLY in the bare
+  # build where the nullifier is severed (the workspace test lane runs WITH
+  # `testing`, which mints — there the tests are excluded by cfg). This lane is the
+  # standing regression guard: if the fail-closed lowering ever regresses to a
+  # silent nullifier fallback, `Ok(_)` trips the assertion.
+  fail-closed-pre-rotation:
+    needs: check-draft
+    name: Fail-closed pre-rotation (SCP-IDENT-1059)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: scp-node self-host create paths fail closed
+        run: cargo test -p scp-node --lib pre_rotation_severance -- --nocapture
+
+  # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
+  # Asserts every shipped FFI artifact's resolved SCP-crate feature set (dev-deps
+  # EXCLUDED) is a subset of an explicit durability-only allowlist — so NO
+  # in-memory nullifier (custody / attestation / pre-rotation / DHT / did:key)
+  # feature can reach a production binary. Closed ⊆-whitelist, ZERO nullifier
+  # exceptions. The fixture harness (a/b/c + soundness + allowlist hygiene) runs
+  # first and must pass before the real workspace gate. NEVER add a resolved
+  # nullifier feature to the allowlist to make this pass — fix the dependency edge.
+  shipped-feature-graph:
+    needs: check-draft
+    name: Shipped-feature-graph (G1 prove-absence)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: G1 — shipped artifacts carry ZERO nullifier features
+        run: bash scripts/check-shipped-feature-graph.sh
 
   # ── Cross-layer ──────────────────────────────────────────────────────
   cross-layer:
@@ -101,7 +167,7 @@ jobs:
         run: bash scripts/check-cross-layer.sh
 
   # ── Bridge symmetry (ADR-047) ────────────────────────────────────────
-  # Verifies that the four FFI bridges (PyO3, UniFFI, NAPI, WASM) expose the
+  # Verifies that the three FFI bridges (PyO3, UniFFI, NAPI) expose the
   # same canonical operation set (per scripts/bridge-aliases.json). Scope is
   # SURFACE-AREA symmetry only; call-ordering invariants are enforced by
   # Layer B (scripts/check-call-invariants.py). Complements the Rust-side
@@ -162,6 +228,29 @@ jobs:
       - run: pip install tree-sitter tree-sitter-rust
       - run: python3.12 scripts/check-protocol-sync.py
 
+  # ── Python stub parity ───────────────────────────────────────────────
+  pyi-generated:
+    needs: check-draft
+    name: Python stub signature parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # ruff pinned for reproducible CI — an unpinned `pip install ruff`
+      # silently tracks upstream and a new release (e.g. 0.16.x restyling
+      # Markdown code blocks) can red the lint gate repo-wide with no local
+      # change. Bump deliberately in its own PR. Keep in sync with python-lint.
+      - run: pip install tree-sitter tree-sitter-rust ruff==0.15.4
+      # Self-test MUST run first: it plants a deliberately-transposed stub
+      # parameter and proves the gate REJECTS it, before we trust it on the
+      # real tree.
+      - name: Self-test gate
+        run: bash scripts/check-pyi-generated.sh --self-test
+      - name: Real check (.pyi ↔ PyO3 signature parity)
+        run: bash scripts/check-pyi-generated.sh
+
   # ── Construction pattern (ADR-052) ──────────────────────────────────────
   construction-pattern:
     needs: check-draft
@@ -182,6 +271,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: bash scripts/check-protocol-deps.sh
+      - run: bash scripts/check-no-shim-reexports.sh
 
   # ── FFI singleton enforcement (ADR-048, #1549 Phase 4) ──────────────────
   bridge-globals:
@@ -296,6 +386,21 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-handler-no-panic.sh
 
+  no-panic-abort:
+    needs: check-draft
+    name: FFI / no panic=abort in cdylib profiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Self-test MUST run first: it plants panic = "abort" in a scratch
+      # manifest (must be DETECTED) and confirms benign lines
+      # (panic = "unwind" / the clippy lint panic = "deny" / a comment) are
+      # NOT flagged — proving the gate is alive before we trust it on the tree.
+      - name: Self-test gate
+        run: bash scripts/check-no-panic-abort.sh --self-test
+      - name: Real check
+        run: bash scripts/check-no-panic-abort.sh
+
   saga-gating-granularity:
     needs: check-draft
     name: Actor / saga gating granularity (ADR-049 §3a)
@@ -332,7 +437,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - run: cargo check -p scp-protocol --target wasm32-unknown-unknown
+      - run: cargo check -p scp-clock -p scp-crypto -p scp-did -p scp-protocol -p scp-relay-client -p scp-mls -p scp-client -p scp-event-log -p scp-client-wasm --target wasm32-unknown-unknown
+
+  wasm-test:
+    needs: check-draft
+    name: WASM / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Pin wasm-pack to a specific version for reproducibility (via the same
+      # taiki-e/install-action the nextest job uses), instead of the unpinned
+      # `curl … | sh` installer that always pulls latest.
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
+      # Runs the `#[wasm_bindgen_test]` cases under Node — the real wasm32
+      # execution the `wasm-protocol` build gate only compiles. Covers the
+      # cross-target determinism KAT wasm entries, the error-mapping `JsValue`
+      # wrapping, and the `JsStorage` extern round-trip (ADR-057 Prerequisite 5).
+      - run: wasm-pack test --node crates/scp-client-wasm
 
   # ── Rust ────────────────────────────────────────────────────────────
   rust-fmt:
@@ -367,11 +497,11 @@ jobs:
       - name: Run clippy
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          # Enable allow_in_memory_custody for scp-ffi-uniffi so that the
+          # Enable testing for scp-ffi-uniffi so that the
           # in-memory custody code paths are lint-checked. Mobile production
           # builds (iOS XCFramework, Android .aar) MUST NOT enable this
           # feature. See GitHub issue #88.
-          cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint -- -D warnings
+          cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant -- -D warnings
           # The optional network transports (quic, http3, udp, coap) are not in
           # the default feature set and are not activated by --workspace, so the
           # sweep above never lints them. They rotted undetected for months
@@ -424,11 +554,11 @@ jobs:
           else
             export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           fi
-          # Enable allow_in_memory_custody for scp-ffi-uniffi so that
+          # Enable testing for scp-ffi-uniffi so that
           # in-memory custody tests run. Mobile production builds (iOS
           # XCFramework, Android .aar) MUST NOT enable this feature.
           # See GitHub issue #88.
-          cargo nextest run --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+          cargo nextest run --workspace --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint,scp-ffi/testing,scp-ffi/outlet-capability-test-grant,scp-ffi-napi/testing,scp-ffi-napi/outlet-capability-test-grant,scp-ffi-uniffi/testing,scp-ffi-uniffi/outlet-capability-test-grant
           # Test scp-transport with optional features that aren't enabled by
           # --workspace (combined includes rusqlite + scp-platform; local-cache
           # enables caching logic).
@@ -451,9 +581,9 @@ jobs:
           cargo nextest run -p scp-testing --features sqlite --test saga_bridge_journal_swap
 
   # Exercises the napi bridge in its PRODUCTION configuration: default features
-  # (`server` on) but WITHOUT `allow_in_memory_custody` / `scp-core/testing` /
+  # (`server` on) but WITHOUT `testing` / `scp-core/testing` /
   # `scp-runtime/testing`. This is the config the feature-free context-export
-  # tests target — `MlsCryptoProvider::validate_creator_identity` only accepts
+  # tests target — `NodeMlsFactory::validate_creator_identity` only accepts
   # `did:dht:z*` identities here (no `did:test:` / `did:key:` test gate), so a
   # callback-shaped custody signer must round-trip and fail-closed for real.
   # Without this lane the production/bare napi test target could silently
@@ -482,12 +612,23 @@ jobs:
           # context-export tests run here for real; the bare/production target
           # must compile and pass without the testing affordances.
           cargo test -p scp-ffi-napi --features server
+          # Run scp-ffi-common with DEFAULT features (no `testing`, no
+          # `testing`) so the DHT capability-injection ABSENCE
+          # tripwires — `ffi_dht_client_is_pkarr_only_in_shipped_build` and
+          # `disabled_node_resolution_returns_ok_none_for_unknown_did`, both
+          # `#[cfg(not(feature = "testing"))]` — actually EXECUTE in CI. The
+          # workspace nextest lane enables `scp-ffi-common/testing`, which
+          # compiles those tests OUT, so without this production-config lane the
+          # G1 in-memory-nullifier-absence tripwires would be latent (ADR-062
+          # Slice 1). ci.yml is not an enforcement file; this is an added
+          # positive test lane.
+          cargo test -p scp-ffi-common
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
-  # features (`server` on) but WITHOUT `allow_in_memory_custody`. This is the
+  # features (`server` on) but WITHOUT `testing`. This is the
   # config `build-matrix.yml` only exercises at release/tag time, so a PR could
   # re-gate a production identity/SCPID/custody op behind the test-only
-  # `allow_in_memory_custody` feature — making it vanish from the production lib —
+  # `testing` feature — making it vanish from the production lib —
   # and the regression would go unnoticed until release. This is the per-PR guard
   # against that over-gating regression class. Build-only (lib + bins): the pyo3
   # test suite assumes in-memory custody and does not compile in prod config, so
@@ -513,11 +654,11 @@ jobs:
         run: |
           # pyo3 links libpython, so LD_LIBRARY_PATH must point at LIBDIR.
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          # Default features = production: `server` on, no `allow_in_memory_custody`.
+          # Default features = production: `server` on, no `testing`.
           cargo build -p scp-ffi --features server
 
   # Builds the uniffi bridge (`scp-ffi-uniffi`) in its PRODUCTION configuration:
-  # default features (`server` on) but WITHOUT `allow_in_memory_custody`. Same
+  # default features (`server` on) but WITHOUT `testing`. Same
   # guardrail rationale as the pyo3 lane above: `build-matrix.yml` only builds
   # the mobile (iOS XCFramework / Android .aar) production libs at release time,
   # so a PR could re-gate a production op behind the test-only feature and break
@@ -540,7 +681,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build uniffi bridge in production config (no in-memory custody)
         run: |
-          # Default features = production: `server` on, no `allow_in_memory_custody`.
+          # Default features = production: `server` on, no `testing`.
           cargo build -p scp-ffi-uniffi --features server
 
   rust-doc:
@@ -561,8 +702,8 @@ jobs:
       - name: Run doc tests and build docs
         run: |
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo test --workspace --doc --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
-          cargo doc --workspace --no-deps --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+          cargo test --workspace --doc --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
+          cargo doc --workspace --no-deps --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing,scp-runtime/saga-witness-test-mint
 
   rust-deny:
     needs: changes
@@ -587,7 +728,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      # ruff pinned for reproducible CI (see the pyi-generated job above for
+      # rationale). Bump deliberately in its own PR.
+      - run: pip install ruff==0.15.4
       - run: ruff format --check .
       - run: ruff check .
       # H14 / M16: enforce `is not None` over falsy checks on Optional
@@ -621,7 +764,14 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features allow_in_memory_custody
+          # `testing` forwards `scp-dht/testing`, which compiles the in-memory
+          # DHT seam (`FfiDhtClient::InMemory`) the co-located multi-party tests
+          # rely on to resolve each participant's DID within one process. Without
+          # it the bridge would build the real Mainline Pkarr client for DID
+          # resolution, and same-process governance vote verification would
+          # fail-close to "unknown voter" (ADR-062 §Decision 1 gated the in-memory
+          # DHT nullifier behind `testing`; the functional test harness opts in).
+          maturin develop --release --features testing
       - name: Run tests (including real FFI)
         run: |
           source .venv/bin/activate
@@ -646,7 +796,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build NAPI native addon
         run: |
-          cargo build -p scp-ffi-napi --release --features scp-ffi-napi/allow_in_memory_custody
+          # `scp-ffi-napi/testing` compiles the in-memory DHT seam
+          # (`FfiDhtClient::InMemory`) the co-located multi-party TypeScript tests
+          # rely on to resolve each participant's DID within one process. Without
+          # it the addon builds the real Mainline Pkarr client for DID resolution,
+          # and same-process resolution/governance flows would block on the network
+          # (test timeouts) or fail-close to "unknown voter" (ADR-062 §Decision 1
+          # gated the in-memory DHT nullifier behind `testing`).
+          cargo build -p scp-ffi-napi --release --features scp-ffi-napi/testing,scp-ffi-napi/testing
       - name: Install TypeScript dependencies
         working-directory: bindings/typescript
         run: bun install
@@ -678,6 +835,89 @@ jobs:
           bun run check
           bun run lint
           bun test
+
+  # ── TypeScript (wasm tier) ──────────────────────────────────────────
+  typescript-wasm-check:
+    needs: changes
+    if: needs.changes.outputs.typescript-wasm == 'true'
+    name: TypeScript-wasm / build + check + lint + guards + test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Pin wasm-pack for reproducibility (same version as the wasm-test job) —
+      # the --release-only build guard depends on the shipped wasm being a
+      # release build (ADR-057 Prereq-4).
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
+      - name: Install dependencies
+        working-directory: bindings/typescript-wasm
+        run: bun install
+      - name: Build (wasm-pack release + tsup + wasm asset copy)
+        working-directory: bindings/typescript-wasm
+        run: bun run build
+      - name: Guards (--release-only + node-free bundle isolation)
+        working-directory: bindings/typescript-wasm
+        run: |
+          bun run guard:release-only
+          bun run guard:node-free
+      - name: Check + lint + test (real wasm)
+        working-directory: bindings/typescript-wasm
+        run: |
+          bun run check
+          bun run lint
+          bun test
+
+  # ── TypeScript (browser scaffold) ───────────────────────────────────
+  # Bounded gate for the structural browser scaffold (ADR-057 Slice 4, #1951):
+  # it depends on the local @limn-works/scp-ts-wasm package via a file: link, so
+  # build that package first (it emits the dist/ the scaffold resolves), then
+  # install + typecheck + lint + bundle the scaffold. Build + check + lint +
+  # build — not a new enforcement framework.
+  scaffold-typescript-web-check:
+    needs: changes
+    if: needs.changes.outputs.scaffold-typescript-web == 'true'
+    name: TypeScript-web scaffold / build wasm dep + check + lint + build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.14.0
+      # Build the local wasm SDK package so the scaffold's file: dependency
+      # resolves against real, built dist/ (types + ESM + the .wasm sibling).
+      - name: Build @limn-works/scp-ts-wasm (dependency)
+        working-directory: bindings/typescript-wasm
+        run: |
+          bun install
+          bun run build
+      - name: Install scaffold dependencies
+        working-directory: scaffolds/typescript-web
+        run: bun install
+      - name: Check + lint + build
+        working-directory: scaffolds/typescript-web
+        run: |
+          bun run check
+          bun run lint
+          bun run build
 
   # ── Kotlin ──────────────────────────────────────────────────────────
   kotlin-lint:
@@ -746,9 +986,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build UniFFI native library
         run: |
-          cargo build -p scp-ffi-uniffi --features allow_in_memory_custody
+          cargo build -p scp-ffi-uniffi --features testing
       - name: Generate Kotlin bindings
-        run: ./scripts/generate-uniffi-kotlin.sh --skip-build --features=allow_in_memory_custody
+        run: ./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
       - uses: gradle/actions/setup-gradle@v4
       - name: Run tests
         working-directory: bindings/kotlin
@@ -756,21 +996,6 @@ jobs:
           # Set JNA library path to find the compiled Rust cdylib
           export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           ./gradlew testDebugUnitTest
-
-  # ── WASM ───────────────────────────────────────────────────────────
-  wasm-clippy:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    name: WASM / clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown -- -D warnings
 
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:
@@ -843,9 +1068,9 @@ jobs:
 
   # ── Bridge parity (ADR-046) ────────────────────────────────────────
   # Cross-bridge runtime parity harness: drives PyO3 (in-process) and
-  # NAPI/WASM (Bun child) with identical inputs, asserts normalized
-  # output equality. Layer C of the bridge enforcement stack (Layer A =
-  # FFI conformance, Layer B = SDK capability matrix).
+  # NAPI (Bun child) with identical inputs, asserts normalized output
+  # equality. Layer C of the bridge enforcement stack (Layer A = FFI
+  # conformance, Layer B = SDK capability matrix).
   bridge-parity:
     needs: changes
     if: >-
@@ -890,11 +1115,7 @@ jobs:
           python-version: "3.12"
       - uses: oven-sh/setup-bun@v2
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - name: Python deps
         run: |
           python -m venv .venv
@@ -904,11 +1125,11 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features scp-core/testing,allow_in_memory_custody,testing
+          maturin develop --release --features scp-core/testing,testing
       - name: Build NAPI native addon
         run: |
           cargo build -p scp-ffi-napi --release \
-            --features scp-ffi-napi/allow_in_memory_custody,scp-ffi-napi/testing,scp-core/testing
+            --features scp-ffi-napi/testing,scp-ffi-napi/testing,scp-core/testing
       - name: Wire NAPI addon into node_modules
         run: |
           ARCH=$(uname -m)
@@ -927,35 +1148,10 @@ jobs:
           fi
           cp "$LIB_FILE" "$PKG_DIR/index.node"
           echo '{"name":"'"$NAPI_PKG"'","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
-      - name: Build WASM bridge (nodejs target for Bun runtime)
-        run: |
-          # The parity harness runs the WASM bridge under Bun, which
-          # uses a Node-style runtime loader. `--target bundler` emits
-          # ESM with a bare `import * from "./X.wasm"` that only works
-          # behind a bundler. `--target nodejs` emits a self-loading
-          # CJS-compatible module that Bun can consume directly.
-          cd crates/scp-ffi/wasm
-          wasm-pack build --target nodejs --release --out-dir pkg-node -- \
-            --features testing
-      - name: Wire WASM package into node_modules
-        run: |
-          WASM_PKG_DIR="bindings/typescript/node_modules/@limn-works/scp-ts-wasm"
-          mkdir -p "$WASM_PKG_DIR"
-          cp -r crates/scp-ffi/wasm/pkg-node/* "$WASM_PKG_DIR/"
-          # Patch the package name to match the dynamic import target.
-          python3 -c "
-          import json
-          p = '$WASM_PKG_DIR/package.json'
-          with open(p) as f:
-              j = json.load(f)
-          j['name'] = '@limn-works/scp-ts-wasm'
-          with open(p, 'w') as f:
-              json.dump(j, f, indent=2)
-          "
       - name: Install TypeScript workspace deps
         working-directory: bindings/typescript
         run: bun install
-      - name: Run parity tests (NAPI + WASM only)
+      - name: Run parity tests (NAPI only)
         # The Kotlin and Swift alt-bridge cases are covered by dedicated
         # jobs (`bridge-parity-kotlin`, `bridge-parity-swift`) that own
         # their respective toolchains. Filter by test ID (which encodes
@@ -965,7 +1161,7 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          PYTHONPATH=. pytest tests/bridge_parity/ -v -m parity -k "napi or wasm"
+          PYTHONPATH=. pytest tests/bridge_parity/ -v -m parity -k "napi"
 
   # ── Bridge parity (Kotlin UniFFI) ──────────────────────────────────
   # Layer C extension: runs the same ADR-046 harness against the UniFFI
@@ -1004,12 +1200,12 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features scp-core/testing,allow_in_memory_custody,testing
+          maturin develop --release --features scp-core/testing,testing
       - name: Build UniFFI cdylib
         run: |
-          cargo build -p scp-ffi-uniffi --features allow_in_memory_custody,testing
+          cargo build -p scp-ffi-uniffi --features testing
       - name: Generate UniFFI Kotlin bindings
-        run: ./scripts/generate-uniffi-kotlin.sh --skip-build --features=allow_in_memory_custody
+        run: ./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
       - name: Build Kotlin parity runner (installDist)
         # Uses the bindings/kotlin/gradlew wrapper against the runner
         # project; `-p` points Gradle at the runner's directory so its
@@ -1021,7 +1217,7 @@ jobs:
         # `-Pscp.uniffi.extraFeatures=testing` threads the `testing`
         # cargo feature through scp-kt's `generateUniffiBindings` task
         # (see build.gradle.kts). Without it, the task's invocation of
-        # `generate-uniffi-kotlin.sh --features=allow_in_memory_custody`
+        # `generate-uniffi-kotlin.sh --features=testing`
         # would re-run `cargo build -p scp-ffi-uniffi` without
         # `testing`, overwriting the dylib we just built (line above)
         # with both features. The parity harness drives
@@ -1077,7 +1273,7 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features scp-core/testing,allow_in_memory_custody,testing
+          maturin develop --release --features scp-core/testing,testing
       - name: Build XCFramework (dev mode — macOS arm64 only)
         run: bindings/swift/build-xcframework.sh --dev
       - name: Build Swift parity runner
@@ -1100,6 +1296,8 @@ jobs:
     if: always()
     needs:
       - error-codes
+      - shipped-feature-graph
+      - fail-closed-pre-rotation
       - cross-layer
       - bridge-symmetry
       - sdk-coverage
@@ -1108,11 +1306,17 @@ jobs:
       - bridge-globals
       - fallback-registry
       - handle-affinity
+      - no-panic-abort
+      - handler-no-panic
+      - saga-gating-granularity
+      - deleted-primitives
+      - bridge-instance-lifecycle
       - no-mutable-globals-rust
       - no-mutable-globals-python
       - no-mutable-globals-ts
       - no-mutable-globals-kotlin
       - wasm-protocol
+      - wasm-test
       - rust-fmt
       - rust-clippy
       - rust-test
@@ -1124,9 +1328,10 @@ jobs:
       - python-lint
       - python-test
       - typescript-check
+      - typescript-wasm-check
+      - scaffold-typescript-web-check
       - kotlin-lint
       - kotlin-test
-      - wasm-clippy
       - swift-lint
       - swift-build-test
       - fuzz-build
@@ -1139,6 +1344,8 @@ jobs:
         run: |
           results=( \
             "${{ needs.error-codes.result }}" \
+            "${{ needs.shipped-feature-graph.result }}" \
+            "${{ needs.fail-closed-pre-rotation.result }}" \
             "${{ needs.cross-layer.result }}" \
             "${{ needs.bridge-symmetry.result }}" \
             "${{ needs.sdk-coverage.result }}" \
@@ -1147,11 +1354,17 @@ jobs:
             "${{ needs.bridge-globals.result }}" \
             "${{ needs.fallback-registry.result }}" \
             "${{ needs.handle-affinity.result }}" \
+            "${{ needs.no-panic-abort.result }}" \
+            "${{ needs.handler-no-panic.result }}" \
+            "${{ needs.saga-gating-granularity.result }}" \
+            "${{ needs.deleted-primitives.result }}" \
+            "${{ needs.bridge-instance-lifecycle.result }}" \
             "${{ needs.no-mutable-globals-rust.result }}" \
             "${{ needs.no-mutable-globals-python.result }}" \
             "${{ needs.no-mutable-globals-ts.result }}" \
             "${{ needs.no-mutable-globals-kotlin.result }}" \
             "${{ needs.wasm-protocol.result }}" \
+            "${{ needs.wasm-test.result }}" \
             "${{ needs.rust-fmt.result }}" \
             "${{ needs.rust-clippy.result }}" \
             "${{ needs.rust-test.result }}" \
@@ -1163,9 +1376,10 @@ jobs:
             "${{ needs.python-lint.result }}" \
             "${{ needs.python-test.result }}" \
             "${{ needs.typescript-check.result }}" \
+            "${{ needs.typescript-wasm-check.result }}" \
+            "${{ needs.scaffold-typescript-web-check.result }}" \
             "${{ needs.kotlin-lint.result }}" \
             "${{ needs.kotlin-test.result }}" \
-            "${{ needs.wasm-clippy.result }}" \
             "${{ needs.swift-lint.result }}" \
             "${{ needs.swift-build-test.result }}" \
             "${{ needs.fuzz-build.result }}" \

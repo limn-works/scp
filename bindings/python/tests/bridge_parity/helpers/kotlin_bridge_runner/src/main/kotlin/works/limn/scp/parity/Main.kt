@@ -335,29 +335,30 @@ private suspend fun opEventLogAppend(args: JsonObject): JsonObject =
 
 // -- ops 6-10 ------------------------------------------------------------
 
-private const val PARITY_TOOL_NAME = "parity_probe"
-private val PARITY_TOOL_CEILING = listOf(
+private const val PARITY_OUTLET_NAME = "parity_probe"
+private val PARITY_OUTLET_CEILING = listOf(
     "messages:read",
     "messages:write",
-    "tool:register",
-    "tool_invoke:*"
+    "outlet:register",
+    "outlet_call:*"
 )
 
 @Suppress("UnusedParameter")
-private suspend fun opToolRegister(args: JsonObject): JsonObject =
+private suspend fun opOutletRegister(args: JsonObject): JsonObject =
     uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
-        val ceiling = ceilingFromArgs(args, PARITY_TOOL_CEILING)
+        val ceiling = ceilingFromArgs(args, PARITY_OUTLET_CEILING)
         val identity = scp.identityCreate("in_memory", null)
         val handle = scp.contextCreate(identity, buildContextParams(ceiling))
         val inputSchema =
             """{"type":"object","properties":{"x":{"type":"integer"},"label":{"type":"string"}}}"""
         val outputSchema =
             """{"type":"object","properties":{"y":{"type":"integer"},"status":{"type":"string"}}}"""
-        val toolId = scp.toolRegister(
+        val outletId = scp.outletRegister(
             handle,
-            uniffi.scp.ToolDefinition(
-                name = PARITY_TOOL_NAME,
-                description = "parity harness probe tool",
+            uniffi.scp.OutletDefinition(
+                name = PARITY_OUTLET_NAME,
+                description = "parity harness probe outlet",
+                kind = uniffi.scp.OutletKind.ACTION,
                 inputSchemaJson = inputSchema,
                 outputSchemaJson = outputSchema,
                 operatorDid = identity.did(),
@@ -366,7 +367,7 @@ private suspend fun opToolRegister(args: JsonObject): JsonObject =
                 cost = null
             )
         )
-        buildJsonObject { put("tool_id", JsonPrimitive(toolId)) }
+        buildJsonObject { put("outlet_id", JsonPrimitive(outletId)) }
     }
 
 private suspend fun opUcanMint(args: JsonObject): JsonObject =
@@ -400,7 +401,9 @@ private suspend fun opUcanValidateMalformed(args: JsonObject): JsonObject =
                 handle,
                 "not.a.jwt",
                 "scp:ctx:any/messages:read",
-                null,
+                // Fail-closed presenting-agent gate: supply one so the malformed
+                // JWT is rejected at PARSE (the behavior under test).
+                identity.did(),
                 null
             )
             buildJsonObject {
@@ -440,7 +443,9 @@ private suspend fun opUcanEvaluateMalformed(args: JsonObject): JsonObject =
                 handle,
                 "not.a.jwt",
                 "scp:ctx:any/messages:read",
-                null,
+                // Fail-closed presenting-agent gate: supply one so the malformed
+                // JWT is rejected at PARSE (the behavior under test).
+                identity.did(),
                 null
             )
             buildJsonObject {
@@ -484,7 +489,7 @@ private suspend fun opUcanEvaluateStructured(args: JsonObject): JsonObject =
         val handle = scp.contextCreate(identity, buildContextParams(ceiling))
         val token = scp.ucanMint(handle, memberDid, capabilities, null)
         val required = "scp:ctx:${handle.contextId()}/$requiredCap"
-        val result = scp.ucanEvaluate(handle, token.encoded(), required, null, null)
+        val result = scp.ucanEvaluate(handle, token.encoded(), required, memberDid, null)
         buildJsonObject {
             put("tokens_valid", JsonPrimitive(result.tokensValid))
             put("signatures_valid", JsonPrimitive(result.signaturesValid))
@@ -499,7 +504,7 @@ private suspend fun opUcanEvaluateStructured(args: JsonObject): JsonObject =
 private suspend fun opTransportStatus(args: JsonObject): JsonObject =
     // ADR-048 §7a: UniFFI now exposes a handleless `transportManagerStatus()`
     // alongside the handle-taking `transportStatus(manager)`, matching the
-    // PyO3 / NAPI / WASM probe contract. The parity harness drives the
+    // PyO3 / NAPI probe contract. The parity harness drives the
     // handleless path so no relay fixture is needed on the UniFFI runners.
     uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use { scp ->
         val status = scp.transportManagerStatus()
@@ -526,7 +531,7 @@ private suspend fun opUnregisteredDidRejected(args: JsonObject): JsonObject =
     uniffi.scp.Scp.withStorage(uniffi.scp.StorageConfig.InMemory).use {
         // UniFFI `scpidSign` takes an opaque `Identity` handle rather
         // than a DID string, so the bridge-local registry lookup path
-        // the PyO3/NAPI/WASM bridges exercise is not reachable. Instead,
+        // the PyO3/NAPI bridges exercise is not reachable. Instead,
         // we exercise the SAME error code via `identityResolve` on the
         // fake DID: its 64-char zbase32 suffix decodes to 40 bytes (not
         // the 32 required by did:dht), so `DidDht::extract_public_key`
@@ -650,7 +655,7 @@ private suspend fun dispatch(req: RawRequest): String {
             "invalid_capability_rejected" -> opInvalidCapability(req.args)
             "event_log_append" -> opEventLogAppend(req.args)
             "sign_message" -> opSignMessage(req.args)
-            "tool_register" -> opToolRegister(req.args)
+            "outlet_register" -> opOutletRegister(req.args)
             "ucan_mint" -> opUcanMint(req.args)
             "ucan_validate_malformed" -> opUcanValidateMalformed(req.args)
             "ucan_evaluate_malformed" -> opUcanEvaluateMalformed(req.args)

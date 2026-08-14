@@ -101,7 +101,7 @@ impl<T> Outcome<T> {
 /// canonical sketch never silently coarsens an error a caller's
 /// `Outcome`-inspecting code might switch on; any other variant collapses to a
 /// `CryptoFailed` carrying the `Display` text (lossless for logging). Hoisted to
-/// one definition so the saga and tools handlers cannot diverge on which
+/// one definition so the saga and outlets handlers cannot diverge on which
 /// variants survive (a `ContextError`-not-`Clone` workaround that had drifted
 /// into two divergent copies).
 #[must_use]
@@ -117,9 +117,14 @@ pub(crate) fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::ContextNotActive => ContextError::ContextNotActive,
         ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
         ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
-        ContextError::RateLimited { resource, message } => ContextError::RateLimited {
+        ContextError::RateLimited {
+            resource,
+            message,
+            retry_after_ms,
+        } => ContextError::RateLimited {
             resource: resource.clone(),
             message: message.clone(),
+            retry_after_ms: *retry_after_ms,
         },
         other => ContextError::CryptoFailed(format!("{other}")),
     }

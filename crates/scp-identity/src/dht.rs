@@ -31,10 +31,17 @@ use sha2::{Digest, Sha256};
 
 use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationKeyHandle};
 
-use super::cache::{Clock, DidCache, DidResolutionResult, Staleness, SystemClock};
-use super::dht_client::{DhtClient, InMemoryDhtClient};
-use super::document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
+use super::cache::{DidCache, DidResolutionResult, Staleness};
 use super::{DidMethod, IdentityError, ScpIdentity};
+use scp_clock::{Clock, SystemClock};
+use scp_dht::DhtClient;
+// `InMemoryDhtClient` is a §17.17.3 resolve nullifier — it is compiled only in
+// test/testing builds (ADR-062 §Decision 1), so no production path can name it.
+#[cfg(any(test, feature = "testing"))]
+use scp_dht::InMemoryDhtClient;
+use scp_did::{
+    DidDocument, DidRotationEvent, MigrationProof, PreRotationProof, decode_multibase_key,
+};
 
 /// The `did:dht` DID method prefix.
 const DID_DHT_PREFIX: &str = "did:dht:";
@@ -79,19 +86,12 @@ pub trait SequenceStore: Send + Sync {
 ///
 /// Stores sequence numbers in a `HashMap` behind a `tokio::sync::Mutex`.
 /// Not suitable for production (no persistence across restarts).
+///
+/// Construct via [`Default`] (`InMemorySequenceStore::default()`); it carries
+/// no configuration, so a bespoke `new()` would be redundant.
 #[derive(Debug, Default)]
 pub struct InMemorySequenceStore {
     sequences: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
-}
-
-impl InMemorySequenceStore {
-    /// Creates a new empty in-memory sequence store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            sequences: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
 }
 
 impl SequenceStore for InMemorySequenceStore {
@@ -205,18 +205,23 @@ type SignFn = dyn Fn(u64, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>
 ///
 /// # Type Parameters
 ///
-/// * `D` — The DHT client implementation. Defaults to [`InMemoryDhtClient`]
-///   for testing. Production code should use a pkarr-based client.
-/// * `C` — The clock implementation for the cache. Defaults to [`SystemClock`].
+/// * `D` — The DHT client implementation. It has **no default**: every caller
+///   must name it explicitly (a production `PkarrDhtClient` / `DisabledDhtClient`,
+///   or an `InMemoryDhtClient` only in test/testing code). Removing the former
+///   `= InMemoryDhtClient` default makes the in-memory §17.17.3 nullifier
+///   inexpressible by omission (ADR-062 §Decision 1; spec §17.17.3 — the
+///   in-memory DHT resolve nullifier).
+/// * `C` — The clock implementation for the cache. Defaults to [`SystemClock`]
+///   (a wall-clock port, not a nullifier), so it keeps its default.
 ///
 /// # Construction
 ///
-/// - [`DidDht::new()`] — Creates a default instance with `InMemoryDhtClient`
-///   and no signing capability (for backward compatibility with SCP-006 tests).
 /// - [`DidDht::with_client()`] — Creates an instance with a specific DHT client.
-/// - `DidDht::with_client_and_custody()` — Creates a fully-configured instance
+/// - [`DidDht::with_client_and_signer()`] — Creates a fully-configured instance
 ///   with DHT client and signing capability.
-pub struct DidDht<D: DhtClient = InMemoryDhtClient, C: Clock = SystemClock> {
+/// - `DidDht::with_in_memory_custody()` — test/testing-only convenience over an
+///   `InMemoryDhtClient`.
+pub struct DidDht<D: DhtClient, C: Clock = SystemClock> {
     /// The DHT client used for publish/resolve operations.
     dht_client: Arc<D>,
     /// Resolution cache for DID documents.
@@ -258,31 +263,16 @@ impl<D: DhtClient + std::fmt::Debug, C: Clock + std::fmt::Debug> std::fmt::Debug
     }
 }
 
-impl Default for DidDht<InMemoryDhtClient, SystemClock> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+/// Test/testing-only convenience constructors over the in-memory DHT.
+///
+/// The former unconditional `Default` impl and no-arg constructor that
+/// hardcoded `InMemoryDhtClient` were **deleted** (ADR-062 §Decision 1): they
+/// made the
+/// §17.17.3 in-memory-DHT nullifier reachable by omission. All construction now
+/// goes through an explicit `DhtClient`. This block survives only for tests and
+/// testing-feature harnesses, where the in-memory arm is legitimate.
+#[cfg(any(test, feature = "testing"))]
 impl DidDht<InMemoryDhtClient, SystemClock> {
-    /// Creates a new `DidDht` instance with an in-memory DHT client and no
-    /// signing capability.
-    ///
-    /// This constructor is backward-compatible with SCP-006 tests. The
-    /// `publish` method will return an error unless a signing function is
-    /// configured via `DidDht::with_client_and_custody`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            dht_client: Arc::new(InMemoryDhtClient::new()),
-            cache: Arc::new(DidCache::new()),
-            sequence: AtomicU64::new(0),
-            sign_fn: None,
-            sequence_store: None,
-            post_resolve_hook: None,
-        }
-    }
-
     /// Creates a `DidDht` instance with in-memory DHT, cache, and a signing
     /// function derived from the provided [`KeyCustody`].
     ///
@@ -293,7 +283,7 @@ impl DidDht<InMemoryDhtClient, SystemClock> {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```ignore
     /// use std::sync::Arc;
     /// use scp_identity::dht::DidDht;
     /// use scp_identity::DidMethod;
@@ -652,6 +642,27 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         }
     }
 
+    /// Creates a new `DidDht` instance with a specific DHT client and a shared
+    /// cache, but **no** signing capability and no sequence store.
+    ///
+    /// This is the constructor for a node whose DHT layer never publishes (e.g.
+    /// `DidDht<DisabledDhtClient>` for `DhtMode::Disabled`, ADR-062 §Decision 1):
+    /// it still needs to share the node's [`DidCache`] with the co-located
+    /// resolver, but has nothing to sign because it does not publish. Any
+    /// `publish` attempt fails at the missing-`sign_fn` guard (and, for a
+    /// disabled client, at the client's fail-closed publish).
+    #[must_use]
+    pub fn with_client_and_cache(dht_client: Arc<D>, cache: Arc<DidCache<C>>) -> Self {
+        Self {
+            dht_client,
+            cache,
+            sequence: AtomicU64::new(0),
+            sign_fn: None,
+            sequence_store: None,
+            post_resolve_hook: None,
+        }
+    }
+
     /// Creates a new `DidDht` instance with DHT client, cache, signing
     /// function, and sequence persistence store (issue #327).
     ///
@@ -748,9 +759,15 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// 1. Load the last-persisted sequence from the [`SequenceStore`] (if
     ///    configured).
-    /// 2. Best-effort DHT query for the current sequence of the DID's BEP44
-    ///    record. If the DHT is unreachable, initialization proceeds with the
-    ///    locally-stored value and logs a warning.
+    /// 2. DHT query for the current sequence of the DID's BEP44 record. A
+    ///    genuine "no record exists" (`Ok(None)`) is a legitimate seq-0 first
+    ///    publish and proceeds. A resolve *failure*, however, is propagated
+    ///    (fail-closed): every caller of this method is a re-publish path (key
+    ///    rotation, agent-key add/rotate/remove, migration, node republish), so
+    ///    proceeding at a possibly-stale sequence would republish beneath a live
+    ///    BEP44 record — real-DHT monotonicity then rejects the write while the
+    ///    OLD (possibly compromised) document stays authoritative. That is
+    ///    fail-open on the revocation path, so we refuse rather than guess.
     /// 3. Set the local sequence to `max(stored, remote)`. The next publish
     ///    will increment this to `max(stored, remote) + 1`.
     ///
@@ -759,8 +776,10 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// # Errors
     ///
-    /// Store load errors are propagated as-is. DHT query failures are
-    /// logged but not propagated (best-effort).
+    /// Store load errors are propagated as-is. A DHT resolve **failure** is
+    /// propagated (fail-closed) — a re-publish must not proceed at a
+    /// possibly-stale sequence. A genuine `Ok(None)` no-record is not an error:
+    /// it yields seq 0 (legitimate first publish).
     pub async fn initialize_sequence(&self, did: &str) -> Result<(), IdentityError> {
         // Step 1: Load from persistent store.
         let mut best_seq: u64 = if let Some(store) = &self.sequence_store
@@ -771,22 +790,21 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             0
         };
 
-        // Step 2: Best-effort DHT query for the current remote sequence.
-        // If the DHT is unreachable we proceed with the locally-stored value
-        // rather than failing the entire initialization.
+        // Step 2: DHT query for the current remote sequence.
+        // A resolve *failure* is fail-closed (propagated): every caller here is
+        // a re-publish path, so proceeding at a possibly-stale sequence would
+        // republish beneath a live BEP44 record — real-DHT monotonicity rejects
+        // the write while the OLD (possibly compromised) document stays
+        // authoritative, i.e. fail-open on the revocation path. A genuine
+        // `Ok(None)` "no record" is NOT a failure: it is a legitimate seq-0
+        // first publish and must proceed.
         let public_key = extract_public_key(did)?;
         match self.dht_client.resolve(&public_key).await {
             Ok(Some(record)) => {
                 best_seq = best_seq.max(record.seq);
             }
             Ok(None) => {} // No record on DHT — first publish or expired.
-            Err(e) => {
-                tracing::warn!(
-                    did = %did,
-                    error = %e,
-                    "DHT query failed during sequence initialization, using local value"
-                );
-            }
+            Err(e) => return Err(e.into()),
         }
 
         // Step 3: Set to the maximum known sequence.
@@ -797,33 +815,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         }
 
         Ok(())
-    }
-
-    /// Constructs the BEP44 signable payload for a value and sequence number.
-    ///
-    /// Delegates to the standalone [`bep44_signable`] function.
-    #[must_use]
-    pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
-        bep44_signable(value, seq)
-    }
-
-    /// Verifies a BEP44 Ed25519 signature over the given value and sequence.
-    ///
-    /// Delegates to the standalone [`verify_bep44_signature`] function.
-    fn verify_bep44_signature(
-        public_key: &[u8; 32],
-        signature: &[u8; 64],
-        value: &[u8],
-        seq: u64,
-    ) -> Result<(), IdentityError> {
-        verify_bep44_signature(public_key, signature, value, seq)
-    }
-
-    /// Extracts the 32-byte public key from a `did:dht:z...` string.
-    ///
-    /// Delegates to the standalone [`extract_public_key`] function.
-    fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
-        extract_public_key(did_string)
     }
 
     /// Publishes a DID document to the DHT with the given signing function.
@@ -857,7 +848,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let seq = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Construct the BEP44 signable payload and sign it.
-        let signable = Self::bep44_signable(value, seq);
+        let signable = scp_dht::bep44_signable(value, seq);
         let sig_bytes = sign_fn(identity.identity_key.id(), signable).await?;
 
         // Convert signature to [u8; 64].
@@ -869,7 +860,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         })?;
 
         // Extract the public key from the DID.
-        let public_key = Self::extract_public_key(&identity.did)?;
+        let public_key = extract_public_key(&identity.did)?;
 
         // Publish to DHT.
         self.dht_client
@@ -964,7 +955,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         }
 
         // Step 2: Extract public key and query DHT.
-        let public_key = Self::extract_public_key(did_string)?;
+        let public_key = extract_public_key(did_string)?;
 
         let record = self
             .dht_client
@@ -973,7 +964,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .ok_or_else(|| IdentityError::DhtNotFound(did_string.to_owned()))?;
 
         // Step 3: Verify BEP44 signature.
-        Self::verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)?;
+        scp_dht::verify_bep44_signature(&public_key, &record.signature, &record.value, record.seq)?;
 
         // Step 4: Deserialize the DID document.
         let doc_json = String::from_utf8(record.value).map_err(|e| {
@@ -2015,57 +2006,6 @@ pub fn verify_self_certification(
     Ok(())
 }
 
-/// Decodes a multibase-encoded public key (z-prefix = base58btc).
-///
-/// Beyond the encoding check, the decoded 32-byte payload is validated
-/// as an Ed25519 Edwards-curve point via
-/// `ed25519_dalek::VerifyingKey::from_bytes`. This rejects non-curve
-/// payloads only (ZIP-215 rules) — low-order / small-subgroup points
-/// are NOT rejected here; they are caught at signature verification
-/// time via `verify_strict`. Matches the WASM bridge's `from_did`
-/// curve-point gate so both decoding entry points behave consistently.
-///
-/// # Errors
-///
-/// Returns [`IdentityError::InvalidDidFormat`] if the key is not properly
-/// base58btc encoded, not exactly 32 bytes, or does not decompress to a
-/// valid Ed25519 Edwards-curve point.
-pub fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
-    let b58_str = encoded.strip_prefix('z').ok_or_else(|| {
-        IdentityError::InvalidDidFormat("multibase key must start with 'z' (base58btc)".to_owned())
-    })?;
-
-    let decoded = base58btc_decode(b58_str)
-        .map_err(|e| IdentityError::InvalidDidFormat(format!("base58btc decode failed: {e}")))?;
-
-    let decoded_array: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-        IdentityError::InvalidDidFormat(format!("expected 32-byte key, got {} bytes", v.len()))
-    })?;
-
-    // Curve-point validation: `ed25519_dalek::VerifyingKey::from_bytes`
-    // rejects byte strings that don't decompress to an Edwards-curve
-    // point (ZIP-215 rules). Low-order / small-subgroup points are NOT
-    // rejected here — they are caught at signature verification time
-    // via `verify_strict`. Matches the WASM `from_did_inner` gate so
-    // both decoding entry points reject non-curve payloads early.
-    ed25519_dalek::VerifyingKey::from_bytes(&decoded_array).map_err(|e| {
-        IdentityError::InvalidDidFormat(format!(
-            "multibase key payload is not a valid Ed25519 public key: {e}"
-        ))
-    })?;
-
-    Ok(decoded_array)
-}
-
-/// Base58btc decoding (Bitcoin alphabet) via the `bs58` crate.
-///
-/// Inverse of the `base58btc_encode` function in `document.rs`.
-fn base58btc_decode(input: &str) -> Result<Vec<u8>, String> {
-    bs58::decode(input)
-        .into_vec()
-        .map_err(|e| format!("base58btc decode error: {e}"))
-}
-
 // The trait uses RPITIT (`-> impl Future<...> + Send`), so each impl method
 // must return a future rather than use `async fn` directly.
 #[allow(clippy::manual_async_fn)]
@@ -2170,21 +2110,15 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
     }
 
     fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
-        // Strip the "did:dht:z" prefix to get the z-base-32 encoded key.
-        let Some(encoded) = did_string
-            .strip_prefix(DID_DHT_PREFIX)
-            .and_then(|s| s.strip_prefix('z'))
-        else {
-            return false;
-        };
-
-        // Decode z-base-32.
-        let Ok(decoded) = zbase32::decode(encoded) else {
-            return false;
-        };
-
-        // Compare decoded bytes to provided public key.
-        decoded == public_key
+        // Delegate to the hardened `extract_public_key` free fn (same module)
+        // rather than decoding inline. That parser strips the "did:dht:z"
+        // prefix, z-base-32-decodes, requires exactly 32 bytes, AND enforces
+        // canonicality (re-encode + byte-exact compare). Routing the self-
+        // certification check through it means a NON-canonical spelling of a
+        // valid key does not self-certify — closing the trailing-bit-padding
+        // non-injectivity — and keeps this decoder byte-for-byte identical to
+        // every other did:dht decoder (single-parser parity).
+        extract_public_key(did_string).is_ok_and(|decoded_key| public_key == decoded_key.as_slice())
     }
 
     fn publish(
@@ -2246,7 +2180,12 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
 /// See ADR-003 acceptance criterion 5.
 #[must_use]
 pub fn verify_did(did_string: &str, public_key: &[u8]) -> bool {
-    DidDht::new().verify(did_string, public_key)
+    // Self-certification is a purely local decode — no DHT client is needed.
+    // Delegate to the same hardened `extract_public_key` parser `DidDht::verify`
+    // uses, so this stays byte-for-byte identical to the trait method without
+    // constructing a `DidDht` (whose `D: DhtClient` no longer defaults; ADR-062
+    // §Decision 1 removed the in-memory default).
+    extract_public_key(did_string).is_ok_and(|decoded_key| public_key == decoded_key.as_slice())
 }
 
 /// Validates that a migration's `rotated_at` timestamp is within the
@@ -2691,52 +2630,6 @@ pub fn verify_migration(
 // BEP44 utility functions — public for use by relay-based resolution (§3.10.2)
 // ---------------------------------------------------------------------------
 
-/// Constructs the BEP44 signable payload for a value and sequence number.
-///
-/// BEP44 signing payload format (without salt):
-/// `"3:seqi" + seq + "e1:v" + val_len + ":" + val`
-///
-/// This is a standalone function usable from both [`DidDht`] and relay-based
-/// resolution (§3.10.2).
-#[must_use]
-pub fn bep44_signable(value: &[u8], seq: u64) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(b"3:seqi");
-    payload.extend_from_slice(seq.to_string().as_bytes());
-    payload.extend_from_slice(b"e1:v");
-    payload.extend_from_slice(value.len().to_string().as_bytes());
-    payload.extend_from_slice(b":");
-    payload.extend_from_slice(value);
-    payload
-}
-
-/// Verifies a BEP44 Ed25519 signature over the given value and sequence.
-///
-/// Constructs the BEP44 signable payload, then verifies the Ed25519 signature
-/// against `public_key`. Used by both DHT resolution and relay-based resolution
-/// (§3.10.2).
-///
-/// # Errors
-///
-/// Returns [`IdentityError::Bep44SignatureInvalid`] if the signature does
-/// not verify or the public key is invalid.
-pub fn verify_bep44_signature(
-    public_key: &[u8; 32],
-    signature: &[u8; 64],
-    value: &[u8],
-    seq: u64,
-) -> Result<(), IdentityError> {
-    let verifying_key = VerifyingKey::from_bytes(public_key)
-        .map_err(|e| IdentityError::Bep44SignatureInvalid(format!("invalid public key: {e}")))?;
-
-    let sig = ed25519_dalek::Signature::from_bytes(signature);
-    let payload = bep44_signable(value, seq);
-
-    verifying_key.verify_strict(&payload, &sig).map_err(|e| {
-        IdentityError::Bep44SignatureInvalid(format!("signature verification failed: {e}"))
-    })
-}
-
 /// Derives the `did:dht:z...` string from a raw Ed25519 public key.
 ///
 /// Encodes the 32-byte public key as z-base-32 and prepends the `did:dht:z`
@@ -2752,58 +2645,49 @@ pub fn did_from_ed25519_public_key(public_key: &[u8; 32]) -> String {
 
 /// Extracts the 32-byte Ed25519 public key from a `did:dht:z...` string.
 ///
-/// Strips the `did:dht:z` prefix and z-base-32 decodes the remainder to recover
-/// the 32-byte Identity Key public key. Used by both DHT resolution and
+/// A thin wrapper (ADR-057 T1c-b): an unconditional `did:dht`-only prefix gate
+/// followed by delegation to the single hardened z-base-32 authority,
+/// [`scp_did::extract_public_key_from_did`]. Used by both DHT resolution and
 /// relay-based resolution (§3.10.2).
 ///
 /// # Errors
 ///
-/// Returns [`IdentityError::InvalidDidFormat`] if the DID format is wrong,
-/// the z-base-32 payload is non-canonical, or the decoded bytes are not
-/// 32 bytes. Returns [`IdentityError::ZBase32DecodeError`] if z-base-32
-/// decoding fails.
+/// Returns [`IdentityError::InvalidDidFormat`] if the DID does not have a
+/// `did:dht:z` prefix, if z-base-32 decoding fails, if the decoded bytes are
+/// not exactly 32, or if the z-base-32 payload is non-canonical. The decode,
+/// length, and canonicality failures carry the `scp-did` authority's message
+/// text under the single `InvalidDidFormat` channel.
 ///
 /// # Canonicality
 ///
 /// z-base-32 encoding of 32-byte payloads is NOT injective on its
 /// trailing bit-padding: 256 bits = 51 full chars (255 bits) + a 52nd
 /// char carrying 1 payload bit + 4 padding bits, so 16 alternate
-/// encodings decode to the same 32-byte payload. We re-encode the
-/// decoded bytes and require the input to match the canonical form,
-/// so two distinct DID strings cannot resolve to the same `#0` key
-/// (would otherwise enable petname squatting, log/UI spoofing, and
+/// encodings decode to the same 32-byte payload. The `scp-did` authority
+/// re-encodes the decoded bytes and requires the input to match the
+/// canonical form, so two distinct DID strings cannot resolve to the same
+/// `#0` key (would otherwise enable petname squatting, log/UI spoofing, and
 /// equality-by-string mismatches downstream).
 pub fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
-    let encoded = did_string
+    // Custody-independent did:dht-only gate (ADR-057 T1c-b). The scp-did
+    // authority accepts a did:key:{hex} test convenience when scp-did/testing
+    // is enabled — a feature reachable transitively through custody opt-ins.
+    // A cfg-gate on this crate's own `testing` feature would be off in those
+    // same custody builds, so the gate is an unconditional positive prefix
+    // check: the native surface accepts ONLY did:dht, in every build,
+    // exactly as before consolidation.
+    let is_did_dht = did_string
         .strip_prefix(DID_DHT_PREFIX)
-        .and_then(|s| s.strip_prefix('z'))
-        .ok_or_else(|| {
-            IdentityError::InvalidDidFormat(format!(
-                "expected 'did:dht:z...' prefix, got: {did_string}"
-            ))
-        })?;
-
-    let decoded = zbase32::decode(encoded)
-        .map_err(|e| IdentityError::ZBase32DecodeError(format!("z-base-32 decode failed: {e}")))?;
-
-    let key_bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-        IdentityError::InvalidDidFormat(format!(
-            "expected 32-byte public key, got {} bytes",
-            v.len()
-        ))
-    })?;
-
-    // Canonicality check: the encoder is not strictly injective on
-    // the trailing bit-padding of a 32-byte payload. Reject inputs
-    // that don't round-trip through the canonical encoding.
-    let canonical = zbase32::encode(&key_bytes);
-    if canonical != encoded {
+        .is_some_and(|s| s.starts_with('z'));
+    if !is_did_dht {
         return Err(IdentityError::InvalidDidFormat(format!(
-            "did:dht z-base-32 payload is not canonical (expected {canonical:?}, got {encoded:?})"
+            "expected 'did:dht:z...' prefix, got: {did_string}"
         )));
     }
 
-    Ok(key_bytes)
+    // Delegate decode, 32-byte length, and z-base-32 canonicality to the
+    // single hardened scp-did authority (one zbase32::decode workspace-wide).
+    scp_did::extract_public_key_from_did(did_string).map_err(IdentityError::InvalidDidFormat)
 }
 
 #[cfg(test)]
@@ -2814,8 +2698,8 @@ mod tests {
     use scp_platform::testing::InMemoryKeyCustody;
 
     use super::*;
-    use crate::cache::TestClock;
-    use crate::dht_client::InMemoryDhtClient;
+    use scp_clock::TestClock;
+    use scp_dht::{DhtError, InMemoryDhtClient};
 
     /// Helper to create a fully-configured `DidDht` for testing.
     fn make_dht_with_custody(
@@ -2830,13 +2714,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Existing SCP-006 tests (preserved, using default DidDht::new())
+    // Existing SCP-006 tests (preserved; explicit in-memory DHT client)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn create_identity_produces_valid_did_format() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2856,7 +2740,7 @@ mod tests {
     #[tokio::test]
     async fn create_identity_verify_self_certifying() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2873,7 +2757,7 @@ mod tests {
     #[tokio::test]
     async fn verify_did_returns_false_for_mismatched_key() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2891,14 +2775,65 @@ mod tests {
 
     #[test]
     fn verify_did_returns_false_for_invalid_prefix() {
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
         assert!(!dht.verify("did:web:example.com", &[1u8; 32]));
     }
 
     #[test]
     fn verify_did_returns_false_for_missing_z_prefix() {
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
         assert!(!dht.verify("did:dht:notzbased", &[1u8; 32]));
+    }
+
+    #[test]
+    fn verify_rejects_non_canonical_spelling_of_matching_key() {
+        // The self-certification check MUST enforce z-base-32 canonicality:
+        // a non-canonical spelling of the SAME key must not self-certify,
+        // even though it decodes to the matching bytes. z-base-32 of a 32-byte
+        // payload is not injective on its trailing bit-padding (52nd char = 1
+        // payload bit + 4 padding bits → 16 alternate encodings). Without the
+        // guard, `verify` would accept 16 distinct DID strings for one key.
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
+        let key = [0x42u8; 32];
+        let canonical_encoded = zbase32::encode(&key);
+        let canonical_did = format!("did:dht:z{canonical_encoded}");
+
+        // Canonical spelling of the matching key self-certifies.
+        assert!(
+            dht.verify(&canonical_did, &key),
+            "canonical did:dht spelling of the matching key must verify true"
+        );
+
+        // Build a non-canonical alternate by toggling a padding bit of the
+        // trailing char.
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[last_idx ^ 1];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the mutated spelling still decodes to the same 32 bytes.
+        assert_eq!(
+            zbase32::decode(&mutated_encoded)
+                .expect("alternate decodes")
+                .as_slice(),
+            &key[..],
+            "the mutated spelling must decode to the same key (a real non-canonical alternate)"
+        );
+
+        // The non-canonical spelling of the matching key MUST NOT self-certify.
+        assert!(
+            !dht.verify(&mutated_did, &key),
+            "non-canonical did:dht spelling must not self-certify even for the matching key"
+        );
     }
 
     #[test]
@@ -2915,7 +2850,7 @@ mod tests {
     #[tokio::test]
     async fn document_has_correct_verification_methods() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2947,7 +2882,7 @@ mod tests {
     #[tokio::test]
     async fn document_has_pre_rotation_service() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -2967,7 +2902,7 @@ mod tests {
     async fn create_identity_deterministic_with_seeded_custody() {
         let custody1 = InMemoryKeyCustody::from_seed_bytes([42u8; 32]);
         let custody2 = InMemoryKeyCustody::from_seed_bytes([42u8; 32]);
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody1 =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -3001,7 +2936,7 @@ mod tests {
     #[ignore = "diagnostic helper — run with --ignored --nocapture"]
     async fn print_parity_seed_expected_values() {
         let custody = InMemoryKeyCustody::from_seed_bytes([0x7bu8; 32]);
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let (identity, _doc, _pre_rotation_handle) =
@@ -3024,7 +2959,7 @@ mod tests {
         let seed = [0x7Bu8; 32];
         let custody1 = InMemoryKeyCustody::from_seed_bytes(seed);
         let custody2 = InMemoryKeyCustody::from_seed_bytes(seed);
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody1 =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -3053,7 +2988,7 @@ mod tests {
     #[tokio::test]
     async fn document_json_roundtrip_from_create() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -3175,8 +3110,7 @@ mod tests {
             &[97u8; 32],
         );
         let tampered_json = tampered_doc.to_json().unwrap();
-        let public_key =
-            DidDht::<InMemoryDhtClient, Arc<TestClock>>::extract_public_key(&identity.did).unwrap();
+        let public_key = extract_public_key(&identity.did).unwrap();
         dht_client
             .publish(&public_key, &[0u8; 64], tampered_json.as_bytes(), 1)
             .await
@@ -3205,7 +3139,7 @@ mod tests {
     #[tokio::test]
     async fn publish_without_signer_returns_error() {
         let custody = InMemoryKeyCustody::new();
-        let dht = DidDht::new();
+        let dht = DidDht::with_client(Arc::new(InMemoryDhtClient::new()));
 
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
@@ -3214,17 +3148,6 @@ mod tests {
 
         let result = dht.publish_document(&identity, &document).await;
         assert!(matches!(result, Err(IdentityError::DhtPublishFailed(_))));
-    }
-
-    #[tokio::test]
-    async fn bep44_signable_format_is_correct() {
-        let value = b"test";
-        let seq = 42;
-        let signable = DidDht::<InMemoryDhtClient>::bep44_signable(value, seq);
-
-        // Expected: "3:seqi42e1:v4:test"
-        let expected = b"3:seqi42e1:v4:test";
-        assert_eq!(signable, expected);
     }
 
     #[tokio::test]
@@ -3312,107 +3235,18 @@ mod tests {
     }
 
     #[test]
-    fn base58btc_decode_roundtrip() {
-        let original = [42u8; 32];
-        // Use the document module's encode (via the multibase_encode path)
-        let encoded =
-            crate::document::DidDocument::new("did:dht:zTest", &original, &[0u8; 32], &[0u8; 32]);
-        let vm = encoded.verification_method_by_fragment("0").unwrap();
-        let decoded = decode_multibase_key(&vm.public_key_multibase).unwrap();
-        assert_eq!(decoded, original);
-    }
-
-    /// `decode_multibase_key` MUST reject payloads that don't decompress
-    /// to a valid Ed25519 Edwards-curve point. ed25519-dalek's
-    /// `from_bytes` enforces ZIP-215 curve-point decompression. About
-    /// half of random 32-byte strings fail this check, so we search for
-    /// one rather than hardcoding a specific value. Matches the WASM
-    /// bridge's `from_did_rejects_non_ed25519_curve_point` guard so
-    /// both decoding entry points reject non-curve payloads early.
-    #[test]
-    fn decode_multibase_key_rejects_non_curve_point() {
-        use rand::RngCore;
-
-        // Search for a 32-byte payload that fails Ed25519 decompression.
-        let non_curve_bytes: [u8; 32] = {
-            let mut found: Option<[u8; 32]> = None;
-            for _ in 0..512 {
-                let mut candidate = [0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut candidate);
-                if ed25519_dalek::VerifyingKey::from_bytes(&candidate).is_err() {
-                    found = Some(candidate);
-                    break;
-                }
-            }
-            found.expect(
-                "should find a non-curve 32-byte payload within 512 tries (~50% rejection rate)",
-            )
-        };
-
-        // base58btc-encode the non-curve payload and prefix with `z`
-        // (matches the on-the-wire multibase form).
-        let encoded = format!("z{}", bs58::encode(&non_curve_bytes).into_string());
-
-        let err = decode_multibase_key(&encoded).expect_err("non-curve payload must be rejected");
-        match err {
-            IdentityError::InvalidDidFormat(msg) => {
-                assert!(
-                    msg.contains("not a valid Ed25519 public key"),
-                    "expected curve-point error message; got: {msg}"
-                );
-            }
-            other => panic!("expected InvalidDidFormat, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn base58btc_decode_known_vector() {
-        // "JxF12TrwUP45BMd" is the base58btc encoding of "Hello World".
-        let decoded = base58btc_decode("JxF12TrwUP45BMd").unwrap();
-        assert_eq!(decoded, b"Hello World");
-    }
-
-    #[test]
-    fn base58btc_decode_leading_ones() {
-        // Leading '1' characters map to leading zero bytes.
-        let decoded = base58btc_decode("112").unwrap();
-        assert_eq!(decoded, vec![0x00, 0x00, 0x01]);
-    }
-
-    #[test]
-    fn base58btc_decode_empty_input() {
-        let decoded = base58btc_decode("").unwrap();
-        assert!(decoded.is_empty());
-    }
-
-    #[test]
-    fn base58btc_decode_rejects_invalid_characters() {
-        // '0', 'O', 'I', 'l' are not in the Bitcoin base58 alphabet.
-        assert!(base58btc_decode("0OIl").is_err());
-    }
-
-    #[test]
-    fn base58btc_roundtrip_32_byte_key() {
-        // Direct roundtrip: encode with bs58, then decode with our function.
-        let key = [0xABu8; 32];
-        let encoded = bs58::encode(&key).into_string();
-        let decoded = base58btc_decode(&encoded).unwrap();
-        assert_eq!(decoded, key);
-    }
-
-    #[test]
     fn extract_public_key_from_valid_did() {
         let key = [42u8; 32];
         let encoded = zbase32::encode(&key);
         let did = format!("did:dht:z{encoded}");
 
-        let extracted = DidDht::<InMemoryDhtClient>::extract_public_key(&did).unwrap();
+        let extracted = extract_public_key(&did).unwrap();
         assert_eq!(extracted, key);
     }
 
     #[test]
     fn extract_public_key_rejects_invalid_prefix() {
-        let result = DidDht::<InMemoryDhtClient>::extract_public_key("did:web:example.com");
+        let result = extract_public_key("did:web:example.com");
         assert!(result.is_err());
     }
 
@@ -3436,8 +3270,7 @@ mod tests {
         let canonical_did = format!("did:dht:z{canonical_encoded}");
 
         // Sanity: the canonical form is accepted.
-        let canonical_result =
-            DidDht::<InMemoryDhtClient>::extract_public_key(&canonical_did).unwrap();
+        let canonical_result = extract_public_key(&canonical_did).unwrap();
         assert_eq!(canonical_result, key);
 
         // Construct a non-canonical alternate by mutating the trailing
@@ -3461,8 +3294,7 @@ mod tests {
         assert_eq!(raw_decoded.as_slice(), &key[..]);
 
         // The canonicality check MUST reject it.
-        let err = DidDht::<InMemoryDhtClient>::extract_public_key(&mutated_did)
-            .expect_err("non-canonical DID MUST be rejected");
+        let err = extract_public_key(&mutated_did).expect_err("non-canonical DID MUST be rejected");
         match err {
             IdentityError::InvalidDidFormat(msg) => {
                 assert!(
@@ -3472,6 +3304,109 @@ mod tests {
             }
             other => panic!("expected InvalidDidFormat, got: {other:?}"),
         }
+    }
+
+    /// Re-fork guard (ADR-057 T1c-b): the native wrapper
+    /// (`scp_identity::dht::extract_public_key`) delegates to the single
+    /// hardened z-base-32 authority (`scp_did::extract_public_key_from_did`) —
+    /// the same parser the browser/event-log signature-verify path reaches. This
+    /// test feeds the *same* `did:dht:z…` fixtures through both symbols and
+    /// asserts they accept and reject identically. Its purpose is to catch a
+    /// future RE-FORK: if someone reintroduces an inline z-base-32 decode inside
+    /// the wrapper that drifts from the authority (e.g. drops the canonicality
+    /// round-trip), the wrapper would accept a non-canonical `did:dht` the
+    /// authority rejects and this assertion would fail. It pins the
+    /// security-parity invariant: the native surface must never accept a key the
+    /// shared authority would reject as non-canonical.
+    #[test]
+    fn wrapper_delegates_to_scp_did_authority_on_accept_and_reject() {
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let key = [42u8; 32];
+        let canonical_encoded = zbase32::encode(&key);
+        let canonical_did = format!("did:dht:z{canonical_encoded}");
+
+        // Wrapper and authority accept the canonical spelling and yield the
+        // same key.
+        assert_eq!(extract_public_key(&canonical_did).unwrap(), key);
+        assert_eq!(
+            scp_did::extract_public_key_from_did(&canonical_did).unwrap(),
+            key
+        );
+
+        // Construct a non-canonical alternate (toggle a trailing padding bit).
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mutated_idx = last_idx ^ 1;
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[mutated_idx];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the alternate decodes to the same 32 bytes on both sides.
+        assert_eq!(
+            zbase32::decode(&mutated_encoded)
+                .expect("alternate decodes")
+                .as_slice(),
+            &key[..]
+        );
+
+        // Wrapper and authority MUST reject the non-canonical input — identical
+        // inputs, identical rejection (the wrapper only by delegating).
+        assert!(
+            extract_public_key(&mutated_did).is_err(),
+            "wrapper must reject non-canonical did:dht"
+        );
+        assert!(
+            scp_did::extract_public_key_from_did(&mutated_did).is_err(),
+            "scp-did authority must reject non-canonical did:dht"
+        );
+    }
+
+    /// The native wrapper accepts ONLY `did:dht` — never `did:key` — in every
+    /// build. The shared `scp-did` authority accepts a `did:key:{hex}` test
+    /// convenience when `scp-did/testing` is enabled, and that feature is
+    /// unified ON by sibling crates (`scp-protocol/testing`, `scp-mls/testing`,
+    /// `scp-event-log/testing`, `scp-ffi-common/testing`) in any workspace or
+    /// CI build that also compiles this crate — including custody-opt-in
+    /// builds. The wrapper's unconditional prefix gate rejects `did:key`
+    /// regardless of which path enables it.
+    ///
+    /// Caveat on what this test proves in isolation: under a bare
+    /// `cargo test -p scp-identity` the authority's `did:key` branch is compiled
+    /// out anyway, so the authority alone would also reject. The load-bearing
+    /// execution is the feature-unified workspace run (CI), where
+    /// `scp-did/testing` IS on and the authority WOULD accept `did:key` — there,
+    /// the wrapper's gate is the sole reason the native surface still rejects.
+    #[test]
+    fn extract_public_key_rejects_did_key_in_every_build() {
+        // 64 hex chars = 32 bytes; a form the scp-did authority accepts under
+        // `testing`, but the native wrapper must not.
+        let did_key = format!("did:key:{}", "aa".repeat(32));
+        let result = extract_public_key(&did_key);
+        assert!(
+            matches!(result, Err(IdentityError::InvalidDidFormat(_))),
+            "wrapper must reject did:key with InvalidDidFormat, got: {result:?}"
+        );
+    }
+
+    /// A malformed `did:dht:z…` payload surfaces as `InvalidDidFormat`, pinning
+    /// the reconciled error taxonomy (ADR-057 T1c-b): z-base-32 decode failures
+    /// once had their own typed variant and are now folded into the single
+    /// `InvalidDidFormat` channel carrying the `scp-did` authority's message
+    /// text.
+    #[test]
+    fn extract_public_key_maps_decode_failure_to_invalid_did_format() {
+        let result = extract_public_key("did:dht:z!!!invalid!!!");
+        assert!(
+            matches!(result, Err(IdentityError::InvalidDidFormat(_))),
+            "decode failure must map to InvalidDidFormat, got: {result:?}"
+        );
     }
 
     /// Helper that creates an identity with a fresh
@@ -4676,7 +4611,7 @@ mod tests {
         // whose `#0` verification method has a malformed
         // `publicKeyMultibase`: missing the `z` base58btc prefix that
         // `decode_multibase_key` requires.
-        let malformed_vm0 = crate::document::VerificationMethod {
+        let malformed_vm0 = scp_did::VerificationMethod {
             id: format!("{}#0", event.old_did),
             method_type: "Ed25519VerificationKey2020".to_owned(),
             controller: event.old_did.clone(),
@@ -5906,7 +5841,7 @@ mod tests {
         let agent_vm = rotated_doc
             .verification_method_by_fragment("agent")
             .unwrap();
-        let doc_agent_bytes = super::decode_multibase_key(&agent_vm.public_key_multibase).unwrap();
+        let doc_agent_bytes = decode_multibase_key(&agent_vm.public_key_multibase).unwrap();
         assert_eq!(
             doc_agent_bytes,
             <[u8; 32]>::try_from(agent_public.as_bytes()).unwrap()
@@ -6081,7 +6016,7 @@ mod tests {
             signature: &[u8; 64],
             value: &[u8],
             seq: u64,
-        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl Future<Output = Result<(), DhtError>> + Send {
             let pk = *public_key;
             let sig = *signature;
             let val = value.to_vec();
@@ -6098,8 +6033,7 @@ mod tests {
         fn resolve(
             &self,
             public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<crate::dht_client::DhtRecord>, IdentityError>> + Send
-        {
+        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
             let pk = *public_key;
             async move { self.inner.resolve(&pk).await }
         }
@@ -6338,7 +6272,7 @@ mod tests {
     async fn publish_persists_sequence_to_store() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
 
         let pre_rotation_custody =
@@ -6365,7 +6299,7 @@ mod tests {
     async fn initialize_sequence_from_store() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
 
         let pre_rotation_custody =
@@ -6397,7 +6331,7 @@ mod tests {
     async fn initialize_sequence_from_dht_when_no_store() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
 
         // First instance: publish with a store.
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
@@ -6411,7 +6345,7 @@ mod tests {
         assert_eq!(dht.current_sequence(), 5);
 
         // Second instance: fresh store (simulating lost storage), but same DHT.
-        let fresh_store = Arc::new(InMemorySequenceStore::new());
+        let fresh_store = Arc::new(InMemorySequenceStore::default());
         let dht2 = make_dht_with_store(&custody, Arc::clone(&dht_client), fresh_store);
 
         dht2.initialize_sequence(&identity.did).await.unwrap();
@@ -6427,7 +6361,7 @@ mod tests {
     async fn initialize_sequence_uses_max_of_store_and_dht() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
 
         // First instance: publish to get DHT seq to 3.
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
@@ -6458,7 +6392,7 @@ mod tests {
         // "publish -> restart -> publish again -> second publication has higher sequence"
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
 
         // First session: create and publish.
         let dht1 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
@@ -6509,7 +6443,7 @@ mod tests {
         // New identity, no store, no DHT record: sequence stays at 0.
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
-        let store = Arc::new(InMemorySequenceStore::new());
+        let store = Arc::new(InMemorySequenceStore::default());
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
 
         let pre_rotation_custody =
@@ -6517,6 +6451,70 @@ mod tests {
         let (identity, _document, _pre_rotation_handle) =
             dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.initialize_sequence(&identity.did).await.unwrap();
+        assert_eq!(dht.current_sequence(), 0);
+    }
+
+    /// A `DhtClient` whose `resolve` always fails, to exercise the
+    /// fail-closed path in [`DidDht::initialize_sequence`]. `publish` is a
+    /// no-op success — it is never exercised by these tests.
+    struct ResolveFailingDhtClient;
+
+    #[allow(clippy::manual_async_fn)]
+    impl DhtClient for ResolveFailingDhtClient {
+        fn publish(
+            &self,
+            _public_key: &[u8; 32],
+            _signature: &[u8; 64],
+            _value: &[u8],
+            _seq: u64,
+        ) -> impl Future<Output = Result<(), DhtError>> + Send {
+            async { Ok(()) }
+        }
+
+        fn resolve(
+            &self,
+            _public_key: &[u8; 32],
+        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
+            async {
+                Err(DhtError::DhtResolveFailed(
+                    "simulated transient resolve failure".to_owned(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_sequence_fails_closed_on_dht_resolve_error() {
+        // Regression for the P4 fail-open-on-revocation finding: every caller
+        // of `initialize_sequence` is a re-publish path (key rotation,
+        // agent-key add/rotate/remove, migration, node republish). If a
+        // transient DHT resolve failure were swallowed, `best_seq` would stay
+        // at its stale stored value (0 with no store), the next publish would
+        // republish at seq=1 beneath a live BEP44 record already at seq=N,
+        // real-DHT monotonicity would reject the write, and the OLD (possibly
+        // compromised) document would stay authoritative. The resolve error
+        // MUST therefore propagate (fail-closed), NOT silently succeed at a
+        // stale sequence.
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(clock));
+        let sign_fn =
+            DidDht::<ResolveFailingDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
+        let dht = DidDht::with_client_and_signer(Arc::new(ResolveFailingDhtClient), cache, sign_fn);
+
+        // A valid `did:dht` identity so `extract_public_key` succeeds and we
+        // reach Step 2's resolve. `create` neither resolves nor publishes.
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, _document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
+
+        let result = dht.initialize_sequence(&identity.did).await;
+        assert!(
+            matches!(result, Err(IdentityError::DhtResolveFailed(_))),
+            "resolve failure during initialize_sequence must propagate (fail closed), got {result:?}"
+        );
+        // Sequence must remain untouched (0) — we did NOT assume a stale value.
         assert_eq!(dht.current_sequence(), 0);
     }
 
@@ -6825,7 +6823,7 @@ mod tests {
             signature: &[u8; 64],
             value: &[u8],
             seq: u64,
-        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+        ) -> impl Future<Output = Result<(), DhtError>> + Send {
             let pk = *public_key;
             let sig = *signature;
             let val = value.to_vec();
@@ -6840,14 +6838,14 @@ mod tests {
                 match mode {
                     FailingPublishMode::FailOnNew => {
                         // Don't record: nothing actually hit the wire.
-                        return Err(IdentityError::DhtPublishFailed(
+                        return Err(DhtError::DhtPublishFailed(
                             "simulated step-7 publish failure".to_owned(),
                         ));
                     }
                     FailingPublishMode::FailOnOldAfterNew if idx == 1 => {
                         // The OLD republish (second publish in migrate_identity).
                         // Don't record — it failed.
-                        return Err(IdentityError::DhtPublishFailed(
+                        return Err(DhtError::DhtPublishFailed(
                             "simulated step-8 publish failure".to_owned(),
                         ));
                     }
@@ -6861,8 +6859,7 @@ mod tests {
         fn resolve(
             &self,
             public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<crate::dht_client::DhtRecord>, IdentityError>> + Send
-        {
+        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
             let pk = *public_key;
             async move { self.inner.resolve(&pk).await }
         }

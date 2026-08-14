@@ -27,7 +27,7 @@
 //! non-`Send` actor-spawns-actor recursion; it therefore dispatches
 //! supervisor-direct.
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextError;
 use sha2::{Digest, Sha256};
 

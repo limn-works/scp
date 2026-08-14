@@ -18,8 +18,6 @@ use crate::context::actor::commands::EconomyCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::economy::receipt::ReceiptVerificationError;
-use scp_protocol::context::ContextError;
-use tokio::sync::oneshot;
 
 /// Per-call transport budget for economy handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -32,7 +30,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// the actor dispatch seam, but this domain reads NOTHING from the owned
 /// state (receipt verification flows entirely through the payment
 /// adapter on `deps`). It is therefore taken as `_cell` — no
-/// [`ClassSCell::state_mut`] escape hatch, no [`Deref`](std::ops::Deref)
+/// `ClassSCell::state_mut` escape hatch, no [`Deref`](std::ops::Deref)
 /// read (ADR-049 §9). The `&mut` referent also keeps the spawned dispatch
 /// future `Send`, which a shared `&ClassSCell` would not (`ClassSCell` is
 /// not `Sync`).
@@ -47,7 +45,6 @@ pub(crate) async fn dispatch(
 
 async fn dispatch_inner(deps: &ActorDeps, cmd: EconomyCommand) -> Outcome<()> {
     match cmd {
-        EconomyCommand::Placeholder { reply } => reply_not_implemented(reply),
         EconomyCommand::VerifyPaymentReceipts { receipts, reply } => {
             handle_verify_payment_receipts(deps, *receipts, reply).await
         }
@@ -90,11 +87,4 @@ async fn handle_verify_payment_receipts(
     let _ = reply.send(results);
     // Verify payment receipts is a pure read — mutated=false.
     Outcome::ok(())
-}
-
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "EconomyCommand::Placeholder — mailbox-pipe smoke target; \
-                       no real work performed";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

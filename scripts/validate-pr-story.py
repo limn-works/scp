@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Parsing
 # ---------------------------------------------------------------------------
 
+
 def extract_story_id(body: str) -> str | None:
     """Extract story ID from PR body.
 
@@ -68,17 +69,11 @@ def extract_checked_ac(body: str) -> tuple[list[str], list[str]]:
 
     # Find the AC section between markers or under ## Acceptance Criteria
     ac_section = ""
-    m = re.search(
-        r"<!--\s*ac:start\s*-->(.*?)<!--\s*ac:end\s*-->",
-        body, re.DOTALL
-    )
+    m = re.search(r"<!--\s*ac:start\s*-->(.*?)<!--\s*ac:end\s*-->", body, re.DOTALL)
     if m:
         ac_section = m.group(1)
     else:
-        m = re.search(
-            r"## Acceptance Criteria\s*\n(.*?)(?=\n## |\Z)",
-            body, re.DOTALL
-        )
+        m = re.search(r"## Acceptance Criteria\s*\n(.*?)(?=\n## |\Z)", body, re.DOTALL)
         if m:
             ac_section = m.group(1)
 
@@ -100,6 +95,7 @@ def extract_checked_ac(body: str) -> tuple[list[str], list[str]]:
 # ---------------------------------------------------------------------------
 # Story lookup
 # ---------------------------------------------------------------------------
+
 
 def find_story(story_id: str) -> tuple[dict | None, str | None]:
     """Find a story by ID across all PRD files.
@@ -146,6 +142,7 @@ def collect_all_stories() -> dict[str, dict]:
 # Checks
 # ---------------------------------------------------------------------------
 
+
 def check_file_coverage(
     story_files: list[str],
     changed_files: list[str],
@@ -178,17 +175,21 @@ def check_dependencies(story: dict) -> list[dict]:
     for dep_id in story.get("blockedBy", []):
         dep = all_stories.get(dep_id)
         if dep is None:
-            blocking.append({
-                "id": dep_id,
-                "status": "not-found",
-                "title": "(story not found)",
-            })
+            blocking.append(
+                {
+                    "id": dep_id,
+                    "status": "not-found",
+                    "title": "(story not found)",
+                }
+            )
         elif dep.get("status") != "done":
-            blocking.append({
-                "id": dep_id,
-                "status": dep.get("status", "unknown"),
-                "title": dep.get("title", ""),
-            })
+            blocking.append(
+                {
+                    "id": dep_id,
+                    "status": dep.get("status", "unknown"),
+                    "title": dep.get("title", ""),
+                }
+            )
 
     return blocking
 
@@ -210,11 +211,13 @@ def check_stubs(story_id: str, changed_files: list[str]) -> list[dict]:
                 resolved.read_text(encoding="utf-8").splitlines(), 1
             ):
                 if stub_pattern.search(line):
-                    stubs.append({
-                        "file": filepath,
-                        "line": lineno,
-                        "text": line.strip(),
-                    })
+                    stubs.append(
+                        {
+                            "file": filepath,
+                            "line": lineno,
+                            "text": line.strip(),
+                        }
+                    )
         except (OSError, UnicodeDecodeError):
             continue
 
@@ -282,11 +285,13 @@ def check_source_freshness(story: dict) -> list[dict]:
 
         resolved = REPO_ROOT / source_file
         if not resolved.is_file():
-            stale.append({
-                "file": source_file,
-                "section": source_section,
-                "reason": "file does not exist",
-            })
+            stale.append(
+                {
+                    "file": source_file,
+                    "section": source_section,
+                    "reason": "file does not exist",
+                }
+            )
             continue
 
         # Check if section heading still exists
@@ -294,11 +299,13 @@ def check_source_freshness(story: dict) -> list[dict]:
             try:
                 content = resolved.read_text(encoding="utf-8")
                 if source_section not in content:
-                    stale.append({
-                        "file": source_file,
-                        "section": source_section,
-                        "reason": "section heading not found in file",
-                    })
+                    stale.append(
+                        {
+                            "file": source_file,
+                            "section": source_section,
+                            "reason": "section heading not found in file",
+                        }
+                    )
             except (OSError, UnicodeDecodeError):
                 pass
 
@@ -353,6 +360,7 @@ def check_ac_vs_story(
 # Report
 # ---------------------------------------------------------------------------
 
+
 def build_report(
     story_id: str,
     story: dict,
@@ -361,9 +369,7 @@ def build_report(
 ) -> str:
     """Build a markdown report from findings."""
     lines = ["## PRD Story Review\n"]
-    lines.append(
-        f"**Story:** `{story_id}` — {story.get('title', '<untitled>')}"
-    )
+    lines.append(f"**Story:** `{story_id}` — {story.get('title', '<untitled>')}")
     lines.append(f"**PRD:** `{prd_name}.json`")
     lines.append(
         f"**Gate:** `{story.get('gate', '?')}` | "
@@ -420,9 +426,7 @@ def build_report(
     if findings["stale_sources"]:
         for ss in findings["stale_sources"]:
             if ss["reason"] == "file does not exist":
-                errors.append(
-                    f"**Source file missing:** `{ss['file']}`"
-                )
+                errors.append(f"**Source file missing:** `{ss['file']}`")
             else:
                 warnings.append(
                     f"**Source drift:** `{ss['file']}` — {ss['reason']}"
@@ -433,14 +437,10 @@ def build_report(
     ac = findings["ac_comparison"]
     if ac["missing_from_pr"]:
         for criterion in ac["missing_from_pr"]:
-            errors.append(
-                f"**Missing AC** (in story, not in PR): {criterion}"
-            )
+            errors.append(f"**Missing AC** (in story, not in PR): {criterion}")
     if ac["extra_in_pr"]:
         for criterion in ac["extra_in_pr"]:
-            info.append(
-                f"**Extra AC** (in PR, not in story): {criterion}"
-            )
+            info.append(f"**Extra AC** (in PR, not in story): {criterion}")
     if not ac["all_checked"] and ac["pr_ac_count"] > 0:
         warnings.append(
             f"**{ac['unchecked_count']}/{ac['pr_ac_count']} acceptance "
@@ -496,10 +496,9 @@ def build_report(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Validate PR against PRD story"
-    )
+    parser = argparse.ArgumentParser(description="Validate PR against PRD story")
     parser.add_argument(
         "--body-file",
         help="Path to PR body file (default: stdin)",
@@ -521,31 +520,43 @@ def main() -> int:
         body = sys.stdin.read()
 
     if not body.strip():
-        print(json.dumps({
-            "valid": False,
-            "parse_error": "Empty PR body",
-        }))
+        print(
+            json.dumps(
+                {
+                    "valid": False,
+                    "parse_error": "Empty PR body",
+                }
+            )
+        )
         return 2
 
     # Extract story ID
     story_id = args.story_id or extract_story_id(body)
     if not story_id:
-        print(json.dumps({
-            "valid": False,
-            "parse_error": (
-                "Could not extract story ID from PR body. "
-                "Use <!-- story-id: PREFIX-NNN --> or pass --story-id."
-            ),
-        }))
+        print(
+            json.dumps(
+                {
+                    "valid": False,
+                    "parse_error": (
+                        "Could not extract story ID from PR body. "
+                        "Use <!-- story-id: PREFIX-NNN --> or pass --story-id."
+                    ),
+                }
+            )
+        )
         return 2
 
     # Find story in PRD files
     story, prd_name = find_story(story_id)
     if story is None:
-        print(json.dumps({
-            "valid": False,
-            "parse_error": f"Story {story_id} not found in any PRD file",
-        }))
+        print(
+            json.dumps(
+                {
+                    "valid": False,
+                    "parse_error": f"Story {story_id} not found in any PRD file",
+                }
+            )
+        )
         return 2
 
     # Read changed files
@@ -596,19 +607,23 @@ def main() -> int:
         "prd_file": prd_name,
         "story_title": story.get("title", ""),
         "findings": findings,
-        "error_count": sum([
-            len(missing),
-            len(blocking_deps),
-            len(stubs),
-            len([s for s in stale_sources if s["reason"] == "file does not exist"]),
-            len(ac_comparison.get("missing_from_pr", [])),
-        ]),
-        "warning_count": sum([
-            1 if not test_coverage["has_tests"] else 0,
-            1 if not ac_comparison.get("all_checked", True) else 0,
-            len([s for s in stale_sources if s["reason"] != "file does not exist"]),
-            1 if story.get("status") == "done" else 0,
-        ]),
+        "error_count": sum(
+            [
+                len(missing),
+                len(blocking_deps),
+                len(stubs),
+                len([s for s in stale_sources if s["reason"] == "file does not exist"]),
+                len(ac_comparison.get("missing_from_pr", [])),
+            ]
+        ),
+        "warning_count": sum(
+            [
+                1 if not test_coverage["has_tests"] else 0,
+                1 if not ac_comparison.get("all_checked", True) else 0,
+                len([s for s in stale_sources if s["reason"] != "file does not exist"]),
+                1 if story.get("status") == "done" else 0,
+            ]
+        ),
         "report": report,
     }
 

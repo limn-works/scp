@@ -8,21 +8,21 @@
 #![allow(clippy::significant_drop_tightening)]
 
 //! Cross-domain `ContextManager` infrastructure helpers with explicit-
-//! collaborator signatures (ADR-049 commit 12).
+//! collaborator signatures (ADR-049 §15).
 //!
 //! # Purpose
 //!
 //! This module hoists the cross-domain infrastructure methods that the
 //! existing per-domain `*_helpers.rs` files reach via `mgr.X(...)`. The
 //! per-domain helpers (lifecycle, messaging, broadcast, governance,
-//! economy, queries, standing, tools, `trust_recovery`) all need access to
+//! economy, queries, standing, outlets, `trust_recovery`) all need access to
 //! the same per-context lock primitives, persistence shortcuts, broadcast
 //! initialization, payment-failure event recording, and operational gauge
 //! updates — methods that don't fit into a single domain's helper file.
 //!
 //! Co-locating them here keeps each domain's helper module focused while
 //! preserving the "one canonical free-function form per legacy method"
-//! invariant the rest of the 12c hoist series established.
+//! invariant the rest of the ADR-049 §15 actor-migration hoists established.
 //!
 //! # Behavior preservation
 //!
@@ -34,7 +34,7 @@
 //!   [`Supervisor`](crate::context::supervisor::Supervisor), or
 //! - `supervisor.X_ref()` accessor calls for the provider slots already
 //!   lifted to [`Supervisor`](crate::context::supervisor::Supervisor) in
-//!   ADR-049 commit 12c.9a/9b.
+//!   ADR-049 §15.
 //!
 //! The legacy inherent methods on
 //! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
@@ -42,22 +42,22 @@
 //! through the `Weak<Supervisor>` back-pointer installed by
 //! [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers)
 //! during bridge construction. The forwarders are deleted alongside the
-//! outer shim in commit 12c.9g.4.
+//! outer shim in ADR-049 §15.
 //!
 //! # Hoisted methods
 //!
 //! The per-context lock primitives and the `contexts` `DashMap` they read
 //! were deleted in the ADR-049 Phase 2A finalization once the last
-//! `&Supervisor` caller (the legacy tools economy wrapper) moved to the
+//! `&Supervisor` caller (the legacy outlets economy wrapper) moved to the
 //! actor-split economy reserve/settle path. Per-context state now lives
 //! only inside the per-context actor; the helpers below remain because
 //! they mailbox the actors or touch supervisor-scoped provider slots.
 //!
 //! Persistence shortcuts:
 //! - [`has_persistence`] — predicate for skipping snapshot work.
-//! - [`persist_context_snapshot`] — best-effort persist + crypto export.
-//! - [`persist_broadcast_snapshot`] — best-effort persist of broadcast state.
-//! - [`persist_context_and_broadcast`] — atomic snapshot of both pairs.
+//! - [`persist_context_and_broadcast`] — best-effort flush of the whole
+//!   [`ContextSnapshot`] (context state + crypto export + embedded broadcast)
+//!   via the target actor's `FlushSnapshot` command.
 //!
 //! Broadcast bootstrapping:
 //! - [`init_broadcast_context`] — create + persist initial broadcast state.
@@ -65,12 +65,9 @@
 //! Operational metrics:
 //! - [`update_context_gauges`] — refresh active-contexts + buffer-occupancy gauges.
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::ContextParams;
-use scp_protocol::context::ContextState;
-use scp_protocol::context::broadcast::{
-    BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
-};
+use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext};
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::params::{ContextMode, TemplateId};
 
@@ -82,7 +79,7 @@ use crate::context::supervisor::Supervisor;
 // ---------------------------------------------------------------------------
 
 /// Canonical diagnostic message for the
-/// [`ContextError::NotInitialized`] error variant returned when a
+/// [`ContextError::NotInitialized`](crate::context::ContextError::NotInitialized) error variant returned when a
 /// helper consults a provider slot that has not been populated by
 /// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers).
 ///
@@ -100,8 +97,8 @@ pub const PROVIDER_NOT_INITIALIZED: &str =
 /// Returns `true` if a persistence provider is configured.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::has_persistence`](crate::context::supervisor::Supervisor::has_persistence)
-/// (ADR-049 commit 12). Byte-identical behavior — uses the
+/// [`has_persistence`](crate::context::manager_methods::has_persistence)
+/// (ADR-049 §15). Byte-identical behavior — uses the
 /// supervisor's lifted persistence slot
 /// (`Supervisor::persistence_ref`) which already collapses the
 /// "not attached" + "attached but no persistence" cases to a single
@@ -167,32 +164,6 @@ pub async fn update_context_gauges(supervisor: &Supervisor) {
 }
 
 // ---------------------------------------------------------------------------
-// persist_broadcast_snapshot
-// ---------------------------------------------------------------------------
-
-/// Persists a broadcast context snapshot if a persistence provider is
-/// configured. Best-effort: logs errors but does not propagate.
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::persist_broadcast_snapshot`](crate::context::supervisor::Supervisor::persist_broadcast_snapshot)
-/// (ADR-049 commit 12). Byte-identical behavior.
-pub fn persist_broadcast_snapshot(
-    supervisor: &Supervisor,
-    context_id: &str,
-    snapshot: &BroadcastContextSnapshot,
-) {
-    if let Some(persistence) = supervisor.persistence_ref()
-        && let Err(e) = persistence.persist_broadcast(context_id, snapshot)
-    {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to persist broadcast snapshot"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // 11. init_broadcast_context
 // ---------------------------------------------------------------------------
 
@@ -202,8 +173,8 @@ pub fn persist_broadcast_snapshot(
 /// for crash recovery.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::init_broadcast_context`](crate::context::supervisor::Supervisor::init_broadcast_context)
-/// (ADR-049 commit 12). Byte-identical behavior.
+/// [`init_broadcast_context`](crate::context::supervisor::handle::SupervisorHandle::init_broadcast_context)
+/// (ADR-049 §15). Byte-identical behavior.
 pub fn init_broadcast_context(
     supervisor: &Supervisor,
     context_id: &str,
@@ -231,10 +202,11 @@ pub fn init_broadcast_context(
     // Register the creator as the first author (messagesWrite).
     bc.add_author(creator_did)
         .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-    // Persist initial broadcast state for crash recovery.
-    if has_persistence(supervisor) {
-        persist_broadcast_snapshot(supervisor, context_id, &bc.to_snapshot());
-    }
+    // The initial broadcast state (creator-as-author, epoch 0, no blocks) now
+    // rides the Class-S `ContextSnapshot` (ADR-049 §9); it is persisted with the
+    // context snapshot on the creation path — no separate best-effort broadcast
+    // write. The `supervisor` handle is unused now that the eager persist is gone.
+    let _ = supervisor;
     Ok(Some(bc))
 }
 
@@ -285,13 +257,15 @@ pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: 
 /// Takes a [`ContextSnapshot`] from the current [`PerContextState`].
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::snapshot_context`](crate::context::supervisor::Supervisor::snapshot_context)
-/// (ADR-049 commit 12). Byte-identical behavior.
+/// [`snapshot_context`](crate::context::manager_methods::snapshot_context)
+/// (ADR-049 §15). Byte-identical behavior.
 ///
 /// Must be called while the contexts mutex is held (snapshot under lock).
 pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
-    let state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
-    let ttl_remaining_secs = ctx.ttl.timer.remaining_secs();
+    let state = ctx.handle.state();
+    // Absolute convergent deadline persisted verbatim (ADR-049 §9) — see
+    // `messaging_helpers::build_snapshot_from_state`.
+    let ttl_deadline_secs = ctx.ttl.timer.deadline_unix_secs;
     // Capture grace entries for transactional persistence (§23.11).
     // On clock error, persist an empty vec — the recovery path will
     // treat the missing entries as expired (conservative: forward secrecy
@@ -313,10 +287,10 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
             .keys()
             .copied()
             .collect(),
-        ttl_remaining_secs,
-        registered_tools: ctx.governance.registered_tools.clone(),
+        ttl_deadline_secs,
+        registered_outlets: ctx.governance.registered_outlets.clone(),
         read_exclusion_list: ctx.access.read_exclusion_list.clone(),
-        tool_interfaces: ctx.governance.tool_interfaces.clone(),
+        outlet_interfaces: ctx.governance.outlet_interfaces.clone(),
         threshold_signers: ctx.governance.class_s.threshold_signers.clone(),
         threshold_value: ctx.governance.class_s.threshold_value,
         pruning_policy: ctx.governance.pruning_policy.clone(),
@@ -367,10 +341,23 @@ pub fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         xctx_committed_outputs: crate::context::messaging_helpers::xctx_committed_outputs_snapshot(
             ctx,
         ),
+        xctx_committed_stream_outputs:
+            crate::context::messaging_helpers::xctx_committed_stream_outputs_snapshot(ctx),
         xctx_committed_invocations:
             crate::context::messaging_helpers::xctx_committed_invocations_snapshot(ctx),
         xctx_caller_reservations:
             crate::context::messaging_helpers::xctx_caller_reservations_snapshot(ctx),
         xctx_nonce_dedup: crate::context::messaging_helpers::xctx_nonce_dedup_snapshot(ctx),
+        // §7.3.8 Class S: persist the value-caveat counters (ADR-049 §9).
+        caveat_counters: crate::context::messaging_helpers::caveat_counters_snapshot(ctx),
+        // Fix-D Class S: persist the streaming reservation recovery records.
+        stream_reservations: crate::context::messaging_helpers::stream_reservations_snapshot(ctx),
+        // ADR-049 §9 Class S (§5.14.8 block-before-serve): fold broadcast security
+        // + roster state into the snapshot so block / ban / key-epoch advance is
+        // durable atomically with `read_exclusion_list`.
+        broadcast: ctx
+            .broadcast_context
+            .as_ref()
+            .map(scp_protocol::context::broadcast::BroadcastContext::to_snapshot),
     }
 }

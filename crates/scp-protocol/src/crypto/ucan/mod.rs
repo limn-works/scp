@@ -3,7 +3,7 @@
 //!
 //! This module implements the UCAN token data structures and capability URI
 //! parsing specified by ADR-016 in `.docs/adrs/phase-3.md`. Every protocol
-//! action in an SCP context — message send, tool invocation, member management,
+//! action in an SCP context — message send, outlet invocation, member management,
 //! role change — requires a valid UCAN token with matching capabilities.
 //!
 //! # Types
@@ -221,6 +221,26 @@ pub enum UcanError {
     /// Capability URI parsing failed.
     #[error("invalid capability URI: {0}")]
     InvalidCapabilityUri(String),
+
+    /// A child delegation's invocation caveats failed the per-field
+    /// [`InvocationCaveats::narrow`](crate::trust::caveats::InvocationCaveats::narrow)
+    /// check at Step 7b (attenuation). Carries the structured
+    /// [`AttenuationViolation`](crate::trust::caveats::AttenuationViolation)
+    /// so SDK consumers can match on the exact rule that fired.
+    ///
+    /// Maps to error code [`crate::CODE_AUTHORIZATION_ATTENUATION`]
+    /// (`SCP-OUTLET-6114`) with the per-violation slug from
+    /// [`crate::trust::caveats::AttenuationViolation::slug`].
+    #[error("caveat attenuation violation: {0}")]
+    CaveatAttenuationViolation(crate::trust::caveats::AttenuationViolation),
+
+    /// The presenting token's invocation caveats failed the Step 11b time-box
+    /// check (`valid_from` / `valid_until` / `hours_of_day` / `days_of_week`).
+    ///
+    /// Maps to error code [`crate::CODE_AUTHORIZATION_DENIED`]
+    /// (`SCP-OUTLET-6110`) with slug `authorization.time-box-violation`.
+    #[error("caveat time-box violation: {0}")]
+    CaveatTimeBoxViolation(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -295,10 +315,10 @@ impl UcanHeader {
     /// Unknown `kid` values default to `SigningKeyId::Active` for backward
     /// compatibility (fail-open on identification, fail-closed on enforcement).
     #[must_use]
-    pub fn signing_key_id(&self) -> crate::identity::SigningKeyId {
+    pub fn signing_key_id(&self) -> scp_did::SigningKeyId {
         match self.kid.as_deref() {
-            Some("#agent") => crate::identity::SigningKeyId::Agent,
-            _ => crate::identity::SigningKeyId::Active,
+            Some("#agent") => scp_did::SigningKeyId::Agent,
+            _ => scp_did::SigningKeyId::Active,
         }
     }
 
@@ -336,7 +356,7 @@ impl Default for UcanHeader {
 ///
 /// Each attenuation specifies a resource URI and an action. The resource URI
 /// follows the SCP capability URI format: `scp:ctx:{context_id}/{resource}:{action}`,
-/// where compound resources use underscores (e.g. `tool_invoke`, `context_child`).
+/// where compound resources use underscores (e.g. `outlet_invoke`, `context_child`).
 ///
 /// The `can` field holds the action portion (e.g. `"*"`, `"calculator"`,
 /// `"write"`, `"propose"`). See [`CapabilityUri`]
@@ -350,7 +370,7 @@ pub struct Attenuation {
     ///
     /// Examples:
     /// - `"scp:ctx:abc123/messages:write"`
-    /// - `"scp:ctx:abc123/tool_invoke:*"`
+    /// - `"scp:ctx:abc123/outlet_call:*"`
     /// - `"scp:ctx:*/messages:write"` (wildcard — all contexts)
     pub with: String,
     /// Action on the resource (e.g. `"*"`, `"write"`, `"calculator"`,
@@ -393,6 +413,16 @@ pub struct UcanPayload {
     /// Optional facts — arbitrary JSON data attached to the token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fct: Option<serde_json::Value>,
+    /// §7.3.8 invocation caveats carried in the UCAN `nb` field. Absent when
+    /// the token carries no caveat-level constraints — preserves backward
+    /// compatibility with tokens that have no `nb` field at all.
+    ///
+    /// The wire encoding uses the spec §7.3.8 vocabulary verbatim
+    /// (`amountMaxPerCall`, `validFrom`, …) — see
+    /// [`crate::trust::caveats::InvocationCaveats`] for the field-level
+    /// serialization contract.
+    #[serde(rename = "nb", skip_serializing_if = "Option::is_none", default)]
+    pub nb: Option<crate::trust::caveats::InvocationCaveats>,
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +579,7 @@ mod tests {
     #[test]
     fn attenuation_clone_eq() {
         let att = Attenuation {
-            with: "scp:ctx:abc123/tool_invoke:assistant".to_owned(),
+            with: "scp:ctx:abc123/outlet_call:assistant".to_owned(),
             can: "invoke".to_owned(),
         };
         let cloned = att.clone();
@@ -574,6 +604,7 @@ mod tests {
             }],
             prf: vec!["bafyreiabc123".to_owned()],
             fct: Some(serde_json::json!({"note": "test token"})),
+            nb: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let deserialized: UcanPayload = serde_json::from_str(&json).unwrap();
@@ -591,6 +622,7 @@ mod tests {
             att: vec![],
             prf: vec![],
             fct: None,
+            nb: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         // nbf and fct should not appear in the JSON when None
@@ -633,6 +665,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: "eyJ0eXAi...".to_owned(),
@@ -666,6 +699,7 @@ mod tests {
                 ],
                 prf: vec!["bafyreiabc123".to_owned()],
                 fct: Some(serde_json::json!({"role": "member"})),
+                nb: None,
             },
             signature: vec![1u8; 64],
             encoded: "header.payload.signature".to_owned(),
@@ -688,6 +722,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),

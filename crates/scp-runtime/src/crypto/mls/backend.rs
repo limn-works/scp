@@ -11,7 +11,7 @@
 //! The split strictly preserves RFC 9420 conformance: every method maps to a
 //! single `OpenMLS` primitive with no SCP orchestration in between. The SCP
 //! ciphersuite is fixed to
-//! [`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`](super::group::SCP_CIPHERSUITE).
+//! [`MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`](scp_mls::group::SCP_CIPHERSUITE).
 //!
 //! # Method contracts
 //!
@@ -32,10 +32,10 @@
 //! # Production impl
 //!
 //! [`super::production_backend::ProductionMlsBackend`] delegates to the
-//! existing [`super::group`] and [`super::encrypt`] free functions — the same
-//! primitives the pre-refactor `MlsCryptoProvider` calls today. The
+//! existing [`scp_mls::group`] and [`scp_mls::encrypt`] free functions — the same
+//! primitives the pre-refactor `NodeMlsFactory` calls today. The
 //! byte-identical output test in `production_backend.rs` feeds the same input
-//! to both the backend and a bare `MlsCryptoProvider` and asserts equality on
+//! to both the backend and a bare `NodeMlsFactory` and asserts equality on
 //! the produced ciphertext / Welcome / Commit bytes.
 
 use std::sync::Arc;
@@ -43,11 +43,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openmls::prelude::LeafNodeIndex;
 
-use super::credential::ScpCredential;
-use super::encrypt::DecryptedContent;
-use super::error::MlsError;
-use super::group::ScpMlsGroup;
 use super::storage_adapter::OpenMlsStorageAdapter;
+use scp_clock::Clock;
+use scp_mls::credential::ScpCredential;
+use scp_mls::encrypt::DecryptedContent;
+use scp_mls::error::MlsError;
+use scp_mls::group::ScpMlsGroup;
 
 // ---------------------------------------------------------------------------
 // Wrapper output types
@@ -85,16 +86,30 @@ pub struct RemoveMemberRaw {
     pub group_info: Option<Vec<u8>>,
 }
 
-/// Output of `validate_key_package` — wraps the validated bytes.
+/// Output of `validate_key_package` — the validated bytes plus the identity
+/// the validated leaf credential authenticates.
 ///
-/// `validate_key_package` returns a plain success marker plus the canonical
-/// bytes of the validated `KeyPackage`. The raw bytes are kept on the
-/// successful path so handler code can re-serialize for storage (key package
-/// pool) without re-running validation.
+/// `validate_key_package` runs the full stateless `KeyPackage` validation
+/// (signature / protocol / hardened-clock lifetime / SCP ciphersuite) exactly
+/// once and returns both the canonical bytes of the validated `KeyPackage` and
+/// the credential DID extracted from that same validated leaf. Callers use
+/// `key_package_bytes` to re-serialize for storage (key package pool) and
+/// `credential_did` to bind the `KeyPackage` to an expected identity — both
+/// WITHOUT re-running validation or re-parsing the bytes to re-extract the DID
+/// (which would re-validate the same `KeyPackage` a second time).
 #[derive(Debug, Clone)]
 pub struct ValidatedKeyPackage {
     /// The TLS-serialized `KeyPackage` bytes that passed validation.
     pub key_package_bytes: Vec<u8>,
+    /// The DID authenticated by the validated leaf credential.
+    ///
+    /// Extracted from the SAME validated `KeyPackage` leaf that produced
+    /// `key_package_bytes` (leaf credential → `BasicCredential` → SCP
+    /// credential → `did`), so it is authenticated under the exact validation
+    /// (and hardened-clock lifetime) the bytes passed. Callers compare this
+    /// against the expected owner / member DID to bind the `KeyPackage` to an
+    /// identity, with no second validation pass.
+    pub credential_did: String,
 }
 
 /// Output of `generate_key_package` — pairs the wire bytes with the opaque
@@ -171,7 +186,7 @@ impl std::fmt::Debug for SignerState {
 pub trait MlsBackend: Send + Sync {
     /// Creates a new MLS group with the caller as the sole member.
     ///
-    /// Wraps [`super::group::create_group_with_wrapping_key`] exactly.
+    /// Wraps [`scp_mls::group::create_group_with_wrapping_key`] exactly.
     ///
     /// # Errors
     ///
@@ -271,13 +286,23 @@ pub trait MlsBackend: Send + Sync {
     /// Validates a TLS-serialized `KeyPackage` for joinability. Does not
     /// touch any group state; callers use this before committing an add.
     ///
+    /// Stateless with respect to the backend: the hardened [`Clock`] used to
+    /// re-validate the accepted `Lifetime` (ADR-057 §Prereq-1) is threaded in
+    /// as the `clock` parameter rather than read from backend state, so this
+    /// method depends on no per-context or per-backend state (ADR-049
+    /// Decision 6 / SCP-CRYPTOMOVE-000c). Callers pass the same hardened clock
+    /// they inject everywhere else (never openmls's internal wall clock).
+    ///
     /// # Errors
     ///
     /// Returns [`MlsError::AddMemberFailed`] on validation failure (malformed
-    /// KP, signature invalid, ciphersuite mismatch).
+    /// KP, signature invalid, ciphersuite mismatch), or
+    /// [`MlsError::KeyPackageLifetimeInvalid`] when the accepted `Lifetime`
+    /// is expired / out of range under `clock`.
     async fn validate_key_package(
         &self,
         key_package_bytes: &[u8],
+        clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError>;
 
     /// Generates a fresh `KeyPackage` for `credential`, optionally with an
@@ -309,7 +334,7 @@ pub trait MlsBackend: Send + Sync {
     /// bookkeeping. On a successful join the init key is durably added to the
     /// set. The backstop covers every join that flows through THIS method
     /// (`MlsBackend::join_from_welcome`); the legacy
-    /// `MlsCryptoProvider::join_from_welcome` path calls
+    /// `NodeMlsFactory::join_from_welcome` path calls
     /// `group::join_group_from_bytes` directly and is production-unreachable
     /// (test/feature-gated, `#[cfg(any(test, feature = "testing"))]`), slated for
     /// deletion when the spawn-from-Welcome entrypoint lands — so there is no

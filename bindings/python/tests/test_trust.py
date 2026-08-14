@@ -1,293 +1,68 @@
 """Tests for SCP Python SDK trust evaluation.
 
 Covers:
-- UCAN error classification into the 6 independent Layer 1 checks
-- CapabilityValidation field independence
-- evaluate_trust Layer 1 integration (mocked bridge)
+- evaluate_trust Layer 1 consumption of the structured ucan_evaluate result
+- CapabilityValidation field independence and multi-token AND aggregation
+- Read-only diagnostic semantics: ucan_evaluate records NO nonce state
 - Dataclass construction for all trust types
 - Participation requirement verification
 
-See ``.docs/adrs/phase-3.md`` ADR-017 and spec section 9.3 for the
-four-layer trust model.
+See ``.docs/adrs/phase-2.md`` ADR-059 and ``.docs/specs/07-trust-validation-and-capabilities.md``
+§7.2.4 (structured capability evaluation: gate vs. diagnostic), and ADR-017 /
+spec section 9.3 for the four-layer trust model.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from scp_sdk.errors import ContextError
 from scp_sdk.trust import (
-    _PASSED_BEFORE,
-    Attestation,
+    AttestationSummary,
+    AttestorInfo,
     BehavioralRecord,
+    CachedAttestation,
+    CachedAttestationEnvelope,
     CapabilityValidation,
-    ChallengeResult,
-    Endorsement,
+    ChallengeRequest,
+    ChallengeResponse,
+    EventLogEntry,
     ParticipationFact,
     ParticipationProfile,
     ParticipationThreshold,
     RequireParticipation,
     TrustEvaluation,
-    _classify_ucan_error,
-    _extract_core_error,
     evaluate_trust,
+    participation_record,
     verify_participation_requirements,
 )
 
 # -----------------------------------------------------------------------
-# Error extraction helper tests
+# Structured-result test fake
 # -----------------------------------------------------------------------
 
 
-class TestExtractCoreError:
-    """Tests for _extract_core_error which strips bridge formatting."""
-
-    def test_full_bridge_format(self) -> None:
-        msg = (
-            "[SCP-PERM-3001] permission error: token expired"
-            " \u2014 check token format, signatures, time bounds, and capability chain"
-        )
-        assert _extract_core_error(msg) == "token expired"
-
-    def test_no_prefix(self) -> None:
-        msg = "token expired \u2014 advice text"
-        assert _extract_core_error(msg) == "token expired"
-
-    def test_no_suffix(self) -> None:
-        msg = "[SCP-PERM-3001] permission error: token expired"
-        assert _extract_core_error(msg) == "token expired"
-
-    def test_bare_message(self) -> None:
-        msg = "token expired"
-        assert _extract_core_error(msg) == "token expired"
-
-
-# -----------------------------------------------------------------------
-# Error classification tests
-# -----------------------------------------------------------------------
-
-
-class TestClassifyUcanError:
-    """Tests that _classify_ucan_error maps errors to correct pipeline stages."""
-
-    # -- Token parse errors (step 1) --
-
-    def test_malformed_token(self) -> None:
-        assert _classify_ucan_error("malformed token: bad base64") == "token_parse"
-
-    def test_deserialization_failed(self) -> None:
-        assert _classify_ucan_error("deserialization failed: invalid JSON") == "token_parse"
-
-    def test_unsupported_algorithm(self) -> None:
-        msg = "unsupported algorithm: expected EdDSA, got RS256"
-        assert _classify_ucan_error(msg) == "token_parse"
-
-    def test_unsupported_version(self) -> None:
-        msg = "unsupported UCAN version: expected 0.10.0, got 0.9.0"
-        assert _classify_ucan_error(msg) == "token_parse"
-
-    # -- Signature/chain errors (steps 2-7) --
-
-    def test_signature_invalid(self) -> None:
-        assert _classify_ucan_error("signature verification failed") == "signatures"
-
-    def test_invalid_issuer(self) -> None:
-        msg = "invalid issuer: expected did:dht:zCreator, got did:dht:zImposter"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_audience_mismatch(self) -> None:
-        msg = "audience mismatch: expected did:dht:zMember, got did:dht:zOther"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_delegation_chain_broken(self) -> None:
-        assert _classify_ucan_error("delegation chain broken: aud/iss mismatch") == "signatures"
-
-    def test_circular_delegation(self) -> None:
-        assert _classify_ucan_error("circular delegation detected: A->B->A") == "signatures"
-
-    def test_attenuation_violation(self) -> None:
-        assert _classify_ucan_error("attenuation violation: widened scope") == "signatures"
-
-    def test_key_scope_mismatch(self) -> None:
-        msg = "key scope mismatch: token scoped to #agent but signed by #active"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_self_delegation(self) -> None:
-        msg = "self-delegation (iss == aud) requires scp_key_scope in facts"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_category_a_violation(self) -> None:
-        msg = "Category A violation: did_document:update signed by agent key (kid=#agent)"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_did_not_found(self) -> None:
-        """MalformedToken from DID resolver (step 2) → signatures, not token_parse."""
-        msg = "malformed token: DID not found: did:dht:z6MkMissing"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_invalid_did_document(self) -> None:
-        """MalformedToken from invalid DID document (step 2) → signatures."""
-        msg = "malformed token: invalid DID document: BEP44 signature invalid"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_network_unavailable(self) -> None:
-        """MalformedToken from network unavailable (step 2) → signatures."""
-        msg = "malformed token: network unavailable: all resolvers timed out"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_did_revoked_downgraded(self) -> None:
-        """MalformedToken from DID revoked/downgraded (step 2) → signatures."""
-        msg = "malformed token: DID revoked/downgraded: stale sequence for did:dht:zTest"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    # -- Capability/ceiling errors (steps 6, 8) --
-
-    def test_capability_outside_ceiling(self) -> None:
-        assert _classify_ucan_error("capability outside ceiling: messages:admin") == "ceiling"
-
-    def test_capability_not_granted(self) -> None:
-        assert _classify_ucan_error("capability not granted: messages:write") == "ceiling"
-
-    def test_unparseable_capability_uri(self) -> None:
-        """MalformedToken from capability URI parse (step 6) → ceiling, not token_parse."""
-        msg = "malformed token: unparseable capability URI in attestation: bad://uri"
-        assert _classify_ucan_error(msg) == "ceiling"
-
-    # -- Nonce errors (step 9) --
-
-    def test_nonce_reused(self) -> None:
-        assert _classify_ucan_error("nonce reused: abc-123") == "nonce"
-
-    def test_nonce_too_old(self) -> None:
-        assert _classify_ucan_error("nonce too old: 1000-aabb") == "nonce"
-
-    def test_nonce_from_future(self) -> None:
-        assert _classify_ucan_error("nonce from the future: 9999999-aabb") == "nonce"
-
-    def test_nonce_format_invalid(self) -> None:
-        assert _classify_ucan_error("invalid nonce format: bad") == "nonce"
-
-    def test_nonce_tracker_full(self) -> None:
-        msg = "nonce tracker full: capacity 100000 reached with no expired entries to prune"
-        assert _classify_ucan_error(msg) == "nonce"
-
-    # -- Revocation errors (step 10) --
-
-    def test_token_revoked(self) -> None:
-        assert _classify_ucan_error("token revoked: bafyabc123") == "revoked"
-
-    # -- Expiry errors (step 11) --
-
-    def test_token_expired(self) -> None:
-        assert _classify_ucan_error("token expired") == "expiry"
-
-    def test_token_not_yet_valid(self) -> None:
-        assert _classify_ucan_error("token not yet valid") == "expiry"
-
-    def test_invalid_time_range(self) -> None:
-        msg = "invalid time range: nbf (1000) must be less than exp (999)"
-        assert _classify_ucan_error(msg) == "expiry"
-
-    def test_expiry_too_far(self) -> None:
-        msg = "expiry too far in the future: 100000s exceeds 24h maximum"
-        assert _classify_ucan_error(msg) == "expiry"
-
-    # -- Delegation chain parent-token failures (issue #1026) --
-    # These errors are now wrapped as DelegationChainBroken by Rust, so
-    # they classify as "signatures" (conservative) instead of the
-    # optimistic leaf-token stages they would have matched before.
-
-    def test_parent_token_expired_classifies_as_signatures(self) -> None:
-        """Parent expiry wrapped by Rust → 'signatures', not 'expiry'."""
-        msg = "delegation chain broken: parent token failed: token expired"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_parent_token_not_yet_valid_classifies_as_signatures(self) -> None:
-        msg = "delegation chain broken: parent token failed: token not yet valid"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_parent_token_invalid_time_range_classifies_as_signatures(self) -> None:
-        msg = (
-            "delegation chain broken: parent token failed: "
-            "invalid time range: nbf (1000) must be less than exp (999)"
-        )
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_parent_token_expiry_too_far_classifies_as_signatures(self) -> None:
-        msg = (
-            "delegation chain broken: parent token failed: "
-            "expiry too far in the future: 100000s exceeds 24h maximum"
-        )
-        assert _classify_ucan_error(msg) == "signatures"
-
-    def test_parent_token_revoked_classifies_as_signatures(self) -> None:
-        msg = "delegation chain broken: parent token failed: token revoked: bafyabc123"
-        assert _classify_ucan_error(msg) == "signatures"
-
-    # -- Unknown --
-
-    def test_unknown_error(self) -> None:
-        assert _classify_ucan_error("something completely unexpected") == "unknown"
-
-    # -- With full bridge formatting --
-
-    def test_with_bridge_prefix_and_suffix(self) -> None:
-        msg = (
-            "[SCP-PERM-3001] permission error: token revoked: bafyabc123"
-            " \u2014 check token format, signatures, time bounds, and capability chain"
-        )
-        assert _classify_ucan_error(msg) == "revoked"
-
-    def test_signature_with_bridge_format(self) -> None:
-        msg = (
-            "[SCP-PERM-3001] permission error: signature verification failed"
-            " \u2014 check token format, signatures, time bounds, and capability chain"
-        )
-        assert _classify_ucan_error(msg) == "signatures"
-
-
-# -----------------------------------------------------------------------
-# Passed-before mapping tests
-# -----------------------------------------------------------------------
-
-
-class TestPassedBeforeMapping:
-    """Tests that _PASSED_BEFORE correctly reflects the pipeline order."""
-
-    def test_token_parse_nothing_passed(self) -> None:
-        assert _PASSED_BEFORE["token_parse"] == set()
-
-    def test_signatures_tokens_passed(self) -> None:
-        assert _PASSED_BEFORE["signatures"] == {"tokens_valid"}
-
-    def test_ceiling_tokens_and_sigs_passed(self) -> None:
-        assert _PASSED_BEFORE["ceiling"] == {"tokens_valid", "signatures_valid"}
-
-    def test_nonce_tokens_sigs_and_ceiling_passed(self) -> None:
-        assert _PASSED_BEFORE["nonce"] == {"tokens_valid", "signatures_valid", "within_ceiling"}
-
-    def test_revoked_all_except_revoked_passed(self) -> None:
-        assert _PASSED_BEFORE["revoked"] == {
-            "tokens_valid",
-            "signatures_valid",
-            "within_ceiling",
-            "nonce_valid",
-        }
-
-    def test_expiry_all_except_expiry_passed(self) -> None:
-        assert _PASSED_BEFORE["expiry"] == {
-            "tokens_valid",
-            "signatures_valid",
-            "within_ceiling",
-            "nonce_valid",
-            "not_revoked",
-        }
-
-    def test_unknown_nothing_passed(self) -> None:
-        assert _PASSED_BEFORE["unknown"] == set()
+@dataclass
+class _FakeStructuredResult:
+    """Stand-in for the bridge's PyCapabilityValidation (six snake_case bools).
+
+    The structured diagnostic returns this; evaluate_trust reads the six
+    attributes directly. Tests construct it to model per-stage outcomes
+    instead of emitting error prose (ADR-059).
+    """
+
+    tokens_valid: bool = True
+    signatures_valid: bool = True
+    within_ceiling: bool = True
+    nonce_valid: bool = True
+    not_revoked: bool = True
+    time_bounds_valid: bool = True
 
 
 # -----------------------------------------------------------------------
@@ -296,26 +71,20 @@ class TestPassedBeforeMapping:
 
 
 class TestCapabilityValidationFieldIndependence:
-    """Verify that each CapabilityValidation field is set independently.
+    """Verify evaluate_trust maps the structured ucan_evaluate result.
 
-    These tests mock the bridge and exercise the full classification +
-    field-setting logic in evaluate_trust.
+    These mock the bridge's ``ucan_evaluate`` to return a structured
+    per-stage result (NOT raising prose) and exercise the field-mapping
+    and AND-aggregation logic in evaluate_trust.
     """
 
-    # Sentinel exception class that simulates _scp_core.UcanError for
-    # tests.  The production code catches ``bridge.UcanError``; the mock
-    # bridge exposes this class so the except clause can match it.
-    class _MockUcanError(Exception):
-        pass
-
-    def _run(self, error_msg: str) -> CapabilityValidation:
-        """Helper: mock bridge.ucan_validate to raise with given message."""
+    def _run(self, result: _FakeStructuredResult) -> CapabilityValidation:
+        """Helper: mock bridge.ucan_evaluate to return the given result."""
         mock_bridge = MagicMock()
-        mock_bridge.UcanError = self._MockUcanError
-        mock_bridge.ucan_validate.side_effect = self._MockUcanError(error_msg)
+        mock_bridge.ucan_evaluate.return_value = result
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = asyncio.run(
+            evaluation = asyncio.run(
                 evaluate_trust(
                     scp=MagicMock(),
                     subject_did="did:dht:z6MkBob",
@@ -323,23 +92,10 @@ class TestCapabilityValidationFieldIndependence:
                     capability_tokens=["fake-token"],
                 )
             )
-        return result.capability_validation
+        return evaluation.capability_validation
 
-    def test_all_pass_when_validation_succeeds(self) -> None:
-        mock_bridge = MagicMock()
-        mock_bridge.UcanError = self._MockUcanError
-        mock_bridge.ucan_validate.return_value = None
-
-        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = asyncio.run(
-                evaluate_trust(
-                    scp=MagicMock(),
-                    subject_did="did:dht:z6MkBob",
-                    context_id="ctx-test",
-                    capability_tokens=["good-token"],
-                )
-            )
-        cv = result.capability_validation
+    def test_all_pass_when_evaluation_succeeds(self) -> None:
+        cv = self._run(_FakeStructuredResult())
         assert cv.tokens_valid is True
         assert cv.signatures_valid is True
         assert cv.within_ceiling is True
@@ -347,9 +103,9 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.not_revoked is True
         assert cv.time_bounds_valid is True
 
-    def test_revoked_token_has_valid_signature(self) -> None:
-        """A revoked token should show signatures_valid=True, not_revoked=False."""
-        cv = self._run("token revoked: bafyabc123")
+    def test_revoked_token_keeps_other_fields(self) -> None:
+        """A revoked token: structured result reports not_revoked=False directly."""
+        cv = self._run(_FakeStructuredResult(not_revoked=False, time_bounds_valid=False))
         assert cv.tokens_valid is True
         assert cv.signatures_valid is True
         assert cv.within_ceiling is True
@@ -357,9 +113,18 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.not_revoked is False
         assert cv.time_bounds_valid is False
 
-    def test_invalid_signature_does_not_affect_tokens_valid(self) -> None:
-        """A bad signature should show tokens_valid=True (parse worked)."""
-        cv = self._run("signature verification failed")
+    def test_invalid_signature_reported_directly(self) -> None:
+        """Bad signature: signatures_valid=False, later stages False (short-circuit)."""
+        cv = self._run(
+            _FakeStructuredResult(
+                tokens_valid=True,
+                signatures_valid=False,
+                within_ceiling=False,
+                nonce_valid=False,
+                not_revoked=False,
+                time_bounds_valid=False,
+            )
+        )
         assert cv.tokens_valid is True
         assert cv.signatures_valid is False
         assert cv.within_ceiling is False
@@ -367,19 +132,8 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.not_revoked is False
         assert cv.time_bounds_valid is False
 
-    def test_expired_token_has_valid_everything_else(self) -> None:
-        """An expired token shows all other checks passed but time_bounds_valid=False."""
-        cv = self._run("token expired")
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is True
-        assert cv.within_ceiling is True
-        assert cv.nonce_valid is True
-        assert cv.not_revoked is True
-        assert cv.time_bounds_valid is False
-
-    def test_token_not_yet_valid_marks_time_bounds_valid_false(self) -> None:
-        """A not-yet-valid token shows all checks passed but time_bounds_valid=False."""
-        cv = self._run("token not yet valid")
+    def test_expired_token_only_time_bounds_false(self) -> None:
+        cv = self._run(_FakeStructuredResult(time_bounds_valid=False))
         assert cv.tokens_valid is True
         assert cv.signatures_valid is True
         assert cv.within_ceiling is True
@@ -388,7 +142,14 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.time_bounds_valid is False
 
     def test_capability_outside_ceiling(self) -> None:
-        cv = self._run("capability outside ceiling: messages:admin")
+        cv = self._run(
+            _FakeStructuredResult(
+                within_ceiling=False,
+                nonce_valid=False,
+                not_revoked=False,
+                time_bounds_valid=False,
+            )
+        )
         assert cv.tokens_valid is True
         assert cv.signatures_valid is True
         assert cv.within_ceiling is False
@@ -397,29 +158,18 @@ class TestCapabilityValidationFieldIndependence:
         assert cv.time_bounds_valid is False
 
     def test_malformed_token_all_false(self) -> None:
-        """A malformed token means nothing could be checked."""
-        cv = self._run("malformed token: bad base64")
+        """An unparseable token: structured result is all-False."""
+        cv = self._run(
+            _FakeStructuredResult(
+                tokens_valid=False,
+                signatures_valid=False,
+                within_ceiling=False,
+                nonce_valid=False,
+                not_revoked=False,
+                time_bounds_valid=False,
+            )
+        )
         assert cv.tokens_valid is False
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_nonce_reused(self) -> None:
-        """Nonce reuse: parse, sig, and ceiling passed; nonce_valid=False."""
-        cv = self._run("nonce reused: abc-123")
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is True
-        assert cv.within_ceiling is True
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_audience_mismatch(self) -> None:
-        msg = "audience mismatch: expected did:dht:zMember, got did:dht:zOther"
-        cv = self._run(msg)
-        assert cv.tokens_valid is True
         assert cv.signatures_valid is False
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
@@ -429,10 +179,8 @@ class TestCapabilityValidationFieldIndependence:
     def test_no_tokens_all_default_false(self) -> None:
         """When no tokens are provided, all fields stay at default (False)."""
         mock_bridge = MagicMock()
-        mock_bridge.UcanError = self._MockUcanError
-
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = asyncio.run(
+            evaluation = asyncio.run(
                 evaluate_trust(
                     scp=MagicMock(),
                     subject_did="did:dht:z6MkBob",
@@ -440,160 +188,27 @@ class TestCapabilityValidationFieldIndependence:
                     capability_tokens=None,
                 )
             )
-        cv = result.capability_validation
+        cv = evaluation.capability_validation
         assert cv.tokens_valid is False
         assert cv.signatures_valid is False
         assert cv.within_ceiling is False
         assert cv.nonce_valid is False
         assert cv.not_revoked is False
         assert cv.time_bounds_valid is False
+        # The diagnostic must not even be called when there are no tokens.
+        mock_bridge.ucan_evaluate.assert_not_called()
 
-    def test_with_bridge_formatted_error(self) -> None:
-        """Full bridge error format is parsed correctly."""
-        msg = (
-            "[SCP-PERM-3001] permission error: token revoked: bafyabc123"
-            " \u2014 check token format, signatures, time bounds, and capability chain"
-        )
-        cv = self._run(msg)
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is True
-        assert cv.within_ceiling is True
-        assert cv.nonce_valid is True
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
+    def test_malformed_ffi_input_propagates(self) -> None:
+        """Malformed FFI input still raises and is NOT swallowed.
 
-    def test_did_not_found_classified_as_signature(self) -> None:
-        """DID resolution failure (step 2) → tokens_valid=True, signatures_valid=False."""
-        cv = self._run("malformed token: DID not found: did:dht:z6MkMissing")
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_invalid_did_document_classified_as_signature(self) -> None:
-        """Invalid DID document (step 2) → tokens_valid=True, signatures_valid=False."""
-        cv = self._run("malformed token: invalid DID document: BEP44 signature invalid")
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_network_unavailable_classified_as_signature(self) -> None:
-        """Network unavailable (step 2) → tokens_valid=True, signatures_valid=False."""
-        cv = self._run("malformed token: network unavailable: all resolvers timed out")
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_did_revoked_downgraded_classified_as_signature(self) -> None:
-        """DID revoked/downgraded (step 2) → tokens_valid=True, signatures_valid=False."""
-        cv = self._run("malformed token: DID revoked/downgraded: stale sequence")
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_unparseable_capability_classified_as_ceiling(self) -> None:
-        """Capability URI parse failure (step 6) → tokens+sigs valid, ceiling=False."""
-        cv = self._run("malformed token: unparseable capability URI in attestation: bad://uri")
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is True
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_unknown_error_conservatively_all_false(self) -> None:
-        """Unrecognized errors set all fields to False (fail-closed)."""
-        cv = self._run("something completely unexpected happened")
-        assert cv.tokens_valid is False
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    # -- Delegation chain parent-token failures (issue #1026) --
-    # Parent-token expiry/revocation now classifies conservatively: only
-    # tokens_valid is True (parse passed for the leaf), all other fields
-    # are False because steps 6-11 never ran on the leaf token.
-
-    def test_parent_expired_does_not_report_ceiling_true(self) -> None:
-        """AC: parent expired + leaf invalid ceiling → within_ceiling is not True."""
-        cv = self._run("delegation chain broken: parent token failed: token expired")
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_parent_revoked_does_not_report_nonce_or_revoked_true(self) -> None:
-        """AC: parent revoked + leaf valid → not_revoked and nonce_valid are not True."""
-        cv = self._run("delegation chain broken: parent token failed: token revoked: bafyabc123")
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_parent_not_yet_valid_conservative(self) -> None:
-        """Parent not-yet-valid → conservative (only tokens_valid)."""
-        cv = self._run("delegation chain broken: parent token failed: token not yet valid")
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_parent_expiry_too_far_conservative(self) -> None:
-        """Parent expiry-too-far → conservative (only tokens_valid)."""
-        cv = self._run(
-            "delegation chain broken: parent token failed: "
-            "expiry too far in the future: 100000s exceeds 24h maximum"
-        )
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_parent_invalid_time_range_conservative(self) -> None:
-        """Parent invalid-time-range → conservative (only tokens_valid)."""
-        cv = self._run(
-            "delegation chain broken: parent token failed: "
-            "invalid time range: nbf (1000) must be less than exp (999)"
-        )
-        assert cv.tokens_valid is True
-        assert cv.signatures_valid is False
-        assert cv.within_ceiling is False
-        assert cv.nonce_valid is False
-        assert cv.not_revoked is False
-        assert cv.time_bounds_valid is False
-
-    def test_non_ucan_exception_propagates(self) -> None:
-        """Non-UcanError exceptions (e.g. ValidationError) are NOT silently caught."""
+        Per §7.2.4 the diagnostic is non-throwing for capability OUTCOMES,
+        but malformed FFI input (e.g. a control char in context_id) still
+        raises a ValidationError-shaped exception that must propagate.
+        """
         mock_bridge = MagicMock()
-        mock_bridge.UcanError = self._MockUcanError
-        # Raise a plain Exception — this should NOT be caught by
-        # ``except bridge.UcanError``, and must propagate to the caller.
-        mock_bridge.ucan_validate.side_effect = RuntimeError(
+        mock_bridge.ucan_evaluate.side_effect = RuntimeError(
             "[SCP-VALID-7001] validation error: context_id contains control characters"
         )
-
-        import pytest
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             with pytest.raises(RuntimeError, match="control characters"):
@@ -605,6 +220,196 @@ class TestCapabilityValidationFieldIndependence:
                         capability_tokens=["fake-token"],
                     )
                 )
+
+
+# -----------------------------------------------------------------------
+# Multi-token AND aggregation
+# -----------------------------------------------------------------------
+
+
+class TestMultiTokenAndAggregation:
+    """evaluate_trust AND-combines the six booleans across the token set."""
+
+    def test_any_token_failing_a_stage_fails_the_aggregate(self) -> None:
+        """Token A all-true, token B within_ceiling=False -> aggregate within_ceiling=False."""
+        token_a = _FakeStructuredResult()  # all true
+        token_b = _FakeStructuredResult(within_ceiling=False)  # one stage false
+
+        mock_bridge = MagicMock()
+        mock_bridge.ucan_evaluate.side_effect = [token_a, token_b]
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            evaluation = asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=["token-a", "token-b"],
+                )
+            )
+        cv = evaluation.capability_validation
+        # The single false field on token B makes only that aggregate field False.
+        assert cv.within_ceiling is False
+        # Every other field stays True (both tokens passed those stages).
+        assert cv.tokens_valid is True
+        assert cv.signatures_valid is True
+        assert cv.nonce_valid is True
+        assert cv.not_revoked is True
+        assert cv.time_bounds_valid is True
+        # Both tokens were evaluated.
+        assert mock_bridge.ucan_evaluate.call_count == 2
+
+    def test_evaluate_trust_supplies_no_challenge_capability(self) -> None:
+        """evaluate_trust must call ucan_evaluate WITHOUT a challenge capability.
+
+        Trust evaluation assesses each token's GENERAL (intrinsic) validity, so
+        it must NOT impose an invoked-capability grant-match. The historical
+        bug passed a ``"*"`` sentinel the real bridge rejects; the fix is to
+        pass no capability at all (intrinsic-validity mode, ADR-059 / §7.2.4).
+        This pins the call shape so the mock cannot diverge from the real
+        None-accepting contract.
+        """
+        mock_bridge = MagicMock()
+        mock_bridge.ucan_evaluate.return_value = _FakeStructuredResult()
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=["only-token"],
+                )
+            )
+
+        assert mock_bridge.ucan_evaluate.call_count == 1
+        call = mock_bridge.ucan_evaluate.call_args
+        # No challenge capability in either positional or keyword form, and
+        # never the rejected "*" sentinel.
+        positional = call.args
+        assert "*" not in positional
+        assert "*" not in call.kwargs.values()
+        # The diagnostic is called for general validity with the challenge
+        # capability None and the subject DID passed as the presenting agent
+        # (so the audience check evaluates against the DID under assessment; the
+        # bridge requires it fail-closed and rejects an absent/empty value
+        # rather than falling back to a tautological token-own-aud check).
+        # Signature is
+        # ucan_evaluate(context_id, token, capability, presenting_agent_did).
+        assert positional == ("ctx-test", "only-token", None, "did:dht:z6MkBob")
+        assert "capability" not in call.kwargs
+
+    def test_all_tokens_passing_yields_all_true(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.ucan_evaluate.side_effect = [
+            _FakeStructuredResult(),
+            _FakeStructuredResult(),
+            _FakeStructuredResult(),
+        ]
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            evaluation = asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=["a", "b", "c"],
+                )
+            )
+        cv = evaluation.capability_validation
+        assert cv.all_valid
+
+
+# -----------------------------------------------------------------------
+# Read-only diagnostic: nonce is NOT recorded
+# -----------------------------------------------------------------------
+
+
+class TestDiagnosticDoesNotRecordNonce:
+    """The structured diagnostic probes the nonce read-only and records nothing.
+
+    This is the class of bug ADR-059 surfaces: the OLD prose mocks emitted
+    a nonce string unconditionally and never modeled nonce *state*, so a
+    repeated-evaluation nonce defect could hide. Here the fakes model state:
+
+    - ``ucan_evaluate`` (the diagnostic) returns ``nonce_valid=True`` even
+      when called twice on the same token -- proving it records nothing.
+    - ``ucan_validate`` (the gate) flips to a NonceReused error on the 2nd
+      call -- proving the gate DOES record, so the mock genuinely models the
+      real recording semantics rather than ignoring state.
+
+    evaluate_trust (which uses the diagnostic) must therefore be idempotent
+    across repeated calls on the same token.
+    """
+
+    class _NonceReused(Exception):
+        pass
+
+    def test_repeated_evaluation_is_idempotent_diagnostic_records_nothing(self) -> None:
+        # Stateful gate: records the nonce; 2nd call on same token is a replay.
+        recorded: set[str] = set()
+
+        def gate(context_id: str, token: str, capability: str | None = None, *args: Any) -> None:
+            if token in recorded:
+                raise self._NonceReused(f"nonce reused: {token}")
+            recorded.add(token)
+
+        # Stateful diagnostic: NEVER records -- always reports nonce_valid=True,
+        # regardless of how many times it is called on the same token. Capability
+        # is optional (evaluate_trust runs the intrinsic-validity diagnostic, so it
+        # calls ucan_evaluate(context_id, token) with no challenge capability).
+        def diagnostic(
+            context_id: str, token: str, capability: str | None = None, *args: Any
+        ) -> _FakeStructuredResult:
+            return _FakeStructuredResult(nonce_valid=True)
+
+        mock_bridge = MagicMock()
+        mock_bridge.UcanError = self._NonceReused
+        mock_bridge.ucan_validate.side_effect = gate
+        mock_bridge.ucan_evaluate.side_effect = diagnostic
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            first = asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=["same-token"],
+                )
+            )
+            second = asyncio.run(
+                evaluate_trust(
+                    scp=MagicMock(),
+                    subject_did="did:dht:z6MkBob",
+                    context_id="ctx-test",
+                    capability_tokens=["same-token"],
+                )
+            )
+
+        # Idempotent: both evaluations see nonce_valid=True. The diagnostic
+        # recorded nothing, so the second call is not a replay.
+        assert first.capability_validation.nonce_valid is True
+        assert second.capability_validation.nonce_valid is True
+        # evaluate_trust must use the read-only diagnostic, never the gate.
+        mock_bridge.ucan_validate.assert_not_called()
+
+    def test_mock_gate_actually_models_recording(self) -> None:
+        """Sanity check that the gate fake DOES record (else the test above is vacuous).
+
+        Calling the gate twice on the same token must raise NonceReused --
+        proving the mock models real nonce-recording state, so the
+        diagnostic's idempotence is a meaningful contrast, not an artifact
+        of a stateless mock.
+        """
+        recorded: set[str] = set()
+
+        def gate(token: str) -> None:
+            if token in recorded:
+                raise self._NonceReused(f"nonce reused: {token}")
+            recorded.add(token)
+
+        gate("t")  # first call records
+        with pytest.raises(self._NonceReused, match="nonce reused"):
+            gate("t")  # replay
 
 
 # -----------------------------------------------------------------------
@@ -642,49 +447,256 @@ class TestCapabilityValidation:
 
 
 class TestBehavioralRecord:
-    """Tests for the BehavioralRecord dataclass."""
+    """Tests for the BehavioralRecord dataclass (the typed §7.3.2 facts)."""
 
     def test_default_construction(self) -> None:
         br = BehavioralRecord()
-        assert br.contexts_participated == 0
-        assert br.total_duration == 0.0
+        # The twelve typed participation facts, all defaulted.
+        assert br.subject_did == ""
+        assert br.participation_duration_secs == 0
         assert br.governance_actions_against == 0
-        assert br.tool_invocations == []
-        assert br.role_history == []
-        assert br.endorsement_accuracy is None
+        assert br.governance_actions_by == 0
+        assert br.outlet_invocation_count == 0
+        assert br.outlet_invocation_count_anchored is False
+        assert br.context_creation_count == 0
+        assert br.role_progression_count == 0
+        assert br.attestation_count == 0
+        assert br.attestation_count_anchored is False
+        assert br.computed_at == 0
+        assert br.event_log_root == ""
+
+    def test_obsolete_fields_removed(self) -> None:
+        # The client-side-computation fields are gone from the typed shape.
+        br = BehavioralRecord()
+        for obsolete in (
+            "contexts_participated",
+            "total_duration",
+            "outlet_invocations",
+            "role_history",
+            "endorsement_accuracy",
+        ):
+            assert not hasattr(br, obsolete), f"obsolete field {obsolete} must be removed"
 
 
-class TestAttestation:
-    """Tests for the Attestation dataclass."""
+class _FakeParticipationRecord:
+    """A fake PyParticipationRecord with the twelve typed fields."""
+
+    def __init__(self, **overrides: object) -> None:
+        self.subject_did = "did:dht:zsubject"
+        self.participation_duration_secs = 0
+        self.governance_actions_against = 0
+        self.governance_actions_by = 0
+        self.outlet_invocation_count = 0
+        self.outlet_invocation_count_anchored = False
+        self.context_creation_count = 0
+        self.role_progression_count = 0
+        self.attestation_count = 0
+        self.attestation_count_anchored = False
+        self.computed_at = 1
+        self.event_log_root = "00"
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+
+class TestParticipationRecordWrapper:
+    """The participation_record SDK wrapper projects the typed bridge record."""
+
+    def test_projects_all_twelve_fields(self) -> None:
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.return_value = _FakeParticipationRecord(
+            subject_did="did:dht:zalice",
+            participation_duration_secs=300,
+            governance_actions_against=2,
+            governance_actions_by=3,
+            outlet_invocation_count=4,
+            outlet_invocation_count_anchored=False,
+            context_creation_count=1,
+            role_progression_count=5,
+            attestation_count=0,
+            computed_at=42,
+            event_log_root="deadbeef",
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            record = participation_record(mock_scp, "ctx-1", "did:dht:zalice")
+
+        assert isinstance(record, BehavioralRecord)
+        assert record.subject_did == "did:dht:zalice"
+        assert record.participation_duration_secs == 300
+        assert record.governance_actions_against == 2
+        assert record.governance_actions_by == 3
+        assert record.outlet_invocation_count == 4
+        assert record.outlet_invocation_count_anchored is False
+        assert record.context_creation_count == 1
+        assert record.role_progression_count == 5
+        assert record.attestation_count == 0
+        # attestation_count is credential-layer, never Merkle-anchored.
+        assert record.attestation_count_anchored is False
+        assert record.computed_at == 42
+        assert record.event_log_root == "deadbeef"
+
+    def test_defaults_to_empty_cached_attestations(self) -> None:
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.return_value = _FakeParticipationRecord()
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            participation_record(mock_scp, "ctx-1", "did:dht:zsubject")
+
+        # No cached attestations supplied → the bridge receives an empty JSON
+        # array (honest, verifier-relative; the SDK fabricates none).
+        call = mock_bridge.participation_record.call_args
+        assert call.args == ("ctx-1", "did:dht:zsubject", "[]")
+
+    def test_typed_cached_attestation_serializes_to_snake_case_wire(self) -> None:
+        """A typed CachedAttestation is json.dumps'd onto the wire verbatim.
+
+        The TypedDict is a dict at runtime, so its serde-canonical snake_case
+        keys cross the FFI exactly as the Python SDK's raw dicts (and the TS
+        SDK's typed input) do — parity across bindings.
+        """
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.return_value = _FakeParticipationRecord()
+        envelope: CachedAttestationEnvelope = {
+            "id": "att-1",
+            "attestation_type": "IdentityLink",
+            "issuer": "did:dht:zissuer",
+            "subject": "did:dht:zsubject",
+            "claim": {"linked_did": "did:dht:zsubject"},
+            "issued_at": 1000,
+            "revocation_status": "NotRevoked",
+            "signature": list(range(64)),
+        }
+        cached: CachedAttestation = {
+            "attestation": envelope,
+            "verified_at": 1234,
+            "ttl_secs": 3600,
+        }
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            participation_record(mock_scp, "ctx-1", "did:dht:zsubject", [cached])
+
+        call = mock_bridge.participation_record.call_args
+        assert call.args == ("ctx-1", "did:dht:zsubject", json.dumps([cached]))
+        # The signature is a list of 64 byte ints (serde_bytes deserializes a
+        # sequence of u8); confirm it survives serialization intact.
+        wire = json.loads(call.args[2])
+        assert wire[0]["attestation"]["signature"] == list(range(64))
+        assert wire[0]["attestation"]["attestation_type"] == "IdentityLink"
+
+    def test_evaluate_trust_layer2_consumes_participation_record(self) -> None:
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.return_value = _FakeParticipationRecord(
+            subject_did="did:dht:zbob",
+            governance_actions_by=7,
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            evaluation = asyncio.run(
+                evaluate_trust(
+                    scp=mock_scp,
+                    subject_did="did:dht:zbob",
+                    context_id="ctx-1",
+                )
+            )
+
+        # Layer 2 is the typed record received from the bridge op — NOT a
+        # client-side event-log classification. evaluate_trust never queries the
+        # event log itself.
+        mock_bridge.event_log_query.assert_not_called()
+        assert evaluation.behavioral_record is not None
+        assert evaluation.behavioral_record.governance_actions_by == 7
+        assert evaluation.behavioral_record.attestation_count_anchored is False
+        # evaluate_trust supplies no cached attestations.
+        call = mock_bridge.participation_record.call_args
+        assert call.args == ("ctx-1", "did:dht:zbob", "[]")
+
+    def test_evaluate_trust_empty_log_folds_into_zeroed_record(self) -> None:
+        """An empty event log (SCP-CTX-2076) folds into a ZEROED record.
+
+        The branch keys on the STRUCTURED code, not error prose, and the record
+        is non-null (all counts 0) — identical in shape to the populated case.
+        """
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.side_effect = ContextError(
+            "no recorded participation facts for did:dht:zsubject",
+            code="SCP-CTX-2076",
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            evaluation = asyncio.run(
+                evaluate_trust(
+                    scp=mock_scp,
+                    subject_did="did:dht:zsubject",
+                    context_id="ctx-1",
+                )
+            )
+
+        record = evaluation.behavioral_record
+        assert isinstance(record, BehavioralRecord)
+        assert record.subject_did == "did:dht:zsubject"
+        assert record.participation_duration_secs == 0
+        assert record.outlet_invocation_count == 0
+        assert record.outlet_invocation_count_anchored is False
+        assert record.attestation_count == 0
+        assert record.attestation_count_anchored is False
+        assert record.event_log_root == ""
+
+    def test_evaluate_trust_propagates_non_empty_log_context_error(self) -> None:
+        """A genuine ContextError (NOT SCP-CTX-2076) propagates, never swallowed.
+
+        The prior blanket ``except ContextError`` masked real failures such as
+        NotInitialized; only the dedicated empty-log code is folded gracefully.
+        """
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+        mock_bridge.participation_record.side_effect = ContextError(
+            "context not initialized",
+            code="SCP-CTX-2000",
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            with pytest.raises(ContextError, match="not initialized"):
+                asyncio.run(
+                    evaluate_trust(
+                        scp=mock_scp,
+                        subject_did="did:dht:zsubject",
+                        context_id="ctx-1",
+                    )
+                )
+
+    def test_participation_record_translates_native_error_with_code(self) -> None:
+        """The public wrapper re-raises native bridge errors as coded SDK errors.
+
+        A native exception whose string carries ``[SCP-CTX-2076]`` becomes a
+        typed :class:`ContextError` exposing ``.code`` so callers branch on the
+        structured code, not prose.
+        """
+        mock_scp = MagicMock()
+        mock_bridge = MagicMock()
+
+        class _NativeContextError(Exception):
+            pass
+
+        _NativeContextError.__name__ = "ContextError"  # mimic the PyO3 class name
+        mock_bridge.participation_record.side_effect = _NativeContextError(
+            "[SCP-CTX-2076] context error: no recorded participation facts"
+        )
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            with pytest.raises(ContextError) as excinfo:
+                participation_record(mock_scp, "ctx-1", "did:dht:zsubject")
+        assert excinfo.value.code == "SCP-CTX-2076"
+
+
+class TestAttestationSummary:
+    """Tests for the AttestationSummary dataclass (canonical 4-field shape)."""
 
     def test_construction(self) -> None:
-        att = Attestation(type="identity", signature_valid=True)
+        att = AttestationSummary(
+            type="identity", issuer="did:dht:zIssuer", valid=True, revoked=False
+        )
         assert att.type == "identity"
-        assert att.signature_valid is True
-        assert att.evidence_valid is None
-        assert att.fresh is False
-        assert att.issuer == ""
-        assert att.claim == {}
-
-
-class TestEndorsement:
-    """Tests for the Endorsement dataclass."""
-
-    def test_construction(self) -> None:
-        end = Endorsement(from_did="did:dht:zAlice", capability="messages:write")
-        assert end.from_did == "did:dht:zAlice"
-        assert end.capability == "messages:write"
-        assert end.endorser_behavioral_record == {}
-
-
-class TestChallengeResult:
-    """Tests for the ChallengeResult dataclass."""
-
-    def test_construction(self) -> None:
-        cr = ChallengeResult(capability="tool_invoke:assistant", passed=True)
-        assert cr.capability == "tool_invoke:assistant"
-        assert cr.passed is True
-        assert cr.verified_at == ""
+        assert att.issuer == "did:dht:zIssuer"
+        assert att.valid is True
+        assert att.revoked is False
 
 
 class TestTrustEvaluation:
@@ -698,11 +710,19 @@ class TestTrustEvaluation:
         assert te.subject_did == "did:dht:zBob"
         assert te.context_id == "ctx-123"
         assert te.capability_validation.tokens_valid is False
-        assert te.behavioral_record is None
+        # behavioral_record is non-null (a zeroed default), identical in shape to
+        # the TypeScript SDK — never `None`.
+        assert isinstance(te.behavioral_record, BehavioralRecord)
+        assert te.behavioral_record.subject_did == ""
+        assert te.behavioral_record.participation_duration_secs == 0
+        assert te.behavioral_record.attestation_count_anchored is False
+        # Canonical shape across all four SDKs: Layers 1-3 only. The Layer-4
+        # fields (endorsements, challenge_results, consequence_structure) are
+        # NOT part of this op's result.
         assert te.attestations == []
-        assert te.endorsements == []
-        assert te.challenge_results == []
-        assert te.consequence_structure is None
+        assert not hasattr(te, "endorsements")
+        assert not hasattr(te, "challenge_results")
+        assert not hasattr(te, "consequence_structure")
 
 
 # -----------------------------------------------------------------------
@@ -732,7 +752,7 @@ class TestVerifyParticipationRequirements:
         mock_bridge = MagicMock()
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = verify_participation_requirements([req], [profile])
+            result = verify_participation_requirements("did:dht:zAlice", [req], [profile])
         assert result is None
         mock_bridge.verify_participation_requirements.assert_called_once()
 
@@ -752,7 +772,7 @@ class TestVerifyParticipationRequirements:
         )
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             with pytest.raises(RuntimeError, match="threshold not met"):
-                verify_participation_requirements([req], [profile])
+                verify_participation_requirements("did:dht:zAlice", [req], [profile])
 
     def test_multiple_requirements_all_pass(self) -> None:
         """Bridge returns without exception when multiple requirements are all satisfied."""
@@ -774,7 +794,7 @@ class TestVerifyParticipationRequirements:
         mock_bridge = MagicMock()
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = verify_participation_requirements(reqs, [profile])
+            result = verify_participation_requirements("did:dht:zAlice", reqs, [profile])
         assert result is None
 
     def test_multiple_profiles(self) -> None:
@@ -797,7 +817,7 @@ class TestVerifyParticipationRequirements:
         mock_bridge = MagicMock()
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = verify_participation_requirements([req], profiles)
+            result = verify_participation_requirements("did:dht:zAlice", [req], profiles)
         assert result is None
 
     def test_serialization_format(self) -> None:
@@ -815,13 +835,15 @@ class TestVerifyParticipationRequirements:
         mock_bridge = MagicMock()
         mock_bridge.verify_participation_requirements.return_value = True
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            verify_participation_requirements([req], [profile])
+            verify_participation_requirements("did:dht:zAlice", [req], [profile])
 
         call_args = mock_bridge.verify_participation_requirements.call_args
         import json
 
-        profiles_json = json.loads(call_args[0][0])
+        assert call_args[0][0] == "did:dht:zAlice"
+        # Bridge arg order is (expected_subject, requirements_json, profile_json).
         reqs_json = json.loads(call_args[0][1])
+        profiles_json = json.loads(call_args[0][2])
 
         assert profiles_json[0]["subject_did"] == "did:dht:zAlice"
         assert profiles_json[0]["governance_actions_against"] == 1
@@ -833,7 +855,7 @@ class TestVerifyParticipationRequirements:
     def test_max_age_secs_default(self) -> None:
         """RequireParticipation defaults max_age_secs to 3600."""
         req = RequireParticipation(
-            fact=ParticipationFact(name="ToolInvocationCount"),
+            fact=ParticipationFact(name="OutletInvocationCount"),
             threshold=ParticipationThreshold(operator="Equals", value=10),
         )
         assert req.max_age_secs == 3600
@@ -885,7 +907,7 @@ class TestU64UpperBoundValidation:
             "participation_duration_secs",
             "governance_actions_against",
             "governance_actions_by",
-            "tool_invocation_count",
+            "outlet_invocation_count",
             "context_creation_count",
             "role_progression_count",
             "attestation_count",
@@ -904,7 +926,7 @@ class TestU64UpperBoundValidation:
             "participation_duration_secs",
             "governance_actions_against",
             "governance_actions_by",
-            "tool_invocation_count",
+            "outlet_invocation_count",
             "context_creation_count",
             "role_progression_count",
             "attestation_count",
@@ -1042,7 +1064,13 @@ class TestAggregateTrustInputFalsy:
 
         bridge = self._mock_bridge()
         rules = [{"name": "rate-limit", "trigger": "velocity"}]
-        thresholds = {"WebAuthn": {"min_attestors": 2}}
+        thresholds = {
+            "Endorsement": {
+                "required_count": 2,
+                "total_attestors": 3,
+                "independence_threshold": 0.5,
+            }
+        }
         with patch("scp_sdk.trust._bridge", return_value=bridge):
             aggregate_trust_input(
                 scp=MagicMock(),
@@ -1056,3 +1084,316 @@ class TestAggregateTrustInputFalsy:
         call_args = bridge.aggregate_trust_input.call_args[0]
         assert _json.loads(call_args[4]) == rules
         assert _json.loads(call_args[5]) == thresholds
+
+
+class TestAggregateTrustInputTyped:
+    """ADR-058: aggregate_trust_input takes typed inputs and serializes to the
+    exact serde wire JSON the bridge deserializes — no hand-authored JSON."""
+
+    @staticmethod
+    def _mock_bridge() -> MagicMock:
+        bridge = MagicMock()
+        bridge.aggregate_trust_input.return_value = "{}"
+        return bridge
+
+    @staticmethod
+    def _event() -> EventLogEntry:
+        return {
+            "event_type": "MessageSent",
+            "actor_did": "did:dht:zActor",
+            "timestamp": 1_700_000_000,
+            "sequence": 0,
+            "payload": {"data": [1, 2, 3]},
+            "prev_hash": [0] * 32,
+            "signature": [5] * 64,
+        }
+
+    def test_typed_events_serialize_verbatim(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        event = self._event()
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                scp=MagicMock(),
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[event],
+                merkle_root=[7] * 32,
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert json.loads(call_args[2]) == [event]
+        assert json.loads(call_args[3]) == [7] * 32
+
+    def test_typed_attestor_sets_serialize_verbatim(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        attestor: AttestorInfo = {
+            "did": "did:dht:zAttestor",
+            "context_memberships": ["ctx-1"],
+            "endorsements": ["did:dht:zOther"],
+            "attestation": None,
+        }
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                scp=MagicMock(),
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                attestor_sets={"Endorsement": [attestor]},
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert json.loads(call_args[6]) == {"Endorsement": [attestor]}
+
+    def test_challenge_results_accept_the_dataclass(self) -> None:
+        """``challenge_results`` accepts the merged ChallengeVerification
+        dataclass and serializes it via its bridge projection."""
+        from scp_sdk.trust import (
+            ChallengeVerification,
+            ChallengeVerificationMethod,
+            aggregate_trust_input,
+        )
+
+        bridge = self._mock_bridge()
+        verification = ChallengeVerification(
+            verification_id="v-1",
+            verifier_did="did:dht:zVerifier",
+            subject_did="did:dht:zAlice",
+            capability_uri="scp:capability:schema-validation/v1",
+            challenge_type="scp:capability:schema-validation/v1",
+            verification_method=ChallengeVerificationMethod(name="SelfAttested"),
+            passed=True,
+            test_count=1,
+            pass_count=1,
+            result=True,
+            completed_at=1_700_000_000,
+            verified_at=1_700_000_000,
+            expires_at=4_000_000_000,
+            verifier_signature=[9] * 64,
+        )
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            aggregate_trust_input(
+                scp=MagicMock(),
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                challenge_results=[verification],
+            )
+        call_args = bridge.aggregate_trust_input.call_args[0]
+        assert json.loads(call_args[8]) == [verification._to_bridge_dict()]
+
+    def test_rejects_wrong_length_merkle_root(self) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        with (
+            patch("scp_sdk.trust._bridge", return_value=bridge),
+            pytest.raises(ValueError, match="merkle_root must be exactly 32 elements, got 3"),
+        ):
+            aggregate_trust_input(
+                scp=MagicMock(),
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[1, 2, 3],
+            )
+        bridge.aggregate_trust_input.assert_not_called()
+
+    @pytest.mark.parametrize("param", ["threshold_requirements", "attestor_sets"])
+    def test_rejects_invalid_attestation_type_key(self, param: str) -> None:
+        from scp_sdk.trust import aggregate_trust_input
+
+        bridge = self._mock_bridge()
+        with (
+            patch("scp_sdk.trust._bridge", return_value=bridge),
+            pytest.raises(ValueError, match="not an AttestationType"),
+        ):
+            aggregate_trust_input(
+                scp=MagicMock(),
+                context_id="ctx-1",
+                subject_did="did:dht:zAlice",
+                events=[],
+                merkle_root=[0] * 32,
+                **{param: {"WebAuthn": {}}},
+            )
+        bridge.aggregate_trust_input.assert_not_called()
+
+    def test_scp_method_serializes_through_the_shared_encoder(self) -> None:
+        """SCP.aggregate_trust_input (the class surface) takes the same typed
+        inputs and emits byte-identical wire JSON via the shared encoder."""
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native.aggregate_trust_input.return_value = "{}"
+        event = self._event()
+        result = asyncio.run(
+            SCP.aggregate_trust_input(
+                scp,
+                "ctx-1",
+                "did:dht:zAlice",
+                events=[event],
+                merkle_root=[7] * 32,
+                threshold_requirements={
+                    "Endorsement": {
+                        "required_count": 1,
+                        "total_attestors": 1,
+                        "independence_threshold": 0.0,
+                    }
+                },
+            )
+        )
+        assert result == "{}"
+        call_args = scp._native.aggregate_trust_input.call_args[0]
+        assert call_args[0] == "ctx-1"
+        assert call_args[1] == "did:dht:zAlice"
+        assert json.loads(call_args[2]) == [event]
+        assert json.loads(call_args[3]) == [7] * 32
+        assert call_args[4] == "[]"
+        assert json.loads(call_args[5]) == {
+            "Endorsement": {
+                "required_count": 1,
+                "total_attestors": 1,
+                "independence_threshold": 0.0,
+            }
+        }
+        assert call_args[6] == "{}"
+        assert call_args[7] == "[]"
+        assert call_args[8] == "[]"
+
+    def test_scp_method_rejects_wrong_length_merkle_root(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        with pytest.raises(ValueError, match="merkle_root must be exactly 32 elements"):
+            asyncio.run(
+                SCP.aggregate_trust_input(scp, "ctx-1", "did:dht:zAlice", [], [1, 2]),
+            )
+        scp._native.aggregate_trust_input.assert_not_called()
+
+
+class TestTrustVerifyTyped:
+    """ADR-058 Op D: trust_verify_attestation / trust_verify_response take
+    typed wire DTOs and serialize to the exact serde JSON the bridge parses."""
+
+    @staticmethod
+    def _envelope() -> CachedAttestationEnvelope:
+        return {
+            "id": "att-1",
+            "attestation_type": "AgentCapability",
+            "issuer": "did:dht:zIssuer",
+            "subject": "did:dht:zSubject",
+            "claim": {"capability": "scp:capability:schema-validation/v1"},
+            "issued_at": 1_700_000_000,
+            "revocation_status": "Active",
+            "signature": [3] * 64,
+        }
+
+    @staticmethod
+    def _challenge() -> ChallengeRequest:
+        return {
+            "challenge_id": "chal-1",
+            "challenge_type": "scp:capability:schema-validation/v1",
+            "challenger_did": "did:dht:zChallenger",
+            "subject_did": "did:dht:zSubject",
+            "capability_uri": "scp:capability:schema-validation/v1",
+            "parameters": {"schema": "object"},
+            "timeout": {"secs": 300, "nanos": 0},
+            "signature": [8] * 64,
+        }
+
+    @staticmethod
+    def _response() -> ChallengeResponse:
+        return {
+            "challenge_id": "chal-1",
+            "responder_did": "did:dht:zSubject",
+            "result": {"passed": True},
+            "completed_at": 1_700_000_100,
+            "signature": [4] * 64,
+        }
+
+    def test_verify_attestation_serializes_the_typed_envelope(self) -> None:
+        from scp_sdk.trust import trust_verify_attestation
+
+        bridge = MagicMock()
+        bridge.trust_verify_attestation.return_value = {
+            "valid": False,
+            "chain_depth": 0,
+            "error": "unresolvable issuer",
+        }
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            result = trust_verify_attestation(self._envelope())
+        assert result["valid"] is False
+        (wire_json,) = bridge.trust_verify_attestation.call_args[0]
+        assert json.loads(wire_json) == self._envelope()
+
+    def test_verify_response_serializes_both_typed_records(self) -> None:
+        from scp_sdk.trust import trust_verify_response
+
+        bridge = MagicMock()
+        bridge.trust_verify_response.return_value = False
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            result = trust_verify_response(self._challenge(), self._response())
+        assert result is False
+        challenge_json, response_json = bridge.trust_verify_response.call_args[0]
+        assert json.loads(challenge_json) == self._challenge()
+        assert json.loads(response_json) == self._response()
+
+    def test_verify_attestation_real_bridge_call_through(self) -> None:
+        """The typed envelope's serialized JSON parses on the REAL Rust
+        `Attestation` deserializer: a dummy signature yields a structured
+        `valid: False` (verification ran), never a parse error."""
+        pytest.importorskip("_scp_core")
+        from scp_sdk.trust import trust_verify_attestation
+
+        result = trust_verify_attestation(self._envelope())
+        assert result["valid"] is False
+        assert result["error"]
+
+    def test_verify_response_real_bridge_call_through(self) -> None:
+        """The typed challenge pair's serialized JSON parses on the REAL Rust
+        `ChallengeRequest` / `ChallengeResponse` deserializers: dummy
+        signatures yield a structured `False`, never a parse error."""
+        pytest.importorskip("_scp_core")
+        from scp_sdk.trust import trust_verify_response
+
+        assert trust_verify_response(self._challenge(), self._response()) is False
+
+
+class TestTrustCreateChallenge:
+    """trust_create_challenge wraps the bridge free function unchanged and
+    returns its `challenge_id` / `challenge_json` dict."""
+
+    def test_passes_target_did_through_to_the_bridge(self) -> None:
+        from scp_sdk.trust import trust_create_challenge
+
+        bridge = MagicMock()
+        bridge.trust_create_challenge.return_value = {
+            "challenge_id": "chal-1",
+            "challenge_json": "{}",
+        }
+        with patch("scp_sdk.trust._bridge", return_value=bridge):
+            result = trust_create_challenge("did:dht:zSubject")
+        assert result == {"challenge_id": "chal-1", "challenge_json": "{}"}
+        bridge.trust_create_challenge.assert_called_once_with("did:dht:zSubject")
+
+    def test_real_bridge_call_through(self) -> None:
+        """The REAL bridge issues a signed schema-validation challenge: the
+        returned `challenge_json` parses and targets the subject DID."""
+        pytest.importorskip("_scp_core")
+        from scp_sdk.trust import trust_create_challenge
+
+        result = trust_create_challenge("did:dht:zSubject")
+        assert result["challenge_id"]
+        challenge = json.loads(result["challenge_json"])
+        assert challenge["challenge_id"] == result["challenge_id"]
+        assert challenge["subject_did"] == "did:dht:zSubject"
+        assert len(challenge["signature"]) == 64
+
+    def test_exported_from_the_package_root(self) -> None:
+        import scp_sdk
+        from scp_sdk.trust import trust_create_challenge
+
+        assert scp_sdk.trust_create_challenge is trust_create_challenge

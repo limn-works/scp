@@ -26,7 +26,7 @@ use crate::crypto::ucan::capability::CapabilityUri;
 use crate::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext, validate_ucan,
 };
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // BroadcastAdmission
@@ -216,17 +216,31 @@ pub struct SubscriberRecord {
 pub struct AuthorState {
     /// The author's DID.
     pub author_did: String,
-    /// The current AES-256-GCM broadcast key.
-    pub broadcast_key: SenderKey,
-    /// The current key epoch (monotonically increasing).
-    pub epoch: u64,
+    /// The current AES-256-GCM broadcast key. PRIVATE (§5.14.8 mutation-surface
+    /// confinement, ADR-049 §9): key rotation is a downward-authorization
+    /// (encryption-as-access-control) mutation, so only the in-module security
+    /// mutators (`block_subscriber`, `governance_ban_subscriber`,
+    /// `rotate_all_author_keys`) — reachable outside this crate ONLY through a
+    /// whole `&mut BroadcastContext` handed out by a fail-closed combinator — may
+    /// write it. Read externally via [`Self::broadcast_key`].
+    broadcast_key: SenderKey,
+    /// The current key epoch (monotonically increasing). PRIVATE for the same
+    /// reason as `broadcast_key` — an epoch advance is the durable witness of a
+    /// key rotation. Read externally via [`Self::epoch`].
+    epoch: u64,
     /// Next sequence number for this author's messages. Starts at 1 and
     /// increments with each `publish()` call. Used for replay detection
-    /// on the consumer side (§5.14.5, issue #352).
+    /// on the consumer side (§5.14.5, issue #352). BENIGN (not a downward-auth
+    /// witness): a coalesce-window rollback of a burned sequence leaves a bounded
+    /// gap, never a re-grant — so the field-granular Class-C publish view may
+    /// mutate it.
     pub next_sequence: u64,
     /// DIDs blocked by this author. Blocked subscribers receive no key
-    /// material for epochs after the block.
-    pub block_list: HashSet<String>,
+    /// material for epochs after the block. PRIVATE (§5.14.8): a block-list
+    /// INSERT is a downward-authorization revocation and a REMOVE is a re-grant,
+    /// so only the in-module block/ban/unblock mutators may write it. Read
+    /// externally via [`Self::block_list`].
+    block_list: HashSet<String>,
 }
 
 impl AuthorState {
@@ -241,6 +255,30 @@ impl AuthorState {
             next_sequence: 1,
             block_list: HashSet::new(),
         }
+    }
+
+    /// READ-ONLY access to the current key epoch (§5.14.8 confinement). The
+    /// field is private; an epoch advance is a security mutation reachable only
+    /// through the in-module rotation mutators.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// READ-ONLY access to the current broadcast key (§5.14.8 confinement). The
+    /// field is private; key rotation is a security mutation reachable only
+    /// through the in-module rotation mutators.
+    #[must_use]
+    pub const fn broadcast_key(&self) -> &SenderKey {
+        &self.broadcast_key
+    }
+
+    /// READ-ONLY access to this author's block list (§5.14.8 confinement). The
+    /// field is private; block-list writes are security mutations reachable only
+    /// through the in-module block/ban/unblock mutators.
+    #[must_use]
+    pub const fn block_list(&self) -> &HashSet<String> {
+        &self.block_list
     }
 }
 
@@ -273,8 +311,9 @@ pub struct SubscriptionResult {
 ///
 /// Contains the new broadcast key and epoch after rotation, which the caller
 /// must distribute to non-blocked subscribers. Also includes the author DID
-/// and the full block list so the caller can persist block state via
-/// `ProtocolRepository::store_broadcast_block_list`.
+/// and the full block list so the caller can persist the updated block state
+/// as part of the context's broadcast snapshot (the block list is embedded in
+/// the per-author broadcast state carried by [`BroadcastContextSnapshot`]).
 #[derive(Debug)]
 pub struct BlockResult {
     /// The new AES-256-GCM broadcast key after rotation.
@@ -294,8 +333,9 @@ pub struct BlockResult {
 /// Result returned by [`BroadcastContext::unblock_subscriber`].
 ///
 /// Contains the author DID and the full block list after the unblock operation
-/// so the caller can persist the updated block state via
-/// `ProtocolRepository::store_broadcast_block_list`. Unlike [`BlockResult`], this
+/// so the caller can persist the updated block state as part of the context's
+/// broadcast snapshot (the block list is embedded in the per-author broadcast
+/// state carried by [`BroadcastContextSnapshot`]). Unlike [`BlockResult`], this
 /// does NOT contain a new key or epoch — unblocking does not rotate keys
 /// (§9.16.8).
 #[derive(Debug)]
@@ -550,6 +590,456 @@ pub struct BroadcastContext {
     subscribers: HashMap<String, SubscriberRecord>,
     /// Per-author broadcast key state, keyed by author DID.
     authors: HashMap<String, AuthorState>,
+    /// Durable governance-ban record (§5.14.8). DIDs banned by an authority via
+    /// `RevokeAccess`/`governance_ban_subscriber`. This is INDEPENDENT of the
+    /// `subscribers` registry and of the runtime membership-scoped
+    /// `read_exclusion_list`: a ban is written here when the subject is removed
+    /// from `subscribers`, and is cleared ONLY by an authority through
+    /// `governance_unban_subscriber` (reached via `RestoreAccess`). Because it is
+    /// separate from any membership-teardown hygiene, the ban survives the banned
+    /// subject's own `leave_context` AND a subsequent `RemoveMember`, so a banned
+    /// DID cannot re-subscribe by leaving and replaying a retained `messages:read`
+    /// UCAN. Carried across restart in [`BroadcastContextSnapshot`] on the same
+    /// Class-S fail-closed path as `block_list`.
+    banned_subscribers: HashSet<String>,
+}
+
+/// Uniform deny reason for a broadcast key request (§5.14.8 non-leakage).
+///
+/// Every authorization-denial path ([`BroadcastContext::handle_key_request`] and
+/// the runtime `read_exclusion_list` serve-path consult) returns THIS exact
+/// string so that denial causes (blocked, unsubscribed, gated, unknown author,
+/// governance-banned / read-excluded) are indistinguishable in diagnostic
+/// output — a blocked subscriber cannot distinguish "you are blocked" from "you
+/// were never subscribed". A seal failure after authorization passes uses a
+/// DISTINCT reason (internal error, not an authorization denial).
+pub const KEY_REQUEST_DENY_REASON: &str = "key request denied";
+
+/// Uniform deny reason for a broadcast SUBSCRIBE admission rejection
+/// (§5.14.4 / §5.14.8 non-leakage).
+///
+/// The runtime `subscribe_broadcast` admission gate returns THIS exact string
+/// when a subscriber is refused for a read-access reason (currently: the DID is
+/// in the governance `read_exclusion_list`, i.e. a governance-banned /
+/// read-revoked subscriber). It is deliberately generic so a rejection does not
+/// disclose that the specific DID is banned versus refused for any other
+/// admission reason — the subscribe analogue of [`KEY_REQUEST_DENY_REASON`] on
+/// the serve path.
+pub const SUBSCRIBE_DENY_REASON: &str = "subscriber is not permitted to subscribe";
+
+// ---------------------------------------------------------------------------
+// BroadcastContextClassCParts — field-granular Class-C publish seam (ADR-049 §9)
+// ---------------------------------------------------------------------------
+
+/// DISJOINT field references over a [`BroadcastContext`], the cross-crate seam
+/// for `scp-runtime`'s field-granular Class-C broadcast view (ADR-049 §9,
+/// §5.14.8 mutation-surface confinement).
+///
+/// Produced by [`BroadcastContext::class_c_parts`]. Mirrors
+/// [`crate::context::roles::ContextRoleClassCParts`]: the raw `&mut` fields are
+/// the disjoint-borrow PRIMITIVE, and the confinement is the CONSUMING runtime
+/// view's responsibility. The BENIGN publish-path / roster methods live HERE (so
+/// they can reach the now-private [`AuthorState`] security fields), while the
+/// downward-authorization security mutators (`block_subscriber`, `block_author`,
+/// `governance_ban_subscriber`, `rotate_all_author_keys`) deliberately do NOT
+/// — they stay inherent `&mut self` on [`BroadcastContext`], reachable only
+/// through a whole `&mut BroadcastContext` a fail-closed combinator hands out.
+///
+/// # Seam contract — confinement is the CONSUMING VIEW's responsibility
+///
+/// The `authors` / `subscribers` fields are RAW `&mut` (a caller could
+/// `authors.remove(..)` — which is `block_author` — or clear a block list by
+/// hand). This struct does NOT itself narrow that: the runtime
+/// `BroadcastContextClassCMut` holds it PRIVATELY and forwards ONLY the benign
+/// methods below, exactly as `RoleStateClassCMut` wraps `ContextRoleClassCParts`.
+/// A future second consumer MUST apply the same discipline. That `pub` surface is
+/// §9-safe NOT by access modifier but by REACHABILITY: producing a
+/// `BroadcastContextClassCParts` requires a `&mut BroadcastContext`, and in the
+/// actor the only `&mut BroadcastContext` is reached through `ClassSCell` — which
+/// has NO `DerefMut` and holds the state behind PRIVATE fields — so no caller
+/// outside the runtime's fail-closed view layer can obtain the `&mut` needed to
+/// call `class_c_parts` in the first place.
+pub struct BroadcastContextClassCParts<'a> {
+    /// `&mut` to the subscriber roster (Class-C — roster ADD/REMOVE carries no
+    /// key secrecy; content is public, per-author keys protect publication).
+    pub subscribers: &'a mut HashMap<String, SubscriberRecord>,
+    /// `&mut` to the per-author key state. The [`AuthorState`] security fields
+    /// (`broadcast_key` / `epoch` / `block_list`) are PRIVATE, so DIRECT raw
+    /// field reach through this `&mut` is limited to `next_sequence` for code
+    /// OUTSIDE this crate (the `#[F.2]` compile-fail witness pins exactly this:
+    /// no *direct* private-field write via the parts). The benign METHODS below
+    /// DO write those fields, but only in the SAFE direction: voluntary-
+    /// unsubscribe key rotation (forward-only `epoch` advance + fresh
+    /// `broadcast_key`; a coalesce-rollback returns to "subscriber present under
+    /// the old key", never a re-grant) and `unblock_subscriber` (UPWARD re-grant
+    /// clearing an entry from `block_list`; a rollback re-instates the block).
+    /// The REVOCATION-direction mutators (`block_subscriber`, `block_author`,
+    /// `governance_ban_subscriber`, `rotate_all_author_keys`) stay inherent on
+    /// [`BroadcastContext`] — only those carry the fail-closed, must-survive-
+    /// crash guarantee; the safe-direction unsubscribe/unblock writes are
+    /// persisted best-effort.
+    pub authors: &'a mut HashMap<String, AuthorState>,
+    /// Copy of the admission policy (read-only input to `subscribe`).
+    pub admission: BroadcastAdmission,
+    /// Shared `&` to the context identifier (structural identity, stable).
+    pub context_id: &'a str,
+    /// SHARED (read-only) `&` to the durable governance-ban record. The Class-C
+    /// roster-ADD path (`subscribe`) READS this to reject a banned DID at the
+    /// structural chokepoint every subscribe funnels through; it deliberately
+    /// gets NO `&mut` — ban WRITES (`governance_ban_subscriber`) and un-ban
+    /// (`governance_unban_subscriber`) stay inherent on the whole
+    /// `&mut BroadcastContext`, keeping the durable ban authority-only-clearable.
+    pub banned_subscribers: &'a HashSet<String>,
+}
+
+impl BroadcastContextClassCParts<'_> {
+    /// Context identifier (structural identity).
+    #[must_use]
+    pub const fn context_id(&self) -> &str {
+        self.context_id
+    }
+
+    /// Whether `did` holds `messages:write` (is a registered author).
+    #[must_use]
+    fn can_write(&self, did: &str) -> bool {
+        self.authors.contains_key(did)
+    }
+
+    /// Registers a subscriber (benign roster ADD). See
+    /// [`BroadcastContext::subscribe`] for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContext::subscribe`].
+    pub fn subscribe<D, N, R, P, S>(
+        &mut self,
+        subscriber_did: &str,
+        ucan: Option<&UcanToken>,
+        timestamp: u64,
+        validation_ctx: Option<&mut ValidationContext<'_, D, N, R, P, S>>,
+    ) -> Result<SubscriptionResult, ContextError>
+    where
+        D: DidResolver,
+        N: NonceTracker,
+        R: RevocationChecker,
+        P: ProofResolver,
+        S: BuildHasher,
+    {
+        // Durable-ban structural guard (§5.14.8, #2088). EVERY subscribe path
+        // funnels through here (the runtime `subscribe_broadcast` via
+        // `broadcast_class_c_mut`, and `BroadcastContext::subscribe` /
+        // `register_subscriber` via `class_c_parts`), so a governance-banned DID
+        // is rejected BY CONSTRUCTION before the duplicate-subscriber check and
+        // before any roster mutation or `MemberJoined` event — no caller can
+        // re-admit a banned subject by replaying a retained `messages:read` UCAN.
+        // The ban is authority-only-clearable (`RestoreAccess`) and survives the
+        // subject's own leave and admin-remove (see `BroadcastContext`
+        // `banned_subscribers`). Uniform reason: non-leaking (§5.14.8).
+        if self.banned_subscribers.contains(subscriber_did) {
+            return Err(ContextError::PermissionDenied(
+                SUBSCRIBE_DENY_REASON.to_owned(),
+            ));
+        }
+        if self.subscribers.contains_key(subscriber_did) {
+            return Err(ContextError::MembershipFailed(format!(
+                "subscriber already registered: {subscriber_did}"
+            )));
+        }
+
+        let has_ucan = match self.admission {
+            BroadcastAdmission::Open => ucan.is_some(),
+            BroadcastAdmission::Gated => {
+                let token = ucan.ok_or_else(|| {
+                    ContextError::PermissionDenied(
+                        "gated broadcast requires messages:read UCAN".to_owned(),
+                    )
+                })?;
+                let ctx = validation_ctx.ok_or_else(|| {
+                    ContextError::PermissionDenied(
+                        "gated broadcast requires validation context for UCAN verification"
+                            .to_owned(),
+                    )
+                })?;
+                validate_messages_read_ucan(token, self.context_id, ctx)?;
+                true
+            }
+        };
+
+        self.subscribers.insert(
+            subscriber_did.to_owned(),
+            SubscriberRecord {
+                subscriber_did: subscriber_did.to_owned(),
+                registered_at: timestamp,
+                has_ucan,
+            },
+        );
+
+        let author_epochs = self
+            .authors
+            .iter()
+            .map(|(did, state)| (did.clone(), state.epoch))
+            .collect();
+
+        // Spec section 5.14.3: "Event log records registration via
+        // MemberJoined with role subscriber."
+        let event = ContextEvent::MemberJoined {
+            member_did: DID(subscriber_did.to_owned()),
+            role_name: "subscriber".to_owned(),
+        };
+
+        Ok(SubscriptionResult {
+            author_epochs,
+            event,
+        })
+    }
+
+    /// Removes a subscriber (benign roster REMOVE + optional forward-secrecy key
+    /// rotation). See [`BroadcastContext::unsubscribe`] for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContext::unsubscribe`].
+    pub fn unsubscribe(
+        &mut self,
+        subscriber_did: &str,
+        rotate_keys: bool,
+    ) -> Result<UnsubscribeResult, ContextError> {
+        if !self.subscribers.contains_key(subscriber_did) {
+            return Err(ContextError::MemberNotFound(format!(
+                "subscriber not found: {subscriber_did}"
+            )));
+        }
+
+        self.subscribers.remove(subscriber_did);
+
+        let mut key_rotations = Vec::new();
+
+        if rotate_keys {
+            // Collect author DIDs first to avoid borrowing conflict.
+            let author_dids: Vec<String> = self.authors.keys().cloned().collect();
+
+            for author_did in &author_dids {
+                // Safety: `author_did` was just collected from `self.authors.keys()`,
+                // so the entry is guaranteed to exist.
+                if let Some(author) = self.authors.get_mut(author_did.as_str()) {
+                    let new_epoch = author.epoch.checked_add(1).ok_or_else(|| {
+                        ContextError::CryptoFailed("broadcast key epoch overflow".to_owned())
+                    })?;
+
+                    let new_key = generate_sender_key();
+                    author.epoch = new_epoch;
+                    author.broadcast_key = new_key.clone();
+
+                    key_rotations.push(BlockResult {
+                        new_key,
+                        new_epoch,
+                        author_did: author_did.clone(),
+                        block_list: author.block_list.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(UnsubscribeResult {
+            subscriber_did: subscriber_did.to_owned(),
+            key_rotations,
+        })
+    }
+
+    /// Unblocks a previously blocked subscriber (UPWARD authorization change —
+    /// best-effort by design, §9.16.8). See
+    /// [`BroadcastContext::unblock_subscriber`] for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContext::unblock_subscriber`].
+    pub fn unblock_subscriber(
+        &mut self,
+        author_did: &str,
+        unblocked_did: &str,
+    ) -> Result<UnblockResult, ContextError> {
+        let author = self.authors.get_mut(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        if !author.block_list.remove(unblocked_did) {
+            return Err(ContextError::InvalidState(format!(
+                "subscriber {unblocked_did} not blocked by author {author_did}"
+            )));
+        }
+
+        // Per §9.16.8: NO key rotation on unblock. The current key remains
+        // valid. The unblocked subscriber will receive it on next pull.
+
+        let result_author_did = author.author_did.clone();
+        let result_block_list = author.block_list.clone();
+
+        Ok(UnblockResult {
+            author_did: result_author_did,
+            block_list: result_block_list,
+        })
+    }
+
+    /// Returns publish signing metadata (benign READ). See
+    /// [`BroadcastContext::publish_metadata`] for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContext::publish_metadata`].
+    pub fn publish_metadata(
+        &self,
+        author_did: &str,
+    ) -> Result<BroadcastPublishMetadata<'_>, ContextError> {
+        if !self.can_write(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "{author_did} is not an author (messages:write required)"
+            )));
+        }
+
+        let author = self.authors.get(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        Ok(BroadcastPublishMetadata {
+            context_id: self.context_id,
+            author_did: &author.author_did,
+            next_sequence: author.next_sequence,
+            key_epoch: author.epoch,
+        })
+    }
+
+    /// Single-phase capability-enforced publish (benign — increments only the
+    /// author's `next_sequence`). See [`BroadcastContext::publish`] for the full
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContext::publish`].
+    pub fn publish(
+        &mut self,
+        author_did: &str,
+        payload: &[u8],
+        timestamp: u64,
+        signature: ed25519_dalek::Signature,
+        nonce: &[u8; 12],
+        provenance: Option<crate::provenance::DataProvenance>,
+    ) -> Result<BroadcastEnvelope, ContextError> {
+        if !self.can_write(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "{author_did} is not an author (messages:write required)"
+            )));
+        }
+
+        let author = self.authors.get_mut(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        let sequence = author.next_sequence;
+        author.next_sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| ContextError::CryptoFailed("broadcast sequence overflow".to_owned()))?;
+
+        let broadcast_key = BroadcastKey::from_parts(
+            author.broadcast_key.clone(),
+            author.epoch,
+            author.author_did.clone(),
+        );
+
+        let params = SealBroadcastParams {
+            context_id: self.context_id,
+            sequence,
+            timestamp,
+            provenance,
+            signature,
+        };
+
+        seal_broadcast(&broadcast_key, payload, nonce, &params)
+            .map_err(|e| ContextError::CryptoFailed(format!("seal_broadcast failed: {e}")))
+    }
+
+    /// Phase 1 of the two-phase publish (benign — reserves a `next_sequence`
+    /// slot). See [`BroadcastContext::reserve_publish`] for the full contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContext::reserve_publish`].
+    pub fn reserve_publish(
+        &mut self,
+        author_did: &str,
+    ) -> Result<BroadcastPublishReservation, ContextError> {
+        if !self.can_write(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "{author_did} is not an author (messages:write required)"
+            )));
+        }
+
+        let author = self.authors.get_mut(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        let reserved_sequence = author.next_sequence;
+        author.next_sequence = reserved_sequence
+            .checked_add(1)
+            .ok_or_else(|| ContextError::CryptoFailed("broadcast sequence overflow".to_owned()))?;
+
+        Ok(BroadcastPublishReservation {
+            reserved_sequence,
+            key_epoch: author.epoch,
+        })
+    }
+
+    /// Phase 2 of the two-phase publish (benign — seals with the already-reserved
+    /// sequence). See [`BroadcastContext::apply_reserved_publish`] for the full
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`BroadcastContext::apply_reserved_publish`].
+    pub fn apply_reserved_publish(
+        &mut self,
+        author_did: &str,
+        payload: &[u8],
+        nonce: &[u8; 12],
+        apply: ReservedPublishApply,
+    ) -> Result<BroadcastEnvelope, ContextError> {
+        if !self.can_write(author_did) {
+            return Err(ContextError::PermissionDenied(format!(
+                "{author_did} is not an author (messages:write required)"
+            )));
+        }
+
+        let author = self.authors.get(author_did).ok_or_else(|| {
+            ContextError::MemberNotFound(format!("author not found: {author_did}"))
+        })?;
+
+        let broadcast_key = BroadcastKey::from_parts(
+            author.broadcast_key.clone(),
+            author.epoch,
+            author.author_did.clone(),
+        );
+
+        let params = SealBroadcastParams {
+            context_id: self.context_id,
+            sequence: apply.sequence,
+            timestamp: apply.timestamp,
+            provenance: apply.provenance,
+            signature: apply.signature,
+        };
+
+        seal_broadcast(&broadcast_key, payload, nonce, &params)
+            .map_err(|e| ContextError::CryptoFailed(format!("seal_broadcast failed: {e}")))
+    }
+
+    /// Rolls back an unapplied reservation (benign — restores `next_sequence` if
+    /// still the head). See [`BroadcastContext::rollback_reserved_publish`] for
+    /// the full contract.
+    pub fn rollback_reserved_publish(&mut self, author_did: &str, reserved_sequence: u64) {
+        if let Some(author) = self.authors.get_mut(author_did)
+            && author.next_sequence == reserved_sequence.saturating_add(1)
+        {
+            author.next_sequence = reserved_sequence;
+        }
+    }
 }
 
 impl BroadcastContext {
@@ -572,7 +1062,19 @@ impl BroadcastContext {
             admission,
             subscribers: HashMap::new(),
             authors: HashMap::new(),
+            banned_subscribers: HashSet::new(),
         })
+    }
+
+    /// Whether `did` is under a durable governance ban (§5.14.8, #2088).
+    ///
+    /// The authoritative admission check the runtime `subscribe_broadcast` gate
+    /// consults. `true` only while the DID is in the `banned_subscribers` record,
+    /// which is written by [`Self::governance_ban_subscriber`] and cleared ONLY
+    /// by an authority via [`Self::governance_unban_subscriber`] (`RestoreAccess`).
+    #[must_use]
+    pub fn is_banned(&self, did: &str) -> bool {
+        self.banned_subscribers.contains(did)
     }
 
     /// Returns the context ID.
@@ -585,6 +1087,60 @@ impl BroadcastContext {
     #[must_use]
     pub const fn admission(&self) -> BroadcastAdmission {
         self.admission
+    }
+
+    /// Destructure `self` into DISJOINT field references for the field-granular
+    /// Class-C broadcast view (ADR-049 §9, §5.14.8 mutation-surface confinement).
+    ///
+    /// This single destructure is what lets `scp-runtime` build the field-granular
+    /// [`BroadcastContextClassCParts`] (and its runtime wrapper
+    /// `BroadcastContextClassCMut`) WITHOUT reaching a whole `&mut BroadcastContext`
+    /// on which the security mutators (`block_subscriber`, `block_author`,
+    /// `governance_ban_subscriber`, `rotate_all_author_keys`) would be callable
+    /// best-effort. The benign publish-path / roster methods live on the returned
+    /// parts; the security mutators stay inherent on `self`.
+    ///
+    /// # Mutation-axis structural witness (§5.14.8, ADR-049 §9)
+    ///
+    /// The field-granular Class-C path cannot mutate a per-author security field.
+    /// The witness below holds the MAXIMAL reach that path grants — the raw parts,
+    /// a strict superset of the benign forwards the runtime
+    /// `BroadcastContextClassCMut` view exposes — and still cannot write
+    /// `block_list`: the field is PRIVATE on [`AuthorState`], so the write is a
+    /// field-privacy compile error (not a method-resolution failure a rename could
+    /// evade). `epoch` and `broadcast_key` are private for the same reason, so the
+    /// same witness shape covers all three security fields:
+    ///
+    /// ```compile_fail
+    /// use scp_protocol::context::broadcast::BroadcastContext;
+    ///
+    /// fn clear_block_list_via_class_c(bc: &mut BroadcastContext) {
+    ///     let mut parts = bc.class_c_parts();
+    ///     if let Some(author) = parts.authors.get_mut("did:example:author") {
+    ///         // ERROR[E0616]: field `block_list` of struct `AuthorState` is
+    ///         // private — a block-list clear (an authorization RE-GRANT) is
+    ///         // unreachable through the field-granular Class-C parts.
+    ///         author.block_list.clear();
+    ///     }
+    /// }
+    /// ```
+    pub fn class_c_parts(&mut self) -> BroadcastContextClassCParts<'_> {
+        let Self {
+            context_id,
+            admission,
+            subscribers,
+            authors,
+            banned_subscribers,
+        } = self;
+        BroadcastContextClassCParts {
+            subscribers,
+            authors,
+            admission: *admission,
+            context_id,
+            // Downgrade the `&mut` from the destructure to a SHARED `&`: the
+            // Class-C roster path only READS the ban record.
+            banned_subscribers: &*banned_subscribers,
+        }
     }
 
     /// Returns the number of registered subscribers.
@@ -767,57 +1323,10 @@ impl BroadcastContext {
         P: ProofResolver,
         S: BuildHasher,
     {
-        if self.subscribers.contains_key(subscriber_did) {
-            return Err(ContextError::MembershipFailed(format!(
-                "subscriber already registered: {subscriber_did}"
-            )));
-        }
-
-        let has_ucan = match self.admission {
-            BroadcastAdmission::Open => ucan.is_some(),
-            BroadcastAdmission::Gated => {
-                let token = ucan.ok_or_else(|| {
-                    ContextError::PermissionDenied(
-                        "gated broadcast requires messages:read UCAN".to_owned(),
-                    )
-                })?;
-                let ctx = validation_ctx.ok_or_else(|| {
-                    ContextError::PermissionDenied(
-                        "gated broadcast requires validation context for UCAN verification"
-                            .to_owned(),
-                    )
-                })?;
-                validate_messages_read_ucan(token, &self.context_id, ctx)?;
-                true
-            }
-        };
-
-        self.subscribers.insert(
-            subscriber_did.to_owned(),
-            SubscriberRecord {
-                subscriber_did: subscriber_did.to_owned(),
-                registered_at: timestamp,
-                has_ucan,
-            },
-        );
-
-        let author_epochs = self
-            .authors
-            .iter()
-            .map(|(did, state)| (did.clone(), state.epoch))
-            .collect();
-
-        // Spec section 5.14.3: "Event log records registration via
-        // MemberJoined with role subscriber."
-        let event = ContextEvent::MemberJoined {
-            member_did: DID(subscriber_did.to_owned()),
-            role_name: "subscriber".to_owned(),
-        };
-
-        Ok(SubscriptionResult {
-            author_epochs,
-            event,
-        })
+        // Benign roster ADD — delegates to the field-granular Class-C parts
+        // (§5.14.8 confinement); mirrors the runtime best-effort path.
+        self.class_c_parts()
+            .subscribe(subscriber_did, ucan, timestamp, validation_ctx)
     }
 
     // -----------------------------------------------------------------------
@@ -947,26 +1456,11 @@ impl BroadcastContext {
         author_did: &str,
         unblocked_did: &str,
     ) -> Result<UnblockResult, ContextError> {
-        let author = self.authors.get_mut(author_did).ok_or_else(|| {
-            ContextError::MemberNotFound(format!("author not found: {author_did}"))
-        })?;
-
-        if !author.block_list.remove(unblocked_did) {
-            return Err(ContextError::InvalidState(format!(
-                "subscriber {unblocked_did} not blocked by author {author_did}"
-            )));
-        }
-
-        // Per §9.16.8: NO key rotation on unblock. The current key remains
-        // valid. The unblocked subscriber will receive it on next pull.
-
-        let result_author_did = author.author_did.clone();
-        let result_block_list = author.block_list.clone();
-
-        Ok(UnblockResult {
-            author_did: result_author_did,
-            block_list: result_block_list,
-        })
+        // UPWARD (re-grant) change — delegates to the field-granular Class-C
+        // parts; best-effort by design (§9.16.8, §5.14.8 block-before-serve
+        // asymmetry).
+        self.class_c_parts()
+            .unblock_subscriber(author_did, unblocked_did)
     }
 
     /// Returns `true` if the given subscriber DID is blocked by the given
@@ -980,9 +1474,10 @@ impl BroadcastContext {
 
     /// Restores a previously persisted block list for an author.
     ///
-    /// Called during initialization to rehydrate block state from
-    /// `ProtocolRepository::load_broadcast_block_list`. If the author is not
-    /// registered, returns an error.
+    /// Called during initialization to rehydrate block state from the
+    /// context's persisted broadcast snapshot (the block list is embedded in
+    /// the per-author broadcast state). If the author is not registered,
+    /// returns an error.
     ///
     /// # Errors
     ///
@@ -1000,47 +1495,121 @@ impl BroadcastContext {
         Ok(())
     }
 
+    /// Reconcile a governance `read_exclusion_list` into broadcast block state
+    /// (§5.14.8 block-before-serve, restore-path defense-in-depth).
+    ///
+    /// For each excluded DID: drop it from the subscriber registry and insert it
+    /// into EVERY author's block list. Idempotent. This re-derives the block
+    /// state a governance ban (`execute_revoke` read path) establishes, closing
+    /// any window where a restored snapshot's per-author block lists and the
+    /// durable `read_exclusion_list` could disagree — e.g. an author registered
+    /// after the ban, or a legacy snapshot whose broadcast block lists predate
+    /// the exclusion set.
+    ///
+    /// A per-author UNILATERAL block does NOT write `read_exclusion_list`, so
+    /// this reconciliation CANNOT rescue that arm — the per-author block MUST be
+    /// persisted fail-closed at block time (asymmetry pinned by §5.14.8).
+    pub fn apply_read_exclusions<I>(&mut self, excluded: I)
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        for did in excluded {
+            let did = did.as_ref();
+            self.subscribers.remove(did);
+            for author in self.authors.values_mut() {
+                author.block_list.insert(did.to_owned());
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Governance bans (spec section 5.14.8)
     // -----------------------------------------------------------------------
 
-    /// Bans a subscriber via governance action (§5.14.8).
+    /// Bans a DID via governance action (§5.14.8).
     ///
-    /// Unlike per-author blocking, governance bans are context-wide:
+    /// ALWAYS, for ANY read-ban (subscriber or not, #2088):
     ///
-    /// 1. The subscriber is removed from the subscriber registry.
-    /// 2. The subscriber is added to **every** author's block list.
-    /// 3. **Every** author's broadcast key is rotated (mandatory
-    ///    `KeyEpochAdvance`) to ensure the banned subscriber cannot decrypt
-    ///    future content from any author.
+    /// 1. Records the durable ban ([`Self::is_banned`]) for the DID — so a
+    ///    read-revoked member who never subscribed cannot launder the ban by
+    ///    leaving and replaying a retained grant.
+    /// 2. Rotates **every** author's broadcast key (mandatory `KeyEpochAdvance`,
+    ///    forward secrecy §9.5) — so any broadcast key the banned DID cached
+    ///    BEFORE the ban (a subscriber's requested key, or an author-to-author
+    ///    key held by a banned author/member) goes stale and cannot decrypt
+    ///    FUTURE content, returned in `rotated_authors`.
+    ///
+    /// Additionally, when the DID IS a current subscriber, it is removed from the
+    /// subscriber registry and added to **every** author's block list (the
+    /// per-author serve-deny belt). A non-subscriber is caught by the durable ban
+    /// gate on the serve path, so no block-list entry is written for them.
     ///
     /// This method does NOT check ceiling policy — that is the
     /// `ContextManager`'s responsibility.
     ///
     /// # Errors
     ///
-    /// - [`ContextError::MemberNotFound`] if the subscriber DID is not
-    ///   registered.
-    /// - [`ContextError::CryptoFailed`] if any author's epoch counter
-    ///   overflows.
+    /// - [`ContextError::CryptoFailed`] if any author's epoch counter overflows
+    ///   during the mandatory key rotation.
     pub fn governance_ban_subscriber(
         &mut self,
         did: &str,
         scope: crate::context::governance::AccessScope,
     ) -> Result<GovernanceBanResult, ContextError> {
-        if !self.subscribers.contains_key(did) {
-            return Err(ContextError::MemberNotFound(format!(
-                "subscriber not found: {did}"
-            )));
+        // Record the durable ban FIRST — for ANY governance read-revocation,
+        // INDEPENDENT of current roster presence (§5.14.8, #2088). This record is
+        // INDEPENDENT of the subscriber registry and of the runtime
+        // membership-scoped `read_exclusion_list` (which teardown paths clear on
+        // leave/remove for §5.6.1/§5.9 hygiene): it persists across the banned
+        // subject's own leave and admin-remove, and is cleared ONLY by
+        // `governance_unban_subscriber` (via `RestoreAccess`). It is the
+        // authoritative source for the subscribe-admission ban guard, closing the
+        // replay-after-leave laundering path.
+        //
+        // Recording BEFORE the roster-presence check is load-bearing: a
+        // read-revoked MEMBER who holds a valid `messages:read` UCAN but never
+        // subscribed — the context creator (seeded into `membership` as "admin"
+        // at creation), any post-`RestoreAccess` member who has not re-subscribed,
+        // or an author who is a member — must ALSO be durably banned, else they
+        // launder the ban by self-leaving (clearing their `read_exclusion_list`
+        // entry) and replaying the retained grant. On an OPEN broadcast no UCAN is
+        // even needed.
+        self.banned_subscribers.insert(did.to_owned());
+
+        // Roster removal applies only to a CURRENT subscriber (a non-subscriber
+        // holds no roster entry). `remove` returns whether the DID was present, so
+        // this both drops the roster entry AND classifies the ban. NOT
+        // `MemberNotFound` for a non-subscriber — the durable ban WAS recorded, so
+        // a not-found error would be misleading and `execute_revoke` would swallow
+        // it, losing the signal that a ban is now in force.
+        let was_subscriber = self.subscribers.remove(did).is_some();
+
+        // FORWARD SECRECY (§9.5, #2088): a read-ban MUST rotate EVERY author's
+        // broadcast key, whether or not the banned DID is a current subscriber.
+        // The banned DID may hold a broadcast key it legitimately pulled BEFORE the
+        // ban — a subscriber's requested key, OR (for a banned AUTHOR/member; the
+        // context creator is ALWAYS an author) an author-to-author key. Without
+        // rotation the author keeps publishing under the SAME key and the banned
+        // reader decrypts every FUTURE broadcast from its cached copy, never
+        // touching the (now ban-gated) serve path. Rotating advances each author's
+        // epoch + mints a fresh key, so cached copies go stale; the subscriber and
+        // non-subscriber paths were inconsistent before (only the subscriber path
+        // rotated) — this closes that forward-secrecy gap.
+        let author_dids: Vec<String> = self.authors.keys().cloned().collect();
+
+        // Pre-validate: ensure EVERY author can increment its epoch before mutating
+        // any state — all-or-nothing rotation (mirrors `rotate_all_author_keys`), so
+        // a mid-loop overflow (only reachable at 2^64 bans) cannot leave some
+        // authors rotated and others not.
+        for author in self.authors.values() {
+            author.epoch.checked_add(1).ok_or_else(|| {
+                ContextError::CryptoFailed("broadcast key epoch overflow".to_owned())
+            })?;
         }
 
-        // Remove from subscriber registry.
-        self.subscribers.remove(did);
-
-        // Add to every author's block list and rotate keys.
-        let author_dids: Vec<String> = self.authors.keys().cloned().collect();
+        // All epochs validated — safe to mutate.
         let mut rotated_authors = Vec::with_capacity(author_dids.len());
-
         for author_did in &author_dids {
             // Safety: `author_did` was just collected from `self.authors.keys()`,
             // so the entry is guaranteed to exist.
@@ -1048,13 +1617,18 @@ impl BroadcastContext {
                 ContextError::MemberNotFound(format!("author not found: {author_did}"))
             })?;
 
-            author.block_list.insert(did.to_owned());
+            // A banned SUBSCRIBER is added to every author's block_list (the
+            // per-author serve-deny belt retained from the original design). A
+            // banned non-subscriber is caught by the durable ban gate on the serve
+            // path, so NO block_list entry is written for them — keeping
+            // `banned_subscribers` the distinct authoritative signal.
+            if was_subscriber {
+                author.block_list.insert(did.to_owned());
+            }
 
-            let new_epoch = author.epoch.checked_add(1).ok_or_else(|| {
-                ContextError::CryptoFailed("broadcast key epoch overflow".to_owned())
-            })?;
-
-            author.epoch = new_epoch;
+            // Increment is overflow-free: pre-validated above.
+            author.epoch += 1;
+            let new_epoch = author.epoch;
             author.broadcast_key = generate_sender_key();
 
             let new_key = BroadcastKey::from_parts(
@@ -1087,6 +1661,11 @@ impl BroadcastContext {
     /// This method does NOT check ceiling policy — that is the
     /// `ContextManager`'s responsibility.
     pub fn governance_unban_subscriber(&mut self, did: &str) {
+        // Clear the durable ban record (§5.14.8, #2088). This is the ONLY clearer
+        // of `banned_subscribers`, reached exclusively via the authority
+        // `RestoreAccess` path — so a banned DID can only be re-admitted by an
+        // authority, never by self-leave or admin-remove.
+        self.banned_subscribers.remove(did);
         for author in self.authors.values_mut() {
             author.block_list.remove(did);
         }
@@ -1208,7 +1787,7 @@ impl BroadcastContext {
             context_id: &self.context_id,
             author_did: &author.author_did,
             next_sequence: author.next_sequence,
-            key_epoch: author.epoch,
+            key_epoch: author.epoch(),
         })
     }
 
@@ -1257,37 +1836,10 @@ impl BroadcastContext {
         nonce: &[u8; 12],
         provenance: Option<crate::provenance::DataProvenance>,
     ) -> Result<BroadcastEnvelope, ContextError> {
-        if !self.can_write(author_did) {
-            return Err(ContextError::PermissionDenied(format!(
-                "{author_did} is not an author (messages:write required)"
-            )));
-        }
-
-        let author = self.authors.get_mut(author_did).ok_or_else(|| {
-            ContextError::MemberNotFound(format!("author not found: {author_did}"))
-        })?;
-
-        let sequence = author.next_sequence;
-        author.next_sequence = sequence
-            .checked_add(1)
-            .ok_or_else(|| ContextError::CryptoFailed("broadcast sequence overflow".to_owned()))?;
-
-        let broadcast_key = BroadcastKey::from_parts(
-            author.broadcast_key.clone(),
-            author.epoch,
-            author.author_did.clone(),
-        );
-
-        let params = SealBroadcastParams {
-            context_id: &self.context_id,
-            sequence,
-            timestamp,
-            provenance,
-            signature,
-        };
-
-        seal_broadcast(&broadcast_key, payload, nonce, &params)
-            .map_err(|e| ContextError::CryptoFailed(format!("seal_broadcast failed: {e}")))
+        // Benign single-phase publish (only `next_sequence` advances) — delegates
+        // to the field-granular Class-C parts.
+        self.class_c_parts()
+            .publish(author_did, payload, timestamp, signature, nonce, provenance)
     }
 
     // -----------------------------------------------------------------------
@@ -1324,25 +1876,9 @@ impl BroadcastContext {
         &mut self,
         author_did: &str,
     ) -> Result<BroadcastPublishReservation, ContextError> {
-        if !self.can_write(author_did) {
-            return Err(ContextError::PermissionDenied(format!(
-                "{author_did} is not an author (messages:write required)"
-            )));
-        }
-
-        let author = self.authors.get_mut(author_did).ok_or_else(|| {
-            ContextError::MemberNotFound(format!("author not found: {author_did}"))
-        })?;
-
-        let reserved_sequence = author.next_sequence;
-        author.next_sequence = reserved_sequence
-            .checked_add(1)
-            .ok_or_else(|| ContextError::CryptoFailed("broadcast sequence overflow".to_owned()))?;
-
-        Ok(BroadcastPublishReservation {
-            reserved_sequence,
-            key_epoch: author.epoch,
-        })
+        // Benign phase-1 reservation (only `next_sequence` advances) — delegates
+        // to the field-granular Class-C parts.
+        self.class_c_parts().reserve_publish(author_did)
     }
 
     /// Apply a reservation produced by
@@ -1368,32 +1904,10 @@ impl BroadcastContext {
         nonce: &[u8; 12],
         apply: ReservedPublishApply,
     ) -> Result<BroadcastEnvelope, ContextError> {
-        if !self.can_write(author_did) {
-            return Err(ContextError::PermissionDenied(format!(
-                "{author_did} is not an author (messages:write required)"
-            )));
-        }
-
-        let author = self.authors.get(author_did).ok_or_else(|| {
-            ContextError::MemberNotFound(format!("author not found: {author_did}"))
-        })?;
-
-        let broadcast_key = BroadcastKey::from_parts(
-            author.broadcast_key.clone(),
-            author.epoch,
-            author.author_did.clone(),
-        );
-
-        let params = SealBroadcastParams {
-            context_id: &self.context_id,
-            sequence: apply.sequence,
-            timestamp: apply.timestamp,
-            provenance: apply.provenance,
-            signature: apply.signature,
-        };
-
-        seal_broadcast(&broadcast_key, payload, nonce, &params)
-            .map_err(|e| ContextError::CryptoFailed(format!("seal_broadcast failed: {e}")))
+        // Benign phase-2 seal (reads key material, mutates nothing) — delegates
+        // to the field-granular Class-C parts.
+        self.class_c_parts()
+            .apply_reserved_publish(author_did, payload, nonce, apply)
     }
 
     /// Roll back a reservation produced by
@@ -1414,11 +1928,9 @@ impl BroadcastContext {
     ///
     /// [`MembershipState::rollback_sequence_number`]: crate::context::membership::MembershipState::rollback_sequence_number
     pub fn rollback_reserved_publish(&mut self, author_did: &str, reserved_sequence: u64) {
-        if let Some(author) = self.authors.get_mut(author_did)
-            && author.next_sequence == reserved_sequence.saturating_add(1)
-        {
-            author.next_sequence = reserved_sequence;
-        }
+        // Benign — delegates to the field-granular Class-C parts.
+        self.class_c_parts()
+            .rollback_reserved_publish(author_did, reserved_sequence);
     }
 
     // -----------------------------------------------------------------------
@@ -1444,46 +1956,10 @@ impl BroadcastContext {
         subscriber_did: &str,
         rotate_keys: bool,
     ) -> Result<UnsubscribeResult, ContextError> {
-        if !self.subscribers.contains_key(subscriber_did) {
-            return Err(ContextError::MemberNotFound(format!(
-                "subscriber not found: {subscriber_did}"
-            )));
-        }
-
-        self.subscribers.remove(subscriber_did);
-
-        let mut key_rotations = Vec::new();
-
-        if rotate_keys {
-            // Collect author DIDs first to avoid borrowing conflict.
-            let author_dids: Vec<String> = self.authors.keys().cloned().collect();
-
-            for author_did in &author_dids {
-                // Safety: `author_did` was just collected from `self.authors.keys()`,
-                // so the entry is guaranteed to exist.
-                if let Some(author) = self.authors.get_mut(author_did.as_str()) {
-                    let new_epoch = author.epoch.checked_add(1).ok_or_else(|| {
-                        ContextError::CryptoFailed("broadcast key epoch overflow".to_owned())
-                    })?;
-
-                    let new_key = generate_sender_key();
-                    author.epoch = new_epoch;
-                    author.broadcast_key = new_key.clone();
-
-                    key_rotations.push(BlockResult {
-                        new_key,
-                        new_epoch,
-                        author_did: author_did.clone(),
-                        block_list: author.block_list.clone(),
-                    });
-                }
-            }
-        }
-
-        Ok(UnsubscribeResult {
-            subscriber_did: subscriber_did.to_owned(),
-            key_rotations,
-        })
+        // Benign roster REMOVE (+ optional forward-secrecy rotation) — delegates
+        // to the field-granular Class-C parts.
+        self.class_c_parts()
+            .unsubscribe(subscriber_did, rotate_keys)
     }
 
     // -----------------------------------------------------------------------
@@ -1523,7 +1999,26 @@ impl BroadcastContext {
         // (blocked, unsubscribed, gated, unknown author) are indistinguishable
         // in diagnostic output. This prevents block list status leakage
         // through logging. See §5.14.8.
-        const DENY_REASON: &str = "key request denied";
+        const DENY_REASON: &str = KEY_REQUEST_DENY_REASON;
+
+        // Durable-ban serve-path guard (§5.14.8, #2088 / BLACK-303). The
+        // authoritative admission check for BOTH surfaces: subscribe (roster ADD)
+        // AND key-request serve (this gate). A governance ban is recorded in
+        // `banned_subscribers` INDEPENDENT of the roster and of every author's
+        // block list — and for a banned DID who was never a subscriber (an
+        // AUTHOR — the context creator is ALWAYS an author, §5.14 creation) NO
+        // block-list entry is written, so the block-list check below cannot catch
+        // them. The runtime serve consult of `read_exclusion_list` also cannot:
+        // it is cleared when the banned subject self-leaves. So `banned_subscribers`
+        // is the ONLY durable, authority-only-clearable signal — consult it FIRST,
+        // before ANY grant, so a banned DID (subscriber OR author) cannot obtain a
+        // broadcast key to decrypt content until an authority `RestoreAccess`
+        // clears the ban (`governance_unban_subscriber`).
+        if self.banned_subscribers.contains(requester_did) {
+            return KeyRequestDecision::Deny {
+                reason: DENY_REASON.to_owned(),
+            };
+        }
 
         // Author must exist.
         let Some(author) = self.authors.get(author_did) else {
@@ -1600,8 +2095,9 @@ impl BroadcastContext {
     /// Creates a serializable snapshot of the broadcast context state.
     ///
     /// Captures authors (with key material and epochs), subscribers, and
-    /// admission policy. Used by `ProtocolRepository::store_broadcast_state` to
-    /// persist broadcast context state across process restarts.
+    /// admission policy. The returned snapshot is embedded in the context's
+    /// persisted state and flushed with it, so broadcast state survives
+    /// process restarts.
     ///
     /// See spec section 5.14.
     #[must_use]
@@ -1628,6 +2124,7 @@ impl BroadcastContext {
             admission: self.admission,
             subscribers: self.subscribers.clone(),
             authors,
+            banned_subscribers: self.banned_subscribers.clone(),
         }
     }
 
@@ -1660,6 +2157,7 @@ impl BroadcastContext {
             admission: snapshot.admission,
             subscribers: snapshot.subscribers,
             authors,
+            banned_subscribers: snapshot.banned_subscribers,
         }
     }
 }
@@ -1672,8 +2170,9 @@ impl BroadcastContext {
 ///
 /// Captures the full broadcast context state: admission policy, subscriber
 /// roster, and per-author key state (including key material, epochs, and
-/// block lists). Stored via `ProtocolRepository::store_broadcast_state` under the
-/// key `context/{context_id}/broadcast_state`.
+/// block lists). Embedded in the context's persisted snapshot (as the
+/// `broadcast` field) and flushed with it, so broadcast state survives
+/// process restarts.
 ///
 /// This is separate from `BroadcastContext` because `AuthorState` contains
 /// `SenderKey` which has `Zeroize`/`ZeroizeOnDrop` derives that make adding
@@ -1691,6 +2190,13 @@ pub struct BroadcastContextSnapshot {
     pub subscribers: HashMap<String, SubscriberRecord>,
     /// Per-author broadcast key state, keyed by author DID.
     pub authors: HashMap<String, AuthorStateSnapshot>,
+    /// Durable governance-ban record (§5.14.8, #2088). Carries the authoritative
+    /// ban set across restart on the same Class-S fail-closed path as
+    /// `block_list`. `#[serde(default)]` for backward-compat: a snapshot written
+    /// before this field existed deserializes to an empty set (no bans lost,
+    /// because pre-existing persisted state had no separate ban record).
+    #[serde(default)]
+    pub banned_subscribers: HashSet<String>,
 }
 
 /// Serializable snapshot of per-author broadcast key state.
@@ -1826,10 +2332,10 @@ mod tests {
     };
     use crate::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, InMemoryDidResolver, InMemoryNonceTracker,
-        InMemoryProofResolver, InMemoryRevocationChecker,
+        InMemoryProofResolver, InMemoryRevocationChecker, NoCaveatResolver,
     };
     use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload};
-    use scp_primitives::Clock;
+    use scp_clock::Clock;
     use std::collections::HashMap as StdHashMap;
 
     // AAD constants for sender-layer encrypt/decrypt in broadcast tests.
@@ -1920,8 +2426,8 @@ mod tests {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use ed25519_dalek::Signer;
 
-        let now_secs = scp_primitives::SystemClock.now_secs();
-        let now_millis = scp_primitives::SystemClock.now_millis();
+        let now_secs = scp_clock::SystemClock.now_secs();
+        let now_millis = scp_clock::SystemClock.now_millis();
 
         let header = UcanHeader::new();
         let payload = UcanPayload {
@@ -1936,6 +2442,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let header_json = serde_json::to_vec(&header).unwrap();
@@ -2152,7 +2659,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx
@@ -2160,6 +2668,238 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.author_epochs.len(), 1);
+        assert!(ctx.is_subscriber("did:example:bob"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable governance ban (§5.14.8, #2088)
+    // -----------------------------------------------------------------------
+
+    /// #4 (structural guard): a DID in the durable `banned_subscribers` record is
+    /// rejected at the protocol subscribe chokepoint EVERY caller funnels through
+    /// — both `BroadcastContext::subscribe` and `register_subscriber` — with the
+    /// uniform `SUBSCRIBE_DENY_REASON`, by construction.
+    #[test]
+    fn subscribe_rejects_banned_did_structurally() {
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        let mut setup = GatedTestSetup::new();
+        // Make the subscriber's key resolvable so `register_subscriber`'s
+        // signature check passes and it reaches the shared subscribe chokepoint.
+        let bob_key = ed25519_dalek::SigningKey::from_bytes(&[0x5c; 32]);
+        setup.did_resolver.keys.insert(
+            "did:example:bob".to_owned(),
+            bob_key.verifying_key().to_bytes(),
+        );
+
+        // Bob subscribes, then is governance-banned.
+        let ucan = setup.make_ucan("ctx-gated-1", "did:example:bob");
+        {
+            let mut val_ctx = ValidationContext {
+                did_resolver: &setup.did_resolver,
+                nonce_tracker: &mut setup.nonce_tracker,
+                revocation_checker: &setup.revocation_checker,
+                proof_resolver: &setup.proof_resolver,
+                ceiling: &setup.ceiling,
+                context_creator_did: &setup.issuer_did,
+                presenting_agent_did: "did:example:bob",
+                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_clock::SystemClock,
+                caveat_resolver: &NoCaveatResolver,
+            };
+            ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
+                .unwrap();
+        }
+        ctx.governance_ban_subscriber("did:example:bob", AccessScope::Read)
+            .unwrap();
+        assert!(ctx.is_banned("did:example:bob"));
+
+        // (a) BroadcastContext::subscribe — banned DID rejected before the UCAN
+        // is even validated.
+        {
+            let mut val_ctx = ValidationContext {
+                did_resolver: &setup.did_resolver,
+                nonce_tracker: &mut setup.nonce_tracker,
+                revocation_checker: &setup.revocation_checker,
+                proof_resolver: &setup.proof_resolver,
+                ceiling: &setup.ceiling,
+                context_creator_did: &setup.issuer_did,
+                presenting_agent_did: "did:example:bob",
+                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_clock::SystemClock,
+                caveat_resolver: &NoCaveatResolver,
+            };
+            let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
+            assert!(
+                matches!(&result, Err(ContextError::PermissionDenied(m)) if m == SUBSCRIBE_DENY_REASON),
+                "banned DID must be rejected at BroadcastContext::subscribe with the uniform reason: {result:?}"
+            );
+        }
+        assert!(!ctx.is_subscriber("did:example:bob"));
+
+        // (b) register_subscriber — delegates to the same chokepoint; the ban
+        // guard fires after signature verification.
+        {
+            let reg = make_signed_registration(
+                "ctx-gated-1",
+                "did:example:bob",
+                &bob_key,
+                [7u8; 32],
+                2000,
+                Some(ucan.clone()),
+            );
+            let mut val_ctx = ValidationContext {
+                did_resolver: &setup.did_resolver,
+                nonce_tracker: &mut setup.nonce_tracker,
+                revocation_checker: &setup.revocation_checker,
+                proof_resolver: &setup.proof_resolver,
+                ceiling: &setup.ceiling,
+                context_creator_did: &setup.issuer_did,
+                presenting_agent_did: "did:example:bob",
+                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_clock::SystemClock,
+                caveat_resolver: &NoCaveatResolver,
+            };
+            let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
+            assert!(
+                matches!(&result, Err(ContextError::PermissionDenied(m)) if m == SUBSCRIBE_DENY_REASON),
+                "banned DID must be rejected via register_subscriber too: {result:?}"
+            );
+        }
+        assert!(!ctx.is_subscriber("did:example:bob"));
+    }
+
+    /// #3 (persistence): the durable ban survives a snapshot round-trip
+    /// (restart), so a banned DID stays rejected after restore.
+    #[test]
+    fn banned_did_survives_snapshot_roundtrip() {
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        let mut setup = GatedTestSetup::new();
+        let ucan = setup.make_ucan("ctx-gated-1", "did:example:bob");
+        {
+            let mut val_ctx = ValidationContext {
+                did_resolver: &setup.did_resolver,
+                nonce_tracker: &mut setup.nonce_tracker,
+                revocation_checker: &setup.revocation_checker,
+                proof_resolver: &setup.proof_resolver,
+                ceiling: &setup.ceiling,
+                context_creator_did: &setup.issuer_did,
+                presenting_agent_did: "did:example:bob",
+                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_clock::SystemClock,
+                caveat_resolver: &NoCaveatResolver,
+            };
+            ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
+                .unwrap();
+        }
+        ctx.governance_ban_subscriber("did:example:bob", AccessScope::Read)
+            .unwrap();
+
+        // Round-trip through the persistence snapshot (restart).
+        let snapshot = ctx.to_snapshot();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored_snapshot: BroadcastContextSnapshot = serde_json::from_str(&json).unwrap();
+        let restored = BroadcastContext::from_snapshot(restored_snapshot);
+
+        assert!(
+            restored.is_banned("did:example:bob"),
+            "the durable ban must survive the snapshot round-trip"
+        );
+
+        let mut restored = restored;
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:bob",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
+        };
+        let result = restored.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
+        assert!(
+            matches!(&result, Err(ContextError::PermissionDenied(m)) if m == SUBSCRIBE_DENY_REASON),
+            "a ban that survived restart must still reject re-subscribe: {result:?}"
+        );
+    }
+
+    /// A snapshot serialized BEFORE the `banned_subscribers` field existed (no
+    /// such key in the JSON) must deserialize to an empty ban set
+    /// (`#[serde(default)]` backward-compat), not fail.
+    #[test]
+    fn snapshot_without_banned_field_deserializes_to_empty() {
+        let json = r#"{
+            "context_id": "ctx-old",
+            "admission": "Gated",
+            "subscribers": {},
+            "authors": {}
+        }"#;
+        let snapshot: BroadcastContextSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snapshot.banned_subscribers.is_empty());
+        let ctx = BroadcastContext::from_snapshot(snapshot);
+        assert!(!ctx.is_banned("did:example:anyone"));
+    }
+
+    /// #5 (un-ban restores): `governance_unban_subscriber` (the ONLY clearer,
+    /// reached via `RestoreAccess`) clears the durable ban and every author block
+    /// list, after which the DID can re-subscribe (emitting `MemberJoined`).
+    #[test]
+    fn unban_clears_durable_record_and_allows_resubscribe() {
+        let mut ctx = make_gated_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        let mut setup = GatedTestSetup::new();
+        let ucan = setup.make_ucan("ctx-gated-1", "did:example:bob");
+        {
+            let mut val_ctx = ValidationContext {
+                did_resolver: &setup.did_resolver,
+                nonce_tracker: &mut setup.nonce_tracker,
+                revocation_checker: &setup.revocation_checker,
+                proof_resolver: &setup.proof_resolver,
+                ceiling: &setup.ceiling,
+                context_creator_did: &setup.issuer_did,
+                presenting_agent_did: "did:example:bob",
+                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_clock::SystemClock,
+                caveat_resolver: &NoCaveatResolver,
+            };
+            ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx))
+                .unwrap();
+        }
+        ctx.governance_ban_subscriber("did:example:bob", AccessScope::Read)
+            .unwrap();
+        assert!(ctx.is_banned("did:example:bob"));
+
+        // Authority un-ban (RestoreAccess path).
+        ctx.governance_unban_subscriber("did:example:bob");
+        assert!(!ctx.is_banned("did:example:bob"));
+        assert!(
+            !ctx.is_blocked("did:example:alice", "did:example:bob"),
+            "un-ban must also drop the DID from every author's block list"
+        );
+
+        // Fresh nonce tracker for a fresh grant (the old nonce was consumed).
+        setup.nonce_tracker = InMemoryNonceTracker::new();
+        let ucan2 = setup.make_ucan("ctx-gated-1", "did:example:bob");
+        let mut val_ctx = ValidationContext {
+            did_resolver: &setup.did_resolver,
+            nonce_tracker: &mut setup.nonce_tracker,
+            revocation_checker: &setup.revocation_checker,
+            proof_resolver: &setup.proof_resolver,
+            ceiling: &setup.ceiling,
+            context_creator_did: &setup.issuer_did,
+            presenting_agent_did: "did:example:bob",
+            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
+        };
+        let result = ctx
+            .subscribe("did:example:bob", Some(&ucan2), 1000, Some(&mut val_ctx))
+            .expect("re-subscribe after un-ban must succeed");
+        assert!(matches!(result.event, ContextEvent::MemberJoined { .. }));
         assert!(ctx.is_subscriber("did:example:bob"));
     }
 
@@ -2180,7 +2920,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -2200,8 +2941,8 @@ mod tests {
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
             use ed25519_dalek::Signer;
 
-            let now_secs = scp_primitives::SystemClock.now_secs();
-            let now_millis = scp_primitives::SystemClock.now_millis();
+            let now_secs = scp_clock::SystemClock.now_secs();
+            let now_millis = scp_clock::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -2216,6 +2957,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             };
 
             let header_json = serde_json::to_vec(&header).unwrap();
@@ -2245,7 +2987,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -2269,7 +3012,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -2726,7 +3470,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:sub1",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
         ctx.subscribe("did:example:sub1", Some(&ucan), 1000, Some(&mut val_ctx))
             .unwrap();
@@ -2777,8 +3522,8 @@ mod tests {
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
             use ed25519_dalek::Signer;
 
-            let now_secs = scp_primitives::SystemClock.now_secs();
-            let now_millis = scp_primitives::SystemClock.now_millis();
+            let now_secs = scp_clock::SystemClock.now_secs();
+            let now_millis = scp_clock::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -2793,6 +3538,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             };
 
             let header_json = serde_json::to_vec(&header).unwrap();
@@ -2822,7 +3568,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         // With full validation, a properly signed wildcard UCAN from the
@@ -2849,8 +3596,8 @@ mod tests {
             use base64::Engine;
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-            let now_secs = scp_primitives::SystemClock.now_secs();
-            let now_millis = scp_primitives::SystemClock.now_millis();
+            let now_secs = scp_clock::SystemClock.now_secs();
+            let now_millis = scp_clock::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -2865,6 +3612,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             };
 
             let header_json = serde_json::to_vec(&header).unwrap();
@@ -2893,7 +3641,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -3265,7 +4014,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx
@@ -3497,6 +4247,115 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Durable-ban serve-path gate (§5.14.8, #2088 / BLACK-303)
+    // -----------------------------------------------------------------------
+
+    /// BLACK-303: a governance-banned AUTHOR is DENIED at the key-request serve
+    /// path — even though the author bypasses the gated-UCAN check and is on NO
+    /// block list (a non-subscriber ban writes none). Proves the serve path
+    /// consults the durable ban record, closing the author-side laundering hole.
+    #[test]
+    fn handle_key_request_denies_banned_author() {
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:evil").unwrap(); // evil is an author (like the creator)
+
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let pubkey = X25519Pub::from(&secret).to_bytes();
+
+        // Baseline: as an author, evil may request alice's key (author bypass).
+        assert!(
+            matches!(
+                ctx.handle_key_request("did:example:alice", "did:example:evil", &pubkey),
+                KeyRequestDecision::Grant { .. }
+            ),
+            "precondition: an author may request another author's key"
+        );
+
+        // Governance bans evil. evil is NOT a subscriber, so NO block-list entry
+        // is written — only the durable ban record.
+        ctx.governance_ban_subscriber("did:example:evil", AccessScope::Read)
+            .unwrap();
+        assert!(ctx.is_banned("did:example:evil"));
+        assert!(
+            !ctx.is_blocked("did:example:alice", "did:example:evil"),
+            "a non-subscriber ban writes NO block-list entry — so the block-list \
+             check cannot catch the banned author; only the ban record can"
+        );
+
+        // Serve path now DENIES the banned author.
+        assert!(
+            matches!(
+                ctx.handle_key_request("did:example:alice", "did:example:evil", &pubkey),
+                KeyRequestDecision::Deny { .. }
+            ),
+            "a banned author MUST be denied a broadcast key (BLACK-303)"
+        );
+    }
+
+    /// BLACK-303 variant: being (re-)added as an AUTHOR after a ban does NOT
+    /// launder it — `add_author` grants write, not read, and the durable ban
+    /// still gates the serve path. No `RestoreAccess` was called.
+    #[test]
+    fn readd_as_author_does_not_launder_durable_ban() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+
+        // Ban a DID that is neither subscriber nor author yet — records the ban.
+        ctx.governance_ban_subscriber("did:example:evil", AccessScope::Read)
+            .unwrap();
+        assert!(ctx.is_banned("did:example:evil"));
+
+        // Later, evil is added as an author (write access) — WITHOUT RestoreAccess.
+        ctx.add_author("did:example:evil").unwrap();
+
+        // Serve path STILL denies: authorship grants write, not read; ban stands.
+        assert!(
+            matches!(
+                ctx.handle_key_request("did:example:alice", "did:example:evil", &[0u8; 32]),
+                KeyRequestDecision::Deny { .. }
+            ),
+            "becoming an author must NOT launder a durable ban (still denied)"
+        );
+    }
+
+    /// Positive: after authority `RestoreAccess` (`governance_unban_subscriber`),
+    /// the previously-banned author's key request is GRANTED again — proving the
+    /// serve-path gate is exactly ban-scoped and authority-reversible.
+    #[test]
+    fn handle_key_request_grants_after_unban() {
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:evil").unwrap();
+
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let pubkey = X25519Pub::from(&secret).to_bytes();
+
+        ctx.governance_ban_subscriber("did:example:evil", AccessScope::Read)
+            .unwrap();
+        assert!(matches!(
+            ctx.handle_key_request("did:example:alice", "did:example:evil", &pubkey),
+            KeyRequestDecision::Deny { .. }
+        ));
+
+        // Authority un-ban.
+        ctx.governance_unban_subscriber("did:example:evil");
+        assert!(!ctx.is_banned("did:example:evil"));
+
+        assert!(
+            matches!(
+                ctx.handle_key_request("did:example:alice", "did:example:evil", &pubkey),
+                KeyRequestDecision::Grant { .. }
+            ),
+            "after un-ban the serve path grants the key again"
+        );
+    }
+
     #[test]
     fn handle_key_request_returns_current_epoch_after_rotation() {
         let mut ctx = make_open_ctx();
@@ -3673,7 +4532,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: "did:example:sub1",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         // Subscribe with UCAN.
@@ -4303,18 +5163,175 @@ mod tests {
         assert_eq!(ctx.get_author("did:example:carol").unwrap().epoch, 1);
     }
 
+    /// #2088 Finding 1 + forward secrecy: banning a DID that is NOT a current
+    /// subscriber (e.g. a read-revoked member/author who never subscribed) must
+    /// STILL record the durable ban and — critically — ROTATE every author's key
+    /// (forward secrecy §9.5), not return `MemberNotFound` and not skip rotation.
+    /// A banned author/member may hold a cached author-to-author key; rotation
+    /// invalidates it.
     #[test]
-    fn governance_ban_nonexistent_subscriber_returns_error() {
+    fn governance_ban_nonsubscriber_records_durable_ban_and_rotates() {
         let mut ctx = make_open_ctx();
         ctx.add_author("did:example:alice").unwrap();
+        // "ghost" was never a subscriber — but is (conceptually) a read-revoked
+        // member holding a retained grant / cached key.
+        assert!(!ctx.is_subscriber("did:example:ghost"));
+        assert_eq!(ctx.get_author("did:example:alice").unwrap().epoch, 0);
 
-        let result = ctx.governance_ban_subscriber("did:example:ghost", AccessScope::Read);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let result = ctx
+            .governance_ban_subscriber("did:example:ghost", AccessScope::Read)
+            .expect("banning a non-subscriber must succeed (records the durable ban)");
+        assert_eq!(result.banned_did, "did:example:ghost");
         assert!(
-            err.contains("subscriber not found"),
-            "expected MemberNotFound, got: {err}"
+            ctx.is_banned("did:example:ghost"),
+            "the durable ban MUST be recorded even for a non-subscriber (#2088)"
         );
+        // FORWARD SECRECY: the author's key MUST be rotated even though the banned
+        // DID was never a subscriber — otherwise a cached key decrypts future
+        // content indefinitely. Epoch advanced 0 → 1; rotation reported.
+        assert_eq!(
+            ctx.get_author("did:example:alice").unwrap().epoch,
+            1,
+            "a non-subscriber read-ban MUST rotate every author's key (forward secrecy)"
+        );
+        assert_eq!(
+            result.rotated_authors.len(),
+            1,
+            "the rotation must be reported in rotated_authors"
+        );
+        assert_eq!(result.rotated_authors[0].author_did, "did:example:alice");
+        assert_eq!(result.rotated_authors[0].new_epoch, 1);
+        // A non-subscriber ban writes NO block-list entry (the durable ban gate is
+        // the distinct authoritative signal on the serve path).
+        assert!(!ctx.is_blocked("did:example:alice", "did:example:ghost"));
+    }
+
+    /// #2088 forward secrecy (the crypto proof): a read-banned AUTHOR who cached a
+    /// peer author's broadcast key BEFORE the ban cannot decrypt content that peer
+    /// publishes AFTER the ban — the non-subscriber ban rotates every author's key,
+    /// so the cached copy is stale (epoch mismatch + different key). Mirrors the
+    /// block-subscriber forward-secrecy test, but via the governance ban of a
+    /// non-subscriber (which previously skipped rotation entirely).
+    #[test]
+    fn governance_ban_nonsubscriber_rotation_invalidates_cached_key() {
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        ctx.add_author("did:example:evil").unwrap(); // evil is an author, NOT a subscriber
+
+        // evil legitimately holds alice's epoch-0 key (author-to-author pull);
+        // model the cached copy by capturing alice's current key.
+        let pre_ban_author = ctx.get_author("did:example:alice").unwrap();
+        assert_eq!(pre_ban_author.epoch, 0);
+        let cached_key = BroadcastKey::from_parts(
+            pre_ban_author.broadcast_key.clone(),
+            pre_ban_author.epoch,
+            pre_ban_author.author_did.clone(),
+        );
+
+        // Pre-ban: alice publishes and evil's cached key decrypts it.
+        let pre_msg = b"pre-ban content";
+        let pre_env = test_publish(&mut ctx, "did:example:alice", pre_msg).unwrap();
+        assert_eq!(
+            open_broadcast_trusted(&cached_key, &pre_env).unwrap(),
+            pre_msg
+        );
+
+        // Governance read-bans evil (a non-subscriber author) → alice's key rotates.
+        let ban = ctx
+            .governance_ban_subscriber("did:example:evil", AccessScope::Read)
+            .unwrap();
+        assert!(
+            !ban.rotated_authors.is_empty(),
+            "a non-subscriber read-ban must rotate keys (forward secrecy)"
+        );
+        assert_eq!(ctx.get_author("did:example:alice").unwrap().epoch, 1);
+
+        // Post-ban: alice publishes under the NEW key/epoch.
+        let post_msg = b"post-ban content";
+        let post_env = test_publish(&mut ctx, "did:example:alice", post_msg).unwrap();
+        assert_eq!(post_env.key_epoch, 1);
+
+        // evil's CACHED epoch-0 key CANNOT decrypt the post-ban envelope.
+        assert!(
+            open_broadcast_trusted(&cached_key, &post_env).is_err(),
+            "a read-banned author's cached pre-ban key must NOT decrypt post-ban \
+             content — the ban rotation makes it stale (forward secrecy)"
+        );
+        // Sanity: pre-ban content is still openable with the old key (no data loss).
+        assert_eq!(
+            open_broadcast_trusted(&cached_key, &pre_env).unwrap(),
+            pre_msg
+        );
+    }
+
+    /// After a ban rotation, a legitimate (un-banned) SUBSCRIBER re-keys via the
+    /// serve path to the NEW epoch — the rotation does not lock out honest readers.
+    #[test]
+    fn legitimate_subscriber_rekeys_after_ban_rotation() {
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+        ctx.add_author("did:example:evil").unwrap();
+
+        // Ban evil (non-subscriber author) → alice rotates to epoch 1.
+        ctx.governance_ban_subscriber("did:example:evil", AccessScope::Read)
+            .unwrap();
+        assert_eq!(ctx.get_author("did:example:alice").unwrap().epoch, 1);
+
+        // Legitimate sub1 (not banned) requests alice's key → GRANTED at epoch 1.
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let pubkey = X25519Pub::from(&secret).to_bytes();
+        match ctx.handle_key_request("did:example:alice", "did:example:sub1", &pubkey) {
+            KeyRequestDecision::Grant { epoch, .. } => assert_eq!(
+                epoch, 1,
+                "a legitimate subscriber must re-key to the NEW (post-rotation) epoch"
+            ),
+            KeyRequestDecision::Deny { reason } => {
+                panic!("legitimate subscriber must be granted the new key: {reason}")
+            }
+        }
+    }
+
+    /// Un-ban does NOT rotate (the ban already did); a re-subscribe after
+    /// `RestoreAccess` gets the CURRENT key epoch via the serve path — no stale key.
+    #[test]
+    fn resubscribe_after_unban_gets_current_key_epoch() {
+        use x25519_dalek::{PublicKey as X25519Pub, StaticSecret};
+
+        let mut ctx = make_open_ctx();
+        ctx.add_author("did:example:alice").unwrap();
+        subscribe_open(&mut ctx, "did:example:sub1", None, 1000).unwrap();
+
+        // Ban sub1 → alice rotates to epoch 1; sub1 removed + block-listed + banned.
+        ctx.governance_ban_subscriber("did:example:sub1", AccessScope::Read)
+            .unwrap();
+        assert_eq!(ctx.get_author("did:example:alice").unwrap().epoch, 1);
+
+        // Authority un-ban — clears ban + block lists, does NOT rotate again.
+        ctx.governance_unban_subscriber("did:example:sub1");
+        assert!(!ctx.is_banned("did:example:sub1"));
+        assert_eq!(
+            ctx.get_author("did:example:alice").unwrap().epoch,
+            1,
+            "un-ban must NOT rotate keys (the ban already rotated; a second rotation \
+             would needlessly churn honest subscribers)"
+        );
+
+        // sub1 re-subscribes and requests alice's key → CURRENT epoch (1), not stale.
+        subscribe_open(&mut ctx, "did:example:sub1", None, 2000).unwrap();
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let pubkey = X25519Pub::from(&secret).to_bytes();
+        match ctx.handle_key_request("did:example:alice", "did:example:sub1", &pubkey) {
+            KeyRequestDecision::Grant { epoch, .. } => assert_eq!(
+                epoch, 1,
+                "the re-subscriber must get the CURRENT key epoch, not a stale one"
+            ),
+            KeyRequestDecision::Deny { reason } => {
+                panic!("re-subscribe after un-ban must be granted the key: {reason}")
+            }
+        }
     }
 
     #[test]
@@ -4666,7 +5683,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
@@ -4714,7 +5732,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -4765,7 +5784,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -4812,7 +5832,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -4858,7 +5879,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
@@ -4891,8 +5913,8 @@ mod tests {
             use base64::engine::general_purpose::URL_SAFE_NO_PAD;
             use ed25519_dalek::Signer as _;
 
-            let now_secs = scp_primitives::SystemClock.now_secs();
-            let now_millis = scp_primitives::SystemClock.now_millis();
+            let now_secs = scp_clock::SystemClock.now_secs();
+            let now_millis = scp_clock::SystemClock.now_millis();
 
             let header = UcanHeader::new();
             let payload = UcanPayload {
@@ -4907,6 +5929,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             };
 
             let header_json = serde_json::to_vec(&header).unwrap();
@@ -4945,7 +5968,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -4986,7 +6010,8 @@ mod tests {
             context_creator_did: &setup.issuer_did,
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
+            clock: &scp_clock::SystemClock,
+            caveat_resolver: &NoCaveatResolver,
         };
 
         let result = validate_ucan(&ucan, &required_cap, &mut val_ctx);
@@ -5035,5 +6060,140 @@ mod tests {
         assert_eq!(decoded.wrapping_pubkey, reg.wrapping_pubkey);
         assert_eq!(decoded.timestamp, reg.timestamp);
         assert_eq!(decoded.signature, reg.signature);
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.14.8 block-before-serve crash-durability (ADR-049 §9)
+    // -----------------------------------------------------------------------
+
+    /// Test 12 — the snapshot round-trip preserves block-list CONTENTS and the
+    /// key epoch, so a block folded into the Class-S `ContextSnapshot` restores
+    /// the exact revocation state (no post-block re-grant).
+    #[test]
+    fn snapshot_round_trip_preserves_block_list_and_epoch() {
+        let author = "did:example:bcast-author";
+        let blocked = "did:example:bcast-blocked";
+        let mut ctx = make_open_ctx();
+        ctx.add_author(author).unwrap();
+        // Block advances the epoch (0 -> 1) and records the blocked DID.
+        ctx.block_subscriber(author, blocked).unwrap();
+        assert_eq!(ctx.get_author(author).unwrap().epoch, 1);
+
+        // Round-trip through the on-disk serialization boundary.
+        let snap = ctx.to_snapshot();
+        let bytes = rmp_serde::to_vec_named(&snap).unwrap();
+        let decoded: BroadcastContextSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+        let restored = BroadcastContext::from_snapshot(decoded);
+
+        assert!(
+            restored.is_blocked(author, blocked),
+            "block-list contents must survive the snapshot round-trip"
+        );
+        assert_eq!(
+            restored.get_author(author).unwrap().epoch,
+            1,
+            "the key epoch advance must survive the snapshot round-trip"
+        );
+    }
+
+    /// Test 13 — `governance_ban_subscriber` advances EVERY author's key epoch
+    /// AND removes the banned DID from the subscriber registry (the two
+    /// downward-authorization effects a crash must not roll back).
+    #[test]
+    fn governance_ban_advances_epoch_and_removes_from_registry() {
+        use crate::context::governance::AccessScope;
+
+        let author_a = "did:example:ban-author-a";
+        let author_b = "did:example:ban-author-b";
+        let banned = "did:example:ban-target";
+        let mut ctx = make_open_ctx();
+        ctx.add_author(author_a).unwrap();
+        ctx.add_author(author_b).unwrap();
+        subscribe_open(&mut ctx, banned, None, 1_700_000_000).unwrap();
+        assert!(ctx.is_subscriber(banned));
+        // Fresh authors start at epoch 0; the ban must advance each to 1.
+        assert_eq!(ctx.get_author(author_a).unwrap().epoch, 0);
+        assert_eq!(ctx.get_author(author_b).unwrap().epoch, 0);
+
+        let result = ctx
+            .governance_ban_subscriber(banned, AccessScope::Read)
+            .unwrap();
+
+        assert!(
+            !ctx.is_subscriber(banned),
+            "governance ban must remove the banned DID from the subscriber registry"
+        );
+        assert!(
+            ctx.is_blocked(author_a, banned) && ctx.is_blocked(author_b, banned),
+            "governance ban must block the banned DID for EVERY author"
+        );
+        assert_eq!(
+            ctx.get_author(author_a).unwrap().epoch,
+            1,
+            "governance ban must advance author A's key epoch"
+        );
+        assert_eq!(
+            ctx.get_author(author_b).unwrap().epoch,
+            1,
+            "governance ban must advance author B's key epoch"
+        );
+        assert_eq!(
+            result.rotated_authors.len(),
+            2,
+            "both authors must be reported as rotated"
+        );
+    }
+
+    /// Test 8 — `apply_read_exclusions` (restore-path reconciliation) inserts
+    /// every excluded DID into EVERY author's block list and drops it from the
+    /// subscriber registry, re-deriving the governance-ban block state.
+    #[test]
+    fn apply_read_exclusions_reconciles_block_lists_and_registry() {
+        let author_a = "did:example:reconcile-author-a";
+        let author_b = "did:example:reconcile-author-b";
+        let excluded = "did:example:reconcile-excluded";
+        let mut ctx = make_open_ctx();
+        ctx.add_author(author_a).unwrap();
+        ctx.add_author(author_b).unwrap();
+        // The excluded DID is (adversarially / legacy-snapshot) still a
+        // subscriber and NOT yet on any author's block list.
+        subscribe_open(&mut ctx, excluded, None, 1_700_000_000).unwrap();
+        assert!(ctx.is_subscriber(excluded));
+        assert!(!ctx.is_blocked(author_a, excluded));
+
+        ctx.apply_read_exclusions(std::iter::once(excluded));
+
+        assert!(
+            !ctx.is_subscriber(excluded),
+            "reconciliation must drop the excluded DID from the registry"
+        );
+        assert!(
+            ctx.is_blocked(author_a, excluded) && ctx.is_blocked(author_b, excluded),
+            "reconciliation must block the excluded DID for every author"
+        );
+    }
+
+    /// Test 9 — the reconciliation ASYMMETRY: `apply_read_exclusions` keys ONLY
+    /// on the governance `read_exclusion_list`, so it CANNOT rescue a per-author
+    /// UNILATERAL block (which does not write `read_exclusion_list`). This is why
+    /// the per-author block MUST persist fail-closed at block time.
+    #[test]
+    fn apply_read_exclusions_does_not_rescue_a_unilateral_block() {
+        let author = "did:example:asym-author";
+        let unilaterally_blocked = "did:example:asym-blocked";
+        let mut ctx = make_open_ctx();
+        ctx.add_author(author).unwrap();
+
+        // A unilateral per-author block is NOT in any read_exclusion_list, so an
+        // empty reconciliation input leaves the (hypothetically dropped) block
+        // un-restored — the block is absent because we never applied it here, and
+        // reconciliation with an empty exclusion set cannot conjure it.
+        ctx.apply_read_exclusions(std::iter::empty::<&str>());
+
+        assert!(
+            !ctx.is_blocked(author, unilaterally_blocked),
+            "reconciliation keyed on read_exclusion_list cannot re-derive a \
+             per-author unilateral block — that arm relies on fail-closed persist"
+        );
     }
 }

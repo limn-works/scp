@@ -13,7 +13,7 @@
 //! | `SCP-PERM-` | 3000-3999 | UCAN / permission errors |
 //! | `SCP-CRYPTO-` | 4000-4999 | Cryptographic errors |
 //! | `SCP-TRANS-` | 5000-5999 | Transport errors |
-//! | `SCP-TOOL-` | 6000-6999 | Tool errors |
+//! | `SCP-OUTLET-` | 6000-6999 | Outlet errors |
 //! | `SCP-VALID-` | 7000-7999 | Validation errors |
 //!
 //! # napi-rs error model
@@ -94,12 +94,12 @@ pub enum ScpNapiError {
         code: String,
     },
 
-    /// A tool operation failed (registration, invocation, verification).
-    #[error("[{code}] tool error: {message}")]
-    Tool {
+    /// A outlet operation failed (registration, invocation, verification).
+    #[error("[{code}] outlet error: {message}")]
+    Outlet {
         /// Human-readable error message.
         message: String,
-        /// Stable error code (e.g. `SCP-TOOL-6001`).
+        /// Stable error code (e.g. `SCP-OUTLET-6001`).
         code: String,
     },
 
@@ -110,6 +110,69 @@ pub enum ScpNapiError {
         message: String,
         /// Stable error code (e.g. `SCP-VALID-7001`).
         code: String,
+    },
+
+    /// A §6.2.4 cross-context outlet-invocation saga aborted at a Prepare phase
+    /// (ADR-049 §3a).
+    ///
+    /// This terminal surfaces a §6.2.4 saga `Aborted` and, like its `PyO3` and
+    /// `UniFFI` siblings, may be a PERMANENT rejection (authorization / freshness
+    /// / rate-limit / co-residency policy denial) OR a RETRYABLE transient (a
+    /// rate limit, or a participant actor unavailable to complete the Prepare
+    /// exchange) — distinguished by the `SCP-SAGA-*` code.
+    ///
+    /// napi-rs collapses every `ScpNapiError` to a single `napi::Error` whose
+    /// only payload is a message string (the TypeScript SDK reverses the
+    /// `[{code}]` prefix into a typed `ScpError`). So the load-bearing
+    /// structured datum — the rate-limit back-off hint — is appended to the
+    /// message in a machine-parseable `(retry_after_ms=…)` suffix that the TS
+    /// wrapper reads. `retry_after_ms` is rendered as a literal `null` when
+    /// `None` (NEVER `0`): a `0` would read as "retry immediately" and re-trip
+    /// the same hard limit. The field stays `Option<u64>` here so the value is
+    /// read STRUCTURALLY off `SagaAbortReason::RateLimited`, never re-parsed.
+    #[error(
+        "[{code}] saga aborted: {message} (retry_after_ms={})",
+        retry_after_ms.map_or_else(|| "null".to_owned(), |v| v.to_string())
+    )]
+    SagaAborted {
+        /// Human-readable detail.
+        message: String,
+        /// The canonical `SCP-SAGA-13xxx` code.
+        code: String,
+        /// Rate-limit back-off hint in milliseconds, or `None` (never `0`).
+        retry_after_ms: Option<u64>,
+    },
+
+    /// A §6.2.4 saga exhausted its Commit retries and may have diverged
+    /// (ADR-049 §3a).
+    ///
+    /// The durable `saga_id` operator-repair handle is appended to the message
+    /// in a machine-parseable `(saga_id=…)` suffix for the TS wrapper, and held
+    /// STRUCTURALLY in the variant.
+    #[error("[{code}] saga needs repair: {message} (saga_id={saga_id})")]
+    SagaNeedsRepair {
+        /// Human-readable detail.
+        message: String,
+        /// The canonical `SCP-SAGA-13065` code.
+        code: String,
+        /// The durable saga identifier — the operator-repair handle.
+        saga_id: String,
+    },
+
+    /// A §6.2.4 saga's participant context set overlapped an in-flight saga
+    /// (§5.15.4).
+    ///
+    /// The contended context id is appended to the message in a
+    /// machine-parseable `(contended_context=…)` suffix for the TS wrapper, and
+    /// held STRUCTURALLY in the variant.
+    #[error("[{code}] saga busy: {message} (contended_context={contended_context})")]
+    SagaBusy {
+        /// Human-readable detail.
+        message: String,
+        /// The canonical `SCP-SAGA-13066` code.
+        code: String,
+        /// The shared context id that forced serialization.
+        contended_context: String,
     },
 }
 
@@ -166,7 +229,7 @@ impl From<scp_identity::IdentityError> for ScpNapiError {
 /// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
 ///
 /// Mirrors the `PyO3` bridge's `extract_scp_code` helper. Used to recover
-/// economy (12xxx) and tool-invocation (6xxx) codes embedded inside
+/// economy (12xxx) and outlet-invocation (6xxx) codes embedded inside
 /// `ContextError::PermissionDenied(String)` so TypeScript callers can
 /// check `.code` instead of string-matching the message body.
 pub(crate) fn extract_scp_code(message: &str) -> Option<String> {
@@ -258,9 +321,19 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2136.to_owned(),
             },
-            // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
+            // §5.9: a `RestoreAccess` requested capabilities that were not
+            // actually suspended for the member (and the member is not
+            // read-excluded with read requested). Dedicated SCP-CTX-2137
+            // instead of the CTX_2001 catch-all so a caller can detect a no-op
+            // restore. Mirrors the PyO3 bridge for cross-bridge
+            // parity.
+            CE::NothingToRestore(_) => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2137.to_owned(),
+            },
+            // Recover embedded SCP-ECON-/SCP-OUTLET-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
-            // typed-envelope contract holds for tool-economy failures.
+            // typed-envelope contract holds for outlet-economy failures.
             CE::PermissionDenied(msg) => {
                 let code = extract_scp_code(msg).unwrap_or_else(|| codes::PERM_3001.to_owned());
                 if code.starts_with("SCP-PERM-") {
@@ -268,8 +341,8 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                         message: format!("{e}"),
                         code,
                     }
-                } else if code.starts_with("SCP-TOOL-") {
-                    Self::Tool {
+                } else if code.starts_with("SCP-OUTLET-") {
+                    Self::Outlet {
                         message: format!("{e}"),
                         code,
                     }
@@ -343,33 +416,33 @@ impl From<scp_core::context::promotion::PromotionError> for ScpNapiError {
     }
 }
 
-impl From<scp_core::context::tools::ToolError> for ScpNapiError {
-    fn from(e: scp_core::context::tools::ToolError) -> Self {
-        Self::Tool {
+impl From<scp_core::context::outlets::OutletError> for ScpNapiError {
+    fn from(e: scp_core::context::outlets::OutletError) -> Self {
+        Self::Outlet {
             message: format!(
-                "tool operation failed: {e} — check tool registration, permissions, and input schema"
+                "outlet operation failed: {e} — check outlet registration, permissions, and input schema"
             ),
-            code: codes::TOOL_6001.to_owned(),
+            code: codes::OUTLET_6001.to_owned(),
         }
     }
 }
 
-impl From<scp_core::context::tools::invoke::InvocationError> for ScpNapiError {
-    fn from(e: scp_core::context::tools::invoke::InvocationError) -> Self {
-        Self::Tool {
+impl From<scp_core::context::outlets::invoke::InvocationError> for ScpNapiError {
+    fn from(e: scp_core::context::outlets::invoke::InvocationError) -> Self {
+        Self::Outlet {
             message: format!(
-                "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
+                "outlet invocation failed: {e} — verify outlet ID, input, and caller permissions"
             ),
-            code: codes::TOOL_6002.to_owned(),
+            code: codes::OUTLET_6002.to_owned(),
         }
     }
 }
 
-impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpNapiError {
-    fn from(e: scp_core::context::tools::schema::SchemaValidationError) -> Self {
+impl From<scp_core::context::outlets::schema::SchemaValidationError> for ScpNapiError {
+    fn from(e: scp_core::context::outlets::schema::SchemaValidationError) -> Self {
         Self::Validation {
             message: format!(
-                "schema validation failed: {e} — check input against the tool's JSON Schema"
+                "schema validation failed: {e} — check input against the outlet's JSON Schema"
             ),
             code: codes::VALID_7001.to_owned(),
         }
@@ -685,6 +758,19 @@ mod tests {
         let err: ScpNapiError =
             scp_core::context::ContextError::KeyPackageReplay("kp".to_owned()).into();
         assert_eq!(context_code_of(err), codes::CTX_2136);
+    }
+
+    /// §5.9: a `RestoreAccess` with nothing to restore must surface the
+    /// dedicated SCP-CTX-2137 code, distinct from the catch-all SCP-CTX-2001.
+    /// The same code is surfaced by the `PyO3` bridge for
+    /// cross-bridge parity.
+    #[test]
+    fn nothing_to_restore_surfaces_ctx_2137() {
+        let err: ScpNapiError = scp_core::context::ContextError::NothingToRestore(
+            "no suspended capabilities to restore for did:dht:zsubject".to_owned(),
+        )
+        .into();
+        assert_eq!(context_code_of(err), codes::CTX_2137);
     }
 
     /// Regression guard: an unrelated `ContextError` still falls through to

@@ -7,7 +7,7 @@
 //!
 //! Run with:
 //! ```sh
-//! cargo test -p scp-ffi-uniffi --test lifecycle --features allow_in_memory_custody
+//! cargo test -p scp-ffi-uniffi --test lifecycle --features testing
 //! ```
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]

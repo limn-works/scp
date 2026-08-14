@@ -377,6 +377,14 @@ export function createMockNativeScp(options: CreateMockNativeScpOptions = {}): M
  *   share setup across multiple SCP instances or opt into lenient mode
  *   via `createMockNativeScp({ strict: false })`.
  */
+/**
+ * NOTE: `mountMockScp` sets `#native` (for `SCP`-class methods that dispatch via
+ * `this.#native.*`) but does NOT populate the `_nativeBridgeForScp` WeakMap used
+ * by `getBridge(scp)`. Tests that exercise SDK methods routing through
+ * `getBridge` (e.g. identity-lifecycle wrappers, `evaluateTrust`) must
+ * additionally call `__setBridgeForTests(scp, spyBridge)` from
+ * `../src/internal/bridge` to inject a bridge into the WeakMap.
+ */
 export function mountMockScp(mockNativeScp?: MockNativeScp): {
   scp: SCP;
   native: MockNativeScp;

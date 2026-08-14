@@ -376,14 +376,14 @@ pub fn verify_compact_proof(proof: &CompactProof) -> bool {
 /// classification decision at compile time rather than silently defaulting.
 ///
 /// The 36 base variants retain their established classification. The 40
-/// native↔WASM unification variants (ADR-011 Amendment) are classified per the
+/// typed-event unification variants (ADR-011 Amendment) are classified per the
 /// same §2c rationale: governance / membership / lifecycle /
 /// structural-evolution events are structural; high-frequency operational
 /// records are operational. The 2 ADR-011 Amendment §6 cross-context-saga
 /// variants follow the same rule: `CrossContextDivergenceMarker` (a durable
 /// one-sided-commit accountability record) is structural;
-/// `CrossContextToolInvoked` (a per-invocation provenance edge, the
-/// cross-context analog of `ToolInvoked`) is operational.
+/// `CrossContextOutletInvoked` (a per-invocation provenance edge, the
+/// cross-context analog of `OutletInvoked`) is operational.
 ///
 /// Classification note:
 /// [`EventType::ContentKeysRotated`] and [`EventType::RecoveryEpochAdvanced`]
@@ -439,7 +439,7 @@ pub const fn is_structural_event(event_type: &EventType) -> bool {
         | EventType::ContextMigrationStarted
         | EventType::ContextMigrationCancelled
         | EventType::ContextTombstoned
-        | EventType::ToolRemoved
+        | EventType::OutletRemoved
         | EventType::PruningPolicyModified
         | EventType::TtlExtended
         | EventType::TtlExtensionRejected
@@ -462,11 +462,11 @@ pub const fn is_structural_event(event_type: &EventType) -> bool {
         // Base operational variants (unchanged classification):
         EventType::TokenRevoked
         | EventType::MessageSent
-        | EventType::ToolRegistered
-        | EventType::ToolUpdated
-        | EventType::ToolInvoked
-        | EventType::ToolVerified
-        | EventType::ToolInterfaceEstablished
+        | EventType::OutletRegistered
+        | EventType::OutletUpdated
+        | EventType::OutletInvoked
+        | EventType::OutletVerified
+        | EventType::OutletInterfaceEstablished
         | EventType::AbsenceProofRequested
         | EventType::KeyEpochAdvance
         | EventType::MediaSessionStarted
@@ -493,10 +493,10 @@ pub const fn is_structural_event(event_type: &EventType) -> bool {
         | EventType::CommitBroadcastSucceeded
         | EventType::CommitBroadcastFailed
         | EventType::PaymentCaptureFailed
-        // Cross-context-saga caller-side tool-call record (ADR-011 Amendment §6):
+        // Cross-context-saga caller-side outlet-call record (ADR-011 Amendment §6):
         // a per-invocation provenance edge, the cross-context analog of the
-        // operational `ToolInvoked` record — operational per ADR-030 §2c.
-        | EventType::CrossContextToolInvoked => false,
+        // operational `OutletInvoked` record — operational per ADR-030 §2c.
+        | EventType::CrossContextOutletInvoked => false,
     }
 }
 
@@ -1155,11 +1155,11 @@ mod tests {
             (EventType::RoleAssigned, true),
             (EventType::TokenRevoked, false),
             (EventType::MessageSent, false),
-            (EventType::ToolRegistered, false),
-            (EventType::ToolUpdated, false),
-            (EventType::ToolInvoked, false),
-            (EventType::ToolVerified, false),
-            (EventType::ToolInterfaceEstablished, false),
+            (EventType::OutletRegistered, false),
+            (EventType::OutletUpdated, false),
+            (EventType::OutletInvoked, false),
+            (EventType::OutletVerified, false),
+            (EventType::OutletInterfaceEstablished, false),
             (EventType::GovernanceAction, true),
             (EventType::ConsistencyCheckpoint, true),
             (EventType::AbsenceProofRequested, false),
@@ -1202,7 +1202,7 @@ mod tests {
             (EventType::HardRateLimitModified, true),
             (EventType::EconomicPolicyLocked, true),
             (EventType::ContextMigrationStarted, true),
-            (EventType::ToolRemoved, true),
+            (EventType::OutletRemoved, true),
             (EventType::PruningPolicyModified, true),
             (EventType::CommitBroadcasted, false),
             (EventType::CommitBroadcastPending, false),
@@ -1223,7 +1223,7 @@ mod tests {
             (EventType::AppBound, true),
             (EventType::AppUnbound, true),
             // --- Cross-context-saga carve-out (ADR-011 Amendment §6) ---
-            (EventType::CrossContextToolInvoked, false),
+            (EventType::CrossContextOutletInvoked, false),
             (EventType::CrossContextDivergenceMarker, true),
         ];
 

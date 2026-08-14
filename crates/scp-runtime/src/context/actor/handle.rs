@@ -145,7 +145,7 @@ impl ContextActorHandle {
 
     /// Like [`Self::send`], but RECOVERS the un-delivered command when the
     /// mailbox send itself fails, so a caller that moved an unbalanced,
-    /// must-consume payload (e.g. a `ToolEconomyTicket`-bearing reservation)
+    /// must-consume payload (e.g. a `OutletEconomyTicket`-bearing reservation)
     /// into the command can reclaim and balance it instead of dropping it.
     ///
     /// [`Self::send`] builds the command, then on a full/closed mailbox drops
@@ -280,9 +280,9 @@ impl ContextActorHandle {
     /// the ack. See [`Self::send`] for error semantics.
     ///
     /// Called by the `BridgeInstanceCore::suspend` default body in
-    /// `scp_ffi_common::bridge_instance::BridgeInstanceCore` — commit 6
-    /// lands the send-path stub; the handler that processes the variant
-    /// lands with the lifecycle-control migration in commit 11.
+    /// `scp_ffi_common::bridge_instance::BridgeInstanceCore`. The handler
+    /// that processes the `Pause` variant is implemented in
+    /// [`crate::context::actor::handlers::lifecycle_control`].
     ///
     /// # Errors
     ///
@@ -330,7 +330,19 @@ impl ContextActorHandle {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::context::actor::commands::MessagingCommand;
+    use crate::context::actor::commands::QueriesCommand;
+
+    /// Build the read-only smoke-test command used across these plumbing
+    /// tests: a `MemberCount` query is side-effect-free and carries a
+    /// unit-shaped `Result<Option<usize>, _>` reply, so it exercises the
+    /// mailbox/handle machinery without invoking any real handler here
+    /// (these tests use hand-rolled pseudo-actors, not the dispatch loop).
+    fn smoke_query(reply: oneshot::Sender<Result<Option<usize>, ContextError>>) -> ContextCommand {
+        ContextCommand::Queries(QueriesCommand::MemberCount {
+            context_id: "smoke".to_owned(),
+            reply,
+        })
+    }
 
     #[test]
     fn send_timeout_is_30_seconds() {
@@ -346,7 +358,7 @@ mod tests {
         drop(rx);
         let handle = ContextActorHandle::from_sender(tx);
         let err = handle
-            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+            .send(smoke_query)
             .await
             .expect_err("closed mailbox must error");
         match err {
@@ -362,16 +374,12 @@ mod tests {
     async fn send_recover_on_failure_returns_command_on_closed_mailbox() {
         // FIX 1 core: a send to a closed mailbox RETURNS the un-delivered
         // command instead of dropping it, so a caller that moved a must-use
-        // payload (a ToolEconomyTicket-bearing reservation) into the command can
+        // payload (a OutletEconomyTicket-bearing reservation) into the command can
         // reclaim and balance it rather than tripping the ticket's drop guard.
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
         drop(rx);
         let handle = ContextActorHandle::from_sender(tx);
-        let result: Result<(), _> = handle
-            .send_recover_on_failure(|reply| {
-                ContextCommand::Messaging(MessagingCommand::Placeholder { reply })
-            })
-            .await;
+        let result: Result<Option<usize>, _> = handle.send_recover_on_failure(smoke_query).await;
         let (err, recovered) = result.expect_err("closed mailbox must error");
         match err {
             ContextError::ActorBusy(msg) => {
@@ -383,7 +391,7 @@ mod tests {
         assert!(
             matches!(
                 *cmd,
-                ContextCommand::Messaging(MessagingCommand::Placeholder { .. })
+                ContextCommand::Queries(QueriesCommand::MemberCount { .. })
             ),
             "the recovered command must be the SAME command we attempted to send"
         );
@@ -395,17 +403,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<ContextCommand>(1);
         let handle = ContextActorHandle::from_sender(tx);
         let actor = tokio::spawn(async move {
-            if let Some(ContextCommand::Messaging(MessagingCommand::Placeholder { reply })) =
+            if let Some(ContextCommand::Queries(QueriesCommand::MemberCount { reply, .. })) =
                 rx.recv().await
             {
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(Ok(None));
             }
         });
-        let result: Result<(), _> = handle
-            .send_recover_on_failure(|reply| {
-                ContextCommand::Messaging(MessagingCommand::Placeholder { reply })
-            })
-            .await;
+        let result: Result<Option<usize>, _> = handle.send_recover_on_failure(smoke_query).await;
         assert!(result.is_ok(), "delivered command must return Ok");
         actor.await.unwrap();
     }
@@ -418,16 +422,14 @@ mod tests {
 
         let actor_task = tokio::spawn(async move {
             let cmd = rx.recv().await.expect("actor received a command");
-            if let ContextCommand::Messaging(MessagingCommand::Placeholder { reply }) = cmd {
-                let _ = reply.send(Ok(()));
+            if let ContextCommand::Queries(QueriesCommand::MemberCount { reply, .. }) = cmd {
+                let _ = reply.send(Ok(None));
             } else {
                 panic!("unexpected command variant");
             }
         });
 
-        let result: Result<(), ContextError> = handle
-            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
-            .await;
+        let result: Result<Option<usize>, ContextError> = handle.send(smoke_query).await;
         assert!(result.is_ok(), "roundtrip must succeed, got {result:?}");
         actor_task.await.unwrap();
     }

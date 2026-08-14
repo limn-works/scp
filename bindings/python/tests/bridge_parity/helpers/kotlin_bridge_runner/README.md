@@ -14,8 +14,8 @@ UniFFI Kotlin bindings must already be generated:
 
 ```sh
 cd <repo-root>
-cargo build -p scp-ffi-uniffi --features allow_in_memory_custody
-./scripts/generate-uniffi-kotlin.sh --skip-build --features=allow_in_memory_custody
+cargo build -p scp-ffi-uniffi --features testing
+./scripts/generate-uniffi-kotlin.sh --skip-build --features=testing
 ```
 
 Then build the runner's distribution. The runner does NOT ship its own

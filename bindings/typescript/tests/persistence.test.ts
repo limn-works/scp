@@ -61,7 +61,8 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 // attempt a cheap `new SCP({ storage: { type: "in_memory" } })` inside a try/catch — if the addon is
 // structurally unavailable we'll get a `SCP-VALID-7005` ValidationError
 // and skip the whole suite. This keeps the test file runnable in
-// browser/WASM-only environments without hard-failing.
+// environments without the native addon (e.g. an unsupported platform)
+// without hard-failing.
 function napiAvailable(): boolean {
   try {
     const probe = new SCP({ storage: { type: "in_memory" } });

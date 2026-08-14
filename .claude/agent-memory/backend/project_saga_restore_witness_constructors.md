@@ -1,0 +1,21 @@
+---
+name: saga-restore-witness-constructors
+description: Supervisor saga-journal/persistence wiring facts that gate how RestoredContexts witness + restore_on_startup tests can be built
+metadata:
+  type: project
+---
+
+§17.16.4 restore-then-replay startup (ADR-049 Phase 2D) constructor/visibility facts in `crates/scp-runtime/src/context/supervisor/supervisor.rs`:
+
+- `RestoredContexts` is the type-witness: `replay_unresolved_sagas(&RestoredContexts)` requires it; only `restore_all_contexts` mints it via private `new`. This encodes restore-before-replay at the type level.
+- `Supervisor::new(persistence, journal, cfg)` (pub, 3-arg) accepts ANY `Arc<dyn SagaJournal>` (incl. durable `ProtocolRepositorySagaJournal`) BUT does NOT populate `helper_persistence` (the `OnceLock` that `persistence_ref()` reads). Only `with_providers`/`with_providers_and_journal` set `helper_persistence`.
+- `restore_all_contexts` helper branches on `persistence_ref()` (= `helper_persistence.get()`). A `Supervisor::new` supervisor → `persistence_ref()` is `None` → restore returns `Err(PersistenceFailed)` (NOT an empty token). Proven by test `restore_on_startup_fails_closed_when_restore_leg_errors`. So you CANNOT mint a `RestoredContexts` via `restore_all_contexts().expect()` in the `Supervisor::new` integration harnesses — it panics.
+- `with_providers` (pub) HARD-WIRES `NoopSagaJournal` (obfuscated nowhere; named `NoopSagaJournal`). `NoopSagaJournal::load_unresolved` always returns empty → no saga replay observable. Production bridges build the supervisor via `build_supervisor`→`Supervisor::with_providers`, so **production currently uses a no-op saga journal** — the durable `ProtocolRepositorySagaJournal` is referenced ONLY in scp-runtime tests, never in any bridge/node path. (Latent: §17.16.4 replay is a no-op in prod bridges. Separate concern.)
+- `with_providers_and_journal` (durable-journal + populated helper_persistence seam) is `pub(in crate::context)` — NOT reachable from scp-ffi/common or from scp-runtime *integration* test crates (separate crate). The in-`src` `#[cfg(test)]` builders `xctx_supervisor_with_real_journal[_persistence]` use it to drive the genuine `restore_on_startup` both-legs proof.
+
+**Why:** a review found a `Default`-forge + a `testing`-feature leak on `RestoredContexts`, and asked for a bridge-layer bootstrap test of `restore_all_persisted_contexts`.
+**How to apply (RESOLVED in commit d4f7a7aea):**
+- `for_test` re-gated `testing` → dedicated `saga-witness-test-mint` scp-runtime feature (NOT implied by `testing`), added to the `actor_saga_coordinator`/`actor_saga_crash_recovery` `[[test]]` `required-features`. CONSEQUENCE: `cargo test -p scp-runtime --test actor_saga_* --features testing` now ERRORS (required-features unmet); a `--workspace` run SILENTLY SKIPS them. So you MUST thread `scp-runtime/saga-witness-test-mint` into the workspace CI test/clippy/doc invocations (ci.yml clippy+nextest+doc, release.yml, build-matrix.yml, docs.yml) or those targets stop running in CI. Leak now closed (probe `for_test`/`default()` → E0599 in the allow_in_memory_custody lib build).
+- Bridge both-legs test went to scp-testing (`tests/integration/saga_bridge_bootstrap.rs`, NOT scp-ffi/common — scp-testing already deps scp-ffi-common + uses `CoreFields`). Widened `with_providers_and_journal` to `pub`. KEY GOTCHAS minting a restorable context: (1) MLS storage Arc must be SHARED across the pre-crash + post-restart supervisors (group state lives in OpenMLS storage); (2) use `ContextMode::Encrypted` not `Broadcast` — Broadcast restore hits a routing-variant mismatch (`snapshot broadcast=true contradicts reconstructed mode broadcast=false`); (3) `read_context_state(id)==Some(_)` proves residency (restore leg); query a separately-held `Arc<dyn SagaJournal>` over the same storage for `load_unresolved` (supervisor.saga_journal is private).
+- Intra-doc links to the feature-gated `for_test` were softened to plain backticks so feature-free `cargo doc` doesn't dangle.
+The `testing`-feature leak on `for_test` was real (proven: probe `RestoredContexts::for_test(vec![])` compiled in `cargo build -p scp-ffi --features allow_in_memory_custody --lib`) because `allow_in_memory_custody → dep:scp-testing → scp-core{testing} → scp-runtime/testing`.

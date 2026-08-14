@@ -5,12 +5,12 @@
 //! # Design
 //!
 //! [`ProductionMlsBackend`] is a stateless struct that delegates every
-//! primitive to the existing [`super::group`], [`super::encrypt`], and
-//! [`super::ratchet`] free functions — the same `OpenMLS` primitives the
-//! pre-refactor `MlsCryptoProvider` calls. This guarantees byte-identical
+//! primitive to the existing [`scp_mls::group`], [`scp_mls::encrypt`], and
+//! [`scp_mls::ratchet`] free functions — the same `OpenMLS` primitives the
+//! pre-refactor `NodeMlsFactory` calls. This guarantees byte-identical
 //! output for equivalent inputs (see the unit test suite below), which is a
 //! hard requirement of the commit 4 plan: later commits replace
-//! `MlsCryptoProvider` with handler functions that call this trait, and the
+//! `NodeMlsFactory` with handler functions that call this trait, and the
 //! migration MUST NOT perturb wire bytes.
 //!
 //! # Signer-state serialization
@@ -36,12 +36,15 @@ use super::backend::{
     AddMemberRaw, GeneratedKeyPackage, MlsBackend, RemoveMemberRaw, SignerState,
     ValidatedKeyPackage,
 };
-use super::credential::ScpCredential;
-use super::encrypt::{DecryptedContent, decrypt_with_sender_did};
-use super::error::MlsError;
-use super::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
-use super::storage::{InMemoryMlsProvider, new_provider};
+use super::storage::new_provider;
 use super::storage_adapter::OpenMlsStorageAdapter;
+use scp_clock::Clock;
+use scp_mls::InMemoryMlsProvider;
+use scp_mls::credential::ScpCredential;
+use scp_mls::encrypt::{DecryptedContent, decrypt_with_sender_did};
+use scp_mls::error::MlsError;
+use scp_mls::group::{self, SCP_CIPHERSUITE, ScpMlsGroup};
+use scp_mls::validate_key_package_lifetime;
 
 /// Durable-store key namespace for the consumed-init-key set (A2 crypto-layer
 /// single-use backstop). Value at `scp-kp-consumed-initkey/{hex(SHA-256(init_key))}`
@@ -56,7 +59,7 @@ const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 /// Production `MlsBackend` backed by `OpenMLS`.
 ///
 /// Stateless on the wire-primitive surface — every MLS primitive delegates to
-/// the same free-function family the pre-refactor `MlsCryptoProvider` uses,
+/// the same free-function family the pre-refactor `NodeMlsFactory` uses,
 /// preserving byte-identical output through the trait split. The owned state is
 /// the durable consumed-init-key set (`consumed_init_key_store`), a crypto-layer
 /// single-use backstop attached once after construction via
@@ -65,12 +68,12 @@ const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 ///
 /// # Why the store is attached after construction (not a constructor arg)
 ///
-/// The backend is built inside `MlsCryptoProvider::new` / `with_backends`,
+/// The backend is built inside `NodeMlsFactory::new` / `with_backends`,
 /// which run BEFORE the supervisor exists and therefore before the
 /// supervisor-owned `mls_storage` is available — the provider (carrying this
 /// backend) is passed INTO `Supervisor::with_providers`, which only then has
 /// the storage to wire. A construction-time required parameter is thus
-/// impossible without inverting that ordering across all four FFI bridges.
+/// impossible without inverting that ordering across all three FFI bridges.
 /// Instead the store is a [`OnceLock`] set once after construction, and
 /// `join_from_welcome` **fails CLOSED** when it is still unset (deny-by-default)
 /// — the single-use backstop never silently vanishes.
@@ -98,8 +101,13 @@ const CONSUMED_INIT_KEY_PREFIX: &str = "scp-kp-consumed-initkey";
 /// Giving A2 a SEPARATE failure domain from A1 is a possible FUTURE hardening,
 /// out of scope until the consume path is production-wired (the
 /// spawn-from-Welcome entrypoint) and deliberately NOT implemented now.
-#[derive(Default)]
 pub struct ProductionMlsBackend {
+    /// Injected hardened [`Clock`] used to stamp `KeyPackage` / group-leaf
+    /// `Lifetime`s on generation and to re-validate accepted `Lifetime`s on the
+    /// receive/add paths (ADR-057 §Prereq-1). In production this is the SAME
+    /// `Arc` the owning `NodeMlsFactory` and the actor-deps clock share, so
+    /// there is one hardened clock per node — never openmls's internal one.
+    clock: Arc<dyn Clock>,
     /// Durable consumed-init-key set. `None` until
     /// [`MlsBackend::set_consumed_init_key_store`] wires the supervisor's
     /// shared `mls_storage`. When unset, `join_from_welcome` FAILS CLOSED (it
@@ -114,12 +122,17 @@ pub struct ProductionMlsBackend {
     /// hot per-context dispatch path, so ADR-049 §12's "no `Mutex` on read
     /// paths" rule is not implicated (the gate is acquired only on a join,
     /// which is not a per-command-dispatch read).
+    #[allow(
+        clippy::disallowed_types,
+        reason = "ADR-049 §Decision 12 allow-list: serializes the join_from_welcome consumed-init-key retrieve→join→store sequence (TOCTOU guard). Acquired only on a join, not on a per-command read path."
+    )]
     join_gate: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for ProductionMlsBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProductionMlsBackend")
+            .field("clock", &"<Arc<dyn Clock>>")
             .field(
                 "consumed_init_key_store",
                 &self.consumed_init_key_store.get().is_some(),
@@ -135,11 +148,22 @@ impl ProductionMlsBackend {
     /// [`MlsBackend::set_consumed_init_key_store`] (called from the
     /// supervisor's `with_providers`) BEFORE any join is attempted; until the
     /// store is attached, [`MlsBackend::join_from_welcome`] fails closed.
+    ///
+    /// # Arguments
+    ///
+    /// * `clock` - The injected hardened [`Clock`] used for `KeyPackage` /
+    ///   group-leaf `Lifetime` stamping and validation (ADR-057 §Prereq-1).
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        #[allow(
+            clippy::disallowed_types,
+            reason = "ADR-049 §Decision 12 allow-list: constructs the join_from_welcome TOCTOU guard (see the `join_gate` field); acquired only on a join, not a per-command read."
+        )]
+        let join_gate = tokio::sync::Mutex::new(());
         Self {
+            clock,
             consumed_init_key_store: OnceLock::new(),
-            join_gate: tokio::sync::Mutex::new(()),
+            join_gate,
         }
     }
 
@@ -311,9 +335,10 @@ impl MlsBackend for ProductionMlsBackend {
         wrapping_pubkey: Option<&[u8; 32]>,
     ) -> Result<ScpMlsGroup, MlsError> {
         // Delegate to the free function; byte-identical to
-        // `MlsCryptoProvider::create_mls_group` (which also calls the same
-        // primitive).
-        group::create_group_with_wrapping_key(credential, wrapping_pubkey)
+        // `NodeMlsFactory::create_mls_group` (which also calls the same
+        // primitive). The creator's own leaf `Lifetime` is stamped from the
+        // injected hardened clock (ADR-057 §Prereq-1).
+        group::create_group_with_wrapping_key(credential, wrapping_pubkey, self.clock.as_ref())
     }
 
     async fn add_member_raw(
@@ -328,7 +353,7 @@ impl MlsBackend for ProductionMlsBackend {
         let kp = KeyPackageIn::tls_deserialize(&mut &*key_package_bytes)
             .map_err(|e| MlsError::AddMemberFailed(format!("deserializing key package: {e}")))?;
 
-        let result = group::add_member(group, kp)?;
+        let result = group::add_member(group, kp, self.clock.as_ref())?;
 
         // Serialize the outputs. TLS-serialize matches the primitive
         // `AddMemberResult` fields exactly — byte-identical to the pre-
@@ -384,8 +409,8 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, MlsError> {
-        let mls_message = super::encrypt::encrypt(group, plaintext)?;
-        super::encrypt::serialize_ciphertext(&mls_message)
+        let mls_message = scp_mls::encrypt::encrypt(group, plaintext)?;
+        scp_mls::encrypt::serialize_ciphertext(&mls_message)
     }
 
     async fn decrypt(
@@ -393,7 +418,7 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         ciphertext: &[u8],
     ) -> Result<DecryptedContent, MlsError> {
-        decrypt_with_sender_did(group, ciphertext)
+        decrypt_with_sender_did(group, ciphertext, self.clock.as_ref())
     }
 
     async fn process_commit(
@@ -404,7 +429,7 @@ impl MlsBackend for ProductionMlsBackend {
         // Parse the incoming Commit bytes and process via `decrypt_with_sender_did`
         // path, but only accept Commit outcomes. This reuses the existing
         // `process_message` + `merge_staged_commit` sequence verbatim.
-        let content = decrypt_with_sender_did(group, commit_bytes)?;
+        let content = decrypt_with_sender_did(group, commit_bytes, self.clock.as_ref())?;
         match content {
             DecryptedContent::Commit { .. } => Ok(()),
             DecryptedContent::Application { .. } => Err(MlsError::CommitProcessingFailed(
@@ -421,12 +446,12 @@ impl MlsBackend for ProductionMlsBackend {
         group: &mut ScpMlsGroup,
         wrapping_pubkey: Option<&[u8; 32]>,
     ) -> Result<Vec<u8>, MlsError> {
-        // Match the existing `MlsCryptoProvider::advance_epoch` semantics:
+        // Match the existing `NodeMlsFactory::advance_epoch` semantics:
         // the pre-refactor code defaulted the wrapping key to zero-bytes
         // when the provider had not yet generated one (rare but possible
         // during test flows). Mirror that behaviour byte-for-byte.
         let wrap = wrapping_pubkey.map_or([0u8; 32], |k| *k);
-        let commit = super::ratchet::propose_update_with_wrapping_key(group, &wrap)?;
+        let commit = scp_mls::ratchet::propose_update_with_wrapping_key(group, &wrap)?;
         commit
             .tls_serialize_detached()
             .map_err(|e| MlsError::CommitProcessingFailed(format!("serializing commit: {e}")))
@@ -435,6 +460,7 @@ impl MlsBackend for ProductionMlsBackend {
     async fn validate_key_package(
         &self,
         key_package_bytes: &[u8],
+        clock: &dyn Clock,
     ) -> Result<ValidatedKeyPackage, MlsError> {
         // Deserialize and validate against the SCP ciphersuite. This runs the
         // OpenMLS-side validation without holding any group state.
@@ -446,6 +472,15 @@ impl MlsBackend for ProductionMlsBackend {
             .validate(provider.crypto(), ProtocolVersion::Mls10)
             .map_err(|e| MlsError::AddMemberFailed(format!("key package validation: {e}")))?;
 
+        // SECURITY (ADR-057 §Prereq-1): openmls's `validate` above runs its own
+        // internal `Lifetime::is_valid` against openmls's (wasm: unhardened)
+        // clock. Re-validate the accepted `Lifetime` against the injected
+        // hardened clock (threaded in as `clock`, not read from backend state —
+        // SCP-CRYPTOMOVE-000c) and enforce the RFC 9420 max-range bound
+        // openmls's `validate` never applies. Additive hardening; never
+        // replaces openmls.
+        validate_key_package_lifetime(validated.life_time(), clock)?;
+
         // Guard the SCP ciphersuite invariant: any KP using a non-SCP
         // ciphersuite MUST be rejected even if OpenMLS validates it against
         // `Mls10`.
@@ -456,6 +491,18 @@ impl MlsBackend for ProductionMlsBackend {
             )));
         }
 
+        // Extract the authenticated credential DID from the SAME already-
+        // validated leaf. This is the single validate-and-bind that replaces
+        // the caller-side re-parse + `scp_mls::group::key_package_in_did`
+        // re-validation: it mirrors that primitive's extraction exactly
+        // (leaf credential → `BasicCredential` → `ScpCredential` → `did`) but
+        // reuses `validated` instead of re-running `.validate` on the bytes.
+        let credential = validated.leaf_node().credential().clone();
+        let basic = BasicCredential::try_from(credential).map_err(|e| {
+            MlsError::CredentialSerializationFailed(format!("extracting BasicCredential: {e}"))
+        })?;
+        let credential_did = ScpCredential::from_bytes(basic.identity())?.did;
+
         // Re-serialize to return the canonical validated bytes. Functionally
         // equivalent to the input (OpenMLS does not mutate on validate), but
         // we construct via the validated type so downstream persistence is
@@ -463,6 +510,7 @@ impl MlsBackend for ProductionMlsBackend {
         let bytes = key_package_bytes.to_vec();
         Ok(ValidatedKeyPackage {
             key_package_bytes: bytes,
+            credential_did,
         })
     }
 
@@ -471,8 +519,33 @@ impl MlsBackend for ProductionMlsBackend {
         credential: &ScpCredential,
         wrapping_pubkey: Option<&[u8; 32]>,
     ) -> Result<GeneratedKeyPackage, MlsError> {
-        let (bundle, signer, provider) =
-            group::generate_key_package_with_wrapping_key(credential, wrapping_pubkey)?;
+        // Every pooled KeyPackage must be joinable into an SCP *context* group,
+        // whose `group_context` carries the `scp_context_params` (`0xFF02`)
+        // extension. OpenMLS rejects (`valn0502`, RFC 9420 §12.1.8.2) an Add
+        // whose leaf does not declare support for every `group_context`
+        // extension present in the group — so the KP leaf MUST advertise the
+        // `0xFF02` capability regardless of whether a wrapping key is available.
+        //
+        // `generate_key_package_with_context_params` declares BOTH `0xFF01` +
+        // `0xFF02` *capabilities* unconditionally, and attaches the `0xFF01`
+        // wrapping-key *leaf extension* only when a key is present (§9.16.1).
+        // The capability is what `valn0502` requires (no key material); the
+        // leaf extension is the optional enhancement that lets other members
+        // HPKE-seal sender keys to this member. Passing `wrapping_pubkey`
+        // straight through therefore yields a context-joinable KP in BOTH
+        // cases: `Some` → full participant (declares `0xFF02`, carries the
+        // wrapping key); `None` → context-joinable but non-receiving until the
+        // identity publishes a wrapping key. A `None` KP is NOT downgraded to a
+        // wrapping-only (`0xFF01`-only) KeyPackage, which real MLS would reject
+        // from a context group.
+        //
+        // The injected `Clock` mints the KeyPackage `Lifetime` (ADR-057
+        // Prereq-1, #2026) — never wall-clock `SystemTime::now()`.
+        let (bundle, signer, provider) = group::generate_key_package_with_context_params(
+            credential,
+            wrapping_pubkey,
+            self.clock.as_ref(),
+        )?;
 
         let kp_bytes = bundle.key_package().tls_serialize_detached().map_err(|e| {
             MlsError::KeyPackageGenerationFailed(format!("serializing key package: {e}"))
@@ -637,12 +710,12 @@ fn assert_groups_equivalent(left: &ScpMlsGroup, right: &ScpMlsGroup) -> Result<(
 }
 
 // ---------------------------------------------------------------------------
-// Tests — byte-identical output with MlsCryptoProvider MLS primitive calls
+// Tests — byte-identical output with NodeMlsFactory MLS primitive calls
 // ---------------------------------------------------------------------------
 //
 // These tests feed identical inputs to `ProductionMlsBackend` and the existing
 // `group::*` / `encrypt::*` / `ratchet::*` primitives (the same primitives
-// `MlsCryptoProvider` delegates to) and assert byte-identical output on the
+// `NodeMlsFactory` delegates to) and assert byte-identical output on the
 // MLS primitive surface. Because MLS Welcome / Commit / Ciphertext bytes all
 // embed fresh randomness (HPKE ephemeral, AEAD nonces, ratcheted key
 // schedule), strict byte equality on identical random inputs requires the
@@ -665,10 +738,11 @@ fn assert_groups_equivalent(left: &ScpMlsGroup, right: &ScpMlsGroup) -> Result<(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::crypto::mls::credential::ScpCredential;
     use crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter;
-    use scp_identity::SigningKeyId;
-    use scp_platform::testing::InMemoryStorage;
+    use scp_clock::SystemClock;
+    use scp_did::SigningKeyId;
+    use scp_mls::credential::ScpCredential;
+    use scp_platform::in_memory::InMemoryStorage;
 
     fn test_credential(name: &str) -> ScpCredential {
         ScpCredential::new(format!("did:dht:z6Mk{name}"), None, SigningKeyId::Active).unwrap()
@@ -679,7 +753,7 @@ mod tests {
     /// JOINABLE (it fails closed without a store). Use for any test that drives
     /// a real join.
     fn joinable_backend() -> ProductionMlsBackend {
-        let backend = ProductionMlsBackend::new();
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let store: Arc<dyn OpenMlsStorageAdapter> = Arc::new(SpawnBlockingStorageAdapter::new(
             Arc::new(InMemoryStorage::new()),
         ));
@@ -767,11 +841,11 @@ mod tests {
 
     #[tokio::test]
     async fn create_group_matches_primitive() {
-        let backend = ProductionMlsBackend::new();
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("alice-create");
 
         let via_backend = backend.create_group(&cred, None).await.unwrap();
-        let via_primitive = group::create_group(&cred).unwrap();
+        let via_primitive = group::create_group(&cred, &SystemClock).unwrap();
 
         // Both groups are single-member at epoch 0 with the SCP ciphersuite.
         assert_groups_equivalent(&via_backend, &via_primitive).expect("groups diverge");
@@ -782,7 +856,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_group_with_wrapping_key_propagates_extension() {
-        let backend = ProductionMlsBackend::new();
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let cred = test_credential("alice-wrap");
         let wrap_pub = [0x11u8; 32];
 
@@ -791,7 +865,7 @@ mod tests {
         // Reading the wrapping key back via the existing helper proves the
         // extension was placed correctly — byte-for-byte with the primitive
         // path.
-        let own_wrap = crate::crypto::mls::wrapping_extension::extract_own_wrapping_key(&grp)
+        let own_wrap = scp_mls::wrapping_extension::extract_own_wrapping_key(&grp)
             .expect("extension present")
             .expect("wrapping key bytes");
         assert_eq!(own_wrap, wrap_pub);
@@ -874,7 +948,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_member_raw_advances_epoch() {
-        let backend = ProductionMlsBackend::new();
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
 
         let alice_cred = test_credential("alice-rem");
         let bob_cred = test_credential("bob-rem");
@@ -902,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn advance_epoch_with_wrapping_key_matches_primitive() {
-        let backend = ProductionMlsBackend::new();
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
 
         let alice_cred = test_credential("alice-adv");
         let mut alice_grp = backend.create_group(&alice_cred, None).await.unwrap();
@@ -921,22 +995,70 @@ mod tests {
 
     #[tokio::test]
     async fn validate_key_package_accepts_valid_scp_kp() {
-        let backend = ProductionMlsBackend::new();
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
         let bob_cred = test_credential("bob-val");
         let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
 
         let validated = backend
-            .validate_key_package(&bob_gen.key_package_bytes)
+            .validate_key_package(&bob_gen.key_package_bytes, &SystemClock)
             .await
             .unwrap();
         assert_eq!(validated.key_package_bytes, bob_gen.key_package_bytes);
+        // The single validate-and-bind extracts the authenticated credential DID
+        // from the SAME validated leaf — it MUST equal the DID the KeyPackage was
+        // minted for (this is the binding the join/add call sites now rely on
+        // instead of a second `key_package_in_did` pass).
+        assert_eq!(validated.credential_did, bob_cred.did);
     }
 
     #[tokio::test]
     async fn validate_key_package_rejects_garbage() {
-        let backend = ProductionMlsBackend::new();
-        let err = backend.validate_key_package(&[0u8; 64]).await.unwrap_err();
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let err = backend
+            .validate_key_package(&[0u8; 64], &SystemClock)
+            .await
+            .unwrap_err();
         assert!(matches!(err, MlsError::AddMemberFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_key_package_stateless_clock_param_valid_and_expired() {
+        // SCP-CRYPTOMOVE-000c AC4: drive the stateless `MlsBackend::validate_key_package`
+        // form directly and assert both arms — a valid KeyPackage returns
+        // `Ok(ValidatedKeyPackage)`, and an expired-lifetime KeyPackage returns
+        // `MlsError::KeyPackageLifetimeInvalid` (the stateless form's variant; the
+        // retained `NodeMlsFactory::validate_key_package` wrapper maps the same
+        // condition to `ContextError::InvalidKeyPackage`, asserted in
+        // `provider::tests::validate_key_package_rejects_expired_lifetime_at_gate`).
+        use scp_clock::TestClock;
+        use scp_mls::KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS;
+
+        // Mint the KeyPackage at the REAL present (backend clock is `SystemClock`)
+        // so openmls's un-injectable internal `is_valid` accepts it; the injected
+        // `clock` param is what drives the SCP hardened re-check below.
+        let backend = ProductionMlsBackend::new(Arc::new(SystemClock));
+        let cred = test_credential("carol-stateless");
+        let generated = backend.generate_key_package(&cred, None).await.unwrap();
+
+        // Valid arm: clock at the real present → Ok(ValidatedKeyPackage).
+        let validated = backend
+            .validate_key_package(&generated.key_package_bytes, &SystemClock)
+            .await
+            .unwrap();
+        assert_eq!(validated.key_package_bytes, generated.key_package_bytes);
+
+        // Expired arm: advance the injected clock one full max-range past the
+        // present so the SCP bracket's `now < not_after` check fails.
+        let future_now = SystemClock.now_secs() + KEY_PACKAGE_LIFETIME_MAX_RANGE_SECS * 2;
+        let err = backend
+            .validate_key_package(&generated.key_package_bytes, &TestClock::new(future_now))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MlsError::KeyPackageLifetimeInvalid { .. }),
+            "expired lifetime under the injected clock must return \
+             KeyPackageLifetimeInvalid, got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -944,7 +1066,7 @@ mod tests {
         let backend = joinable_backend();
 
         // `advance_epoch` always proposes a wrapping-extension update on
-        // the leaf (mirrors `MlsCryptoProvider::advance_epoch`). For Bob
+        // the leaf (mirrors `NodeMlsFactory::advance_epoch`). For Bob
         // to accept the commit, Alice's group, Bob's KeyPackage, and the
         // subsequent `advance_epoch` call MUST agree on the wrapping
         // extension being present. We pass the same `wrap_pub` to
@@ -1014,12 +1136,12 @@ mod tests {
 
         // Backend → primitive.
         let ct1 = backend.encrypt(&mut alice_grp, b"msg-a").await.unwrap();
-        let pt1 = super::super::encrypt::decrypt(&mut bob_grp, &ct1).unwrap();
+        let pt1 = scp_mls::encrypt::decrypt(&mut bob_grp, &ct1).unwrap();
         assert_eq!(pt1, b"msg-a");
 
         // Primitive → backend.
-        let mls_out = super::super::encrypt::encrypt(&mut bob_grp, b"msg-b").unwrap();
-        let ct2 = super::super::encrypt::serialize_ciphertext(&mls_out).unwrap();
+        let mls_out = scp_mls::encrypt::encrypt(&mut bob_grp, b"msg-b").unwrap();
+        let ct2 = scp_mls::encrypt::serialize_ciphertext(&mls_out).unwrap();
         let decrypted = backend.decrypt(&mut alice_grp, &ct2).await.unwrap();
         match decrypted {
             DecryptedContent::Application { plaintext, .. } => {
@@ -1027,5 +1149,157 @@ mod tests {
             }
             other => panic!("expected Application, got {other:?}"),
         }
+    }
+
+    /// Root `scp_context_params` extension fixture.
+    fn sample_context_extension(context_id: &str) -> scp_protocol::context::ScpContextExtension {
+        use scp_did::DID;
+        use scp_protocol::context::GovernanceModel;
+        use scp_protocol::context::params::{CeilingPolicy, ContextMode};
+        use scp_protocol::context::roles::{Capability, CapabilityCeiling};
+
+        let governance = GovernanceModel::Threshold {
+            threshold: 2,
+            signers: vec![
+                DID::from("did:dht:z6MkAlice".to_owned()),
+                DID::from("did:dht:z6MkBob".to_owned()),
+            ],
+        };
+        let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
+        scp_protocol::context::ScpContextExtension::for_root(
+            context_id.to_owned(),
+            DID::from("did:dht:z6MkAlice".to_owned()),
+            ContextMode::Encrypted,
+            &governance,
+            CeilingPolicy::Immutable,
+            &ceiling,
+        )
+        .unwrap()
+    }
+
+    /// End-to-end proof of the wrapping-key / context-params coupling
+    /// (`valn0502`): a `KeyPackage` produced by the **production**
+    /// [`MlsBackend::generate_key_package`] path (which now declares BOTH
+    /// `0xFF01` and `0xFF02`) can be added to, and joined into, an SCP context
+    /// group (whose `group_context` carries the `0xFF02` extension). Without the
+    /// context-params switch in `generate_key_package`, the pooled KP would
+    /// declare only `0xFF01` and `OpenMLS` would reject the Add with
+    /// `AddMemberFailed`. This is the load-bearing coupling test.
+    #[tokio::test]
+    async fn production_key_package_joins_context_group() {
+        let backend = joinable_backend();
+
+        // Creator side: a context group carrying the 0xFF02 extension.
+        let alice_cred = test_credential("alice-ctx");
+        let alice_wrap = [0xA1u8; 32];
+        let ctx_ext = sample_context_extension("ctx:prod-join");
+        let mut alice_group = group::create_group_with_context(
+            &alice_cred,
+            &alice_wrap,
+            &ctx_ext,
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
+
+        // Joiner side: KP via the PRODUCTION generate_key_package path WITH a
+        // wrapping key — now declares 0xFF01 + 0xFF02.
+        let bob_cred = test_credential("bob-ctx");
+        let bob_wrap = [0xB2u8; 32];
+        let bob_gen = backend
+            .generate_key_package(&bob_cred, Some(&bob_wrap))
+            .await
+            .unwrap();
+
+        // The Add SUCCEEDS: bob's leaf declares 0xFF02, satisfying valn0502.
+        let added = backend
+            .add_member_raw(&mut alice_group, &bob_gen.key_package_bytes)
+            .await
+            .expect("production KP must satisfy valn0502 for a context group");
+
+        // And bob joins from the Welcome, recovering the creator-committed
+        // context extension byte-identically from the replicated group_context.
+        let bob_group = backend
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .expect("joiner processes the Welcome for the context group");
+
+        assert_eq!(
+            bob_group.group_context_extension().unwrap(),
+            Some(ctx_ext.clone()),
+            "joiner reads the creator-committed context extension"
+        );
+        assert_eq!(
+            alice_group.group_context_extension().unwrap(),
+            bob_group.group_context_extension().unwrap(),
+            "creator and joiner observe identical context extensions"
+        );
+    }
+
+    /// The `None`-branch (no wrapping key) production KP is STILL
+    /// context-joinable: it declares the `0xFF02` (`scp_context_params`)
+    /// capability — required by `valn0502` — even though it carries no `0xFF01`
+    /// wrapping-key leaf extension. This is the load-bearing invariant for the
+    /// production reserve path, whose supervisor `wrapping_keys` map has no
+    /// production writer yet (§9.16.1 wrapping-key publication is unwired), so
+    /// every reserved KP is generated with `wrapping_pubkey == None`. Were the
+    /// `None` branch to downgrade to a wrapping-only (`0xFF01`-only) KP, real
+    /// MLS would reject the Add ("the capabilities of the add proposal are
+    /// insufficient for this group") and NO node could ever join an encrypted
+    /// context via the reserve path.
+    ///
+    /// The joiner completes the Welcome round-trip and reads the
+    /// creator-committed context extension byte-identically. Sender-key
+    /// distribution to this member is separately (and correctly) skipped
+    /// because the leaf carries no wrapping key — but MLS membership succeeds.
+    #[tokio::test]
+    async fn production_key_package_without_wrapping_key_joins_context_group() {
+        let backend = joinable_backend();
+
+        let alice_cred = test_credential("alice-ctx-neg");
+        let alice_wrap = [0xA3u8; 32];
+        let ctx_ext = sample_context_extension("ctx:prod-neg");
+        let mut alice_group = group::create_group_with_context(
+            &alice_cred,
+            &alice_wrap,
+            &ctx_ext,
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
+
+        // Reserve-path KP: generated WITHOUT a wrapping key (the production
+        // reserve path today, since supervisor `wrapping_keys` is unwired).
+        let bob_cred = test_credential("bob-ctx-neg");
+        let bob_gen = backend.generate_key_package(&bob_cred, None).await.unwrap();
+
+        // The Add SUCCEEDS: bob's leaf declares 0xFF02 (capability, no key
+        // material required), satisfying valn0502 for the context group.
+        let added = backend
+            .add_member_raw(&mut alice_group, &bob_gen.key_package_bytes)
+            .await
+            .expect(
+                "a wrapping-key-less production KP MUST still be context-joinable \
+                 (declares 0xFF02 capability)",
+            );
+
+        // And bob joins from the Welcome, recovering the creator-committed
+        // context extension byte-identically.
+        let bob_group = backend
+            .join_from_welcome(
+                &added.welcome,
+                bob_gen.signer_state.clone(),
+                &bob_gen.key_package_bytes,
+            )
+            .await
+            .expect("wrapping-key-less joiner processes the Welcome for the context group");
+
+        assert_eq!(
+            bob_group.group_context_extension().unwrap(),
+            Some(ctx_ext),
+            "wrapping-key-less joiner reads the creator-committed context extension",
+        );
     }
 }

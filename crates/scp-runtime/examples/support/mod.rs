@@ -1,7 +1,7 @@
 //! Shared mock providers for scp-runtime examples.
 //!
 //! After ADR-049 commit 12c.9e, crypto is the concrete
-//! [`MlsCryptoProvider`]. Examples construct one per local DID; the
+//! [`NodeMlsFactory`]. Examples construct one per local DID; the
 //! old `MockCrypto` trait-impl scaffold was deleted along with the
 //! trait. The `MockTransport` / `MockEventLog` trait-based stubs
 //! remain because the transport and event-log traits are still
@@ -9,11 +9,11 @@
 
 #![allow(dead_code)]
 
-use scp_identity::DID;
+use scp_did::DID;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::{ContextError, ContextParams};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
+use scp_runtime::crypto::mls::provider::NodeMlsFactory;
 
 /// Derives a deterministic signing key from a DID string for example use.
 pub fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
@@ -26,9 +26,12 @@ pub fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&seed)
 }
 
-/// Convenience constructor: real `MlsCryptoProvider` bound to a DID.
-pub fn example_crypto(did: &str) -> std::sync::Arc<MlsCryptoProvider> {
-    std::sync::Arc::new(MlsCryptoProvider::new(did.to_owned()))
+/// Convenience constructor: real `NodeMlsFactory` bound to a DID.
+pub fn example_crypto(did: &str) -> std::sync::Arc<NodeMlsFactory> {
+    std::sync::Arc::new(NodeMlsFactory::new(
+        did.to_owned(),
+        std::sync::Arc::new(scp_clock::SystemClock),
+    ))
 }
 
 /// Convenience constructor: an in-memory `OpenMLS` storage adapter for the
@@ -39,7 +42,7 @@ pub fn example_mls_storage()
 -> std::sync::Arc<dyn scp_runtime::crypto::mls::storage_adapter::OpenMlsStorageAdapter> {
     std::sync::Arc::new(
         scp_runtime::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(
-            std::sync::Arc::new(scp_platform::testing::InMemoryStorage::new()),
+            std::sync::Arc::new(scp_platform::in_memory::InMemoryStorage::new()),
         ),
     )
 }
@@ -47,21 +50,26 @@ pub fn example_mls_storage()
 /// Mock transport provider — reports connected, all sends succeed silently.
 pub struct MockTransport;
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for MockTransport {
     fn is_connected(&self) -> bool {
         true
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn send_message(&self, _id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        _id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
         Ok(())
     }
 }
@@ -69,11 +77,12 @@ impl ContextTransportProvider for MockTransport {
 /// Mock event log provider — all operations succeed with no persistence.
 pub struct MockEventLog;
 
+#[async_trait::async_trait]
 impl ContextEventLogProvider for MockEventLog {
-    fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn append_event(
+    async fn append_event(
         &self,
         _id: &[u8; 32],
         _event_type: scp_event_log::EventType,
@@ -83,7 +92,7 @@ impl ContextEventLogProvider for MockEventLog {
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 }

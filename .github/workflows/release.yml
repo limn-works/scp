@@ -91,7 +91,7 @@ jobs:
           restore-keys: conformance-
 
       - name: Run all workspace tests
-        run: cargo test --workspace --release --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/saga-witness-test-mint
+        run: cargo test --workspace --release --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/saga-witness-test-mint
 
       # Conformance test suite runs against JSON fixtures.
       # When tests/conformance/ exists, run the dedicated conformance runner.
@@ -165,11 +165,16 @@ jobs:
         id: tags
         run: |
           TAGS=(
-            "scp-primitives@${{ env.VERSION }}"
+            "scp-clock@${{ env.VERSION }}"
+            "scp-crypto@${{ env.VERSION }}"
+            "scp-did@${{ env.VERSION }}"
+            "scp-dht@${{ env.VERSION }}"
             "scp-platform@${{ env.VERSION }}"
-            "scp-identity@${{ env.VERSION }}"
             "scp-event-log@${{ env.VERSION }}"
             "scp-protocol@${{ env.VERSION }}"
+            "scp-identity@${{ env.VERSION }}"
+            "scp-mls@${{ env.VERSION }}"
+            "scp-client@${{ env.VERSION }}"
             "scp-runtime@${{ env.VERSION }}"
             "scp-core@${{ env.VERSION }}"
             "scp-transport@${{ env.VERSION }}"
@@ -356,10 +361,34 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       # Publish order matters: dependencies first
-      - name: Publish scp-primitives
+      - name: Publish scp-clock
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish -p scp-primitives --allow-dirty
+        run: cargo publish -p scp-clock --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-crypto
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-crypto --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-did
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-did --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-dht
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-dht --allow-dirty
 
       - name: Wait for crates.io index
         run: sleep 60
@@ -368,14 +397,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p scp-platform --allow-dirty
-
-      - name: Wait for crates.io index
-        run: sleep 60
-
-      - name: Publish scp-identity
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish -p scp-identity --allow-dirty
 
       - name: Wait for crates.io index
         run: sleep 60
@@ -396,6 +417,30 @@ jobs:
       - name: Wait for crates.io index
         run: sleep 60
 
+      - name: Publish scp-identity
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-identity --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-mls
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-mls --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-client
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-client --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
       - name: Publish scp-runtime
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
@@ -408,6 +453,14 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: cargo publish -p scp-core --allow-dirty
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Publish scp-relay-client
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish -p scp-relay-client --allow-dirty
 
       - name: Wait for crates.io index
         run: sleep 60
@@ -824,7 +877,7 @@ jobs:
           done
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Registries that would be published to:" >> $GITHUB_STEP_SUMMARY
-          echo "- crates.io: scp-primitives, scp-platform, scp-identity, scp-event-log, scp-protocol, scp-runtime, scp-core, scp-transport, scp-mcp, scp-media, scp-node, scp-relay" >> $GITHUB_STEP_SUMMARY
+          echo "- crates.io: scp-clock, scp-crypto, scp-did, scp-dht, scp-platform, scp-event-log, scp-protocol, scp-identity, scp-mls, scp-client, scp-runtime, scp-core, scp-relay-client, scp-transport, scp-mcp, scp-media, scp-node, scp-relay" >> $GITHUB_STEP_SUMMARY
           echo "- PyPI: scp-python" >> $GITHUB_STEP_SUMMARY
           echo "- npm: @limn-works/scp-ts + @limn-works/scp-ts-napi-{linux-x64-gnu,linux-arm64-gnu,darwin-x64,darwin-arm64,win32-x64-msvc}" >> $GITHUB_STEP_SUMMARY
           echo "- Maven Central: works.limn:scp-kt, works.limn:scp-kt-android" >> $GITHUB_STEP_SUMMARY

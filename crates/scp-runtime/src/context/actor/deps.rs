@@ -17,31 +17,31 @@
 //! actor B directly" a compile-time property. Cross-actor atomicity is
 //! saga-only, enforced through the `start_saga` shape.
 //!
-//! # Commit 12a.5 expansion
+//! # ADR-049 §15 — collaborator-bundle expansion
 //!
-//! Commit 12a.5 of ADR-049 (pre-work for handler body migration)
-//! extends the bundle with every cross-cutting collaborator the legacy
-//! `ContextManager` handler submodules reach via `self.X`:
+//! The ADR-049 actor migration (§15, pre-work for handler body migration)
+//! extended the bundle with every cross-cutting collaborator the
+//! deleted `ContextManager` handler submodules reached via `self.X`:
 //!
-//! - `clock` — wall-clock source. Legacy: `ContextManager::clock`.
+//! - `clock` — wall-clock source. Formerly `ContextManager::clock`.
 //! - `event_tx` — optional fan-out channel for external `ContextEvent`
-//!   subscribers (webhook dispatcher in `scp-node`). Legacy:
+//!   subscribers (webhook dispatcher in `scp-node`). Formerly
 //!   `ContextManager::event_tx`. `Option` because not every embedder
-//!   wires a subscriber; legacy treats `None` as "drop silently."
+//!   wires a subscriber; the legacy handler treated `None` as "drop silently."
 //! - `key_resolver` — DID → Ed25519 verifying-key map used by UCAN /
-//!   governance vote verification. Legacy: `ContextManager::key_resolver`.
+//!   governance vote verification. Formerly `ContextManager::key_resolver`.
 //! - `payment_adapter` — optional economy adapter for the 9-step paid
-//!   action flow (spec §19.2.2). Legacy:
+//!   action flow (spec §19.2.2). Formerly
 //!   `ContextManager::payment_adapter`. `Option` because "free context"
 //!   is a valid configuration.
 //!
-//! # Commit 12b.2a expansion
+//! # ADR-049 §15 — actor-owned-state expansion
 //!
-//! Commit 12b.2a of ADR-049 (actor-owned-state infrastructure) adds one
-//! additional cross-cutting collaborator that handler bodies need once
-//! they stop delegating to `ContextManager`:
+//! The ADR-049 actor migration (§15, actor-owned-state infrastructure) adds one
+//! additional cross-cutting collaborator that handler bodies needed once
+//! they stopped delegating to the legacy manager:
 //!
-//! - `local_dids` — `Arc<ArcSwap<HashSet<DID>>>`. Legacy:
+//! - `local_dids` — `Arc<ArcSwap<HashSet<DID>>>`. Formerly
 //!   `ContextManager::local_dids` (`RwLock<HashSet<DID>>`). Rewritten to
 //!   `ArcSwap` here because the read path is on the hot path of every
 //!   `deliver_incoming` (resolve local member for sender-key layer) —
@@ -57,13 +57,13 @@
 //! over `S: Storage` (see `ProtocolRepositorySagaJournal<S>`,
 //! `ProtocolRepository<S>`). Embedding a generic in `ActorDeps` would
 //! require parameterizing every handler signature over `S`, which is a
-//! non-additive restructure out of scope for commit 12b.2a.
+//! non-additive restructure out of scope for the ADR-049 actor migration (§15).
 //!
 //! Handler bodies that need raw byte-blob storage (saga evidence, KP
 //! store blobs) reach it through the specific bridge that already
 //! owns a concrete `Arc<S>` — e.g. [`ActorDeps::persistence`] (typed
 //! `ContextSnapshot` persistence), or the
-//! [`KeyPackageStoreHandle`](crate::context::supervisor::key_package_actor::KeyPackageStoreHandle)
+//! [`KeyPackageStoreHandle`]
 //! inside the bundle. No handler currently needs `dyn Storage`
 //! directly; if one ever does, the path is a focused generic
 //! parameterization, not a dyn-trait field here.
@@ -76,23 +76,21 @@
 //!   capability contract (ADR §2: "Never ContextActor → ContextActor
 //!   directly"). Cross-context work goes through
 //!   `SupervisorHandle::start_saga`.
-//! - `task_set` / `next_generation` — supervisor-scoped lifecycle
-//!   state that migrates with the actor run-loop in commit 12b/c.
 //! - `consequence_rules` — per-context state stored in `PerContextState`,
 //!   not a cross-cutting dep.
 //!
-//! The new fields are wired on the supervisor side at actor-spawn time
-//! (shim wiring lives behind the `testing` feature until the legacy
-//! manager is deleted in commit 12). Handler bodies do not yet read the
-//! new fields — 12b+ performs the mechanical migration from
-//! `view.manager().foo` → `deps.foo`.
+//! These `ActorDeps` fields are wired on the supervisor side at
+//! actor-spawn time and read directly by the handler bodies — e.g.
+//! `deps.event_tx` in governance, `deps.payment_adapter` in saga, and
+//! `deps.local_dids` in queries. The former `view.manager().foo`
+//! indirection and the legacy manager it reached through are gone.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use scp_identity::DID;
-use scp_primitives::Clock;
+use scp_clock::Clock;
+use scp_did::DID;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 
@@ -103,7 +101,7 @@ use crate::context::supervisor::identity_capability::OwnedIdentityDid;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::crypto::hpke_backend::HpkeBackend;
 use crate::crypto::mls::backend::MlsBackend;
-use crate::crypto::mls::provider::MlsCryptoProvider;
+use crate::crypto::mls::provider::NodeMlsFactory;
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 use crate::economy::adapter::PaymentAdapterDyn;
 
@@ -124,22 +122,28 @@ use crate::economy::adapter::PaymentAdapterDyn;
 /// handler ever needs to re-dispatch through the handle set it should
 /// hold its own clones of the individual handles.
 pub struct ActorDeps {
-    /// MLS crypto provider — owns the per-context MLS group + sender-key
-    /// state map. Legacy: `ContextManager::crypto`. Held on
-    /// [`Supervisor`](crate::context::supervisor::Supervisor) directly
-    /// during the helper-migration window; cloned into each actor's
-    /// `ActorDeps` at spawn time so handler bodies can call
-    /// [`MlsCryptoProvider::seal`] / `open` / `advance_epoch` without
-    /// reaching back through `&Supervisor`.
+    /// MLS crypto provider — the group **birth/restore seam** (ADR-049 §15).
     ///
-    /// Added in Phase 2A.1 of ADR-049 (trust_recovery domain migration)
-    /// — first migrated handler that needs MLS provider state. Will
-    /// remain populated through the rest of Phase 2A; eventually the
-    /// `MlsCryptoProvider` dissolves (plan §"MlsCryptoProvider
-    /// dissolution") and per-context crypto state moves entirely onto
-    /// [`crate::context::actor::state::ContextCryptoState`] inside
-    /// [`crate::context::actor::state::PerContextState`].
-    pub crypto: Arc<MlsCryptoProvider>,
+    /// Post-PR-7 (SCP-CRYPTOMOVE-001) the steady-state per-context MLS group +
+    /// sender-key state is **owned by the actor** — it lives on
+    /// [`ContextCryptoState`](crate::context::actor::state::ContextCryptoState)
+    /// inside
+    /// [`PerContextState`](crate::context::actor::state::PerContextState), and
+    /// per-context crypto reads/writes go through the actor's inherent crypto
+    /// methods (`seal` / `open` / `rotate_sender_key` / `advance_epoch` /
+    /// `add_member`), never back through this provider. The atomic crypto move
+    /// `take`s the freshly-built state off this provider onto the actor, after
+    /// which a `take` on an already-taken context fails closed ("context state
+    /// owned by actor").
+    ///
+    /// What remains here is the work the actor delegates at spawn/birth time:
+    /// group birth/restore at the Create/Join seam (`create_mls_group` /
+    /// `add_member`, and `restore_crypto_state` returning owned material — §15
+    /// keeps these permitted provider calls after PR-7), plus the
+    /// supervisor-owned Class-M epoch/replay floors, which must outlive the
+    /// actor-task unwind (ADR-049 Decision 9). Cloned into each actor's
+    /// `ActorDeps` at spawn time.
+    pub crypto: Arc<NodeMlsFactory>,
     /// Transport provider (relay, subscription, publish).
     pub transport: Arc<dyn ContextTransportProvider>,
     /// Context snapshot persistence backend.
@@ -162,9 +166,9 @@ pub struct ActorDeps {
     /// actor's `OpenMlsBackend` is per-actor but reads/writes the same
     /// underlying KV via this adapter).
     pub mls_storage: Arc<dyn OpenMlsStorageAdapter>,
-    /// Wall-clock source. Legacy: `ContextManager::clock`
-    /// (`Arc<dyn scp_primitives::Clock>`, default
-    /// [`scp_primitives::SystemClock`]). Every handler that computes
+    /// Wall-clock source. Formerly `ContextManager::clock`
+    /// (`Arc<dyn scp_clock::Clock>`, default
+    /// [`scp_clock::SystemClock`]). Every handler that computes
     /// pricing windows, velocity tracking, TTL comparisons, UCAN expiry
     /// checks, or rate-limit buckets reads the clock — concentrating it
     /// in `ActorDeps` removes the per-handler plumbing required if each
@@ -172,36 +176,37 @@ pub struct ActorDeps {
     pub clock: Arc<dyn Clock>,
     /// Optional fan-out channel for `(context_id, ContextEvent)` pairs
     /// sent to external subscribers (the webhook dispatcher in
-    /// `scp-node`, SDK event streams). Legacy:
+    /// `scp-node`, SDK event streams). Formerly
     /// `ContextManager::event_tx`. `None` in embedders that do not
     /// subscribe to context events — handlers check `Option::is_some`
-    /// before sending and drop silently otherwise, matching legacy.
+    /// before sending and drop silently otherwise, matching the legacy behavior.
     ///
     /// Lagging receivers lose events (bounded channel) — delivery is
     /// best-effort.
     pub event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
     /// DID → Ed25519 verifying-key resolver used by governance vote
     /// verification (spec §5.9, ADR-031) and UCAN proof validation.
-    /// Legacy: `ContextManager::key_resolver` (typealias
+    /// Formerly `ContextManager::key_resolver` (typealias
     /// `Arc<dyn Fn(&DID) -> Option<VerifyingKey> + Send + Sync>`).
     pub key_resolver: KeyResolver,
     /// Optional economy adapter for the 9-step paid action flow
-    /// (spec §19.2.2). Legacy: `ContextManager::payment_adapter`.
+    /// (spec §19.2.2). Formerly `ContextManager::payment_adapter`.
     /// `None` for "free context" configurations — handlers skip the
     /// escrow path and fall through to budget-only enforcement.
     pub payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
     /// DIDs controlled by the local node/SDK. `ArcSwap` for lock-free
-    /// reads on every `deliver_incoming` (resolve local member). Legacy:
-    /// [`crate::context::supervisor::Supervisor::local_dids`]
-    /// (`RwLock<HashSet<DID>>`). The actor model hoists this to the
-    /// supervisor so every actor shares the same snapshot without each
-    /// one carrying its own `RwLock` — the `Arc<ArcSwap<_>>` is
-    /// clone-cheap and every actor gets a snapshot reference at spawn
-    /// time.
+    /// reads on every `deliver_incoming` (resolve local member).
+    /// Sourced from
+    /// [`crate::context::supervisor::Supervisor::local_dids`]: the
+    /// actor model hoists this set to the supervisor (it was a
+    /// per-manager `RwLock<HashSet<DID>>` before the actor refactor)
+    /// so every actor shares the same snapshot without each one
+    /// carrying its own lock — the `Arc<ArcSwap<_>>` is clone-cheap
+    /// and every actor gets a snapshot reference at spawn time.
     ///
-    /// Added in commit 12b.2a of ADR-049. Read by the messaging
-    /// handler's `deliver_incoming` body (landing 12b.2b) to resolve
-    /// which local DID the incoming envelope addresses.
+    /// Added in ADR-049 §15. Read by the messaging
+    /// handler's `deliver_incoming` body to resolve which local DID
+    /// the incoming envelope addresses.
     pub local_dids: Arc<ArcSwap<HashSet<DID>>>,
     /// Unforgeable capability token proving which identity owns this
     /// actor (ADR-049 §5). Minted fresh per-actor at spawn time in

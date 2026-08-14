@@ -5,11 +5,13 @@
 #           number in the allocated range (sdk-common.md).
 # Phase 2: Detects cross-bridge error code collisions — same code number
 #           used for semantically different errors.
+# Phase 3: Registry in-band uniqueness — each code literal is defined by
+#           exactly one constant in error_codes.rs (one number, one purpose).
 #
 # Canonical prefixes and ranges:
 #   SCP-IDENT-   1000-1999    SCP-CTX-     2000-2999
 #   SCP-PERM-    3000-3999    SCP-CRYPTO-  4000-4999
-#   SCP-TRANS-   5000-5999    SCP-TOOL-    6000-6999
+#   SCP-TRANS-   5000-5999    SCP-OUTLET-  6000-6999
 #   SCP-VALID-   7000-7999    SCP-STORAGE- 8000-8999
 #   SCP-ATTEST-  9000-9999    SCP-MCP-     10000-10999
 #
@@ -53,7 +55,7 @@ check_code() {
         SCP-PERM)     [[ $num -ge 3000 && $num -le 3999 ]] || { echo "VIOLATION: $file:$line_num: $code — PERM range is 3000-3999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-CRYPTO)   [[ $num -ge 4000 && $num -le 4999 ]] || { echo "VIOLATION: $file:$line_num: $code — CRYPTO range is 4000-4999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-TRANS)    [[ $num -ge 5000 && $num -le 5999 ]] || { echo "VIOLATION: $file:$line_num: $code — TRANS range is 5000-5999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
-        SCP-TOOL)     [[ $num -ge 6000 && $num -le 6999 ]] || { echo "VIOLATION: $file:$line_num: $code — TOOL range is 6000-6999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
+        SCP-OUTLET)   [[ $num -ge 6000 && $num -le 6999 ]] || { echo "VIOLATION: $file:$line_num: $code — OUTLET range is 6000-6999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-VALID)    [[ $num -ge 7000 && $num -le 7999 ]] || { echo "VIOLATION: $file:$line_num: $code — VALID range is 7000-7999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-STORAGE)  [[ $num -ge 8000 && $num -le 8999 ]] || { echo "VIOLATION: $file:$line_num: $code — STORAGE range is 8000-8999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-ATTEST)   [[ $num -ge 9000 && $num -le 9999 ]] || { echo "VIOLATION: $file:$line_num: $code — ATTEST range is 9000-9999"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
@@ -73,6 +75,15 @@ check_code() {
                 [[ $num -ge 13000 && $num -le 13999 ]] || { echo "VIOLATION: $file:$line_num: $code — SAGA range is 13000-13999"; VIOLATIONS=$((VIOLATIONS + 1)); }
             fi
             ;;
+        # SCP-CAPSEL is NOT an emitted error code. It is the capability-selection
+        # *classification* taxonomy defined in .docs/specs/17-persistence-and-storage.md
+        # §17.17.1/§17.17.2 (the exact defined set is 8000, 8001, 8002, 8010, 8011,
+        # 8012, 8013). It is cited in source comments/rustdoc for provenance
+        # (ADR-062 capability-injection work) and is deliberately absent from the
+        # error-code registry (error_codes.rs, sdk-common.md; see the "ID note" at
+        # §17.17.2). We validate it for range — a genuinely malformed CAPSEL code is
+        # still caught — but do NOT treat it as a mis-prefixed error code.
+        SCP-CAPSEL)   [[ $num -ge 8000 && $num -le 8099 ]] || { echo "VIOLATION: $file:$line_num: $code — CAPSEL classification range is 8000-8099 (§17.17.2)"; VIOLATIONS=$((VIOLATIONS + 1)); } ;;
         SCP-UNKNOWN)  ;; # Sentinel for unmapped bridge errors — allowed
         SCP-TEST)     ;; # Test sentinel — allowed
         *)
@@ -93,6 +104,19 @@ cd "$REPO_ROOT"
 # Excludes: .git, target, build, node_modules, .docs (specs/ADRs use codes in prose),
 #           sdk-common.md (the definition file itself), this script, CLAUDE.md files.
 while IFS=: read -r file line_num content; do
+    # Honour the inline `SCP-CODE-OK:` exemption marker. This is the only
+    # mechanism by which a production-source line can carry a literal
+    # canonical-prefix code that is deliberately out-of-range or
+    # non-canonical: negative-test fixtures that verify the rejection path,
+    # and validator self-references where the prefix appears in a
+    # `starts_with` / `b"..."` byte comparison rather than as an emitted
+    # code. Marker must appear on the same line; whole-file exemption is
+    # intentionally not supported. Real error codes carry no marker, so this
+    # cannot be used to smuggle a genuinely mis-ranged code past the gate.
+    case "$content" in
+        *"SCP-CODE-OK:"*) continue ;;
+    esac
+
     # Extract all SCP codes from the line
     while [[ "$content" =~ SCP-([A-Z]+)-([0-9]+) ]]; do
         full_code="SCP-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
@@ -135,7 +159,7 @@ echo "Checked $CHECKED error code occurrences."
 # Test files, assertions, and comment-only lines are excluded.
 #
 # Same code for same purpose across bridges is fine (e.g. SCP-VALID-7120 =
-# "lock poisoned" in all 4 bridges). Different messages for the same code
+# "lock poisoned" in all 3 bridges). Different messages for the same code
 # signals a collision.
 # ---------------------------------------------------------------------------
 
@@ -185,7 +209,7 @@ while IFS=: read -r file line_num content; do
         *) continue ;;
     esac
 
-    while [[ "$content" =~ SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA)-([0-9]+) ]]; do
+    while [[ "$content" =~ SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|OUTLET|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA)-([0-9]+) ]]; do
         prefix="${BASH_REMATCH[1]}"
         number="${BASH_REMATCH[2]}"
         full_code="SCP-${prefix}-${number}"
@@ -249,7 +273,7 @@ while IFS=: read -r file line_num content; do
         content="${content#*"$full_code"}"
     done
 done < <(
-    grep -rnE 'SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|TOOL|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA)-[0-9]+' \
+    grep -rnE 'SCP-(IDENT|CTX|PERM|CRYPTO|TRANS|OUTLET|VALID|STORAGE|ATTEST|MCP|GOV|ECON|SAGA)-[0-9]+' \
         --include='*.rs' \
         --include='*.kt' \
         --include='*.swift' \
@@ -273,6 +297,31 @@ if [[ $COLLISION_COUNT -gt 0 ]]; then
     echo ""
     echo "Found $COLLISION_COUNT error code collision(s)."
     echo "Each error code number must have a single semantic meaning across all bridges."
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 3: Registry in-band uniqueness.
+#
+# The registry (error_codes.rs) is the single source of truth mapping each
+# code number to one purpose (the constant's doc-comment is normative).
+# Assert that every quoted "SCP-...-NNNN" literal appears exactly once in
+# the registry file — a duplicate means two constants (two purposes) claim
+# the same number.
+# ---------------------------------------------------------------------------
+
+REGISTRY_FILE="crates/scp-ffi/common/src/error_codes.rs"
+if [[ -f "$REGISTRY_FILE" ]]; then
+    REGISTRY_DUPES=$(grep -oE '"SCP-[A-Z]+-[0-9]+"' "$REGISTRY_FILE" | sort | uniq -d || true)
+    if [[ -n "$REGISTRY_DUPES" ]]; then
+        while IFS= read -r dup; do
+            echo "VIOLATION: $REGISTRY_FILE: $dup is defined by more than one registry constant"
+            VIOLATIONS=$((VIOLATIONS + 1))
+        done <<< "$REGISTRY_DUPES"
+        echo "Each code number must map to exactly one registry constant/purpose."
+    fi
+else
+    echo "VIOLATION: registry file $REGISTRY_FILE not found"
+    VIOLATIONS=$((VIOLATIONS + 1))
 fi
 
 if [[ $VIOLATIONS -gt 0 ]]; then

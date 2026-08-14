@@ -25,14 +25,14 @@
 //!   `identity_resolve`).
 //! - [`context`] — Context lifecycle (create, join, leave, close, send,
 //!   subscribe).
-//! - [`tools`] — Tool registration, invocation, and verification.
+//! - [`outlets`] — Outlet registration, invocation, and verification.
 //! - [`transport`] — Transport connection and status.
 //! - [`ucan`] — UCAN token management (validate, mint, revoke).
 //! - [`event_log`] — Event log queries and Merkle proofs.
 //!
 //! # Async model
 //!
-//! Unlike the WASM bridge, this bridge has full access to the tokio
+//! This bridge has full access to the tokio
 //! multi-thread runtime. All async bridge functions are declared `async fn`
 //! and annotated with `#[napi]`. napi-rs generates `ThreadsafeFunction`-backed
 //! async bridges automatically, running the Rust `Future` on the tokio runtime
@@ -56,9 +56,7 @@
 //!
 //! # Direct `scp-core` calls
 //!
-//! Unlike the WASM bridge (which cannot depend on `scp-core` due to tokio's
-//! multi-thread runtime constraint on `wasm32-unknown-unknown`), this bridge
-//! calls `scp-core` directly. The `"in_memory"` custody path in
+//! This bridge calls `scp-core` directly. The `"in_memory"` custody path in
 //! [`Scp::identity_create`](crate::scp::Scp::identity_create) uses a real
 //! `InMemoryKeyCustody` to
 //! generate a live `did:dht` identity.
@@ -132,12 +130,13 @@ pub mod event_log;
 pub mod identity;
 pub mod mcp;
 pub mod media;
+pub mod outlet_stream;
+pub mod outlets;
 pub mod provenance;
 pub mod runtime;
 pub mod scp;
 pub mod scpid;
 pub mod sync;
-pub mod tools;
 pub mod transport;
 pub mod trust;
 pub mod ucan;
@@ -145,14 +144,14 @@ pub mod ucan;
 pub use scp::Scp;
 
 // Server startup (relay + application node) — behind the `server` feature on
-// scp-ffi-common. Not available for WASM (ADR-034).
+// scp-ffi-common.
 #[cfg(feature = "server")]
 pub mod server;
 
-// Full-stack E2E testing module — feature-gated behind allow_in_memory_custody.
+// Full-stack E2E testing module — feature-gated behind testing.
 // Exposes FullStackNetwork/FullStackNode from scp-testing for real
 // encrypt→decrypt roundtrip tests from TypeScript.
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 pub mod testing;
 
 // ---------------------------------------------------------------------------

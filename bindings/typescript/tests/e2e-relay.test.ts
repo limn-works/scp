@@ -20,7 +20,7 @@
  *
  * NOTE: Full decrypt roundtrip (send -> relay -> subscribe -> MLS decrypt)
  * cannot be tested in a single-process NAPI bridge because the single
- * `MlsCryptoProvider` instance cannot decrypt its own ciphertext (MLS
+ * `NodeMlsFactory` instance cannot decrypt its own ciphertext (MLS
  * self-decryption is not supported -- the group's encryption state has
  * already advanced past the sent message). The full decrypt roundtrip is
  * verified at the Rust layer in the `encrypted_relay_roundtrip` integration
@@ -28,7 +28,7 @@
  * which uses separate MLS group instances for Alice and Bob.
  *
  * Prerequisites:
- * - NAPI bridge compiled with `allow_in_memory_custody` feature.
+ * - NAPI bridge compiled with `testing` feature.
  * - Platform-specific `@limn-works/scp-ts-napi-*` package loadable.
  *
  * If the native addon is not available, all tests are skipped gracefully.

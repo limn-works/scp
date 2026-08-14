@@ -1,6 +1,6 @@
 //! Shared per-context bridge connector state for FFI bridges.
 //!
-//! All non-WASM FFI bridges (`PyO3`, napi-rs, `UniFFI`) maintain per-context
+//! All FFI bridges (`PyO3`, napi-rs, `UniFFI`) maintain per-context
 //! [`ShadowRegistry`] and [`SenderKeyStore`] instances across bridge function
 //! calls. Without this persistent state, each call to `bridge_create_shadow`
 //! would create ephemeral registries that are dropped when the function returns.
@@ -9,7 +9,7 @@
 //! is owned by [`CoreFields::bridge_state`](crate::bridge_instance::CoreFields)
 //! and accessed via `bridge_instance().bridge_state()`.
 //!
-//! Gated behind the `resolvers` feature (not available for WASM — ADR-034).
+//! Gated behind the `resolvers` feature.
 //!
 //! See spec section 12 (Bridge System) and ADR-023.
 

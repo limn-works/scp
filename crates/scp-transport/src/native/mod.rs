@@ -1,9 +1,12 @@
-//! SCP native relay protocol types and wire format.
+//! SCP native relay -- server, adapters, and blob storage.
 //!
-//! This module defines the message types for the SCP native relay -- a
-//! purpose-built, WebSocket-based store-and-forward relay for SCP envelopes.
-//! The relay is deliberately simple: accept opaque blobs, hold them for a TTL,
-//! deliver to subscribers, delete on expiry or request.
+//! This module implements the SCP native relay -- a purpose-built,
+//! WebSocket-based store-and-forward relay for SCP envelopes. The relay is
+//! deliberately simple: accept opaque blobs, hold them for a TTL, deliver to
+//! subscribers, delete on expiry or request. The wire types it speaks
+//! ([`scp_relay_client::ClientMessage`] / [`scp_relay_client::RelayMessage`])
+//! live in the wasm-safe `scp-relay-client` leaf, shared with the in-browser
+//! client (ADR-057 Slice 3, Decision D5).
 //!
 //! # Wire format
 //!
@@ -33,12 +36,10 @@ pub mod cert_pin;
 pub(crate) mod client;
 #[cfg(feature = "combined")]
 pub mod combined;
-pub mod error;
 #[cfg(feature = "local-cache")]
 pub mod local_cache;
 #[cfg(feature = "postgres-blob")]
 pub mod postgres_blob;
-pub mod protocol;
 #[cfg(feature = "redb-blob")]
 pub mod redb_blob;
 pub mod relay_persistence;
@@ -50,10 +51,12 @@ pub mod sqlite_blob;
 pub mod storage;
 
 // Re-export primary types for convenience.
+//
+// The relay wire types (`ClientMessage`, `RelayMessage`, the constants, and
+// `RelayProtocolError` / `code`) now live in the wasm-safe `scp-relay-client`
+// leaf so the native relay and the in-browser client share ONE definition
+// (ADR-057 Slice 3, Decision D5). Import them directly from `scp_relay_client`;
+// they are deliberately NOT re-exported here (a shim re-export is forbidden by
+// the ADR-057 Amendment — see `scripts/check-no-shim-reexports.sh`).
 pub use adapter::NativeRelayAdapter;
 pub use cert_pin::{CertPinResult, CertificatePin};
-pub use error::{NativeProtocolError, code};
-pub use protocol::{
-    ClientMessage, DEFAULT_QUERY_LIMIT, MAX_BLOB_SIZE, MAX_BLOB_TTL, MAX_QUERY_LIMIT,
-    MAX_REF_ID_LEN, MIN_BLOB_TTL, RelayMessage,
-};

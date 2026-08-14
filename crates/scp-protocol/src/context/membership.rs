@@ -40,7 +40,7 @@ pub const MAX_BUFFER_CAPACITY: usize = 10_000;
 // DID (re-exported from identity module -- SCP-187)
 // ---------------------------------------------------------------------------
 
-use scp_primitives::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // KeyPackage (stub)
@@ -50,7 +50,7 @@ use scp_primitives::DID;
 ///
 /// Wraps an optional TLS-serialized MLS `KeyPackage` from `OpenMLS` alongside
 /// the member's DID. The `mls_key_package_bytes` field is `None` when using
-/// mock crypto providers in tests; the production `MlsCryptoProvider` requires
+/// mock crypto providers in tests; the production `NodeMlsFactory` requires
 /// real MLS key package bytes.
 ///
 /// The MLS key package is stored as TLS-serialized bytes rather than the

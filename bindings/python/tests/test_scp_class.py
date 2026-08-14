@@ -171,7 +171,7 @@ def test_configure_local_transport_rejects_invalid_did() -> None:
 def test_petname_apply_event_and_counts() -> None:
     """`petname_apply_event` replays a serialized event into the owner's map.
 
-    Mirrors the WASM `petname_apply_event` / `petname_did_count` /
+    Mirrors the `petname_apply_event` / `petname_did_count` /
     `petname_context_count` surface promoted to cross-bridge parity. The
     DID and context petname maps are per-owner and per-instance, so a
     fresh `SCP({"type": "in_memory"})` starts empty.
@@ -217,7 +217,7 @@ def test_petname_apply_event_matches_set_petname() -> None:
         '{"SetPetname": {"did": "did:dht:zBob", "name": "bob"}}',
     )
     # The PyO3 bridge returns a native ``list[str]`` (per-SDK idiom — it does
-    # not JSON-encode the resolution like the WASM/NAPI string surfaces).
+    # not JSON-encode the resolution like the NAPI string surface).
     resolved = scp.petname_resolve_did(owner, "bob")
     assert resolved == ["did:dht:zBob"]
 
@@ -242,7 +242,7 @@ def test_petname_rejects_malformed_owner() -> None:
     """A non-empty but syntactically invalid `owner_did` is rejected.
 
     The pre-existing petname ops now enforce the same strict `validate_did`
-    gate as the WASM bridge and the §4.7 ops, so all four bridges treat the
+    gate as the §4.7 ops, so all bridges treat the
     per-identity petname partition key uniformly as a DID.
     """
     scp = SCP({"type": "in_memory"})

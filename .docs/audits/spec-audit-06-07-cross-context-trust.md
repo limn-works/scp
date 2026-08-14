@@ -4,25 +4,25 @@
 
 ## Executive Summary
 
-These two spec files establish the cross-context data flow architecture and the four-layer trust model. The conceptual design is genuinely strong -- the separation of validation from trust, the provenance chain architecture, and the bidirectional consent model for tool interfaces are all well-conceived. However, both files operate at a high narrative level, leaving critical implementation details unspecified. An independent implementor working from these specs alone would be forced to make dozens of decisions about wire formats, error semantics, timing constants, and state machine transitions that are not constrained by the spec. Many of these decisions have security implications.
+These two spec files establish the cross-context data flow architecture and the four-layer trust model. The conceptual design is genuinely strong -- the separation of validation from trust, the provenance chain architecture, and the bidirectional consent model for outlet interfaces are all well-conceived. However, both files operate at a high narrative level, leaving critical implementation details unspecified. An independent implementor working from these specs alone would be forced to make dozens of decisions about wire formats, error semantics, timing constants, and state machine transitions that are not constrained by the spec. Many of these decisions have security implications.
 
-The most significant gap pattern is this: the specs describe *what* the protocol does but frequently omit *how* an implementation deterministically performs the operation. There are no wire-level message definitions for cross-context tool calls, no formal state machines for session lifecycle, no concrete algorithms for independence checking in threshold attestations, and no specified data formats for several structures that transit the network (challenge suites, consequence rules, tool interface agreements). Multiple "suggested defaults" are used for security-critical constants without mandating them, meaning two conformant implementations could have incompatible security properties.
+The most significant gap pattern is this: the specs describe *what* the protocol does but frequently omit *how* an implementation deterministically performs the operation. There are no wire-level message definitions for cross-context outlet calls, no formal state machines for session lifecycle, no concrete algorithms for independence checking in threshold attestations, and no specified data formats for several structures that transit the network (challenge suites, consequence rules, outlet interface agreements). Multiple "suggested defaults" are used for security-critical constants without mandating them, meaning two conformant implementations could have incompatible security properties.
 
 ---
 
 ## Findings: 06-cross-context-communication.md
 
-### [6.2.0] No Wire Format for Cross-Context Tool Calls
+### [6.2.0] No Wire Format for Cross-Context Outlet Calls
 - **Category**: Missing wire format details
 - **Location**: Section 6.2.0 (lines 16-28)
-- **What's missing**: There is no wire-level message definition for how a cross-context tool call is structured, transported, authenticated, or acknowledged. The spec describes shared-member bridging (SDK-local) and multi-parent child contexts, but provides zero field-level definitions for a `ToolCallRequest` or `ToolCallResponse` message. What fields does the request carry? How is the caller authenticated to the target context? How is the response authenticated back to the caller? What serialization format? What happens if the response exceeds a size limit?
-- **Why it matters**: Two independently implemented SDKs will produce incompatible cross-context tool call messages. This is the primary data flow mechanism across context boundaries -- interoperability requires byte-level agreement on format.
+- **What's missing**: There is no wire-level message definition for how a cross-context outlet call is structured, transported, authenticated, or acknowledged. The spec describes shared-member bridging (SDK-local) and multi-parent child contexts, but provides zero field-level definitions for a `OutletCallRequest` or `OutletCallResponse` message. What fields does the request carry? How is the caller authenticated to the target context? How is the response authenticated back to the caller? What serialization format? What happens if the response exceeds a size limit?
+- **Why it matters**: Two independently implemented SDKs will produce incompatible cross-context outlet call messages. This is the primary data flow mechanism across context boundaries -- interoperability requires byte-level agreement on format.
 - **Severity**: CRITICAL
 
 ### [6.2.0] Bidirectional Consent Mechanism Undefined
 - **Category**: Underspecified algorithms
 - **Location**: Section 6.2.0 (line 32) and Section 6.2 (line 26)
-- **What's missing**: "Both contexts opt in explicitly (bidirectional consent at the context level)" -- but the consent mechanism is never defined. How does Context A express that it wants to expose a tool to Context B? How does Context B accept? Is there a handshake protocol? Is it governance-gated on both sides? What message types are exchanged? What happens if Context A publishes a tool interface but Context B never consents? Is there a pending state? Can consent be withdrawn? What event types represent interface creation and teardown?
+- **What's missing**: "Both contexts opt in explicitly (bidirectional consent at the context level)" -- but the consent mechanism is never defined. How does Context A express that it wants to expose an outlet to Context B? How does Context B accept? Is there a handshake protocol? Is it governance-gated on both sides? What message types are exchanged? What happens if Context A publishes an outlet interface but Context B never consents? Is there a pending state? Can consent be withdrawn? What event types represent interface creation and teardown?
 - **Why it matters**: Without a specified consent protocol, the "bidirectional consent" guarantee is aspirational, not mechanical. An implementor must invent the entire interface lifecycle.
 - **Severity**: HIGH
 
@@ -30,10 +30,10 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 - **Category**: Missing constants/defaults
 - **Location**: Section 6.2.0 (line 20)
 - **What's missing**: "Context A's outbound policy and Context B's inbound policy are validated before the call proceeds." These policies are never defined. What is an outbound policy? What is an inbound policy? Are they governance rules? UCAN capabilities? Configuration parameters? What are their fields? What does "validation" mean concretely?
-- **Why it matters**: These policies are the enforcement mechanism for cross-context tool calls. Without definition, the security boundary is a placeholder.
+- **Why it matters**: These policies are the enforcement mechanism for cross-context outlet calls. Without definition, the security boundary is a placeholder.
 - **Severity**: HIGH
 
-### [6.2.0] Rate Limit Parameters Undefined for Tool Interfaces
+### [6.2.0] Rate Limit Parameters Undefined for Outlet Interfaces
 - **Category**: Missing constants/defaults
 - **Location**: Section 6.2 (line 36)
 - **What's missing**: "Rate-limited: both contexts can enforce rate limits on interface calls." No defaults are specified. No rate limit structure is defined. No sliding window duration. No per-caller vs. global distinction. No burst allowance. No error code for rate-limited calls. Section 9.2.1 mentions "per-window rate limiting across chains" with "a sliding time window" but never defines the window duration, the limit count, or the enforcement semantics (drop? queue? return error?).
@@ -51,14 +51,14 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [6.2] Schema Specificity Floor -- No Recursive Depth Check
 - **Category**: Missing edge cases
 - **Location**: Section 6.2 (line 38), cross-ref with Section 9.2.1
-- **What's missing**: The schema specificity floor requires "at least two distinct fields in either input or output." But there is no specification of maximum schema complexity, maximum nesting depth, or maximum total size of a tool schema. An attacker could register a tool with a deeply nested schema containing thousands of fields, causing parsing overhead on every invocation check. There is also no prohibition on `additionalProperties: true` in JSON Schema, which would allow arbitrary extra fields despite the structural constraint.
-- **Why it matters**: The structural constraint prevents trivial messaging-pipe tools but does not prevent computationally expensive schema validation or schema-level DoS.
+- **What's missing**: The schema specificity floor requires "at least two distinct fields in either input or output." But there is no specification of maximum schema complexity, maximum nesting depth, or maximum total size of an outlet schema. An attacker could register an outlet with a deeply nested schema containing thousands of fields, causing parsing overhead on every invocation check. There is also no prohibition on `additionalProperties: true` in JSON Schema, which would allow arbitrary extra fields despite the structural constraint.
+- **Why it matters**: The structural constraint prevents trivial messaging-pipe outlets but does not prevent computationally expensive schema validation or schema-level DoS.
 - **Severity**: MEDIUM
 
 ### [6.2.1] Session Identifier Format Undefined
 - **Category**: Missing wire format details
 - **Location**: Section 6.2.1 (lines 43-59)
-- **What's missing**: Session identifiers are described as "opaque" (line 57) but no format constraints are specified. Maximum length? Character set? Who generates them (caller or tool context)? Are they unique across contexts or only within a tool? The example shows `"sched:abc123"` suggesting a prefix convention but this is not normative. Can a caller forge a session_id to hijack another caller's session?
+- **What's missing**: Session identifiers are described as "opaque" (line 57) but no format constraints are specified. Maximum length? Character set? Who generates them (caller or outlet context)? Are they unique across contexts or only within an outlet? The example shows `"sched:abc123"` suggesting a prefix convention but this is not normative. Can a caller forge a session_id to hijack another caller's session?
 - **Why it matters**: Without format constraints, session IDs could be used as a covert data channel (arbitrary-length strings). Without uniqueness guarantees, session hijacking between callers is possible. Without a generation rule, two callers could collide.
 - **Severity**: MEDIUM
 
@@ -73,8 +73,8 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [6.2.1] Session State Visibility and Cleanup Semantics
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 6.2.1 (lines 57-59)
-- **What's missing**: What happens when a caller tries to continue a session that has expired or been garbage-collected? Is there a specific error code? Can the caller query session status? What happens to sessions when the calling context is destroyed? What happens when the tool's context restarts -- are sessions persistent or volatile? If sessions are tied to context lifetime (line 59), what is the cleanup order when a context with active sessions is destroyed?
-- **Why it matters**: Without defined failure semantics, callers cannot distinguish between "session expired," "session never existed," and "tool context unreachable" -- leading to incorrect retry logic.
+- **What's missing**: What happens when a caller tries to continue a session that has expired or been garbage-collected? Is there a specific error code? Can the caller query session status? What happens to sessions when the calling context is destroyed? What happens when the outlet's context restarts -- are sessions persistent or volatile? If sessions are tied to context lifetime (line 59), what is the cleanup order when a context with active sessions is destroyed?
+- **Why it matters**: Without defined failure semantics, callers cannot distinguish between "session expired," "session never existed," and "outlet context unreachable" -- leading to incorrect retry logic.
 - **Severity**: MEDIUM
 
 ### [6.2.2A] DID Document Capabilities -- No Schema for `SCPCapabilities`
@@ -84,10 +84,10 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 - **Why it matters**: Without a normative schema, DID document capabilities are unparseable by conformant implementations. The conflict between freeform strings (example) and structured URIs (Section 7.3.4.1) creates ambiguity about what values are valid.
 - **Severity**: MEDIUM
 
-### [6.2.2B] Standard Tool Schemas -- No Error Responses
+### [6.2.2B] Standard Outlet Schemas -- No Error Responses
 - **Category**: Undefined error/failure behavior
 - **Location**: Section 6.2.2B (lines 88-101)
-- **What's missing**: The standard discovery tool schemas (`agent_search`, `agent_register`, `agent_deregister`) define input and output for success cases only. What does the response look like when: search finds no results? Registration is rejected by governance? The DID is already registered? The DID to deregister is not found? The caller lacks write permission? Rate limit exceeded? What error codes are returned?
+- **What's missing**: The standard discovery outlet schemas (`agent_search`, `agent_register`, `agent_deregister`) define input and output for success cases only. What does the response look like when: search finds no results? Registration is rejected by governance? The DID is already registered? The DID to deregister is not found? The caller lacks write permission? Rate limit exceeded? What error codes are returned?
 - **Why it matters**: Without specified error responses, SDK implementations will return different error structures, making cross-SDK discovery interoperability fragile.
 - **Severity**: MEDIUM
 
@@ -109,13 +109,13 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 - **Category**: Missing constants/defaults
 - **Location**: Section 6.2.2B (lines 119-123)
 - **What's missing**: "structured metadata entries (~100-500 bytes per agent)" -- no normative maximum. How many entries can a single context hold? How many capabilities per entry? Maximum description length? Maximum tag count and tag length? Without limits, a single agent could register with megabytes of metadata, or a coordinated attack could fill a registry to exhaustion.
-- **Why it matters**: Storage exhaustion is a DoS vector for contexts with discovery tools.
+- **Why it matters**: Storage exhaustion is a DoS vector for contexts with discovery outlets.
 - **Severity**: MEDIUM
 
 ### [6.2.2B] Inclusion Proof Format
 - **Category**: Missing wire format details
 - **Location**: Section 6.2.2B (line 110)
-- **What's missing**: "Readers can request inclusion proofs to verify their registration was recorded." The format of these inclusion proofs is not defined. What is the Merkle tree structure? What hash algorithm? What is the proof response format? How does the reader request a proof -- via a tool call or a dedicated protocol message?
+- **What's missing**: "Readers can request inclusion proofs to verify their registration was recorded." The format of these inclusion proofs is not defined. What is the Merkle tree structure? What hash algorithm? What is the proof response format? How does the reader request a proof -- via an outlet call or a dedicated protocol message?
 - **Why it matters**: Inclusion proofs are the mechanism by which readers verify registry integrity. Without a specified format, implementations will produce incompatible proofs.
 - **Severity**: MEDIUM
 
@@ -123,7 +123,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 - **Category**: Missing constants/defaults
 - **Location**: Section 6.2.2B (line 114)
 - **What's missing**: "SDK ships with default bootstrap context IDs (configurable)." No actual context IDs are specified. No governance model for the default list. No update mechanism for the defaults. No signature over the default list to prevent tampering. The analogy to "browser CA lists or DNS root servers" is appropriate -- but those systems have extensive governance around their default lists. SCP has none specified.
-- **Why it matters**: The bootstrap contexts with discovery tools are the protocol's cold-start mechanism. Without governance, an SDK could ship with malicious defaults that direct all new users to attacker-controlled registries.
+- **Why it matters**: The bootstrap contexts with discovery outlets are the protocol's cold-start mechanism. Without governance, an SDK could ship with malicious defaults that direct all new users to attacker-controlled registries.
 - **Severity**: MEDIUM
 
 ### [6.2.3] Mixed-Mode Nesting Security Properties Not Analyzed
@@ -136,8 +136,8 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [6.3] No Protocol Mechanism for Human Bridge Overload
 - **Category**: Missing edge cases
 - **Location**: Section 6.3 (lines 141-153)
-- **What's missing**: The spec acknowledges "the human is the bridge" but provides no mechanism for the human to delegate bridging to their agent for specific patterns. If a human is in 50 contexts with cross-context tool calls, every tool call requires human facilitation. There is no "trust this tool interface pattern and auto-bridge" mechanism analogous to auto-accept for context invitations.
-- **Why it matters**: At scale, the human bridge becomes a bottleneck that makes cross-context tool calls impractical. The auto-accept pattern exists for context joins (Section 5.12.2) but not for tool call bridging.
+- **What's missing**: The spec acknowledges "the human is the bridge" but provides no mechanism for the human to delegate bridging to their agent for specific patterns. If a human is in 50 contexts with cross-context outlet calls, every outlet call requires human facilitation. There is no "trust this outlet interface pattern and auto-bridge" mechanism analogous to auto-accept for context invitations.
+- **Why it matters**: At scale, the human bridge becomes a bottleneck that makes cross-context outlet calls impractical. The auto-accept pattern exists for context joins (Section 5.12.2) but not for outlet call bridging.
 - **Severity**: LOW
 
 ---
@@ -147,7 +147,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.2] UCAN Capability Matching Algorithm Not Specified
 - **Category**: Underspecified algorithms
 - **Location**: Section 7.2 (lines 56-68)
-- **What's missing**: "Capability matches the action being performed" -- the matching algorithm is not specified. How does the protocol determine that a UCAN capability token authorizes a specific action? Is it string equality? Hierarchical matching? Regular expression? The capability categories in Section 5.3 (`messaging`, `toolInvocation`, `media.voice`, etc.) suggest a dotted hierarchy, but Section 7.3.4.1 defines a completely different URI-based namespace (`scp:capability:...`). Are these the same system? How do UCAN `att` (attenuation) claims map to SCP capability categories?
+- **What's missing**: "Capability matches the action being performed" -- the matching algorithm is not specified. How does the protocol determine that a UCAN capability token authorizes a specific action? Is it string equality? Hierarchical matching? Regular expression? The capability categories in Section 5.3 (`messaging`, `outletInvocation`, `media.voice`, etc.) suggest a dotted hierarchy, but Section 7.3.4.1 defines a completely different URI-based namespace (`scp:capability:...`). Are these the same system? How do UCAN `att` (attenuation) claims map to SCP capability categories?
 - **Why it matters**: Capability matching is the most security-critical operation in Layer 1. If two implementations match differently, one will permit unauthorized actions.
 - **Severity**: CRITICAL
 
@@ -224,14 +224,14 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.3.3] Test Vector Format Not Specified
 - **Category**: Missing wire format details
 - **Location**: Section 7.3.3 (lines 228-249)
-- **What's missing**: "Test vectors (known input-output pairs that define correct behavior)" -- no format is specified. Are test vectors JSON? Are they stored in the tool registration? How are non-deterministic outputs handled (the spec says "not exact string matching" but does not define the comparison algorithm)? How many test vectors are required? Can a tool register with zero test vectors? Is there a maximum count?
-- **Why it matters**: Tool verification is a key Layer 2 mechanism. Without specified test vector format and comparison semantics, different agents will reach different conclusions about tool integrity from the same test vectors.
+- **What's missing**: "Test vectors (known input-output pairs that define correct behavior)" -- no format is specified. Are test vectors JSON? Are they stored in the outlet registration? How are non-deterministic outputs handled (the spec says "not exact string matching" but does not define the comparison algorithm)? How many test vectors are required? Can an outlet register with zero test vectors? Is there a maximum count?
+- **Why it matters**: Outlet verification is a key Layer 2 mechanism. Without specified test vector format and comparison semantics, different agents will reach different conclusions about outlet integrity from the same test vectors.
 - **Severity**: MEDIUM
 
 ### [7.3.3] Implementation Hash Algorithm Not Specified
 - **Category**: Missing constants/defaults
 - **Location**: Section 7.3.3 (line 235)
-- **What's missing**: "Implementation hash (content-addressable reference to the implementation)" -- what hash algorithm? SHA-256? BLAKE3? Multihash? What is hashed -- the source code, the compiled binary, a canonical representation of the schema? How does an agent obtain the implementation to hash-check it? If the tool is a remote service (LLM-backed), what constitutes the "implementation"?
+- **What's missing**: "Implementation hash (content-addressable reference to the implementation)" -- what hash algorithm? SHA-256? BLAKE3? Multihash? What is hashed -- the source code, the compiled binary, a canonical representation of the schema? How does an agent obtain the implementation to hash-check it? If the outlet is a remote service (LLM-backed), what constitutes the "implementation"?
 - **Why it matters**: Without a specified hash algorithm and hashing target, "verifying the implementation hash hasn't changed since registration" is unimplementable.
 - **Severity**: MEDIUM
 
@@ -245,7 +245,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.3.4] Challenge Suite Protocol Not Specified
 - **Category**: Underspecified algorithms
 - **Location**: Section 7.3.4 (lines 253-263)
-- **What's missing**: "A context or peer agent can issue a challenge: a set of test cases." No challenge protocol is defined. How does a challenger initiate a challenge? Is it a tool call? A dedicated message type? What is the request format? What is the response format? How does the challenger determine pass/fail? Is there a timeout? What happens if the challenged agent refuses or times out? Is there a standard for "the agent passed"?
+- **What's missing**: "A context or peer agent can issue a challenge: a set of test cases." No challenge protocol is defined. How does a challenger initiate a challenge? Is it an outlet call? A dedicated message type? What is the request format? What is the response format? How does the challenger determine pass/fail? Is there a timeout? What happens if the challenged agent refuses or times out? Is there a standard for "the agent passed"?
 - **Why it matters**: Without a challenge protocol, the 27 listed challenge capabilities are aspirational categories, not testable properties.
 - **Severity**: HIGH
 
@@ -273,14 +273,14 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.3.6] Renewal Intervals Not Specified
 - **Category**: Missing constants/defaults
 - **Location**: Section 7.3.6 (lines 385-393)
-- **What's missing**: "The protocol defines standard renewal intervals by attestation type." No renewal intervals are actually defined. The examples ("OAuth every 30 days," "tool integrity check run weekly") are illustrative, not normative. There is no table of attestation types to renewal intervals. There is no definition of what constitutes a "stale" attestation.
+- **What's missing**: "The protocol defines standard renewal intervals by attestation type." No renewal intervals are actually defined. The examples ("OAuth every 30 days," "outlet integrity check run weekly") are illustrative, not normative. There is no table of attestation types to renewal intervals. There is no definition of what constitutes a "stale" attestation.
 - **Why it matters**: Without specified renewal intervals, "standard renewal intervals by attestation type" is a false claim. Different SDKs will use different intervals, and an attestation considered fresh by one SDK may be stale by another.
 - **Severity**: MEDIUM
 
 ### [7.3.7] Consequence Rule Format Not Specified
 - **Category**: Missing wire format details
 - **Location**: Section 7.3.7 (lines 396-412)
-- **What's missing**: "automated consequence rules" are described with four examples (message velocity, tool invocation rate, multiple governance warnings, capability ceiling violation). But there is no structured format for consequence rules. No field definitions. No specification of how thresholds are expressed. No specification of how consequences are expressed (duration of suspension, scope of revocation, what "automatic role demotion" means mechanically). No specification of where these rules are stored or how they are evaluated.
+- **What's missing**: "automated consequence rules" are described with four examples (message velocity, outlet invocation rate, multiple governance warnings, capability ceiling violation). But there is no structured format for consequence rules. No field definitions. No specification of how thresholds are expressed. No specification of how consequences are expressed (duration of suspension, scope of revocation, what "automatic role demotion" means mechanically). No specification of where these rules are stored or how they are evaluated.
 - **Why it matters**: Consequence mechanisms are described as "protocol-enforced" and "declared at context creation." Without a format, they cannot be declared, inspected, or enforced across implementations.
 - **Severity**: MEDIUM
 
@@ -308,7 +308,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.4.1] Attestation `evidence` Field Type-Specific Formats Undefined
 - **Category**: Missing wire format details
 - **Location**: Section 7.4.1 (line 433)
-- **What's missing**: `evidence: supporting proof (type-specific, optional)` -- the type-specific evidence formats are not defined for any attestation type. What is the evidence format for an identity link? For a tool integrity attestation? For an endorsement? Section 7.4.2 describes each type's evidence at a high level ("OAuth, signed post, DNS record" for identity links) but does not specify the structured format.
+- **What's missing**: `evidence: supporting proof (type-specific, optional)` -- the type-specific evidence formats are not defined for any attestation type. What is the evidence format for an identity link? For an outlet integrity attestation? For an endorsement? Section 7.4.2 describes each type's evidence at a high level ("OAuth, signed post, DNS record" for identity links) but does not specify the structured format.
 - **Why it matters**: Evidence is what enables automated verification (Layer 3). Without specified formats, verification of evidence across implementations is impossible.
 - **Severity**: MEDIUM
 
@@ -336,14 +336,14 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 ### [7.7.1] DataProvenance `chainPath` Privacy Leak
 - **Category**: Security-relevant omissions
 - **Location**: Section 7.7.1 (line 523)
-- **What's missing**: `chainPath: [contextID]? -- optional: ordered list of intermediary context IDs in the chain` -- this field reveals the chain of context IDs that data has traversed. Combined with context metadata (Section 5.7), this leaks information about which contexts are connected via tool interfaces. The spec does not analyze this as a metadata privacy concern or specify when `chainPath` should be omitted (it is marked optional but no guidance on when to include vs. omit).
-- **Why it matters**: An adversary observing provenance records learns the topology of cross-context tool interface connections. This is metadata leakage that contradicts the protocol's metadata privacy goals (Section 9.10).
+- **What's missing**: `chainPath: [contextID]? -- optional: ordered list of intermediary context IDs in the chain` -- this field reveals the chain of context IDs that data has traversed. Combined with context metadata (Section 5.7), this leaks information about which contexts are connected via outlet interfaces. The spec does not analyze this as a metadata privacy concern or specify when `chainPath` should be omitted (it is marked optional but no guidance on when to include vs. omit).
+- **Why it matters**: An adversary observing provenance records learns the topology of cross-context outlet interface connections. This is metadata leakage that contradicts the protocol's metadata privacy goals (Section 9.10).
 - **Severity**: MEDIUM
 
 ### [7.7.1] DataProvenance `counterparties` Privacy Leak
 - **Category**: Security-relevant omissions
 - **Location**: Section 7.7.1 (line 515)
-- **What's missing**: `counterparties: [DID]` lists all DIDs in the source interaction. When data flows through a tool call from Context A to Context B, Context B's members see the full DID list of Context A's participants. This reveals Context A's membership to Context B. The spec does not analyze this privacy implication or provide a mechanism to redact counterparties.
+- **What's missing**: `counterparties: [DID]` lists all DIDs in the source interaction. When data flows through an outlet call from Context A to Context B, Context B's members see the full DID list of Context A's participants. This reveals Context A's membership to Context B. The spec does not analyze this privacy implication or provide a mechanism to redact counterparties.
 - **Why it matters**: Counterparty revelation violates context isolation expectations. A member of a private context might not consent to their DID being revealed in provenance records to unknown contexts.
 - **Severity**: HIGH
 
@@ -393,7 +393,7 @@ The most significant gap pattern is this: the specs describe *what* the protocol
 | **Total** | **45** |
 
 The four CRITICAL findings are:
-1. No wire format for cross-context tool calls (06, Section 6.2.0)
+1. No wire format for cross-context outlet calls (06, Section 6.2.0)
 2. UCAN capability matching algorithm not specified (07, Section 7.2)
 3. Merkle tree construction not specified (07, Section 7.3.1)
 4. No provenance record integrity protection (07, Section 7.7)

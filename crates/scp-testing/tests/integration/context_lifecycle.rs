@@ -14,11 +14,10 @@ use scp_core::context::nesting::ParentRef;
 use scp_core::context::params::{
     CeilingPolicy, ConsequenceConfig, GovernanceModel, MemoryScope, PromotionPolicy,
 };
-use scp_core::context::ttl::{TtlError, TtlPolicy};
 use scp_core::context::{
     Capability, CapabilityCeiling, ContextError, ContextHandle, ContextMode, ContextParams,
     ContextState, ExtensionConsentMode, MembershipState, TemplateId, TtlExtensionProposal,
-    builtin_admin, builtin_author, builtin_member, builtin_observer, builtin_subscriber, check_ttl,
+    builtin_admin, builtin_author, builtin_member, builtin_observer, builtin_subscriber,
     compute_ceiling_intersection, consent_mode_for_member_count, template_params,
     validate_child_ttl, validate_nesting_depth,
 };
@@ -33,7 +32,7 @@ async fn context_handle_creation() {
     let handle = ContextHandle::new("ctx-b4-001".to_owned(), params);
 
     assert_eq!(handle.context_id(), "ctx-b4-001");
-    assert_eq!(handle.state().await, ContextState::Creating);
+    assert_eq!(handle.state(), ContextState::Creating);
     assert_eq!(handle.params().mode, ContextMode::Encrypted);
 }
 
@@ -46,19 +45,19 @@ async fn state_transitions_happy_path() {
     let handle = ContextHandle::new("ctx-b4-002".to_owned(), ContextParams::default());
 
     // Creating -> Active
-    let new = handle.transition_to(&ContextState::Active).await.unwrap();
+    let new = handle.transition_to(&ContextState::Active).unwrap();
     assert_eq!(new, ContextState::Active);
-    assert_eq!(handle.state().await, ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 
     // Active -> Closing
-    let new = handle.transition_to(&ContextState::Closing).await.unwrap();
+    let new = handle.transition_to(&ContextState::Closing).unwrap();
     assert_eq!(new, ContextState::Closing);
-    assert_eq!(handle.state().await, ContextState::Closing);
+    assert_eq!(handle.state(), ContextState::Closing);
 
     // Closing -> Closed
-    let new = handle.transition_to(&ContextState::Closed).await.unwrap();
+    let new = handle.transition_to(&ContextState::Closed).unwrap();
     assert_eq!(new, ContextState::Closed);
-    assert_eq!(handle.state().await, ContextState::Closed);
+    assert_eq!(handle.state(), ContextState::Closed);
 }
 
 // ---------------------------------------------------------------------------
@@ -68,11 +67,11 @@ async fn state_transitions_happy_path() {
 #[tokio::test]
 async fn state_transition_active_to_expired() {
     let handle = ContextHandle::new("ctx-b4-003".to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await.unwrap();
+    handle.transition_to(&ContextState::Active).unwrap();
 
-    let new = handle.transition_to(&ContextState::Expired).await.unwrap();
+    let new = handle.transition_to(&ContextState::Expired).unwrap();
     assert_eq!(new, ContextState::Expired);
-    assert_eq!(handle.state().await, ContextState::Expired);
+    assert_eq!(handle.state(), ContextState::Expired);
 }
 
 // ---------------------------------------------------------------------------
@@ -83,11 +82,11 @@ async fn state_transition_active_to_expired() {
 async fn invalid_state_transitions() {
     // Closed -> Active
     let handle = ContextHandle::new("ctx-b4-004a".to_owned(), ContextParams::default());
-    handle.transition_to(&ContextState::Active).await.unwrap();
-    handle.transition_to(&ContextState::Closing).await.unwrap();
-    handle.transition_to(&ContextState::Closed).await.unwrap();
+    handle.transition_to(&ContextState::Active).unwrap();
+    handle.transition_to(&ContextState::Closing).unwrap();
+    handle.transition_to(&ContextState::Closed).unwrap();
 
-    let result = handle.transition_to(&ContextState::Active).await;
+    let result = handle.transition_to(&ContextState::Active);
     assert!(result.is_err());
     assert!(
         matches!(
@@ -99,14 +98,14 @@ async fn invalid_state_transitions() {
         ),
         "Closed -> Active should return InvalidTransition"
     );
-    assert_eq!(handle.state().await, ContextState::Closed);
+    assert_eq!(handle.state(), ContextState::Closed);
 
     // Expired -> Active
     let handle2 = ContextHandle::new("ctx-b4-004b".to_owned(), ContextParams::default());
-    handle2.transition_to(&ContextState::Active).await.unwrap();
-    handle2.transition_to(&ContextState::Expired).await.unwrap();
+    handle2.transition_to(&ContextState::Active).unwrap();
+    handle2.transition_to(&ContextState::Expired).unwrap();
 
-    let result2 = handle2.transition_to(&ContextState::Active).await;
+    let result2 = handle2.transition_to(&ContextState::Active);
     assert!(result2.is_err());
     assert!(
         matches!(
@@ -118,7 +117,7 @@ async fn invalid_state_transitions() {
         ),
         "Expired -> Active should return InvalidTransition"
     );
-    assert_eq!(handle2.state().await, ContextState::Expired);
+    assert_eq!(handle2.state(), ContextState::Expired);
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +133,7 @@ async fn context_params_defaults() {
     assert_eq!(params.ceiling_policy, CeilingPolicy::Immutable);
     assert_eq!(params.promotion_policy, PromotionPolicy::NoPromotion);
     assert!(params.roles.is_empty());
-    assert!(params.tools.is_empty());
+    assert!(params.outlets.is_empty());
     assert!(params.ttl.is_none());
     assert_eq!(params.memory_scope, MemoryScope::Ephemeral);
     assert_eq!(params.governance, GovernanceModel::SingleAdmin);
@@ -157,13 +156,13 @@ async fn context_params_all_fields() {
         ceiling: vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
         ],
         ceiling_policy: CeilingPolicy::Governed,
         promotion_policy: PromotionPolicy::Promotable,
         roles: Vec::new(),
-        tools: Vec::new(),
+        outlets: Vec::new(),
         ttl: Some(Duration::from_hours(1)),
         memory_scope: MemoryScope::Full,
         governance: GovernanceModel::SingleAdmin,
@@ -177,6 +176,7 @@ async fn context_params_all_fields() {
         session_cap: None,
         counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
         participation_requirements: Vec::new(),
+        capability_requirements: Vec::new(),
         incomplete_verification_policy:
             scp_core::context::params::IncompleteVerificationPolicy::default(),
         min_protocol_version: None,
@@ -184,6 +184,7 @@ async fn context_params_all_fields() {
         consequence_rules: Vec::new(),
         consequence_config: ConsequenceConfig::default(),
         sybil_policy: None,
+        ..ContextParams::default()
     };
 
     assert_eq!(params.mode, ContextMode::Broadcast);
@@ -210,7 +211,7 @@ async fn context_params_backward_compat() {
         "ceiling_policy": "Immutable",
         "promotion_policy": "NoPromotion",
         "roles": [],
-        "tools": [],
+        "outlets": [],
         "ttl": null,
         "memory_scope": "Ephemeral",
         "governance": "SingleAdmin",
@@ -239,7 +240,7 @@ async fn all_template_ids() {
         TemplateId::GroupDiscussion,
         TemplateId::PublicBroadcast,
         TemplateId::GatedBroadcast,
-        TemplateId::ToolInterfaceTemplate,
+        TemplateId::OutletInterfaceTemplate,
         TemplateId::PaidService,
         TemplateId::PaidBroadcast,
         TemplateId::HandleRegistry,
@@ -317,15 +318,15 @@ async fn capability_ceiling_contains() {
     let ceiling = CapabilityCeiling::new([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolInvokeAll,
+        Capability::OutletCallAll,
     ]);
 
     assert!(ceiling.contains(&Capability::MessagesRead));
     assert!(ceiling.contains(&Capability::MessagesWrite));
-    assert!(ceiling.contains(&Capability::ToolInvokeAll));
+    assert!(ceiling.contains(&Capability::OutletCallAll));
 
-    // ToolInvoke("foo") is implicitly contained when ToolInvokeAll is present
-    assert!(ceiling.contains(&Capability::ToolInvoke("foo".to_owned())));
+    // OutletCall("foo") is implicitly contained when OutletCallAll is present
+    assert!(ceiling.contains(&Capability::OutletCall("foo".to_owned())));
 
     // Not in ceiling
     assert!(!ceiling.contains(&Capability::MemberInvite));
@@ -342,8 +343,8 @@ async fn all_capability_variants() {
     let capabilities = vec![
         (Capability::MessagesRead, "messages:read"),
         (Capability::MessagesWrite, "messages:write"),
-        (Capability::ToolInvokeAll, "tool:invoke:*"),
-        (Capability::ToolRegister, "tool:register"),
+        (Capability::OutletCallAll, "outlet:call:*"),
+        (Capability::OutletRegister, "outlet:register"),
         (Capability::MemberInvite, "member:invite"),
         (Capability::MemberRemove, "member:remove"),
         (Capability::RoleAssign, "role:assign"),
@@ -351,15 +352,15 @@ async fn all_capability_variants() {
         (Capability::GovernanceVote, "governance:vote"),
         (Capability::ContextClose, "context:close"),
         (Capability::ChildContextCreate, "context:child:create"),
-        (Capability::ToolInterface, "tool:interface"),
+        (Capability::OutletInterface, "outlet:interface"),
         (Capability::Bridging, "bridging"),
         (Capability::MediaVoice, "media:voice"),
         (Capability::MediaVideo, "media:video"),
         (Capability::MediaScreenShare, "media:screen_share"),
         (Capability::MemberBan, "member:ban"),
         (
-            Capability::ToolInvoke("my-tool".to_owned()),
-            "tool:invoke:my-tool",
+            Capability::OutletCall("my-outlet".to_owned()),
+            "outlet:call:my-outlet",
         ),
         (Capability::Custom("special".to_owned()), "special"),
     ];
@@ -373,14 +374,20 @@ async fn all_capability_variants() {
     }
 
     // Verify Capability::new round-trips for well-known names
-    assert_eq!(Capability::new("messages:read"), Capability::MessagesRead);
-    assert_eq!(Capability::new("context:close"), Capability::ContextClose);
     assert_eq!(
-        Capability::new("tool:invoke:my-tool"),
-        Capability::ToolInvoke("my-tool".to_owned())
+        Capability::new("messages:read").expect("known capability"),
+        Capability::MessagesRead
     );
     assert_eq!(
-        Capability::new("unknown-cap"),
+        Capability::new("context:close").expect("known capability"),
+        Capability::ContextClose
+    );
+    assert_eq!(
+        Capability::new("outlet:call:my-outlet").expect("known capability"),
+        Capability::OutletCall("my-outlet".to_owned())
+    );
+    assert_eq!(
+        Capability::new("unknown-cap").expect("known capability"),
         Capability::Custom("unknown-cap".to_owned())
     );
 }
@@ -394,7 +401,7 @@ async fn builtin_roles_capabilities() {
     let ceiling = CapabilityCeiling::new([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolInvokeAll,
+        Capability::OutletCallAll,
         Capability::MemberInvite,
         Capability::MemberRemove,
         Capability::RoleAssign,
@@ -421,12 +428,12 @@ async fn builtin_roles_capabilities() {
     assert!(!observer.capabilities.contains(&Capability::MessagesWrite));
     assert_eq!(observer.capabilities.len(), 1);
 
-    // Member gets MessagesRead, MessagesWrite, ToolInvokeAll
+    // Member gets MessagesRead, MessagesWrite, OutletInvokeAll
     let member = builtin_member(&ceiling);
     assert_eq!(member.name, "member");
     assert!(member.capabilities.contains(&Capability::MessagesRead));
     assert!(member.capabilities.contains(&Capability::MessagesWrite));
-    assert!(member.capabilities.contains(&Capability::ToolInvokeAll));
+    assert!(member.capabilities.contains(&Capability::OutletCallAll));
     assert_eq!(member.capabilities.len(), 3);
 
     // Broadcast roles
@@ -439,31 +446,6 @@ async fn builtin_roles_capabilities() {
     assert_eq!(subscriber.name, "subscriber");
     assert!(subscriber.capabilities.contains(&Capability::MessagesRead));
     assert!(!subscriber.capabilities.contains(&Capability::MessagesWrite));
-}
-
-// ---------------------------------------------------------------------------
-// 14. ttl_check
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn ttl_check() {
-    // No TTL policy: always valid
-    assert!(check_ttl(1000, TtlPolicy::None, None, 999_999).is_ok());
-
-    // Finite TTL, not expired
-    let created_at = 1000;
-    let ttl = TtlPolicy::Finite(Duration::from_hours(1));
-    assert!(check_ttl(created_at, ttl, None, 2000).is_ok());
-
-    // Finite TTL, expired (now >= created_at + ttl_secs)
-    let result = check_ttl(created_at, ttl, None, 5000);
-    assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), TtlError::Expired));
-
-    // Extended TTL: extended_until takes precedence
-    assert!(check_ttl(created_at, ttl, Some(6000), 5500).is_ok());
-    let result = check_ttl(created_at, ttl, Some(6000), 6001);
-    assert!(result.is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +526,7 @@ async fn ceiling_intersection() {
         ceiling: CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
+            Capability::OutletCallAll,
             Capability::ChildContextCreate,
         ]),
         governance_config: scp_core::context::nesting::ParentGovernanceConfig {
@@ -561,7 +543,7 @@ async fn ceiling_intersection() {
         context_id: "parent-b".to_owned(),
         ceiling: CapabilityCeiling::new([
             Capability::MessagesRead,
-            Capability::ToolInvokeAll,
+            Capability::OutletCallAll,
             Capability::MemberInvite,
             Capability::ChildContextCreate,
         ]),
@@ -577,9 +559,9 @@ async fn ceiling_intersection() {
 
     let intersection = compute_ceiling_intersection(&[parent_a, parent_b]);
 
-    // Only MessagesRead, ToolInvokeAll, and ChildContextCreate are in both
+    // Only MessagesRead, OutletInvokeAll, and ChildContextCreate are in both
     assert!(intersection.contains(&Capability::MessagesRead));
-    assert!(intersection.contains(&Capability::ToolInvokeAll));
+    assert!(intersection.contains(&Capability::OutletCallAll));
     assert!(intersection.contains(&Capability::ChildContextCreate));
 
     // MessagesWrite is only in parent A, MemberInvite only in parent B
@@ -635,20 +617,20 @@ async fn context_close_lifecycle() {
     let handle = ContextHandle::new("ctx-b4-019".to_owned(), ContextParams::default());
 
     // Creating -> Active
-    handle.transition_to(&ContextState::Active).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Active);
+    handle.transition_to(&ContextState::Active).unwrap();
+    assert_eq!(handle.state(), ContextState::Active);
 
     // Active -> Closing
-    handle.transition_to(&ContextState::Closing).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Closing);
+    handle.transition_to(&ContextState::Closing).unwrap();
+    assert_eq!(handle.state(), ContextState::Closing);
 
     // Closing -> Closed
-    handle.transition_to(&ContextState::Closed).await.unwrap();
-    assert_eq!(handle.state().await, ContextState::Closed);
+    handle.transition_to(&ContextState::Closed).unwrap();
+    assert_eq!(handle.state(), ContextState::Closed);
 
     // Verify terminal: cannot go back to Active or Closing
-    assert!(handle.transition_to(&ContextState::Active).await.is_err());
-    assert!(handle.transition_to(&ContextState::Closing).await.is_err());
-    assert!(handle.transition_to(&ContextState::Creating).await.is_err());
-    assert_eq!(handle.state().await, ContextState::Closed);
+    assert!(handle.transition_to(&ContextState::Active).is_err());
+    assert!(handle.transition_to(&ContextState::Closing).is_err());
+    assert!(handle.transition_to(&ContextState::Creating).is_err());
+    assert_eq!(handle.state(), ContextState::Closed);
 }

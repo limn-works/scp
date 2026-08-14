@@ -113,6 +113,12 @@
 // vector at the compiler instead of via a source-text scanner.
 #![deny(non_local_definitions)]
 
+// ADR-049 (read-authority switch): the supervisor-owned Class-M floor registry.
+// Private to `supervisor` — the `ContextFloors` type and `FloorAdvanceError`
+// are reachable only through the `Supervisor` gate primitives + `SupervisorHandle`
+// accessors, keeping the registry internal (nothing outside the supervisor
+// module names it directly).
+mod floors;
 pub mod handle;
 pub(in crate::context) mod identity_capability;
 pub mod key_package_actor;
@@ -120,6 +126,10 @@ pub mod saga_journal;
 pub mod saga_prepared_state;
 #[allow(clippy::module_inception)]
 pub mod supervisor;
+
+#[cfg(test)]
+#[path = "spawn_from_welcome_tests.rs"]
+mod spawn_from_welcome_tests;
 
 pub use handle::SupervisorHandle;
 pub use key_package_actor::{
@@ -131,7 +141,7 @@ pub use saga_journal::{
     SagaJournal, SagaState, SagaTerminalState,
 };
 pub use saga_prepared_state::{
-    CrossContextToolInvocationPrepared, CrossContextToolInvocationSnapshot, SagaPreparedState,
+    CrossContextOutletInvocationPrepared, CrossContextOutletInvocationSnapshot, SagaPreparedState,
     SagaPreparedStateSnapshot,
 };
 /// The per-saga participant-context-set reservation RAII guard. Exposed only
@@ -140,7 +150,8 @@ pub use saga_prepared_state::{
 #[cfg(any(test, feature = "testing"))]
 pub use supervisor::SagaSetReservation;
 pub use supervisor::{
-    ACTOR_MAILBOX_CAPACITY, CrashWindow, CrossContextToolInvocationRequest, DurableProviders,
-    MessageSigner, PendingSagaProjection, RestoredContexts, SagaDivergenceRepairRecord, SagaInput,
-    SagaOutput, SagaSigningKeys, Supervisor, SupervisorConfig,
+    ACTOR_MAILBOX_CAPACITY, CrashWindow, CrossContextOutletInvocationRequest, DurableProviders,
+    InviteMemberOutcome, MessageSigner, RestoredContexts, SagaAbortReason,
+    SagaDivergenceRepairRecord, SagaError, SagaInput, SagaOutput, SagaSigningKeys, Supervisor,
+    SupervisorConfig, WelcomeJoinRequest,
 };

@@ -10,10 +10,14 @@ homepage.workspace = true
 [dependencies]
 scp-protocol = { path = "../scp-protocol", version = "=0.1.0-beta.2" }
 scp-runtime = { path = "../scp-runtime", version = "=0.1.0-beta.2" }
+scp-mls = { path = "../scp-mls", version = "=0.1.0-beta.2" }
 
 [features]
 testing = ["scp-runtime/testing"]
 allow_unencrypted_storage = ["scp-runtime/allow_unencrypted_storage"]
+# Forwards the runtime's non-leaking capability-escalation test seam feature.
+# Deliberately NOT implied by `testing` (see scp-runtime/Cargo.toml).
+outlet-capability-test-grant = ["scp-runtime/outlet-capability-test-grant"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

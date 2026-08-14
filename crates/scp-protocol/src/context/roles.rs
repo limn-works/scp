@@ -21,13 +21,16 @@
 //!
 //! Built-in roles are always available in every context:
 //! - `admin` -- all capabilities in the ceiling.
-//! - `moderator` -- `MessagesRead`, `MessagesWrite`, `ToolInvokeAll`,
-//!   `MemberRemove`, `GovernancePropose` (§5.9 elected moderators).
-//! - `member` -- `MessagesRead`, `MessagesWrite`, `ToolInvokeAll`.
+//! - `moderator` -- `MessagesRead`, `MessagesWrite`, `OutletQueryAll`,
+//!   `OutletCallAll`, `MemberRemove`, `GovernancePropose` (§5.9 elected
+//!   moderators).
+//! - `member` -- `MessagesRead`, `MessagesWrite`, `OutletQueryAll`,
+//!   `OutletCallAll`.
 //! - `observer` -- `MessagesRead` only.
 //!
 //! Broadcast-specific roles:
-//! - `author` -- `MessagesWrite`, `MessagesRead`, `ToolInvokeAll`.
+//! - `author` -- `MessagesWrite`, `MessagesRead`, `OutletQueryAll`,
+//!   `OutletCallAll`.
 //! - `subscriber` -- `MessagesRead` only.
 //!
 //! Custom roles are defined at context creation with arbitrary capability
@@ -39,21 +42,21 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 
 use super::ContextError;
 use crate::crypto::ucan::nonce::generate_nonce;
 
 // ---------------------------------------------------------------------------
-// ToolId
+// OutletId
 // ---------------------------------------------------------------------------
 
-/// Identifier for a tool registered within a context.
+/// Identifier for an outlet registered within a context.
 ///
-/// This is a simple string type alias. The full `ToolRegistration` type is
-/// defined in `params.rs`; this type identifies a specific tool for
-/// capability scoping (e.g., `ToolInvoke(tool_id)`).
-pub type ToolId = String;
+/// This is a simple string type alias. The full `OutletRegistration` type is
+/// defined in `params.rs`; this type identifies a specific outlet for
+/// capability scoping (e.g., `OutletCall(outlet_id)`, `OutletQuery(outlet_id)`).
+pub type OutletId = String;
 
 // ---------------------------------------------------------------------------
 // Capability
@@ -73,12 +76,18 @@ pub enum Capability {
     MessagesRead,
     /// Write (send) messages in the context.
     MessagesWrite,
-    /// Invoke a specific registered tool, identified by [`ToolId`].
-    ToolInvoke(ToolId),
-    /// Invoke any registered tool in the context.
-    ToolInvokeAll,
-    /// Register new tools in the context.
-    ToolRegister,
+    /// Invoke a specific registered Query (read-only) outlet, identified by
+    /// [`OutletId`] (§5.4.2).
+    OutletQuery(OutletId),
+    /// Invoke any registered Query outlet in the context (§5.4.2).
+    OutletQueryAll,
+    /// Invoke a specific registered Action (mutating) outlet, identified by
+    /// [`OutletId`] (§5.4.2).
+    OutletCall(OutletId),
+    /// Invoke any registered Action outlet in the context (§5.4.2).
+    OutletCallAll,
+    /// Register new outlets in the context.
+    OutletRegister,
     /// Invite new members to the context.
     MemberInvite,
     /// Remove members from the context.
@@ -93,8 +102,8 @@ pub enum Capability {
     ContextClose,
     /// Create child contexts with this context as parent (spec section 5.13).
     ChildContextCreate,
-    /// Cross-context tool interface exposure (spec section 6.2).
-    ToolInterface,
+    /// Cross-context outlet interface exposure (spec section 6.2).
+    OutletInterface,
     /// Bridge connector participation (spec section 12).
     Bridging,
     /// Real-time voice communication via delegated media transport (spec section 10.9.1).
@@ -112,90 +121,180 @@ pub enum Capability {
     Custom(String),
 }
 
+/// Validates an outlet-stem suffix against §5.4.2.1 step 2.
+///
+/// Returns `Some(suffix.to_owned())` if `suffix` matches the regex
+/// `^[a-z0-9_-]{1,128}$`. Returns `None` for the empty string, suffixes
+/// longer than 128 bytes, suffixes containing characters outside
+/// `[a-z0-9_-]` (uppercase, colons, dots, etc.), or any other shape.
+///
+/// The wildcard `*` is NOT handled here — exact-name match handles it.
+/// This helper is for the parameterized `outlet_query:{id}` /
+/// `outlet_call:{id}` form only.
+///
+/// # Spec reference
+///
+/// `.docs/specs/05-contexts.md` §5.4.2.1 UCAN Capability Stem Parser
+/// (step 2: opaque suffix with `outlet_id` validation). Identical bounds
+/// must apply across every bridge per the parser-differential guard.
+fn parse_outlet_suffix(suffix: &str) -> Option<String> {
+    // Step 2a: length bound. Empty and >128 byte suffixes fail. The
+    // length check uses bytes (UTF-8 is irrelevant — the alphabet is
+    // ASCII) and `len()` matches the regex `{1,128}` quantifier.
+    if suffix.is_empty() || suffix.len() > 128 {
+        return None;
+    }
+    // Step 2b: character class. Every byte must be in `[a-z0-9_-]`.
+    // Uppercase, colons, dots, slashes, plus signs, and any non-ASCII
+    // bytes all reject. Walking bytes (rather than chars) is correct
+    // because every accepted character is exactly one byte in UTF-8.
+    if !suffix
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some(suffix.to_owned())
+}
+
 impl Capability {
-    /// Creates a capability from a string name.
+    /// Creates a capability from a string name, applying strict validation
+    /// for parameterized stems.
     ///
-    /// A built-in capability is recognized in **either** of its two equivalent
-    /// spellings of the SAME enumerated category, so a built-in always parses to
-    /// its proper variant (never a [`Custom`](Self::Custom) lookalike):
+    /// Returns `None` if the input fails the §5.4.2.1 two-step parser for
+    /// the `outlet_query:` / `outlet_call:` stems (or their SDK-facing
+    /// `outlet:query:` / `outlet:call:` aliases), if it uses the deleted
+    /// `outlet:invoke:` / `outlet_invoke:` stem (hard break per ADR-049 §1
+    /// and SCP-OUT-014), or if it parses any pre-rename `tool:invoke:` /
+    /// `tool_invoke:` legacy form. Otherwise returns `Some(capability)`.
     ///
-    /// - **User-facing colon form** (spec §5.3.1 table): `"messages:read"`,
-    ///   `"messages:write"`, `"tool:invoke:*"`, `"tool:register"`,
-    ///   `"member:invite"`, `"member:remove"`, `"role:assign"`,
-    ///   `"governance:propose"`, `"governance:vote"`, `"context:close"`,
-    ///   `"context:child:create"`, `"tool:interface"`, `"bridging"`,
-    ///   `"media:voice"`, `"media:video"`, `"media:screen_share"`,
-    ///   `"member:ban"`, `"metadata:edit"`. Names starting with `"tool:invoke:"`
-    ///   parse as `ToolInvoke(id)`.
-    /// - **UCAN wire form** (the `{resource}:{action}` output of
-    ///   [`ucan_capability_name`](Self::ucan_capability_name), §7.3.4) — the
-    ///   spellings that differ from colon form because the resource is a
-    ///   multi-segment, underscore-joined token: `"tool_invoke:*"`
-    ///   (== `ToolInvokeAll`), `"tool_invoke:{id}"` (== `ToolInvoke(id)`),
-    ///   `"context_child:create"` (== `ChildContextCreate`), and `"bridging:*"`
-    ///   (== `Bridging`). Recognizing these is what lets a context's STORED
-    ///   ceiling (kept in canonical UCAN form) round-trip back to the proper
-    ///   built-in enum, and lets a UCAN-form ceiling entry resolve to the
-    ///   enumerated category it names rather than a `Custom` lookalike. There is
-    ///   no ambiguity: no well-formed custom ceiling entry contains a `_` in its
-    ///   resource (the custom grammar is kebab-only, §5.3.1.1), so a built-in's
-    ///   UCAN spelling can never collide with a valid custom.
+    /// # Recognized exact names
     ///
-    /// Names starting with `"custom:"` are parsed as `Custom(remainder)`.
-    /// Anything else maps to `Custom(name)`.
+    /// User-facing colon form (spec §5.3.1 table): `"messages:read"`,
+    /// `"messages:write"`, `"outlet:query:*"`, `"outlet:call:*"`,
+    /// `"outlet:register"`, `"member:invite"`, `"member:remove"`,
+    /// `"role:assign"`, `"governance:propose"`, `"governance:vote"`,
+    /// `"context:close"`, `"context:child:create"`, `"outlet:interface"`,
+    /// `"bridging"`, `"media:voice"`, `"media:video"`, `"media:screen_share"`,
+    /// `"member:ban"`, `"metadata:edit"`.
+    ///
+    /// It ALSO recognizes the **UCAN wire form** (the `{resource}:{action}`
+    /// output of [`ucan_capability_name`](Self::ucan_capability_name), §7.3.4)
+    /// for the multi-segment built-ins whose spelling differs from colon form:
+    /// `"outlet_query:*"` (== `OutletQueryAll`), `"outlet_call:*"`
+    /// (== `OutletCallAll`), `"context_child:create"` (== `ChildContextCreate`),
+    /// and `"bridging:*"` (== `Bridging`). Recognizing these is what lets a
+    /// context's STORED ceiling (kept in canonical UCAN form) round-trip back to
+    /// the proper built-in enum.
+    ///
+    /// # Parameterized prefixes (strict — §5.4.2.1)
+    ///
+    /// - `"outlet:query:{id}"` and `"outlet_query:{id}"` parse as
+    ///   [`OutletQuery(id)`](Self::OutletQuery).
+    /// - `"outlet:call:{id}"` and `"outlet_call:{id}"` parse as
+    ///   [`OutletCall(id)`](Self::OutletCall).
+    ///
+    /// The suffix after the stem prefix must be the literal wildcard `*` or
+    /// match the regex `^[a-z0-9_-]{1,128}$`. Suffixes that contain a colon
+    /// (`outlet_query:call:foo`), are empty (`outlet_query:`), use uppercase
+    /// (`outlet_query:FOO`), or exceed the 128-byte length bound all return
+    /// `None`. This is the parser-differential guard required by spec
+    /// §5.4.2.1 step 2.
+    ///
+    /// # Custom prefix
+    ///
+    /// Names starting with `"custom:"` parse as `Custom(remainder)`. Anything
+    /// else (with no recognized prefix) maps to `Custom(name)`.
+    ///
+    /// # Hard-break prefixes (always `None`)
+    ///
+    /// - `"outlet:invoke:..."` / `"outlet_invoke:..."` — deleted in
+    ///   SCP-OUT-014 (no transitional alias, ADR-049 §1).
+    /// - `"tool:invoke:..."` / `"tool_invoke:..."` — pre-rename legacy form
+    ///   removed in SCP-OUT-002 (no transitional alias).
+    /// - `"tool:register"`, `"tool:interface"` — pre-rename legacy form.
     ///
     /// [`name`](Self::name) and [`Display`](std::fmt::Display) always emit the
     /// canonical colon form, so `new(name())` and `new(to_string())` round-trip.
     #[must_use]
-    pub fn new(name: impl AsRef<str>) -> Self {
-        match name.as_ref() {
+    pub fn new(name: impl AsRef<str>) -> Option<Self> {
+        let n = name.as_ref();
+        // Hard-break forms must NEVER parse — checked before any prefix
+        // splitting so a `outlet_invoke:foo` cannot reach the Custom
+        // catch-all below (ADR-049 §1, SCP-OUT-014).
+        if n.starts_with("outlet:invoke:") || n.starts_with("outlet_invoke:") {
+            return None;
+        }
+        if n.starts_with("tool:invoke:") || n.starts_with("tool_invoke:") {
+            return None;
+        }
+        if matches!(
+            n,
+            "tool:register" | "tool:interface" | "tool_register" | "tool_interface"
+        ) {
+            return None;
+        }
+
+        match n {
             // Built-in categories. Each arm lists the user-facing colon spelling
             // (spec §5.3.1 table) AND, for the multi-segment built-ins, the
             // equivalent UCAN wire spelling (the underscore-joined-resource output
             // of `ucan_capability_name`, §7.3.4) — the two spellings of the SAME
-            // enumerated category. Recognizing the UCAN spelling is what lets a
-            // context's STORED ceiling (kept in canonical UCAN form) round-trip
-            // back to the proper built-in enum, and resolves a UCAN-form ceiling
-            // entry to its category instead of a `Custom` lookalike. No valid
-            // custom collides: the custom grammar is kebab-only (no `_` in the
-            // resource, §5.3.1.1).
-            "messages:read" => Self::MessagesRead,
-            "messages:write" => Self::MessagesWrite,
-            "tool:invoke:*" | "tool_invoke:*" => Self::ToolInvokeAll,
-            "tool:register" => Self::ToolRegister,
-            "member:invite" => Self::MemberInvite,
-            "member:remove" => Self::MemberRemove,
-            "role:assign" => Self::RoleAssign,
-            "governance:propose" => Self::GovernancePropose,
-            "governance:vote" => Self::GovernanceVote,
-            "context:close" => Self::ContextClose,
-            "context:child:create" | "context_child:create" => Self::ChildContextCreate,
-            "tool:interface" => Self::ToolInterface,
-            "bridging" | "bridging:*" => Self::Bridging,
-            "media:voice" => Self::MediaVoice,
-            "media:video" => Self::MediaVideo,
-            "media:screen_share" => Self::MediaScreenShare,
-            "member:ban" => Self::MemberBan,
-            "metadata:edit" => Self::MetadataEdit,
-            other => other
-                .strip_prefix("tool:invoke:")
-                .or_else(|| other.strip_prefix("tool_invoke:"))
-                .map_or_else(
-                    || {
-                        other.strip_prefix("custom:").map_or_else(
-                            || Self::Custom(other.to_owned()),
-                            |custom_name| Self::Custom(custom_name.to_owned()),
-                        )
-                    },
-                    |tool_id| Self::ToolInvoke(tool_id.to_owned()),
-                ),
+            // enumerated category. No valid custom collides: the custom grammar is
+            // kebab-only (no `_` in the resource, §5.3.1.1).
+            "messages:read" => Some(Self::MessagesRead),
+            "messages:write" => Some(Self::MessagesWrite),
+            "outlet:query:*" | "outlet_query:*" => Some(Self::OutletQueryAll),
+            "outlet:call:*" | "outlet_call:*" => Some(Self::OutletCallAll),
+            "outlet:register" => Some(Self::OutletRegister),
+            "member:invite" => Some(Self::MemberInvite),
+            "member:remove" => Some(Self::MemberRemove),
+            "role:assign" => Some(Self::RoleAssign),
+            "governance:propose" => Some(Self::GovernancePropose),
+            "governance:vote" => Some(Self::GovernanceVote),
+            "context:close" => Some(Self::ContextClose),
+            "context:child:create" | "context_child:create" => Some(Self::ChildContextCreate),
+            "outlet:interface" => Some(Self::OutletInterface),
+            "bridging" | "bridging:*" => Some(Self::Bridging),
+            "media:voice" => Some(Self::MediaVoice),
+            "media:video" => Some(Self::MediaVideo),
+            "media:screen_share" => Some(Self::MediaScreenShare),
+            "member:ban" => Some(Self::MemberBan),
+            "metadata:edit" => Some(Self::MetadataEdit),
+            // Strict §5.4.2.1 parser for the four valid outlet-stem prefixes.
+            // The wildcard `*` form is matched as an exact name above; the
+            // remaining suffix must satisfy `parse_outlet_suffix`. Invalid
+            // suffixes return `None` rather than falling back to Custom —
+            // this is what distinguishes `outlet_query:call:foo` (parser-
+            // differential rejection) from a Custom capability.
+            _ if n.starts_with("outlet:query:") => {
+                parse_outlet_suffix(&n["outlet:query:".len()..]).map(Self::OutletQuery)
+            }
+            _ if n.starts_with("outlet_query:") => {
+                parse_outlet_suffix(&n["outlet_query:".len()..]).map(Self::OutletQuery)
+            }
+            _ if n.starts_with("outlet:call:") => {
+                parse_outlet_suffix(&n["outlet:call:".len()..]).map(Self::OutletCall)
+            }
+            _ if n.starts_with("outlet_call:") => {
+                parse_outlet_suffix(&n["outlet_call:".len()..]).map(Self::OutletCall)
+            }
+            // Custom prefix and bare custom names. The Custom catch-all is
+            // unreachable for outlet-stem inputs because the four prefixes
+            // above (and the hard-break checks at the top) already cover
+            // every `outlet:` / `outlet_` shape.
+            _ => Some(n.strip_prefix("custom:").map_or_else(
+                || Self::Custom(n.to_owned()),
+                |custom_name| Self::Custom(custom_name.to_owned()),
+            )),
         }
     }
 
     /// Returns the canonical input name of this capability.
     ///
-    /// For [`ToolInvoke`](Self::ToolInvoke) variants, includes the tool ID
-    /// (e.g. `"tool:invoke:my_tool"`). For [`Custom`](Self::Custom) variants,
+    /// For [`OutletQuery`](Self::OutletQuery) and [`OutletCall`](Self::OutletCall)
+    /// variants, includes the outlet ID (e.g. `"outlet:query:my_outlet"`,
+    /// `"outlet:call:my_outlet"`). For [`Custom`](Self::Custom) variants,
     /// returns the raw name without prefix (e.g. `"foo"`, not `"custom:foo"`).
     ///
     /// **Note:** This differs from [`Display`](std::fmt::Display) for Custom
@@ -206,9 +305,11 @@ impl Capability {
         match self {
             Self::MessagesRead => std::borrow::Cow::Borrowed("messages:read"),
             Self::MessagesWrite => std::borrow::Cow::Borrowed("messages:write"),
-            Self::ToolInvoke(id) => std::borrow::Cow::Owned(format!("tool:invoke:{id}")),
-            Self::ToolInvokeAll => std::borrow::Cow::Borrowed("tool:invoke:*"),
-            Self::ToolRegister => std::borrow::Cow::Borrowed("tool:register"),
+            Self::OutletQuery(id) => std::borrow::Cow::Owned(format!("outlet:query:{id}")),
+            Self::OutletQueryAll => std::borrow::Cow::Borrowed("outlet:query:*"),
+            Self::OutletCall(id) => std::borrow::Cow::Owned(format!("outlet:call:{id}")),
+            Self::OutletCallAll => std::borrow::Cow::Borrowed("outlet:call:*"),
+            Self::OutletRegister => std::borrow::Cow::Borrowed("outlet:register"),
             Self::MemberInvite => std::borrow::Cow::Borrowed("member:invite"),
             Self::MemberRemove => std::borrow::Cow::Borrowed("member:remove"),
             Self::RoleAssign => std::borrow::Cow::Borrowed("role:assign"),
@@ -216,7 +317,7 @@ impl Capability {
             Self::GovernanceVote => std::borrow::Cow::Borrowed("governance:vote"),
             Self::ContextClose => std::borrow::Cow::Borrowed("context:close"),
             Self::ChildContextCreate => std::borrow::Cow::Borrowed("context:child:create"),
-            Self::ToolInterface => std::borrow::Cow::Borrowed("tool:interface"),
+            Self::OutletInterface => std::borrow::Cow::Borrowed("outlet:interface"),
             Self::Bridging => std::borrow::Cow::Borrowed("bridging"),
             Self::MediaVoice => std::borrow::Cow::Borrowed("media:voice"),
             Self::MediaVideo => std::borrow::Cow::Borrowed("media:video"),
@@ -229,23 +330,25 @@ impl Capability {
 
     /// Returns the `(resource, action)` pair for UCAN capability URIs.
     ///
-    /// The canonical user-facing format uses colons (e.g., `"tool:invoke:*"`),
+    /// The canonical user-facing format uses colons (e.g., `"outlet:call:*"`),
     /// but UCAN URIs use `{resource}:{action}` where `resource` is a single
     /// underscore-joined token. This method bridges the two formats:
     ///
-    /// - `tool:invoke:*`         -> `("tool_invoke", "*")`
-    /// - `tool:invoke:calculator` -> `("tool_invoke", "calculator")`
-    /// - `context:child:create`  -> `("context_child", "create")`
-    /// - `messages:write`        -> `("messages", "write")`
-    /// - `context:close`         -> `("context", "close")`
-    /// - `role:assign`           -> `("role", "assign")`
-    /// - `bridging`              -> `("bridging", "*")`
+    /// - `outlet:query:*`          -> `("outlet_query", "*")`
+    /// - `outlet:query:calculator` -> `("outlet_query", "calculator")`
+    /// - `outlet:call:*`           -> `("outlet_call", "*")`
+    /// - `outlet:call:calculator`  -> `("outlet_call", "calculator")`
+    /// - `context:child:create`    -> `("context_child", "create")`
+    /// - `messages:write`          -> `("messages", "write")`
+    /// - `context:close`           -> `("context", "close")`
+    /// - `role:assign`             -> `("role", "assign")`
+    /// - `bridging`                -> `("bridging", "*")`
     ///
     /// The returned strings are suitable for constructing
     /// [`CapabilityUri`](crate::crypto::ucan::capability::CapabilityUri) values
     /// and for building ceiling string sets (`{resource}:{action}`).
     ///
-    /// See issue #1293 for the mismatch this method resolves.
+    /// See §5.4.2.1 for the outlet stem parser semantics.
     #[must_use]
     pub fn ucan_resource_action(&self) -> (std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>) {
         match self {
@@ -257,16 +360,24 @@ impl Capability {
                 std::borrow::Cow::Borrowed("messages"),
                 std::borrow::Cow::Borrowed("write"),
             ),
-            Self::ToolInvoke(id) => (
-                std::borrow::Cow::Borrowed("tool_invoke"),
+            Self::OutletQuery(id) => (
+                std::borrow::Cow::Borrowed("outlet_query"),
                 std::borrow::Cow::Borrowed(id.as_str()),
             ),
-            Self::ToolInvokeAll => (
-                std::borrow::Cow::Borrowed("tool_invoke"),
+            Self::OutletQueryAll => (
+                std::borrow::Cow::Borrowed("outlet_query"),
                 std::borrow::Cow::Borrowed("*"),
             ),
-            Self::ToolRegister => (
-                std::borrow::Cow::Borrowed("tool"),
+            Self::OutletCall(id) => (
+                std::borrow::Cow::Borrowed("outlet_call"),
+                std::borrow::Cow::Borrowed(id.as_str()),
+            ),
+            Self::OutletCallAll => (
+                std::borrow::Cow::Borrowed("outlet_call"),
+                std::borrow::Cow::Borrowed("*"),
+            ),
+            Self::OutletRegister => (
+                std::borrow::Cow::Borrowed("outlet"),
                 std::borrow::Cow::Borrowed("register"),
             ),
             Self::MemberInvite => (
@@ -297,8 +408,8 @@ impl Capability {
                 std::borrow::Cow::Borrowed("context_child"),
                 std::borrow::Cow::Borrowed("create"),
             ),
-            Self::ToolInterface => (
-                std::borrow::Cow::Borrowed("tool"),
+            Self::OutletInterface => (
+                std::borrow::Cow::Borrowed("outlet"),
                 std::borrow::Cow::Borrowed("interface"),
             ),
             Self::Bridging => (
@@ -368,7 +479,8 @@ impl Capability {
     /// ```
     /// use scp_protocol::context::roles::Capability;
     ///
-    /// assert_eq!(Capability::ToolInvokeAll.ucan_capability_name(), "tool_invoke:*");
+    /// assert_eq!(Capability::OutletCallAll.ucan_capability_name(), "outlet_call:*");
+    /// assert_eq!(Capability::OutletQueryAll.ucan_capability_name(), "outlet_query:*");
     /// assert_eq!(Capability::MessagesWrite.ucan_capability_name(), "messages:write");
     /// assert_eq!(Capability::ChildContextCreate.ucan_capability_name(), "context_child:create");
     /// ```
@@ -382,8 +494,9 @@ impl Capability {
     /// grammar (spec §5.3.1.1).
     ///
     /// Built-in variants are well-formed by construction (they correspond to
-    /// rows of the §5.3.1 table). [`ToolInvoke`](Self::ToolInvoke) and
-    /// [`Custom`](Self::Custom) variants carry caller-supplied text, so they are
+    /// rows of the §5.3.1 table). [`OutletQuery`](Self::OutletQuery),
+    /// [`OutletCall`](Self::OutletCall), and [`Custom`](Self::Custom) variants
+    /// carry caller-supplied text, so they are
     /// reconstructed to their user-facing entry string ([`name`](Self::name)) and
     /// validated via [`validate_ceiling_entry`]. This is the enum-form entry point
     /// onto the single canonical string validator, so a malformed custom (e.g. a
@@ -394,14 +507,14 @@ impl Capability {
     ///
     /// A [`Custom`](Self::Custom) wraps an arbitrary string that an untrusted peer
     /// can put on the wire (`Capability` derives a plain `Deserialize` with no
-    /// normalization, so `{"Custom":"tool:invoke:*"}` deserializes verbatim). Such
+    /// normalization, so `{"Custom":"outlet:call:*"}` deserializes verbatim). Such
     /// a `Custom` projects through [`ucan_capability_name`](Self::ucan_capability_name)
     /// onto the EXACT canonical UCAN form of a privileged built-in — e.g.
-    /// `Custom("tool:invoke:*")` → `"tool_invoke:*"` (== [`ToolInvokeAll`](Self::ToolInvokeAll))
-    /// — so a non-conformant `Custom` could masquerade as "invoke any tool" if it
+    /// `Custom("outlet:call:*")` → `"outlet_call:*"` (== [`OutletCallAll`](Self::OutletCallAll))
+    /// — so a non-conformant `Custom` could masquerade as "call any outlet" if it
     /// reached the stored ceiling. Plain grammar validation
     /// ([`validate_ceiling_entry`]) does NOT catch this: it early-accepts a built-in's
-    /// COLON spelling (`tool:invoke:*`, `tool:invoke:{id}`) and otherwise applies only
+    /// COLON spelling (`outlet:call:*`, `outlet:call:{id}`) and otherwise applies only
     /// the custom `{resource}:{action}` grammar, neither of which distinguishes a
     /// masquerading custom from a legitimate one.
     ///
@@ -410,7 +523,8 @@ impl Capability {
     /// the `Custom` string through the canonical parser [`Capability::new`]: if it
     /// resolves to ANY non-[`Custom`](Self::Custom) variant, the string names a
     /// built-in in SOME spelling (colon OR UCAN form, including the parameterized
-    /// `ToolInvoke(id)` family for any concrete `tool_id`) and the `Custom` is
+    /// `OutletQuery(id)` / `OutletCall(id)` family for any concrete `outlet_id`)
+    /// and the `Custom` is
     /// rejected. A legitimate custom (`Custom("payments:read")`) re-resolves back to a
     /// `Custom` and proceeds to grammar validation. This covers EVERY built-in
     /// spelling by construction — the parser is the single authority on "what string
@@ -429,29 +543,33 @@ impl Capability {
         match self {
             // A `Custom` carries an arbitrary, untrusted string. Before applying the
             // custom grammar, reject any `Custom` that names a built-in in ANY
-            // spelling: re-resolve through the canonical parser and reject if it does
-            // not round-trip back to a `Custom`. This is closed by construction over
+            // spelling: re-resolve through the canonical parser and reject unless it
+            // round-trips back to a `Custom`. This is closed by construction over
             // every built-in spelling (colon AND UCAN form, including the
-            // parameterized `tool:invoke:{id}` / `tool_invoke:{id}` family) because
+            // parameterized `outlet:query:{id}` / `outlet:call:{id}` family) because
             // `Capability::new` is the single authority on which strings are
             // built-ins — see the "No privileged-built-in collision" doc section
-            // above (§5.3.1.1).
+            // above (§5.3.1.1). A string the parser hard-rejects (`None`, e.g. a
+            // deleted `outlet:invoke:*` stem) is likewise rejected here: it is not a
+            // legitimate custom and must never enter the stored ceiling.
             Self::Custom(name) => {
-                if !matches!(Self::new(name), Self::Custom(_)) {
+                if !matches!(Self::new(name), Some(Self::Custom(_))) {
                     return Err(CeilingEntryError::invalid(
                         name,
                         "custom ceiling entry names a built-in capability (it resolves to a \
-                         built-in variant in its colon or canonical UCAN spelling); a custom \
-                         must not masquerade as a privileged built-in (§5.3.1.1 no \
-                         privileged-built-in collision)",
+                         built-in variant in its colon or canonical UCAN spelling), or names a \
+                         deleted/invalid stem the parser rejects; a custom must not masquerade \
+                         as a privileged built-in (§5.3.1.1 no privileged-built-in collision)",
                     ));
                 }
                 validate_ceiling_entry(name)
             }
-            // `ToolInvoke(id)` carries caller-supplied text — route it through the
-            // canonical string grammar using its user-facing entry form. Built-in
-            // variants are well-formed by construction.
-            Self::ToolInvoke(_) => validate_ceiling_entry(self.name().as_ref()),
+            // `OutletQuery(id)` / `OutletCall(id)` carry caller-supplied text —
+            // route through the canonical string grammar using their user-facing
+            // entry form. Built-in variants are well-formed by construction.
+            Self::OutletQuery(_) | Self::OutletCall(_) => {
+                validate_ceiling_entry(self.name().as_ref())
+            }
             _ => Ok(()),
         }
     }
@@ -462,9 +580,11 @@ impl std::fmt::Display for Capability {
         match self {
             Self::MessagesRead => write!(f, "messages:read"),
             Self::MessagesWrite => write!(f, "messages:write"),
-            Self::ToolInvoke(id) => write!(f, "tool:invoke:{id}"),
-            Self::ToolInvokeAll => write!(f, "tool:invoke:*"),
-            Self::ToolRegister => write!(f, "tool:register"),
+            Self::OutletQuery(id) => write!(f, "outlet:query:{id}"),
+            Self::OutletQueryAll => write!(f, "outlet:query:*"),
+            Self::OutletCall(id) => write!(f, "outlet:call:{id}"),
+            Self::OutletCallAll => write!(f, "outlet:call:*"),
+            Self::OutletRegister => write!(f, "outlet:register"),
             Self::MemberInvite => write!(f, "member:invite"),
             Self::MemberRemove => write!(f, "member:remove"),
             Self::RoleAssign => write!(f, "role:assign"),
@@ -472,7 +592,7 @@ impl std::fmt::Display for Capability {
             Self::GovernanceVote => write!(f, "governance:vote"),
             Self::ContextClose => write!(f, "context:close"),
             Self::ChildContextCreate => write!(f, "context:child:create"),
-            Self::ToolInterface => write!(f, "tool:interface"),
+            Self::OutletInterface => write!(f, "outlet:interface"),
             Self::Bridging => write!(f, "bridging"),
             Self::MediaVoice => write!(f, "media:voice"),
             Self::MediaVideo => write!(f, "media:video"),
@@ -590,16 +710,23 @@ impl CapabilityCeiling {
     /// Returns `true` if the given capability is within the ceiling.
     ///
     /// This is the core ceiling check used during UCAN validation and role
-    /// definition. `ToolInvoke(id)` is considered within the ceiling if either
-    /// `ToolInvoke(id)` or `ToolInvokeAll` is in the ceiling.
+    /// definition. `OutletQuery(id)` is considered within the ceiling if either
+    /// `OutletQuery(id)` or `OutletQueryAll` is in the ceiling. Likewise
+    /// `OutletCall(id)` is implied by `OutletCallAll`. The two classes are
+    /// disjoint: `OutletQueryAll` does NOT cover `OutletCall(id)` and
+    /// `OutletCallAll` does NOT cover `OutletQuery(id)` (query ≠ call, §5.4.2).
     #[must_use]
     pub fn contains(&self, capability: &Capability) -> bool {
         if self.capabilities.contains(capability) {
             return true;
         }
-        // ToolInvoke(id) is implicitly allowed if ToolInvokeAll is in the ceiling.
-        if let Capability::ToolInvoke(_) = capability {
-            return self.capabilities.contains(&Capability::ToolInvokeAll);
+        // OutletQuery(id) is implicitly allowed if OutletQueryAll is in the ceiling.
+        if let Capability::OutletQuery(_) = capability {
+            return self.capabilities.contains(&Capability::OutletQueryAll);
+        }
+        // OutletCall(id) is implicitly allowed if OutletCallAll is in the ceiling.
+        if let Capability::OutletCall(_) = capability {
+            return self.capabilities.contains(&Capability::OutletCallAll);
         }
         false
     }
@@ -691,7 +818,7 @@ impl CapabilityCeiling {
 
 /// Returns the default capability ceiling for new contexts.
 ///
-/// Includes all standard SCP capabilities: messaging, tool management, role
+/// Includes all standard SCP capabilities: messaging, outlet management, role
 /// assignment, membership control, governance, and context close. Used by
 /// all FFI bridges when no explicit ceiling is provided.
 #[must_use]
@@ -699,8 +826,9 @@ pub fn default_ceiling() -> CapabilityCeiling {
     CapabilityCeiling::new([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolRegister,
-        Capability::ToolInvokeAll,
+        Capability::OutletRegister,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
         Capability::RoleAssign,
         Capability::MemberInvite,
         Capability::MemberRemove,
@@ -718,19 +846,22 @@ pub fn default_ceiling() -> CapabilityCeiling {
 /// "String field validation"). Entries exceeding this cap are rejected.
 pub const MAX_CEILING_ENTRY_LENGTH: usize = 256;
 
-/// Maximum byte length of a `tool_id` in a parameterized `tool:invoke:{tool_id}`
-/// built-in entry (spec §5.4.1 `ToolRegistration.tool_id`, `max 128 chars`).
-const MAX_TOOL_ID_LENGTH: usize = 128;
+/// Maximum byte length of an `outlet_id` in a parameterized
+/// `outlet:query:{outlet_id}` / `outlet:call:{outlet_id}` built-in entry (spec
+/// §5.4.1 `OutletRegistration.outlet_id`, `max 128 chars`).
+const MAX_OUTLET_ID_LENGTH: usize = 128;
 
 /// The exhaustive set of non-parameterized built-in capability category strings
 /// (spec §5.3.1 table). These are matched exactly and case-sensitively. The
-/// parameterized `tool:invoke:{tool_id}` and the resource wildcard
-/// `tool:invoke:*` are validated separately (see [`validate_ceiling_entry`]).
+/// parameterized `outlet:query:{outlet_id}` / `outlet:call:{outlet_id}` and the
+/// resource wildcards `outlet:query:*` / `outlet:call:*` are validated
+/// separately (see [`validate_ceiling_entry`]).
 const BUILTIN_CEILING_CATEGORIES: &[&str] = &[
     "messages:read",
     "messages:write",
-    "tool:register",
-    "tool:invoke:*",
+    "outlet:register",
+    "outlet:query:*",
+    "outlet:call:*",
     "member:invite",
     "member:remove",
     "member:ban",
@@ -739,7 +870,7 @@ const BUILTIN_CEILING_CATEGORIES: &[&str] = &[
     "media:video",
     "media:screen_share",
     "bridging",
-    "tool:interface",
+    "outlet:interface",
     "context:child:create",
     "governance:propose",
     "governance:vote",
@@ -783,8 +914,9 @@ impl CeilingEntryError {
 /// The exhaustive list of non-parameterized built-in [`Capability`] variants.
 ///
 /// Single source of truth for "which capabilities are built-ins" — the
-/// parameterized [`Capability::ToolInvoke`] and [`Capability::Custom`] carry
-/// caller text and are validated through the grammar, so they are deliberately
+/// parameterized [`Capability::OutletQuery`] / [`Capability::OutletCall`] and
+/// [`Capability::Custom`] carry caller text and are validated through the
+/// grammar, so they are deliberately
 /// excluded here. Used by [`validate_ucan_ceiling_string`] to recognize the
 /// canonical UCAN-form spelling of every built-in (its
 /// [`Capability::ucan_capability_name`]). Adding a built-in variant is a compile
@@ -793,8 +925,9 @@ impl CeilingEntryError {
 const BUILTIN_CAPABILITIES: &[Capability] = &[
     Capability::MessagesRead,
     Capability::MessagesWrite,
-    Capability::ToolInvokeAll,
-    Capability::ToolRegister,
+    Capability::OutletQueryAll,
+    Capability::OutletCallAll,
+    Capability::OutletRegister,
     Capability::MemberInvite,
     Capability::MemberRemove,
     Capability::RoleAssign,
@@ -802,7 +935,7 @@ const BUILTIN_CAPABILITIES: &[Capability] = &[
     Capability::GovernanceVote,
     Capability::ContextClose,
     Capability::ChildContextCreate,
-    Capability::ToolInterface,
+    Capability::OutletInterface,
     Capability::Bridging,
     Capability::MediaVoice,
     Capability::MediaVideo,
@@ -820,10 +953,10 @@ const BUILTIN_CAPABILITIES: &[Capability] = &[
 /// spellings, because the two paths carry different vocabularies:
 ///
 /// - [`validate_ceiling_entry`] validates **user-facing colon form** (e.g.
-///   `tool:invoke:*`, `context:child:create`) — what `create_context` /
+///   `outlet:call:*`, `context:child:create`) — what `create_context` /
 ///   `ModifyCeiling` receive, where built-ins resolve to enum variants via
 ///   [`Capability::new`] and skip the string grammar entirely.
-/// - This function validates **UCAN form** (e.g. `tool_invoke:*`,
+/// - This function validates **UCAN form** (e.g. `outlet_call:*`,
 ///   `context_child:create`) — what a context's stored ceiling string set and a
 ///   signed export snapshot carry. A built-in's UCAN spelling can contain `_`
 ///   (from a multi-segment resource), which the kebab grammar in
@@ -834,9 +967,10 @@ const BUILTIN_CAPABILITIES: &[Capability] = &[
 /// A UCAN-form entry is well-formed iff it is **exactly one** of:
 /// 1. the [`Capability::ucan_capability_name`] of a non-parameterized built-in
 ///    ([`BUILTIN_CAPABILITIES`]);
-/// 2. a parameterized `tool_invoke:{tool_id}` whose `tool_id` is a non-empty
-///    `[a-z0-9_-]` token (spec §5.4.1) — `tool_invoke:*` is already covered by
-///    rule 1 via [`Capability::ToolInvokeAll`];
+/// 2. a parameterized `outlet_query:{outlet_id}` / `outlet_call:{outlet_id}`
+///    whose `outlet_id` is a non-empty `[a-z0-9_-]` token (spec §5.4.1) —
+///    `outlet_query:*` / `outlet_call:*` are already covered by rule 1 via
+///    [`Capability::OutletQueryAll`] / [`Capability::OutletCallAll`];
 /// 3. a well-formed custom `{resource}:{action}` accepted by the shared
 ///    [`validate_custom_ceiling_entry`] grammar core.
 ///
@@ -864,22 +998,25 @@ pub fn validate_ucan_ceiling_string(entry: &str) -> Result<(), CeilingEntryError
         return Ok(());
     }
 
-    // 2. Parameterized `tool_invoke:{tool_id}` (UCAN form). `tool_invoke:*` is a
-    //    built-in handled above; here `tool_id` is a concrete id and MUST NOT
-    //    contain `*`.
-    if let Some(tool_id) = entry.strip_prefix("tool_invoke:") {
-        if tool_id.len() > MAX_TOOL_ID_LENGTH {
+    // 2. Parameterized `outlet_query:{outlet_id}` / `outlet_call:{outlet_id}`
+    //    (UCAN form). The `*` wildcards are built-ins handled above; here
+    //    `outlet_id` is a concrete id and MUST NOT contain `*`.
+    if let Some(outlet_id) = entry
+        .strip_prefix("outlet_query:")
+        .or_else(|| entry.strip_prefix("outlet_call:"))
+    {
+        if outlet_id.len() > MAX_OUTLET_ID_LENGTH {
             return Err(CeilingEntryError::invalid(
                 entry,
-                format!("tool_id exceeds maximum length of {MAX_TOOL_ID_LENGTH} bytes"),
+                format!("outlet_id exceeds maximum length of {MAX_OUTLET_ID_LENGTH} bytes"),
             ));
         }
-        if is_tool_id_token(tool_id) {
+        if is_outlet_id_token(outlet_id) {
             return Ok(());
         }
         return Err(CeilingEntryError::invalid(
             entry,
-            "tool_id must be a non-empty [a-z0-9_-] token (no '*', no ':', no whitespace)",
+            "outlet_id must be a non-empty [a-z0-9_-] token (no '*', no ':', no whitespace)",
         ));
     }
 
@@ -887,7 +1024,7 @@ pub fn validate_ucan_ceiling_string(entry: &str) -> Result<(), CeilingEntryError
     //    (single colon, kebab resource — no conversion-introduced `_`), so the
     //    shared custom grammar accepts it verbatim. We call the custom core
     //    directly (NOT `validate_ceiling_entry`) so a non-canonical COLON-form
-    //    built-in (e.g. `tool:invoke:*`, `context:child:create`) is rejected on
+    //    built-in (e.g. `outlet:call:*`, `context:child:create`) is rejected on
     //    the UCAN/import path — the stored vocabulary is strictly UCAN form, and
     //    accepting a colon-form built-in here would let an import store a spelling
     //    that diverges from the canonical form every gate check matches against.
@@ -947,12 +1084,12 @@ fn is_kebab_token(token: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// Returns `true` if every byte of `tool_id` is in the §5.4.1 `tool_id` charset
-/// `[a-z0-9_-]` and `tool_id` is non-empty. Differs from [`is_kebab_token`] by
-/// also permitting `_` (underscore), per §5.4.1.
-fn is_tool_id_token(tool_id: &str) -> bool {
-    !tool_id.is_empty()
-        && tool_id
+/// Returns `true` if every byte of `outlet_id` is in the §5.4.1 `outlet_id`
+/// charset `[a-z0-9_-]` and `outlet_id` is non-empty. Differs from
+/// [`is_kebab_token`] by also permitting `_` (underscore), per §5.4.1.
+fn is_outlet_id_token(outlet_id: &str) -> bool {
+    !outlet_id.is_empty()
+        && outlet_id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
@@ -966,8 +1103,9 @@ fn is_tool_id_token(tool_id: &str) -> bool {
 ///
 /// A well-formed entry is **exactly one** of:
 /// 1. a built-in category — exact, case-sensitive match against the §5.3.1
-///    table (including parameterized `tool:invoke:{tool_id}` and the resource
-///    wildcard `tool:invoke:*`);
+///    table (including parameterized `outlet:query:{outlet_id}` /
+///    `outlet:call:{outlet_id}` and the resource wildcards `outlet:query:*` /
+///    `outlet:call:*`);
 /// 2. a custom `{resource}:{action}` — exactly one colon; both tokens non-empty
 ///    kebab-case `[a-z0-9-]+`;
 /// 3. an explicit resource wildcard `{resource}:*` — `{resource}` kebab-case;
@@ -1000,23 +1138,27 @@ pub(crate) fn validate_ceiling_entry(entry: &str) -> Result<(), CeilingEntryErro
         return Ok(());
     }
 
-    // 1b. Parameterized built-in: `tool:invoke:{tool_id}` (the `*` form is in the
-    // table above). The tool_id follows §5.4.1's charset/length (allows `_`).
-    if let Some(tool_id) = entry.strip_prefix("tool:invoke:") {
-        // `tool:invoke:*` already matched as a built-in above; here tool_id is a
-        // concrete id and MUST NOT contain a `*`.
-        if tool_id.len() > MAX_TOOL_ID_LENGTH {
+    // 1b. Parameterized built-in: `outlet:query:{outlet_id}` /
+    // `outlet:call:{outlet_id}` (the `*` forms are in the table above). The
+    // outlet_id follows §5.4.1's charset/length (allows `_`).
+    if let Some(outlet_id) = entry
+        .strip_prefix("outlet:query:")
+        .or_else(|| entry.strip_prefix("outlet:call:"))
+    {
+        // `outlet:query:*` / `outlet:call:*` already matched as built-ins above;
+        // here outlet_id is a concrete id and MUST NOT contain a `*`.
+        if outlet_id.len() > MAX_OUTLET_ID_LENGTH {
             return Err(CeilingEntryError::invalid(
                 entry,
-                format!("tool_id exceeds maximum length of {MAX_TOOL_ID_LENGTH} bytes"),
+                format!("outlet_id exceeds maximum length of {MAX_OUTLET_ID_LENGTH} bytes"),
             ));
         }
-        if is_tool_id_token(tool_id) {
+        if is_outlet_id_token(outlet_id) {
             return Ok(());
         }
         return Err(CeilingEntryError::invalid(
             entry,
-            "tool_id must be a non-empty [a-z0-9_-] token (no '*', no ':', no whitespace)",
+            "outlet_id must be a non-empty [a-z0-9_-] token (no '*', no ':', no whitespace)",
         ));
     }
 
@@ -1030,7 +1172,7 @@ pub(crate) fn validate_ceiling_entry(entry: &str) -> Result<(), CeilingEntryErro
 /// Validates the CUSTOM `{resource}:{action}` portion of the ceiling-entry
 /// grammar (spec §5.3.1.1) — the rules shared by [`validate_ceiling_entry`]
 /// (colon form) and [`validate_ucan_ceiling_string`] (UCAN form) once the
-/// built-in and parameterized `tool*invoke` spellings have been excluded by the
+/// built-in and parameterized `outlet_query` / `outlet_call` spellings have been excluded by the
 /// caller. A well-formed custom entry has EXACTLY ONE colon, a non-empty
 /// kebab-case `[a-z0-9-]+` resource, and an action that is either a kebab-case
 /// token or the single literal `*` (explicit wildcard). There is no silent
@@ -1214,17 +1356,18 @@ pub fn builtin_admin(ceiling: &CapabilityCeiling) -> RoleDefinition {
 
 /// Returns the `member` built-in role definition.
 ///
-/// Members can read and write messages and invoke any registered tool.
-/// Capabilities are intersected with the ceiling -- if a capability is not
-/// in the ceiling, it is not granted.
+/// Members can read and write messages and invoke any registered Query or
+/// Action outlet. Capabilities are intersected with the ceiling -- if a
+/// capability is not in the ceiling, it is not granted.
 ///
-/// See ADR-009 acceptance criterion 2.
+/// See ADR-009 acceptance criterion 2 and §5.5.1 / §5.4.2.
 #[must_use]
 pub fn builtin_member(ceiling: &CapabilityCeiling) -> RoleDefinition {
     let desired = HashSet::from([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolInvokeAll,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
     ]);
     let capabilities = desired
         .into_iter()
@@ -1235,19 +1378,20 @@ pub fn builtin_member(ceiling: &CapabilityCeiling) -> RoleDefinition {
 
 /// Returns the `moderator` built-in role definition.
 ///
-/// Moderators can read/write messages, invoke tools, remove members, and
-/// propose governance actions. This fills the gap between `member` (no
-/// moderation power) and `admin` (full control). Referenced in §5.9 as
-/// "elected moderators" governance pattern. Capabilities are intersected
-/// with the ceiling.
+/// Moderators can read/write messages, invoke Query and Action outlets,
+/// remove members, and propose governance actions. This fills the gap
+/// between `member` (no moderation power) and `admin` (full control).
+/// Referenced in §5.9 as "elected moderators" governance pattern.
+/// Capabilities are intersected with the ceiling.
 ///
-/// See ADR-009 acceptance criterion 2.
+/// See ADR-009 acceptance criterion 2 and §5.5.1 / §5.4.2.
 #[must_use]
 pub fn builtin_moderator(ceiling: &CapabilityCeiling) -> RoleDefinition {
     let desired = HashSet::from([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolInvokeAll,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
         Capability::MemberRemove,
         Capability::GovernancePropose,
     ]);
@@ -1276,17 +1420,18 @@ pub fn builtin_observer(ceiling: &CapabilityCeiling) -> RoleDefinition {
 
 /// Returns the `author` broadcast-specific role definition.
 ///
-/// Authors can write and read messages and invoke any registered tool.
-/// Designed for one-to-many publishing scenarios (spec section 5.14).
-/// Capabilities are intersected with the ceiling.
+/// Authors can write and read messages and invoke any registered Query or
+/// Action outlet. Designed for one-to-many publishing scenarios
+/// (spec section 5.14). Capabilities are intersected with the ceiling.
 ///
-/// See ADR-009 acceptance criterion 2.
+/// See ADR-009 acceptance criterion 2 and §5.5.1 / §5.4.2.
 #[must_use]
 pub fn builtin_author(ceiling: &CapabilityCeiling) -> RoleDefinition {
     let desired = HashSet::from([
         Capability::MessagesWrite,
         Capability::MessagesRead,
-        Capability::ToolInvokeAll,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
     ]);
     let capabilities = desired
         .into_iter()
@@ -1467,60 +1612,6 @@ pub struct RoleAssignment {
 /// all the state needed for role assignment operations without requiring
 /// access to `ContextHandle` internals. It is the primary input for
 /// [`assign_role`].
-///
-/// # `member_capabilities`/ceiling consistency invariant (AUTHORITATIVE)
-///
-/// This block is the single authoritative statement of why the local Tier-2 gate
-/// ([`Self::member_has_capability`]) may trust [`Self::member_capabilities`]
-/// verbatim — NOT re-intersected against [`Self::ceiling`] at read time. Other
-/// docs on this type ([`Self::member_has_capability`], [`Self::set_ceiling`],
-/// [`Self::reconcile_to_ceiling`]) point here rather than restating it.
-///
-/// The read-time trust rests on TWO distinct write-time guards, plus a third
-/// reconstruction-path argument:
-///
-/// (i) **Assignment-time gate.** Every role-derived write into
-///     `member_capabilities` is ceiling-validated at assignment time. Both
-///     [`assign_role`] and [`system_assign_role`] (the free fns AND the inherent
-///     [`Self::system_assign_role`]) call [`validate_role_definition`] against
-///     [`Self::ceiling`] BEFORE copying `role_def.capabilities` into the cache; an
-///     out-of-ceiling role definition (e.g. one built via `new_unchecked`) is
-///     rejected at that gate, so it can never poison `member_capabilities`.
-///     [`Self::new`] likewise ceiling-validates every custom role at construction
-///     and mints only the ceiling-derived `admin` role.
-///
-/// (ii) **Ceiling-lowering reconcile.** [`Self::set_ceiling`] additionally runs
-///      [`Self::reconcile_to_ceiling`], which SHRINKS the role definitions, the
-///      `member_capabilities` cache, and `suspended_capabilities` down to a
-///      lowered ceiling — closing the window where a ceiling change would
-///      otherwise leave a previously-granted, now-out-of-ceiling capability in the
-///      cache.
-///
-/// (iii) **Import is signature-bound, not construction-closed.** The export/import
-///       reconstruction path installs a `role_state` VERBATIM
-///       (`scp_runtime::context::lifecycle_helpers` consumes
-///       `export.snapshot.role_state` directly — it does NOT route through
-///       `set_ceiling`, so guards (i)/(ii) do not run on it). The creator's
-///       Ed25519 signature over the snapshot, verified in
-///       `validate_export_for_import`, binds the snapshot's ORIGIN (it came from
-///       the creator), NOT its well-formedness. A creator who signs a
-///       self-inconsistent snapshot — one whose `member_capabilities` is not a
-///       subset of `ceiling` — WOULD install an out-of-ceiling grant that this
-///       local gate then serves. This is therefore NOT construction-closed at the
-///       local gate. It is nonetheless INERT: (a) the creator is the very
-///       authority that sets the ceiling, so a self-grant beyond their own ceiling
-///       buys nothing they could not obtain by simply declaring a higher ceiling;
-///       and (b) any cross-node re-presentation of such a grant is independently
-///       re-validated against the signed ceiling (spec §7.2.1 step 8), so the
-///       local out-of-ceiling grant never propagates. Adding an import-time
-///       cap-subset-of-ceiling re-check would be a redundant re-check of a
-///       signature-bound, inert property, not a new guarantee.
-///
-/// A future writer adding any NEW mutation of `member_capabilities` (or
-/// `role_definitions[*].capabilities`) MUST preserve this invariant — keep the
-/// write within the current ceiling (guard (i)), or route it through `set_ceiling`
-/// so reconciliation re-establishes it (guard (ii)). Breaking it would let the
-/// local gate serve a capability the signed ceiling does not authorize.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextRoleState {
     /// The context's unique identifier.
@@ -1693,14 +1784,6 @@ impl ContextRoleState {
     ///
     /// Suspension-aware: returns `false` if the capability is in the member's
     /// suspended set, even if their role grants it.
-    ///
-    /// # Ceiling consistency (deliberately no use-time re-intersection)
-    ///
-    /// This gate reads [`Self::member_capabilities`] minus
-    /// [`Self::suspended_capabilities`] and does NOT additionally re-intersect the
-    /// result against [`Self::ceiling`]. Soundness of not re-intersecting the
-    /// ceiling at read time: see the [`ContextRoleState`] ceiling-consistency
-    /// invariant.
     #[must_use]
     pub fn member_has_capability(&self, member_did: &str, capability: &Capability) -> bool {
         // Check suspension first.
@@ -1840,24 +1923,6 @@ impl ContextRoleState {
     /// ceiling is left UNCHANGED (fail-closed: a rejected write never widens or
     /// poisons the authorization envelope).
     ///
-    /// EAGER CEILING RECONCILIATION (spec §5.3.2 step 5, §7.2.2): after the new
-    /// ceiling is validated and stored, the cached authorization state
-    /// (`role_definitions[*].capabilities`, `member_capabilities[*]`,
-    /// `suspended_capabilities[*]`) is intersected with the new ceiling, dropping
-    /// any capability no longer within it (see [`Self::reconcile_to_ceiling`]).
-    /// The reconciliation is a pure SHRINK: it never grants, so a WIDEN adds no
-    /// capability (every previously cached capability is still within a wider
-    /// ceiling), and a same-ceiling re-application is a true no-op — the load-bearing
-    /// property for the §23.16.8 / ADR-050 deterministic export digest (stable across
-    /// repeated same-ceiling applies). (A SHRINK also drops now-empty cache entries,
-    /// so the first pass over a state holding an empty-capability entry need not be
-    /// byte-identical; an empty and an absent entry are equivalent at the gate, so
-    /// behavior is unchanged.) Because this is the single whole-ceiling write chokepoint, BOTH the
-    /// native deferred-apply path (`apply_pending_ceiling_modification`) and the
-    /// WASM `dispatch_modify_ceiling` path inherit reconciliation identically.
-    /// Soundness of this reconciliation as guard (ii) of the read-time-trust
-    /// argument: see the [`ContextRoleState`] ceiling-consistency invariant.
-    ///
     /// # Errors
     ///
     /// Returns [`CeilingEntryError::InvalidCeilingCategory`] if any entry of
@@ -1868,72 +1933,7 @@ impl ContextRoleState {
         // malformed ceiling cannot leave the state half-written.
         ceiling.validate_entries()?;
         self.ceiling = ceiling;
-        // Reconcile cached authorization state DOWN to the (possibly lowered) new
-        // ceiling so no stale, out-of-ceiling capability survives at the local gate
-        // (spec §5.3.2 step 5, §7.2.2).
-        self.reconcile_to_ceiling();
         Ok(())
-    }
-
-    /// Intersect all cached authorization state with the current ceiling, dropping
-    /// any capability no longer within it. SHRINK-ONLY and IDEMPOTENT: a no-op when
-    /// every cached capability is still within `self.ceiling` (i.e. on a WIDEN or a
-    /// same-ceiling re-application), so the deterministic export digest (§23.16.8,
-    /// ADR-050) is unchanged in those cases.
-    ///
-    /// Reconciles three caches against [`Self::ceiling`] (using
-    /// [`CapabilityCeiling::contains`], which honors the `ToolInvoke(id)`-under-
-    /// `ToolInvokeAll` wildcard):
-    /// - `role_definitions[*].capabilities` — a custom role whose permission set is
-    ///   fully pruned is RETAINED as an empty role (its name may still be referenced
-    ///   by `assignments`/membership; deleting the name would dangle those refs).
-    /// - `member_capabilities[*]` — a member whose cached grants are fully pruned has
-    ///   their (now empty) entry removed, mirroring the empty-set cleanup style of
-    ///   [`Self::prune_suspensions_to_role_grants`].
-    /// - `suspended_capabilities[*]` — a suspension referencing a capability no
-    ///   longer granted to that member becomes dead weight; pruned the same way as
-    ///   [`Self::prune_suspensions_to_role_grants`] (a pure shrink, harmless: a
-    ///   suspended-but-out-of-ceiling capability is denied at the gate regardless).
-    ///
-    /// Called only from [`Self::set_ceiling`] (the single whole-ceiling write
-    /// chokepoint), so it never runs on the verbatim export/import reconstruction
-    /// path (which installs a creator-signed `role_state` directly, NOT via
-    /// `set_ceiling`). For why that import path is nonetheless sound — and why this
-    /// reconcile is guard (ii), not the import guard — see the
-    /// [`ContextRoleState`] ceiling-consistency invariant.
-    fn reconcile_to_ceiling(&mut self) {
-        // Bind the ceiling locally so the per-field `retain` closures below borrow
-        // only `self.ceiling` immutably while a single other field is borrowed
-        // mutably (no whole-`self` borrow conflict).
-        let ceiling = &self.ceiling;
-
-        // Prune each role definition's permission set; retain empty roles so
-        // assignment/membership references stay valid.
-        for role in self.role_definitions.values_mut() {
-            role.capabilities.retain(|cap| ceiling.contains(cap));
-        }
-
-        // Prune each member's cached capability set; drop members left with an
-        // empty set so no dangling empty entries remain (digest-stable cleanup).
-        self.member_capabilities.retain(|_member, caps| {
-            caps.retain(|cap| ceiling.contains(cap));
-            !caps.is_empty()
-        });
-
-        // Prune suspensions that reference a capability no longer within the
-        // ceiling OR no longer granted to that member; drop members left with an
-        // empty suspension set. Bind the (already-pruned) `member_capabilities` to
-        // a local immutable reference so the `retain` closure splits the borrow:
-        // `self.suspended_capabilities` mutable, `member_capabilities` immutable —
-        // disjoint fields, no whole-`self` conflict. Matches the shrink semantics
-        // of `prune_suspensions_to_role_grants`.
-        let member_capabilities = &self.member_capabilities;
-        self.suspended_capabilities.retain(|member, suspended| {
-            let granted = member_capabilities.get(member);
-            suspended
-                .retain(|cap| ceiling.contains(cap) && granted.is_some_and(|g| g.contains(cap)));
-            !suspended.is_empty()
-        });
     }
 
     /// TEST-ONLY mutable access to the ceiling (ADR-049 §9). Gated
@@ -2023,6 +2023,36 @@ impl ContextRoleState {
         self.prune_suspensions_to_role_grants(member_did, &role_def.capabilities);
 
         Ok(tokens)
+    }
+
+    /// Canonical teardown of ALL per-DID role state on member removal (spec §5.6.1
+    /// clean-teardown). Drops the DID from `members`, `assignments`,
+    /// `member_capabilities`, AND the downward-auth `suspended_capabilities`. Returns
+    /// `true` if the DID was present in `members` (mirrors `HashSet::remove`), so a
+    /// caller can fold this into a not-found guard; the other three drops are no-ops
+    /// when the DID is absent.
+    ///
+    /// Per-DID state owned OUTSIDE this struct — the runtime
+    /// `read_exclusion_list`, the access-key store, MLS sequence counters, and
+    /// pseudonym routing — is NOT touched here; each caller drops those inline.
+    ///
+    /// # §9 caller obligation (ADR-049 §9 — downward-auth)
+    ///
+    /// This writes the `pub(crate)` downward-auth `suspended_capabilities` directly.
+    /// A member removal is ITSELF a downward-authorization transition (the DID holds
+    /// no role afterward), so dropping its suspension can never re-grant authority —
+    /// a suspension only ever DENIES, and is meaningless once the DID holds no
+    /// capabilities. The removal as a whole is nonetheless a state mutation a
+    /// coalesce-window rollback could re-admit, so callers MUST invoke this inside
+    /// their fail-closed-persisting (ADR-049 §9 `commit_class_s_keep`) combinator,
+    /// exactly as they already do for the membership/`member_capabilities` strip this
+    /// replaces.
+    pub fn remove_member(&mut self, member_did: &str) -> bool {
+        let was_member = self.members.remove(member_did);
+        self.assignments.remove(member_did);
+        self.member_capabilities.remove(member_did);
+        self.suspended_capabilities.remove(member_did);
+        was_member
     }
 
     /// Destructure `self` into DISJOINT field references for the cross-crate
@@ -2500,8 +2530,8 @@ mod tests {
         CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
             Capability::MemberInvite,
             Capability::MemberRemove,
             Capability::RoleAssign,
@@ -2526,9 +2556,9 @@ mod tests {
         let caps = vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvoke("tool-1".to_owned()),
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCall("outlet-1".to_owned()),
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
             Capability::MemberInvite,
             Capability::MemberRemove,
             Capability::RoleAssign,
@@ -2551,7 +2581,7 @@ mod tests {
 
     #[test]
     fn capability_clone_preserves_equality() {
-        let cap = Capability::ToolInvoke("my-tool".to_owned());
+        let cap = Capability::OutletCall("my-outlet".to_owned());
         let cloned = cap.clone();
         assert_eq!(cap, cloned);
     }
@@ -2573,11 +2603,16 @@ mod tests {
         assert_eq!(format!("{}", Capability::MessagesRead), "messages:read");
         assert_eq!(format!("{}", Capability::MessagesWrite), "messages:write");
         assert_eq!(
-            format!("{}", Capability::ToolInvoke("foo".to_owned())),
-            "tool:invoke:foo"
+            format!("{}", Capability::OutletCall("foo".to_owned())),
+            "outlet:call:foo"
         );
-        assert_eq!(format!("{}", Capability::ToolInvokeAll), "tool:invoke:*");
-        assert_eq!(format!("{}", Capability::ToolRegister), "tool:register");
+        assert_eq!(format!("{}", Capability::OutletCallAll), "outlet:call:*");
+        assert_eq!(
+            format!("{}", Capability::OutletQuery("foo".to_owned())),
+            "outlet:query:foo"
+        );
+        assert_eq!(format!("{}", Capability::OutletQueryAll), "outlet:query:*");
+        assert_eq!(format!("{}", Capability::OutletRegister), "outlet:register");
         assert_eq!(format!("{}", Capability::MemberInvite), "member:invite");
         assert_eq!(format!("{}", Capability::MemberRemove), "member:remove");
         assert_eq!(format!("{}", Capability::RoleAssign), "role:assign");
@@ -2603,9 +2638,9 @@ mod tests {
         let standard_caps = vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvoke("my-tool".to_owned()),
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCall("my-outlet".to_owned()),
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
             Capability::MemberInvite,
             Capability::MemberRemove,
             Capability::RoleAssign,
@@ -2613,7 +2648,7 @@ mod tests {
             Capability::GovernanceVote,
             Capability::ContextClose,
             Capability::ChildContextCreate,
-            Capability::ToolInterface,
+            Capability::OutletInterface,
             Capability::Bridging,
             Capability::MediaVoice,
             Capability::MediaVideo,
@@ -2625,7 +2660,8 @@ mod tests {
             let displayed = cap.to_string();
             let roundtripped = Capability::new(&displayed);
             assert_eq!(
-                *cap, roundtripped,
+                Some(cap.clone()),
+                roundtripped,
                 "Display→new roundtrip failed for {cap:?} (displayed as {displayed:?})"
             );
         }
@@ -2646,7 +2682,8 @@ mod tests {
             let displayed = cap.to_string();
             let roundtripped = Capability::new(&displayed);
             assert_eq!(
-                *cap, roundtripped,
+                Some(cap.clone()),
+                roundtripped,
                 "Display→new roundtrip failed for {cap:?} (displayed as {displayed:?})"
             );
         }
@@ -2657,7 +2694,7 @@ mod tests {
         for cap in standard_caps.iter().chain(&custom_caps) {
             let via_name = Capability::new(cap.name());
             assert_eq!(
-                *cap,
+                Some(cap.clone()),
                 via_name,
                 "name()→new() roundtrip failed for {cap:?} (name = {:?})",
                 cap.name()
@@ -2670,8 +2707,8 @@ mod tests {
         let caps = vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvoke("search".to_owned()),
-            Capability::ToolInvokeAll,
+            Capability::OutletCall("search".to_owned()),
+            Capability::OutletCallAll,
             Capability::MemberBan,
             Capability::Custom("my-cap".to_owned()),
         ];
@@ -2684,7 +2721,7 @@ mod tests {
 
     #[test]
     fn member_ban_capability_new_and_name() {
-        let cap = Capability::new("member:ban");
+        let cap = Capability::new("member:ban").expect("known capability");
         assert_eq!(cap, Capability::MemberBan);
         assert_eq!(cap.name(), "member:ban");
         assert_eq!(format!("{cap}"), "member:ban");
@@ -2723,21 +2760,21 @@ mod tests {
     }
 
     #[test]
-    fn ceiling_tool_invoke_all_implies_specific_tool() {
-        let ceiling = CapabilityCeiling::new([Capability::ToolInvokeAll, Capability::MessagesRead]);
-        assert!(ceiling.contains(&Capability::ToolInvoke("any-tool".to_owned())));
-        assert!(ceiling.contains(&Capability::ToolInvoke("another-tool".to_owned())));
+    fn ceiling_outlet_call_all_implies_specific_call() {
+        let ceiling = CapabilityCeiling::new([Capability::OutletCallAll, Capability::MessagesRead]);
+        assert!(ceiling.contains(&Capability::OutletCall("any-outlet".to_owned())));
+        assert!(ceiling.contains(&Capability::OutletCall("another-outlet".to_owned())));
     }
 
     #[test]
-    fn ceiling_specific_tool_does_not_imply_all() {
+    fn ceiling_specific_call_does_not_imply_all() {
         let ceiling = CapabilityCeiling::new([
-            Capability::ToolInvoke("specific-tool".to_owned()),
+            Capability::OutletCall("specific-outlet".to_owned()),
             Capability::MessagesRead,
         ]);
-        assert!(ceiling.contains(&Capability::ToolInvoke("specific-tool".to_owned())));
-        assert!(!ceiling.contains(&Capability::ToolInvoke("other-tool".to_owned())));
-        assert!(!ceiling.contains(&Capability::ToolInvokeAll));
+        assert!(ceiling.contains(&Capability::OutletCall("specific-outlet".to_owned())));
+        assert!(!ceiling.contains(&Capability::OutletCall("other-outlet".to_owned())));
+        assert!(!ceiling.contains(&Capability::OutletCallAll));
     }
 
     #[test]
@@ -2785,11 +2822,11 @@ mod tests {
     }
 
     #[test]
-    fn check_ceiling_tool_invoke_all_covers_specific() {
-        let ceiling = CapabilityCeiling::new([Capability::ToolInvokeAll]);
+    fn check_ceiling_outlet_call_all_covers_specific() {
+        let ceiling = CapabilityCeiling::new([Capability::OutletCallAll]);
         assert!(check_ceiling(
             &ceiling,
-            &Capability::ToolInvoke("test-tool".to_owned())
+            &Capability::OutletCall("test-outlet".to_owned())
         ));
     }
 
@@ -2848,7 +2885,7 @@ mod tests {
         assert_eq!(member.name, "member");
         assert!(member.capabilities.contains(&Capability::MessagesRead));
         assert!(member.capabilities.contains(&Capability::MessagesWrite));
-        assert!(member.capabilities.contains(&Capability::ToolInvokeAll));
+        assert!(member.capabilities.contains(&Capability::OutletCallAll));
         assert_eq!(member.capabilities.len(), 3);
     }
 
@@ -2868,7 +2905,7 @@ mod tests {
         assert_eq!(moderator.name, "moderator");
         assert!(moderator.capabilities.contains(&Capability::MessagesRead));
         assert!(moderator.capabilities.contains(&Capability::MessagesWrite));
-        assert!(moderator.capabilities.contains(&Capability::ToolInvokeAll));
+        assert!(moderator.capabilities.contains(&Capability::OutletCallAll));
         assert!(moderator.capabilities.contains(&Capability::MemberRemove));
         assert!(
             moderator
@@ -2884,7 +2921,7 @@ mod tests {
         let ceiling = CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
+            Capability::OutletCallAll,
             Capability::MemberRemove,
         ]);
         let moderator = builtin_moderator(&ceiling);
@@ -2903,7 +2940,7 @@ mod tests {
         assert_eq!(author.name, "author");
         assert!(author.capabilities.contains(&Capability::MessagesWrite));
         assert!(author.capabilities.contains(&Capability::MessagesRead));
-        assert!(author.capabilities.contains(&Capability::ToolInvokeAll));
+        assert!(author.capabilities.contains(&Capability::OutletCallAll));
         assert_eq!(author.capabilities.len(), 3);
     }
 
@@ -2918,10 +2955,10 @@ mod tests {
 
     #[test]
     fn builtin_member_respects_ceiling() {
-        // If ToolInvokeAll is not in the ceiling, member should not have it.
+        // If OutletCallAll / OutletQueryAll are not in the ceiling, member should not have them.
         let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
         let member = builtin_member(&ceiling);
-        assert!(!member.capabilities.contains(&Capability::ToolInvokeAll));
+        assert!(!member.capabilities.contains(&Capability::OutletCallAll));
         assert_eq!(member.capabilities.len(), 2);
     }
 
@@ -2979,7 +3016,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3017,7 +3054,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![custom],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assert!(state.role_definitions.contains_key("content-mod"));
@@ -3038,7 +3075,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![bad_custom],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
     }
@@ -3051,7 +3088,7 @@ mod tests {
             "did:dht:creator",
             ceiling.clone(),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3071,7 +3108,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3090,7 +3127,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3102,7 +3139,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_ok());
 
@@ -3113,7 +3150,7 @@ mod tests {
         // Alice should now have member capabilities.
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
-        assert!(state.member_has_capability("did:dht:alice", &Capability::ToolInvokeAll));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::OutletCallAll));
     }
 
     #[test]
@@ -3133,7 +3170,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3156,7 +3193,7 @@ mod tests {
             "did:dht:alice",
             "smuggled",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(
             matches!(
@@ -3184,7 +3221,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3204,7 +3241,7 @@ mod tests {
             &mut state,
             "did:dht:alice",
             "smuggled",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(
             matches!(
@@ -3228,7 +3265,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3242,7 +3279,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3252,7 +3289,7 @@ mod tests {
             "did:dht:bob",
             "member",
             "did:dht:alice",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         assert!(matches!(
@@ -3269,7 +3306,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3278,7 +3315,7 @@ mod tests {
             "did:dht:nobody",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         assert!(matches!(
@@ -3295,7 +3332,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3306,7 +3343,7 @@ mod tests {
             "did:dht:alice",
             "nonexistent",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         );
         assert!(result.is_err());
         assert!(matches!(
@@ -3323,7 +3360,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3335,7 +3372,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
@@ -3346,7 +3383,7 @@ mod tests {
             "did:dht:alice",
             "observer",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
@@ -3367,7 +3404,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3379,7 +3416,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3399,7 +3436,7 @@ mod tests {
             "did:dht:alice",
             "observer",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3423,7 +3460,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3435,7 +3472,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3448,7 +3485,7 @@ mod tests {
             "did:dht:alice",
             "admin",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3477,7 +3514,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3487,7 +3524,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3504,7 +3541,7 @@ mod tests {
             "did:dht:alice",
             "observer",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3526,7 +3563,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3537,7 +3574,7 @@ mod tests {
             "did:dht:alice",
             "observer",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3561,7 +3598,7 @@ mod tests {
             "did:dht:creator",
             ceiling.clone(),
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3572,7 +3609,7 @@ mod tests {
             "did:dht:alice",
             "admin",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3606,7 +3643,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![custom],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3617,7 +3654,7 @@ mod tests {
             "did:dht:alice",
             "content-mod",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assert_eq!(tokens.len(), 3);
@@ -3638,7 +3675,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         state.members.insert("did:dht:alice".to_owned());
@@ -3648,7 +3685,7 @@ mod tests {
             "did:dht:alice",
             "admin",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3679,7 +3716,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         state.members.insert("did:dht:alice".to_owned());
@@ -3688,7 +3725,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -3696,7 +3733,7 @@ mod tests {
         // member's capability set (roles.rs doesn't add custom
         // capabilities via the standard role flow but the fold must
         // handle them correctly if someone does).
-        let custom = Capability::Custom("tool:invoke:calculator".to_owned());
+        let custom = Capability::Custom("outlet:call:calculator".to_owned());
         state
             .member_capabilities
             .get_mut("did:dht:alice")
@@ -3724,7 +3761,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         state.members.insert("did:dht:alice".to_owned());
@@ -3734,7 +3771,7 @@ mod tests {
             "did:dht:alice",
             "admin",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         let custom = Capability::Custom("payments:approve".to_owned());
@@ -3769,7 +3806,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         state.members.insert("did:dht:alice".to_owned());
@@ -3778,7 +3815,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
@@ -3866,7 +3903,7 @@ mod tests {
     #[test]
     fn generated_nonces_are_unique() {
         let nonces: Vec<String> = (0..100)
-            .map(|_| generate_nonce(&scp_primitives::SystemClock))
+            .map(|_| generate_nonce(&scp_clock::SystemClock))
             .collect();
         let unique: HashSet<&String> = nonces.iter().collect();
         assert_eq!(
@@ -3878,7 +3915,7 @@ mod tests {
 
     #[test]
     fn nonce_format_is_valid() {
-        let nonce = generate_nonce(&scp_primitives::SystemClock);
+        let nonce = generate_nonce(&scp_clock::SystemClock);
         let parts: Vec<&str> = nonce.splitn(2, '-').collect();
         assert_eq!(parts.len(), 2, "nonce should have timestamp-hex format");
         // Timestamp part should be a valid number.
@@ -3968,9 +4005,11 @@ mod tests {
         for entry in [
             "messages:read",
             "messages:write",
-            "tool:register",
-            "tool:invoke:*",
-            "tool:invoke:calc",
+            "outlet:register",
+            "outlet:query:*",
+            "outlet:call:*",
+            "outlet:query:calc",
+            "outlet:call:calc",
             "member:invite",
             "member:remove",
             "member:ban",
@@ -3979,7 +4018,7 @@ mod tests {
             "media:video",
             "media:screen_share",
             "bridging",
-            "tool:interface",
+            "outlet:interface",
             "context:child:create",
             "governance:propose",
             "governance:vote",
@@ -4103,17 +4142,24 @@ mod tests {
     }
 
     #[test]
-    fn ceiling_entry_rejects_tool_invoke_with_stray_wildcard() {
-        // `tool:invoke:*` is the only wildcard built-in; an embedded `*` in the
-        // tool_id is malformed.
-        assert!(matches!(
-            validate_ceiling_entry("tool:invoke:ca*lc"),
-            Err(CeilingEntryError::InvalidCeilingCategory { .. })
-        ));
-        assert!(matches!(
-            validate_ceiling_entry("tool:invoke:"),
-            Err(CeilingEntryError::InvalidCeilingCategory { .. })
-        ));
+    fn ceiling_entry_rejects_outlet_stem_with_stray_wildcard() {
+        // `outlet:query:*` / `outlet:call:*` are the only wildcard outlet
+        // built-ins; an embedded `*` in the outlet_id is malformed, as is an
+        // empty outlet_id.
+        for bad in [
+            "outlet:call:ca*lc",
+            "outlet:call:",
+            "outlet:query:ca*lc",
+            "outlet:query:",
+        ] {
+            assert!(
+                matches!(
+                    validate_ceiling_entry(bad),
+                    Err(CeilingEntryError::InvalidCeilingCategory { .. })
+                ),
+                "outlet stem {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -4142,17 +4188,17 @@ mod tests {
         // Built-ins are always well-formed.
         assert!(Capability::MessagesRead.validate_as_ceiling_entry().is_ok());
         assert!(
-            Capability::ToolInvokeAll
+            Capability::OutletCallAll
                 .validate_as_ceiling_entry()
                 .is_ok()
         );
         assert!(
-            Capability::ToolInvoke("calc".to_owned())
+            Capability::OutletCall("calc".to_owned())
                 .validate_as_ceiling_entry()
                 .is_ok()
         );
         assert!(
-            Capability::ToolInvoke("ca*lc".to_owned())
+            Capability::OutletCall("ca*lc".to_owned())
                 .validate_as_ceiling_entry()
                 .is_err()
         );
@@ -4161,43 +4207,64 @@ mod tests {
     /// `Capability::new` recognizes a built-in in EITHER its colon spelling or
     /// its UCAN wire spelling, always yielding the proper built-in variant (never
     /// a `Custom` lookalike) — the multi-segment built-ins whose UCAN form differs
-    /// from colon form (`tool_invoke:*`, `tool_invoke:{id}`,
+    /// from colon form (`outlet_query:*`, `outlet_call:*`, `outlet_call:{id}`,
     /// `context_child:create`, `bridging:*`) plus a representative sample of the
     /// identical-spelling built-ins. Without this, a context's STORED (canonical
     /// UCAN-form) ceiling re-parses to a `Custom` and fails re-validation
-    /// (`InvalidCeilingCategory: tool_invoke:* is malformed`), breaking context
-    /// creation / tool flow / cross-bridge parity.
+    /// (`InvalidCeilingCategory: outlet_call:* is malformed`), breaking context
+    /// creation / outlet flow / cross-bridge parity.
     #[test]
     fn capability_new_parses_builtin_colon_and_ucan_spellings() {
         // Colon spelling → built-in variant.
-        assert_eq!(Capability::new("tool:invoke:*"), Capability::ToolInvokeAll);
+        assert_eq!(
+            Capability::new("outlet:call:*"),
+            Some(Capability::OutletCallAll)
+        );
+        assert_eq!(
+            Capability::new("outlet:query:*"),
+            Some(Capability::OutletQueryAll)
+        );
         assert_eq!(
             Capability::new("context:child:create"),
-            Capability::ChildContextCreate
+            Some(Capability::ChildContextCreate)
         );
-        assert_eq!(Capability::new("bridging"), Capability::Bridging);
+        assert_eq!(Capability::new("bridging"), Some(Capability::Bridging));
         assert_eq!(
-            Capability::new("tool:invoke:calc"),
-            Capability::ToolInvoke("calc".to_owned())
+            Capability::new("outlet:call:calc"),
+            Some(Capability::OutletCall("calc".to_owned()))
+        );
+        assert_eq!(
+            Capability::new("outlet:query:calc"),
+            Some(Capability::OutletQuery("calc".to_owned()))
         );
 
         // UCAN wire spelling → the SAME built-in variant (not a Custom).
-        assert_eq!(Capability::new("tool_invoke:*"), Capability::ToolInvokeAll);
+        assert_eq!(
+            Capability::new("outlet_call:*"),
+            Some(Capability::OutletCallAll)
+        );
+        assert_eq!(
+            Capability::new("outlet_query:*"),
+            Some(Capability::OutletQueryAll)
+        );
         assert_eq!(
             Capability::new("context_child:create"),
-            Capability::ChildContextCreate
+            Some(Capability::ChildContextCreate)
         );
-        assert_eq!(Capability::new("bridging:*"), Capability::Bridging);
+        assert_eq!(Capability::new("bridging:*"), Some(Capability::Bridging));
         assert_eq!(
-            Capability::new("tool_invoke:calc"),
-            Capability::ToolInvoke("calc".to_owned())
+            Capability::new("outlet_call:calc"),
+            Some(Capability::OutletCall("calc".to_owned()))
         );
 
         // Identical-spelling built-ins parse the same either way.
-        assert_eq!(Capability::new("messages:read"), Capability::MessagesRead);
+        assert_eq!(
+            Capability::new("messages:read"),
+            Some(Capability::MessagesRead)
+        );
         assert_eq!(
             Capability::new("media:screen_share"),
-            Capability::MediaScreenShare
+            Some(Capability::MediaScreenShare)
         );
 
         // Every built-in's UCAN form round-trips back to its variant, so the
@@ -4205,8 +4272,8 @@ mod tests {
         for cap in BUILTIN_CAPABILITIES {
             let ucan = cap.ucan_capability_name();
             assert_eq!(
-                &Capability::new(&ucan),
-                cap,
+                Capability::new(&ucan).as_ref(),
+                Some(cap),
                 "UCAN form {ucan:?} must parse back to {cap:?}"
             );
         }
@@ -4215,23 +4282,26 @@ mod tests {
     /// A built-in supplied in EITHER spelling is a valid ceiling entry; a
     /// malformed custom is rejected in either parse. Mirrors the create-path
     /// `Capability::new(entry).validate_as_ceiling_entry()` the bridges run, and
-    /// pins the regression: the canonical UCAN spellings (`tool_invoke:*`,
-    /// `context_child:create`, `bridging:*`, `tool_invoke:{id}`) and the
-    /// user-facing colon spellings must BOTH pass; underscore-resource customs and
-    /// stray-wildcard / multi-colon customs must still fail.
+    /// pins the regression: the canonical UCAN spellings (`outlet_call:*`,
+    /// `outlet_query:*`, `context_child:create`, `bridging:*`, `outlet_call:{id}`)
+    /// and the user-facing colon spellings must BOTH pass; underscore-resource
+    /// customs and stray-wildcard / multi-colon customs must still fail.
     #[test]
     fn ceiling_entry_accepts_builtin_either_spelling_rejects_malformed_custom() {
         for good in [
             // Colon spellings (spec §5.3.1 table / SDK input).
             "messages:read",
-            "tool:invoke:*",
-            "tool:invoke:calc",
+            "outlet:call:*",
+            "outlet:query:*",
+            "outlet:call:calc",
+            "outlet:query:calc",
             "context:child:create",
             "bridging",
             "media:screen_share",
             // UCAN wire spellings (canonical stored form).
-            "tool_invoke:*",
-            "tool_invoke:calc",
+            "outlet_call:*",
+            "outlet_query:*",
+            "outlet_call:calc",
             "context_child:create",
             "bridging:*",
             // Well-formed customs.
@@ -4239,6 +4309,7 @@ mod tests {
             "payments:*",
         ] {
             Capability::new(good)
+                .unwrap_or_else(|| panic!("ceiling entry {good:?} must parse"))
                 .validate_as_ceiling_entry()
                 .unwrap_or_else(|e| panic!("ceiling entry {good:?} must be accepted: {e}"));
         }
@@ -4249,32 +4320,45 @@ mod tests {
             "*:read",              // stray wildcard resource
             "payments:read:write", // multi-colon custom
             "pay_ments:approve",   // underscore resource is NOT a valid custom
-            "tool_invoke:ca*lc",   // stray `*` in tool_id (UCAN form)
-            "tool:invoke:ca*lc",   // stray `*` in tool_id (colon form)
         ] {
+            let cap = Capability::new(bad)
+                .unwrap_or_else(|| panic!("custom {bad:?} must still parse to a Custom"));
             assert!(
-                Capability::new(bad).validate_as_ceiling_entry().is_err(),
+                cap.validate_as_ceiling_entry().is_err(),
                 "ceiling entry {bad:?} must be rejected"
+            );
+        }
+
+        // Stray `*` in an outlet_id makes the whole stem UNPARSEABLE (the strict
+        // §5.4.2.1 parser returns `None`), so these never even reach
+        // `validate_as_ceiling_entry`.
+        for unparseable in ["outlet_call:ca*lc", "outlet:call:ca*lc"] {
+            assert_eq!(
+                Capability::new(unparseable),
+                None,
+                "outlet stem {unparseable:?} with a stray '*' must fail the parser"
             );
         }
     }
 
     /// `BUILTIN_CAPABILITIES` must list every non-parameterized built-in variant
-    /// (everything except `ToolInvoke(_)` and `Custom(_)`). An exhaustive match
-    /// makes a newly-added built-in a compile error here, forcing it into the
-    /// list so `validate_ucan_ceiling_string` recognizes its UCAN spelling.
+    /// (everything except `OutletQuery(_)` / `OutletCall(_)` and `Custom(_)`). An
+    /// exhaustive match makes a newly-added built-in a compile error here, forcing
+    /// it into the list so `validate_ucan_ceiling_string` recognizes its UCAN
+    /// spelling.
     #[test]
     fn builtin_capabilities_list_is_exhaustive() {
         fn assert_listed(cap: &Capability) {
             // Exhaustive match: a new variant breaks compilation here.
             match cap {
-                Capability::ToolInvoke(_) | Capability::Custom(_) => {
+                Capability::OutletQuery(_) | Capability::OutletCall(_) | Capability::Custom(_) => {
                     // Parameterized / custom — deliberately NOT in the built-in list.
                 }
                 Capability::MessagesRead
                 | Capability::MessagesWrite
-                | Capability::ToolInvokeAll
-                | Capability::ToolRegister
+                | Capability::OutletQueryAll
+                | Capability::OutletCallAll
+                | Capability::OutletRegister
                 | Capability::MemberInvite
                 | Capability::MemberRemove
                 | Capability::RoleAssign
@@ -4282,7 +4366,7 @@ mod tests {
                 | Capability::GovernanceVote
                 | Capability::ContextClose
                 | Capability::ChildContextCreate
-                | Capability::ToolInterface
+                | Capability::OutletInterface
                 | Capability::Bridging
                 | Capability::MediaVoice
                 | Capability::MediaVideo
@@ -4301,16 +4385,16 @@ mod tests {
         }
         assert_eq!(
             BUILTIN_CAPABILITIES.len(),
-            18,
-            "BUILTIN_CAPABILITIES should hold all 18 non-parameterized built-ins"
+            19,
+            "BUILTIN_CAPABILITIES should hold all 19 non-parameterized built-ins"
         );
     }
 
     /// `validate_ucan_ceiling_string` accepts the canonical UCAN spelling of
-    /// every built-in (including the underscore forms `tool_invoke:*`,
-    /// `context_child:create`, `bridging:*`) plus parameterized tool invokes and
-    /// well-formed customs — and rejects malformed entries and non-canonical
-    /// COLON-form built-ins.
+    /// every built-in (including the underscore forms `outlet_query:*`,
+    /// `outlet_call:*`, `context_child:create`, `bridging:*`) plus parameterized
+    /// outlet invokes and well-formed customs — and rejects malformed entries and
+    /// non-canonical COLON-form built-ins.
     #[test]
     fn validate_ucan_ceiling_string_accepts_canonical_and_rejects_malformed() {
         // Every built-in's UCAN form round-trips through the UCAN validator.
@@ -4319,8 +4403,9 @@ mod tests {
             validate_ucan_ceiling_string(&ucan)
                 .unwrap_or_else(|e| panic!("built-in UCAN form {ucan:?} must validate: {e}"));
         }
-        // Parameterized tool invoke + well-formed customs.
-        validate_ucan_ceiling_string("tool_invoke:calc").unwrap();
+        // Parameterized outlet invoke + well-formed customs.
+        validate_ucan_ceiling_string("outlet_call:calc").unwrap();
+        validate_ucan_ceiling_string("outlet_query:calc").unwrap();
         validate_ucan_ceiling_string("payments:approve").unwrap();
         validate_ucan_ceiling_string("billing:*").unwrap();
 
@@ -4329,8 +4414,8 @@ mod tests {
             "payments",                // no colon
             "*:*",                     // stray wildcard resource
             "a:b:c",                   // multi-colon custom
-            "custom_payments:approve", // underscore-resource custom (the WASM-create bug spelling)
-            "tool:invoke:*",           // non-canonical COLON-form built-in
+            "custom_payments:approve", // underscore-resource custom (historical bug spelling)
+            "outlet:call:*",           // non-canonical COLON-form built-in
             "context:child:create",    // non-canonical COLON-form built-in
         ] {
             assert!(
@@ -4381,8 +4466,8 @@ mod tests {
     /// bypass `Capability::new`.
     #[test]
     fn capability_new_bridging_wildcard_resolves_to_builtin_not_custom() {
-        assert_eq!(Capability::new("bridging:*"), Capability::Bridging);
-        assert_eq!(Capability::new("bridging"), Capability::Bridging);
+        assert_eq!(Capability::new("bridging:*"), Some(Capability::Bridging));
+        assert_eq!(Capability::new("bridging"), Some(Capability::Bridging));
     }
 
     /// A built-in's own UCAN string is accepted as a BUILT-IN by the UCAN-form
@@ -4403,22 +4488,23 @@ mod tests {
     }
 
     /// §5.3.1.1 HIGH-severity regression: a `Custom` whose string is the COLON
-    /// spelling of the privileged `tool:invoke:*` built-in must be rejected by the
+    /// spelling of the privileged `outlet:call:*` built-in must be rejected by the
     /// enum-form entry point. The colon spelling early-accepts inside
-    /// [`validate_ceiling_entry`] (`tool:invoke:*` is in
+    /// [`validate_ceiling_entry`] (`outlet:call:*` is in
     /// [`BUILTIN_CEILING_CATEGORIES`]), so plain grammar validation would let it
     /// through; the rejection here comes from the `validate_as_ceiling_entry`
-    /// re-resolution check (the string resolves to [`Capability::ToolInvokeAll`],
-    /// not a `Custom`). Without this guard, `Custom("tool:invoke:*")` would store
-    /// `tool_invoke:*` — "invoke any tool" — onto the ceiling fed to UCAN minting.
-    /// The reason text is asserted so the test proves the §5.3.1.1 guard rejected it.
+    /// re-resolution check (the string resolves to [`Capability::OutletCallAll`],
+    /// not a `Custom`). Without this guard, `Custom("outlet:call:*")` would store
+    /// `outlet_call:*` — "call any Action outlet" — onto the ceiling fed to UCAN
+    /// minting. The reason text is asserted so the test proves the §5.3.1.1 guard
+    /// rejected it.
     #[test]
-    fn validate_as_ceiling_entry_rejects_custom_naming_tool_invoke_all_builtin() {
-        let err = Capability::Custom("tool:invoke:*".to_owned())
+    fn validate_as_ceiling_entry_rejects_custom_naming_outlet_call_all_builtin() {
+        let err = Capability::Custom("outlet:call:*".to_owned())
             .validate_as_ceiling_entry()
-            .expect_err("Custom(\"tool:invoke:*\") names the ToolInvokeAll built-in");
+            .expect_err("Custom(\"outlet:call:*\") names the OutletCallAll built-in");
         let CeilingEntryError::InvalidCeilingCategory { entry, reason } = err;
-        assert_eq!(entry, "tool:invoke:*");
+        assert_eq!(entry, "outlet:call:*");
         assert!(
             reason.contains("names a built-in") && reason.contains("§5.3.1.1"),
             "rejection must be the §5.3.1.1 built-in-collision guard (reason was {reason:?})"
@@ -4426,19 +4512,20 @@ mod tests {
     }
 
     /// §5.3.1.1 HIGH-severity regression: a `Custom` naming the parameterized
-    /// `tool:invoke:{tool_id}` built-in family (here `tool:invoke:calc`) must be
+    /// `outlet:call:{outlet_id}` built-in family (here `outlet:call:calc`) must be
     /// rejected. The colon spelling early-accepts as a parameterized built-in inside
     /// [`validate_ceiling_entry`] (rule 1b), so plain grammar validation would let it
     /// through; the rejection comes from the `validate_as_ceiling_entry` re-resolution
-    /// check (the string resolves to `Capability::ToolInvoke("calc")`, not a
-    /// `Custom`). Confirms the parameterized family is covered for a concrete `tool_id`.
+    /// check (the string resolves to `Capability::OutletCall("calc")`, not a
+    /// `Custom`). Confirms the parameterized family is covered for a concrete
+    /// `outlet_id`.
     #[test]
-    fn validate_as_ceiling_entry_rejects_custom_naming_parameterized_tool_invoke_builtin() {
-        let err = Capability::Custom("tool:invoke:calc".to_owned())
+    fn validate_as_ceiling_entry_rejects_custom_naming_parameterized_outlet_call_builtin() {
+        let err = Capability::Custom("outlet:call:calc".to_owned())
             .validate_as_ceiling_entry()
-            .expect_err("Custom(\"tool:invoke:calc\") names the ToolInvoke(id) built-in family");
+            .expect_err("Custom(\"outlet:call:calc\") names the OutletCall(id) built-in family");
         let CeilingEntryError::InvalidCeilingCategory { entry, reason } = err;
-        assert_eq!(entry, "tool:invoke:calc");
+        assert_eq!(entry, "outlet:call:calc");
         assert!(
             reason.contains("names a built-in") && reason.contains("§5.3.1.1"),
             "rejection must be the §5.3.1.1 built-in-collision guard (reason was {reason:?})"
@@ -4446,7 +4533,7 @@ mod tests {
     }
 
     /// The §5.3.1.1 guard covers EVERY built-in spelling a `Custom` could carry —
-    /// not just `tool:invoke:*` and `bridging:*`. For every built-in, both its
+    /// not just `outlet:call:*` and `bridging:*`. For every built-in, both its
     /// user-facing colon spelling ([`Capability::name`]) and its canonical UCAN
     /// spelling ([`Capability::ucan_capability_name`]), wrapped in a `Custom`, must
     /// be rejected by the re-resolution backstop. This is the general property the
@@ -4468,16 +4555,21 @@ mod tests {
                 );
             }
         }
-        // Parameterized `ToolInvoke(id)` family, both spellings, for a concrete id.
-        let tool = Capability::ToolInvoke("calc".to_owned());
-        for spelling in [tool.name().into_owned(), tool.ucan_capability_name()] {
-            assert!(
-                Capability::Custom(spelling.clone())
-                    .validate_as_ceiling_entry()
-                    .is_err(),
-                "Custom({spelling:?}) names the parameterized ToolInvoke built-in and must be \
-                 rejected"
-            );
+        // Parameterized `OutletQuery(id)` / `OutletCall(id)` families, both
+        // spellings, for a concrete id.
+        for outlet in [
+            Capability::OutletCall("calc".to_owned()),
+            Capability::OutletQuery("calc".to_owned()),
+        ] {
+            for spelling in [outlet.name().into_owned(), outlet.ucan_capability_name()] {
+                assert!(
+                    Capability::Custom(spelling.clone())
+                        .validate_as_ceiling_entry()
+                        .is_err(),
+                    "Custom({spelling:?}) names the parameterized outlet built-in and must be \
+                     rejected"
+                );
+            }
         }
     }
 
@@ -4497,8 +4589,10 @@ mod tests {
         for cap in BUILTIN_CAPABILITIES {
             let resource = cap.ucan_resource_action().0.into_owned();
             // A custom resource is kebab `[a-z0-9-]`; built-in resources containing
-            // `_` (e.g. `tool_invoke`, `context_child`) can never be spelled by a
-            // custom, so they are not reachable shadow targets.
+            // `_` (e.g. `outlet_query`, `outlet_call`, `context_child`) can never be
+            // spelled by a custom, so they are not reachable shadow targets. The
+            // `outlet` resource (from `OutletRegister` / `OutletInterface`) IS kebab
+            // and therefore shadowable.
             if is_kebab_token(&resource) {
                 shadowable.insert(resource);
             }
@@ -4507,7 +4601,7 @@ mod tests {
             "member",
             "messages",
             "media",
-            "tool",
+            "outlet",
             "role",
             "governance",
             "context",
@@ -4604,11 +4698,11 @@ mod tests {
     }
 
     /// The untrusted-bytes backstop: a [`CapabilityCeiling`] DESERIALIZED from JSON
-    /// carrying a `Custom` that names a privileged built-in (`tool:invoke:*` and the
-    /// parameterized `tool:invoke:calc`) is REJECTED at the `#[serde(try_from)]` /
+    /// carrying a `Custom` that names a privileged built-in (`outlet:call:*` and the
+    /// parameterized `outlet:call:calc`) is REJECTED at the `#[serde(try_from)]` /
     /// `validate_entries` boundary. This is the exact attack surface the HIGH finding
     /// described: `Capability` derives a plain `Deserialize` with no normalization,
-    /// so `{"Custom":"tool:invoke:*"}` deserializes verbatim; the type-level
+    /// so `{"Custom":"outlet:call:*"}` deserializes verbatim; the type-level
     /// validating `Deserialize` must refuse to materialize it. `bridging:*` is
     /// included so the deserialize guard is shown to catch the whole family — like
     /// the other masquerade strings, it is rejected by the `validate_as_ceiling_entry`
@@ -4616,7 +4710,7 @@ mod tests {
     /// built-in), not by the custom grammar (which `bridging:*` satisfies).
     #[test]
     fn ceiling_deserialize_rejects_custom_naming_builtin() {
-        for masquerade in ["tool:invoke:*", "tool:invoke:calc", "bridging:*"] {
+        for masquerade in ["outlet:call:*", "outlet:call:calc", "bridging:*"] {
             // `CapabilityCeiling::new` does NOT validate (validation happens at the
             // write/deserialize boundary), so this constructs the exact bytes a
             // non-conformant peer could sign and export.
@@ -4672,7 +4766,7 @@ mod tests {
     #[test]
     fn context_role_state_new_rejects_malformed_ceiling_entry() {
         // End-to-end: context creation fails (does not store) a malformed entry.
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let ceiling = CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::Custom("payments".to_owned()),
@@ -4688,12 +4782,12 @@ mod tests {
 
     #[test]
     fn context_role_state_new_accepts_wellformed_custom_ceiling() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let ceiling = CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::Custom("payments:approve".to_owned()),
             Capability::Custom("billing:*".to_owned()),
-            Capability::ToolInvoke("calc".to_owned()),
+            Capability::OutletCall("calc".to_owned()),
         ]);
         ContextRoleState::new("ctx-1", "did:scp:creator", ceiling, vec![], &clock).unwrap();
     }
@@ -4703,7 +4797,7 @@ mod tests {
         // Construction invariant: `set_ceiling` validates the WHOLE replacement
         // against the ceiling-entry grammar before storing, so a malformed
         // `CapabilityCeiling` can never be stored via the mutation path either.
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let initial = CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::Custom("payments:approve".to_owned()),
@@ -4729,7 +4823,7 @@ mod tests {
 
     #[test]
     fn set_ceiling_accepts_wellformed_replacement() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let initial = CapabilityCeiling::new([Capability::MessagesRead]);
         let mut state =
             ContextRoleState::new("ctx-1", "did:scp:creator", initial, vec![], &clock).unwrap();
@@ -4738,246 +4832,10 @@ mod tests {
             Capability::MessagesRead,
             Capability::Custom("payments:approve".to_owned()),
             Capability::Custom("billing:*".to_owned()),
-            Capability::ToolInvoke("calc".to_owned()),
+            Capability::OutletCall("calc".to_owned()),
         ]);
         state.set_ceiling(replacement.clone()).unwrap();
         assert_eq!(state.ceiling(), &replacement);
-    }
-
-    // -----------------------------------------------------------------------
-    // set_ceiling eager reconciliation (spec §5.3.2 step 5, §7.2.2)
-    // -----------------------------------------------------------------------
-
-    /// A read-only ceiling — strictly narrower than `minimal_ceiling()` (which
-    /// still includes `MessagesWrite`). Used as the LOWERED target so that
-    /// `MessagesWrite` and `ToolInvokeAll` fall out of the ceiling.
-    fn read_only_ceiling() -> CapabilityCeiling {
-        CapabilityCeiling::new([Capability::MessagesRead])
-    }
-
-    /// Builds a state on `test_ceiling()` whose creator-admin holds every
-    /// ceiling capability, with `alice` assigned `member`
-    /// (`MessagesRead` + `MessagesWrite` + `ToolInvokeAll`).
-    fn state_with_member() -> ContextRoleState {
-        let mut state = ContextRoleState::new(
-            "ctx-1",
-            "did:dht:creator",
-            test_ceiling(),
-            vec![],
-            &scp_primitives::SystemClock,
-        )
-        .unwrap();
-        state.members.insert("did:dht:alice".to_owned());
-        assign_role(
-            &mut state,
-            "did:dht:alice",
-            "member",
-            "did:dht:creator",
-            &scp_primitives::SystemClock,
-        )
-        .expect("assign member");
-        state
-    }
-
-    #[test]
-    fn set_ceiling_lower_prunes_member_capabilities() {
-        let mut state = state_with_member();
-        // Precondition: alice holds MessagesWrite (in member role + ceiling).
-        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
-
-        // Lower the ceiling to read-only (drops MessagesWrite + everything else).
-        state.set_ceiling(read_only_ceiling()).unwrap();
-
-        // alice's cached MessagesWrite is pruned; MessagesRead survives.
-        let alice = state
-            .member_capabilities
-            .get("did:dht:alice")
-            .expect("alice still cached (MessagesRead survives)");
-        assert!(!alice.contains(&Capability::MessagesWrite));
-        assert!(alice.contains(&Capability::MessagesRead));
-        // The creator-admin's out-of-ceiling caps are likewise pruned.
-        let creator = state
-            .member_capabilities
-            .get("did:dht:creator")
-            .expect("creator still cached");
-        assert!(!creator.contains(&Capability::RoleAssign));
-        assert!(!creator.contains(&Capability::ToolInvokeAll));
-        assert!(creator.contains(&Capability::MessagesRead));
-    }
-
-    #[test]
-    fn set_ceiling_lower_prunes_role_definitions() {
-        let mut state = state_with_member();
-        // Precondition: the built-in `member` role grants MessagesWrite.
-        assert!(
-            state
-                .role_definitions
-                .get("member")
-                .unwrap()
-                .capabilities
-                .contains(&Capability::MessagesWrite)
-        );
-
-        state.set_ceiling(read_only_ceiling()).unwrap();
-
-        // Every role definition's permission set is intersected with the new
-        // ceiling; out-of-ceiling caps are gone, in-ceiling caps remain, and the
-        // role name is RETAINED even if its set becomes empty.
-        for (name, role) in &state.role_definitions {
-            for cap in &role.capabilities {
-                assert!(
-                    state.ceiling().contains(cap),
-                    "role {name} retains out-of-ceiling cap {cap:?}"
-                );
-            }
-        }
-        // The `member` role still exists (its name may back assignments).
-        assert!(state.role_definitions.contains_key("member"));
-        assert!(
-            !state
-                .role_definitions
-                .get("member")
-                .unwrap()
-                .capabilities
-                .contains(&Capability::MessagesWrite)
-        );
-    }
-
-    #[test]
-    fn set_ceiling_widen_does_not_grant() {
-        // Start narrow, assign a member, then WIDEN the ceiling. Widening must NOT
-        // add any capability to a member's cache (a grant is only ever derived
-        // from an explicit role assignment, never from a ceiling change alone).
-        // Base ceiling grants RoleAssign (so the creator-admin can assign roles)
-        // but NOT ToolInvokeAll, so the member role lacks ToolInvokeAll.
-        let narrow = CapabilityCeiling::new([
-            Capability::MessagesRead,
-            Capability::MessagesWrite,
-            Capability::RoleAssign,
-        ]);
-        let mut state = ContextRoleState::new(
-            "ctx-1",
-            "did:dht:creator",
-            narrow,
-            vec![],
-            &scp_primitives::SystemClock,
-        )
-        .unwrap();
-        state.members.insert("did:dht:alice".to_owned());
-        assign_role(
-            &mut state,
-            "did:dht:alice",
-            "member",
-            "did:dht:creator",
-            &scp_primitives::SystemClock,
-        )
-        .expect("assign member");
-
-        let alice_before = state
-            .member_capabilities
-            .get("did:dht:alice")
-            .cloned()
-            .unwrap_or_default();
-
-        // Widen to the full test ceiling.
-        state.set_ceiling(test_ceiling()).unwrap();
-
-        let alice_after = state
-            .member_capabilities
-            .get("did:dht:alice")
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(
-            alice_before, alice_after,
-            "widening the ceiling must not grant alice any new capability"
-        );
-        // Concretely: alice does not gain ToolInvokeAll just because the wider
-        // ceiling now permits it.
-        assert!(!state.member_has_capability("did:dht:alice", &Capability::ToolInvokeAll));
-    }
-
-    #[test]
-    fn set_ceiling_reconcile_idempotent() {
-        let mut state = state_with_member();
-        state.set_ceiling(read_only_ceiling()).unwrap();
-        let after_first = state.clone();
-
-        // Re-applying the SAME ceiling must yield a byte-identical state (matters
-        // for the §23.16.8 / ADR-050 deterministic export digest).
-        state.set_ceiling(read_only_ceiling()).unwrap();
-        assert_eq!(
-            state, after_first,
-            "a second set_ceiling with the same ceiling must be a no-op"
-        );
-    }
-
-    #[test]
-    fn suspended_out_of_ceiling_stays_denied() {
-        let mut state = state_with_member();
-        // Suspend MessagesWrite for alice, then lower the ceiling to drop it.
-        state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
-        assert!(!state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
-
-        state.set_ceiling(read_only_ceiling()).unwrap();
-
-        // The capability is gone from the grant cache (pruned), so it is denied
-        // regardless of suspension state; and the now-meaningless suspension entry
-        // is pruned (dead weight removed).
-        assert!(!state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
-        assert!(
-            state
-                .suspended_for("did:dht:alice")
-                .is_none_or(|s| !s.contains(&Capability::MessagesWrite)),
-            "suspension referencing a pruned capability must be cleaned up"
-        );
-        // An in-ceiling, still-granted, NON-suspended cap remains allowed.
-        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
-    }
-
-    #[test]
-    fn tool_invoke_wildcard_under_lowered_ceiling() {
-        // alice's cache holds a concrete ToolInvoke(id) admitted under a
-        // ToolInvokeAll ceiling. Lowering the ceiling to drop ToolInvokeAll must
-        // prune the now-out-of-ceiling concrete ToolInvoke(id) from the cache.
-        let mut state = state_with_member();
-        let tool = Capability::ToolInvoke("calc".to_owned());
-        // Seed alice's cache with the concrete tool-invoke (within the ToolInvokeAll
-        // ceiling via CapabilityCeiling::contains' wildcard rule).
-        state
-            .member_capabilities
-            .get_mut("did:dht:alice")
-            .unwrap()
-            .insert(tool.clone());
-        assert!(state.member_has_capability("did:dht:alice", &tool));
-        assert!(state.ceiling().contains(&tool));
-
-        // Lower the ceiling so it no longer contains ToolInvokeAll (read-only).
-        state.set_ceiling(read_only_ceiling()).unwrap();
-
-        assert!(
-            !state.ceiling().contains(&tool),
-            "lowered ceiling no longer admits the concrete tool-invoke"
-        );
-        assert!(
-            !state.member_has_capability("did:dht:alice", &tool),
-            "the stale concrete ToolInvoke(id) must be pruned from the cache"
-        );
-    }
-
-    #[test]
-    fn member_has_capability_false_after_lowering() {
-        let mut state = state_with_member();
-        // X = MessagesWrite (will fall out of ceiling), Y = MessagesRead (stays).
-        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
-        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
-
-        state.set_ceiling(read_only_ceiling()).unwrap();
-
-        // After the lowering, the now-out-of-ceiling cap X is denied at the gate
-        // (because the cache was pruned), while the in-ceiling cap Y is still
-        // allowed.
-        assert!(!state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
-        assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
     }
 
     #[test]
@@ -5028,7 +4886,7 @@ mod tests {
             Capability::MessagesRead,
             Capability::Custom("payments:approve".to_owned()),
             Capability::Custom("billing:*".to_owned()),
-            Capability::ToolInvoke("calc".to_owned()),
+            Capability::OutletCall("calc".to_owned()),
         ]);
         let json = serde_json::to_string(&ceiling).unwrap();
         let deserialized: CapabilityCeiling = serde_json::from_str(&json).unwrap();
@@ -5108,7 +4966,7 @@ mod tests {
     /// embeds a `ContextRoleState`). No per-field re-validation is needed.
     #[test]
     fn context_role_state_deserialize_rejects_malformed_ceiling() {
-        let clock = scp_primitives::SystemClock;
+        let clock = scp_clock::SystemClock;
         let mut state = ContextRoleState::new(
             "ctx-1",
             "did:scp:creator",
@@ -5155,7 +5013,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -5167,7 +5025,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
         assign_role(
@@ -5175,7 +5033,7 @@ mod tests {
             "did:dht:bob",
             "observer",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -5210,7 +5068,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![custom],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -5221,7 +5079,7 @@ mod tests {
             "did:dht:alice",
             "content-mod",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -5328,7 +5186,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![custom],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap_err();
         assert!(
@@ -5342,17 +5200,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ucan_resource_action_tool_invoke_all() {
-        let (resource, action) = Capability::ToolInvokeAll.ucan_resource_action();
-        assert_eq!(resource.as_ref(), "tool_invoke");
+    fn ucan_resource_action_outlet_call_all() {
+        let (resource, action) = Capability::OutletCallAll.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "outlet_call");
+        assert_eq!(action.as_ref(), "*");
+
+        let (resource, action) = Capability::OutletQueryAll.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "outlet_query");
         assert_eq!(action.as_ref(), "*");
     }
 
     #[test]
-    fn ucan_resource_action_tool_invoke_specific() {
-        let cap = Capability::ToolInvoke("calculator".to_owned());
+    fn ucan_resource_action_outlet_call_specific() {
+        let cap = Capability::OutletCall("calculator".to_owned());
         let (resource, action) = cap.ucan_resource_action();
-        assert_eq!(resource.as_ref(), "tool_invoke");
+        assert_eq!(resource.as_ref(), "outlet_call");
+        assert_eq!(action.as_ref(), "calculator");
+
+        let cap = Capability::OutletQuery("calculator".to_owned());
+        let (resource, action) = cap.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "outlet_query");
         assert_eq!(action.as_ref(), "calculator");
     }
 
@@ -5398,25 +5265,29 @@ mod tests {
     #[test]
     fn ucan_resource_action_from_name_string() {
         // Parsing from the canonical colon name produces the correct UCAN pair.
-        let cap = Capability::new("tool:invoke:*");
+        let cap = Capability::new("outlet:call:*").expect("valid wildcard");
         let (resource, action) = cap.ucan_resource_action();
-        assert_eq!(resource.as_ref(), "tool_invoke");
+        assert_eq!(resource.as_ref(), "outlet_call");
         assert_eq!(action.as_ref(), "*");
     }
 
     #[test]
-    fn ucan_resource_action_tool_invoke_specific_from_name() {
-        let cap = Capability::new("tool:invoke:calculator");
+    fn ucan_resource_action_outlet_call_specific_from_name() {
+        let cap = Capability::new("outlet:call:calculator").expect("valid call");
         let (resource, action) = cap.ucan_resource_action();
-        assert_eq!(resource.as_ref(), "tool_invoke");
+        assert_eq!(resource.as_ref(), "outlet_call");
         assert_eq!(action.as_ref(), "calculator");
     }
 
     #[test]
     fn ucan_capability_name_format() {
         assert_eq!(
-            Capability::ToolInvokeAll.ucan_capability_name(),
-            "tool_invoke:*"
+            Capability::OutletCallAll.ucan_capability_name(),
+            "outlet_call:*"
+        );
+        assert_eq!(
+            Capability::OutletQueryAll.ucan_capability_name(),
+            "outlet_query:*"
         );
         assert_eq!(
             Capability::MessagesWrite.ucan_capability_name(),
@@ -5427,13 +5298,13 @@ mod tests {
             "context_child:create"
         );
         assert_eq!(
-            Capability::ToolInvoke("calc".to_owned()).ucan_capability_name(),
-            "tool_invoke:calc"
+            Capability::OutletCall("calc".to_owned()).ucan_capability_name(),
+            "outlet_call:calc"
         );
         assert_eq!(Capability::Bridging.ucan_capability_name(), "bridging:*");
         assert_eq!(
-            Capability::ToolRegister.ucan_capability_name(),
-            "tool:register"
+            Capability::OutletRegister.ucan_capability_name(),
+            "outlet:register"
         );
     }
 
@@ -5479,9 +5350,9 @@ mod tests {
         let caps = vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvoke("test".to_owned()),
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCall("test".to_owned()),
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
             Capability::MemberInvite,
             Capability::MemberRemove,
             Capability::RoleAssign,
@@ -5489,7 +5360,7 @@ mod tests {
             Capability::GovernanceVote,
             Capability::ContextClose,
             Capability::ChildContextCreate,
-            Capability::ToolInterface,
+            Capability::OutletInterface,
             Capability::Bridging,
             Capability::MediaVoice,
             Capability::MediaVideo,
@@ -5535,7 +5406,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -5547,7 +5418,7 @@ mod tests {
             "did:dht:alice",
             "member",
             "did:dht:creator",
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .expect("creator can assign member role");
 
@@ -5612,7 +5483,7 @@ mod tests {
             "did:dht:creator",
             ceiling,
             vec![],
-            &scp_primitives::SystemClock,
+            &scp_clock::SystemClock,
         )
         .unwrap();
 
@@ -5646,5 +5517,408 @@ mod tests {
             state.members.contains("did:dht:creator"),
             "SuspendAll must preserve membership — that's what RemoveMember is for"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_member (spec §5.6.1 clean teardown)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remove_member_clears_all_per_did_role_state() {
+        // Spec §5.6.1: removing a member drops members, assignments,
+        // member_capabilities, AND suspended_capabilities for that DID.
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
+
+        state.members.insert("did:dht:alice".to_owned());
+        state
+            .system_assign_role("did:dht:alice", "member", &scp_clock::SystemClock)
+            .unwrap();
+        // Suspend a capability the role grants, so a dangling suspension is
+        // possible if removal does not clear it.
+        state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
+
+        // Preconditions: present in all four maps.
+        assert!(state.members.contains("did:dht:alice"));
+        assert!(state.assignments.contains_key("did:dht:alice"));
+        assert!(state.member_capabilities.contains_key("did:dht:alice"));
+        assert!(state.suspended_for("did:dht:alice").is_some());
+
+        let was_member = state.remove_member("did:dht:alice");
+        assert!(
+            was_member,
+            "remove_member returns true for a present member"
+        );
+
+        // Postconditions: absent from ALL four maps, including the
+        // pub(crate) suspended_capabilities (the dangling-suspension fix).
+        assert!(!state.members.contains("did:dht:alice"));
+        assert!(!state.assignments.contains_key("did:dht:alice"));
+        assert!(!state.member_capabilities.contains_key("did:dht:alice"));
+        assert!(
+            state.suspended_for("did:dht:alice").is_none(),
+            "remove_member MUST clear the suspended_capabilities entry (spec §5.6.1)"
+        );
+    }
+
+    #[test]
+    fn remove_member_returns_was_present() {
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
+
+        state.members.insert("did:dht:alice".to_owned());
+
+        // Present -> true.
+        assert!(state.remove_member("did:dht:alice"));
+        // Idempotent no-op when absent -> false.
+        assert!(!state.remove_member("did:dht:alice"));
+        // Never-present DID -> false.
+        assert!(!state.remove_member("did:dht:nobody"));
+    }
+
+    #[test]
+    fn remove_then_readmit_same_did_has_no_stale_suspension() {
+        // Core regression (spec §5.6.1): a re-admitted same-DID member is a fresh
+        // admission and MUST NOT inherit a phantom suspension from a prior tenure.
+        let ceiling = test_ceiling();
+        let mut state = ContextRoleState::new(
+            "ctx-1",
+            "did:dht:creator",
+            ceiling,
+            vec![],
+            &scp_clock::SystemClock,
+        )
+        .unwrap();
+
+        // First tenure: join, get the member role, then suspend a granted cap.
+        state.members.insert("did:dht:alice".to_owned());
+        state
+            .system_assign_role("did:dht:alice", "member", &scp_clock::SystemClock)
+            .unwrap();
+        state.suspend_capabilities("did:dht:alice", [Capability::MessagesWrite]);
+        assert!(
+            !state.member_has_capability("did:dht:alice", &Capability::MessagesWrite),
+            "suspension denies the capability during the first tenure"
+        );
+
+        // Remove.
+        assert!(state.remove_member("did:dht:alice"));
+
+        // Re-admit the SAME DID with the SAME role.
+        state.members.insert("did:dht:alice".to_owned());
+        state
+            .system_assign_role("did:dht:alice", "member", &scp_clock::SystemClock)
+            .unwrap();
+
+        // The re-admitted member holds the capability their new role grants —
+        // no phantom suspension survived the removal.
+        assert!(
+            state.member_has_capability("did:dht:alice", &Capability::MessagesWrite),
+            "re-admitted same-DID member MUST NOT inherit a phantom suspension (spec §5.6.1)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-014 — split outlet stems, strict §5.4.2.1 parser, attenuation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn out014_capability_new_returns_some_for_outlet_query_id() {
+        // Capability::new("outlet:query:{outlet_id}") returns Some(OutletQuery(..)).
+        assert_eq!(
+            Capability::new("outlet:query:my-outlet"),
+            Some(Capability::OutletQuery("my-outlet".to_owned()))
+        );
+        assert_eq!(
+            Capability::new("outlet:query:lookup_users"),
+            Some(Capability::OutletQuery("lookup_users".to_owned()))
+        );
+    }
+
+    #[test]
+    fn out014_capability_new_returns_some_for_outlet_call_id() {
+        // Capability::new("outlet:call:{outlet_id}") returns Some(OutletCall(..)).
+        assert_eq!(
+            Capability::new("outlet:call:send_payment"),
+            Some(Capability::OutletCall("send_payment".to_owned()))
+        );
+    }
+
+    #[test]
+    fn out014_capability_new_wildcards_round_trip_both_forms() {
+        // Capability::new("outlet:query:*") / "outlet:call:*" return the wildcard
+        // variants. Both wire (`outlet_query:*`) and SDK (`outlet:query:*`) forms
+        // are accepted.
+        assert_eq!(
+            Capability::new("outlet:query:*"),
+            Some(Capability::OutletQueryAll)
+        );
+        assert_eq!(
+            Capability::new("outlet_query:*"),
+            Some(Capability::OutletQueryAll)
+        );
+        assert_eq!(
+            Capability::new("outlet:call:*"),
+            Some(Capability::OutletCallAll)
+        );
+        assert_eq!(
+            Capability::new("outlet_call:*"),
+            Some(Capability::OutletCallAll)
+        );
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_outlet_invoke_hard_break() {
+        // Capability::new("outlet:invoke:{outlet_id}") returns None (hard break,
+        // ADR-049 §1 / SCP-OUT-014 — no transitional alias).
+        assert_eq!(Capability::new("outlet:invoke:foo"), None);
+        assert_eq!(Capability::new("outlet:invoke:*"), None);
+        assert_eq!(Capability::new("outlet_invoke:foo"), None);
+        assert_eq!(Capability::new("outlet_invoke:*"), None);
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_pre_rename_tool_forms() {
+        // The pre-rename `outlet:*` legacy forms are removed with no transitional
+        // alias (SCP-OUT-002 / SCP-OUT-014).
+        assert_eq!(Capability::new("tool:invoke:foo"), None);
+        assert_eq!(Capability::new("tool:invoke:*"), None);
+        assert_eq!(Capability::new("tool_invoke:foo"), None);
+        assert_eq!(Capability::new("tool_invoke:*"), None);
+        assert_eq!(Capability::new("tool:register"), None);
+        assert_eq!(Capability::new("tool:interface"), None);
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_inner_colon_in_suffix() {
+        // A colon inside the outlet_id (an extra segment) is a parser-differential
+        // rejection, NOT a Custom fallback.
+        assert_eq!(Capability::new("outlet_query:call:foo"), None);
+        assert_eq!(Capability::new("outlet:query:call:foo"), None);
+        assert_eq!(Capability::new("outlet_call:invoke:bar"), None);
+        assert_eq!(Capability::new("outlet:call:do:something"), None);
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_empty_suffix() {
+        assert_eq!(Capability::new("outlet_query:"), None);
+        assert_eq!(Capability::new("outlet:query:"), None);
+        assert_eq!(Capability::new("outlet_call:"), None);
+        assert_eq!(Capability::new("outlet:call:"), None);
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_uppercase_suffix() {
+        assert_eq!(Capability::new("outlet_query:FOO"), None);
+        assert_eq!(Capability::new("outlet:call:Bar"), None);
+        assert_eq!(Capability::new("outlet_call:abcDEF"), None);
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_oversized_suffix() {
+        // A 129-char suffix returns None; 128 chars (the bound) MUST parse.
+        let oversized: String = "a".repeat(129);
+        let input = format!("outlet_query:{oversized}");
+        assert_eq!(Capability::new(&input), None);
+        let max: String = "a".repeat(128);
+        let ok = format!("outlet_query:{max}");
+        assert_eq!(Capability::new(&ok), Some(Capability::OutletQuery(max)));
+    }
+
+    #[test]
+    fn out014_capability_new_rejects_non_ascii_and_punctuation() {
+        // Defense-in-depth: characters outside [a-z0-9_-] reject.
+        assert_eq!(Capability::new("outlet_query:hello world"), None);
+        assert_eq!(Capability::new("outlet_call:foo.bar"), None);
+        assert_eq!(Capability::new("outlet_query:foo/bar"), None);
+        assert_eq!(Capability::new("outlet_query:foo+bar"), None);
+        assert_eq!(Capability::new("outlet_query:héllo"), None); // non-ASCII
+    }
+
+    #[test]
+    fn out014_ucan_wire_form_uses_underscore() {
+        // UCAN wire form is `outlet_query:{id}` / `outlet_call:{id}`.
+        let cap = Capability::OutletQuery("calc".to_owned());
+        let (resource, action) = cap.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "outlet_query");
+        assert_eq!(action.as_ref(), "calc");
+        assert_eq!(cap.ucan_capability_name(), "outlet_query:calc");
+
+        let cap2 = Capability::OutletCall("send".to_owned());
+        assert_eq!(cap2.ucan_capability_name(), "outlet_call:send");
+    }
+
+    #[test]
+    fn out014_sdk_form_uses_colon() {
+        // SDK-facing display form is `outlet:query:{id}` / `outlet:call:{id}`.
+        let cap = Capability::OutletQuery("calc".to_owned());
+        assert_eq!(cap.name().as_ref(), "outlet:query:calc");
+        assert_eq!(format!("{cap}"), "outlet:query:calc");
+
+        let cap2 = Capability::OutletCall("send".to_owned());
+        assert_eq!(cap2.name().as_ref(), "outlet:call:send");
+    }
+
+    #[test]
+    fn out014_round_trip_capability_new_to_display() {
+        // The SDK-facing colon form round-trips through Display.
+        let originals = [
+            Capability::OutletQuery("my-outlet".to_owned()),
+            Capability::OutletQueryAll,
+            Capability::OutletCall("send_log".to_owned()),
+            Capability::OutletCallAll,
+        ];
+        for cap in &originals {
+            let displayed = cap.to_string();
+            let reparsed = Capability::new(&displayed);
+            assert_eq!(
+                reparsed.as_ref(),
+                Some(cap),
+                "round-trip failed for {cap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn out014_round_trip_wire_form_through_new() {
+        // The wire form `outlet_query:{id}` must also round-trip through new().
+        let pairs = [
+            (
+                "outlet_query:my-outlet",
+                Capability::OutletQuery("my-outlet".to_owned()),
+            ),
+            ("outlet_query:*", Capability::OutletQueryAll),
+            (
+                "outlet_call:send_payment",
+                Capability::OutletCall("send_payment".to_owned()),
+            ),
+            ("outlet_call:*", Capability::OutletCallAll),
+        ];
+        for (wire, expected) in &pairs {
+            let parsed = Capability::new(wire);
+            assert_eq!(
+                parsed.as_ref(),
+                Some(expected),
+                "wire form {wire:?} did not parse to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn out014_attenuation_query_all_to_query_specific_is_valid() {
+        // parent(OutletQueryAll) → child(OutletQuery(x)) is valid.
+        // CapabilityCeiling::contains is the protocol-level subset check.
+        let ceiling = CapabilityCeiling::new([Capability::OutletQueryAll]);
+        assert!(ceiling.contains(&Capability::OutletQuery("any-outlet".to_owned())));
+        assert!(ceiling.contains(&Capability::OutletQuery("other".to_owned())));
+        assert!(ceiling.contains(&Capability::OutletQueryAll));
+    }
+
+    #[test]
+    fn out014_attenuation_query_all_does_not_grant_call() {
+        // parent(OutletQueryAll) → child(OutletCall(x)) is REJECTED (cross-class).
+        let ceiling = CapabilityCeiling::new([Capability::OutletQueryAll]);
+        assert!(!ceiling.contains(&Capability::OutletCall("any-outlet".to_owned())));
+        assert!(!ceiling.contains(&Capability::OutletCallAll));
+    }
+
+    #[test]
+    fn out014_attenuation_call_all_does_not_grant_query() {
+        // Mirror: parent(OutletCallAll) → child(OutletQuery(x)) is REJECTED.
+        let ceiling = CapabilityCeiling::new([Capability::OutletCallAll]);
+        assert!(!ceiling.contains(&Capability::OutletQuery("any-outlet".to_owned())));
+        assert!(!ceiling.contains(&Capability::OutletQueryAll));
+    }
+
+    #[test]
+    fn out014_capability_uri_matches_rejects_cross_class() {
+        // The UCAN-layer attenuation check (CapabilityUri::matches) MUST reject
+        // cross-class because the resource strings differ.
+        use crate::crypto::ucan::capability::CapabilityUri;
+        let parent_query_all = CapabilityUri::new("ctx-1", "outlet_query", "*");
+        let child_call_specific = CapabilityUri::new("ctx-1", "outlet_call", "outlet");
+        assert!(
+            !parent_query_all.matches(&child_call_specific),
+            "outlet_query:* must NOT match outlet_call:outlet — cross-class attenuation"
+        );
+
+        let parent_call_all = CapabilityUri::new("ctx-1", "outlet_call", "*");
+        let child_query_specific = CapabilityUri::new("ctx-1", "outlet_query", "outlet");
+        assert!(
+            !parent_call_all.matches(&child_query_specific),
+            "outlet_call:* must NOT match outlet_query:outlet — cross-class attenuation"
+        );
+
+        // Same-class attenuation MUST succeed.
+        let parent_query_all = CapabilityUri::new("ctx-1", "outlet_query", "*");
+        let child_query_specific = CapabilityUri::new("ctx-1", "outlet_query", "outlet");
+        assert!(
+            parent_query_all.matches(&child_query_specific),
+            "outlet_query:* MUST match outlet_query:outlet — same-class wildcard"
+        );
+    }
+
+    #[test]
+    fn out014_no_outlet_invoke_variant_remains() {
+        // The Capability enum does NOT have variants OutletInvoke / OutletInvokeAll.
+        // Enforced statically by the enum definition; also verified by construction
+        // that the deleted forms cannot be produced by the parser.
+        for input in [
+            "outlet:invoke:*",
+            "outlet:invoke:any",
+            "outlet_invoke:*",
+            "outlet_invoke:any",
+        ] {
+            assert_eq!(
+                Capability::new(input),
+                None,
+                "deleted stem {input:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn out014_role_defaults_double_grant_query_and_call() {
+        // A query-capable role can BOTH query and call: member / moderator /
+        // author role defaults grant both `OutletQueryAll` AND `OutletCallAll`
+        // when the ceiling permits them.
+        let ceiling = CapabilityCeiling::new([
+            Capability::MessagesRead,
+            Capability::MessagesWrite,
+            Capability::OutletQueryAll,
+            Capability::OutletCallAll,
+            Capability::MemberRemove,
+            Capability::GovernancePropose,
+        ]);
+        for role in [
+            builtin_member(&ceiling),
+            builtin_moderator(&ceiling),
+            builtin_author(&ceiling),
+        ] {
+            assert!(
+                role.capabilities.contains(&Capability::OutletQueryAll),
+                "role {:?} must grant OutletQueryAll",
+                role.name
+            );
+            assert!(
+                role.capabilities.contains(&Capability::OutletCallAll),
+                "role {:?} must grant OutletCallAll",
+                role.name
+            );
+        }
     }
 }

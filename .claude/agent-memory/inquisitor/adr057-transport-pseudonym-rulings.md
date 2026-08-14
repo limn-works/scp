@@ -1,0 +1,18 @@
+---
+name: adr057-transport-pseudonym-rulings
+description: ADR-057 Slice-3 transport rulings (T-1/T-2/T-3) planning-session-10 + ADR amendment — sound decisions, one aspirational-reach over-claim + sequencing gap
+metadata:
+  type: project
+---
+
+Interrogated branch `docs/adr057-transport-pseudonym-rulings` @952eef02f (ADR-057 amendment 2026-07-16 + planning-session-10). Rulings: T-1 real §9.10.4 zeroed-routing_id per-member fan-out + EXTRACT pure logic to `scp-protocol::context::pseudonym` (no shared-channel shortcut); T-2 native↔browser join over shared §5.12.3 InvitationBundle (not deferred); T-3 injected JsSocket, only per-target code = sync orchestration, `#[cfg(test)]` loopback only.
+
+**Verdict: INTERROGATE FURTHER (correct-direction, decisions sound, 1 HIGH honesty finding).**
+
+**HIGH — aspirational stated as verified ground-truth (task item #4).** Both docs assert "the browser reaches [pseudonym derivation] through `JsKeyCustody`" (planning L15 under a "Verified ground-truth, read in native code" header; amendment T-1 "the browser reaches it through the JsKeyCustody port"). FALSE today: `JsKeyCustody` extern surface (custody.rs) = did/sign/getPublicKey/generateKeypair/destroyKey/dhAgree — NO derive_pseudonym, all labeled "future custody slice SEAM, no driver call site this slice"; `scp-client-wasm` does NOT depend on `scp-platform`; `grep -ri pseudonym crates/scp-client{,-wasm}/src` = ZERO hits. The derivation ALGORITHM is shared (scp-platform/pseudonym.rs, KeyCustody::derive_pseudonym — TRUE); the browser's REACH to it is unbuilt. Phantom-provenance shape: cites custody.rs as evidence for a path that file doesn't contain.
+
+**Consequent MED — unlisted prerequisite / sequencing gap.** Native gets its OWN pseudonym "pre-derived at the FFI boundary via KeyCustody::derive_pseudonym, hard-fails before reaching runtime" (actor/state.rs:598, lifecycle_helpers.rs:121). Browser must do the same to announce + be addressed → a JsKeyCustody derive-pseudonym seam is a STRUCTURAL PREREQUISITE of the T-1/T-3 transport slice. Docs frame browser derivation as a separate "custody-slice" concern about byte-PARITY (L41/L74), conflating parity with existence: transport slice can't emit §9.10.4 routing at all without the seam. Sequencing (1 extract→2 transport→3 pkg→4 examples) omits it; D5/D6 are named prerequisites, this one isn't. Fix: name the seam as an explicit prerequisite; restate "already reaches it" → "algorithm shared; browser custody-derive seam is a prerequisite not yet built."
+
+**SOUND, verified:** privacy claim accurate (routing_id=[0u8;32] build_encrypted_envelope:202; context_routing_id RESERVED via is_reserved_pseudonym:533; leaks relay correlator — code comments 188-210/1084-1090 confirm). T-1 extraction split honest anti-fork (pure classify_* liftable; &mut registry-insert+event-emit stay native; browser consumes ONE copy not a re-impl — same pattern as scp-client over scp-mls). T-2 reachability real (invitation_bundle only cfg is `#[cfg(test)]`:520, pub-exported, scp-client already consumes sibling hpke_seal_sender_key) → non-deferral GENUINE (no external blocker). T-3 sync-pump forced by `&mut self` driver; loopback-test-only posture consistent w/ no-stand-in tenet. Amendment composes honestly (planning→ADR = correct tier; "composes with, not supersedes" 2026-07-15 Component-3 note; fence unchanged since dest = already-wasm-safe scp-protocol).
+
+Minor: docs' "defeats pseudonym-unlinkability" slightly overstates — fan-out is REDUCED not full unlinkability (pre-existing KNOWN LIMITATION at messaging_helpers.rs:1092: same MLS ciphertext to all addresses → relay blob-matching residual; not introduced here, not mentioned in rulings).

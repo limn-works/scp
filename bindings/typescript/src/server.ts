@@ -14,8 +14,7 @@
  * disableSiteProjection — NAPI exposes all of those on the raw handle,
  * so they continue to work without going back through an `SCP`.
  *
- * Server operations are native-only (Bun/Node.js). Not available for
- * WASM (ADR-034).
+ * Server operations require the native addon (Bun/Node.js).
  *
  * @packageDocumentation
  */

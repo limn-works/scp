@@ -1,0 +1,44 @@
+---
+name: adr057-teststack-kat-adversarial
+description: ADR-057 test-stack slice (branch feat/adr057-test-stack @deb07953f) — cross-target determinism KAT + 10 driver_adversarial fail-closed tests + CI wasm-test job. Verdict SHIP.
+metadata:
+  type: project
+---
+
+# ADR-057 test-stack slice review (@deb07953f on fe336d218)
+
+## RE-REVIEW pass-3 @9c9940168 — SHIP (all prior findings CLOSED)
+Tests 11-14 + wasm regression + KAT credential leg are now COMMITTED (were the uncommitted follow-up). Verified native: driver_adversarial 14/14, KAT 2/2. Findings 1 (typed `NoPendingJoinMaterial`+SCP-CTX-2005 replaces `contains("no pending key package")`), 2a/2b/2c (tests 11/12/14), 3 (wasm 32-MiB grow regression) all landed. Test 13 proves BOTH second-attempt NoPendingJoinMaterial AND bob2.root==alice.root recovery. Test 14 now asserts EXACTLY `SenderKey(_)` (my prior `|Mls(_)` looseness fixed) + behavioral Alice-decrypt probe. Join-consumes-pending confirmed at client.rs:633 remove BEFORE :650 join_group_from_bytes.
+RESIDUAL (non-blocking, unchanged): test 14's "installed no key" is proven by error-layer (`SenderKey(_)` ⇒ stopped at hpke-open step-3, before install step-4) + code structure, NOT by the Alice-probe (Alice's key decrypting doesn't observe Carol's absence from Bob's sender_key_store — no public observer exists). Minor coverage gaps: tampered-leaf-CONTENT event_log (vs test 5 reorder) + bad wrapping_keys into join untested. All low-ROI.
+
+
+Files: `crates/scp-client-wasm/tests/cross_target_determinism_kat.rs` (2 tests, dual native+wasm32 entries via `#[cfg_attr(target_arch="wasm32", wasm_bindgen_test)]` / `#[cfg_attr(not, test)]`), `crates/scp-client/tests/driver_adversarial.rs` (10 tests), CI `wasm-test` job. Verified: native KAT 2/2 pass, native adversarial 10/10 pass (golden consts are NOT mistyped).
+
+## KAT robustness — SOUND
+- Transitive golden design sound: goldens are `const &str`/`[&str;3]` HEX LITERALS (pinned, captured-once), NOT runtime-recomputed on both sides. native==golden ∧ wasm==golden ⟹ native==wasm. The dangerous anti-pattern (regenerate on both targets + compare, which hides shared bugs) is NOT present.
+- MLS legs (Commit/Welcome/KeyPackage) test ENCODER DETERMINISM correctly: `tls_deserialize` a fixed golden blob then `tls_serialize_detached` and assert byte-eq to golden. This is the corrected Prereq-5 reading (re-encode fixed blob, NOT two constructions — RNG-derived keys/HPKE/nonce can't be pinned). Non-canonical codec caught by native leg; cross-target width/order bug caught by wasm leg.
+- Leg 1 (event log) is the strong one: pins EACH of 3 leaf hashes AND root AND cross-checks `leaf_hash()` helper == appended leaves (explicitly defeats "root masks compensating leaf bugs").
+- Zero flakiness: fixed KAT_TIMESTAMP, fixed sequence/prev_hash, no clock/RNG/map-iteration in any golden preimage.
+- WEAK LEG (non-blocking): AEAD roundtrip leg 4 is NOT a cross-target determinism assertion — decrypt(encrypt(m))==m is self-consistent PER TARGET and would pass on both even if AEAD diverged across targets (ciphertext correctly not pinned due to random nonce). It's a functional smoke + AAD-binding negative check riding in a determinism KAT. Module doc is honest about it.
+
+## Adversarial tests — STRONG "no mutation on rejection"
+- `StateSnapshot` captures {mls_epoch, members(sorted), leaf_count, root, leaf_hashes}; derives PartialEq. Tests 1/3/4/10 snapshot a FULLY-POPULATED context (converged/joined) before hostile input and assert byte-eq after → non-vacuous. Tests 5/7 correctly assert ABSENCE (member_dids None etc.) instead of snapshot-eq because context shouldn't exist / is destroyed.
+- Replay floor is internal (not in snapshot) — tests 4 & 10 correctly probe it BEHAVIORALLY (honest msg still decrypts after attack; genuine replay still rejected). Doc acknowledges this.
+- Error asserts use VARIANT matching (`ClientError::Mls(_)`, `EventLog(_)`, `Mls|Codec`, `UnknownContext`, `ContextAlreadyExists`) — good, not brittle.
+- Test 8 genuinely proves join CONSUMES pending material (3rd join after close → Driver "no pending" instead of resurrecting context). Strong behavioral.
+- Not redundant: test1 (foreign well-formed frame, decrypt-fails-under-group) vs test10 (undecodable bytes, deserialize-fails) are distinct paths, doc distinguishes them.
+
+## Findings (all non-blocking; verdict SHIP)
+1. BRITTLE STRING (minor, Revise): tests 8 & 9 assert `msg.contains("no pending key package")` on `ClientError::Driver(String)`. Forced by stringly-typed Driver variant. Fix: add typed `ClientError::NoPendingJoinMaterial{context_id}` for a robust variant-match + better API. `contains` (not exact) softens it.
+2. COVERAGE GAP (ROI): no adversarial no-mutation test for MUTATING ops that consume EXTERNAL bytes on the ADDER side: (a) malformed/foreign KeyPackage → `add_member` (deserializes+validates KP at client.rs:494; garbage should leave Alice's epoch/membership/log unchanged — the adder-side dual of test 5). (b) malformed/foreign Welcome → `join_context_encrypted` (test 5 corrupts ONLY event_log, Welcome stays valid). Note join does `pending_joins.remove()` at client.rs:611 BEFORE `join_group_from_bytes` — a FAILED join on bad Welcome CONSUMES pending material (victim can't retry) — untested whether intended fail-closed or footgun. (c) sender-key distribution with target_did ≠ receiver.
+3. storage.rs `set(&[u8])→set(Vec<u8>)` change (avoids wasm-memory subarray aliasing — well reasoned) has no dedicated regression test; only transitively smoke-covered by wasm_surface_exchange.rs.
+
+## FOLLOW-UP diff (uncommitted on deb07953f) — closes prior findings 1,2,3
+Adds driver_adversarial tests 11-14 + wasm regression test + typed `ClientError::NoPendingJoinMaterial{context_id}` (wasm code SCP-CTX-2005). Directly resolves my prior findings: #1 (typed variant replaces `contains("no pending key package")`; tests 8/9 now match the variant), #2a (test 11 malformed/wrong-type/empty KeyPackage→add_member, snapshot-eq on POPULATED 2-member state — self-validates the "deserialize before mutable borrow" claim regardless of comment), #2b (test 12 malformed Welcome→join leaves NO half-built ctx), #2c (test 14 misdirected sender-key seal), #3 (wasm retaining-store regression test).
+- Test 13 EXEMPLARY: pins the prior open question ("failed join consumes pending — intended or footgun?") as INTENDED fail-closed. Uses a GOOD welcome on the 2nd in-tab attempt → consume-on-attempt is DISTINGUISHING (a non-consuming impl would succeed and fail the NoPendingJoinMaterial match). Recovery asserts membership==[alice,bob] AND event_log_root==alice's, not just Ok. Reconstruct-from-durable proven (bob2 fresh over shared storage, member_dids None first, then join succeeds only if ctor restored the durable pending blob).
+- Test 14 ASSERTION GAP (Revise, low sev): StateSnapshot does NOT capture the sender_key_store, and there is NO public observer of installed PEER sender keys (only rotate_sender_key exists). So "reject WITHOUT installing Carol's key" is backed only by expect_err + drain-empty + snapshot(epoch/members/log). A bug that wrongly installs then errors wouldn't be caught by the snapshot (realistically low: install is step-4 AFTER hpke_open step-3, so open-Err skips install). Fix: post-rejection behavioral probe (deliver Alice's LEGIT distribution to Bob, assert still installs). Error path is genuinely `ClientError::SenderKey` (hpke_open_sender_key→SenderKeyError via #[from], crypto_state.rs:572-579); `| Mls(_)` is defensive-loose but not a false-pass vector (Bob at correct post-add epoch reaches step-3; a fall to step-2 ceiling would be Driver→test fails safe). Consider narrowing to `SenderKey(_)`.
+- wasm retaining_js_store_survives_wasm_memory_reuse: RUNS in new CI wasm-test job (`wasm-pack test --node`). Would catch a `&[u8]`-view regression only PROBABILISTICALLY — via dlmalloc reuse of freed blob regions (blobs are dropped temporaries after put) AND/OR opportunistic `memory.grow` detaching retained subarray views. 4KB×64 filler + 64KB scratch makes corruption likely but NOT by-construction. STRENGTHEN: force a guaranteed multi-MB alloc → guaranteed memory.grow → detached view → deterministic corruption. On the FIXED (owned-Vec) code it's deterministically green (Low flake).
+
+## CI wasm-test job — sound, won't silently no-op
+- `wasm-pack test --node crates/scp-client-wasm`, `needs: check-draft` (identical gating to wasm-protocol), added to BOTH the gate `needs:` list and the result-check loop (line ~1179). Loop fails on "failure"/"cancelled"; "skipped" passes — but wasm-test has NO `if:` path filter so it always runs on non-draft PRs (never skipped). 15 `wasm_bindgen_test` across crate (KAT + error.rs + lib.rs + wasm_surface_exchange.rs) so not a zero-test no-op; compile failure under wasm32 fails the job (not no-op).
+- Minor: `curl | sh` wasm-pack install unpinned (supply-chain/reproducibility).

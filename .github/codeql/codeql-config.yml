@@ -7,3 +7,22 @@ paths-ignore:
   - "**/node_modules/**"
   - "**/target/**"
   - ".claude/**"
+
+# `paths-ignore` excludes test *directories*, but the Rust analysis runs
+# `build-mode: none` (parses source without evaluating `#[cfg]`), so it also
+# extracts inline `#[cfg(test)] mod tests { … }` blocks inside src files —
+# which path-based ignores cannot reach.
+#
+# `rust/hard-coded-cryptographic-value` fires on literal byte arrays passed to
+# APIs it models as taking a crypto nonce/key. In inline unit tests this is a
+# false positive: e.g. `xctx_nonce_dedup.record([0x3C; 16], ts)` records a
+# fixed value into the *replay-dedup tracker* (a lookup key the test then
+# asserts on), NOT an AEAD/crypto nonce. Excluding the rule is a deliberate,
+# human-approved trade-off (ADR-049 Decision-7 review): production hard-coded
+# crypto values are caught by the cryptographer + security-reviewer roster on
+# every crypto change, and production key/nonce material derives from
+# HKDF/OsRng/MLS — never source literals — so the residual risk is low while
+# the FP rate on inline test fixtures is high.
+query-filters:
+  - exclude:
+      id: rust/hard-coded-cryptographic-value

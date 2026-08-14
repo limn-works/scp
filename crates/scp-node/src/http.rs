@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use zeroize::Zeroizing;
 
-use scp_identity::document::DidDocument;
+use scp_did::DidDocument;
 use scp_platform::traits::Storage;
 use scp_transport::native::server::RelayConfig as TransportRelayConfig;
 use scp_transport::native::storage::BlobStorageBackend;
@@ -1165,7 +1165,7 @@ mod tests {
             dev_token: None,
             dev_bind_addr: None,
             projected_contexts: RwLock::new(HashMap::new()),
-            blob_storage: Arc::new(BlobStorageBackend::default()),
+            blob_storage: Arc::new(BlobStorageBackend::in_memory()),
             relay_config: scp_transport::native::server::RelayConfig::default(),
             start_time: Instant::now(),
             http_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8443)),
@@ -1179,7 +1179,7 @@ mod tests {
             ),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_identity::document::DidDocument {
+            did_document: scp_did::DidDocument {
                 context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
                 id: "did:dht:cors_test".to_owned(),
                 verification_method: vec![],
@@ -1373,7 +1373,7 @@ mod vhost_tests {
             ),
             tls_config: None,
             cert_resolver: None,
-            did_document: scp_identity::document::DidDocument {
+            did_document: scp_did::DidDocument {
                 context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
                 id: "did:dht:vhost_test".to_owned(),
                 verification_method: vec![],

@@ -5,14 +5,14 @@
 //!
 //! Coverage:
 //! - **Context**: membership store/load/list/remove roundtrip; role CRUD;
-//!   context state and params; broadcast state and block lists; `delete_context`
-//!   cascades; active context listing.
+//!   context state and params; `delete_context` cascades; active context
+//!   listing.
 //! - **Identity**: DID document roundtrip; signing key roundtrip; private state
 //!   sequence ordering; `delete_identity` cascades.
 //! - **UCAN / Nonce**: token CRUD; revocation; nonce replay rejection after
 //!   `check_and_record_nonce`; `prune_expired_nonces` removes only expired.
 //! - **Economy**: adapter credential store/load/list/remove; identity isolation.
-//! - **Tools**: tool and tool-session CRUD; context scoping; delete cascades.
+//! - **Outlets**: outlet and outlet-session CRUD; context scoping; delete cascades.
 //! - **Event Log**: append/load/range query, Merkle root and tree node roundtrip.
 //! - **Sender Keys**: store/load/list/remove roundtrip; context isolation.
 //! - **DID Cache**: cache with expiry; TOFU record roundtrip.
@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use scp_core::crypto::mls::MlsStorageBridge;
 use scp_core::store::ProtocolRepository;
-use scp_identity::DID;
-use scp_platform::testing::InMemoryStorage;
+use scp_did::DID;
+use scp_platform::in_memory::InMemoryStorage;
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -204,14 +204,17 @@ async fn delete_context_removes_all_associated_state() {
     let ctx = "ctx-delete-test";
     let did = DID::from("did:dht:z6MkMember");
 
-    // Populate context with state, params, membership, role, tool, session.
+    // Populate context with state, params, membership, role, outlet, session.
     store.store_context_state(ctx, b"state").await.unwrap();
     store.store_context_params(ctx, b"params").await.unwrap();
     store.store_membership(ctx, &did, "member").await.unwrap();
     store.store_role(ctx, "admin", b"role-data").await.unwrap();
-    store.store_tool(ctx, "tool-1", b"tool-reg").await.unwrap();
     store
-        .store_tool_session(ctx, "sess-1", b"sess-data")
+        .store_outlet(ctx, "outlet-1", b"outlet-reg")
+        .await
+        .unwrap();
+    store
+        .store_outlet_session(ctx, "sess-1", b"sess-data")
         .await
         .unwrap();
     store
@@ -231,10 +234,10 @@ async fn delete_context_removes_all_associated_state() {
     assert!(store.load_context_params(ctx).await.unwrap().is_none());
     assert!(store.load_membership(ctx, &did).await.unwrap().is_none());
     assert!(store.load_role(ctx, "admin").await.unwrap().is_none());
-    assert!(store.load_tool(ctx, "tool-1").await.unwrap().is_none());
+    assert!(store.load_outlet(ctx, "outlet-1").await.unwrap().is_none());
     assert!(
         store
-            .load_tool_session(ctx, "sess-1")
+            .load_outlet_session(ctx, "sess-1")
             .await
             .unwrap()
             .is_none()
@@ -266,160 +269,6 @@ async fn list_active_contexts_returns_contexts_with_state() {
 
     let contexts = store.list_active_contexts().await.unwrap();
     assert_eq!(contexts, vec!["ctx-alpha", "ctx-beta"]);
-}
-
-// =========================================================================
-// Context module — broadcast block list persistence
-// =========================================================================
-
-#[tokio::test]
-async fn broadcast_block_list_store_load_roundtrip() {
-    let store = make_store();
-    let ctx = "ctx-broadcast-blocks";
-    let author_did = "did:dht:z6MkAuthor";
-
-    let mut block_list = HashSet::new();
-    block_list.insert("did:dht:z6MkBlocked1".to_owned());
-    block_list.insert("did:dht:z6MkBlocked2".to_owned());
-
-    store
-        .store_broadcast_block_list(ctx, author_did, &block_list)
-        .await
-        .unwrap();
-
-    let loaded = store
-        .load_broadcast_block_list(ctx, author_did)
-        .await
-        .unwrap();
-    assert_eq!(loaded, Some(block_list));
-}
-
-#[tokio::test]
-async fn broadcast_block_list_returns_none_for_missing() {
-    let store = make_store();
-    let loaded = store
-        .load_broadcast_block_list("ctx-missing", "did:dht:z6MkUnknown")
-        .await
-        .unwrap();
-    assert!(loaded.is_none());
-}
-
-#[tokio::test]
-async fn broadcast_block_list_overwrite() {
-    let store = make_store();
-    let ctx = "ctx-block-overwrite";
-    let author = "did:dht:z6MkAuthor";
-
-    let mut v1 = HashSet::new();
-    v1.insert("did:dht:z6MkA".to_owned());
-    store
-        .store_broadcast_block_list(ctx, author, &v1)
-        .await
-        .unwrap();
-
-    let mut v2 = HashSet::new();
-    v2.insert("did:dht:z6MkA".to_owned());
-    v2.insert("did:dht:z6MkB".to_owned());
-    store
-        .store_broadcast_block_list(ctx, author, &v2)
-        .await
-        .unwrap();
-
-    let loaded = store.load_broadcast_block_list(ctx, author).await.unwrap();
-    assert_eq!(loaded, Some(v2));
-}
-
-#[tokio::test]
-async fn delete_context_removes_broadcast_block_lists() {
-    let store = make_store();
-    let ctx = "ctx-block-delete";
-    let author = "did:dht:z6MkAuthor";
-
-    let mut block_list = HashSet::new();
-    block_list.insert("did:dht:z6MkBlocked".to_owned());
-    store
-        .store_broadcast_block_list(ctx, author, &block_list)
-        .await
-        .unwrap();
-
-    store.delete_context(ctx).await.unwrap();
-
-    let loaded = store.load_broadcast_block_list(ctx, author).await.unwrap();
-    assert!(loaded.is_none());
-}
-
-// =========================================================================
-// Context module — broadcast state persistence
-// =========================================================================
-
-#[tokio::test]
-async fn broadcast_state_store_load_roundtrip() {
-    use scp_core::context::broadcast::{
-        AuthorStateSnapshot, BroadcastAdmission, BroadcastContextSnapshot, SubscriberRecord,
-    };
-    use scp_core::crypto::sender_keys::generate_sender_key;
-    use std::collections::HashMap;
-
-    let store = make_store();
-    let ctx = "ctx-broadcast-state";
-
-    let mut subscribers = HashMap::new();
-    subscribers.insert(
-        "did:dht:z6MkSub1".to_owned(),
-        SubscriberRecord {
-            subscriber_did: "did:dht:z6MkSub1".to_owned(),
-            registered_at: 1_700_000_000,
-            has_ucan: false,
-        },
-    );
-
-    let mut block_list = HashSet::new();
-    block_list.insert("did:dht:z6MkBlocked".to_owned());
-
-    let mut authors = HashMap::new();
-    authors.insert(
-        "did:dht:z6MkAuthor".to_owned(),
-        AuthorStateSnapshot {
-            author_did: "did:dht:z6MkAuthor".to_owned(),
-            broadcast_key: generate_sender_key(),
-            epoch: 5,
-            next_sequence: 1,
-            block_list,
-        },
-    );
-
-    let snapshot = BroadcastContextSnapshot {
-        context_id: ctx.to_owned(),
-        admission: BroadcastAdmission::Open,
-        subscribers,
-        authors,
-    };
-
-    store.store_broadcast_state(ctx, &snapshot).await.unwrap();
-
-    let loaded = store.load_broadcast_state(ctx).await.unwrap();
-    assert!(loaded.is_some());
-    let loaded = loaded.unwrap();
-    assert_eq!(loaded.context_id, ctx);
-    assert_eq!(loaded.admission, BroadcastAdmission::Open);
-    assert_eq!(loaded.subscribers.len(), 1);
-    assert!(loaded.subscribers.contains_key("did:dht:z6MkSub1"));
-    assert_eq!(loaded.authors.len(), 1);
-    let author = loaded.authors.get("did:dht:z6MkAuthor").unwrap();
-    assert_eq!(author.epoch, 5);
-    assert!(author.block_list.contains("did:dht:z6MkBlocked"));
-}
-
-#[tokio::test]
-async fn broadcast_state_returns_none_for_missing() {
-    let store = make_store();
-    assert!(
-        store
-            .load_broadcast_state("nonexistent")
-            .await
-            .unwrap()
-            .is_none()
-    );
 }
 
 // =========================================================================
@@ -871,80 +720,86 @@ async fn adapter_credentials_isolated_between_identities() {
 }
 
 // =========================================================================
-// Tools module — tool registration and sessions
+// Outlets module — outlet registration and sessions
 // =========================================================================
 
 #[tokio::test]
-async fn tool_store_load_list_delete_roundtrip() {
+async fn outlet_store_load_list_delete_roundtrip() {
     let store = make_store();
-    let ctx = "ctx-tools";
+    let ctx = "ctx-outlets";
 
     store
-        .store_tool(ctx, "calculator", b"calc-reg")
+        .store_outlet(ctx, "calculator", b"calc-reg")
         .await
         .unwrap();
     store
-        .store_tool(ctx, "search", b"search-reg")
+        .store_outlet(ctx, "search", b"search-reg")
         .await
         .unwrap();
 
     // Load.
     assert_eq!(
-        store.load_tool(ctx, "calculator").await.unwrap(),
+        store.load_outlet(ctx, "calculator").await.unwrap(),
         Some(b"calc-reg".to_vec())
     );
 
     // List.
-    let tools = store.list_tools(ctx).await.unwrap();
-    assert_eq!(tools, vec!["calculator", "search"]);
+    let outlets = store.list_outlets(ctx).await.unwrap();
+    assert_eq!(outlets, vec!["calculator", "search"]);
 
     // Delete.
-    store.delete_tool(ctx, "calculator").await.unwrap();
-    assert!(store.load_tool(ctx, "calculator").await.unwrap().is_none());
+    store.delete_outlet(ctx, "calculator").await.unwrap();
+    assert!(
+        store
+            .load_outlet(ctx, "calculator")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
-async fn tools_are_context_scoped() {
+async fn outlets_are_context_scoped() {
     let store = make_store();
 
     store
-        .store_tool("ctx-1", "tool-abc", b"data-1")
+        .store_outlet("ctx-1", "outlet-abc", b"data-1")
         .await
         .unwrap();
     store
-        .store_tool("ctx-2", "tool-abc", b"data-2")
+        .store_outlet("ctx-2", "outlet-abc", b"data-2")
         .await
         .unwrap();
 
     assert_eq!(
-        store.load_tool("ctx-1", "tool-abc").await.unwrap(),
+        store.load_outlet("ctx-1", "outlet-abc").await.unwrap(),
         Some(b"data-1".to_vec())
     );
     assert_eq!(
-        store.load_tool("ctx-2", "tool-abc").await.unwrap(),
+        store.load_outlet("ctx-2", "outlet-abc").await.unwrap(),
         Some(b"data-2".to_vec())
     );
 }
 
 #[tokio::test]
-async fn tool_session_store_load_delete_roundtrip() {
+async fn outlet_session_store_load_delete_roundtrip() {
     let store = make_store();
     let ctx = "ctx-sessions";
 
     store
-        .store_tool_session(ctx, "sess-1", b"session-state")
+        .store_outlet_session(ctx, "sess-1", b"session-state")
         .await
         .unwrap();
 
     assert_eq!(
-        store.load_tool_session(ctx, "sess-1").await.unwrap(),
+        store.load_outlet_session(ctx, "sess-1").await.unwrap(),
         Some(b"session-state".to_vec())
     );
 
-    store.delete_tool_session(ctx, "sess-1").await.unwrap();
+    store.delete_outlet_session(ctx, "sess-1").await.unwrap();
     assert!(
         store
-            .load_tool_session(ctx, "sess-1")
+            .load_outlet_session(ctx, "sess-1")
             .await
             .unwrap()
             .is_none()
@@ -965,7 +820,7 @@ async fn context_isolation_between_modules() {
         .await
         .unwrap();
     store
-        .store_tool("ctx-2", "tool-1", b"tool-data")
+        .store_outlet("ctx-2", "outlet-1", b"outlet-data")
         .await
         .unwrap();
     store
@@ -974,7 +829,13 @@ async fn context_isolation_between_modules() {
         .unwrap();
 
     // Each context only has its own data.
-    assert!(store.load_tool("ctx-1", "tool-1").await.unwrap().is_none());
+    assert!(
+        store
+            .load_outlet("ctx-1", "outlet-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(
         store
             .load_ucan_token("ctx-1", "tok-1")
@@ -991,7 +852,13 @@ async fn context_isolation_between_modules() {
             .is_none()
     );
     assert!(store.load_context_state("ctx-3").await.unwrap().is_none());
-    assert!(store.load_tool("ctx-3", "tool-1").await.unwrap().is_none());
+    assert!(
+        store
+            .load_outlet("ctx-3", "outlet-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 // =========================================================================

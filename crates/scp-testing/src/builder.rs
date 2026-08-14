@@ -9,8 +9,9 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use scp_identity::DID;
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_did::DID;
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
 
 use crate::clock::SimulatedClock;
 use crate::relay::{BehaviorMode, InMemoryRelay};

@@ -6,7 +6,7 @@
 //!
 //! Run with `--nocapture` to see hex-encoded intermediate and final values:
 //! ```bash
-//! cargo test -p scp-core --test test_vectors -- --nocapture
+//! cargo test -p scp-runtime --test test_vectors -- --nocapture
 //! ```
 
 #![allow(
@@ -19,8 +19,8 @@
 use ed25519_dalek::{Signer, Verifier};
 use sha2::{Digest, Sha256};
 
-use scp_identity::DID;
-use scp_protocol::context::tools::interface::InterfaceOffer;
+use scp_did::DID;
+use scp_protocol::context::outlets::interface::InterfaceOffer;
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash, canonical_hash_bytes};
 use scp_protocol::crypto::key_continuity::{
     KeyContinuityParty, compute_key_continuity_fingerprint, fingerprint_to_decimal,
@@ -1081,27 +1081,27 @@ fn vector_27_did_pseudonymization() {
 }
 
 // ---------------------------------------------------------------------------
-// §25.15 Tool Interface Offer ID Vectors
+// §25.15 Outlet Interface Offer ID Vectors
 // ---------------------------------------------------------------------------
 
 #[test]
-fn vector_28_tool_interface_offer_id() {
-    println!("=== Vector 28: Tool Interface Offer ID ===");
+fn vector_28_outlet_interface_offer_id() {
+    println!("=== Vector 28: Outlet Interface Offer ID ===");
 
     let source_context = "source-ctx-01";
-    let tool_id = "tool-abc123";
+    let outlet_id = "outlet-abc123";
     let target_context = "target-ctx-02";
     let timestamp: u64 = 1_700_000_000;
 
     // Use the actual InterfaceOffer::compute_offer_id implementation.
     let offer_id =
-        InterfaceOffer::compute_offer_id(source_context, tool_id, target_context, timestamp);
+        InterfaceOffer::compute_offer_id(source_context, outlet_id, target_context, timestamp);
     print_vec("Offer ID", &offer_id);
 
     // §25.15 Vector 28: assert exact spec hex value.
     assert_eq!(
         hex(&offer_id),
-        "b9f0cd497bede455c99c995c16eb2a0a2bc013a94cdd744dfd5ddbcd73791d53"
+        "ea9ce09b497405e8c160c8d0d57067c726092866f6d1ec541e8e6081a5328733"
     );
 
     // Also verify via manual construction to confirm the implementation matches.
@@ -1109,13 +1109,13 @@ fn vector_28_tool_interface_offer_id() {
     buf.extend_from_slice(b"SCP-OFFER-ID-V1:");
     buf.extend_from_slice(&(source_context.len() as u32).to_be_bytes());
     buf.extend_from_slice(source_context.as_bytes());
-    buf.extend_from_slice(&(tool_id.len() as u32).to_be_bytes());
-    buf.extend_from_slice(tool_id.as_bytes());
+    buf.extend_from_slice(&(outlet_id.len() as u32).to_be_bytes());
+    buf.extend_from_slice(outlet_id.as_bytes());
     buf.extend_from_slice(&(target_context.len() as u32).to_be_bytes());
     buf.extend_from_slice(target_context.as_bytes());
     buf.extend_from_slice(&timestamp.to_be_bytes());
 
-    assert_eq!(buf.len(), 73, "offer ID input must be 73 bytes per §25.15");
+    assert_eq!(buf.len(), 75, "offer ID input must be 75 bytes per §25.15");
 
     let manual_hash: [u8; 32] = Sha256::digest(&buf).into();
     assert_eq!(
@@ -1175,6 +1175,103 @@ fn vector_29_attestation_id() {
 }
 
 // ---------------------------------------------------------------------------
+// §25.20 Trust Attestation Signing Vectors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vector_34_trust_attestation_signature() {
+    use scp_clock::TestClock;
+    use scp_protocol::trust::attestation::{
+        Attestation, DidPublicKeyResolver, RevocationStatus, canonical_attestation_bytes,
+        verify_attestation,
+    };
+    use scp_protocol::trust::{AttestationType, TrustError, attestation_type_tag};
+
+    /// Resolver returning the §25.2 reference public key for any DID.
+    struct RefResolver;
+    impl DidPublicKeyResolver for RefResolver {
+        fn resolve_public_key(&self, _did: &str) -> Result<Vec<u8>, TrustError> {
+            Ok(REF_PUBKEY.to_vec())
+        }
+    }
+
+    println!("=== Vector 34: Trust Attestation Signature ===");
+
+    // Construct the attestation per §25.20 spec inputs. The claim is built
+    // with keys in NON-sorted insertion order on purpose: RFC 8785 (JCS)
+    // sorts object keys, so insertion order must not affect the preimage.
+    let attestation = Attestation {
+        id: "att-trust-001".to_owned(),
+        attestation_type: AttestationType::Endorsement,
+        issuer: "did:dht:z6MkIssuer".into(),
+        subject: "did:dht:z6MkSubject".into(),
+        claim: serde_json::json!({"score": 42, "level": "gold"}),
+        evidence: None,
+        issued_at: 1_700_000_000,
+        expires_at: None,
+        renewal_interval: None,
+        renewed_at: None,
+        revocation_status: RevocationStatus::Active,
+        signature: Vec::new(),
+    };
+
+    // Production canonical bytes: the 32-byte SHA-256 of the §9.5.2 preimage.
+    let canonical = canonical_attestation_bytes(&attestation).unwrap();
+    print_vec("Trust attestation canonical hash", &canonical);
+
+    // §25.20 Vector 34: assert exact spec hex value.
+    assert_eq!(
+        hex(&canonical),
+        "6d07c76821a2ae4dd830ca117aa9fd8e30232cca72459a4d129432f56d87a08c",
+        "trust attestation canonical hash must match §25.20 Vector 34"
+    );
+
+    // Manual preimage reconstruction per §25.20 (mirrors the §9.5.2
+    // Attestation row order) to confirm the implementation's construction.
+    let claim_jcs: &[u8] = br#"{"level":"gold","score":42}"#; // RFC 8785: sorted keys
+    let revocation_bytes = rmp_serde::to_vec_named(&attestation.revocation_status).unwrap();
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"SCP-ATTESTATION-V1:");
+    buf.extend_from_slice(&(attestation.id.len() as u32).to_be_bytes());
+    buf.extend_from_slice(attestation.id.as_bytes());
+    // attestation_type: 2-byte BE u16 tag (Endorsement = 4).
+    assert_eq!(attestation_type_tag(&attestation.attestation_type), 4);
+    buf.extend_from_slice(&attestation_type_tag(&attestation.attestation_type).to_be_bytes());
+    buf.extend_from_slice(&(attestation.issuer.len() as u32).to_be_bytes());
+    buf.extend_from_slice(attestation.issuer.as_bytes());
+    buf.extend_from_slice(&(attestation.subject.len() as u32).to_be_bytes());
+    buf.extend_from_slice(attestation.subject.as_bytes());
+    buf.extend_from_slice(&(claim_jcs.len() as u32).to_be_bytes());
+    buf.extend_from_slice(claim_jcs);
+    buf.extend_from_slice(&ABSENT_SENTINEL); // absent evidence
+    buf.extend_from_slice(&attestation.issued_at.to_be_bytes());
+    buf.extend_from_slice(&ABSENT_SENTINEL); // absent expires_at
+    buf.extend_from_slice(&(revocation_bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&revocation_bytes);
+
+    println!("  Preimage length: {} bytes", buf.len());
+    assert_eq!(buf.len(), 197, "preimage must be 197 bytes per §25.20");
+
+    let manual_hash: [u8; 32] = Sha256::digest(&buf).into();
+    assert_eq!(
+        manual_hash.to_vec(),
+        canonical,
+        "canonical_attestation_bytes must match the manual §25.20 preimage construction"
+    );
+
+    // Sign the canonical hash with the §25.2 reference key and verify via the
+    // production verification path (per §25.17 step 5).
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&REF_SEED);
+    let mut signed = attestation;
+    signed.signature = signing_key.sign(&canonical).to_bytes().to_vec();
+    print_vec("Trust attestation signature", &signed.signature);
+
+    let clock = TestClock::new(1_700_000_001);
+    verify_attestation(&signed, &RefResolver, &clock)
+        .expect("trust attestation Vector 34 signature must verify");
+}
+
+// ---------------------------------------------------------------------------
 // Cross-vector consistency checks
 // ---------------------------------------------------------------------------
 
@@ -1203,7 +1300,7 @@ fn domain_separators_are_all_unique() {
         "SCP-PARTICIPATION-V1:",
         "SCP-IDENTITY-LINK-ATTESTATION-V1:",
         "SCP-ACCESS-KEY-REQUEST-V1:",
-        "SCP-TOOL-REGISTRATION-V1:",
+        "SCP-OUTLET-REGISTRATION-V2:",
         "SCP-FORK-ID-V1:",
         "SCP-COMMIT-RANGE-REQ-V1:",
         "SCP-COMMIT-RANGE-RESP-V1:",

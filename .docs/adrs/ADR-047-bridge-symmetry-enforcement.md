@@ -3,7 +3,8 @@
 **Status:** Accepted
 **Date:** 2026-04-17
 **Decider:** @alecmarcus
-**Related:** ADR-034 (WASM bridge re-implementation), ADR-046 (cross-bridge runtime parity harness), ADR-045 (fuzzing governance artifact model)
+**Amended by ADR-055 (2026-06-29):** the WASM bridge is removed (browser clients are remote thin clients to a server-side `scp-node`); bridge symmetry is now a three-bridge invariant (PyO3, UniFFI, napi-rs). References below to a fourth `wasm-bindgen` bridge, the `wasm_names()` scanner function, and the `wasm_required` JSON field / `WASM_REQUIRED_OPERATIONS` ratchet are historical — those symbols were removed with the bridge, and the surviving enforcement (`scripts/bridge-aliases.json`, `scripts/check-bridge-symmetry.sh`, `ffi_conformance.rs`) was rewritten to the three-bridge shape. The decision and rationale below are otherwise unchanged.
+**Related:** ADR-034 (WASM bridge re-implementation, superseded by ADR-055), ADR-046 (cross-bridge runtime parity harness), ADR-045 (fuzzing governance artifact model)
 **Enforcement files (this ADR):**
 - `scripts/bridge-aliases.json` — single source of truth for canonical FFI operations
 - `scripts/check-bridge-symmetry.sh` — portable bash + awk surface-area scanner (CI + hook)
@@ -13,7 +14,7 @@
 
 ## Context
 
-SCP exposes one Rust core across four FFI bridges (PyO3, UniFFI, NAPI, wasm-bindgen). The bridges do not share code — each is a separate `proc-macro`-driven surface that re-exports a subset of the core. Surface-area symmetry across bridges is a protocol invariant: if PyO3 exposes `identity_resolve` but WASM omits it, downstream SDKs diverge and the WASM surface quietly becomes a second-class citizen. ADR-034 carves out the only legitimate asymmetry (WASM cannot expose operations requiring tokio multi-thread); every other operation MUST exist in all four bridges.
+SCP exposes one Rust core across three FFI bridges (PyO3, UniFFI, napi-rs). The bridges do not share code — each is a separate `proc-macro`-driven surface that re-exports a subset of the core. Surface-area symmetry across bridges is a protocol invariant: if PyO3 exposes `identity_resolve` but NAPI omits it, downstream SDKs diverge and the NAPI surface quietly becomes a second-class citizen. Every operation MUST exist in all three bridges, except where a per-bridge exemption documents a legitimate absence in `scripts/bridge-aliases.json`. (Historically a fourth `wasm-bindgen` bridge existed; ADR-034 carved out its only legitimate asymmetry — operations requiring tokio multi-thread. ADR-055 removed the WASM bridge entirely, so that carve-out no longer applies.)
 
 ### Prior state (before this ADR)
 
@@ -37,7 +38,7 @@ Round 3 and Round 4 alignment reviews across the three-layer enforcement program
 
 ### 1. Single source of truth: `scripts/bridge-aliases.json`
 
-One JSON file declares every canonical operation the bridges must expose, with per-bridge alias lists and explicit exemptions:
+One JSON file declares every canonical operation the bridges must expose, with per-bridge alias lists and a top-level `exemptions` block declaring legitimate per-bridge absences:
 
 ```json
 {
@@ -46,26 +47,31 @@ One JSON file declares every canonical operation the bridges must expose, with p
     {
       "canonical": "identity_create",
       "category": "identity",
-      "wasm_required": true,
       "pyo3":   ["py_identity_create"],
       "uniffi": ["identity_create"],
-      "napi":   ["identity_create"],
-      "wasm":   ["identity_create"]
+      "napi":   ["identity_create"]
     }
-  ]
+  ],
+  "exemptions": {
+    "pyo3":   [],
+    "uniffi": [],
+    "napi":   []
+  }
 }
 ```
+
+> **Note (ADR-055):** when this ADR was written the registry carried a fourth `wasm` alias array and a per-operation `wasm_required` boolean (`false` for operations ADR-034 excluded from the WASM bridge). ADR-055 removed the WASM bridge, so both the `wasm` array and the `wasm_required` field were deleted. Per-bridge exemptions are now expressed via the top-level `exemptions` object (a `{ canonical, reason }` entry per exempt operation), not an inline boolean.
 
 Fields:
 
 - **`canonical`** — the stable operation name referenced by the SDK capability matrix and specs.
 - **`category`** — grouping for reporting (identity, governance, messaging, …).
-- **`wasm_required`** — `false` only for operations ADR-034 excludes from the WASM bridge (e.g., tokio multi-thread dependents). A `false` value is a documented exemption; the canonical operation still exists in the other three bridges.
-- **`pyo3` / `uniffi` / `napi` / `wasm`** — alias lists. Multiple aliases are allowed because historical bridges (notably PyO3) use `py_`-prefixed names. Every alias must resolve to a real non-test `fn` in the corresponding bridge file, or the bridge must be declared exempt for that operation.
+- **`pyo3` / `uniffi` / `napi`** — alias lists. Multiple aliases are allowed because some bridges (notably PyO3) use `py_`-prefixed names. Every alias must resolve to a real non-test `fn` in the corresponding bridge file, or the canonical must appear in that bridge's `exemptions` array.
+- **`exemptions`** — per-bridge (`pyo3` / `uniffi` / `napi`) arrays of `{ canonical, reason }` entries. An operation listed here is permitted to be absent from that bridge; the `reason` documents why (citing a spec section or ADR).
 
 This file is consumed by:
 
-- **Rust** via `include_str!("../../../../scripts/bridge-aliases.json")` + `serde_json::from_str` in `ffi_conformance.rs`. The test `aliases_json_is_in_sync_with_parity_operations` fails the build if the JSON drifts from the in-file `PARITY_OPERATIONS` ratchet.
+- **Rust** via `include_str!("../../../../scripts/bridge-aliases.json")` + `serde_json::from_str` in `ffi_conformance.rs`. The test `aliases_json_is_in_sync_with_parity_operations` fails the build if the JSON drifts from the in-file ratchet (the `MIN_PARITY_OPERATIONS` floor on total op count).
 - **Bash** via `jq` in `scripts/check-bridge-symmetry.sh`. The script enumerates operations, looks up each bridge file, and verifies at least one declared alias has a non-test `fn NAME(` definition.
 
 ### 2. AST-level parsing in both scanners
@@ -126,16 +132,16 @@ A second `PreToolUse` hook in `.claude/settings.json` protects the enforcement f
 
 - `scripts/bridge-aliases.json`, `scripts/check-bridge-symmetry.sh`, `scripts/tests/bridge-symmetry/**`, and `crates/scp-testing/tests/integration/ffi_conformance.rs` are named in CLAUDE.md's enforcement-files list. Weakening, removing, or adding an exemption to any of them requires explicit human approval via a separate PR. The `.claude/settings.json` enforcement-file hook blocks in-band edits.
 - New canonical operations MUST be added to `scripts/bridge-aliases.json` in the same PR that adds them to any bridge. The CI `bridge-symmetry` job will fail otherwise.
-- An operation is exempt from a bridge only by declaring `"<bridge>": []` or (for WASM specifically) `"wasm_required": false`. Exemptions must cite a spec reference (ADR-034 for WASM exclusions, or a spec section for others) in a PR comment or in the JSON entry's `category`.
+- An operation is exempt from a bridge only by adding a `{ canonical, reason }` entry to that bridge's array in the top-level `exemptions` object. The `reason` must cite a spec reference (a spec section or ADR). (Historically, WASM exclusions per ADR-034 were instead expressed via a per-operation `wasm_required: false` boolean; ADR-055 removed the WASM bridge and that field.)
 - Both scanners MUST produce identical verdicts on the same source. The fixture tests under `scripts/tests/bridge-symmetry/fixtures/` are the enforcement mechanism; new scanner edge cases require a new fixture.
 
 ## Related
 
-- **ADR-034** — WASM bridge re-implementation strategy. Defines which operations are legitimately absent from the WASM bridge; those operations carry `wasm_required: false` in `bridge-aliases.json`.
+- **ADR-034** — WASM bridge re-implementation strategy (superseded by ADR-055). Originally defined which operations were legitimately absent from the WASM bridge (those carried `wasm_required: false` in `bridge-aliases.json`). ADR-055 removed the WASM bridge, the `wasm_required` field, and this carve-out.
 - **ADR-046** — Cross-bridge runtime parity harness (Layer C). Complements this ADR's surface-area enforcement with runtime equivalence: this ADR checks that the functions exist; ADR-046 checks that they produce equivalent behavior across bridges.
 - **Layer B — `scripts/check-call-invariants.py`** (declarative call-precedence rules). Uses `tree-sitter-rust` to verify call-ordering invariants (e.g., "authentication MUST be checked before authorization"). Orthogonal to this ADR's surface-area scope.
 - **Prior art — `scripts/check-cross-layer.sh`** — verifies every `pub fn` in `scp-runtime` has a matching FFI export. Narrower scope (one direction, one layer); this ADR extends the pattern to cross-bridge symmetry with the JSON registry and dual-scanner pattern.
-- **Prior art — `scripts/check-sdk-coverage.py`** — verifies every FFI export has a matching SDK wrapper. Downstream of this ADR; once a canonical operation is enforced across all four bridges, SDK coverage closes the loop to the language SDKs.
+- **Prior art — `scripts/check-sdk-coverage.py`** — verifies every FFI export has a matching SDK wrapper. Downstream of this ADR; once a canonical operation is enforced across all three bridges, SDK coverage closes the loop to the language SDKs.
 
 ## Acceptance criteria
 

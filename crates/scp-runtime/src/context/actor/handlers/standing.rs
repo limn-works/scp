@@ -1,6 +1,6 @@
 //! Standing-pair handlers — see
 //! [`StandingCommand`](crate::context::actor::commands::StandingCommand)
-//! and spec §5.15.7.
+//! and spec §5.12.6 (contact graph) / §5.15.8 (standing-pair creation).
 //!
 //! # Phase 2A.2 — actor-shape dispatch
 //!
@@ -13,8 +13,12 @@
 //! `Supervisor::dispatch_standing_direct` in
 //! [`crate::context::supervisor::supervisor`].
 //!
-//! The `StandingContext` get-or-create variant still routes through the
-//! legacy path, which is idempotent by construction.
+//! The `StandingContext` get-or-create variant is likewise
+//! supervisor-scoped: it always dispatches supervisor-direct through
+//! `Supervisor::dispatch_standing_direct` →
+//! `Supervisor::standing_context` (idempotent by construction) and
+//! never lands on a per-context actor mailbox — see the routing-error
+//! arm in [`dispatch`].
 
 use std::time::Duration;
 
@@ -37,7 +41,6 @@ pub async fn dispatch(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
 
 async fn dispatch_inner(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
     match cmd {
-        StandingCommand::Placeholder { reply } => reply_not_implemented(reply),
         StandingCommand::StandingContext { reply, .. } => {
             // `StandingContext` get-or-create is supervisor-scoped and is
             // ALWAYS dispatched supervisor-direct through
@@ -96,7 +99,7 @@ async fn handle_standing_context_count(
 /// Handle [`StandingCommand::HasStandingContext`] — read-only.
 async fn handle_has_standing_context(
     deps: &ActorDeps,
-    peer_did: scp_identity::DID,
+    peer_did: scp_did::DID,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let has_fut = async { crate::context::standing_helpers::has_standing_context(deps, &peer_did) };
@@ -117,11 +120,11 @@ async fn handle_has_standing_context(
 }
 
 /// Handle [`StandingCommand::RegisterStandingContext`] — delegates to
-/// [`ContextManager::register_standing_context`](crate::context::standing_helpers::register_standing_context)
+/// [`standing_helpers::register_standing_context`](crate::context::standing_helpers::register_standing_context)
 /// under a 30s timeout. Always mutating.
 async fn handle_register_standing_context(
     deps: &ActorDeps,
-    peer_did: scp_identity::DID,
+    peer_did: scp_did::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let register_fut =
@@ -147,7 +150,7 @@ async fn handle_register_standing_context(
 }
 
 /// Handle [`StandingCommand::ReconnectAllStanding`] — delegates to
-/// [`ContextManager::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing)
+/// [`standing_helpers::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing)
 /// under a 30s timeout. Always mutating.
 async fn handle_reconnect_all_standing(
     deps: &ActorDeps,
@@ -193,12 +196,4 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
-}
-
-fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "StandingCommand::Placeholder — real variants migrate in commit 11 of \
-                       ADR-049; Placeholder retained for commit-6 compile stability and \
-                       deleted in commit 12 with the shim";
-    let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
-    Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

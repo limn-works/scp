@@ -1,0 +1,24 @@
+---
+name: ticket-1533-heartbeat-loop
+description: Architecture review of #1533 heartbeat send/receive loop (§9.9.2) — APPROVED; layering/precedent facts
+metadata:
+  type: project
+---
+
+#1533 closes the §9.9.2 suppression-detection heartbeat loop. APPROVED at branch `feat/1533-heartbeat-loop` (HEAD a81775b5c).
+
+**Why APPROVED / what's sound:**
+- **Send-side layering is correct, not DOA.** Periodic send originates in `scp-ffi-common::heartbeat_scheduler::run_heartbeat_scheduler`, spawned alongside the napi subscribe loop, routed through `Supervisor::send_heartbeat` → `SendHeartbeat` actor command → `messaging_helpers::send_heartbeat`. Key (`signing_key`) enters per-call exactly like `SendMessage`/`BuildLocalCheckpoint` because the actor holds NO signer after ADR-049 (key_resolver = public keys only). This mirrors the reconnect driver (#1540) and the receive-side `maybe_start_heartbeat` monitor — both already at the FFI/transport boundary. Same layer, same rationale.
+- **`send_heartbeat` is a faithful clone of `send_checkpoint`** (messaging_helpers.rs §9b vs §9c): identical broadcast-vs-pseudonym routing, sequence `0`, classify-before-content-sequence-tracker. The "minimal MLS application message with a sequence number" spec phrase (§9.9.2) is satisfied conceptually the same way ConsistencyCheckpoint already established — liveness/management messages use seq 0 and never advance the per-sender APPLICATION sequence (which is what the gap detector keys on). NOT a spec divergence.
+- **`DeliverOutcome` enum** (Application/Heartbeat/Handled) cleanly replaces the overloaded `Option<(Vec<u8>,String)>`. Three callers that must branch differently now do so explicitly. `Supervisor::deliver_commit_blob` correctly collapses Heartbeat|Handled→None (reconnection driver only cares about app content). Re-exported via `actor::commands::DeliverOutcome` for FFI naming.
+- **`TransportAdapter::record_heartbeat_received`** default no-op: ONLY native adapter overrides it (verified — webrtc/nostr/udp/quic/webtransport inherit no-op). The 17 non-native adapters are genuinely unaffected. `TransportManager::record_heartbeat_received` fans out to all adapters (same shape as unsubscribe/delete) — merged subscription stream doesn't attribute blobs to relays, and the liveness baseline doesn't need per-relay attribution (that's the MergedStream cross-check's job).
+- **`HeartbeatConfig::for_profile`** is a genuine single source of truth: both the native adapter monitor (adapter.rs, refactored to call it) AND the scheduler interval (`heartbeat_interval` thin wrapper) derive from it. Send cadence cannot drift from the local monitor threshold.
+- **CONSISTENCY CHECK PASSED:** napi transport connect path (transport.rs:251/477/536) derives monitor profile from `TransportProfile::platform_default()` — the SAME source the scheduler uses (context.rs). On one node, send cadence and receive threshold can't diverge.
+
+**napi-only completion boundary is LEGITIMATE (ride-on-prerequisite, not a cut):** Only napi has a live `context_subscribe` loop. pyo3 = buffer-drain, uniffi `context_subscribe` = deferred stub, wasm = ADR-034. Heartbeat wiring lands where subscribe loops exist; core/transport surface (`Supervisor::send_heartbeat`, `record_heartbeat_received`, `DeliverOutcome`, `send_heartbeat` helper) is fully ready for the others. Same shape as #1540's WASM exemption. Capability matrix is honest: `subscribe` row already swift=false with exemption; no phantom heartbeat row added (heartbeat correctly rides on subscribe, not a standalone op).
+
+**Enforcement:** `b3_heartbeat_send_receive_loop_wired` pipeline assertion added (ratchet 41→42), pins all 5 links (scheduler→send_heartbeat, subscribe→spawn scheduler, send_heartbeat→encrypt_and_send+MessageType::Heartbeat, deliver_incoming→classify, subscribe→record_heartbeat_received) with `fn_body_contains` real call-site checks, NOT bare string search. MANAGER_SRC concat includes messaging_helpers.rs so those assertions resolve.
+
+**ONE OBSERVATION (not a blocker):** Cross-profile edge — Mobile sender (120s interval) vs Server/Desktop receiver (60s × 2.0 multiplier = 120s suspicion threshold) lands heartbeats right at the suspicion boundary; jitter/delay could trip a false SuppressionSuspected. This is INHERITED from the pre-existing monitor threshold design (the monitor chose its profile's threshold before this PR), and §9.9.2 is best-effort SHOULD with "alert + try alternate relay" response, not hard failure. Worth a forward note if profiles get more heterogeneous, but not introduced by #1533.
+
+**Tests:** fullstack AC2/AC3 (heartbeat tagged + does NOT advance app sequence — straddling messages stay consecutive), heartbeat_suppression.rs closed-loop with injectable clock, MessageType discriminator stability test (Heartbeat=5, distinct/stable wire commitment).

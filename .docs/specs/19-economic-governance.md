@@ -15,8 +15,8 @@ SCP's existing primitives (DIDs, UCANs, contexts, governance, transport adapters
 **Three independent levels of economic policy:**
 
 1. **Relay-level:** Relay operators charge for transport (bandwidth, storage, routing). Separate trust model — relays are dumb pipes (§9.9).
-2. **Context-level:** Context creators charge for participation (messages, tools, membership). Inside the encrypted envelope, invisible to relays.
-3. **Tool-level:** Individual tools declare per-invocation costs. Additive with context costs.
+2. **Context-level:** Context creators charge for participation (messages, outlets, membership). Inside the encrypted envelope, invisible to relays.
+3. **Outlet-level:** Individual outlets declare per-invocation costs. Additive with context costs.
 
 **Free operation is the default.** No economic policy = free. The protocol never charges without explicit opt-in from both sides. Economic governance is entirely optional infrastructure for contexts and relays that choose to use it.
 
@@ -29,7 +29,7 @@ SCP's existing primitives (DIDs, UCANs, contexts, governance, transport adapters
 | `SpendingCapability` UCAN type | Tax/compliance, payment UI |
 | `PaymentReceipt` provenance record | Adapter credentials, wallet integration |
 | `PricingFormula` model | Production adapter implementations |
-| Integration points with contexts/relays/tools | Adapter-specific licensing/compliance |
+| Integration points with contexts/relays/outlets | Adapter-specific licensing/compliance |
 | Conformance tests | — |
 
 **Novel contribution:** No existing standard combines UCAN delegation chains with payment semantics. L402/Macaroons have spending caveats but not DID-based delegation. ILP/GNAP has payment authorization but not capability-chain attenuation. SCP bridges both — spending-scoped UCAN capabilities at the intersection of UCAN delegation chains, L402/Macaroon spending caveats, and ILP streaming models.
@@ -72,7 +72,7 @@ pub type PaymentAdapterRef = String;
 /// Action type for which a payment is made. Used in PaymentReceipt and cost estimation.
 pub enum PaidActionType {
     MessageSend,
-    ToolInvoke,
+    OutletCall,
     ContextJoin,
     SubscriptionPeriod,
     ByteStored,
@@ -84,6 +84,8 @@ pub enum PaidActionType {
 **`PaymentAdapterRef` validation (§9.1A).** `PaymentAdapterRef` strings are validated for control characters and HTML-special characters at the FFI boundary, since they may be rendered in payment UIs. Maximum length: 256 bytes.
 
 **Why fixed-point coefficients:** Pricing formulas need fractional multipliers (e.g., "cost increases by 0.5x per 100 messages/min"). `Coefficient` provides 6 decimal places of precision using integer arithmetic. Evaluation: `(coefficient.0 * metric_value) / 1_000_000`. Both sides compute the same result.
+
+**Wire form for monetary values (ADR-060):** `Amount` and `Coefficient` pick their wire form by encoding class. In **human-readable encodings (JSON)** they serialize as a **canonical base-10 decimal string** of their underlying smallest-unit integer — e.g. `Amount(1500)` → `"1500"`, `Coefficient(-500000)` → `"-500000"`, `Amount(0)` → `"0"` — everywhere they appear in a wire-crossing structure (`CostSchedule`, `PricingFormula`, `SubscriptionCost`, `PaymentReceipt`, `SpendingCapability`, outlet `OutletCost`, etc.). The string encodes the smallest-unit integer, NOT a human decimal (`"1.50"` is invalid); the scale lives with `currency` / `COEFFICIENT_SCALE`. JSON deserialization is strict and injective — digits only, no leading zeros (except the lone `"0"`), a single optional leading `-` for `Coefficient`, and no `+`, `-0`, whitespace, separators, decimal point, exponent, hex, or bare JSON number. In **binary encodings (MessagePack)** they serialize as the **native integer** (`u64` / `i64`). The string is a JSON-parser-safety measure — JS `JSON.parse` cannot round-trip a `u64` above 2⁵³ — that MessagePack's exact 64-bit integer does not need; keeping the binary path native leaves it idiomatic and compact and every binary KAT / signature preimage byte-identical to its pre-ADR-060 value. See ADR-060 and §19.15.1.
 
 ## 19.2 Payment Adapters
 
@@ -206,7 +208,7 @@ The critical flow — how payment interleaves with SCP actions:
 3. Agent SDK calls adapter.authorize(payer_did, payee_did, amount, currency, metadata)
 4. PaymentAuthorization attached to action envelope (inside encrypted payload)
 5. Receiving side verifies authorization via its own adapter instance (adapter.verify)
-6. Action is processed (message delivered, tool invoked, etc.)
+6. Action is processed (message delivered, outlet invoked, etc.)
 7. Receiving side calls adapter.capture(auth)
 8. PaymentReceipt recorded as provenance (per-payee local `ContextEvent` until ADR-051; a convergent Merkle leaf thereafter — see the ADR-011 amendment, exclusion taxonomy §2)
 9. On failure at step 5-7: adapter.void(auth) — funds released
@@ -310,18 +312,18 @@ pub struct EconomicPolicy {
 pub struct CostSchedule {
     pub currency: CurrencyCode,                     // currency for all Amount fields in this schedule
     pub per_message: Option<Amount>,
-    pub per_tool_invoke: Option<Amount>,            // default for tools without own cost
+    pub per_outlet_call: Option<Amount>,            // default for Action outlets without own cost
     pub per_join: Option<Amount>,                   // one-time membership cost
     pub per_period: Option<SubscriptionCost>,       // recurring (carries its own currency for flexibility)
     pub per_byte_stored: Option<Amount>,            // storage costs
 }
 ```
 
-**Tool-level costs**: declared in tool registration (§5.4), additive with context costs. A tool calling an external API can pass through its cost. Tool costs carry their own payee DID (may differ from context payee).
+**Outlet-level costs**: declared in outlet registration (§5.4), additive with context costs. An outlet calling an external API can pass through its cost. Outlet costs carry their own payee DID (may differ from context payee).
 
 **Relay-level costs**: declared in `.well-known/scp` `relay_config` (§18.3.3 extension). Separate economic relationship from in-context pricing — relay charges for transport, context charges for participation.
 
-**Economic policy is orthogonal to capability ceiling** (§5.3). Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with `tool:invoke:*` in its ceiling and `per_tool_invoke: $0.01` in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them.
+**Economic policy is orthogonal to capability ceiling** (§5.3). Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with `outlet:call:*` in its ceiling and `per_outlet_call: $0.01` in its economic policy allows Action outlet invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them.
 
 **Child context independence:** Child contexts (§5.13) do NOT inherit parent economic policy — each child's pricing is independent. A free parent can have paid children and vice versa.
 
@@ -456,7 +458,7 @@ signed_payload = receipt_id (32 bytes)
               || payee_did (UTF-8 bytes, length-prefixed with u16 big-endian)
               || amount (u64 big-endian, 8 bytes)
               || currency (4 bytes, raw CurrencyCode)
-              || action_type (u8: 0=MessageSend, 1=ToolInvoke, 2=ContextJoin,
+              || action_type (u8: 0=MessageSend, 1=OutletCall, 2=ContextJoin,
                               3=SubscriptionPeriod, 4=ByteStored)
               || context_id (32 bytes if Some, 0x00 if None)
               || adapter_id (UTF-8 bytes, length-prefixed with u16 big-endian)
@@ -523,8 +525,8 @@ Relay economics are SEPARATE from context economics — different trust model. R
     "rate_limit_publish": 6000,
     "economic": {
       "currency": "USD",
-      "per_publish": 10,
-      "per_byte_stored": 1,
+      "per_publish": "10",
+      "per_byte_stored": "1",
       "payment_adapters": ["x402", "lightning"],
       "payee": "did:dht:z6Mk..."
     }
@@ -532,9 +534,9 @@ Relay economics are SEPARATE from context economics — different trust model. R
 }
 ```
 
-**`per_byte_stored` billing model.** The `per_byte_stored` amount is a **one-time storage fee** charged when a blob is published to the relay. The fee is `per_byte_stored * blob_size_bytes`, charged once at publish time. There is no recurring charge — once paid, the blob is stored until its TTL expires. Example: with `per_byte_stored: 1` (1 cent) and `currency: "USD"`, a 256 KiB blob costs `1 * 262144 = 262144 cents = $2,621.44`. Relay operators SHOULD set `per_byte_stored` to values appropriate for their cost structure — the example value of `1` is illustrative, not recommended. A more realistic value for a USD-denominated relay might be `per_byte_stored: 0` (free, subsidized by `per_publish`) or use sub-cent amounts via a different currency unit (e.g., SAT with `per_byte_stored: 1` = 1 satoshi per byte = ~$0.0004 per byte at $40k/BTC).
+**`per_byte_stored` billing model.** The `per_byte_stored` amount is a **one-time storage fee** charged when a blob is published to the relay. The fee is `per_byte_stored * blob_size_bytes`, charged once at publish time. There is no recurring charge — once paid, the blob is stored until its TTL expires. Example: with `per_byte_stored: "1"` (1 cent) and `currency: "USD"`, a 256 KiB blob costs `1 * 262144 = 262144 cents = $2,621.44`. Relay operators SHOULD set `per_byte_stored` to values appropriate for their cost structure — the example value of `"1"` is illustrative, not recommended. A more realistic value for a USD-denominated relay might be `per_byte_stored: "0"` (free, subsidized by `per_publish`) or use sub-cent amounts via a different currency unit (e.g., SAT with `per_byte_stored: "1"` = 1 satoshi per byte = ~$0.0004 per byte at $40k/BTC).
 
-**JSON Amount serialization:** `Amount` values in `.well-known/scp` are serialized as JSON integers in the smallest currency unit specified by `currency`. For USD (unit: cent), `10` = $0.10. For BTC (unit: satoshi), `100` = 100 satoshis. Parsers convert JSON integer → `Amount(u64)` directly. Decimal string representations are NOT valid — all amounts are integers. The `currency` field determines the interpretation scale.
+**Amount wire serialization (ADR-060):** `Amount` values in `.well-known/scp` — a JSON document, and everywhere monetary values cross the wire in a **human-readable (JSON)** encoding — are serialized as a **canonical base-10 decimal string** of the smallest-unit integer specified by `currency`. For USD (unit: cent), `"10"` = $0.10. For BTC (unit: satoshi), `"100"` = 100 satoshis. The string encodes the smallest-unit integer directly — it is NOT a human decimal like `"1.50"` (the scale stays with `currency`). JSON parsers accept ONLY the canonical form (digits only; no leading zeros except the lone `"0"`; no sign, separators, whitespace, decimal point, or exponent) and reject bare JSON numbers, so encode/decode are byte-identical and reproducible across reimplementations. In **binary (MessagePack)** encodings the value is the native `u64` — MessagePack round-trips an exact 64-bit integer, so it needs no string safeguard. This supersedes the earlier JSON-integer representation: the JSON wire form is a string, so reimplementations (notably JS `JSON.parse`, which cannot round-trip a `u64`) reproduce values exactly.
 
 **Payment flow:** Agent evaluates relay config (visible before connecting) → selects compatible adapter → authorizes per-action → relay verifies + captures.
 
@@ -549,7 +551,7 @@ Relay economics are SEPARATE from context economics — different trust model. R
 Economic metadata participates in all discovery channels:
 
 - **Context metadata (§5.7):** Economic policy visible before opt-in. Prospective members see pricing alongside capability ceiling, governance model, and roles.
-- **Context registration (§6.2.2B):** Contexts advertising in contexts with discovery tools include economic metadata in their registration.
+- **Context registration (§6.2.2B):** Contexts advertising in contexts with discovery outlets include economic metadata in their registration.
 - **DID document `SCPCapabilities` (§18.2.2):** Optional economic metadata — identities may advertise accepted payment adapters and currencies.
 - **Relay config in `.well-known/scp` (§18.3.3):** Relay economic parameters visible alongside operational parameters.
 
@@ -559,12 +561,12 @@ All follow the legibility principle: agents see economic terms before committing
 
 Two new well-known templates:
 
-**`scp:template/paid-service`:** Tool invocation context with per-invoke cost. `economic_policy.cost_schedule.per_tool_invoke` required at creation. Single-admin governance. Extends `scp:template/tool-interface`.
+**`scp:template/paid-service`:** Action outlet invocation context with per-invoke cost. `economic_policy.cost_schedule.per_outlet_call` required at creation. Single-admin governance. Extends `scp:template/outlet-interface`.
 
 Properties:
-- Ceiling: `messages:read`, `messages:write`, `tool:register`, `tool:invoke:*`
+- Ceiling: `messages:read`, `messages:write`, `outlet:register`, `outlet:query:*`, `outlet:call:*`
 - Ceiling policy: `immutable`
-- Economic policy: required, `per_tool_invoke` must be set
+- Economic policy: required, `per_outlet_call` must be set
 - Governance: single-admin
 - Memory scope: `full` (receipts are provenance)
 
@@ -609,7 +611,7 @@ SCP.Identity.configureAdapter(adapter) → ()
 
 ## 19.13 Phase Integration
 
-All protocol components (trait, policy, UCAN type, receipts, formulas) are **Phase 3** — they compose Phase 1 (crypto, UCAN, event log) and Phase 2 (context lifecycle, tools, governance) primitives. No new cryptographic primitives are introduced. No new transport mechanisms. Economic governance is a layer built entirely on existing protocol infrastructure.
+All protocol components (trait, policy, UCAN type, receipts, formulas) are **Phase 3** — they compose Phase 1 (crypto, UCAN, event log) and Phase 2 (context lifecycle, outlets, governance) primitives. No new cryptographic primitives are introduced. No new transport mechanisms. Economic governance is a layer built entirely on existing protocol infrastructure.
 
 Community payment adapters (x402, Lightning, SPL, Stripe) are **Phase 4+** — external dependencies, not protocol-blocking. The `TestAdapter` reference implementation ships with Phase 3. Production adapters are community-contributed or vendor-maintained.
 
@@ -617,7 +619,7 @@ Community payment adapters (x402, Lightning, SPL, Stripe) are **Phase 4+** — e
 
 1. **Economic policy visible before opt-in (legibility).** Economic terms are part of context metadata (§5.7), visible to any identity that inspects the context before joining.
 2. **No implicit spending — spending UCAN always required.** Protocol NEVER authorizes expenditure without an explicit, valid spending UCAN from the payer's delegation chain.
-3. **Free operation is default — no economic policy = free.** Contexts without `EconomicPolicy` are free. Relays without `economic` in `relay_config` are free. Tools without cost metadata are free.
+3. **Free operation is default — no economic policy = free.** Contexts without `EconomicPolicy` are free. Relays without `economic` in `relay_config` are free. Outlets without cost metadata are free.
 4. **Receipts are provenance records — every payment is traceable and (under ADR-051) Merkle-verifiable.** Payment receipts participate in the provenance chain (§7.7). Authorship is non-repudiable via the receipt's signature regardless; `PaymentReceipt` is per-payee application activity, so its *convergent Merkle anchoring* (tamper-evident ordering/completeness) is a local `ContextEvent` until ADR-051 and a canonical leaf thereafter (ADR-011 amendment, exclusion taxonomy §2).
 5. **Payment adapters are substitutable — no single rail privileged.** The `PaymentAdapter` trait treats all payment rails equally. Protocol correctness does not depend on any specific adapter.
 6. **Economic policy mutable by default, optional immutability lock is voluntary.** Unlike ceiling policy (immutable by default), economic policy is governed by default. Creators may voluntarily lock pricing at creation.
@@ -627,16 +629,18 @@ Community payment adapters (x402, Lightning, SPL, Stripe) are **Phase 4+** — e
 
 ## 19.15 Wire Format Tables
 
-This section tabulates the wire format for all economy protocol types that cross the network. All types use serde serialization (JSON for tool call payloads, MessagePack for MLS application messages and event log entries). An independent implementer MUST implement these types with exactly the field names, types, and semantics shown below.
+This section tabulates the wire format for all economy protocol types that cross the network. All types use serde serialization (JSON for outlet call payloads, MessagePack for MLS application messages and event log entries). An independent implementer MUST implement these types with exactly the field names, types, and semantics shown below.
+
+**Monetary values are encoding-dependent (ADR-060):** `Amount` and `Coefficient` serialize as a **canonical base-10 decimal string** in the human-readable encoding (JSON) and as the **native integer** (`uint64` / `int64`) in the binary encoding (MessagePack). The string form is a JSON-`parse` safety measure (JS cannot round-trip a `u64`); MessagePack's exact 64-bit integer needs no such safeguard, so its binary form stays native. Each type's table below gives the per-encoding representation.
 
 ### 19.15.1 Core Value Types
 
-**`Amount`** — Newtype wrapping `u64`. Represents the smallest currency unit (e.g., cents for USD, satoshis for BTC). No floating-point anywhere in the economy protocol.
+**`Amount`** — Newtype wrapping `u64`. Represents the smallest currency unit (e.g., cents for USD, satoshis for BTC). No floating-point anywhere in the economy protocol. Wire form depends on the encoding class (ADR-060): a **canonical base-10 decimal string** in human-readable encodings (JSON), and the **native `uint64`** in binary encodings (MessagePack). JSON uses the string because JS `JSON.parse` cannot round-trip a `u64`; MessagePack's exact 64-bit integer needs no such safeguard, so the binary form stays native and idiomatic.
 
 | Wire Representation | Type | Notes |
 |---------------------|------|-------|
-| JSON | `number` (unsigned integer) | e.g., `1500` = 15.00 USD |
-| MessagePack | `uint 64` | Network byte order |
+| JSON | `string` (canonical decimal) | e.g., `"1500"` = 15.00 USD. Strict: digits only, no leading zeros (except `"0"`), no sign, separators, whitespace, decimal point, or exponent (ADR-060). |
+| MessagePack | `uint 64` | Native unsigned 64-bit integer, e.g. `1500` (ADR-060). NOT a string. |
 
 **`CurrencyCode`** — Newtype wrapping `[u8; 4]`. ISO 4217 currency code, null-padded to 4 bytes.
 
@@ -647,12 +651,12 @@ This section tabulates the wire format for all economy protocol types that cross
 
 **JSON encoding note:** JSON representations MUST use the trimmed currency string without null-byte padding (e.g., `"USD"`, not `"USD\u0000"`). Null-padding to 4 bytes is applied only in MessagePack/binary encoding. This avoids parser-compatibility issues across implementations, since many JSON parsers reject or mishandle embedded null bytes in strings.
 
-**`Coefficient`** — Newtype wrapping `i64`. Fixed-point with 6 decimal places: `value = raw / 1,000,000`.
+**`Coefficient`** — Newtype wrapping `i64`. Fixed-point with 6 decimal places: `value = raw / 1,000,000`. Wire form depends on the encoding class (ADR-060): a **canonical base-10 decimal string** of the raw fixed-point integer in human-readable encodings (JSON), and the **native `int64`** in binary encodings (MessagePack).
 
 | Wire Representation | Type | Notes |
 |---------------------|------|-------|
-| JSON | `number` (signed integer) | e.g., `1500000` = 1.5 |
-| MessagePack | `int 64` | Signed |
+| JSON | `string` (canonical decimal) | e.g., `"1500000"` = 1.5. A single leading `-` is allowed for negatives; otherwise strict as for `Amount` (ADR-060). |
+| MessagePack | `int 64` | Native signed 64-bit integer, e.g. `1500000` or `-500000` (ADR-060). NOT a string. |
 
 ### 19.15.2 Cost Structure
 
@@ -679,7 +683,7 @@ This section tabulates the wire format for all economy protocol types that cross
 |-------|------|----------|-----------|
 | `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency for all costs in this schedule. |
 | `per_message` | `Amount` (u64) | No | Cost per message sent. |
-| `per_tool_invoke` | `Amount` (u64) | No | Cost per tool invocation. |
+| `per_outlet_call` | `Amount` (u64) | No | Cost per Action outlet invocation. |
 | `per_join` | `Amount` (u64) | No | One-time cost to join the context. |
 | `per_period` | `SubscriptionCost` | No | Recurring subscription cost. |
 | `per_byte_stored` | `Amount` (u64) | No | Cost per byte of stored data. |
@@ -689,7 +693,7 @@ This section tabulates the wire format for all economy protocol types that cross
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
 | `MessageSend` | `"MessageSend"` | Sending a message. |
-| `ToolInvoke` | `"ToolInvoke"` | Invoking a tool. |
+| `OutletCall` | `"OutletCall"` | Invoking an Action outlet. |
 | `ContextJoin` | `"ContextJoin"` | Joining a context. |
 | `SubscriptionPeriod` | `"SubscriptionPeriod"` | Recurring subscription payment. |
 | `ByteStored` | `"ByteStored"` | Data storage. |

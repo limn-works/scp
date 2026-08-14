@@ -226,7 +226,7 @@ private class TestNativeBindings : NativeBindings {
     override fun restoreAllContexts(): String = "[]"
 
     // BroadcastBindings
-    override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String) = Unit
+    override fun broadcastSubscribe(contextHandle: Long, subscriberDid: String, messagesReadUcanJwt: String?) = Unit
     override fun broadcastUnsubscribe(contextHandle: Long, subscriberDid: String, rotateKeys: Boolean) = Unit
     override fun broadcastPublish(contextHandle: Long, identityHandle: Long, payload: ByteArray) = Unit
     override fun broadcastBlockSubscriber(contextHandle: Long, subscriberDid: String, blockerDid: String) = Unit
@@ -254,10 +254,10 @@ private class TestNativeBindings : NativeBindings {
     ): String =
         """{"results":[{"blob_id":"stub","etag":"stub","deploy_id":"stub-deploy"}],"deploy_id":"stub-deploy"}"""
 
-    override fun toolRegister(contextHandle: Long, definitionJson: String): String = ""
-    override fun toolInvoke(
+    override fun outletRegister(contextHandle: Long, definitionJson: String): String = ""
+    override fun outletInvoke(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identityHandle: Long,
         ucanToken: String?,
@@ -265,31 +265,43 @@ private class TestNativeBindings : NativeBindings {
         spendingUcan: String?,
     ): String = ""
     @Suppress("LongParameterList")
-    override fun toolInvokeCrossContext(
+    override fun outletInvokeCrossContext(
         sourceContextHandle: Long,
         targetContextHandle: Long,
-        toolId: String,
+        outletId: String,
         inputJson: String,
         identityHandle: Long,
         ucanToken: String,
         chainDepth: Int,
         proofTokens: List<String>?,
     ): String = ""
-    override fun toolVerify(contextHandle: Long, toolId: String): String =
-        """{"tool_id":"$toolId","passed":false,"failures":[]}"""
-    override fun toolInterfaceExpose(
-        contextHandle: Long, toolId: String, targetContextId: String, rateLimitJson: String?,
+    @Suppress("LongParameterList")
+    override fun outletInvokeCrossContextSaga(
+        sourceContextHandle: Long,
+        targetContextHandle: Long,
+        callerDid: String,
+        outletRegistrationId: String,
+        inputJson: String,
+        assertedNonceHex: String,
+        timestampMs: Long,
+        chainDepth: Int,
+        ucanProofId: String?,
+    ): String = ""
+    override fun outletVerify(contextHandle: Long, outletId: String): String =
+        """{"outlet_id":"$outletId","passed":false,"failures":[]}"""
+    override fun outletInterfaceExpose(
+        contextHandle: Long, outletId: String, targetContextId: String, rateLimitJson: String?,
     ): String = "{}"
-    override fun toolInterfaceAccept(contextHandle: Long, interfaceJson: String): String = "{}"
-    override fun toolInterfaceRevoke(contextHandle: Long, interfaceIdHex: String): String = "{}"
-    override fun toolSessionCreate(
+    override fun outletInterfaceAccept(contextHandle: Long, interfaceJson: String): String = "{}"
+    override fun outletInterfaceRevoke(contextHandle: Long, interfaceIdHex: String): String = "{}"
+    override fun outletSessionCreate(
         contextHandle: Long,
-        toolId: String,
+        outletId: String,
         sourceContextId: String,
         ttlSeconds: Long?,
     ): String = "\"00000000-0000-0000-0000-000000000000\""
     @Suppress("LongParameterList")
-    override fun toolSessionInvoke(
+    override fun outletSessionInvoke(
         contextHandle: Long,
         sessionId: String,
         inputJson: String,
@@ -297,12 +309,12 @@ private class TestNativeBindings : NativeBindings {
         ucanToken: String,
         proofTokens: List<String>?,
     ): String = "{}"
-    override fun toolSessionClose(contextHandle: Long, sessionId: String) { /* no-op */ }
+    override fun outletSessionClose(contextHandle: Long, sessionId: String) { /* no-op */ }
     override fun ucanValidate(
         contextHandle: Long,
         token: String,
         capability: String,
-        presentingAgentDid: String?,
+        presentingAgentDid: String,
         proofTokens: List<String>?,
     ) { /* no-op */ }
     override fun ucanMint(contextHandle: Long, memberDid: String, capabilitiesJson: String): String = ""

@@ -26,9 +26,9 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_clock::Clock;
 use scp_ffi_common::error_codes as codes;
 use scp_platform::traits::Storage;
-use scp_primitives::Clock;
 
 use crate::error::ScpPyError;
 use crate::runtime::PyBridgeInstance;
@@ -225,7 +225,10 @@ fn query_manager_entries(
     context_id: &str,
     query_filter: &scp_core::store::event_log::EventQueryFilter,
 ) -> PyResult<Option<Vec<PyEvent>>> {
-    let ctx_id_bytes = scp_core::context::context_id_bytes(context_id);
+    // ADR-056: resolve the context-id string to its 32-byte digest via the
+    // canonical chokepoint (NOT the raw SHA-256 routing primitive, which
+    // double-hashes a real 64-hex id and queries the wrong event-log key).
+    let ctx_id_bytes = scp_core::context::state::context_id_to_bytes(context_id);
     let Some(entries) = crate::runtime::supervisor(bi)
         .ok()
         .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
@@ -255,9 +258,19 @@ fn query_manager_entries(
         let timestamp = entry.timestamp as f64;
         let leaf_hash = scp_event_log::tree::leaf_hash(entry)
             .map_err(|e| ScpPyError::context(format!("event leaf hash failed: {e}")))?;
-        let payload_json = serde_json::json!({
+        // Project the typed payload's bridge-facing fields (e.g. `target_did`
+        // for governance/access-revocation events, `subject_did` for
+        // role/membership events) through the single shared helper so all
+        // bridges surface byte-identical values. Each key is omitted when the
+        // projection yields `None`.
+        let mut payload_json = serde_json::json!({
             "hash": encode_hex(&leaf_hash),
         });
+        scp_ffi_common::event_log::inject_projection(
+            &mut payload_json,
+            &entry.event_type,
+            &entry.payload,
+        );
         let payload = json_to_py_dict(py, &payload_json)?;
         py_events.push(PyEvent {
             event_type: scp_ffi_common::event_log::event_type_label(&entry.event_type),
@@ -286,7 +299,7 @@ fn event_log_query_impl(
     // First, try the ContextManager's event log provider — this is the
     // authoritative source populated by `builder_create_context`
     // (`ContextCreated` at step 7) and subsequent manager operations.
-    // Mirrors the NAPI bridge. Aligned across PyO3/NAPI/WASM/UniFFI —
+    // Mirrors the NAPI bridge. Aligned across PyO3/NAPI/UniFFI —
     // pinned by the cross-bridge parity harness's `OP_EVENT_LOG_APPEND`
     // and `OP_EVENT_LOG_FILTERED` (ADR-046).
     if let Some(events) = query_manager_entries(bi, py, context_id, &query_filter)? {
@@ -312,77 +325,8 @@ fn event_log_query_impl(
     // Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolRepository requires
     // an owned Storage impl. The key convention matches ProtocolRepository's
     // event_data key format (GitHub issue #303).
-    if let Ok(storage) = crate::runtime::get_storage(bi) {
-        let rt = crate::runtime()?;
-        let prefix = format!("context/{context_id}/event_data/");
-        let keys_result = rt.block_on(storage.list_keys(&prefix));
-
-        if let Ok(keys) = keys_result {
-            let seq_start = query_filter.sequence_start.unwrap_or(0);
-            let seq_end = query_filter.sequence_end.unwrap_or(event_count);
-            let start_suffix = format!("{seq_start:020}");
-            let end_suffix = format!("{seq_end:020}");
-
-            let mut py_events = Vec::new();
-            for key in &keys {
-                if let Some(seq_str) = key.strip_prefix(&prefix) {
-                    if seq_str >= end_suffix.as_str() {
-                        break;
-                    }
-                    if seq_str < start_suffix.as_str() {
-                        continue;
-                    }
-                    if let Ok(Some(data)) = rt.block_on(storage.retrieve(key))
-                        && let Ok(event) = rmp_serde::from_slice::<scp_event_log::Event>(&data)
-                    {
-                        // Apply additional filters.
-                        if let Some(ref et) = query_filter.event_type
-                            && format!("{:?}", event.event_type) != *et
-                        {
-                            continue;
-                        }
-                        if let Some(ref actor) = query_filter.actor_did
-                            && event.actor_did.0 != *actor
-                        {
-                            continue;
-                        }
-                        if let Some(ts_start) = query_filter.timestamp_start
-                            && event.timestamp < ts_start
-                        {
-                            continue;
-                        }
-                        if let Some(ts_end) = query_filter.timestamp_end
-                            && event.timestamp >= ts_end
-                        {
-                            continue;
-                        }
-
-                        let payload_json = serde_json::json!({
-                            "data": serde_json::to_value(&event.payload.data).unwrap_or_default(),
-                        });
-                        let payload = json_to_py_dict(py, &payload_json)?;
-
-                        #[allow(clippy::cast_precision_loss)]
-                        py_events.push(PyEvent {
-                            event_type: format!("{:?}", event.event_type),
-                            actor_did: event.actor_did.0.clone(),
-                            timestamp: event.timestamp as f64,
-                            payload,
-                            sequence: event.sequence,
-                        });
-
-                        if let Some(limit) = query_filter.limit
-                            && py_events.len() >= limit
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-            if !py_events.is_empty() {
-                return Ok(py_events);
-            }
-        }
+    if let Some(events) = query_storage_fallback(bi, py, context_id, &query_filter, event_count)? {
+        return Ok(events);
     }
 
     // Fallback: Build a summary event with log metadata when ProtocolRepository
@@ -397,7 +341,7 @@ fn event_log_query_impl(
         event_type: "LogSummary".to_owned(),
         actor_did: String::new(),
         #[allow(clippy::cast_precision_loss)] // Unix timestamp seconds fit in f64 mantissa for centuries.
-        timestamp: scp_primitives::SystemClock.now_secs() as f64,
+        timestamp: scp_clock::SystemClock.now_secs() as f64,
         payload,
         sequence: event_count.saturating_sub(1),
     };
@@ -409,6 +353,114 @@ fn event_log_query_impl(
         Ok(events.into_iter().take(lim).collect())
     } else {
         Ok(events)
+    }
+}
+
+/// Loads real events from this bridge's per-context storage when the manager
+/// path returned nothing.
+///
+/// Returns `Ok(Some(events))` when storage held matching events, `Ok(None)`
+/// when storage is unavailable or held none (so the caller falls through to the
+/// summary event). Mirrors the manager path's payload projection: each event's
+/// bridge-facing fields (e.g. `target_did`, `subject_did`) are decoded through
+/// the single shared [`scp_event_log::payload::project_payload`] decoder.
+///
+/// Uses the `Storage` trait directly because the global storage is
+/// `Arc<EncryptingAdapter<InMemoryStorage>>` and `ProtocolRepository` requires
+/// an owned `Storage` impl. The key convention matches `ProtocolRepository`'s
+/// `event_data` key format.
+fn query_storage_fallback(
+    bi: &PyBridgeInstance,
+    py: Python<'_>,
+    context_id: &str,
+    query_filter: &scp_core::store::event_log::EventQueryFilter,
+    event_count: u64,
+) -> PyResult<Option<Vec<PyEvent>>> {
+    let Ok(storage) = crate::runtime::get_storage(bi) else {
+        return Ok(None);
+    };
+    let rt = crate::runtime()?;
+    let prefix = format!("context/{context_id}/event_data/");
+    let Ok(keys) = rt.block_on(storage.list_keys(&prefix)) else {
+        return Ok(None);
+    };
+
+    let seq_start = query_filter.sequence_start.unwrap_or(0);
+    let seq_end = query_filter.sequence_end.unwrap_or(event_count);
+    let start_suffix = format!("{seq_start:020}");
+    let end_suffix = format!("{seq_end:020}");
+
+    let mut py_events = Vec::new();
+    for key in &keys {
+        let Some(seq_str) = key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if seq_str >= end_suffix.as_str() {
+            break;
+        }
+        if seq_str < start_suffix.as_str() {
+            continue;
+        }
+        if let Ok(Some(data)) = rt.block_on(storage.retrieve(key))
+            && let Ok(event) = rmp_serde::from_slice::<scp_event_log::Event>(&data)
+        {
+            // Apply additional filters.
+            if let Some(ref et) = query_filter.event_type
+                && format!("{:?}", event.event_type) != *et
+            {
+                continue;
+            }
+            if let Some(ref actor) = query_filter.actor_did
+                && event.actor_did.0 != *actor
+            {
+                continue;
+            }
+            if let Some(ts_start) = query_filter.timestamp_start
+                && event.timestamp < ts_start
+            {
+                continue;
+            }
+            if let Some(ts_end) = query_filter.timestamp_end
+                && event.timestamp >= ts_end
+            {
+                continue;
+            }
+
+            // Project the typed payload's bridge-facing fields (`target_did`,
+            // `subject_did`) through the single shared helper, agreeing with
+            // the manager-path projection. Each key is omitted when the
+            // projection yields `None`.
+            let mut payload_json = serde_json::json!({
+                "data": serde_json::to_value(&event.payload.data).unwrap_or_default(),
+            });
+            scp_ffi_common::event_log::inject_projection(
+                &mut payload_json,
+                &event.event_type,
+                &event.payload,
+            );
+            let payload = json_to_py_dict(py, &payload_json)?;
+
+            #[allow(clippy::cast_precision_loss)]
+            py_events.push(PyEvent {
+                event_type: format!("{:?}", event.event_type),
+                actor_did: event.actor_did.0.clone(),
+                timestamp: event.timestamp as f64,
+                payload,
+                sequence: event.sequence,
+            });
+
+            if let Some(limit) = query_filter.limit
+                && py_events.len() >= limit
+            {
+                break;
+            }
+        }
+    }
+
+    if py_events.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(py_events))
     }
 }
 
@@ -669,7 +721,7 @@ fn event_log_verify_impl(
 /// Both public entry points (`event_log_checkpoint`, which takes the identity's
 /// own DID, and `event_log_checkpoint_by_did`, which takes a member DID) share
 /// this implementation — they are distinct public surface but identical in
-/// behavior, mirroring the WASM bridge's single `checkpoint_promise` helper.
+/// behavior.
 fn event_log_checkpoint_impl(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -683,7 +735,7 @@ fn event_log_checkpoint_impl(
     let context_id_owned = context_id.to_owned();
     let did_owned = did.to_owned();
 
-    let sender_did = scp_identity::DID(did_owned.clone());
+    let sender_did = scp_did::DID(did_owned.clone());
 
     let checkpoint = crate::runtime::with_identity(bi, &did_owned, |entry| {
         crate::runtime::with_context(bi, &context_id_owned, |ctx_rt| {

@@ -82,9 +82,9 @@ recipes@cooking-community
 translator-ja@global-services
 ```
 
-### 22.3.1 Handle Tools
+### 22.3.1 Handle Outlets
 
-Contexts that support handles expose three additional standard tool schemas alongside the existing `agent_search`/`agent_register`/`agent_deregister` tools (§6.2.2B). These are conventions, not mandates — a context with discovery tools opts into handle support by implementing these tools.
+Contexts that support handles expose three additional standard outlet schemas alongside the existing `agent_search`/`agent_register`/`agent_deregister` outlets (§6.2.2B). These are conventions, not mandates — a context with discovery outlets opts into handle support by implementing these outlets.
 
 ```
 handle_register(handle, target, metadata?) → confirmation
@@ -141,23 +141,23 @@ handle_deregister(handle, did) → removal
   output: { removed: bool }
 ```
 
-The `did` parameter in `handle_deregister` is explicit rather than inferred from the request signature — this ensures the tool schema is self-documenting and the DID-to-handle ownership check is visible in the interface. Writers verify the DID-signed request signature matches the provided DID and that the DID owns the handle.
+The `did` parameter in `handle_deregister` is explicit rather than inferred from the request signature — this ensures the outlet schema is self-documenting and the DID-to-handle ownership check is visible in the interface. Writers verify the DID-signed request signature matches the provided DID and that the DID owns the handle.
 
-**Uniqueness.** A context with discovery tools enforces handle uniqueness within its own namespace. `handle_register` returns `{ status: "conflict" }` when another DID already holds the requested handle. The handle uniqueness constraint applies per local-part: there can be at most one `alice` in a given context, regardless of target type. Governance determines conflict resolution policy (first-come-first-served, admin-arbitrated, etc.).
+**Uniqueness.** A context with discovery outlets enforces handle uniqueness within its own namespace. `handle_register` returns `{ status: "conflict" }` when another DID already holds the requested handle. The handle uniqueness constraint applies per local-part: there can be at most one `alice` in a given context, regardless of target type. Governance determines conflict resolution policy (first-come-first-served, admin-arbitrated, etc.).
 
 **Capacity limits.** `HandleRegistry` implementations SHOULD enforce a `max_entries` limit (recommended default: 10,000) to prevent resource exhaustion. Registrations that would exceed the limit return `{ status: "capacity_exceeded" }`. This matches the `ScopeRegistry` capacity model (§22.3.5).
 
-**Ownership and verification.** The registrant's DID (authenticated via the DID-signed request) is the handle owner. Only the owner can update or deregister. All handle tool requests MUST carry a DID signature over the request payload. Writers MUST verify the signature before processing. The event log entry for a registration includes the full signed request as payload, making verification replayable by any party with access to the event log. The ownership chain is: DID-signed request → writer verifies signature cryptographically → event log records the registration with the signed payload and owner DID.
+**Ownership and verification.** The registrant's DID (authenticated via the DID-signed request) is the handle owner. Only the owner can update or deregister. All handle outlet requests MUST carry a DID signature over the request payload. Writers MUST verify the signature before processing. The event log entry for a registration includes the full signed request as payload, making verification replayable by any party with access to the event log. The ownership chain is: DID-signed request → writer verifies signature cryptographically → event log records the registration with the signed payload and owner DID.
 
-**DID-signature verification scheme.** Handle tool requests use the same DID-authentication mechanism as context reader requests (§6.2.2B). The signature is constructed as follows:
+**DID-signature verification scheme.** Handle outlet requests use the same DID-authentication mechanism as context reader requests (§6.2.2B). The signature is constructed as follows:
 
 1. **Canonical payload.** The request payload is serialized to canonical JSON (keys sorted lexicographically, no whitespace, no trailing commas). This produces a deterministic byte sequence regardless of JSON serialization library.
-2. **Signed content.** The signed bytes are: `"SCP-HANDLE-TOOL-V1:" || tool_name || ":" || canonical_json_bytes`, where `tool_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, `"scope_register"`, `"scope_lookup"`, `"scope_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-TOOL-V1:"` prevents cross-protocol signature reuse. Scope tools sign with their own tool name (e.g., `"scope_register"`), not the corresponding handle tool name (`"handle_register"`). This maintains domain separation — a signature over a scope registration cannot be replayed as a handle registration, and vice versa.
+2. **Signed content.** The signed bytes are: `"SCP-HANDLE-OUTLET-V1:" || outlet_name || ":" || canonical_json_bytes`, where `outlet_name` is one of `"handle_register"`, `"handle_lookup"`, `"handle_deregister"`, `"scope_register"`, `"scope_lookup"`, `"scope_deregister"`, and `||` denotes byte concatenation. The domain prefix `"SCP-HANDLE-OUTLET-V1:"` prevents cross-protocol signature reuse. Scope outlets sign with their own outlet name (e.g., `"scope_register"`), not the corresponding handle outlet name (`"handle_register"`). This maintains domain separation — a signature over a scope registration cannot be replayed as a handle registration, and vice versa.
 3. **Signature algorithm.** Ed25519 using the requester's `#active` signing key (or `#agent` key if the request is agent-initiated under a valid UCAN delegation).
-4. **Transport.** The signature is carried as an additional field in the tool call request envelope:
+4. **Transport.** The signature is carried as an additional field in the outlet call request envelope:
    ```
    {
-     "input": { ... },                    // the tool's input payload
+     "input": { ... },                    // the outlet's input payload
      "requester_did": "<DID>",            // explicit for verification
      "signature": "<base64url(Ed25519-sign(signing_key, signed_content))>",
      "signing_key_id": "#active"          // which verification method signed
@@ -165,17 +165,17 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
    ```
 5. **Writer verification.** The writer resolves the `requester_did` via DID document, extracts the public key for `signing_key_id`, and verifies the Ed25519 signature over the reconstructed `signed_content`. If verification fails, the request is rejected with a `BRIDGE_NOT_AUTHORIZED` error. The writer MUST verify that the DID document is fresh (fetched within the last 300 seconds or cached with valid TTL).
 
-**Two-tier model.** Handle tools follow the same two-tier architecture as existing discovery tools (§6.2.2B). Writers (MLS members) process handle registrations. Readers (DID-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
+**Two-tier model.** Handle outlets follow the same two-tier architecture as existing discovery outlets (§6.2.2B). Writers (MLS members) process handle registrations. Readers (DID-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
 
 **Instance scope.** Handle registries are **per-context within a single `SCP` instance** (ADR-048). Each `SCP` instance maintains its own in-process registry state keyed by context ID; two `SCP` instances in the same process do not share handle-registry storage. The authoritative registry lives inside each context (replicated via the context event log to all MLS members) — the `SCP`-instance-local registry is an in-memory materialized view of that context state. Cross-instance convergence happens through the context event log, not through any process-global cache. This clarification matches the existing semantics; it is not a semantic change.
 
 ### 22.3.2 Scope Naming
 
-Contexts with discovery tools have a `name` field in their metadata (§5.7). The name used as the `scope` in addresses is this metadata name, normalized: lowercased, spaces replaced with hyphens, non-alphanumeric characters (except hyphens) removed. This normalized form is the **canonical scope name**.
+Contexts with discovery outlets have a `name` field in their metadata (§5.7). The name used as the `scope` in addresses is this metadata name, normalized: lowercased, spaces replaced with hyphens, non-alphanumeric characters (except hyphens) removed. This normalized form is the **canonical scope name**.
 
 Example: A context with metadata name "Cooking Community" has canonical scope name `cooking-community`.
 
-The SDK ships with a mapping of default `BootstrapContextEntry` values (§22.11.6) to their canonical scope names. This mapping serves as a **bootstrap cache** — a local starting point for scope resolution that avoids a network round-trip for well-known scopes. The protocol-level mechanism for scope-to-context resolution is `scope_lookup` via scope tools (§22.3.5). The SDK-local mapping is populated from bootstrap defaults and updated from `scope_lookup` results. Apps can add domain-specific contexts with their own scope names.
+The SDK ships with a mapping of default `BootstrapContextEntry` values (§22.11.6) to their canonical scope names. This mapping serves as a **bootstrap cache** — a local starting point for scope resolution that avoids a network round-trip for well-known scopes. The protocol-level mechanism for scope-to-context resolution is `scope_lookup` via scope outlets (§22.3.5). The SDK-local mapping is populated from bootstrap defaults and updated from `scope_lookup` results. Apps can add domain-specific contexts with their own scope names.
 
 **Scope name collisions.** Two contexts in different scope registries may register the same scope name. Intra-registry conflicts are prevented by `scope_register`'s conflict detection — a scope name maps to at most one context within a single registry (§22.3.5). Cross-registry conflicts are resolved by registry priority in the SDK's bootstrap configuration: the first matching registry in the priority order wins, with the resolution path metadata identifying which registry produced the result. Users can disambiguate by specifying a context explicitly in client UI (selecting from a list rather than typing a scope name).
 
@@ -212,29 +212,29 @@ The SDK ships with a mapping of default `BootstrapContextEntry` values (§22.11.
 
 ### 22.3.4 Handle Registry Template
 
-A new well-known context template for contexts with discovery tools that serve as handle registries:
+A new well-known context template for contexts with discovery outlets that serve as handle registries:
 
 ```
 Template: "scp:template/handle-registry"
   mode:          Encrypted
-  ceiling:       [messagesRead, messagesWrite, toolRegister, toolInvokeAll]
+  ceiling:       [messagesRead, messagesWrite, outletRegister, outletInvokeAll]
   ceiling_policy: immutable
   roles:
     admin:       all capabilities + memberInvite, roleAssign
-    registrar:   messagesWrite, toolInvokeAll      // processes registrations
+    registrar:   messagesWrite, outletInvokeAll      // processes registrations
     reader:      messagesRead                      // DID-authenticated readers (unbounded)
   governance:    single-admin
   memory_scope:  full
-  tools:         handle_register, handle_lookup, handle_deregister,
+  outlets:         handle_register, handle_lookup, handle_deregister,
                  scope_register, scope_lookup, scope_deregister,
                  agent_search, agent_register, agent_deregister
 ```
 
-This template is a starting point. Contexts can customize governance, add tools (reputation scoring, category browsing), or restrict registration policies via context governance. The template follows the two-tier model: bounded registrars/admins (MLS members), unbounded readers.
+This template is a starting point. Contexts can customize governance, add outlets (reputation scoring, category browsing), or restrict registration policies via context governance. The template follows the two-tier model: bounded registrars/admins (MLS members), unbounded readers.
 
-### 22.3.5 Scope Tools (Namespace Registration)
+### 22.3.5 Scope Outlets (Namespace Registration)
 
-Scope tools provide protocol-level registration of scope names — the mapping from human-readable namespace names (the part after `@` in addresses like `alice@cooking-community`) to context IDs. Scope tools use **independent structs for all types**, with separate storage. See ADR-043 for the design decision and security analysis.
+Scope outlets provide protocol-level registration of scope names — the mapping from human-readable namespace names (the part after `@` in addresses like `alice@cooking-community`) to context IDs. Scope outlets use **independent structs for all types**, with separate storage. See ADR-043 for the design decision and security analysis.
 
 **Types.** All scope types are independent structs. Scope types are conceptually distinct from handle types — scopes are namespace registrations ("the phone book for namespaces"), while handles are participant registrations ("the phone book for participants"). Every scope type has its own struct definition:
 
@@ -254,11 +254,11 @@ ScopeRegisterStatus   :: Registered | Conflict | Updated
 
 Callers always use the `Scope*` names. The independent struct definitions reflect the conceptual separation at the type level — no scope type shares a definition with any handle type.
 
-**Separate storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. A context that supports both scope tools and handle tools has two registries — one `ScopeRegistry` for scope-to-context mappings and one `HandleRegistry` for name-to-DID/context mappings. This eliminates cross-type namespace collision by construction.
+**Separate storage.** `ScopeRegistry` is its own struct with its own `HashMap<String, ScopeEntry>`. It is NOT a `HandleRegistry` instance. Scope entries and handle entries never share storage. A context that supports both scope outlets and handle outlets has two registries — one `ScopeRegistry` for scope-to-context mappings and one `HandleRegistry` for name-to-DID/context mappings. This eliminates cross-type namespace collision by construction.
 
-**Scope tools (operate on `ScopeRegistry`):**
+**Scope outlets (operate on `ScopeRegistry`):**
 
-| Scope Tool | Handle Analogue | Additional Constraints |
+| Scope Outlet | Handle Analogue | Additional Constraints |
 |------------|----------------|----------------------|
 | `scope_register` | `handle_register` | `ScopeTarget` is context-only by construction; validates scope name via `validate_scope_name()` |
 | `scope_lookup` | `handle_lookup` | Validates scope name via `validate_scope_name()`; returns only context targets (enforced by `ScopeRegistry` construction) |
@@ -318,13 +318,13 @@ scope_deregister(params: ScopeDeregisterParams) → ScopeDeregisterResult
 
   Removes from ScopeRegistry with scope name validation.
   Admin-level scope entry removal is a governance action processed through the context's
-  governance engine (§5.9), not through the `scope_deregister` tool. The governance engine
+  governance engine (§5.9), not through the `scope_deregister` outlet. The governance engine
   can remove any entry regardless of owner DID, logged as a governance action in the event log.
 ```
 
 **Resolution flow — two-hop address resolution.** See §22.3.3 for the complete resolution flow. Steps 4-5 use `scope_lookup` on bootstrap context(s) to resolve the scope name to a context ID (the "phone book for namespaces" hop). Step 6 uses `handle_lookup` within the resolved context (the "phone book for participants" hop). The SDK ships Limn's context ID in bootstrap defaults, providing the initial scope registry. Apps can add additional scope registries via configuration.
 
-**Hosting model.** Any context can host scope tools. A context with scope tools is not a special type — it is a context that happens to have `scope_register`, `scope_lookup`, and `scope_deregister` in its tool set. A single context can combine scope tools with handle tools, agent tools, and any other tools. A context that supports both has two registries: a `ScopeRegistry` for scope-to-context mappings and a `HandleRegistry` for name-to-DID mappings. These registries are independent — entries in one do not affect the other. For example, Limn's bootstrap context can serve as both a scope registry (mapping scope names to context IDs) and a handle registry (mapping participant names to DIDs) simultaneously, with each backed by its own storage.
+**Hosting model.** Any context can host scope outlets. A context with scope outlets is not a special type — it is a context that happens to have `scope_register`, `scope_lookup`, and `scope_deregister` in its outlet set. A single context can combine scope outlets with handle outlets, agent outlets, and any other outlets. A context that supports both has two registries: a `ScopeRegistry` for scope-to-context mappings and a `HandleRegistry` for name-to-DID mappings. These registries are independent — entries in one do not affect the other. For example, Limn's bootstrap context can serve as both a scope registry (mapping scope names to context IDs) and a handle registry (mapping participant names to DIDs) simultaneously, with each backed by its own storage.
 
 **Authorization.** Scope registration follows the same two-tier model as handle registration (§22.3.1): writers (MLS members) process registrations, readers (DID-authenticated) perform lookups. Governance of the hosting context controls who can register scopes. There is no protocol-level verification that the registrant has any relationship to the target context — see ADR-043 Security Considerations for the rationale and threat analysis.
 
@@ -386,7 +386,7 @@ SCP.AddressResolver.resolveContextPetname(name: "recipes") → ContextId?
 
 Identity attestations (§3.5) already bind external platform handles to DIDs — `@alice` on X → `did:dht:z6Mk...`. This binding is cryptographically signed, user-initiated, independently verifiable, and revocable. What's missing is a **reverse-lookup index**: given `@alice` on X, find the DID.
 
-The addressing layer adds reverse-lookup as a discovery tool, not a new protocol primitive. When a user creates an identity attestation, the SDK SHOULD (opt-out configurable) register the mapping in one or more contexts with discovery tools that support attestation indexing.
+The addressing layer adds reverse-lookup as a discovery outlet, not a new protocol primitive. When a user creates an identity attestation, the SDK SHOULD (opt-out configurable) register the mapping in one or more contexts with discovery outlets that support attestation indexing.
 
 **Format:** `@<handle>` (unqualified, searches all known platforms).
 
@@ -399,9 +399,9 @@ The addressing layer adds reverse-lookup as a discovery tool, not a new protocol
 
 The `@handle` prefix is the syntactic marker for attestation-backed handles. The optional `:platform` suffix qualifies the search to a specific platform — the platform identifier is the short name used in attestation metadata (§3.5), not a domain. This avoids all ambiguity with domain handles: `@alice:x` is unambiguously an attestation lookup on platform "x", while `alice@x.com` follows the standard scoped resolution path (domain first, then attestation fallback per §22.2).
 
-### 22.5.1 Attestation Lookup Tool
+### 22.5.1 Attestation Lookup Outlet
 
-A new standard discovery tool schema for reverse-lookup:
+A new standard discovery outlet schema for reverse-lookup:
 
 ```
 attestation_lookup(platform, handle) → results
@@ -426,10 +426,10 @@ Multiple results are possible if multiple DIDs claim the same platform handle (o
 
 ### 22.5.2 Auto-Registration
 
-When a user creates an identity attestation (§3.5), the SDK SHOULD register the mapping in known contexts with discovery tools that support `attestation_lookup`. This is opt-out via configuration. The registration flow:
+When a user creates an identity attestation (§3.5), the SDK SHOULD register the mapping in known contexts with discovery outlets that support `attestation_lookup`. This is opt-out via configuration. The registration flow:
 
 1. User creates attestation: `SCP.Attestation.create(type: .identityLink, claim: { platform: "x", handle: "@alice_cooks" }, ...)`
-2. SDK discovers which known contexts with discovery tools support `attestation_lookup`.
+2. SDK discovers which known contexts with discovery outlets support `attestation_lookup`.
 3. SDK registers the mapping in each via a DID-authenticated request.
 4. Writers in the context verify the attestation before recording it.
 
@@ -442,7 +442,7 @@ The context's governance determines what verification is required before a mappi
 2. Parse: attestation-backed handle (leading @)
    - If platform-qualified: extract platform from ":x" suffix
    - Otherwise: platform = "*" (search all)
-3. Query known contexts with discovery tools that support attestation_lookup
+3. Query known contexts with discovery outlets that support attestation_lookup
 4. For each: attestation_lookup(platform: platform, handle: "alice_cooks")
 5. Merge results, deduplicate by DID
 6. For each result, verify attestation is still valid (not revoked, not stale)
@@ -553,7 +553,7 @@ TrustLevel:
 
 Trust levels are not strictly ordered — their relative strength is context-dependent. `DomainVerified` is stronger than `DiscoveryContextVerified` in some threat models (established domain with TLS history) and weaker in others (DNS seizure risk). The SDK exposes trust levels to consumers (agents, client UI); consumers decide what's sufficient for their operation.
 
-**`MultiLayerCorroborated`** indicates that multiple resolution paths agree on the same DID. The `sources` field records which paths corroborated, enabling consumers to evaluate the independence of the corroboration. **Caveat:** corroboration across layers is only as strong as the independence of those layers. An attacker who controls a domain, a context with discovery tools, and an attestation can fake corroboration across all three cheaply. Consumers SHOULD evaluate the diversity of corroboration sources (e.g., a domain + an attestation from a major platform + an established context is meaningfully harder to fake than a domain + a self-operated context). The SDK SHOULD flag `MultiLayerCorroborated` results where all non-petname sources share a common operator or were registered within a short time window.
+**`MultiLayerCorroborated`** indicates that multiple resolution paths agree on the same DID. The `sources` field records which paths corroborated, enabling consumers to evaluate the independence of the corroboration. **Caveat:** corroboration across layers is only as strong as the independence of those layers. An attacker who controls a domain, a context with discovery outlets, and an attestation can fake corroboration across all three cheaply. Consumers SHOULD evaluate the diversity of corroboration sources (e.g., a domain + an attestation from a major platform + an established context is meaningfully harder to fake than a domain + a self-operated context). The SDK SHOULD flag `MultiLayerCorroborated` results where all non-petname sources share a common operator or were registered within a short time window.
 
 **`Ambiguous` is a resolution outcome, not a trust level.** When multiple resolution paths find different DIDs for the same handle, the resolver returns multiple `AddressResolution` results — each with its own trust level — rather than a single result tagged `Ambiguous`. The resolver's return type (`Vec<AddressResolution>`) naturally represents this: a single result means unambiguous resolution; multiple results mean the consumer must disambiguate (§22.8.3).
 
@@ -591,7 +591,7 @@ When the address has no scope (`alice` or `@alice`), the resolver searches all p
 
 2. In parallel:
    a. Check domain handles for configured domains
-   b. Query known contexts with discovery tools via handle_lookup
+   b. Query known contexts with discovery outlets via handle_lookup
    c. Query attestation indexes via attestation_lookup
 
 3. Collect results, deduplicate by DID
@@ -631,7 +631,7 @@ SCP.Address.resolve(
   address: "alice@cooking-community"
 ) → [AddressResolution]
 
-// Register a handle in a context with discovery tools
+// Register a handle in a context with discovery outlets
 SCP.Address.register(
   handle: "alice",
   scope: discoveryContextID,
@@ -706,7 +706,7 @@ These events follow the existing identity private state model: append-only event
 
 ### 22.10.1 Handle Squatting
 
-**Context handles.** Governance determines policy. First-come-first-served is the default. Contexts can require attestation-backed registration (prove you are `@alice` on X before claiming `alice@premium-registry`), admin approval, or other policies. Squatting within a context with discovery tools is a governance problem for that community.
+**Context handles.** Governance determines policy. First-come-first-served is the default. Contexts can require attestation-backed registration (prove you are `@alice` on X before claiming `alice@premium-registry`), admin approval, or other policies. Squatting within a context with discovery outlets is a governance problem for that community.
 
 **Domain handles.** Domain operators control their namespace. Squatting within a domain is the domain operator's problem — identical to email.
 
@@ -738,29 +738,29 @@ Protocol defenses:
 
 **Context handles.** Handle registrations are visible to the context (writers see all registrations, readers can query). Handle lookups are DID-authenticated — the context sees who queries what. This is an inherent property of any registry. Registration is opt-in per context, withdrawable via `handle_deregister`.
 
-**Attestation handles.** Attestation existence is public (published for discovery). The reverse-lookup query is a discovery tool call with the same privacy properties as handle lookups.
+**Attestation handles.** Attestation existence is public (published for discovery). The reverse-lookup query is a discovery outlet call with the same privacy properties as handle lookups.
 
 **Domain handles.** The domain operator sees all handles and query traffic. HTTPS protects against third-party observation. Same privacy model as any HTTP-based service.
 
 ### 22.10.5 Query Surveillance
 
-Context handle lookups and attestation lookups are DID-authenticated tool calls. This means context writers can observe every lookup — who searched for whom, when, how often. This is a structural property of any registry model and is not unique to SCP, but it bears explicit acknowledgment.
+Context handle lookups and attestation lookups are DID-authenticated outlet calls. This means context writers can observe every lookup — who searched for whom, when, how often. This is a structural property of any registry model and is not unique to SCP, but it bears explicit acknowledgment.
 
 Mitigations:
-- **Multiple contexts with discovery tools.** Users can distribute their lookups across multiple registries, preventing any single registry from seeing the full query pattern.
+- **Multiple contexts with discovery outlets.** Users can distribute their lookups across multiple registries, preventing any single registry from seeing the full query pattern.
 - **SDK caching.** Resolution caching (§22.8.4) reduces repeat queries to the same context.
-- **No query logging mandate.** The protocol does not require contexts with discovery tools to log queries. Writers process lookups but are not mandated to record them beyond what the event log requires (registrations are logged; reads are not).
-- **Privacy-preserving lookup is a future direction.** Techniques like private information retrieval (PIR) or oblivious queries could be layered onto the context tool interface without protocol changes — the tool schema is compatible. This is acknowledged as unspecified and not blocking for initial implementation.
+- **No query logging mandate.** The protocol does not require contexts with discovery outlets to log queries. Writers process lookups but are not mandated to record them beyond what the event log requires (registrations are logged; reads are not).
+- **Privacy-preserving lookup is a future direction.** Techniques like private information retrieval (PIR) or oblivious queries could be layered onto the context outlet interface without protocol changes — the outlet schema is compatible. This is acknowledged as unspecified and not blocking for initial implementation.
 
 ## 22.11 Wire Format Tables
 
-This section tabulates the wire format for all discovery and addressing types that cross the network. All types use serde serialization (JSON for tool call payloads, MessagePack for MLS application messages). An independent implementer MUST implement these types with exactly the field names, types, and semantics shown below.
+This section tabulates the wire format for all discovery and addressing types that cross the network. All types use serde serialization (JSON for outlet call payloads, MessagePack for MLS application messages). An independent implementer MUST implement these types with exactly the field names, types, and semantics shown below.
 
 ### 22.11.1 Agent Registration and Search
 
-These types are the tool call schemas for the standard context tools defined in §6.2.2B.
+These types are the outlet call schemas for the standard context outlets defined in §6.2.2B.
 
-**`AgentSearchParams`** — Input for `agent_search` tool.
+**`AgentSearchParams`** — Input for `agent_search` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -768,14 +768,14 @@ These types are the tool call schemas for the standard context tools defined in 
 | `keywords` | `Vec<String>` | No | Free-text keyword search. Logical OR — any may match. |
 | `limit` | `u32` | No | Maximum results to return. Default: 100. |
 
-**`AgentSearchResult`** — Output from `agent_search` tool.
+**`AgentSearchResult`** — Output from `agent_search` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `entries` | `Vec<RegistrationEntry>` | Yes | Matching agent entries. |
 | `total_matches` | `u64` | Yes | Total matches (may exceed returned entries if `limit` applied). |
 
-**`AgentRegisterParams`** — Input for `agent_register` tool.
+**`AgentRegisterParams`** — Input for `agent_register` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -783,20 +783,20 @@ These types are the tool call schemas for the standard context tools defined in 
 | `capabilities` | `Vec<String>` | Yes | Capability URIs the agent supports. |
 | `metadata` | `Map<String, Value>` | Yes | Arbitrary metadata (description, tags, etc.). May be empty. |
 
-**`AgentRegisterResult`** — Output from `agent_register` tool.
+**`AgentRegisterResult`** — Output from `agent_register` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `registered` | `bool` | Yes | `true` if registration succeeded. |
 | `entry_id` | `String` | Yes | Unique identifier for the registration entry. |
 
-**`AgentDeregisterParams`** — Input for `agent_deregister` tool.
+**`AgentDeregisterParams`** — Input for `agent_deregister` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `did` | `String` (DID) | Yes | DID to deregister. Must match the authenticated requester. |
 
-**`AgentDeregisterResult`** — Output from `agent_deregister` tool.
+**`AgentDeregisterResult`** — Output from `agent_deregister` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -829,7 +829,7 @@ These types are the tool call schemas for the standard context tools defined in 
 
 ### 22.11.2 Handle Registration and Lookup
 
-**`HandleRegisterParams`** — Input for `handle_register` tool.
+**`HandleRegisterParams`** — Input for `handle_register` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -837,7 +837,7 @@ These types are the tool call schemas for the standard context tools defined in 
 | `target` | `HandleTarget` | Yes | What the handle resolves to. |
 | `metadata` | `HandleMetadata` | No | Optional descriptive metadata. |
 
-**`HandleRegisterResult`** — Output from `handle_register` tool.
+**`HandleRegisterResult`** — Output from `handle_register` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -860,14 +860,14 @@ These types are the tool call schemas for the standard context tools defined in 
 | `description` | `String` | No | Human-readable description. |
 | `tags` | `Vec<String>` | No | Categorization tags. |
 
-**`HandleLookupParams`** — Input for `handle_lookup` tool.
+**`HandleLookupParams`** — Input for `handle_lookup` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `handle` | `String` | Yes | The local-part to look up. |
 | `type_filter` | `HandleTypeFilter` | No | Restrict results to identity or context handles. |
 
-**`HandleLookupResult`** — Output from `handle_lookup` tool.
+**`HandleLookupResult`** — Output from `handle_lookup` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -891,14 +891,14 @@ These types are the tool call schemas for the standard context tools defined in 
 | `metadata` | `HandleMetadata` | Yes | Descriptive metadata. May have all fields absent. |
 | `entry_id` | `String` | Yes | Unique entry identifier. |
 
-**`HandleDeregisterParams`** — Input for `handle_deregister` tool.
+**`HandleDeregisterParams`** — Input for `handle_deregister` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `handle` | `String` | Yes | The local-part to deregister. |
 | `did` | `String` (DID) | Yes | Must match the handle owner. |
 
-**`HandleDeregisterResult`** — Output from `handle_deregister` tool.
+**`HandleDeregisterResult`** — Output from `handle_deregister` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -913,9 +913,9 @@ These types are the tool call schemas for the standard context tools defined in 
 
 ### 22.11.2a Scope Registration and Lookup
 
-Scope tools use independent structs for all types (see §22.3.5, ADR-043). All scope types below are the wire-level representation.
+Scope outlets use independent structs for all types (see §22.3.5, ADR-043). All scope types below are the wire-level representation.
 
-**`ScopeRegisterParams`** — Input for `scope_register` tool.
+**`ScopeRegisterParams`** — Input for `scope_register` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -923,7 +923,7 @@ Scope tools use independent structs for all types (see §22.3.5, ADR-043). All s
 | `target` | `ScopeTarget` | Yes | Context the scope name resolves to. |
 | `metadata` | `ScopeMetadata` | No | Optional descriptive metadata. |
 
-**`ScopeRegisterResult`** — Output from `scope_register` tool.
+**`ScopeRegisterResult`** — Output from `scope_register` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -945,13 +945,13 @@ Scope tools use independent structs for all types (see §22.3.5, ADR-043). All s
 | `description` | `String` | No | Human-readable description. Max 1024 characters. |
 | `tags` | `Vec<String>` | No | Categorization tags. Max 20 items, each max 64 characters. |
 
-**`ScopeLookupParams`** — Input for `scope_lookup` tool.
+**`ScopeLookupParams`** — Input for `scope_lookup` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `name` | `String` | Yes | Scope name to look up. |
 
-**`ScopeLookupResult`** — Output from `scope_lookup` tool.
+**`ScopeLookupResult`** — Output from `scope_lookup` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -968,14 +968,14 @@ Scope tools use independent structs for all types (see §22.3.5, ADR-043). All s
 | `metadata` | `ScopeMetadata` | Yes | Descriptive metadata. May have all fields absent. |
 | `entry_id` | `String` | Yes | Unique entry identifier. |
 
-**`ScopeDeregisterParams`** — Input for `scope_deregister` tool.
+**`ScopeDeregisterParams`** — Input for `scope_deregister` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `name` | `String` | Yes | Scope name to deregister. |
 | `did` | `String` (DID) | Yes | Must match the scope entry owner. |
 
-**`ScopeDeregisterResult`** — Output from `scope_deregister` tool.
+**`ScopeDeregisterResult`** — Output from `scope_deregister` outlet.
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
@@ -1130,7 +1130,7 @@ These events are appended to the identity private state event log (§3.7). They 
 |---------|-----|--------|-----------|
 | `DhtDidDocument` | `"dht_did_document"` | — | Found via `SCPBroadcastContext` service in publisher's DID doc. |
 | `WellKnown` | `"well_known"` | — | Found via `.well-known/scp` on a domain. |
-| `HandleRegistry` | `"handle_registry"` | `context_id: String` | Found via search in a context with discovery tools. |
+| `HandleRegistry` | `"handle_registry"` | `context_id: String` | Found via search in a context with discovery outlets. |
 | `ContextUri` | `"context_uri"` | — | Found via `scp://` URI. |
 
 **`BootstrapConfig`** — Client bootstrap discovery configuration. See §22.13 for the two-context bootstrap governance model.
@@ -1138,7 +1138,7 @@ These events are appended to the identity private state event log (§3.7). They 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
 | `default_contexts` | `Vec<BootstrapContextEntry>` | Yes | SDK default bootstrap contexts with creator DID verification. Replaces the former `default_context_ids: Vec<String>`. |
-| `auto_query_on_identity_creation` | `bool` | Yes | Whether to auto-query contexts with discovery tools on first identity creation. |
+| `auto_query_on_identity_creation` | `bool` | Yes | Whether to auto-query contexts with discovery outlets on first identity creation. |
 | `custom_contexts` | `Vec<BootstrapContextEntry>` | Yes | User-added contexts with creator DID verification. May be empty. Replaces the former `custom_context_ids: Vec<String>`. |
 | `fallback_to_did_resolution` | `bool` | Yes | Whether to fall back to DID document capability resolution. |
 
@@ -1176,11 +1176,11 @@ These events are appended to the identity private state event log (§3.7). They 
 | `provenance` | `DataProvenance` | Yes | Provenance metadata (§24). |
 | `relevance_score` | `f64` | Yes | Relevance score (0.0 to 1.0). |
 
-### 22.11.7 Standard Tool Names
+### 22.11.7 Standard Outlet Names
 
-The following tool names are normative — independent implementations MUST use exactly these names for interoperability:
+The following outlet names are normative — independent implementations MUST use exactly these names for interoperability:
 
-| Tool Name | Direction | Spec Reference |
+| Outlet Name | Direction | Spec Reference |
 |-----------|-----------|----------------|
 | `agent_search` | Reader (DID-authenticated query) | §6.2.2B |
 | `agent_register` | Writer (MLS member write) | §6.2.2B |
@@ -1203,7 +1203,7 @@ The following tool names are normative — independent implementations MUST use 
 
 ## 22.12 Phase Integration
 
-Phase assignments for addressing components are tracked in `.docs/architecture.md` alongside all other build phase allocations. Summary: address format types, petname storage, `.well-known/scp` handles extension, and URI handle parameter land in Phase 2 (extending existing types, no external dependencies). Context handle tools, attestation lookup, `AddressResolver`, and the handle-registry template land in Phase 3 (dependent on context and attestation infrastructure). Scope tools (`scope_register`, `scope_lookup`, `scope_deregister`), `ScopeRegistry`, and `validate_scope_name` land in Phase 4 (ADR-043, dependent on handle tools from Phase 3). `BootstrapContextEntry`, `BootstrapConfig` field migration, and the `evaluate_sybil_resistance` endorsement-independence wiring (§22.13) also land in Phase 4, as the bootstrap contexts serve as scope registries and depend on the scope tool infrastructure.
+Phase assignments for addressing components are tracked in `.docs/architecture.md` alongside all other build phase allocations. Summary: address format types, petname storage, `.well-known/scp` handles extension, and URI handle parameter land in Phase 2 (extending existing types, no external dependencies). Context handle outlets, attestation lookup, `AddressResolver`, and the handle-registry template land in Phase 3 (dependent on context and attestation infrastructure). Scope outlets (`scope_register`, `scope_lookup`, `scope_deregister`), `ScopeRegistry`, and `validate_scope_name` land in Phase 4 (ADR-043, dependent on handle outlets from Phase 3). `BootstrapContextEntry`, `BootstrapConfig` field migration, and the `evaluate_sybil_resistance` endorsement-independence wiring (§22.13) also land in Phase 4, as the bootstrap contexts serve as scope registries and depend on the scope outlet infrastructure.
 
 ## 22.13 Bootstrap Context Governance
 
@@ -1211,15 +1211,15 @@ The SDK ships with two bootstrap contexts that serve as the initial scope regist
 
 ### 22.13.1 Two Bootstrap Contexts
 
-**Verified Context.** Limn-operated. Uses the existing `scp:template/handle-registry` template. Admission is governed by `ContextSybilPolicy::high_trust()` (§9.3) with endorsement independence enabled (§22.13.3). Hosts scope tools (`scope_register`, `scope_lookup`, `scope_deregister`), handle tools (`handle_register`, `handle_lookup`, `handle_deregister`), and agent tools (`agent_search`, `agent_register`, `agent_deregister`). Intended for verified identities with established trust signals — multiple attestation types, significant participation history, and independent endorsements. The higher admission bar makes this the authoritative scope registry for the network.
+**Verified Context.** Limn-operated. Uses the existing `scp:template/handle-registry` template. Admission is governed by `ContextSybilPolicy::high_trust()` (§9.3) with endorsement independence enabled (§22.13.3). Hosts scope outlets (`scope_register`, `scope_lookup`, `scope_deregister`), handle outlets (`handle_register`, `handle_lookup`, `handle_deregister`), and agent outlets (`agent_search`, `agent_register`, `agent_deregister`). Intended for verified identities with established trust signals — multiple attestation types, significant participation history, and independent endorsements. The higher admission bar makes this the authoritative scope registry for the network.
 
-**Community Context.** Operator-independent — any sufficiently trusted identity can operate it. Uses the existing `scp:template/handle-registry` template. Admission is governed by `ContextSybilPolicy::standard()` (§9.3). Hosts the same tool set as the Verified context: scope tools, handle tools, and agent tools. Lower barrier to entry — requires at least one trust signal category with some history but does not require the depth demanded by the Verified context. Provides a namespace for communities, experiments, and identities that have not yet accumulated sufficient trust signals for the Verified context.
+**Community Context.** Operator-independent — any sufficiently trusted identity can operate it. Uses the existing `scp:template/handle-registry` template. Admission is governed by `ContextSybilPolicy::standard()` (§9.3). Hosts the same outlet set as the Verified context: scope outlets, handle outlets, and agent outlets. Lower barrier to entry — requires at least one trust signal category with some history but does not require the depth demanded by the Verified context. Provides a namespace for communities, experiments, and identities that have not yet accumulated sufficient trust signals for the Verified context.
 
 **Why two, not one.** A single bootstrap context creates a single point of governance: either the admission bar is high enough for trust (excluding newcomers from resolution) or low enough for inclusion (diluting trust signals). Two contexts resolve this tension. The Verified context provides high-trust resolution; the Community context provides inclusive resolution. Consumers see the trust level on every resolution result (`DiscoveryContextVerified` with provenance identifying which bootstrap context resolved it) and can make their own decisions. Applications that require high trust can filter for Verified-context results; applications optimizing for reach can accept either.
 
 **Distinguishing Verified from Community results.** Both bootstrap contexts produce `DiscoveryContextVerified` resolution results — the trust level variant is the same for both. Consumers distinguish them via the resolving context's ID in `ResolutionPath` provenance metadata — compare `resolution_path.source_id` (direct handle lookup) or `resolution_path.scope_registry_id` (two-hop scope resolution) against the `BootstrapContextEntry` values in the SDK's `BootstrapConfig`. A match against the Verified context's ID indicates a Verified-context result; a match against the Community context's ID indicates a Community-context result. A match against a `default_contexts` entry with the Verified context's ID indicates a Verified-context result; a match against the Community context's ID indicates a Community-context result. The distinction is in provenance, not in the `TrustLevel` variant.
 
-**Both are standard SCP contexts.** They are not special-cased in the protocol. They use the same `scp:template/handle-registry` template, the same scope tools, the same handle tools, the same governance engine, and the same event log as any other context with discovery tools. Their only distinction is their configuration: which `ContextSybilPolicy` governs admission and whether endorsement independence is enabled. A third-party could stand up an additional bootstrap context with its own policy and add it to clients' `BootstrapConfig` via `custom_contexts` — the protocol supports this by design.
+**Both are standard SCP contexts.** They are not special-cased in the protocol. They use the same `scp:template/handle-registry` template, the same scope outlets, the same handle outlets, the same governance engine, and the same event log as any other context with discovery outlets. Their only distinction is their configuration: which `ContextSybilPolicy` governs admission and whether endorsement independence is enabled. A third-party could stand up an additional bootstrap context with its own policy and add it to clients' `BootstrapConfig` via `custom_contexts` — the protocol supports this by design.
 
 ### 22.13.2 BootstrapContextEntry and Creator DID Verification
 

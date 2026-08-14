@@ -34,7 +34,7 @@ pub const MAX_FRAME_SIZE: u32 = 512_000;
 
 /// Client-to-relay frame sent on a QUIC stream.
 ///
-/// Same field semantics as [`ClientMessage`](crate::native::protocol::ClientMessage)
+/// Same field semantics as [`ClientMessage`](scp_relay_client::ClientMessage)
 /// from ADR-004. The `op` field is used as the serde tag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op")]
@@ -101,7 +101,7 @@ pub enum QuicClientFrame {
 
 /// Relay-to-client frame received on a QUIC stream.
 ///
-/// Same field semantics as [`RelayMessage`](crate::native::protocol::RelayMessage)
+/// Same field semantics as [`RelayMessage`](scp_relay_client::RelayMessage)
 /// from ADR-004. The `op` field is used as the serde tag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op")]

@@ -50,7 +50,7 @@ If a section/crate argument was provided, audit only that scope. Otherwise, work
 2. **ADRs** — read each ADR, extract every decision and constraint
 3. **PRDs** — read each PRD, cross-reference story status vs code reality
 4. **Rust core** (`crates/scp-core/`) — implementation completeness
-5. **FFI bridges** (`crates/scp-ffi/`) — PyO3, UniFFI, NAPI, WASM
+5. **FFI bridges** (`crates/scp-ffi/`) — PyO3, UniFFI, NAPI
 6. **SDK wrappers** (`bindings/`) — Python, TypeScript, Kotlin, Swift
 7. **Cross-cutting** — tests, CI, error codes, standards compliance
 
@@ -112,13 +112,12 @@ For each crate in `crates/`:
 
 ### 2.5 — FFI Bridge Review
 
-For each bridge target (PyO3, UniFFI, NAPI, WASM):
+For each bridge target (PyO3, UniFFI, NAPI):
 
 1. Build coverage matrix: every public `scp-core` function × bridge export status
 2. Read every bridge source file fully
 3. Check that bridge functions correctly call core functions (not reimplementing logic)
 4. Verify error mapping is complete (no swallowed errors)
-5. For WASM: verify reimplementations match core algorithms (per ADR-034)
 
 ### 2.6 — SDK Wrapper Review
 

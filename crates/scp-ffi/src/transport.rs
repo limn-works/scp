@@ -335,12 +335,20 @@ impl crate::scp::PyScp {
                 ScpPyError::transport(format!("failed to connect to relay '{relay_url}': {e}"))
             })?;
 
-        let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+        let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::NodeMlsFactory::new(
             local_did.to_owned(),
+            std::sync::Arc::new(scp_clock::SystemClock),
         ));
         let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
-        let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
-            Box::new(crate::runtime::NoOpEventLogProvider);
+        // The supervisor's own event log MUST be the persistent Merkle provider
+        // (sharing the bridge instance's single storage backend), NOT a NoOp.
+        // `Supervisor::participation_record` (§7.3.2) and any other supervisor
+        // read of the convergent log require `event_log_entries`/Merkle-root
+        // support; a NoOp silently dropped every governance/role/membership
+        // leaf, so the supervisor log was empty and participation facts were
+        // unreadable on the relay (production) path. This matches the
+        // local-transport path, which already builds the real provider.
+        let event_log = crate::runtime::build_event_log_provider(bi);
         crate::runtime::init_context_manager_with(
             bi, local_did, crypto, transport, event_log, None,
         );
@@ -358,7 +366,7 @@ impl crate::scp::PyScp {
     ///
     /// Unlike the default transport (`NotConfiguredTransportProvider`, which
     /// rejects every send/publish), `LocalTransportProvider` silently succeeds
-    /// on all transport calls. A real `MlsCryptoProvider` bound to `local_did`
+    /// on all transport calls. A real `NodeMlsFactory` bound to `local_did`
     /// is still installed, so `context_send` and `broadcast_publish` can be
     /// exercised end to end (encryption included) without a real relay server.
     /// This is test infrastructure for E2E flows that do not need network I/O.

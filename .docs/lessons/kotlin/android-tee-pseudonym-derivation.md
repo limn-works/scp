@@ -16,7 +16,7 @@ The HMAC key is the 32-byte `pseudonym_secret`, **never the public key**. How th
   `pseudonym_secret = HKDF-SHA256(ikm = ed25519_private_seed, salt = "scp-pseudonym-secret-v1", info = "", len = 32)`.
   This is byte-identical across every platform, so software pseudonyms are **cross-platform
   deterministic**. The canonical implementation is `derive_pseudonym_secret()` /
-  `derive_pseudonym_keypair()` in `crates/scp-platform/src/pseudonym.rs`. Known-answer
+  `derive_pseudonym_keypair()` in `crates/scp-crypto/src/pseudonym.rs`. Known-answer
   vectors are pinned in `.docs/specs/25-test-vectors.md` §25.19.
 
 - **Hardware custody** (Android Keystore TEE API 33+, Apple Secure Enclave, HSM):
@@ -51,7 +51,7 @@ need deterministic pseudonym generation across devices for hardware-bound keys.
 
 ## Where this lives
 
-- Canonical recipe + KAT: `crates/scp-platform/src/pseudonym.rs`
+- Canonical recipe + KAT: `crates/scp-crypto/src/pseudonym.rs`
   (`derive_pseudonym_secret`, `derive_pseudonym_keypair`).
 - Software backends: `file.rs`, `sqlite/key_custody.rs`, `testing/key_custody.rs`.
 - Android adapter: `bindings/kotlin/scp-kt-android/.../AndroidKeyCustody.kt`

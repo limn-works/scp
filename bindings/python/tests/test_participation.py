@@ -20,10 +20,15 @@ import pytest
 from scp_sdk.trust import (
     PARTICIPATION_FACT_VARIANTS,
     PARTICIPATION_THRESHOLD_OPERATORS,
+    CapabilityRequirement,
+    ChallengeVerification,
+    ChallengeVerificationMethod,
     ParticipationFact,
     ParticipationProfile,
     ParticipationThreshold,
     RequireParticipation,
+    VerificationLevel,
+    check_capability_requirements,
     verify_participation_requirements,
 )
 
@@ -102,8 +107,8 @@ class TestParticipationProfile:
         assert profile.participation_duration_secs == 0
         assert profile.governance_actions_against == 0
         assert profile.governance_actions_by == 0
-        assert profile.tool_invocation_count == 0
-        assert profile.tool_invocation_count_anchored is False
+        assert profile.outlet_invocation_count == 0
+        assert profile.outlet_invocation_count_anchored is False
         assert profile.context_creation_count == 0
         assert profile.role_progression_count == 0
         assert profile.attestation_count == 0
@@ -133,11 +138,11 @@ class TestParticipationProfile:
                 governance_actions_by=-1,
             )
 
-    def test_negative_tool_invocation_count_rejected(self) -> None:
-        with pytest.raises(ValueError, match="tool_invocation_count must be non-negative"):
+    def test_negative_outlet_invocation_count_rejected(self) -> None:
+        with pytest.raises(ValueError, match="outlet_invocation_count must be non-negative"):
             ParticipationProfile(
                 subject_did="did:dht:z6MkTest",
-                tool_invocation_count=-1,
+                outlet_invocation_count=-1,
             )
 
     def test_negative_context_creation_count_rejected(self) -> None:
@@ -275,8 +280,8 @@ class TestToBridgeDict:
             participation_duration_secs=3600,
             governance_actions_against=2,
             governance_actions_by=5,
-            tool_invocation_count=10,
-            tool_invocation_count_anchored=True,
+            outlet_invocation_count=10,
+            outlet_invocation_count_anchored=True,
             context_creation_count=3,
             role_progression_count=1,
             attestation_count=7,
@@ -291,8 +296,8 @@ class TestToBridgeDict:
         assert d["participation_duration_secs"] == 3600
         assert d["governance_actions_against"] == 2
         assert d["governance_actions_by"] == 5
-        assert d["tool_invocation_count"] == 10
-        assert d["tool_invocation_count_anchored"] is True
+        assert d["outlet_invocation_count"] == 10
+        assert d["outlet_invocation_count_anchored"] is True
         assert d["context_creation_count"] == 3
         assert d["role_progression_count"] == 1
         assert d["attestation_count"] == 7
@@ -303,14 +308,14 @@ class TestToBridgeDict:
 
     def test_require_participation_bridge_dict(self) -> None:
         req = RequireParticipation(
-            fact=ParticipationFact(name="ToolInvocationCount"),
+            fact=ParticipationFact(name="OutletInvocationCount"),
             threshold=ParticipationThreshold(operator="GreaterThan", value=50),
             max_age_secs=7200,
             min_contexts=3,
         )
         d = req._to_bridge_dict()
 
-        assert d["fact"] == "ToolInvocationCount"
+        assert d["fact"] == "OutletInvocationCount"
         assert d["threshold"] == {"GreaterThan": 50}
         assert d["max_age_secs"] == 7200
         assert d["min_contexts"] == 3
@@ -349,7 +354,7 @@ class TestVerifyParticipationRequirements:
         ]
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = verify_participation_requirements(requirements, profiles)
+            result = verify_participation_requirements("did:dht:z6MkAlice", requirements, profiles)
 
         assert result is None
         mock_bridge.verify_participation_requirements.assert_called_once()
@@ -358,8 +363,10 @@ class TestVerifyParticipationRequirements:
         call_args = mock_bridge.verify_participation_requirements.call_args
         import json
 
-        profiles_json = json.loads(call_args[0][0])
+        assert call_args[0][0] == "did:dht:z6MkAlice"
+        # Bridge arg order is (expected_subject, requirements_json, profile_json).
         requirements_json = json.loads(call_args[0][1])
+        profiles_json = json.loads(call_args[0][2])
 
         assert len(profiles_json) == 1
         assert profiles_json[0]["subject_did"] == "did:dht:z6MkAlice"
@@ -376,25 +383,214 @@ class TestVerifyParticipationRequirements:
         profiles = [ParticipationProfile(subject_did="did:dht:z6MkBob")]
         requirements = [
             RequireParticipation(
-                fact=ParticipationFact(name="ToolInvocationCount"),
+                fact=ParticipationFact(name="OutletInvocationCount"),
                 threshold=ParticipationThreshold(operator="AtLeast", value=100),
             ),
         ]
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
             with pytest.raises(RuntimeError, match="Threshold not met"):
-                verify_participation_requirements(requirements, profiles)
+                verify_participation_requirements("did:dht:z6MkBob", requirements, profiles)
 
     def test_empty_requirements_and_profiles(self) -> None:
         mock_bridge = MagicMock()
         mock_bridge.verify_participation_requirements.return_value = True
 
         with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
-            result = verify_participation_requirements([], [])
+            result = verify_participation_requirements("did:dht:z6MkAlice", [], [])
 
         assert result is None
         call_args = mock_bridge.verify_participation_requirements.call_args
         import json
 
-        assert json.loads(call_args[0][0]) == []
+        assert call_args[0][0] == "did:dht:z6MkAlice"
         assert json.loads(call_args[0][1]) == []
+        assert json.loads(call_args[0][2]) == []
+
+
+# ---------------------------------------------------------------------------
+# check_capability_requirements bridge delegation tests (§7.3.4.4, SCP-ACR-008)
+# ---------------------------------------------------------------------------
+
+
+class TestCheckCapabilityRequirements:
+    """Tests that check_capability_requirements delegates to the Rust bridge.
+
+    The typed input (ADR-058) serializes internally to the exact serde
+    snake_case JSON the ``scp-core`` ``CapabilityRequirement`` /
+    ``ChallengeVerification`` deserialize.
+    """
+
+    def test_delegates_to_bridge(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.check_capability_requirements.return_value = None
+
+        requirements = [
+            CapabilityRequirement(
+                capability="scp:capability:schema-validation/v1",
+                verification_level=VerificationLevel("SelfAttested"),
+            ),
+        ]
+        capabilities = ["scp:capability:schema-validation/v1"]
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = check_capability_requirements(
+                "ctx-1", "did:dht:z6MkAlice", requirements, capabilities, []
+            )
+
+        assert result is None
+        mock_bridge.check_capability_requirements.assert_called_once()
+
+        import json
+
+        call_args = mock_bridge.check_capability_requirements.call_args
+        # Bridge arg order: (context_id, subject_did, requirements_json,
+        # agent_capabilities_json, challenge_verifications_json).
+        assert call_args[0][0] == "ctx-1"
+        assert call_args[0][1] == "did:dht:z6MkAlice"
+        # Typed CapabilityRequirement serializes to the serde wire shape.
+        assert json.loads(call_args[0][2]) == [
+            {
+                "capability": "scp:capability:schema-validation/v1",
+                "verification_level": "SelfAttested",
+            },
+        ]
+        assert json.loads(call_args[0][3]) == capabilities
+        assert json.loads(call_args[0][4]) == []
+
+    def test_serializes_challenge_verified_requirement_and_verification(self) -> None:
+        """A ChallengeVerified requirement + a typed ChallengeVerification
+        serialize to the exact snake_case serde wire shape."""
+        mock_bridge = MagicMock()
+        mock_bridge.check_capability_requirements.return_value = None
+
+        requirements = [
+            CapabilityRequirement(
+                capability="scp:capability:code-review/v1",
+                verification_level=VerificationLevel("ChallengeVerified"),
+            ),
+        ]
+        verification = ChallengeVerification(
+            verification_id="chal-1",
+            verifier_did="did:dht:z6MkVerifier",
+            subject_did="did:dht:z6MkAlice",
+            capability_uri="scp:capability:code-review/v1",
+            challenge_type="scp:capability:code-review/v1",
+            verification_method=ChallengeVerificationMethod(
+                "ChallengeVerified", challenge_type="scp:capability:code-review/v1"
+            ),
+            passed=True,
+            test_count=10,
+            pass_count=10,
+            result={"detail": "ok"},
+            completed_at=1_700_000_000,
+            verified_at=1_700_000_001,
+            expires_at=1_800_000_000,
+            verifier_signature=list(range(64)),
+            score=95,
+            context_id="ctx-1",
+        )
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            check_capability_requirements(
+                "ctx-1",
+                "did:dht:z6MkAlice",
+                requirements,
+                ["scp:capability:code-review/v1"],
+                [verification],
+            )
+
+        import json
+
+        call_args = mock_bridge.check_capability_requirements.call_args
+        assert json.loads(call_args[0][2]) == [
+            {
+                "capability": "scp:capability:code-review/v1",
+                "verification_level": "ChallengeVerified",
+            },
+        ]
+        assert json.loads(call_args[0][4]) == [
+            {
+                "verification_id": "chal-1",
+                "verifier_did": "did:dht:z6MkVerifier",
+                "subject_did": "did:dht:z6MkAlice",
+                "capability_uri": "scp:capability:code-review/v1",
+                "challenge_type": "scp:capability:code-review/v1",
+                "verification_method": {
+                    "ChallengeVerified": {"challenge_type": "scp:capability:code-review/v1"}
+                },
+                "passed": True,
+                "score": 95,
+                "test_count": 10,
+                "pass_count": 10,
+                "result": {"detail": "ok"},
+                "completed_at": 1_700_000_000,
+                "verified_at": 1_700_000_001,
+                "expires_at": 1_800_000_000,
+                "context_id": "ctx-1",
+                "verifier_signature": list(range(64)),
+            },
+        ]
+
+    def test_self_attested_verification_method_serializes_as_bare_string(self) -> None:
+        """A SelfAttested ChallengeVerificationMethod serializes as the bare
+        variant string, matching the serde untagged enum."""
+        method = ChallengeVerificationMethod("SelfAttested")
+        assert method._to_bridge_value() == "SelfAttested"
+
+    def test_rejects_bad_verification_level(self) -> None:
+        with pytest.raises(ValueError, match="Invalid VerificationLevel"):
+            VerificationLevel("Nonexistent")
+
+    def test_rejects_wrong_signature_length(self) -> None:
+        with pytest.raises(ValueError, match="verifier_signature must be exactly 64"):
+            ChallengeVerification(
+                verification_id="chal-1",
+                verifier_did="did:dht:z6MkVerifier",
+                subject_did="did:dht:z6MkAlice",
+                capability_uri="scp:capability:code-review/v1",
+                challenge_type="scp:capability:code-review/v1",
+                verification_method=ChallengeVerificationMethod("SelfAttested"),
+                passed=True,
+                test_count=1,
+                pass_count=1,
+                result=None,
+                completed_at=1,
+                verified_at=1,
+                expires_at=2,
+                verifier_signature=[0, 1, 2],
+            )
+
+    def test_raises_on_bridge_failure(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.check_capability_requirements.side_effect = RuntimeError(
+            "missing required capability"
+        )
+
+        requirements = [
+            CapabilityRequirement(
+                capability="scp:capability:schema-validation/v1",
+                verification_level=VerificationLevel("SelfAttested"),
+            ),
+        ]
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            with pytest.raises(RuntimeError, match="missing required capability"):
+                check_capability_requirements("ctx-1", "did:dht:z6MkBob", requirements, [], [])
+
+    def test_empty_inputs(self) -> None:
+        mock_bridge = MagicMock()
+        mock_bridge.check_capability_requirements.return_value = None
+
+        with patch("scp_sdk.trust._bridge", return_value=mock_bridge):
+            result = check_capability_requirements("ctx-1", "did:dht:z6MkAlice", [], [], [])
+
+        assert result is None
+        import json
+
+        call_args = mock_bridge.check_capability_requirements.call_args
+        assert call_args[0][0] == "ctx-1"
+        assert call_args[0][1] == "did:dht:z6MkAlice"
+        assert json.loads(call_args[0][2]) == []
+        assert json.loads(call_args[0][3]) == []
+        assert json.loads(call_args[0][4]) == []

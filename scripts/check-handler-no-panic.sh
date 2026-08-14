@@ -801,7 +801,7 @@ self_test() {
 #       prior `/\btest\b/` gate-detect NEVER matched on macOS, so a bare
 #       `#[cfg(test)]` module was NOT excluded and its `panic!`s were false HITs.
 #   (6) does NOT flag a panic inside a `#[cfg(any(test, feature = "testing"))]`
-#       module (the form tools_helpers.rs / context/mod.rs use),
+#       module (the form outlets_helpers.rs / context/mod.rs use),
 #   (7) DOES flag a production reachable panic inside a `#[cfg(not(test))]` item
 #       — `not(test)` is PRODUCTION code and must stay scanned; the gate-detect
 #       must NOT mistake it for a test gate.

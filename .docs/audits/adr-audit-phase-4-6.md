@@ -89,8 +89,8 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-020] H5: Discovery Reader Authentication Not Specified
 - **Category**: Underspecified interfaces
 - **Location**: ADR-020, acceptance criterion 4-5
-- **What's missing**: "Reader tier: DID-authenticated, unbounded, query via tool endpoints without MLS join." How is DID authentication performed for readers who are not MLS group members? The ADR says "DID-signed request" but does not specify the authentication protocol -- is it a signed HTTP request? A signed SCP message? What prevents replay of a valid DID-signed query?
-- **Why it matters**: Unauthenticated or replay-vulnerable reader queries could be used to enumerate all entries in a context with discovery tools.
+- **What's missing**: "Reader tier: DID-authenticated, unbounded, query via outlet endpoints without MLS join." How is DID authentication performed for readers who are not MLS group members? The ADR says "DID-signed request" but does not specify the authentication protocol -- is it a signed HTTP request? A signed SCP message? What prevents replay of a valid DID-signed query?
+- **Why it matters**: Unauthenticated or replay-vulnerable reader queries could be used to enumerate all entries in a context with discovery outlets.
 - **Severity**: HIGH
 
 ### [ADR-021] H6: Tokio Runtime Shutdown Grace Period May Lose Crypto State
@@ -125,7 +125,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 - **Category**: Missing security analysis
 - **Location**: ADR-029, section 6, "Event Log Reconciliation"
 - **What's missing**: "The reconnecting member requests the missing events via event range requests. Events are verified by recomputing the Merkle path from each event to the known root." But the events are provided by a peer. A malicious peer could provide fabricated events that form a valid Merkle tree but have false content. Verification against the Merkle root only proves structural integrity, not content authenticity. Individual event signatures are not mentioned as a verification step.
-- **Why it matters**: A compromised peer could inject fabricated governance events (role changes, tool registrations) into a reconnecting member's event log.
+- **Why it matters**: A compromised peer could inject fabricated governance events (role changes, outlet registrations) into a reconnecting member's event log.
 - **Severity**: HIGH
 
 ### [ADR-031] H11: Governance Freeze on Simultaneous Commit is Exploitable
@@ -205,7 +205,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-020] M8: Two-Tier Membership Write/Read Isolation Not Cryptographically Enforced
 - **Category**: Missing security analysis
 - **Location**: ADR-020, acceptance criteria 4-5
-- **What's missing**: Writers are MLS members; readers are not. But the ADR does not specify how readers query the context without MLS membership. If readers send requests through the relay, they can observe MLS ciphertext. If they query through a tool endpoint, how is that endpoint authenticated and how does it access the MLS-encrypted registration data?
+- **What's missing**: Writers are MLS members; readers are not. But the ADR does not specify how readers query the context without MLS membership. If readers send requests through the relay, they can observe MLS ciphertext. If they query through an outlet endpoint, how is that endpoint authenticated and how does it access the MLS-encrypted registration data?
 - **Why it matters**: The two-tier model's security properties depend on a reader-query mechanism that is not defined.
 - **Severity**: MEDIUM
 
@@ -282,7 +282,7 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 ### [ADR-030] M19: Checkpoint State Snapshot Is Extremely Large at Scale
 - **Category**: Scope gaps
 - **Location**: ADR-030, `ContextStateSnapshot` struct
-- **What's missing**: `ContextStateSnapshot` includes `membership: Vec<(DID, RoleName)>`, `tools: Vec<ToolRegistration>`, `sender_key_epochs: Vec<(DID, u64)>`, `blocks: Vec<(DID, DID)>`, and `ucan_revocations: Vec<String>`. For a context with 500 members and 100 tools, the snapshot could be hundreds of kilobytes. The ADR does not specify a maximum snapshot size or compression strategy, and this is published as an event log entry.
+- **What's missing**: `ContextStateSnapshot` includes `membership: Vec<(DID, RoleName)>`, `outlets: Vec<OutletRegistration>`, `sender_key_epochs: Vec<(DID, u64)>`, `blocks: Vec<(DID, DID)>`, and `ucan_revocations: Vec<String>`. For a context with 500 members and 100 outlets, the snapshot could be hundreds of kilobytes. The ADR does not specify a maximum snapshot size or compression strategy, and this is published as an event log entry.
 - **Why it matters**: Large checkpoint events dominate storage on mobile devices and increase relay bandwidth costs.
 - **Severity**: MEDIUM
 
@@ -290,13 +290,13 @@ The most concerning patterns are: (1) a cryptographic construction error in ADR-
 - **Category**: Contradictions with other ADRs
 - **Location**: ADR-030, section 2
 - **What's missing**: ADR-018 defines Ephemeral memory scope as "destroys keys immediately" on context close. ADR-030 defines a 30-day minimum retention for event logs. For an ephemeral context that closes after 1 hour, the event log must be retained for 30 days even though the content keys are destroyed. This creates a metadata retention obligation that conflicts with the ephemeral intent.
-- **Why it matters**: Ephemeral contexts that retain event log metadata for 30 days leak participation history (who was present, when, what tool invocations occurred) long after the content is unreadable.
+- **Why it matters**: Ephemeral contexts that retain event log metadata for 30 days leak participation history (who was present, when, what outlet invocations occurred) long after the content is unreadable.
 - **Severity**: MEDIUM
 
 ### [ADR-031] M21: GovernanceAction Variants Missing Size Limits
 - **Category**: Missing defaults
 - **Location**: ADR-031, section 3, `GovernanceAction` enum
-- **What's missing**: `GovernanceAction::RegisterTool { registration: ToolRegistration }` and `GovernanceAction::CreateChildContext { params: Box<ContextParams> }` embed potentially large payloads. No size limits are specified for these embedded objects. A malicious proposer could create proposals with arbitrarily large tool registrations or context params.
+- **What's missing**: `GovernanceAction::RegisterOutlet { registration: OutletRegistration }` and `GovernanceAction::CreateChildContext { params: Box<ContextParams> }` embed potentially large payloads. No size limits are specified for these embedded objects. A malicious proposer could create proposals with arbitrarily large outlet registrations or context params.
 - **Why it matters**: Resource exhaustion through oversized governance proposals stored in the event log.
 - **Severity**: MEDIUM
 

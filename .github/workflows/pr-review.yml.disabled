@@ -266,7 +266,7 @@ jobs:
             - New trait methods with default impls that should be overridden by
               concrete implementations
             - Public API added in core but not exported through FFI bridge
-              (`crates/scp-ffi/`) — check PyO3, UniFFI, NAPI, WASM targets
+              (`crates/scp-ffi/`) — check PyO3, UniFFI, NAPI targets
             - FFI bridge function added but not wrapped in language SDK
               (`bindings/python/`, `bindings/typescript/`, `bindings/swift/`,
               `bindings/kotlin/`)
@@ -274,7 +274,7 @@ jobs:
             **SDK Divergence**
             - If changes touch core types or public APIs, check whether ALL SDK bindings
               reflect the change. Build a matrix:
-              | Operation | Core | PyO3 | UniFFI | NAPI | WASM | Python SDK | TS SDK | Swift SDK | Kotlin SDK |
+              | Operation | Core | PyO3 | UniFFI | NAPI | Python SDK | TS SDK | Swift SDK | Kotlin SDK |
               Missing cells are findings.
             - SDK wrapper signatures must match FFI bridge signatures — watch for
               missing parameters, wrong types, swapped argument order

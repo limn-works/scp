@@ -53,7 +53,9 @@ struct MultiAgent {
             let sender = String(msg.senderDid.prefix(16))
             print("[\(name)] Received from \(sender)...: \(text)")
             count += 1
-            if count >= 2 { break }
+            if count >= 2 {
+                break
+            }
         }
 
         try await scp.contextLeave(handle: handle, identity: identity)
@@ -73,7 +75,7 @@ struct MultiAgent {
             ceiling: [
                 "messages:read",
                 "messages:write",
-                "tool:invoke:*",
+                "outlet:call:*",
                 "member:invite",
                 "member:remove",
                 "role:assign"

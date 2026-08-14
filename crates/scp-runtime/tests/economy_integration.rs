@@ -23,7 +23,7 @@
 //! 8. Free relays MUST always exist in bootstrap list
 //! 9. Auto-accept never applies to paid contexts
 //!
-//! Integration flow: create context with `EconomicPolicy` -> register tool with cost
+//! Integration flow: create context with `EconomicPolicy` -> register outlet with cost
 //! -> grant spending UCAN -> verify spending checks -> verify receipt provenance
 //! -> test auto-accept rejection -> test `SpendingCapabilityRequired`
 //! -> test dynamic pricing -> test anti-spam escalation -> verify free relay exists.
@@ -32,11 +32,11 @@
 
 use std::time::Duration;
 
+use scp_clock::Clock;
+use scp_did::DID;
 use scp_event_log::proof::{prove_inclusion, verify_inclusion};
 use scp_event_log::tree;
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
-use scp_identity::DID;
-use scp_primitives::Clock;
 use scp_protocol::crypto::ucan::spending::{BudgetTracker, SpendingCapability, SpendingError};
 use scp_protocol::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
 use scp_protocol::economy::antispam::{
@@ -200,14 +200,14 @@ fn payee_did() -> DID {
     DID::from("did:dht:z6MkPayee")
 }
 
-/// Creates a paid economic policy with per-message and per-tool-invoke costs.
+/// Creates a paid economic policy with per-message and per-outlet-invoke costs.
 fn paid_policy() -> EconomicPolicy {
     EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(10)),
-            per_tool_invoke: Some(Amount(50)),
+            per_outlet_call: Some(Amount(50)),
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -225,7 +225,7 @@ fn free_policy_no_costs() -> EconomicPolicy {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -245,7 +245,7 @@ fn default_metrics() -> ObservableMetrics {
 /// Uses `exp = now + 3600` (1 hour) to satisfy the 24-hour maximum expiry
 /// check enforced by `validate_spending_ucan`.
 fn make_spending_ucan(cap: &SpendingCapability, scope_uri: &str) -> UcanToken {
-    let now = scp_primitives::SystemClock.now_secs();
+    let now = scp_clock::SystemClock.now_secs();
 
     let cap_json = serde_json::to_value(cap).unwrap();
     let mut fct = serde_json::Map::new();
@@ -265,6 +265,7 @@ fn make_spending_ucan(cap: &SpendingCapability, scope_uri: &str) -> UcanToken {
             }],
             prf: vec![],
             fct: Some(serde_json::Value::Object(fct)),
+            nb: None,
         },
         signature: vec![0u8; 64],
         encoded: String::new(),
@@ -371,7 +372,7 @@ fn invariant_1_economic_policy_visible_before_opt_in() {
     assert!(economic_metadata.is_some());
     let p = economic_metadata.unwrap();
     assert_eq!(p.cost_schedule.per_message, Some(Amount(10)));
-    assert_eq!(p.cost_schedule.per_tool_invoke, Some(Amount(50)));
+    assert_eq!(p.cost_schedule.per_outlet_call, Some(Amount(50)));
     assert_eq!(p.cost_schedule.currency, usd());
     assert_eq!(p.payment_adapters, vec!["test"]);
     assert_eq!(p.payee, payee_did());
@@ -386,7 +387,7 @@ fn invariant_1_dynamic_pricing_visible_before_opt_in() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -462,7 +463,7 @@ fn invariant_1_relay_economic_config_visible_in_wellknown() {
 fn invariant_2_paid_action_without_spending_ucan_rejected() {
     use scp_protocol::crypto::ucan::spending::check_spending_capability;
 
-    let _now = scp_primitives::SystemClock.now_secs();
+    let _now = scp_clock::SystemClock.now_secs();
 
     // Action cost is 10 (non-zero), but no spending UCAN provided.
     let cost = scp_protocol::crypto::ucan::spending::Amount(10);
@@ -547,7 +548,7 @@ async fn invariant_2_authorize_capture_after_spending_check() {
 /// Paid actions with no spending UCAN are rejected.
 ///
 /// (Action capability is verified at the gate layer upstream per spec §19.5
-/// — see the `MessagesWrite` / `ToolInvoke` `member_has_capability` checks
+/// — see the `MessagesWrite` / `OutletInvoke` `member_has_capability` checks
 /// in the manager modules. This test exercises only the spending side.)
 #[test]
 fn invariant_2_spending_capability_paid_action_rejected_without_ucan() {
@@ -586,7 +587,7 @@ fn invariant_3_no_economic_policy_all_actions_free() {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -612,7 +613,7 @@ fn invariant_3_estimate_cost_zero_without_policy() {
     // No policy: all action types are free.
     for action in &[
         PaidActionType::MessageSend,
-        PaidActionType::ToolInvoke,
+        PaidActionType::OutletCall,
         PaidActionType::ContextJoin,
         PaidActionType::SubscriptionPeriod,
         PaidActionType::ByteStored,
@@ -814,7 +815,7 @@ fn invariant_4_payment_history_with_filters() {
         payee: DID::from("did:dht:z6MkAlice"),
         amount: Amount(200),
         currency: usd(),
-        action_type: PaidActionType::ToolInvoke,
+        action_type: PaidActionType::OutletCall,
         context_id: Some("ctx-1".to_owned()),
         adapter_id: "test".to_owned(),
         adapter_proof: vec![0x02],
@@ -948,7 +949,7 @@ fn invariant_6_unlocked_policy_update_succeeds() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -963,7 +964,7 @@ fn invariant_6_unlocked_policy_update_succeeds() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(20)),      // Updated cost.
-            per_tool_invoke: Some(Amount(100)), // New cost.
+            per_outlet_call: Some(Amount(100)), // New cost.
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -987,7 +988,7 @@ fn invariant_6_locked_policy_update_rejected() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1002,7 +1003,7 @@ fn invariant_6_locked_policy_update_rejected() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(20)), // Attempted change.
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1025,7 +1026,7 @@ fn invariant_6_voluntary_lock_transition() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(0)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1251,7 +1252,7 @@ fn invariant_9_auto_accept_blocked_regardless_of_cost_amount() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(1)), // Just 1 cent.
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1286,7 +1287,7 @@ fn invariant_9_pricing_formula_only_blocks_auto_accept() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1324,7 +1325,7 @@ async fn integration_full_lifecycle() {
     // Step 1: Verify policy is inspectable (invariant 1).
     assert!(policy_requires_payment(&policy));
     assert_eq!(policy.cost_schedule.per_message, Some(Amount(10)));
-    assert_eq!(policy.cost_schedule.per_tool_invoke, Some(Amount(50)));
+    assert_eq!(policy.cost_schedule.per_outlet_call, Some(Amount(50)));
 
     // Step 2: Evaluate message cost, authorize, capture.
     let msg_cost = evaluate_cost(&policy, &PaidActionType::MessageSend, &metrics).unwrap();
@@ -1346,30 +1347,30 @@ async fn integration_full_lifecycle() {
         .unwrap();
     let msg_receipt = adapter.capture(&msg_auth).await.unwrap();
 
-    // Step 3: Evaluate tool cost, authorize, capture.
-    let tool_cost = evaluate_cost(&policy, &PaidActionType::ToolInvoke, &metrics).unwrap();
-    assert_eq!(tool_cost, Amount(50));
+    // Step 3: Evaluate outlet cost, authorize, capture.
+    let outlet_cost = evaluate_cost(&policy, &PaidActionType::OutletCall, &metrics).unwrap();
+    assert_eq!(outlet_cost, Amount(50));
 
-    let tool_auth = adapter
+    let outlet_auth = adapter
         .authorize(
             &payer_did(),
             &payee_did(),
-            tool_cost,
+            outlet_cost,
             usd(),
             PaymentMetadata {
-                action_type: PaidActionType::ToolInvoke,
+                action_type: PaidActionType::OutletCall,
                 context_id: Some("ctx-lifecycle".to_owned()),
                 idempotency_key: [1u8; 16],
             },
         )
         .await
         .unwrap();
-    let tool_receipt = adapter.capture(&tool_auth).await.unwrap();
+    let outlet_receipt = adapter.capture(&outlet_auth).await.unwrap();
 
     // Step 4: Verify receipts in payment history (invariant 4). `payment_history`
     // reads the per-context local receipt buffer (PaymentReceived is excluded
     // from the canonical Merkle log per ADR-011 amendment exclusion taxonomy §2).
-    let receipts = vec![msg_receipt, tool_receipt];
+    let receipts = vec![msg_receipt, outlet_receipt];
 
     let history = payment_history(&receipts, None);
     assert_eq!(history.len(), 2);
@@ -1390,7 +1391,7 @@ fn integration_dynamic_pricing() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1535,7 +1536,7 @@ fn integration_anti_spam_via_pricing_formula() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,

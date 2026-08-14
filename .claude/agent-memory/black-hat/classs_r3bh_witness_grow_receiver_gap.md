@@ -1,0 +1,31 @@
+---
+name: classs-r3bh-witness-grow-receiver-gap
+description: ADR-049 §9 Class-S r3-bh (commit b23509123, the linear-token fix on top of beddb1c70) — token is sound but the role_view_grow_resolves_to_trait compile-witness is RECEIVER-SHAPE-FRAGILE: a &mut self inherent GROW on RoleStateClassCMut slips past green. Plus disclosed-class residuals (caller-discipline arming, mem::forget, alias use-as, raw seam).
+metadata:
+  type: project
+---
+
+# Class-S r3-bh @ b23509123 (linear-token consequence-GROW fix) — 1 real compile-witness gap + disclosed residuals
+
+File: crates/scp-runtime/src/context/actor/class_s.rs (6813 lines). roles.rs = crates/scp-protocol/src/context/roles.rs. All 7 probes COMPILED+RAN in worktree classs-r3-bh, reverted zero-diff.
+
+## HEADLINE (MEDIUM/HIGH, latent): BLACK-3 — `role_view_grow_resolves_to_trait` witness is receiver-shape-coupled, NOT GROW-coupled
+- The witness (class_s.rs:3437) builds `let role_view = view.role_state_class_c_mut();` — a NON-`mut` binding — then calls `role_view.suspend_all()` (zero args) binding to `NoGrowWitness`. Coupling = inherent-preferred-over-trait at the `&self` autoref level.
+- PROVEN: injecting a REAL `pub(crate) fn suspend_all(&mut self, member_did:&str)` (idiomatic mutator shape) into `RoleStateClassCMut`'s inherent impl (it holds `&mut member_capabilities` + `&mut suspended_capabilities`, so the GROW body compiles) leaves ALL FOUR witnesses GREEN (role_view_grow_resolves_to_trait, best_effort_view_has_no_whole_mut_accessor, tripwire_rejects_class_s_cell_alias, whitelist_is_bounded). The `&mut self` inherent is INAPPLICABLE at the non-`mut` `role_view` call site, so resolution falls through to the trait shim — witness never sees it.
+- PROVEN usable: `class_c_view().role_state_class_c_mut()` then `RoleStateClassCMut::suspend_all(&mut role_view, victim)` (fully-qual to dodge the in-scope test trait shim; in a real handler the `#[cfg(test)]` trait is NOT in scope so plain `.suspend_all(victim)` resolves to inherent) → member_has_capability flips false, persist_calls==0. Silent best-effort GROW — the exact BLACK-CS-03 transition the witness claims to forbid.
+- CONTROL: a `&self`-receiver inherent `suspend_all` DOES break the witness (E0061 arity + E0308 NoGrowWitness vs ()). So the witness protects ONLY the `&self`/by-value receiver shape, never `&mut self` — and a mutator is `&mut self` by nature. FIX: make the witness bind `let mut role_view` and/or also probe a `&mut self` zero-arg shim; better, brace-depth/field-privatize so a GROW body is unwritable on the best-effort view (the consequence view already isolates the GROW). Same lesson as past waves: a coupled compile-witness must cover the receiver mutability the real mutator uses.
+
+## DISCLOSED RESIDUALS (the fix's own docs admit these — convention, not structure)
+- BLACK-1a (HIGH latent, = re-confirmed BLACK-CS-03): `class_c_view().consequence_split().role_state.suspend_all(victim)` then DROP a `None` `Option<ClassSCommitToken>` sink (never call `note_downward_auth`) → GROW lands, 0 persists, NO panic (token never minted). Arming is a SEPARATE hand-written step decoupled from the mutation; a new caller that forgets it gets a silent non-persisted downward-auth GROW. consequence_split doc (2351) now HONESTLY says this is CALLER DISCIPLINE, not impossibility.
+- BLACK-1c (MEDIUM): same path, `consequence_split().role_state.member_capabilities_mut().remove(victim)` → authority-cache demotion, 0 persists. member_capabilities_mut still EXISTS on the CONSEQUENCE view (only the best-effort RoleStateClassCMut one was deleted in this commit).
+- BLACK-2 (LOW, disclosed): `std::mem::forget(token)` suppresses the Drop guard → armed-but-uncommitted obligation lost, no panic. Token IS otherwise linear: move-consume blocks double-commit; BLACK-1b PROVEN — arming then `sink.take()`+drop PANICS ("dropped without commit"). So once minted the token is sound; the hole is that minting is optional (1a) and forget escapes (2).
+- BLACK-4 (LOW, explicitly disclaimed by tripwire doc): `use …::ClassSCell as Evil;` evades `class_s_cell_alias` (it keys on `type` keyword only). Real impact bounded: ClassSCell.state is a PRIVATE field, so `impl Evil { …self.state.class_s… }` only compiles IN-module (attacker already editing class_s.rs). Compile boundary (private field + no DerefMut) holds.
+- BLACK-5 (LOW): `ContextRoleState::class_c_parts()` is `pub` with RAW `pub &mut suspended_capabilities`/`member_capabilities` — a direct off-obligation GROW with no token/persist. BUT reachability through the CELL is BLOCKED: `&mut cell.role_state` needs DerefMut on ClassSCell (not impl'd). Only a holder of a whole `&mut ContextRoleState` outside the cell reaches it; seam doc says confinement is the consuming view's job (single consumer set today).
+
+## WHAT HOLDS
+- ClassSCell has NO DerefMut → cannot even SEED role_state fields through the cell (must go via a combinator/consequence view). Whole `&mut` to Class-S only via ClassSMut::rest_mut (fail-closed combinator).
+- Token linearity once minted: !Clone/!Copy, move-consume commit (no double-commit), #[must_use], Drop-guard debug panic + release metric. note_downward_auth idempotent (one persist per cascade).
+- best_effort_view_has_no_whole_mut_accessor: ClassCMut holds role_state as a WRAPPED RoleStateClassCMut (not raw &mut ContextRoleState) — an inherent rest_mut/role_state_mut returning whole &mut is UNWRITABLE by construction (M-rest finding from prior waves). That witness guards a property already structurally true; the EXPLOITABLE asymmetry is the RoleStateClassCMut one (BLACK-3), which holds &mut to the actual maps.
+
+## BOTTOM LINE
+The token mechanism is sound. The two real soft spots: (1) BLACK-3 — the GROW compile-witness is receiver-shape-fragile (`&mut self` inherent slips past), so the structural claim "adding an inherent GROW is a compile error" is FALSE for the idiomatic mutator shape; (2) arming the token is caller discipline decoupled from the mutation (BLACK-1a) — a new consequence caller can silently skip the persist. Both are latent (no live exploiting caller today). Everything the commit message claims to make STRUCTURAL is convention guarded by a fragile witness; the genuine structural guarantee remains the cell's no-DerefMut + private-field boundary.

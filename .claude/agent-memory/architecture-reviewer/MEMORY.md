@@ -85,3 +85,6 @@ build-xcframework.sh renames `scp_ffi_uniffi.swift` to `ScpBindings.swift` and c
 - ADR-031: Multi-Admin Governance -- phase-6.md line 2273+
 - Conflict resolution spec: ADR-029 section 5 (line 1409+) and ADR-031 section 7 (line 2614+)
 - Required EventType additions: MemberReset, QueueDrained (ADR-029 criterion 7), GovernanceConflictDetected, GovernanceConflictResolved (ADR-031 section 7)
+
+## Outlet cross-context saga (SCP-OUT)
+- [SCP-OUT-046 streaming-saga seal FSM](scp-out-046-streaming-saga-seal-fsm.md) — APPROVED; ADR-061 seal phase; Class-S/Send/capability-reduction verified; per-set gating (try_reserve_context_set) replaces supervisor-wide AtomicBool; streaming driver is a justified separate FSM (not run_saga).

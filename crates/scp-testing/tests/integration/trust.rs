@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
 use scp_core::context::roles::Capability;
-use scp_core::identity::SigningKeyId;
 use scp_core::identity::block_list::{BlockListEvent, BlockListState};
 use scp_core::trust::challenge::VerificationMethod;
 use scp_core::trust::{
@@ -42,8 +41,8 @@ use scp_core::trust::{
     produce_participation_profile, verify_attestation, verify_challenge_response,
     verify_participation_requirements,
 };
+use scp_did::{DID, SigningKeyId};
 use scp_event_log::{Event, EventPayload, EventType};
-use scp_identity::DID;
 use scp_platform::testing::InMemoryDeviceAttestation;
 use scp_platform::traits::DeviceAttestation;
 
@@ -62,7 +61,7 @@ fn sk_for(seed: u8) -> SigningKey {
 /// Test Clock that always returns a fixed timestamp.
 struct FixedClock(u64);
 
-impl scp_identity::cache::Clock for FixedClock {
+impl scp_clock::Clock for FixedClock {
     fn now_secs(&self) -> u64 {
         self.0
     }
@@ -129,6 +128,18 @@ fn make_event(
     }
 }
 
+/// Encodes a canonical `MembershipChangePayload` (subject-bearing membership
+/// leaf) so participation-duration intervals are attributable to the member
+/// (§7.3.2).
+fn membership_payload(subject_did: &str, role_name: &str) -> Vec<u8> {
+    scp_event_log::payload::encode_payload(&scp_event_log::payload::MembershipChangePayload {
+        subject_did: subject_did.to_owned(),
+        role_name: role_name.to_owned(),
+    })
+    .expect("membership payload encodes")
+    .data
+}
+
 /// Creates a signed attestation using the given signing key.
 fn make_signed_attestation(
     id: &str,
@@ -170,7 +181,9 @@ fn make_signed_attestation(
     use scp_core::crypto::canonical::{CanonicalField, canonical_hash};
     use scp_core::trust::attestation_type_tag;
 
-    let claim_bytes = rmp_serde::to_vec_named(&att.claim).unwrap();
+    // Claim is compact JSON (RFC 8785 JCS) per §9.5.2 Attestation row 5;
+    // evidence/revocation_status stay MessagePack per the §9.5.2 note.
+    let claim_bytes = scp_core::jcs::to_vec(&att.claim).unwrap();
     let evidence_bytes = att
         .evidence
         .as_ref()
@@ -223,25 +236,36 @@ fn make_trust_signal(
 async fn behavioral_record_computation() {
     let alice = "did:dht:z6MkAlice";
     let events = vec![
-        make_event(EventType::MessageSent, alice, 1000, 0, vec![]),
+        make_event(
+            EventType::MemberJoined,
+            alice,
+            1000,
+            0,
+            membership_payload(alice, "member"),
+        ),
         make_event(EventType::MessageSent, alice, 1100, 1, vec![]),
         make_event(
-            EventType::ToolInvoked,
+            EventType::OutletInvoked,
             alice,
             1200,
             2,
-            b"my-tool\0".to_vec(),
+            b"my-outlet\0".to_vec(),
         ),
-        make_event(EventType::ContextCreated, alice, 1300, 3, vec![]),
+        make_event(EventType::ChildContextCreated, alice, 1300, 3, vec![]),
     ];
 
-    let record = compute_participation_record(&events, alice, "ctx-test", [0u8; 32], 2000).unwrap();
+    // No attestation-cache access ⇒ empty accessible-attestation set (§7.3.2).
+    let record =
+        compute_participation_record(&events, alice, "ctx-test", [0u8; 32], 2000, &[]).unwrap();
 
     assert_eq!(record.subject_did, did(alice));
     assert_eq!(record.context_id, "ctx-test");
+    // MemberJoined + MessageSent + OutletInvoked + ChildContextCreated = 4 events.
     assert_eq!(record.participation_count, 4);
-    assert_eq!(record.participation_duration_seconds, 300); // 1300 - 1000
-    assert_eq!(*record.tool_invocations.get("my-tool").unwrap_or(&0), 1);
+    // Membership-interval duration: open MemberJoined (1000) → latest event
+    // ts (1300) = 300 seconds.
+    assert_eq!(record.participation_duration_seconds, 300);
+    assert_eq!(*record.outlet_invocations.get("my-outlet").unwrap_or(&0), 1);
     assert_eq!(record.context_creation_count, 1);
     assert_eq!(record.computed_at, 2000);
 }
@@ -483,7 +507,7 @@ async fn consequence_rules_evaluation() {
             window: Duration::from_mins(1),
         },
         ConsequenceRule {
-            trigger: ConsequenceTrigger::ToolRateExceeded,
+            trigger: ConsequenceTrigger::OutletRateExceeded,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 2,
             window: Duration::from_mins(2),
@@ -495,8 +519,20 @@ async fn consequence_rules_evaluation() {
         make_event(EventType::MessageSent, alice, 950, 0, vec![]),
         make_event(EventType::MessageSent, alice, 960, 1, vec![]),
         make_event(EventType::MessageSent, alice, 970, 2, vec![]),
-        make_event(EventType::ToolInvoked, alice, 980, 3, b"tool-a".to_vec()),
-        make_event(EventType::ToolInvoked, alice, 990, 4, b"tool-b".to_vec()),
+        make_event(
+            EventType::OutletInvoked,
+            alice,
+            980,
+            3,
+            b"outlet-a".to_vec(),
+        ),
+        make_event(
+            EventType::OutletInvoked,
+            alice,
+            990,
+            4,
+            b"outlet-b".to_vec(),
+        ),
     ];
 
     let triggered = evaluate_consequence_rules(&rules, &events, alice, 1000, 1000);
@@ -540,7 +576,7 @@ async fn action_classification() {
 
     // Category B resources (operational)
     assert_eq!(classify_action("messages"), ActionCategory::CategoryB);
-    assert_eq!(classify_action("tool_invoke"), ActionCategory::CategoryB);
+    assert_eq!(classify_action("outlet_call"), ActionCategory::CategoryB);
     assert_eq!(classify_action("member"), ActionCategory::CategoryB);
     assert_eq!(classify_action("role"), ActionCategory::CategoryB);
     assert_eq!(classify_action("context"), ActionCategory::CategoryB);
@@ -910,9 +946,21 @@ async fn participation_profile_produce_verify() {
     let merkle_root = [0u8; 32];
 
     let events = vec![
-        make_event(EventType::MessageSent, alice, 1000, 0, vec![]),
+        make_event(
+            EventType::MemberJoined,
+            alice,
+            1000,
+            0,
+            membership_payload(alice, "member"),
+        ),
         make_event(EventType::MessageSent, alice, 2000, 1, vec![]),
-        make_event(EventType::ToolInvoked, alice, 3000, 2, b"tool-x\0".to_vec()),
+        make_event(
+            EventType::OutletInvoked,
+            alice,
+            3000,
+            2,
+            b"outlet-x\0".to_vec(),
+        ),
     ];
 
     let profile = produce_participation_profile(
@@ -925,13 +973,16 @@ async fn participation_profile_produce_verify() {
             is_member: true,
             is_opted_in: true,
             current_time: 4000,
+            accessible_attestations: &[],
         },
     )
     .unwrap();
 
     assert_eq!(profile.subject_did, did(alice));
-    assert_eq!(profile.participation_duration_secs, 2000); // 3000 - 1000
-    assert_eq!(profile.tool_invocation_count, 1);
+    // Membership-interval duration: open MemberJoined (1000) → latest event
+    // ts (3000) = 2000 seconds.
+    assert_eq!(profile.participation_duration_secs, 2000);
+    assert_eq!(profile.outlet_invocation_count, 1);
     assert_eq!(profile.updated_at, 4000);
     assert_ne!(profile.signature, [0u8; 64]);
 
@@ -953,6 +1004,7 @@ async fn participation_profile_produce_verify() {
             is_member: false,
             is_opted_in: true,
             current_time: 4000,
+            accessible_attestations: &[],
         },
     )
     .unwrap_err();
@@ -969,6 +1021,7 @@ async fn participation_profile_produce_verify() {
             is_member: true,
             is_opted_in: false,
             current_time: 4000,
+            accessible_attestations: &[],
         },
     )
     .unwrap_err();
@@ -987,9 +1040,17 @@ async fn participation_requirements_check() {
     let merkle_root = [0u8; 32];
     let current_time: u64 = 5000;
 
-    // Create events that will produce a profile with some participation.
+    // Create events that will produce a profile with some participation. A
+    // subject-bearing MemberJoined anchors the participation-duration interval
+    // (§7.3.2).
     let events = vec![
-        make_event(EventType::MessageSent, alice, 1000, 0, vec![]),
+        make_event(
+            EventType::MemberJoined,
+            alice,
+            1000,
+            0,
+            membership_payload(alice, "member"),
+        ),
         make_event(EventType::MessageSent, alice, 3000, 1, vec![]),
     ];
 
@@ -1003,6 +1064,7 @@ async fn participation_requirements_check() {
             is_member: true,
             is_opted_in: true,
             current_time: 4500,
+            accessible_attestations: &[],
         },
     )
     .unwrap();
@@ -1017,6 +1079,7 @@ async fn participation_requirements_check() {
             is_member: true,
             is_opted_in: true,
             current_time: 4500,
+            accessible_attestations: &[],
         },
     )
     .unwrap();
@@ -1031,7 +1094,7 @@ async fn participation_requirements_check() {
 
     // Should pass with one profile meeting the threshold.
     let result =
-        verify_participation_requirements(current_time, &requirements, &[profile1.clone()]);
+        verify_participation_requirements(current_time, alice, &requirements, &[profile1.clone()]);
     assert!(result.is_ok(), "should pass with valid profile: {result:?}");
 
     // Requirement needing 2 distinct contexts: passes with 2 profiles.
@@ -1042,19 +1105,27 @@ async fn participation_requirements_check() {
         min_contexts: 2,
     }];
 
-    let result_1 =
-        verify_participation_requirements(current_time, &requirements_2ctx, &[profile1.clone()]);
+    let result_1 = verify_participation_requirements(
+        current_time,
+        alice,
+        &requirements_2ctx,
+        &[profile1.clone()],
+    );
     assert!(result_1.is_err(), "should fail with only 1 context");
 
-    let result_2 =
-        verify_participation_requirements(current_time, &requirements_2ctx, &[profile1, profile2]);
+    let result_2 = verify_participation_requirements(
+        current_time,
+        alice,
+        &requirements_2ctx,
+        &[profile1, profile2],
+    );
     assert!(
         result_2.is_ok(),
         "should pass with 2 distinct contexts: {result_2:?}"
     );
 
     // Empty requirements always pass.
-    assert!(verify_participation_requirements(current_time, &[], &[]).is_ok());
+    assert!(verify_participation_requirements(current_time, alice, &[], &[]).is_ok());
 }
 
 // ---------------------------------------------------------------------------

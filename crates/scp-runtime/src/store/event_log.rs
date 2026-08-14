@@ -128,7 +128,7 @@ fn merkle_event_log_prefix(context_id: &str) -> Result<String, StoreError> {
 /// that dimension. Multiple filters are `ANDed` together.
 #[derive(Debug, Clone, Default)]
 pub struct EventQueryFilter {
-    /// Match events with this exact event type (e.g., `"ToolInvoked"`).
+    /// Match events with this exact event type (e.g., `"OutletInvoked"`).
     pub event_type: Option<String>,
     /// Match events from this specific actor DID.
     pub actor_did: Option<String>,
@@ -722,7 +722,7 @@ impl<S: Storage> ProtocolRepository<S> {
     clippy::cast_possible_truncation
 )]
 mod tests {
-    use scp_platform::testing::InMemoryStorage;
+    use scp_platform::in_memory::InMemoryStorage;
 
     use super::*;
 
@@ -889,7 +889,7 @@ mod tests {
     ) -> scp_event_log::Event {
         scp_event_log::Event {
             event_type,
-            actor_did: scp_event_log::DID(actor.to_owned()),
+            actor_did: scp_did::DID(actor.to_owned()),
             timestamp: 1_700_000_000 + seq,
             sequence: seq,
             payload: scp_event_log::EventPayload {
@@ -907,7 +907,11 @@ mod tests {
     #[tokio::test]
     async fn store_and_load_event_data_roundtrip() {
         let store = make_store();
-        let event = make_test_event(0, scp_event_log::EventType::ToolInvoked, "did:dht:z6MkTest");
+        let event = make_test_event(
+            0,
+            scp_event_log::EventType::OutletInvoked,
+            "did:dht:z6MkTest",
+        );
         let bytes = serialize_event(&event);
 
         store.store_event_data("ctx-1", 0, &bytes).await.unwrap();
@@ -961,7 +965,11 @@ mod tests {
     async fn append_event_full_stores_both_hash_and_payload() {
         let store = make_store();
         let hash = test_hash(0xAB);
-        let event = make_test_event(0, scp_event_log::EventType::ToolInvoked, "did:dht:z6MkTest");
+        let event = make_test_event(
+            0,
+            scp_event_log::EventType::OutletInvoked,
+            "did:dht:z6MkTest",
+        );
         let bytes = serialize_event(&event);
 
         store
@@ -1005,7 +1013,7 @@ mod tests {
         let store = make_store();
 
         let e0 = make_test_event(0, scp_event_log::EventType::MessageSent, "did:dht:z6MkA");
-        let e1 = make_test_event(1, scp_event_log::EventType::ToolInvoked, "did:dht:z6MkB");
+        let e1 = make_test_event(1, scp_event_log::EventType::OutletInvoked, "did:dht:z6MkB");
         let e2 = make_test_event(2, scp_event_log::EventType::MessageSent, "did:dht:z6MkC");
         store
             .append_event_full("ctx-1", 0, &test_hash(0), &serialize_event(&e0))
@@ -1223,7 +1231,7 @@ mod tests {
         let store = make_store();
         let entry = scp_event_log::Event {
             event_type: scp_event_log::EventType::ContextCreated,
-            actor_did: scp_event_log::DID(String::new()),
+            actor_did: scp_did::DID(String::new()),
             timestamp: 1_700_000_000,
             sequence: 0,
             payload: scp_event_log::EventPayload::default(),
@@ -1255,7 +1263,7 @@ mod tests {
         let entries = vec![
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 1_700_000_000,
                 sequence: 0,
                 payload: scp_event_log::EventPayload::default(),
@@ -1264,7 +1272,7 @@ mod tests {
             },
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::MemberJoined,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 1_700_000_001,
                 sequence: 0,
                 payload: scp_event_log::EventPayload::default(),
@@ -1307,7 +1315,7 @@ mod tests {
         let store = make_store();
         let entries = vec![scp_event_log::Event {
             event_type: scp_event_log::EventType::ContextCreated,
-            actor_did: scp_event_log::DID(String::new()),
+            actor_did: scp_did::DID(String::new()),
             timestamp: 1_700_000_000,
             sequence: 0,
             payload: scp_event_log::EventPayload::default(),
@@ -1352,7 +1360,7 @@ mod tests {
         for i in 0..5u8 {
             let entry = scp_event_log::Event {
                 event_type: scp_event_log::EventType::MessageSent,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: u64::from(i),
                 sequence: u64::from(i),
                 payload: scp_event_log::EventPayload::default(),
@@ -1369,7 +1377,7 @@ mod tests {
         let pruned = vec![
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::MessageSent,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 3,
                 sequence: 0,
                 payload: scp_event_log::EventPayload::default(),
@@ -1378,7 +1386,7 @@ mod tests {
             },
             scp_event_log::Event {
                 event_type: scp_event_log::EventType::MessageSent,
-                actor_did: scp_event_log::DID(String::new()),
+                actor_did: scp_did::DID(String::new()),
                 timestamp: 4,
                 sequence: 1,
                 payload: scp_event_log::EventPayload::default(),

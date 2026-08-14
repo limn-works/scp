@@ -1,0 +1,23 @@
+---
+name: changerole-shared-orchestration
+description: ChangeRole shared-orchestration slice (#1877 first convergence + #206 per-action-leaf), branch feat/changerole-shared-orchestration off 62bbe9c11; re-derivation map vs spike 26f0d6d4e
+metadata:
+  type: project
+---
+
+First #1877 convergence slice + closes #206 (WASM per-action ChangeRole leaf). Branch `feat/changerole-shared-orchestration` (commit b800910c7) off origin/main 62bbe9c11. NOT pushed — Alec reviews first.
+
+**What landed:** `scp_protocol::context::orchestration` module (mod.rs + state_view.rs, ChangeRole-only) reused VERBATIM from spike 26f0d6d4e (pure protocol logic over scp-event-log, wasm32-safe, unchanged by #1885). `orchestrate_change_role<S: ContextStateMut>` = is_active → has_member → assign_role → persist_fail_closed (before leaf, §9) → append RoleAssigned (empty `EventPayload::default()`). Native + WASM each impl the 5-method trait.
+
+**Why:** Two transcriptions of the same governance logic drift → divergent Merkle leaves → false-positive §9.9.3 equivocation. Hosting once makes leaf+ordering equal by construction. WASM ALSO previously appended NO RoleAssigned leaf (the #206 gap).
+
+**How to apply (the load-bearing re-derivation — bridge wiring is NOT verbatim from the spike):**
+- The spike's `scp-protocol` module is reusable as-is. The spike's NATIVE wiring is STALE: #1885 rewrote native `execute_change_role` from `state: &mut PerContextState` + free `persist_state_fail_closed` to `cell: &mut ClassSCell` + `cell.commit_class_s_keep(closure)`. ClassSCell has NO DerefMut / no state_mut — the ONLY mutable access is through a persisting combinator, so you CANNOT do assign-then-separate-persist. Native mapping: `assign_role` runs the role mutation INSIDE `commit_class_s_keep` (assign+persist atomic), `persist_fail_closed` is a NO-OP (persist already rode the mutation — documented on the type), `append_leaf` does `append_context_event_with_payload(EventPayload::default())` + `*cell.class_c_view().checkpoint_events_since_mut() += 1` (native-only, no WASM analogue). `event_count` reads `cell.event_log.as_ref().map_or(0, |l| tree::event_count(&l.tree))` via Deref.
+- Native byte-identical: `append_context_event` (old) == `append_context_event_with_payload(.., EventPayload::default(), ..)` (default-forwards). `MemberNotFound(did.to_string())` == `to_owned()` on the &str projection (DID Display writes self.0). Reject-before-mutate guards moved from inside the closure to the shared body's is_active/has_member — still no persist on reject. Oracle = `cargo test -p scp-runtime --test governance_integration --features testing` (58/0, incl full_threshold_lifecycle_add_signer_then_change_role).
+- WASM mapping is closer to spike: `WasmChangeRoleState{ctx,context_id}`. Switch arm from `require_active_context_mut` → `require_context_mut` (shared body does is_active w/ same CTX_2013). `append_leaf` = `ctx.append_log_event(type, executor_did, &payload.data, ts)` — mirrors `dispatch_remove_member`'s MemberLeft EXACTLY. persist=no-op.
+
+**§4 consequence.rs finding (REQUIRED, not optional):** adding the RoleAssigned leaf breaks the WASM direct-execute parity test `cross_impl_governance_action_executed_direct_stamps_proposer_wasm` — it asserted root == SINGLE-leaf GovernanceActionExecuted reconstruction; now it's a TWO-leaf log. Fix = add `native_reference_change_role_two_leaf_root` helper + assert two-leaf root (exactly the spike's consequence.rs change). The OTHER ChangeRole tests in consequence.rs (`stamps_executor`, `nonadmin_voter…mints_one_leaf`) use `.find(GovernanceActionExecuted)` / `.filter(==Executed).count()==1` → robust to the extra leaf, no change. manager.rs replay test (9538) also filters by Executed count → robust.
+
+**§5 conformance:** drop `RoleAssigned` from `wasm_native_full_governance_eventtype_parity_pending`'s `unappended_by_wasm` list + docstring (mirror how #1885 dropped MemberLeft). Add `cross_impl_change_role_leaf_is_empty_and_precedes_executed` modeled on `cross_impl_remove_member_leaf_is_empty_and_precedes_executed` (native two-leaf replay — scp-runtime test crate can't dep scp-ffi-wasm cdylib, so REPLAY not invoke). WASM real-path KAT = `cross_impl_role_assigned_leaf_bytes_wasm` in consequence.rs.
+
+**Scope guard:** ChangeRole ONLY. Do NOT carry the spike's RemoveMember/crypto_view/remove_member_view trait additions (separate later #1877 slice — the hard class needing MLS crypto abstraction, see [[finding-velocity-token-not-durable]] sibling work). 7-file footprint, NO enforcement files touched. Verify gauntlet all green (protocol orch 3/0, wasm lib 380/0, wasm_conformance 58/0+1ign, governance_integration 58/0, full clippy clean, fmt clean).

@@ -22,7 +22,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use scp_fuzz::ArbCanonicalHashInput;
-use scp_primitives::SigningKeyId;
+use scp_did::SigningKeyId;
 use scp_protocol::envelope::InnerEnvelopeParams;
 use scp_protocol::envelope::inner::compute_canonical_hash;
 

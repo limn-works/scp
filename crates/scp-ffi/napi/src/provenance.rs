@@ -45,7 +45,7 @@ pub(crate) async fn evaluate_provenance_quality_on(
         counterparties: counterparties
             .unwrap_or_default()
             .into_iter()
-            .map(scp_identity::DID::from)
+            .map(scp_did::DID::from)
             .collect(),
         purpose: None,
         discovery_method: DiscoveryMethod::OutOfBand,
@@ -88,7 +88,7 @@ pub(crate) fn provenance_attach_on(
         context_id: source_context_id.clone(),
         source_type: st,
         memory_scope: ms,
-        members: members.into_iter().map(scp_identity::DID::from).collect(),
+        members: members.into_iter().map(scp_did::DID::from).collect(),
         discovery_method: dm,
         data_age: std::time::Duration::from_secs(0),
         purpose,
@@ -127,14 +127,19 @@ pub(crate) fn provenance_attach_on(
         None,
     );
 
-    // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
-    let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| {
+    // Compute provenance hash: SHA-256 of the MessagePack-serialized provenance
+    // record (§24.3.3). Uses the same `rmp_serde::to_vec` encoding as the signed
+    // broadcast path
+    // (`scp_protocol::crypto::sender_keys::broadcast::compute_provenance_hash`)
+    // and the event-log leaf, so the logged hash matches the signed-path hash
+    // for identical input.
+    let prov_bytes = rmp_serde::to_vec(&prov).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("failed to serialize provenance for hashing: {e}"),
             code: codes::VALID_7053.to_owned(),
         })
     })?;
-    let prov_hash: [u8; 32] = Sha256::digest(&prov_json_bytes).into();
+    let prov_hash: [u8; 32] = Sha256::digest(&prov_bytes).into();
 
     // Record ProvenanceAttached in the source context event log.
     // Best-effort: log warning if context not found (provenance_attach
@@ -188,7 +193,10 @@ pub(crate) fn provenance_attach_on(
         "chain_path": prov.chain_path,
         "purpose": prov.purpose,
         "discovery_method": discovery_method_str,
-        "payment_amount": prov.payment_amount.map(|a| a.0),
+        // ADR-060: a monetary `Amount` crosses JSON as its canonical base-10
+        // decimal string (never a bare number), so a full `u64` survives the
+        // boundary exactly. The TS SDK parses this string into a `bigint`.
+        "payment_amount": prov.payment_amount.map(|a| a.0.to_string()),
         "payment_adapter": prov.payment_adapter,
         "payment_receipt_id": prov.payment_receipt_id.map(hex::encode),
     });
@@ -322,7 +330,7 @@ pub(crate) fn provenance_update_source_type_on(
 /// Appends a provenance event (`ProvenanceAttached` or `ProvenanceReceived`)
 /// to the event log for the given context.
 ///
-/// Follows the unsigned-event pattern used by `ToolInvoked` in the MCP bridge.
+/// Follows the unsigned-event pattern used by `OutletInvoked` in the MCP bridge.
 fn append_provenance_event(
     bi: &NapiBridgeInstance,
     context_id: &str,
@@ -330,10 +338,7 @@ fn append_provenance_event(
     event_type: scp_event_log::EventType,
     provenance_hash: &[u8; 32],
 ) -> napi::Result<()> {
-    #[allow(clippy::cast_possible_truncation)]
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
     crate::runtime::with_context(bi, context_id, |state| {
         let sequence = scp_event_log::tree::event_count(&state.core.event_log);
@@ -345,7 +350,7 @@ fn append_provenance_event(
 
         let event = scp_event_log::Event {
             event_type,
-            actor_did: scp_identity::DID::from(actor_did.to_owned()),
+            actor_did: scp_did::DID::from(actor_did.to_owned()),
             timestamp,
             sequence,
             payload: scp_event_log::EventPayload {

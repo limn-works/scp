@@ -12,21 +12,24 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use scp_transport::native::storage::BlobStorageBackend;
+
 use axum::body::Body;
 use http_body_util::BodyExt;
 use hyper::Request;
 use tower::ServiceExt;
 
+use scp_clock::SystemClock;
 use scp_core::context::ContextMode;
 use scp_core::uri::ScpUri;
 use scp_core::well_known::WellKnownScp;
-use scp_identity::cache::SystemClock;
+use scp_dht::InMemoryDhtClient;
 use scp_identity::dht::DidDht;
-use scp_identity::dht_client::InMemoryDhtClient;
 use scp_identity::{DidCache, DidMethod};
 use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
-use scp_transport::native::protocol::{ClientMessage, RelayMessage};
+use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::testing::InMemoryKeyCustody;
+use scp_relay_client::{ClientMessage, RelayMessage};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Builds a WebSocket client request to the relay with the bridge secret
@@ -94,6 +97,7 @@ async fn build_test_node_with(
                 did_method: Arc::new(did_dht),
             },
             InMemoryStorage::new(),
+            BlobStorageBackend::in_memory(),
         )
     })
     .await
@@ -859,6 +863,11 @@ async fn scenario8_projection_endpoints_coexist_with_well_known() {
 /// Verifies that `ApplicationNode::dev(port)` creates a fully functional node
 /// with in-memory storage, auto-generated DID identity, self-signed TLS, and
 /// a relay bound to localhost.
+///
+/// `ApplicationNode::dev` is a test-harness constructor (in-memory DHT nullifier)
+/// gated behind `feature = "testing"` (ADR-062 §Decision 1), so this test runs
+/// only in the testing lane (`cargo test -p scp-node --features testing`).
+#[cfg(feature = "testing")]
 #[tokio::test]
 async fn dev_constructor_creates_working_node() {
     use scp_node::ApplicationNode;

@@ -126,7 +126,7 @@ ALLOWLIST=(
     TEMP_FILE_COUNTER               # why: monotonic AtomicU64 for tempfile naming collision avoidance; no shared state.
 
     # One-shot init / test-only clocks
-    SYSTEM_CLOCK                    # why: test-only `scp_primitives::SystemClock` zero-sized type passed by reference from integration test.
+    SYSTEM_CLOCK                    # why: test-only `scp_clock::SystemClock` zero-sized type passed by reference from integration test.
     FORCE_LINK                      # why: link-graph marker (`pub static FORCE_LINK: u8 = 0;`) in `crates/scp-ffi/napi-test-stubs` — test-only rlib referenced by scp-ffi-napi's `#[cfg(test)]` to pull its `cargo:rustc-link-lib=static=napi_test_stubs` build-script directive into the lib-test link args. Not shared state.
 
     # Allowlist carried over from FFI gate (shared names — this gate skips
@@ -155,7 +155,6 @@ EXCLUDE_DIRS=(
     crates/scp-ffi/common/src
     crates/scp-ffi/napi/src
     crates/scp-ffi/uniffi/src
-    crates/scp-ffi/wasm/src
 )
 
 # Directories to scan. Every crate under `crates/` except the excluded FFI

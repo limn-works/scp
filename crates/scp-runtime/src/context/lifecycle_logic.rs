@@ -1,6 +1,6 @@
 //! Context lifecycle: free-function logic for create, join, leave,
 //! restore, export, import. Hoisted out of the deleted `manager/`
-//! directory in ADR-049 commit 12; the helpers in
+//! directory in ADR-049 §15; the helpers in
 //! [`crate::context::lifecycle_helpers`] call into these primitives.
 
 use std::collections::HashMap;
@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 
-use scp_identity::DID;
+use scp_did::DID;
 
-/// Builds an [`IdentityDepthAssessment`] for a member in a context.
+/// Builds an [`IdentityDepthAssessment`](scp_protocol::trust::sybil::IdentityDepthAssessment) for a member in a context.
 ///
 /// Shared by `evaluate_sybil_resistance` (join path) and `check_proposer_eligibility`
 /// (governance path). Populates trust signals from available context state:
@@ -110,9 +110,8 @@ pub(super) const MAX_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 /// `now + MAX_COOLDOWN_SECS`. Both events emit a warning so anomalies
 /// are visible at runtime.
 ///
-/// Mirrors the WASM bridge `validate_imported_snapshot` policy
-/// (`crates/scp-ffi/wasm/src/manager.rs`), but applied to the runtime
-/// `ContextManager` paths that the WASM bridge does not exercise.
+/// Part of the imported-snapshot validation policy applied to the runtime
+/// `ContextManager` import paths.
 pub fn sanitize_cooldown_until(
     cooldown_until: &mut HashMap<usize, u64>,
     consequence_rules: &[scp_protocol::trust::consequence::ConsequenceRule],
@@ -165,7 +164,7 @@ pub fn validate_consequence_rules_for_import(
     Ok(())
 }
 
-// ADR-049 Phase 2A finalization keystone — type unification (commit 12):
+// ADR-049 Phase 2A finalization keystone — type unification (ADR-049 §15):
 // the legacy `evaluate_sybil_resistance(&PerContextState, ...)` /
 // `post_join_bookkeeping(&mut PerContextState, ...)` /
 // `enforce_join_economy(&mut PerContextState, ...)` wrappers were carried
@@ -178,7 +177,7 @@ pub fn validate_consequence_rules_for_import(
 /// Returns the spec §19.7 default per-DID message pricing configuration.
 ///
 /// Every context now uses the same baseline: per-DID escalating cost for
-/// `MessageSend`, `ContextJoin`, and `ToolInvoke`, plus the Matrix-style
+/// `MessageSend`, `ContextJoin`, and `OutletInvoke`, plus the Matrix-style
 /// hard rate limit. The `_economic_policy` parameter is intentionally
 /// unused — it is kept in the signature so call-sites stay symmetrical
 /// with the old `derive_relay_pricing_config` while documenting that
@@ -196,9 +195,9 @@ pub fn derive_message_pricing(
 ///
 /// Reads the `sybil_policy` directly so callers may pass
 /// `state.handle.params().sybil_policy.as_ref()` from the unified
-/// [`PerContextState`] (ADR-049 §Decision 1). When `None`, passes
+/// [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1). When `None`, passes
 /// unconditionally. When `Some`, constructs an
-/// [`IdentityDepthAssessment`] from the member's available trust signals
+/// [`IdentityDepthAssessment`](scp_protocol::trust::sybil::IdentityDepthAssessment) from the member's available trust signals
 /// and delegates to [`scp_protocol::trust::sybil::evaluate_sybil_resistance`].
 ///
 /// # Errors
@@ -230,7 +229,7 @@ pub fn evaluate_sybil_resistance(
 /// into `participation_cache`. Budget spend is NOT recorded here — that is
 /// `enforce_join_economy`'s responsibility (#1537). Takes the `&mut participation_cache` field and a
 /// `&ReceiveBuffer` directly so callers may pass disjoint sub-borrows of the
-/// unified [`PerContextState`] (ADR-049 §Decision 1) — a cell-holder supplies
+/// unified [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1) — a cell-holder supplies
 /// the cache via `governance_class_c_mut().participation_cache_mut()` and the
 /// buffer via `receive_buffer_mut()`, so no whole `&mut GovernanceState` (and no
 /// `state_mut()`) is needed.
@@ -265,6 +264,11 @@ pub fn post_join_bookkeeping(
             context_id,
             merkle_root,
             now,
+            // attestation_count is a credential-layer, verifier-relative fact
+            // (§7.3.2); this lifecycle path gates only on participation_count and
+            // has no attestation-cache access, so it passes an empty accessible-
+            // attestation set (count 0) by design — NOT a stub.
+            &[],
         )
     {
         participation_cache.insert(member_did.to_string(), record);
@@ -278,7 +282,7 @@ pub fn post_join_bookkeeping(
 /// AND-composition (spec §19.5), and records spend against the joiner's
 /// budget. Takes a `&mut GovernanceState` and `member_count` directly so
 /// callers may pass disjoint sub-borrows of the unified
-/// [`PerContextState`] (ADR-049 §Decision 1).
+/// [`PerContextState`](crate::context::actor::state::PerContextState) (ADR-049 §Decision 1).
 ///
 /// # Errors
 ///
@@ -292,7 +296,7 @@ pub fn enforce_join_economy(
     now: u64,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     context_id: &str,
-    clock: &dyn scp_primitives::Clock,
+    clock: &dyn scp_clock::Clock,
     key_resolver: &scp_protocol::context::governance::KeyResolver,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     if scp_protocol::economy::policy::auto_accept_blocked_by_economics(

@@ -332,7 +332,7 @@ pub fn evaluate_formula(formula: &PricingFormula, metrics: &ObservableMetrics) -
 /// for that action type.
 ///
 /// - `MessageSend` -> `per_message`
-/// - `ToolInvoke` -> `per_tool_invoke`
+/// - `OutletCall` -> `per_outlet_call`
 /// - `ContextJoin` -> `per_join`
 /// - `SubscriptionPeriod` -> `per_period.amount`
 /// - `ByteStored` -> `per_byte_stored`
@@ -342,7 +342,7 @@ pub fn evaluate_formula(formula: &PricingFormula, metrics: &ObservableMetrics) -
 pub fn lookup_cost(schedule: &CostSchedule, action: &PaidActionType) -> Option<Amount> {
     match action {
         PaidActionType::MessageSend => schedule.per_message,
-        PaidActionType::ToolInvoke => schedule.per_tool_invoke,
+        PaidActionType::OutletCall => schedule.per_outlet_call,
         PaidActionType::ContextJoin => schedule.per_join,
         PaidActionType::SubscriptionPeriod => schedule.per_period.as_ref().map(|sub| sub.amount),
         PaidActionType::ByteStored => schedule.per_byte_stored,
@@ -448,7 +448,7 @@ pub const fn validate_policy_change(
 pub const fn policy_requires_payment(policy: &EconomicPolicy) -> bool {
     let cs = &policy.cost_schedule;
     cs.per_message.is_some()
-        || cs.per_tool_invoke.is_some()
+        || cs.per_outlet_call.is_some()
         || cs.per_join.is_some()
         || cs.per_period.is_some()
         || cs.per_byte_stored.is_some()
@@ -524,7 +524,7 @@ mod tests {
         Coefficient, PricingFormula, PricingMetric, PricingVariable, SubscriptionCost,
         SubscriptionPeriod,
     };
-    use scp_primitives::DID;
+    use scp_did::DID;
 
     // --- Helpers ---
 
@@ -542,7 +542,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(10)),
-                per_tool_invoke: Some(Amount(50)),
+                per_outlet_call: Some(Amount(50)),
                 per_join: Some(Amount(100)),
                 per_period: Some(SubscriptionCost {
                     amount: Amount(999),
@@ -563,7 +563,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -592,10 +592,10 @@ mod tests {
     }
 
     #[test]
-    fn lookup_per_tool_invoke_returns_configured_cost() {
+    fn lookup_per_outlet_call_returns_configured_cost() {
         let schedule = &simple_policy().cost_schedule;
         assert_eq!(
-            lookup_cost(schedule, &PaidActionType::ToolInvoke),
+            lookup_cost(schedule, &PaidActionType::OutletCall),
             Some(Amount(50))
         );
     }
@@ -631,7 +631,7 @@ mod tests {
     fn lookup_unconfigured_action_returns_none() {
         let schedule = &free_policy().cost_schedule;
         assert_eq!(lookup_cost(schedule, &PaidActionType::MessageSend), None);
-        assert_eq!(lookup_cost(schedule, &PaidActionType::ToolInvoke), None);
+        assert_eq!(lookup_cost(schedule, &PaidActionType::OutletCall), None);
         assert_eq!(lookup_cost(schedule, &PaidActionType::ContextJoin), None);
         assert_eq!(
             lookup_cost(schedule, &PaidActionType::SubscriptionPeriod),
@@ -843,7 +843,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(10)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -878,7 +878,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -957,7 +957,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(10)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1057,7 +1057,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1071,13 +1071,13 @@ mod tests {
     }
 
     #[test]
-    fn auto_accept_blocked_by_per_tool_invoke_cost() {
+    fn auto_accept_blocked_by_per_outlet_call_cost() {
         let policy = EconomicPolicy {
             locked: false,
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: None,
-                per_tool_invoke: Some(Amount(10)),
+                per_outlet_call: Some(Amount(10)),
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1097,7 +1097,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: Some(Amount(100)),
                 per_period: None,
                 per_byte_stored: None,
@@ -1117,7 +1117,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: Some(SubscriptionCost {
                     amount: Amount(999),
@@ -1141,7 +1141,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: Some(Amount(1)),
@@ -1188,7 +1188,7 @@ mod tests {
 
         // All action types compute costs without consulting capabilities.
         assert!(evaluate_cost(&policy, &PaidActionType::MessageSend, &metrics).is_some());
-        assert!(evaluate_cost(&policy, &PaidActionType::ToolInvoke, &metrics).is_some());
+        assert!(evaluate_cost(&policy, &PaidActionType::OutletCall, &metrics).is_some());
         assert!(evaluate_cost(&policy, &PaidActionType::ContextJoin, &metrics).is_some());
     }
 
@@ -1204,7 +1204,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(100)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1219,7 +1219,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1398,7 +1398,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1430,7 +1430,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: Some(Amount(10)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

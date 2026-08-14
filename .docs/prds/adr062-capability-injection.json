@@ -1,0 +1,501 @@
+{
+  "project": "ADR-062 — Capability Injection: Real Backends and Test-Harness-Only Nullifiers",
+  "description": "Realization of ADR-062 (applying umbrella spec §17.17 unchanged), scoped to capabilities that have a real backend TODAY. Every in-memory NULLIFIER with a real backend (key custody -> File/Sqlite/callback; device attestation -> declined per spec §9:187; DID/DHT resolution -> Pkarr) becomes a test-harness-only double gated `#[cfg(feature = \"testing\")]`, provably absent from shipped artifacts via G1's SOLE closed subset-allowlist; durability-only arms (storage, push, blob) stay legitimate explicit runtime options, never Default. The allow_in_memory_custody switch, the public custody=in_memory config, and the DidDht<D=InMemoryDhtClient> nullifier-default type parameter are all deleted. E4 relay-querier (NoOpRelayQuerier) is NOT a nullifier — it fails CLOSED (Ok(None), never a false document) and ships honestly as the DHT-only interim; Slice 11 is a completeness fix (real MultiRelayQuerier, §3.10.12). PRE-ROTATION CUSTODY IS OUT OF SCOPE: production realization is punted to a later e2e-collab stage (RFC #2130 / #1729 / #1777); ADR-054 is Proposed, only the §3a residence RULE is canonical (spec §9.7.4.1 item 3a). Because no real pre-rotation backend is built now, Slice 6 severs the InMemoryPreRotationCustody NULLIFIER to test-harness-only (#[cfg(feature=\"testing\")], folded into `testing` like custody/attestation — NO standalone allowlisted feature) and makes production identity creation FAIL CLOSED with a typed error rather than fall back to the nullifier. G1 allowlists durability-only features ONLY — ZERO nullifiers, no exceptions (PR #2132). Only the real pre-rotation BACKEND is out of scope (RFC #2130 / #1729); whether identities may be created without a pre-rotation commitment is #1553. Six stories: 000 module split; 001 DHT E1 (DidDht default removal + node DhtMode Memory->test-harness-only + fail-closed Disabled); 006 nullifier severance (custody/attestation/DHT) + delete switch + pre-rotation isolation + G1; 009 E2 credentials (delete impl Default live fix); 010 E3 blob (delete impl Default live fix); 011 E4 relay-querier (real MultiRelayQuerier + Disabled-node relay-resolution). #1733 folds+closes at Slice 6 for custody/attestation/DHT/storage (pre-rotation row -> RFC #2130). Forward-only DAG.",
+  "gates": [
+    {
+      "id": "gate-capinject-0",
+      "name": "Module structure (Slice 0, Unit 1)",
+      "stories": [
+        "SCP-CAPINJECT-000"
+      ]
+    },
+    {
+      "id": "gate-capinject-1",
+      "name": "DHT E1 + DidDht default removal + node DhtMode (Slice 1, Unit 1)",
+      "stories": [
+        "SCP-CAPINJECT-001"
+      ]
+    },
+    {
+      "id": "gate-capinject-6",
+      "name": "Nullifier severance + switch deletion + G1 (Slice 6, Unit 2)",
+      "stories": [
+        "SCP-CAPINJECT-006"
+      ]
+    },
+    {
+      "id": "gate-capinject-9",
+      "name": "E2 credentials real backend + seam (Slice 9, Unit 3)",
+      "stories": [
+        "SCP-CAPINJECT-009"
+      ]
+    },
+    {
+      "id": "gate-capinject-10",
+      "name": "E3 blob impl-Default removal + explicit selection (Slice 10, Unit 3)",
+      "stories": [
+        "SCP-CAPINJECT-010"
+      ]
+    },
+    {
+      "id": "gate-capinject-11",
+      "name": "E4 relay querier real MultiRelayQuerier (Slice 11, Unit 3)",
+      "stories": [
+        "SCP-CAPINJECT-011"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-CAPINJECT-000",
+      "title": "Module structure: move in-memory storage/push to an honest in_memory/ module (durability-only, runtime-selectable), keep nullifier doubles testing-gated, delete `pub use testing as software`, delete BridgeInMemoryStorage, re-point the server-feature storage path (F1)",
+      "gate": "gate-capinject-0",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-platform/Cargo.toml",
+        "crates/scp-platform/src/lib.rs",
+        "crates/scp-platform/src/in_memory/mod.rs",
+        "crates/scp-platform/src/in_memory/storage.rs",
+        "crates/scp-platform/src/in_memory/push.rs",
+        "crates/scp-platform/src/testing/mod.rs",
+        "crates/scp-ffi/common/Cargo.toml",
+        "crates/scp-ffi/common/src/bridge_runtime.rs",
+        "crates/scp-ffi/common/src/lib.rs",
+        "crates/scp-ffi/common/src/server.rs",
+        "crates/scp-ffi/src/runtime.rs",
+        "crates/scp-ffi/napi/src/runtime.rs",
+        "crates/scp-ffi/uniffi/src/runtime.rs",
+        "crates/scp-ffi/uniffi/Cargo.toml"
+      ],
+      "description": "ADR-062 Slice 0 (Unit 1, foundational, §Decision 0). Split scp-platform's `pub mod testing` by truth: (a) move `InMemoryStorage`+`InMemoryPush` into `crates/scp-platform/src/in_memory/` behind `in-memory-storage`/`in-memory-push` features (in-memory-push pulls dep:uuid), compiled-available and selected explicitly via `StorageConfig` (never default/fallback, §17.17 SCP-CAPSEL-8000/8011 — the OpenMLS-MemoryStorage case); (b) leave the nullifier doubles (`InMemoryKeyCustody`, `InMemoryDeviceAttestation`, `InMemoryPreRotationCustody`) in the `testing`-named module behind `testing`; (c) delete `pub use testing as software` (lib.rs:52); (d) delete `BridgeInMemoryStorage` (struct + impl Storage + `BridgeInMemoryStorageHandle`:275 + `BridgeInMemoryRepo`:285 + the third tuple element of `build_event_log_provider`:315, the common/src/lib.rs re-export, the three bridge runtime.rs incl. scp-ffi/src/runtime.rs:1112, the uniffi/Cargo.toml:63 comment) — bridges use `EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>` (the `EncryptingAdapter<S>` handle is generic). F1 storage half: re-point `scp-ffi-common`'s `server` feature `scp-platform/testing` edge (common/Cargo.toml:30) to `scp-platform/in-memory-storage`, and switch `server.rs`'s non-test STORAGE construction to the `in_memory` path (the custody phantoms server.rs:322/435 are Slice 6; the DHT constructor server.rs:455 is Slice 1). Does NOT delete the switch or demote nullifiers. Scope exception (prd.md): a module move + feature split + twin deletion is atomic — a half-applied move breaks the build.",
+      "acceptanceCriteria": [
+        "InMemoryStorage and InMemoryPush live in an honest module: crates/scp-platform/src/in_memory/storage.rs and push.rs exist, `grep -rn 'pub use.*InMemoryStorage\\|pub use.*InMemoryPush' crates/scp-platform/src/in_memory/mod.rs` matches, and `grep -rn 'InMemoryStorage\\|InMemoryPush' crates/scp-platform/src/testing/mod.rs` returns 0.",
+        "Two durability-only features exist and gate the module: `grep -nE '^in-memory-(storage|push) *=' crates/scp-platform/Cargo.toml` shows both (in-memory-push pulls dep:uuid); each in_memory/ submodule + re-export carries `#[cfg(feature = \"in-memory-<type>\")]`; `cargo build -p scp-platform --no-default-features --features in-memory-storage` compiles InMemoryStorage WITHOUT enabling `testing`.",
+        "`pub use testing as software` is deleted: `grep -n 'testing as software' crates/scp-platform/src/lib.rs` returns 0.",
+        "The three nullifier doubles remain testing-gated: `grep -n 'InMemoryKeyCustody\\|InMemoryDeviceAttestation\\|InMemoryPreRotationCustody' crates/scp-platform/src/testing/mod.rs` shows all three behind the `#[cfg(feature = \"testing\")]` module gate.",
+        "BridgeInMemoryStorage is deleted: `grep -rn 'BridgeInMemoryStorage' crates/` returns 0; `build_event_log_provider` keeps its tuple shape backed by `EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>`; the three bridge runtime.rs + common/src/lib.rs re-export + uniffi/Cargo.toml:63 are updated.",
+        "F1 storage half: `grep -n 'scp-platform/testing' crates/scp-ffi/common/Cargo.toml` returns 0 (the `server` feature pulls `scp-platform/in-memory-storage`), and non-test STORAGE construction in crates/scp-ffi/common/src/server.rs uses `scp_platform::in_memory::InMemoryStorage`.",
+        "In-memory storage remains an explicit durability-only runtime option: the bridge `StorageConfig` in-memory arm resolves to `scp_platform::in_memory::InMemoryStorage` and no code path defaults/falls back to it (SCP-CAPSEL-8000/8001).",
+        "Full CI green: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings` (switch still exists this slice); `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with all stories present."
+      ],
+      "actionItems": [
+        "git mv the storage/push adapters testing/ -> in_memory/; add `pub mod in_memory` gated on the two features; delete `pub use testing as software`.",
+        "Add in-memory-storage/in-memory-push (dep:uuid) features; keep `testing` gating the three nullifier modules.",
+        "Delete BridgeInMemoryStorage + aliases; back build_event_log_provider with EncryptingAdapter<scp_platform::in_memory::InMemoryStorage>; update the three runtime.rs + common/src/lib.rs + uniffi/Cargo.toml:63.",
+        "F1 storage half: re-point common/Cargo.toml server feature; switch server.rs non-test storage construction to in_memory.",
+        "Point the bridge StorageConfig in-memory arm at scp_platform::in_memory::InMemoryStorage; run full CI + review roster."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "### 0. Honest module structure + durability-only storage stays a runtime option (foundational)"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Folding #1733 (close as folded — at Slice 6, not Slice 0)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.2 Security Classification of Development Arms"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.6 First-Party Storage Adapters (Client SDK)"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "adr": "ADR-062",
+        "unit": "1",
+        "slice": "Slice 0 (module structure)",
+        "scopeException": "atomic module move + feature split + twin deletion"
+      }
+    },
+    {
+      "id": "SCP-CAPINJECT-001",
+      "title": "DHT E1 (structural): remove the DidDht<D=InMemoryDhtClient> default type param + impl Default + new(); ship real Pkarr on PyO3/NAPI; node DhtMode::Memory -> test-harness-only + fail-closed DhtMode::Disabled; demote in-memory DHT to a test-harness double",
+      "gate": "gate-capinject-1",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-identity/src/dht.rs",
+        "crates/scp-identity/src/config.rs",
+        "crates/scp-identity/Cargo.toml",
+        "crates/scp-dht/Cargo.toml",
+        "crates/scp-dht/src/dht_client/mod.rs",
+        "crates/scp-node/src/self_host.rs",
+        "crates/scp-node/src/lib.rs",
+        "crates/scp-node/src/config.rs",
+        "crates/scp-node/Cargo.toml",
+        "crates/scp-runtime/src/discovery/dht_context.rs",
+        "crates/scp-runtime/src/discovery/did_capabilities.rs",
+        "crates/scp-runtime/Cargo.toml",
+        "crates/scp-testing/src/helpers.rs",
+        "crates/scp-testing/Cargo.toml",
+        "crates/scp-ffi/Cargo.toml",
+        "crates/scp-ffi/napi/Cargo.toml",
+        "crates/scp-ffi/uniffi/Cargo.toml",
+        "crates/scp-ffi/common/Cargo.toml",
+        "crates/scp-ffi/common/src/dht.rs",
+        "crates/scp-ffi/common/src/lib.rs",
+        "crates/scp-ffi/common/src/bridge_instance.rs",
+        "crates/scp-ffi/common/src/server.rs",
+        "crates/scp-ffi/common/src/resolvers.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/common/tests/dht_capability_injection.rs",
+        "crates/scp-runtime/tests/identity_config_cross_path.rs",
+        "crates/scp-testing/tests/integration/identity.rs",
+        "crates/scp-testing/tests/integration/encrypted_relay_roundtrip.rs",
+        "crates/scp-testing/tests/integration/agent_binding.rs",
+        "crates/scp-testing/tests/integration/discovery.rs",
+        "crates/scp-ffi/tests/e2e_bridge.rs",
+        "crates/scp-ffi/uniffi/tests/e2e_bridge.rs",
+        "crates/scp-ffi/uniffi/tests/lifecycle.rs",
+        ".docs/standards/construction.md",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "ADR-062 Slice 1 (Unit 1, E1 HIGH; §Decision 1 + D-A + D-B) — builds on SCP-CAPINJECT-000. STRUCTURAL ROOT FIX (D-A): in crates/scp-identity/src/dht.rs, remove the `= InMemoryDhtClient` default type parameter -> `pub struct DidDht<D: DhtClient, C: Clock = SystemClock>` (Clock default stays; SystemClock is not a nullifier), and DELETE `impl Default for DidDht<InMemoryDhtClient>` (:264) + the `pub fn new()` constructor (:270) that hardcode `InMemoryDhtClient::new()`. Every caller now constructs with an explicit DhtClient — PkarrDhtClient on production paths, InMemoryDhtClient only in `#[cfg(test)]`/`testing` code — so no silent in-memory DHT default is expressible (SCP-CAPSEL-8002 by construction). Blast radius (all in files[]): scp-identity/src/{dht.rs,config.rs}+Cargo.toml; scp-node/src/{self_host.rs,lib.rs,config.rs}+Cargo.toml; scp-runtime/src/discovery/{dht_context.rs,did_capabilities.rs}+Cargo.toml; scp-testing/src/helpers.rs+Cargo.toml; scp-ffi/common/src/{server.rs,resolvers.rs,bridge_instance.rs}; scp-ffi/{src,napi/src}/identity.rs; uniffi/src/bridge.rs (:3912/:8063/:9010/:9130/:16714 etc.). Then: `production-dht` unconditional on scp-ffi/napi/common; shared `enum FfiDhtClient` (Pkarr compiled unconditionally + `#[cfg(feature = \"testing\")] InMemory`); retype the chokepoints bridge_instance.rs:358 + server.rs:35 onto FfiDhtClient (the D-A removal compile-forces converting server.rs:455's `InMemoryDhtClient::new()` HERE, moved out of Slice 6); `ClientDhtConfig { gateways }` + `into_client -> Result<_, DhtInitError>` fail-closed; delete throwaway/fresh-per-call clients (scp-ffi/src/identity.rs, napi, uniffi make_dht_with_signer). D-B (node DhtMode reconciliation): `build_memory_did_method` builds DidDht<InMemoryDhtClient> used for BOTH publish and resolve, so DhtMode::Memory is a §17.17.3 resolve-nullifier -> make `DhtMode::Memory` test-harness-only (gated), add a new fail-closed `DhtMode::Disabled` (DHT-layer-off: resolve composes the DualLayerResolver with the DHT arm off (DisabledDhtClient -> Ok(None)); with the interim NoOpRelayQuerier relay arm, unknown-DID resolution returns honest Ok(None); publish fails closed. Never a typed Err on resolve, never a silent in-memory answer), and update construction.md M2's DhtMode::Memory-is-fail-safe text to name Disabled as the fail-safe no-publish value. scp-dht/testing wiring: gate InMemoryDhtClient's type behind a NEW `scp-dht/testing` feature; scp-dht stays a NORMAL dependency; each bridge/consumer `testing` feature carries `scp-dht/testing` as a NORMAL feature edge, and each consumer constructing InMemoryDhtClient in its own tests lists `scp-dht/testing` in ITS [dev-dependencies] (scp-node, scp-runtime, scp-testing) — `scp-dht/testing` MUST NOT appear in any default/non-testing feature list. Add matrix DHT rows. Closes #1518, re-satisfies #627, closes #1880. Scope exception: the default-removal + type-gate + chokepoint retype + node DhtMode split are atomic (partial application breaks the build).",
+      "acceptanceCriteria": [
+        "The DidDht nullifier-default is removed (D-A): `grep -n 'DidDht<D: DhtClient = InMemoryDhtClient' crates/scp-identity/src/dht.rs` returns 0; `grep -n 'impl Default for DidDht<InMemoryDhtClient' crates/scp-identity/src/dht.rs` returns 0; and `grep -n 'pub fn new()' crates/scp-identity/src/dht.rs` returns 0 (the in-memory-hardcoding constructor is gone). The struct is `DidDht<D: DhtClient, C: Clock = SystemClock>`.",
+        "Every production caller constructs an explicit DhtClient; in-memory DHT appears only in test code: outside `#[cfg(test)]`/`#[cfg(feature = \"testing\")]`, `grep -rn 'InMemoryDhtClient' crates/scp-identity crates/scp-node crates/scp-runtime crates/scp-ffi` returns 0; the workspace compiles with the default-param removed (bare-production `cargo build --workspace` with no testing features succeeds and InMemoryDhtClient is out of scope).",
+        "production-dht unconditional on the three FFI crates: `grep -nE 'production-dht' crates/scp-ffi/Cargo.toml crates/scp-ffi/common/Cargo.toml crates/scp-ffi/napi/Cargo.toml` shows scp-dht pulled with production-dht in each dependency features list; no `[features]` entry makes it optional.",
+        "A shared `enum FfiDhtClient` (Pkarr unconditional + `#[cfg(feature = \"testing\")] InMemory`): `grep -n 'pub enum FfiDhtClient' crates/scp-ffi/common/src/dht.rs` matches, the InMemory arm is immediately preceded by that cfg, `grep -n 'allow_in_memory' crates/scp-ffi/common/src/dht.rs` returns 0, `impl scp_dht::DhtClient for FfiDhtClient` delegates publish/resolve.",
+        "InMemoryDhtClient type-gated behind a new `scp-dht/testing` feature wired as NORMAL edges (not cfg(test)): `grep -n 'testing' crates/scp-dht/Cargo.toml` shows the feature; the `pub struct InMemoryDhtClient` + impls carry `#[cfg(feature = \"testing\")]`; `scp-dht/testing` appears in each bridge/consumer `testing` feature list AND in the `[dev-dependencies]` of every consumer that constructs `InMemoryDhtClient` in its own tests — scp-node, scp-runtime, scp-ffi, scp-ffi-napi, scp-ffi-uniffi — EXCEPT scp-testing, which carries `scp-dht = { features = [\"testing\"] }` as a NORMAL dependency (its helpers.rs uses InMemoryDhtClient / TestDidDht at LIB level, mirroring its existing normal `scp-platform/testing` edge) (grep each Cargo.toml); and `scp-dht/testing` appears in NO default/non-testing feature list (grep the Cargo.tomls to confirm it is only under a `testing = [...]` feature or `[dev-dependencies]`). This is the per-crate wiring that makes G1's soundness invariant hold: a consumer's `testing` feature transitively pulls the checked features, so shipped-graph feature-absence == type-absence.",
+        "Chokepoints retyped incl. server.rs:455: `grep -n 'type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>' crates/scp-ffi/common/src/server.rs` and `grep -n 'dht_client: OnceLock<Arc<FfiDhtClient>>' crates/scp-ffi/common/src/bridge_instance.rs` both match; outside `#[cfg(test)]`, `grep -n 'InMemoryDhtClient::new()' crates/scp-ffi/common/src/server.rs` returns 0 (the :455 constructor converted here).",
+        "Throwaway/fresh-per-call clients deleted: outside `#[cfg(test)]`, `grep -nE 'InMemoryDhtClient::new\\(\\)' crates/scp-ffi/src/identity.rs crates/scp-ffi/napi/src/identity.rs` returns 0; the rotation_publish_client fallback and the uniffi make_dht_with_signer fresh-client are removed; an async test rotates a key and asserts a subsequent resolve through the shared resolver reflects the rotation.",
+        "Production DHT fails closed: `ClientDhtConfig::into_client` returns `Err(DhtInitError)` when Pkarr cannot be built; the `into_client` function body contains no `unwrap_or`/`or_else`/`InMemory` (no in-memory/no-op substitution) — the InMemory arm exists only in the `FfiDhtClient` enum definition per AC[3], never inside `into_client`; a unit test asserts an unsatisfiable production config yields Err.",
+        "D-B node DhtMode reconciliation (variant + gate + default flip): `grep -n 'Disabled' crates/scp-node/src/config.rs` shows a new `DhtMode::Disabled` variant; `DhtMode::Memory` is gated `#[cfg(feature = \"testing\")]`; and the node/host_site defaults are flipped Memory->Disabled — `grep -n 'dht: DhtMode::Disabled' crates/scp-node/src/config.rs crates/scp-node/src/self_host.rs` matches at both the NodeConfig default (config.rs:391 region) and the HostSiteConfig default (self_host.rs:976 region), and `grep -n 'dht: DhtMode::Memory' crates/scp-node/src/config.rs crates/scp-node/src/self_host.rs` returns 0 outside `#[cfg(any(test, feature=\"testing\"))]`.",
+        "A2 Disabled semantics — DHT-layer-off, resolver still composes the relay layer, fail-closed (NOT a typed Err on resolve, NOT a silent in-memory answer): a production (no-testing) test asserts that a `DhtMode::Disabled` node's resolution runs the `DualLayerResolver` with the DHT arm off and, with the interim `NoOpRelayQuerier` (pre-Slice-11) relay layer, returns honest not-found `Ok(None)` for an unknown DID (never a fabricated/in-memory document). (The relay-resolution positive path — a Disabled node resolving a peer published to a relay — is asserted in SCP-CAPINJECT-011 once the real MultiRelayQuerier lands; before that a Disabled node has no working resolution path, which matches and honestly improves on the old Memory default that silently resolved nothing.)",
+        "A1 construction.md M2 fully reconciled (no single-grep self-game): every M2 site that named `DhtMode::Memory` as the fail-safe no-publish value now names `DhtMode::Disabled` — check each of `.docs/standards/construction.md` lines ~:53 (the config-shape mapping), ~:63 (the Node/host_site M2 reasoning), ~:165 (`NodeConfig` field comment), and ~:194 (`HostSiteConfig`): `grep -n 'DhtMode::Memory' .docs/standards/construction.md` returns 0 references calling Memory the fail-safe/default value (Memory appears only where labelled test-harness-only), and `grep -c 'DhtMode::Disabled' .docs/standards/construction.md` is >= 4 (one per site, each naming Disabled the fail-safe no-publish value).",
+        ".docs/standards/sdk-capability-matrix.json records DHT shipped backend = Pkarr per binding; `grep -c 'Pkarr' .docs/standards/sdk-capability-matrix.json` >= 1; `python3.12 scripts/check-sdk-coverage.py` exits 0.",
+        "Tests: an `#[ignore]`d live-Mainline roundtrip in crates/scp-ffi/common/tests/dht_capability_injection.rs, and a `#[cfg(not(feature = \"testing\"))]` compile assertion that FfiDhtClient resolves to Pkarr and InMemoryDhtClient is not in scope in a shipped build.",
+        "Full CI green: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings` (switch still exists this slice); a bare-production `cargo build --workspace` (no testing, no allow_in_memory_custody) — Pkarr-only graph compiles, InMemoryDhtClient type absent; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Remove the DidDht `= InMemoryDhtClient` default type param + delete `impl Default for DidDht<InMemoryDhtClient>` + `pub fn new()`; migrate every caller to an explicit DhtClient (Pkarr prod; InMemoryDhtClient under `#[cfg(test)]`/`testing`).",
+        "Add a `testing` feature to crates/scp-dht/Cargo.toml, `#[cfg(feature = \"testing\")]`-gate InMemoryDhtClient; keep scp-dht a NORMAL dep; carry `scp-dht/testing` in each bridge/consumer `testing` feature + the [dev-dependencies] of scp-node/scp-runtime/scp-testing; never in a default list.",
+        "Enable production-dht unconditionally on scp-ffi/napi/common; create crates/scp-ffi/common/src/dht.rs (FfiDhtClient + ClientDhtConfig + DhtInitError); retype ConcreteDidMethod + the dht_client slot + convert server.rs:455.",
+        "Delete throwaway clients (scp-ffi/src/identity.rs, napi, uniffi); route rotation/migration through the shared FfiDhtClient with cache invalidation.",
+        "D-B: gate DhtMode::Memory test-harness-only, add fail-closed DhtMode::Disabled (resolve composes the DualLayerResolver with the DHT arm off (DisabledDhtClient -> Ok(None)); with the interim NoOpRelayQuerier relay arm, unknown-DID resolution returns honest Ok(None); publish fails closed. Never a typed Err on resolve, never a silent in-memory answer), reconcile build_memory_did_method callers, update construction.md M2.",
+        "Add matrix DHT rows; write the tests; run full CI + review roster; PR closing keywords #1518/#627/#1880."
+      ],
+      "blockedBy": [
+        "SCP-CAPINJECT-000"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "### 1. DHT (E1) — remove the nullifier default, ship real Pkarr, demote in-memory DHT to test-harness-only"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Non-goals / boundaries"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.3 The DHT Backend Is an Instance — and Its In-Memory Arm Is a Nullifier"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.6 Anti-Segmentation Invariant"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "adr": "ADR-062",
+        "unit": "1",
+        "slice": "Slice 1 (DHT E1 + D-A default removal + D-B node DhtMode)",
+        "closes": "PR keywords: closes #1518, re-satisfies #627, closes #1880",
+        "scopeException": "default-removal + type-gate + chokepoint retype + node DhtMode split are atomic"
+      }
+    },
+    {
+      "id": "SCP-CAPINJECT-006",
+      "title": "Nullifier severance (all four) + fail-closed pre-rotation: demote in-memory custody + attestation + pre-rotation to test-harness-only, make production pre-rotation create fail closed with a typed error, remove public custody=in_memory, delete allow_in_memory_custody, add G1 as a closed subset-allowlist with ZERO nullifier exceptions",
+      "gate": "gate-capinject-6",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/Cargo.toml",
+        "crates/scp-ffi/napi/Cargo.toml",
+        "crates/scp-ffi/uniffi/Cargo.toml",
+        "crates/scp-ffi/common/Cargo.toml",
+        "crates/scp-ffi/common/src/server.rs",
+        "crates/scp-ffi/src/custody.rs",
+        "crates/scp-ffi/src/scp.rs",
+        "crates/scp-ffi/src/lib.rs",
+        "crates/scp-ffi/napi/src/custody.rs",
+        "crates/scp-ffi/napi/src/scp.rs",
+        "crates/scp-ffi/napi/src/lib.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/uniffi/src/scp.rs",
+        "crates/scp-platform/src/testing/mod.rs",
+        "crates/scp-runtime/src/context/actor/commands.rs",
+        "crates/scp-runtime/src/context/supervisor/supervisor.rs",
+        "scripts/check-shipped-feature-graph.sh",
+        ".docs/standards/sdk-capability-matrix.json",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
+        "CLAUDE.md",
+        "TESTING.md",
+        "CONTRIBUTING.md",
+        "crates/scp-platform/Cargo.toml",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-identity/src/config.rs",
+        "crates/scp-ffi/src/identity.rs",
+        "crates/scp-ffi/src/runtime.rs",
+        "crates/scp-ffi/src/scpid.rs",
+        "crates/scp-ffi/napi/src/identity.rs",
+        "crates/scp-ffi/napi/src/runtime.rs",
+        "crates/scp-ffi/napi/src/scpid.rs",
+        "crates/scp-ffi/napi/src/ucan.rs",
+        "crates/scp-ffi/napi/src/context.rs",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/common/src/error_codes.rs",
+        "crates/scp-identity/Cargo.toml",
+        "crates/scp-node/Cargo.toml",
+        "crates/scp-node/src/lib.rs"
+      ],
+      "description": "ADR-062 Slice 6 (§Decision 6) — depends only on DHT real (SCP-CAPINJECT-001). Severs ALL FOUR in-memory nullifiers (custody, attestation, DHT, pre-rotation) to test-harness-only. Custody/attestation/DHT have real backends now (custody File/Sqlite/callback ship; attestation declined per spec §9:187; DHT real from Slice 1). Pre-rotation has NO real backend yet (RFC #2130 / #1729 / #1777), so severing its nullifier makes production identity creation FAIL CLOSED with a typed error rather than fall back to the nullifier. Per the standing rule (PR #2132; CLAUDE.md builder tenet 'No dev/test-only stand-ins in production' + .docs/standards/sdk-common.md §Stub and Placeholder Policy: 'no dev/test-only stand-in may mask a missing production implementation; the prove-absence gate allowlists durability-only features and ZERO nullifiers, no exceptions'; spec §17.17), G1 grants NO nullifier allowlist exception — not even a documented/tracked one. (a) Key custody: re-gate `FfiKeyCustody::InMemory` (custody.rs:38) from `#[cfg(feature = \"allow_in_memory_custody\")]` to `#[cfg(feature = \"testing\")]`, and REMOVE the public `custody = \"in_memory\"` config value + seed-import path (napi/src/scp.rs:379). (b) Device attestation: re-gate InMemoryDeviceAttestation to `#[cfg(feature = \"testing\")]`; shipped attestation op returns a typed Err (bridge.rs:3622). (c) PRE-ROTATION SEVERANCE + FAIL-CLOSED: re-gate `InMemoryPreRotationCustody` to `#[cfg(feature = \"testing\")]` (folded into `testing` exactly like custody/attestation — NO standalone allowlisted feature); make the ~15+ production weld sites that construct `Arc<scp_platform::testing::InMemoryPreRotationCustody>` (scp-ffi/src/{identity.rs:993/1099/1235, runtime.rs:2391/2472/2800, scpid.rs:420}, napi/src/{scp.rs:454/585/727/4324, identity.rs:1133, scpid.rs:393, ucan.rs, runtime.rs}, uniffi/src/bridge.rs, and scp-identity/src/config.rs:334) return a typed `IdentityError` (new variant in scp-identity/src/lib.rs:151 + SCP-IDENT code: 'no production pre-rotation custody backend available; pre-rotation recovery custody is not yet implemented — see #1729 / RFC #2130') instead of constructing the nullifier — NEVER a silent fallback. FINDING (verified): the core create signatures (dht.rs:2073 create, :1100 create_with_agent_key, internal builder) REQUIRE a PreRotationCustody impl and always commit a PreRotationCommitment — no non-committing create path exists today (config.rs:334 itself mints InMemoryPreRotationCustody); Option A (non-committing create) is out of scope (Discussion #1553, decided with #1729). (d) DELETE `allow_in_memory_custody` entirely (feature defs scp-ffi:27/napi:15/uniffi:32, every cfg site, scp-runtime doc-prose, CLAUDE.md clippy string, ci.yml/release.yml). (e) Sever the `scp-platform/testing` edges (scp-ffi:51, napi:55) + `dep:scp-testing` into each bridge's `testing`/dev-deps. (f) F1 custody retype: server.rs IdentitySource<InMemoryKeyCustody> phantoms (:322,:435) -> FileKeyCustody, drop the testing use (the :455 DHT constructor was already converted in Slice 1). (g) Fix the 4 stale `allow_in_memory_custody` device-attestation strings in sdk-capability-matrix.json (:119/:120/:131/:132). (h) Add G1 (scripts/check-shipped-feature-graph.sh) as a SOLE closed subset-allowlist: the allowlist permits durability-only features ONLY (in-memory-storage/in-memory-push) — ZERO nullifiers, no exceptions; assert the complete RESOLVED feature-set of each shipped artifact ⊆ that allowlist (anything else, named or not, FAILS), and assert `scp-platform/testing` (incl. in-memory-custody/attestation/pre-rotation), `scp-dht/testing`, `scp-testing`, and the scp-core/testing→scp-protocol/testing→scp-did/testing did:key chain ABSENT; run per artifact INCLUDING --features server. #1733 closes-as-folded here (all four nullifiers absent from shipped graphs). Scope exception: switch deletion + cfg-rename + pre-rotation-fail-closed + edge-severance + phantom-retype + G1 are atomic.",
+      "acceptanceCriteria": [
+        "`allow_in_memory_custody` is deleted everywhere: `grep -rn 'allow_in_memory_custody' --include='*.toml' --include='*.rs' --include='*.yml' crates/ .github/` returns 0; `grep -n 'allow_in_memory_custody' CLAUDE.md TESTING.md CONTRIBUTING.md` returns 0; and `grep -c 'allow_in_memory_custody' .docs/standards/sdk-capability-matrix.json` returns 0 (the 4 stale device-attest strings fixed).",
+        "In-memory key custody is test-harness-only: `FfiKeyCustody::InMemory` gated `#[cfg(feature = \"testing\")]` (grep custody.rs + napi/uniffi; `grep -n 'allow_in_memory' crates/scp-ffi/src/custody.rs` returns 0); the public `custody = \"in_memory\"` config value + seed-import path is removed from the CUSTODY parse region only. Scoped so it does NOT flag the legitimate durability-only STORAGE selector strings `{\"type\":\"in_memory\"}` (StorageConfig::InMemory, SCP-CAPSEL-8011), which MUST remain: in the custody parser (`parse_custody_inner` in src/identity.rs; the `identity_create` custody match in napi/src/scp.rs and `parse_custody_method` in uniffi/src/bridge.rs), the `\"in_memory\"` custody ACCEPTANCE arm is gated `#[cfg(feature = \"testing\")]` and the shipped (no-`testing`) build carries a `#[cfg(not(feature = \"testing\"))] \"in_memory\" => Err(...)` REJECT arm — so public custody=in_memory is unreachable in production (grep the cfg-gated reject arm, which does NOT collide with the storage strings). G1 mechanically confirms the `InMemoryKeyCustody` nullifier is absent from every shipped bridge feature-graph.",
+        "Device attestation is test-harness-only and declines cleanly: InMemoryDeviceAttestation bridge usage gated `#[cfg(feature = \"testing\")]`; a test asserts the shipped attestation op returns a typed Err (not silent attest-valid).",
+        "In-memory pre-rotation custody is test-harness-only (NOT a standalone allowlisted feature): `InMemoryPreRotationCustody` is reachable only behind `#[cfg(feature = \"testing\")]` (folded into `testing`, alongside custody/attestation — grep crates/scp-platform/src/testing/mod.rs), and outside `#[cfg(test)]`/`#[cfg(feature = \"testing\")]` `grep -rn 'InMemoryPreRotationCustody' crates/scp-ffi crates/scp-identity` returns 0. No `scp-platform/in-memory-pre-rotation` feature is added and none appears on any G1 allowlist (grep the allowlist config returns 0 for it).",
+        "Production pre-rotation create FAILS CLOSED with a typed error (no nullifier fallback): a new `IdentityError` variant (scp-identity/src/lib.rs) / SCP-IDENT code names #1729 / RFC #2130 ('no production pre-rotation custody backend available'); the ~15+ weld sites (scp-ffi/src/{identity,runtime,scpid}.rs, napi/src/{scp,identity,scpid,ucan,runtime}.rs, uniffi/src/bridge.rs, scp-identity/src/config.rs) no longer construct `Arc<...InMemoryPreRotationCustody>` in production; and async tests assert that ALL production identity creation on a shipped (no-`testing`) build returns that typed error (NOT Ok, NOT a silently-substituted nullifier) — not only the callback-custody bridge but also the File and Sqlite custody create paths and the `scp-node` self-host create path, since every create path funnels through the `scp-identity/src/config.rs:334` lowering that mints the nullifier for every custody kind. (No non-committing create path is invented — Option A is #1553's call, out of scope.)",
+        "F1 custody retype: `grep -rn 'InMemoryKeyCustody\\|scp_platform::testing' crates/scp-ffi/common/src/server.rs` returns 0 outside `#[cfg(test)]` (phantoms retyped to FileKeyCustody), and `grep -n 'scp-platform/testing' crates/scp-ffi/common/Cargo.toml` returns 0.",
+        "G1 is a SOLE closed subset-allowlist, verified BEHAVIORALLY (not by grepping the implementation): scripts/check-shipped-feature-graph.sh derives each shipped artifact's COMPLETE resolved feature set and asserts `resolved-feature-set ⊆ per-artifact permitted-prod-features allowlist`, failing on ANY feature not on the allowlist. Its own test (a fixture harness) feeds G1 synthetic artifact configs and asserts the behavior: (a) an artifact whose resolved set contains a NOVEL, never-before-seen feature name NOT on its allowlist is REJECTED (proves the check is closed/positive, not a fixed denylist); (b) an artifact whose allowlist is edited to OMIT a feature its build genuinely resolves is REJECTED (proves the allowlist is load-bearing, ⊆ enforced); (c) a clean shipped artifact whose resolved set ⊆ its allowlist is ACCEPTED. It runs per artifact INCLUDING `--features server`; exits 0 on the post-slice tree; and is added to the CLAUDE.md enforcement-files list; and a test asserts the per-artifact allowlists contain ONLY durability-only features (in-memory-storage/in-memory-push) — NO nullifier feature (scp-platform/testing or any in-memory-{custody,attestation,pre-rotation}) appears on any artifact's allowlist (ZERO nullifier exceptions).",
+        "G1 soundness invariant machine-checked BEHAVIORALLY: a test asserts that a synthetic consumer whose `testing` feature does NOT transitively pull a checked test-harness feature is REJECTED (or, equivalently, that the allowlist mechanism makes such a bypass impossible), so shipped-graph feature-absence == nullifier-type absence holds by construction rather than by a name-list.",
+        "A shipped-config feature graph is nullifier-free incl. the did:key edge (these four names are TEST INPUTS the allowlist must reject, NOT the check itself): for each shipped artifact's exact build invocation AND `cargo tree -e features -p scp-ffi --no-default-features --features server`, the ⊆-allowlist check passes, and as concrete positive-control inputs `scp-platform/testing`, `scp-dht/testing`, `scp-testing`, and `scp-did/testing` (reached via scp-protocol/Cargo.toml:47) are each confirmed absent from the resolved set — demonstrating the allowlist catches the did:key edge, without those four names being the mechanism.",
+        "Full CI green with the switch gone: `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing,scp-runtime/testing -- -D warnings` (test-harness path now uses `testing`); a bare-production `cargo build --workspace` (no testing) compiling clean; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Re-gate FfiKeyCustody::InMemory + InMemoryDeviceAttestation to `#[cfg(feature = \"testing\")]`; remove the public custody=in_memory config + seed-import path.",
+        "Delete the allow_in_memory_custody feature defs + rename every cfg site to `testing`; update scp-runtime doc-prose, CLAUDE.md clippy string, ci.yml/release.yml; move dep:scp-testing + the scp-platform/testing edges onto each bridge's `testing`/dev-deps.",
+        "F1: retype server.rs IdentitySource<InMemoryKeyCustody> phantoms (:322,:435) to FileKeyCustody, drop the testing use.",
+        "Fix the 4 stale allow_in_memory_custody device-attest strings in sdk-capability-matrix.json.",
+        "Write scripts/check-shipped-feature-graph.sh (G1) as a closed subset-allowlist (per-artifact permitted-prod-features; fail on any non-allowlisted feature) with the transitive-pull soundness assertion; run per artifact incl. --features server; add to the CLAUDE.md enforcement-files list; run full CI + review roster; close #1733 as folded."
+      ],
+      "blockedBy": [
+        "SCP-CAPINJECT-001"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "### 6. Delete the runtime nullifier switch; sever `testing` from shipped graphs; G1 (depends on Slice 1)"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "### 2. Key custody — real backends already ship; demote the in-memory arm to test-harness-only"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "### 3. Device attestation — declines the capability (spec §9:187), not \"Axis A = 0\""
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Enforcement"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.2 Security Classification of Development Arms"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "adr": "ADR-062",
+        "unit": "2",
+        "slice": "Slice 6 (severance + switch deletion + G1 subset-allowlist)",
+        "folds": "#1733 (close as folded here)",
+        "scopeException": "switch deletion + cfg-rename + edge-severance + phantom-retype + G1 are atomic",
+        "note": "pre-rotation NULLIFIER severed here (test-harness-only, fail-closed production create with a typed IdentityError); only the real BACKEND is out of scope (RFC #2130 / #1729). G1 allowlists ZERO nullifiers, no exceptions (PR #2132). Non-committing create = #1553."
+      }
+    },
+    {
+      "id": "SCP-CAPINJECT-009",
+      "title": "E2 credentials: delete the impl Default (live SCP-CAPSEL-8000/8011 fix), introduce the FfiCredentialStore enum seam + a real durable backend, demote InMemoryCredentialStore to test-harness-only",
+      "gate": "gate-capinject-9",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/bridge/credentials.rs",
+        "crates/scp-ffi/common/src/credentials.rs",
+        "crates/scp-ffi/common/src/lib.rs",
+        "crates/scp-ffi/napi/src/runtime.rs",
+        "crates/scp-ffi/src/runtime.rs",
+        ".docs/standards/sdk-capability-matrix.json"
+      ],
+      "description": "ADR-062 Slice 9 (Unit 3, E2 HIGH; §Decision 5). The `impl Default for InMemoryCredentialStore` (credentials.rs:556) wired on shipped NAPI+PyO3 (napi/runtime.rs:313) is a LIVE SCP-CAPSEL-8000/8011 violation (a default selection) — its removal is not deferrable. `BridgeCredentialStore` is RPITIT -> introduce an `enum FfiCredentialStore { Durable(<real durable backend>), #[cfg(feature = \"testing\")] InMemory(InMemoryCredentialStore) }`, DELETE the `impl Default`, require an explicit selection at the bridge construction boundary, and ship a real durable credential store (persisted bridge tokens). InMemoryCredentialStore -> test-harness-only. Classified durability-only (RAM-only tokens are re-obtainable by re-auth); the selection-boundary fix is the security-relevant part. Add the credentials-backend row to the capability matrix. Independent of the DHT/pre-rotation work (blockedBy []); gate-sequenced after Unit 1/2 but the impl-Default removal is a live fix and can land as soon as scheduled. Scope exception: the seam + durable backend + Default removal are one selection-boundary change.",
+      "acceptanceCriteria": [
+        "The `impl Default` is deleted (live SCP-CAPSEL-8000/8011 fix): `grep -n 'impl Default for InMemoryCredentialStore\\|impl Default for BridgeCredentialStore' crates/scp-runtime/src/bridge/credentials.rs` returns 0.",
+        "An `enum FfiCredentialStore` seam exists with a real Durable arm + a test-harness InMemory arm: `grep -n 'enum FfiCredentialStore' crates/scp-ffi/common/src/credentials.rs` matches with a `Durable` arm and an `InMemory` arm gated `#[cfg(feature = \"testing\")]`.",
+        "The bridge requires an explicit credential-store selection (no default): outside `#[cfg(feature = \"testing\")]`, `grep -rn 'InMemoryCredentialStore' crates/scp-ffi/napi/src/runtime.rs crates/scp-ffi/src/runtime.rs` returns 0, and a real durable backend is selected at construction (grep the construction site).",
+        "A real durable credential store persists tokens across restart: a test writes a bridge token, drops+reconstructs the store from the durable backend, and reads the token back (proving it is not RAM-only).",
+        ".docs/standards/sdk-capability-matrix.json has a credentials-backend row; `python3.12 scripts/check-sdk-coverage.py` exits 0.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Delete the impl Default in credentials.rs; add the FfiCredentialStore enum seam (Durable + `#[cfg] InMemory`); require explicit selection at the bridge boundary.",
+        "Implement a real durable credential store (persisted bridge tokens); demote InMemoryCredentialStore to test-harness-only.",
+        "Add the credentials-backend row to the capability matrix; write the persistence + selection tests; run full CI + review roster."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "### 5. Credentials (E2), blob (E3), relay querier (E4) — classified + storied now (live SCP-CAPSEL fixes)"
+        },
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "## Capability classification (§17.17.2 SCP-CAPSEL-8010 — mandatory before ship)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.2 Security Classification of Development Arms"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "adr": "ADR-062",
+        "unit": "3",
+        "slice": "Slice 9 (E2 credentials)",
+        "scopeException": "seam + durable backend + Default removal are one selection-boundary change"
+      }
+    },
+    {
+      "id": "SCP-CAPINJECT-010",
+      "title": "E3 blob storage: delete impl Default for BlobStorageBackend (live SCP-CAPSEL-8011 fix), require the arm at relay/node init; InMemoryBlobStore stays durability-only explicit-only",
+      "gate": "gate-capinject-10",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/native/storage.rs",
+        "crates/scp-node/src/self_host.rs",
+        "crates/scp-node/src/config.rs"
+      ],
+      "description": "ADR-062 Slice 10 (Unit 3, E3 MED; §Decision 5). `BlobStorageBackend::InMemory` is the un-cfg'd variant (storage.rs:480) manufactured by `impl Default -> in_memory()` (storage.rs:561) — a LIVE SCP-CAPSEL-8011 violation (a durability-only arm as the default). Delete `impl Default for BlobStorageBackend` and require the arm to be selected explicitly at relay/node init (the construction boundary). `InMemoryBlobStore` stays durability-only and explicitly selectable (never default/fallback); §17.7 already ships Sqlite/redb/Postgres/S3 real backends. Classified durability-only (blob loss is availability, not a security nullification); the selection-boundary fix is the SCP-CAPSEL-8011 remediation. blockedBy [] (independent live fix). Scope exception: the Default removal + explicit-selection wiring are one selection-boundary change.",
+      "acceptanceCriteria": [
+        "The `impl Default for BlobStorageBackend` is deleted (live SCP-CAPSEL-8011 fix): `grep -n 'impl Default for BlobStorageBackend' crates/scp-transport/src/native/storage.rs` returns 0, and `grep -n 'fn default.*in_memory\\|BlobStorageBackend::default' crates/scp-transport` returns 0.",
+        "The blob backend is required (explicit selection) at relay/node init: the relay/node construction takes the blob backend as a non-Option argument (grep the construction signature in scp-node/src/self_host.rs) and there is no code path defaulting/falling back to InMemory (SCP-CAPSEL-8000/8001).",
+        "InMemoryBlobStore stays a legitimate explicit durability-only option: it remains selectable by explicit choice (a test constructs a relay with an explicit InMemory blob backend) but is never the default.",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Delete impl Default for BlobStorageBackend; make the blob backend a required (non-Option) argument at relay/node init.",
+        "Keep InMemoryBlobStore explicitly selectable (never default/fallback); write the explicit-selection + no-default tests; run full CI + review roster."
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "### 5. Credentials (E2), blob (E3), relay querier (E4) — classified + storied now (live SCP-CAPSEL fixes)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.1 Selection Requirements"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "adr": "ADR-062",
+        "unit": "3",
+        "slice": "Slice 10 (E3 blob)",
+        "scopeException": "Default removal + explicit-selection wiring are one selection-boundary change"
+      }
+    },
+    {
+      "id": "SCP-CAPINJECT-011",
+      "title": "E4 relay layer (READ + WRITE): implement the real MultiRelayQuerier (relay-resolution, SCPR-decode §9.10.12) AND a real production RelayPublisher (SCPR-wrap + publish_raw), sever the InMemoryRelayPublisher default (republish.rs:397) + demote it to test-harness-only, and fix the republish loop's signature/sequence drop (republish.rs:703); demote only the test double InMemoryRelayQuerier to test-harness-only (NoOpRelayQuerier stays a shipped production arm)",
+      "gate": "gate-capinject-11",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/envelope/scpr.rs",
+        "crates/scp-protocol/src/envelope/mod.rs",
+        "crates/scp-identity/src/resolver.rs",
+        "crates/scp-identity/src/resolution.rs",
+        "crates/scp-identity/src/republish.rs",
+        "crates/scp-identity/src/lib.rs",
+        "crates/scp-identity/Cargo.toml",
+        "crates/scp-transport/src/traits.rs",
+        "crates/scp-transport/src/native/adapter.rs"
+      ],
+      "description": "ADR-062 Slice 11 (Unit 3, E4 MED; §Decision 5, spec §3.10.12, §9.10.12 Model A). E4 is the relay resolution layer, which has TWO halves — READ (querier) and WRITE (publisher) — and NEITHER has a production backend today. This story lands BOTH; no half is deferred.\n\nREAD half. `NoOpRelayQuerier` (resolver.rs:309) `query` returns `Ok(None)`; the `DualLayerResolver` falls back to DHT-only and returns honest not-found `Ok(None)` when both layers find nothing — it NEVER fabricates a false document (§3.10.4 'MUST NOT fabricate'). It FAILS CLOSED. So the READ arm is a COMPLETENESS / defense-in-depth gap, NOT a nullifier, and `NoOpRelayQuerier` SHIPS HONESTLY as the DHT-only interim (it need NOT be gated/absent at Slice 6). This story implements the REAL `MultiRelayQuerier` (the trait lives in scp-identity resolver.rs; per the resolution.rs module doc, PRODUCTION queriers live in scp-transport — scp-identity cannot host a relay-talking impl because scp-transport depends on scp-identity, so a reverse dep would be circular). The real querier reads raw SCPR blobs via the SDK public-record `query_raw` path (§9.10.12), SCPR-decodes each returned blob as a kind-1 DID-record frame into the (value, signature, seq) triple, and BEP44-verifies (seq before value, per BEP44) before use.\n\nWRITE half (previously mis-deferred to a phantom follow-on slice that does not exist as a PRD story or ADR slice — the write half is IN THIS STORY, not deferred). `RepublishManager` defaults its publisher type parameter to the test double: `RepublishManager<D, R = InMemoryRelayPublisher>` (republish.rs:397). No production `RelayPublisher` exists (only `InMemoryRelayPublisher` + test doubles impl the trait), and the relay-republish loop drops the signature and sequence, publishing bare `document_bytes` rather than the SCPR kind-1 frame (republish.rs:703). That in-memory DEFAULT is a WRITE-path LATENT, by-construction default-selection violation, structurally identical to E1's `DidDht<D = InMemoryDhtClient>` default: the instant a production `RepublishManager` is wired it would bind the in-memory dev publisher unless severed by construction. Today relays receive no DID frames because relay-republish is ENTIRELY UNWIRED in production (no shipped `RepublishManager` construction; `::new` sets `relay_publisher: None`; the only constructions are `#[cfg(test)]`, republish.rs:863-917), NOT because the default swallows publishes — nothing publishes, so nothing is swallowed. This story: (a) implements a real production `RelayPublisher` (in scp-transport) that wraps (value, signature, seq) into an SCPR kind-1 frame (§9.10.12) and publishes it via the `publish_raw` transport path; (b) SEVERS the `InMemoryRelayPublisher` default type param on `RepublishManager` and requires an explicit publisher (same treatment as E1's `InMemoryDhtClient` default in Slice 1); (c) demotes `InMemoryRelayPublisher` to `#[cfg(any(test, feature=\"testing\"))]`; (d) fixes the republish loop to publish the full SCPR kind-1 frame (signature + sequence no longer dropped).\n\nShared primitive. The SCPR kind-1 encode/decode type both halves consume does not exist yet; per §3.10.12 it is a Phase-2 `scp-protocol` type (§9.10.12). scp-identity gains a `scp-protocol` dependency to consume it (acyclic: scp-protocol does not depend on scp-identity).\n\nRESILIENCE CLAIM (corrected). Only BOTH halves together genuinely restore the §3.10.8 dual-layer suppression resilience: a real querier reading relays that a real publisher actually populates. Landing the querier alone would read relays that never receive DID frames — an empty half that would FALSELY claim restored resilience. This also completes A2 (SCP-CAPINJECT-001): with the write half, a `DhtMode::Disabled` node publishes its OWN DID to the relay and resolves both its own and peers' DIDs there (ADR-062 A2↔A4 sequencing note explicitly requires a Disabled node to resolve its own DID via relay, which requires publishing).\n\nCORRECTION vs. the original story: `NoOpRelayQuerier` STAYS a shipped, documented production arm — the honest not-a-DID-source case, since the loopback/node relay path is a protocol-unaware blob pipe (§10.4), not a DID-QUERY source. Only the pure test doubles demote to test-harness-only: `InMemoryRelayQuerier` (resolution.rs:248, currently `pub`) on the READ side and `InMemoryRelayPublisher` (republish.rs:156) on the WRITE side, both to `#[cfg(any(test, feature=\"testing\"))]`.\n\nOUT OF SCOPE (genuinely separate follow-up, tracked separately — NOT a fabricated slice id): the KeyPackage → SCPR kind-2 migration. KeyPackages function today via `OuterEnvelope.encrypted_blob`; migrating them to a raw SCPR kind-2 blob is a future ADR-062 slice/issue to be filed and is not required for 011.\n\nScope exception: the READ querier + WRITE publisher + their shared SCPR kind-1 primitive + the transport raw-blob path + the InMemory default severance + the test-double demotions are ONE indivisible resolution-layer change — a read half without a write half is an empty half that would falsely claim restored resilience, so both MUST land together.",
+      "acceptanceCriteria": [
+        "READ — generic MultiRelayQuerier composer (scp-identity): the generic, transport-agnostic composer `RealMultiRelayQuerier<Q: RelayQuerier>` that wires the relay layer into dual-layer resolution lives in scp-identity alongside `DualLayerResolver` and the `MultiRelayQuerier` trait (it needs only the scp-identity `RelayQuerier` trait + `did_routing_id` + BEP44 helpers — all local — so composition does NOT depend on scp-transport; resolution.rs:22-24/:86-89 establish this abstraction). Machine-verifiable: `grep -rn 'impl MultiRelayQuerier for' crates/scp-identity/src` matches the generic `RealMultiRelayQuerier<Q>` composer (a real, non-NoOp impl), and the `DualLayerResolver` composes both the relay layer and the DHT layer (grep the dual-layer path).",
+        "READ — concrete relay querier (scp-transport): the concrete `TransportRelayQuerier` that actually performs the relay QUERY via the `query_raw` public-record path (§9.10.12) and SCPR-decodes each returned blob as a kind-1 DID-record frame into (value, signature, seq) before BEP44 verification (§3.10.4/§3.10.12) lives in scp-transport — only the relay-talking impl belongs there (scp-transport depends on scp-identity, so a reverse dep would be circular). Machine-verifiable: `grep -rn 'impl RelayQuerier for' crates/scp-transport/src` matches the concrete `TransportRelayQuerier` (a real, non-InMemory impl) that calls `query_raw` and SCPR-decodes the result.",
+        "READ — transport raw-blob path: the SDK transport adapter exposes a public-record RAW-BLOB path distinct from its `OuterEnvelope` message path (Model A, §9.10.12 / §3.10.2): `grep -rn 'fn publish_raw' crates/scp-transport/src` and `grep -rn 'fn query_raw' crates/scp-transport/src` each match a raw-blob (`Vec<u8>`, NOT `OuterEnvelope`) publish/query method on the transport adapter; the real `MultiRelayQuerier` calls `query_raw` and the real `RelayPublisher` calls `publish_raw` (grep both).",
+        "READ — InMemoryRelayQuerier demotion; NoOpRelayQuerier stays: only the pure test double `InMemoryRelayQuerier` (resolution.rs:248, currently `pub`) demotes to test-harness-only; `NoOpRelayQuerier` STAYS a shipped production resolver arm (the honest not-a-DID-source case, §10.4) and is deliberately NOT grep-restricted. Machine-verifiable: outside `#[cfg(test)]`/`#[cfg(feature = \"testing\")]`, `grep -rn 'InMemoryRelayQuerier' crates/scp-identity/src` returns 0 references as a SHIPPED type (it may exist only as a test double gated by `#[cfg(any(test, feature = \"testing\"))]`).",
+        "READ — NoOpRelayQuerier fail-closed asserted: a test asserts `NoOpRelayQuerier::query` returns `Ok(None)` (never a fabricated document) and that the resolver returns honest not-found `Ok(None)` when both layers find nothing (§3.10.4) — establishing the READ arm was fail-CLOSED before this slice and the relay layer is added for defense-in-depth, not to fix a false-answer bug.",
+        "SHARED — SCPR kind-1 frame primitive: a deterministic SCPR kind-1 encode/decode type exists in scp-protocol (§3.10.12 Phase-2 placement, §9.10.12): `grep -rn 'Scpr' crates/scp-protocol/src/envelope` matches the kind-1 frame type with encode + decode functions, and a round-trip test encodes a (value, signature, seq) triple into a kind-1 frame and decodes it back to a byte-identical triple; the decoder enforces the §9.10.12 rules (reject unknown version/kind, exact-length equality, bound-check-first).",
+        "WRITE — real RelayPublisher: a real production `RelayPublisher` implementation exists in scp-transport that wraps (value, signature, seq) into an SCPR kind-1 frame (§9.10.12) and publishes it via the `publish_raw` transport path: `grep -rn 'impl RelayPublisher for' crates/scp-transport/src` matches a real (non-InMemory, non-test) publisher that SCPR-encodes and calls `publish_raw`.",
+        "WRITE — InMemoryRelayPublisher default severed + demoted: the `RepublishManager` publisher type parameter no longer defaults to the test double. Machine-verifiable: `grep -rn '= InMemoryRelayPublisher' crates/scp-identity/src/republish.rs` returns 0 (no default type param), and outside `#[cfg(test)]`/`#[cfg(feature = \"testing\")]`, `grep -rn 'InMemoryRelayPublisher' crates/scp-identity/src` returns 0 references as a SHIPPED type (gated by `#[cfg(any(test, feature = \"testing\"))]`). Production construction requires an explicit publisher.",
+        "WRITE — republish loop publishes the full SCPR frame (signature/sequence no longer dropped): a test drives the relay-republish path with a real (or recording) publisher and asserts the published blob decodes as a valid SCPR kind-1 frame carrying the SAME (value, signature, seq) as the source `RepublishEntry` — proving republish.rs:703 no longer publishes bare `document_bytes`.",
+        "BOTH — publish→resolve round-trip: a test publishes a DID document ONLY to a relay (not the DHT) via the real `RelayPublisher` and resolves it back via the real `MultiRelayQuerier` (relay-only round-trip), proving the write and read halves interoperate; and a test asserts suppression on one layer is defeated by the other (§3.10.8 dual-layer suppression resilience).",
+        "BOTH — A2 completion (SCP-CAPINJECT-001), Disabled node self-DID + peer via relay: a test constructs a `DhtMode::Disabled` node (DHT-layer-off), publishes its OWN DID to a relay via the real `RelayPublisher`, resolves its own DID back via the real `MultiRelayQuerier`, AND resolves a peer's DID published to a relay — confirming the ADR-062 A2↔A4 sequencing note that a Disabled node's own-DID and peer resolution come online here (self-DID resolution requires the write half).",
+        "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
+        "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
+      ],
+      "actionItems": [
+        "Build the SCPR kind-1 frame encode/decode primitive in scp-protocol (§3.10.12 / §9.10.12); add a `scp-protocol` dependency to scp-identity (acyclic).",
+        "Add a public-record raw-blob path (`publish_raw`/`query_raw`, `Vec<u8>` blobs) to the transport adapter (crates/scp-transport/src/traits.rs + native/adapter.rs), distinct from the `OuterEnvelope` `send`/`query` path (Model A, §9.10.12).",
+        "READ: implement a real production `MultiRelayQuerier` (in scp-transport) that reads raw SCPR blobs via `query_raw`, SCPR-decodes + BEP44-verifies; wire it into the resolver's dual-layer resolution; demote only the test double `InMemoryRelayQuerier` (resolution.rs) to test/testing; keep `NoOpRelayQuerier` shipped.",
+        "WRITE: implement a real production `RelayPublisher` (in scp-transport) that SCPR-wraps (value, signature, seq) and publishes via `publish_raw`; sever the `InMemoryRelayPublisher` default type param on `RepublishManager` and require an explicit publisher; demote `InMemoryRelayPublisher` to test/testing; fix the republish loop (republish.rs:703) to publish the full SCPR kind-1 frame instead of bare `document_bytes`.",
+        "Wire a production `RepublishManager` with the real `RelayPublisher` at the node/runtime construction site so a Disabled node actually publishes its own DID via the relay.",
+        "Write the SCPR round-trip, publish→resolve round-trip, dual-layer suppression, and Disabled-node self-DID + peer tests; run full CI + review roster."
+      ],
+      "blockedBy": [
+        "SCP-CAPINJECT-001"
+      ],
+      "sources": [
+        {
+          "file": ".docs/adrs/ADR-062-capability-injection-and-prove-absent-dev-backends.md",
+          "section": "### 5. Credentials (E2), blob (E3), relay querier (E4) — classified + storied now (live SCP-CAPSEL fixes)"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.12 Phase Integration"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.10.12 Relay Public-Record Frame (SCPR)"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "### 17.17.2 Security Classification of Development Arms"
+        },
+        {
+          "file": ".docs/specs/10-infrastructure-and-self-hosting.md",
+          "section": "## 10.4 Relay Architecture"
+        }
+      ],
+      "details": {
+        "phase": "2",
+        "adr": "ADR-062",
+        "unit": "3",
+        "slice": "Slice 11 (E4 relay layer READ + WRITE — §3.10.12, §9.10.12)",
+        "scopeException": "READ querier + WRITE publisher + shared SCPR kind-1 primitive + transport raw-blob path + InMemory default severance + test-double demotions are one indivisible resolution-layer change (a read half without a write half is an empty half that would falsely claim restored resilience) — Model A, §9.10.12"
+      }
+    }
+  ]
+}

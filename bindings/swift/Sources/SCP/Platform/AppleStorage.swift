@@ -173,7 +173,9 @@
             // swiftlint:disable:next identifier_name
             guard openResult == SQLITE_OK, let db = dbHandle else {
                 let msg = dbHandle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown error"
-                if let handle = dbHandle { sqlite3_close_v2(handle) }
+                if let handle = dbHandle {
+                    sqlite3_close_v2(handle)
+                }
                 throw StorageError.databaseError("Failed to open database: \(msg)")
             }
 

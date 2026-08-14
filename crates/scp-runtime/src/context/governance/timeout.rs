@@ -1,6 +1,11 @@
-//! Governance proposal timeout task with deadlock detection (SCP-271, ADR-031 §5/§10).
+//! Governance proposal timeout + deadlock detection (SCP-271, ADR-031 §5/§10).
 //!
-//! The [`GovernanceTimeoutTask`] runs as a per-context background task that:
+//! The timeout / deadlock-detection pipeline (`process_pending_proposals`,
+//! `detect_deadlock`, `update_detection_state`) is run once every 60 seconds
+//! by the ACTOR-OWNED governance-timeout arm
+//! ([`ContextActor::run`](crate::context::actor::ContextActor)'s
+//! `governance_timeout` interval → `evaluate_governance_timeouts`; ADR-049
+//! Decision-1 / finding A3). Each tick:
 //!
 //! 1. **Checks active proposals every 60 seconds.** When a proposal's
 //!    `voting_deadline` passes without resolution, `resolve()` transitions
@@ -25,18 +30,12 @@
 //!    capability can propose `ReconfigureGovernance` with fallback quorum
 //!    (majority-of-active, 48-hour window, model TYPE never changes).
 //!
-//! The task starts when a context enters `Active` state and stops when the
-//! context is closed or dropped.
+//! The actor arms the interval while the context is `Active` and clears it
+//! once the context leaves `Active` (close / expiry / tombstone).
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::sync::Notify;
-use tokio::task::{AbortHandle, JoinSet};
-
-use scp_identity::DID;
+use scp_did::DID;
 
 use scp_protocol::context::governance::{
     DeadlockJustification, GovernanceContext, GovernanceEngine, GovernanceEvent,
@@ -115,177 +114,6 @@ pub struct DeadlockDetectionState {
     /// Whether a deadlock has been detected and a recovery proposal is
     /// already in flight (prevents duplicate recovery proposals).
     pub recovery_in_progress: bool,
-}
-
-// ---------------------------------------------------------------------------
-// GovernanceTimeoutTask
-// ---------------------------------------------------------------------------
-
-/// Background task that checks governance proposals for timeout, departure,
-/// and deadlock conditions (ADR-031 §5, §10).
-///
-/// One instance per active context. Runs a 60-second interval loop that:
-/// - Calls `resolve()` on all pending proposals to detect expiry.
-/// - Checks for proposer/voter departures.
-/// - Updates deadlock detection state and emits recovery events.
-///
-/// Cancellation: call [`cancel()`](Self::cancel) or drop the task.
-pub struct GovernanceTimeoutTask {
-    /// The spawned task abort handle.
-    task: Option<AbortHandle>,
-    /// Cancellation signal.
-    cancel: Arc<Notify>,
-}
-
-impl GovernanceTimeoutTask {
-    /// Creates a new timeout task without starting it.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            task: None,
-            cancel: Arc::new(Notify::new()),
-        }
-    }
-
-    /// Starts the background timeout loop using bare `tokio::spawn`.
-    ///
-    /// The `tick_fn` callback is invoked every 60 seconds (see
-    /// [`TIMEOUT_CHECK_INTERVAL_SECS`]). It should perform timeout
-    /// processing (call [`process_pending_proposals`], [`detect_deadlock`],
-    /// etc.) and return `true` to continue or `false` to stop the loop
-    /// (e.g., when the context is no longer active).
-    ///
-    /// If the task is already running, this cancels the previous task
-    /// before spawning the new one.
-    ///
-    /// Prefer [`start_in`](Self::start_in) when a shared `JoinSet` is
-    /// available (e.g., within `ContextManager`) so tasks are managed as
-    /// a group and automatically cancelled on manager drop.
-    pub fn start<F, Fut>(&mut self, tick_fn: F)
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = bool> + Send,
-    {
-        // Cancel any existing task.
-        self.cancel.notify_one();
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-
-        // Fresh cancellation signal for the new task.
-        let cancel = Arc::new(Notify::new());
-        self.cancel = cancel.clone();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(TIMEOUT_CHECK_INTERVAL_SECS)) => {
-                        if !tick_fn().await {
-                            break;
-                        }
-                    }
-                    () = cancel.notified() => {
-                        break;
-                    }
-                }
-            }
-        });
-        self.task = Some(handle.abort_handle());
-    }
-
-    /// Starts the background timeout loop, spawning into the given `JoinSet`.
-    ///
-    /// Same as [`start`](Self::start) but spawns into a shared `JoinSet`
-    /// instead of bare `tokio::spawn`. Tasks in the `JoinSet` are
-    /// automatically cancelled when the set is dropped, providing structured
-    /// lifecycle management for `ContextManager` background tasks.
-    ///
-    /// If the task is already running, this cancels the previous task
-    /// before spawning the new one.
-    pub fn start_in<F, Fut>(&mut self, task_set: &mut JoinSet<()>, tick_fn: F)
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = bool> + Send,
-    {
-        // Cancel any existing task.
-        self.cancel.notify_one();
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-
-        // Fresh cancellation signal for the new task.
-        let cancel = Arc::new(Notify::new());
-        self.cancel = cancel.clone();
-
-        let abort_handle = task_set.spawn(async move {
-            loop {
-                tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(TIMEOUT_CHECK_INTERVAL_SECS)) => {
-                        if !tick_fn().await {
-                            break;
-                        }
-                    }
-                    () = cancel.notified() => {
-                        break;
-                    }
-                }
-            }
-        });
-        self.task = Some(abort_handle);
-    }
-
-    /// Installs an already-spawned timeout task's cancel signal and
-    /// abort handle, cancelling any prior task first.
-    ///
-    /// Used by the actor-shape governance-timeout spawn path (ADR-049
-    /// Phase 2A finalization), where the interval loop is spawned onto
-    /// the supervisor's tracked `task_set` via
-    /// [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn)
-    /// rather than [`start_in`](Self::start_in)'s direct `&mut JoinSet`
-    /// access. The caller builds the loop future with a
-    /// `cancel.notified()` select arm using the same `cancel` `Notify`
-    /// it passes here, so [`cancel`](Self::cancel) / drop stop the task.
-    pub fn install(&mut self, cancel: Arc<Notify>, abort: AbortHandle) {
-        // Cancel any existing task (signal + abort), same as `start_in`.
-        self.cancel.notify_one();
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-        self.cancel = cancel;
-        self.task = Some(abort);
-    }
-
-    /// Returns `true` if the task is currently running.
-    #[must_use]
-    pub fn is_active(&self) -> bool {
-        self.task.as_ref().is_some_and(|t| !t.is_finished())
-    }
-
-    /// Cancels the running task, if any.
-    ///
-    /// Signals the cancellation token AND aborts the task via the
-    /// `AbortHandle` for consistency with the `Drop` implementation.
-    pub fn cancel(&self) {
-        self.cancel.notify_one();
-        if let Some(task) = &self.task {
-            task.abort();
-        }
-    }
-}
-
-impl Default for GovernanceTimeoutTask {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for GovernanceTimeoutTask {
-    fn drop(&mut self) {
-        self.cancel.notify_one();
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -638,7 +466,7 @@ mod tests {
     }
 
     fn mock_resolver() -> KeyResolver {
-        Arc::new(|did: &DID, _kid: scp_protocol::identity::SigningKeyId| {
+        Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
             let did_str: &str = did.as_ref();
             match did_str {
                 "did:dht:z6MkAlice" => {
@@ -1204,137 +1032,5 @@ mod tests {
     #[test]
     fn recovery_voting_window_is_48_hours() {
         assert_eq!(DEADLOCK_RECOVERY_VOTING_WINDOW_SECS, 48 * 60 * 60);
-    }
-
-    // -----------------------------------------------------------------------
-    // GovernanceTimeoutTask start/cancel lifecycle (AC: task lifecycle)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn timeout_task_starts_and_is_active() {
-        let mut task = GovernanceTimeoutTask::new();
-        assert!(!task.is_active());
-
-        let tick_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let tick_count_clone = Arc::clone(&tick_count);
-        task.start(move || {
-            let tick_count = Arc::clone(&tick_count_clone);
-            async move {
-                tick_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                true
-            }
-        });
-
-        assert!(task.is_active());
-        task.cancel();
-        // Give the task time to process cancellation.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        // Task should have stopped. It may or may not have finished by now
-        // since cancellation is async, but cancel was called.
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn timeout_task_stops_when_callback_returns_false() {
-        let mut task = GovernanceTimeoutTask::new();
-        task.start(|| async { false });
-
-        // Advance past the check interval to trigger the tick.
-        // Use sleep (which auto-advances paused time) instead of advance().
-        tokio::time::sleep(Duration::from_secs(TIMEOUT_CHECK_INTERVAL_SECS + 1)).await;
-        // Give the spawned task time to finish after the callback returns false.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !task.is_active(),
-            "task should have stopped after callback returned false"
-        );
-    }
-
-    #[tokio::test]
-    async fn timeout_task_cancelled_on_drop() {
-        let mut task = GovernanceTimeoutTask::new();
-        task.start(|| async { true });
-        assert!(task.is_active());
-        let _cancel = task.cancel.clone();
-        drop(task);
-        // After drop, the cancel signal was sent and the task was aborted.
-        // Verify the cancel was notified (drop calls notify_one).
-        // This is a structural test — the Drop impl is already tested by compilation.
-    }
-
-    // -----------------------------------------------------------------------
-    // Integration: proposal expires after voting window via background task
-    // (AC: Test: proposal expires after voting window)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test(start_paused = true)]
-    async fn proposal_expires_via_background_task() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        // ThresholdEngine enforces voting_window_secs >= 300.
-        let mut engine =
-            ThresholdEngine::new(vec![alice(), bob(), carol()], 2, 300, mock_resolver()).unwrap();
-
-        let now = 1_000_000_u64;
-        let ctx = threshold_context(now);
-
-        let (proposal, _events) = engine
-            .propose(
-                &alice(),
-                GovernanceAction::AddMember {
-                    did: dave(),
-                    role: "member".to_owned(),
-                },
-                &ctx,
-                &test_signing_key(),
-            )
-            .unwrap();
-        let proposal_id = proposal.proposal_id;
-
-        // Wrap engine in shared state so the callback can access it.
-        let engine = Arc::new(tokio::sync::Mutex::new(engine));
-        let expired = Arc::new(AtomicBool::new(false));
-
-        let engine_clone = Arc::clone(&engine);
-        let expired_clone = Arc::clone(&expired);
-        let mut task = GovernanceTimeoutTask::new();
-        task.start(move || {
-            let engine = Arc::clone(&engine_clone);
-            let expired = Arc::clone(&expired_clone);
-            async move {
-                let mut eng = engine.lock().await;
-                // Simulate time past the 300-second voting deadline.
-                let expired_ctx = GovernanceContext {
-                    now: now + 301,
-                    ..threshold_context(now)
-                };
-                let result = process_pending_proposals(&mut *eng, &expired_ctx, &[], &[]);
-                if !result.events.is_empty() {
-                    expired.store(true, Ordering::SeqCst);
-                }
-                false // Stop after one tick.
-            }
-        });
-
-        // Advance tokio time past the check interval to trigger the tick.
-        tokio::time::sleep(Duration::from_secs(TIMEOUT_CHECK_INTERVAL_SECS + 1)).await;
-        // Give the spawned task time to execute.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-
-        assert!(
-            expired.load(Ordering::SeqCst),
-            "proposal should have been resolved by the background task"
-        );
-
-        let eng = engine.lock().await;
-        let resolved = eng.get_proposal(&proposal_id).unwrap();
-        assert_eq!(
-            resolved.status,
-            ProposalStatus::Expired,
-            "proposal should be Expired after voting window passed"
-        );
     }
 }

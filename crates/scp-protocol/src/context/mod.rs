@@ -10,18 +10,21 @@ pub mod builder;
 pub mod close;
 pub mod export;
 pub mod governance;
+pub mod group_context_extension;
 pub mod invitation;
+pub mod invitation_bundle;
 pub mod membership;
 pub mod memory_scope;
 pub mod metadata;
 pub mod nesting;
+pub mod outlets;
 pub mod params;
 pub mod policy;
 pub mod promotion;
+pub mod pseudonym;
 pub mod roles;
 pub mod state_machine;
 pub mod templates;
-pub mod tools;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,13 +42,22 @@ pub use governance::{
     ProposalStatus, RejectionReason, SignedVote, VoteType, actions_conflict, compute_proposal_id,
     sign_vote, verify_proposal_votes, verify_vote,
 };
+pub use group_context_extension::{
+    SCP_CONTEXT_EXTENSION_TYPE_ID, ScpContextBindingError, ScpContextExtension,
+};
+pub use invitation_bundle::{
+    InvitationBundle, InvitationBundleError, InvitationKeyMaterial, JoinResponse,
+};
 pub use membership::{MemberInfo, MembershipState};
+pub use metadata::{
+    Ed25519Signature, MetadataRecord, MetadataSnapshot, OperationalMetadata, StructuralMetadata,
+};
 pub use nesting::{compute_ceiling_intersection, validate_child_ttl, validate_nesting_depth};
 pub use params::{
     BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
     ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
-    MigrationSource, ProjectionOverride, ProjectionPolicy, ProjectionRule, PromotionPolicy,
-    PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId, ToolRegistration,
+    MigrationSource, OutletRegistration, ProjectionOverride, ProjectionPolicy, ProjectionRule,
+    PromotionPolicy, PublicMetadata, RoleDefinition, RuntimeMetadata, TemplateId,
     decode_protocol_version, encode_protocol_version,
 };
 pub use roles::{
@@ -57,19 +69,23 @@ pub use roles::{
 pub use state_machine::transition;
 pub use templates::{TemplateError, template_params, validate_against_template};
 
-/// Converts a `context_id` string to a deterministic 32-byte array using SHA-256.
+/// Hashes an arbitrary label to a deterministic 32-byte array using SHA-256.
 ///
-/// This is the **canonical** context ID byte representation used across all
-/// context operations: builder, manager, TTL, memory scope, and any code that
-/// needs a `[u8; 32]` from a context ID string. Using SHA-256 ensures:
-/// - Fixed output size regardless of input length (no truncation/collision).
-/// - Uniform distribution (suitable as cryptographic key material identifiers).
-/// - No information leakage about input length (unlike zero-padding).
+/// This is the **raw routing / synthetic-label primitive ONLY**. It is the
+/// correct outlet for hashing non-context labels — broadcast routing ids and
+/// synthetic pseudo-contexts (e.g. the `"identity-private-state"` recovery
+/// label) that are never a real canonical context id. SHA-256 gives a fixed
+/// output size, uniform distribution, and no input-length leakage.
 ///
-/// # CRITICAL: All modules MUST use this function.
-/// Using raw UTF-8 bytes (truncation/zero-padding) produces different values
-/// than SHA-256 for the same input, causing crypto operations to address the
-/// wrong MLS groups, sender keys, and event logs.
+/// # CRITICAL: do NOT use this to key a real context.
+/// Per ADR-056 a context's canonical identity IS its 32-byte digest, and the
+/// id string is `hex(digest)`. Passing a real 64-hex context id here
+/// **double-hashes** it (`SHA-256(hex(digest))`), producing a key that diverges
+/// from the digest the MLS group, sender keys, and event log all address — a
+/// silent fail-open. To resolve a context id to keying bytes, always route
+/// through the canonical chokepoint resolver `context_id_to_bytes` (in
+/// `scp-runtime`), which DECODES a real 64-hex id to its digest and falls back
+/// to this primitive only for genuine non-context labels.
 #[must_use]
 pub fn context_id_bytes(context_id: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -92,9 +108,12 @@ const CONTEXT_ROUTING_DOMAIN_SEPARATOR: &[u8] = b"scp:context-routing:";
 /// domain-separated SHA-256.
 ///
 /// The routing ID is `SHA-256("scp:context-routing:" || context_id)`.
-/// This is distinct from [`context_id_bytes`] (raw `SHA-256(context_id)`)
-/// which is used for internal crypto keying (MLS groups, sender keys, event
-/// logs). The domain separator prevents routing-level collisions with other
+/// This is distinct from [`context_id_bytes`] (raw `SHA-256(context_id)`),
+/// which is the raw routing / synthetic-label primitive — NOT the crypto
+/// keying path for a real context. Per ADR-056, real-context crypto keying
+/// (MLS groups, sender keys, event logs) routes through the canonical
+/// chokepoint resolver `context_id_to_bytes`, which decodes a 64-hex id to its
+/// digest. The domain separator prevents routing-level collisions with other
 /// hash domains.
 ///
 /// Both the send path (`ContextManager::send_message`) and the subscribe
@@ -147,7 +166,7 @@ pub enum ContextState {
     /// are in progress. If any step fails, the context is dropped without
     /// reaching `Active`.
     Creating,
-    /// Context is fully operational. Messages, tool invocations, and membership
+    /// Context is fully operational. Messages, outlet invocations, and membership
     /// changes are permitted according to the context's roles and capabilities.
     Active,
     /// Context closure has been initiated. Members have a window to process
@@ -161,7 +180,7 @@ pub enum ContextState {
     /// window. See spec section 5.10.
     Expired,
     /// Context migration has been approved and the source context is in a
-    /// read-only grace period (§5.11A.4). No new messages, tool invocations,
+    /// read-only grace period (§5.11A.4). No new messages, outlet invocations,
     /// or governance actions (except migration cancellation) are accepted.
     /// Members can still read existing content.
     MigratingOut,
@@ -190,6 +209,37 @@ impl std::fmt::Display for ContextState {
             Self::MigratingOut => write!(f, "MigratingOut"),
             Self::Tombstoned => write!(f, "Tombstoned"),
             Self::Poisoned => write!(f, "Poisoned"),
+        }
+    }
+}
+
+impl ContextState {
+    /// Returns `true` for the PERMANENT-terminal states — the states from which
+    /// no further transition is ever permitted and the context id is finished
+    /// for good: `Expired`, `Closed`, and `Tombstoned` (see the state-machine
+    /// doc above; ADR-008 / spec §5.11A).
+    ///
+    /// This is the closed-by-construction predicate for "a durable snapshot in
+    /// this state must never be resurrected" — used by the actor's TTL-expiry
+    /// despawn gate ([`crate::context`] consumers in `scp-runtime`) and the B8
+    /// create-time terminal-snapshot precheck. The `match` is EXHAUSTIVE so
+    /// adding a future `ContextState` variant is a compile error here until its
+    /// terminality is decided, rather than silently falling outside an ad-hoc
+    /// `matches!(…)` set.
+    ///
+    /// Deliberately EXCLUDES the transient/recoverable states:
+    /// - `Closing` / `MigratingOut` — in-progress transitions that still resolve
+    ///   to a terminal state (or back to `Active`); callers that must also treat
+    ///   those as "not live" keep their own `Closing`-inclusive checks.
+    /// - `Poisoned` — dormant but RECOVERABLE via operator-driven respawn
+    ///   (ADR-049 §10); it is not a permanent tombstone.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        match self {
+            Self::Expired | Self::Closed | Self::Tombstoned => true,
+            Self::Creating | Self::Active | Self::Closing | Self::MigratingOut | Self::Poisoned => {
+                false
+            }
         }
     }
 }
@@ -359,20 +409,30 @@ pub enum ContextError {
     /// Defense-in-depth cap: a burst of operations above the token
     /// bucket capacity is rejected regardless of cost, even when no
     /// economic policy is configured. Applies to the messaging, join,
-    /// and tool invoke paths. Mapped to the canonical `SCP-ECON-12090`
+    /// and outlet invoke paths. Mapped to the canonical `SCP-ECON-12090`
     /// code through the bridge error translators.
     ///
     /// `resource` identifies which path tripped the limit (`"send"`,
-    /// `"join"`, or `"tool_invoke"`) so callers can apply path-specific
+    /// `"join"`, or `"outlet_invoke"`) so callers can apply path-specific
     /// back-off strategies. Untyped `PermissionDenied` predated this
     /// variant; the three call sites were migrated as part of D4.
     #[error("SCP-ECON-12090: rate limit exceeded on {resource}: {message}")]
     RateLimited {
         /// The path that tripped the limit (e.g., `"send"`, `"join"`,
-        /// `"tool_invoke"`).
+        /// `"outlet_invoke"`).
         resource: String,
         /// Human-readable explanation of the bucket state.
         message: String,
+        /// Structured back-off hint: milliseconds until the limit admits the
+        /// next call, when the tripped limiter can compute it (the §6.2.0.2
+        /// sliding-window saga paths populate this from
+        /// `RateLimit::retry_after_secs`). `None` for the token-bucket hard
+        /// rate limit (`join` / `send` / `outlet_invoke`), which has no exact
+        /// refill instant to surface. Carried so a typed caller (e.g. the §6.2.4 saga
+        /// boundary that lifts this into
+        /// `SagaAbortReason::RateLimited { retry_after_ms }`) reads the hint
+        /// structurally rather than parsing it out of `message`.
+        retry_after_ms: Option<u64>,
     },
 
     /// An imported snapshot attempted to regress a per-sender
@@ -525,6 +585,22 @@ pub enum ContextError {
     #[error("SCP-CTX-2132: not initialized: {0}")]
     NotInitialized(String),
 
+    /// No recorded participation facts exist for the subject in the context.
+    ///
+    /// The event log is empty, so there is nothing to summarize. This is a
+    /// normal, branchable outcome (not a failure) — a freshly-created or
+    /// never-touched context, or a subject with no activity.
+    ///
+    /// Distinct from genuine failures (`NotInitialized`, provider errors, or the
+    /// generic `InvalidState` catch-all) so callers can detect "no facts yet"
+    /// without string-matching. Mapped to canonical code `SCP-CTX-2076` through
+    /// every FFI bridge translator.
+    #[error("SCP-CTX-2076: no recorded participation facts for {subject_did}")]
+    NoParticipationFacts {
+        /// The subject DID for which no participation facts were found.
+        subject_did: String,
+    },
+
     /// A transport operation exceeded its per-call timeout budget while
     /// invoked inside a context actor handler (ADR-049 §7 / plan §"Transport
     /// timeouts inside actor handlers"). Distinct from
@@ -610,10 +686,9 @@ pub enum ContextError {
     /// could otherwise carry plaintext or key material).
     ///
     /// Mapped to canonical code `SCP-CTX-2134` through a dedicated
-    /// translator arm in each non-WASM FFI bridge (`PyO3`, NAPI, `UniFFI`) — not
+    /// translator arm in each FFI bridge (`PyO3`, NAPI, `UniFFI`) — not
     /// the generic `SCP-CTX-2001` fallthrough — so a caller can detect a
-    /// poisoned context. (WASM has no actor model per ADR-034, so it never
-    /// produces this variant.)
+    /// poisoned context.
     #[error(
         "SCP-CTX-2134: context is poisoned (exceeded respawn budget); \
          operator intervention required: {0}"
@@ -631,11 +706,10 @@ pub enum ContextError {
     /// The payload is the affected context id — never a panic payload.
     ///
     /// Mapped to canonical code `SCP-CTX-2135` through a dedicated translator
-    /// arm in each non-WASM FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
+    /// arm in each FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
     /// `SCP-CTX-2001` fallthrough — so a caller can distinguish an
     /// unrecoverable crash from a poisoned context (`SCP-CTX-2134`) and from a
-    /// generic context error. (WASM has no actor model per ADR-034, so it
-    /// never produces this variant.)
+    /// generic context error.
     #[error("SCP-CTX-2135: context actor crashed and could not be respawned: {0}")]
     ActorCrashed(String),
 
@@ -653,9 +727,8 @@ pub enum ContextError {
     /// into an idempotent success rather than a permanent replay failure.
     ///
     /// Mapped to canonical code `SCP-CTX-2136` through a dedicated translator
-    /// arm in each non-WASM FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
+    /// arm in each FFI bridge (`PyO3`, NAPI, `UniFFI`) — not the generic
     /// `SCP-CTX-2001` fallthrough — so a caller can detect a single-use replay.
-    /// (WASM has no actor model per ADR-034, so it never produces this variant.)
     #[error("SCP-CTX-2136: key package already consumed (init-key replay rejected): {0}")]
     KeyPackageReplay(String),
 }

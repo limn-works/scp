@@ -154,8 +154,8 @@ mod tests {
     use super::*;
     use scp_protocol::crypto::access_keys::generate_access_key;
 
-    fn make_store() -> ProtocolRepository<scp_platform::testing::InMemoryStorage> {
-        ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new())
+    fn make_store() -> ProtocolRepository<scp_platform::in_memory::InMemoryStorage> {
+        ProtocolRepository::new_for_testing(scp_platform::in_memory::InMemoryStorage::new())
     }
 
     #[tokio::test]

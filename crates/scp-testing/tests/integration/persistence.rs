@@ -1,6 +1,6 @@
-// ADR-049 commit 12c.9e: ContextCryptoProvider trait deleted. Tests in this
+// ADR-049 §15: ContextCryptoProvider trait deleted. Tests in this
 // file construct ContextManager with the trait's mock implementations; the
-// rewire path lives in 12c.9f via backend injection. File gated until then.
+// rewire path awaits backend injection. File gated until then.
 #![cfg(any())]
 
 //! SCP-PERSIST-070: End-to-end integration tests for context persistence.
@@ -15,19 +15,14 @@
 //! - Cross-adapter parity (macro-driven, currently `InMemoryStorage` only;
 //!   ready for `SqliteStorage` and `FilesystemStorage` when they land).
 //! - Sequence number and role assignment survival across restarts.
-//! - Broadcast context snapshot persistence and restoration.
 //!
 //! See `.docs/prds/` SCP-PERSIST-070 for acceptance criteria.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use scp_core::context::broadcast::{
-    AuthorStateSnapshot, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
-    SubscriberRecord,
-};
 use scp_core::context::governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, KeyResolver, ProposalStatus,
     SingleAdminEngine,
@@ -36,10 +31,9 @@ use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnap
 use scp_core::context::{
     Capability, ContextHandle, ContextMode, ContextParams, ContextState, MemoryScope,
 };
-use scp_core::crypto::sender_keys::generate_sender_key;
 use scp_core::store::ProtocolRepository;
-use scp_identity::DID;
-use scp_platform::testing::InMemoryStorage;
+use scp_did::DID;
+use scp_platform::in_memory::InMemoryStorage;
 
 #[cfg(feature = "filesystem")]
 use scp_platform::filesystem::FilesystemStorage;
@@ -53,49 +47,6 @@ use scp_platform::sqlite::SqliteStorage;
 /// Creates a `ProtocolRepository` wrapping fresh `InMemoryStorage`.
 fn make_store() -> ProtocolRepository<InMemoryStorage> {
     ProtocolRepository::new_for_testing(InMemoryStorage::new())
-}
-
-/// Creates a deterministic `BroadcastContextSnapshot` for testing.
-fn make_broadcast_snapshot(context_id: &str) -> BroadcastContextSnapshot {
-    let mut subscribers = HashMap::new();
-    subscribers.insert(
-        "did:dht:z6MkSub1".to_owned(),
-        SubscriberRecord {
-            subscriber_did: "did:dht:z6MkSub1".to_owned(),
-            registered_at: 1_700_000_000,
-            has_ucan: false,
-        },
-    );
-    subscribers.insert(
-        "did:dht:z6MkSub2".to_owned(),
-        SubscriberRecord {
-            subscriber_did: "did:dht:z6MkSub2".to_owned(),
-            registered_at: 1_700_000_100,
-            has_ucan: true,
-        },
-    );
-
-    let mut block_list = HashSet::new();
-    block_list.insert("did:dht:z6MkBlocked".to_owned());
-
-    let mut authors = HashMap::new();
-    authors.insert(
-        "did:dht:z6MkAuthor1".to_owned(),
-        AuthorStateSnapshot {
-            author_did: "did:dht:z6MkAuthor1".to_owned(),
-            broadcast_key: generate_sender_key(),
-            epoch: 3,
-            next_sequence: 0,
-            block_list,
-        },
-    );
-
-    BroadcastContextSnapshot {
-        context_id: context_id.to_owned(),
-        admission: BroadcastAdmission::Open,
-        subscribers,
-        authors,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,8 +199,8 @@ macro_rules! persistence_tests {
             // ---------------------------------------------------------------
 
             /// `delete_context` removes all persisted state (state, params,
-            /// memberships, roles, broadcast state, block lists). Verified
-            /// via `list_keys` returning empty for context prefix.
+            /// memberships, roles). Verified via `list_keys` returning empty
+            /// for context prefix.
             #[tokio::test]
             async fn close_cleanup_removes_all_context_state() {
                 let store = $make_store;
@@ -272,20 +223,6 @@ macro_rules! persistence_tests {
                     .await
                     .unwrap();
 
-                // Also persist broadcast state if this context were broadcast.
-                let snapshot = make_broadcast_snapshot(ctx_id);
-                store
-                    .store_broadcast_state(ctx_id, &snapshot)
-                    .await
-                    .unwrap();
-
-                let mut block_list = HashSet::new();
-                block_list.insert("did:dht:z6MkBlocked".to_owned());
-                store
-                    .store_broadcast_block_list(ctx_id, "did:dht:z6MkAuthor", &block_list)
-                    .await
-                    .unwrap();
-
                 // Verify state exists before deletion.
                 assert!(store.load_context_state(ctx_id).await.unwrap().is_some());
                 let contexts_before = store.list_active_contexts().await.unwrap();
@@ -294,8 +231,8 @@ macro_rules! persistence_tests {
                 // Delete context.
                 let deleted = store.delete_context(ctx_id).await.unwrap();
                 assert!(
-                    deleted >= 6,
-                    "should have deleted at least 6 keys, got {deleted}"
+                    deleted >= 5,
+                    "should have deleted at least 5 keys, got {deleted}"
                 );
 
                 // Verify all state is gone.
@@ -304,14 +241,6 @@ macro_rules! persistence_tests {
                 assert!(store.load_membership(ctx_id, &did).await.unwrap().is_none());
                 assert!(store.load_role(ctx_id, "admin").await.unwrap().is_none());
                 assert!(store.load_role(ctx_id, "viewer").await.unwrap().is_none());
-                assert!(store.load_broadcast_state(ctx_id).await.unwrap().is_none());
-                assert!(
-                    store
-                        .load_broadcast_block_list(ctx_id, "did:dht:z6MkAuthor")
-                        .await
-                        .unwrap()
-                        .is_none()
-                );
 
                 // Context should no longer appear in active list.
                 let contexts_after = store.list_active_contexts().await.unwrap();
@@ -538,107 +467,6 @@ macro_rules! persistence_tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(loaded, b"state-at-seq-5".to_vec());
-            }
-
-            // ---------------------------------------------------------------
-            // Broadcast context persistence
-            // ---------------------------------------------------------------
-
-            /// Broadcast context snapshot roundtrips through `ProtocolRepository`.
-            #[tokio::test]
-            async fn broadcast_snapshot_roundtrip() {
-                let store = $make_store;
-                let ctx_id = "ctx-broadcast-roundtrip";
-                let snapshot = make_broadcast_snapshot(ctx_id);
-
-                store
-                    .store_broadcast_state(ctx_id, &snapshot)
-                    .await
-                    .unwrap();
-
-                let loaded = store.load_broadcast_state(ctx_id).await.unwrap().unwrap();
-
-                assert_eq!(loaded.context_id, ctx_id);
-                assert_eq!(loaded.admission, BroadcastAdmission::Open);
-                assert_eq!(loaded.subscribers.len(), 2);
-                assert!(loaded.subscribers.contains_key("did:dht:z6MkSub1"));
-                assert!(loaded.subscribers.contains_key("did:dht:z6MkSub2"));
-                assert_eq!(loaded.authors.len(), 1);
-
-                let author = loaded.authors.get("did:dht:z6MkAuthor1").unwrap();
-                let original_author = snapshot.authors.get("did:dht:z6MkAuthor1").unwrap();
-                assert_eq!(author.epoch, 3);
-                assert_eq!(
-                    author.broadcast_key.as_bytes(),
-                    original_author.broadcast_key.as_bytes(),
-                    "broadcast_key must survive persist/load roundtrip"
-                );
-                assert!(author.block_list.contains("did:dht:z6MkBlocked"));
-            }
-
-            /// Broadcast context can be restored from snapshot and produces
-            /// a working `BroadcastContext` instance.
-            #[tokio::test]
-            async fn broadcast_restore_from_snapshot() {
-                let store = $make_store;
-                let ctx_id = "ctx-broadcast-restore";
-                let snapshot = make_broadcast_snapshot(ctx_id);
-
-                store
-                    .store_broadcast_state(ctx_id, &snapshot)
-                    .await
-                    .unwrap();
-
-                let loaded = store.load_broadcast_state(ctx_id).await.unwrap().unwrap();
-
-                // Reconstruct BroadcastContext from snapshot.
-                let bc = BroadcastContext::from_snapshot(loaded);
-
-                // Verify the restored context has the correct state.
-                let re_snapshot = bc.to_snapshot();
-                assert_eq!(re_snapshot.context_id, ctx_id);
-                assert_eq!(re_snapshot.admission, BroadcastAdmission::Open);
-                assert_eq!(re_snapshot.subscribers.len(), 2);
-                assert_eq!(re_snapshot.authors.len(), 1);
-
-                let author = re_snapshot.authors.get("did:dht:z6MkAuthor1").unwrap();
-                assert_eq!(author.epoch, 3);
-            }
-
-            /// Broadcast block lists survive persist/load roundtrip and deletion.
-            #[tokio::test]
-            async fn broadcast_block_list_roundtrip_and_cleanup() {
-                let store = $make_store;
-                let ctx_id = "ctx-block-list-test";
-                let author = "did:dht:z6MkAuthor";
-
-                let mut block_list = HashSet::new();
-                block_list.insert("did:dht:z6MkBlocked1".to_owned());
-                block_list.insert("did:dht:z6MkBlocked2".to_owned());
-
-                store
-                    .store_broadcast_block_list(ctx_id, author, &block_list)
-                    .await
-                    .unwrap();
-
-                let loaded = store
-                    .load_broadcast_block_list(ctx_id, author)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(loaded, block_list);
-
-                // delete_context should also remove block lists.
-                store.store_context_state(ctx_id, b"state").await.unwrap();
-                store.delete_context(ctx_id).await.unwrap();
-
-                assert!(
-                    store
-                        .load_broadcast_block_list(ctx_id, author)
-                        .await
-                        .unwrap()
-                        .is_none()
-                );
             }
 
             // ---------------------------------------------------------------
@@ -876,22 +704,21 @@ persistence_tests!(filesystem, {
 /// storage under the hood.
 struct InMemoryContextPersistence {
     contexts: std::sync::Mutex<HashMap<String, ContextSnapshot>>,
-    broadcasts: std::sync::Mutex<HashMap<String, BroadcastContextSnapshot>>,
 }
 
 impl InMemoryContextPersistence {
     fn new() -> Self {
         Self {
             contexts: std::sync::Mutex::new(HashMap::new()),
-            broadcasts: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+#[async_trait::async_trait]
 impl ContextPersistence for InMemoryContextPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -903,7 +730,7 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(())
     }
 
-    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
         let guard = self
             .contexts
             .lock()
@@ -911,42 +738,15 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(guard.get(context_id).cloned())
     }
 
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &BroadcastContextSnapshot,
-    ) -> Result<(), BoxError> {
-        self.broadcasts
-            .lock()
-            .map_err(|e| -> BoxError { Box::new(std::io::Error::other(e.to_string())) })?
-            .insert(context_id.to_owned(), snapshot.clone());
-        Ok(())
-    }
-
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<BroadcastContextSnapshot>, BoxError> {
-        let guard = self
-            .broadcasts
-            .lock()
-            .map_err(|e| -> BoxError { Box::new(std::io::Error::other(e.to_string())) })?;
-        Ok(guard.get(context_id).cloned())
-    }
-
-    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
         self.contexts
             .lock()
             .map_err(|e| -> BoxError { Box::new(std::io::Error::other(e.to_string())) })?
             .remove(context_id);
-        self.broadcasts
-            .lock()
-            .map_err(|e| -> BoxError { Box::new(std::io::Error::other(e.to_string())) })?
-            .remove(context_id);
         Ok(())
     }
 
-    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
         let guard = self
             .contexts
             .lock()
@@ -961,8 +761,9 @@ impl ContextPersistence for InMemoryContextPersistence {
 /// rule prevents implementing `ContextPersistence` for `Arc<T>` directly.
 struct SharedPersistence(Arc<InMemoryContextPersistence>);
 
+#[async_trait::async_trait]
 impl ContextPersistence for SharedPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -970,30 +771,15 @@ impl ContextPersistence for SharedPersistence {
         self.0.persist_context(context_id, snapshot)
     }
 
-    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
         self.0.load_context(context_id)
     }
 
-    fn persist_broadcast(
-        &self,
-        context_id: &str,
-        snapshot: &BroadcastContextSnapshot,
-    ) -> Result<(), BoxError> {
-        self.0.persist_broadcast(context_id, snapshot)
-    }
-
-    fn load_broadcast(
-        &self,
-        context_id: &str,
-    ) -> Result<Option<BroadcastContextSnapshot>, BoxError> {
-        self.0.load_broadcast(context_id)
-    }
-
-    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
         self.0.delete_context(context_id)
     }
 
-    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
         self.0.list_persisted_contexts()
     }
 }
@@ -1088,27 +874,37 @@ mod mock_providers {
                     .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
             let sender_did = inner.sender_did.clone();
             Ok(scp_core::context::builder::OpenResult::Application(
-                Box::new(scp_core::context::builder::OpenedEnvelope { inner, sender_did }),
+                Box::new(scp_core::context::builder::OpenedEnvelope {
+                    inner,
+                    sender_did,
+                    // ADR-049 PR-4: mock open() has no live recv tracker; the
+                    // follower mirror-forward drop is non-fatal.
+                    receive_floor: scp_core::context::builder::ReceiveFloor {
+                        epoch: 0,
+                        sequence: 0,
+                    },
+                }),
             ))
         }
     }
 
     pub struct MockTransport;
+    #[async_trait::async_trait]
     impl ContextTransportProvider for MockTransport {
         fn is_connected(&self) -> bool {
             true
         }
-        fn publish_context(
+        async fn publish_context(
             &self,
             _ctx_id: &[u8; 32],
             _params: &ContextParams,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn delete_published(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn delete_published(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn send_message(
+        async fn send_message(
             &self,
             _ctx_id: &[u8; 32],
             _encrypted_payload: &[u8],
@@ -1118,11 +914,16 @@ mod mock_providers {
     }
 
     pub struct MockEventLog;
+    // `unused_async`: these methods have no await because they are no-op test
+    // doubles, but the ADR-049 Decision-7 async `ContextEventLogProvider` trait
+    // requires the `async fn` signature.
+    #[async_trait::async_trait]
+    #[allow(clippy::unused_async)]
     impl ContextEventLogProvider for MockEventLog {
-        fn init_event_log(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_event_log(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn append_event(
+        async fn append_event(
             &self,
             _ctx_id: &[u8; 32],
             _event_type: scp_event_log::EventType,
@@ -1132,7 +933,7 @@ mod mock_providers {
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_event_log(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_event_log(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
     }
@@ -1140,7 +941,7 @@ mod mock_providers {
 
 /// Creates a mock key resolver that maps known test DIDs to verifying keys.
 fn mock_key_resolver() -> KeyResolver {
-    Arc::new(|did: &DID, _kid: scp_identity::SigningKeyId| {
+    Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
         let did_str: &str = did.as_ref();
         match did_str {
             "did:dht:z6MkAuthor1" => {
@@ -1166,8 +967,8 @@ async fn context_manager_broadcast_restore_roundtrip() {
 
     let persistence = Arc::new(InMemoryContextPersistence::new());
     let ctx_id = "ctx-manager-restore";
-    let creator_did = scp_identity::DID::from("did:dht:z6MkAuthor1");
-    let bob_did = scp_identity::DID::from("did:dht:z6MkBob");
+    let creator_did = scp_did::DID::from("did:dht:z6MkAuthor1");
+    let bob_did = scp_did::DID::from("did:dht:z6MkBob");
 
     // --- Phase 1: Create context, execute governance action, persist ---
 
@@ -1182,7 +983,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
         ..ContextParams::default()
     };
 
-    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
+    // ADR-049 §15 — wrap with `attach_test_supervisor`.
     let manager = scp_core::context::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto),
         Box::new(MockTransport),
@@ -1247,7 +1048,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
 
     // --- Phase 4: Create a new manager, restore, and verify replay rejection ---
 
-    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
+    // ADR-049 §15 — wrap with `attach_test_supervisor`.
     let manager2 = scp_core::context::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto),
         Box::new(MockTransport),
@@ -1257,7 +1058,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
     ));
 
     let handle2 = ContextHandle::new(ctx_id.to_owned(), params);
-    handle2.transition_to(&ContextState::Active).await.unwrap();
+    handle2.transition_to(&ContextState::Active).unwrap();
     manager2.restore_context(ctx_id, &handle2).await.unwrap();
 
     // Verify membership survived restart.

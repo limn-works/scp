@@ -21,7 +21,7 @@
 //!   evaluation.
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
-//! methods in Phase 4 PR 4 sub-slice E (#1549).
+//! methods in Phase 4 PR 4 sub-slice E.
 //!
 //! The trust engine does not produce trust "scores" — it provides verifiable
 //! facts (participation records, attestation verification results, challenge
@@ -35,9 +35,27 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use scp_ffi_common::error_codes as codes;
 
 use crate::runtime::PyBridgeInstance;
-use crate::validate;
+use crate::types::encode_hex;
+
+// ---------------------------------------------------------------------------
+// Coded-error helper — cross-bridge error-code parity
+// ---------------------------------------------------------------------------
+
+/// Builds a bridge validation error carrying the specific `SCP-VALID-*` code
+/// the UniFFI/NAPI bridges emit for the same logical failure case, so a
+/// Python caller can branch on the same `.code` a Swift/Kotlin/TypeScript
+/// caller sees (e.g. the per-case `verify_participation_requirements` codes
+/// `VALID_7030`/`VALID_7031`/`VALID_7032`, or the trust-helper codes
+/// `VALID_7012..=VALID_7017`).
+fn coded_validation_error(message: String, code: &str) -> crate::error::ScpPyError {
+    crate::error::ScpPyError::ValidationError {
+        message,
+        code: code.to_owned(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // trust_query_score — per-bridge helper used by PyScp method
@@ -51,8 +69,14 @@ fn trust_query_score_impl(
     did: &str,
     context_id: &str,
 ) -> PyResult<Py<PyDict>> {
-    validate::validate_did(did)?;
-    validate::validate_context_id(context_id)?;
+    // Per-argument codes match the UniFFI bridge (invalid DID → VALID_7010,
+    // invalid context id → VALID_7011) so the same logical failure carries
+    // the same code on every native bridge. The PyO3 boundary additionally
+    // rejects malformed (non-empty) values under the same per-argument code.
+    scp_ffi_common::validate::validate_did(did)
+        .map_err(|e| coded_validation_error(e.message, codes::VALID_7010))?;
+    scp_ffi_common::validate::validate_context_id(context_id)
+        .map_err(|e| coded_validation_error(e.message, codes::VALID_7011))?;
 
     // Query the runtime registry for event counts. The event log stores leaf
     // hashes (Merkle tree), not full events. The runtime registry tracks
@@ -94,19 +118,21 @@ fn trust_query_score_impl(
 ///
 /// # Errors
 ///
-/// Returns `ScpError` if the JSON is malformed or cannot be parsed.
+/// Returns `ValidationError` with code `VALID_7012` (matching the UniFFI/NAPI
+/// bridges) if the JSON is malformed or cannot be parsed.
 #[pyfunction]
 #[pyo3(name = "trust_verify_attestation")]
 pub fn py_trust_verify_attestation(py: Python<'_>, attestation_json: &str) -> PyResult<Py<PyDict>> {
     let attestation: scp_core::trust::Attestation = serde_json::from_str(attestation_json)
         .map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to parse attestation JSON: {e}"
-            ))
+            coded_validation_error(
+                format!("failed to parse attestation JSON: {e}"),
+                codes::VALID_7012,
+            )
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     let dict = PyDict::new(py);
     match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
@@ -141,11 +167,17 @@ pub fn py_trust_verify_attestation(py: Python<'_>, attestation_json: &str) -> Py
 ///
 /// # Errors
 ///
-/// Returns `ScpError` if input validation or signing fails.
+/// Returns `ValidationError` with a per-case code matching the UniFFI/NAPI
+/// bridges: `VALID_7013` for an invalid target DID, `VALID_7014` if challenge
+/// creation fails, `VALID_7015` if serialization fails.
 #[pyfunction]
 #[pyo3(name = "trust_create_challenge")]
 pub fn py_trust_create_challenge(py: Python<'_>, target_did: &str) -> PyResult<Py<PyDict>> {
-    validate::validate_did(target_did)?;
+    // VALID_7013 matches the UniFFI bridge's code for an empty target DID;
+    // the PyO3 boundary additionally rejects malformed (non-empty) DIDs
+    // under the same per-argument code.
+    scp_ffi_common::validate::validate_did(target_did)
+        .map_err(|e| coded_validation_error(e.message, codes::VALID_7013))?;
 
     struct EphemeralSigner(ed25519_dalek::SigningKey);
     impl scp_core::trust::ChallengeSigner for EphemeralSigner {
@@ -171,11 +203,14 @@ pub fn py_trust_create_challenge(py: Python<'_>, target_did: &str) -> PyResult<P
         &signer,
     )
     .map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("challenge creation failed: {e}"))
+        coded_validation_error(format!("challenge creation failed: {e}"), codes::VALID_7014)
     })?;
 
     let challenge_json = serde_json::to_string(&request).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to serialize challenge: {e}"))
+        coded_validation_error(
+            format!("failed to serialize challenge: {e}"),
+            codes::VALID_7015,
+        )
     })?;
 
     let dict = PyDict::new(py);
@@ -200,22 +235,30 @@ pub fn py_trust_create_challenge(py: Python<'_>, target_did: &str) -> PyResult<P
 ///
 /// # Errors
 ///
-/// Returns `ScpError` if the JSON is malformed.
+/// Returns `ValidationError` with a per-case code matching the UniFFI/NAPI
+/// bridges: `VALID_7016` for malformed challenge JSON, `VALID_7017` for
+/// malformed response JSON.
 #[pyfunction]
 #[pyo3(name = "trust_verify_response")]
 pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> PyResult<bool> {
     let request: scp_core::trust::ChallengeRequest =
         serde_json::from_str(challenge_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("failed to parse challenge JSON: {e}"))
+            coded_validation_error(
+                format!("failed to parse challenge JSON: {e}"),
+                codes::VALID_7016,
+            )
         })?;
 
     let response: scp_core::trust::ChallengeResponse = serde_json::from_str(response_json)
         .map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("failed to parse response JSON: {e}"))
+            coded_validation_error(
+                format!("failed to parse response JSON: {e}"),
+                codes::VALID_7017,
+            )
         })?;
 
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_identity::cache::SystemClock;
+    let clock = scp_clock::SystemClock;
 
     struct EphemeralVerifierSigner(ed25519_dalek::SigningKey);
     impl scp_core::trust::ChallengeSigner for EphemeralVerifierSigner {
@@ -243,56 +286,196 @@ pub fn py_trust_verify_response(challenge_json: &str, response_json: &str) -> Py
 // verify_participation_requirements (SCP-BA-004)
 // ---------------------------------------------------------------------------
 
-/// Verifies participation profiles against admission requirements.
+/// Verifies participation profiles against admission requirements, bound to the
+/// agent being admitted.
 ///
-/// Both inputs are JSON strings:
-/// - `profile_json`: JSON array of `ParticipationProfile` objects.
+/// Inputs:
+/// - `expected_subject`: the DID of the agent being admitted. Only profiles
+///   whose signed `subject_did` equals this value contribute to any threshold,
+///   freshness, or distinct-signer accounting — a victim's genuine profiles
+///   cannot be replayed to admit a different agent (cross-subject replay).
 /// - `requirements_json`: JSON array of `RequireParticipation` objects.
+/// - `profile_json`: JSON array of `ParticipationProfile` objects.
 ///
-/// Uses the current system time for freshness checks. Returns `Ok(true)` on
-/// success. The Python SDK wrapper discards the return value — success is
-/// indicated by returning without exception. Raises `ScpError` with a
-/// diagnostic message if any requirement fails or if the JSON is malformed.
+/// Uses the current system time for freshness checks. Returns `Ok(())` on
+/// success — success is indicated by returning without exception. Raises
+/// `ScpError` with a diagnostic message if any requirement fails or if the JSON
+/// is malformed.
 ///
 /// See §7.3.2.1.
 ///
 /// # Errors
 ///
-/// Returns `PyValueError` if JSON parsing fails, or `PyRuntimeError` if
-/// participation admission verification fails (with the specific failure
-/// reason from `ParticipationAdmissionError`).
+/// Returns `ValidationError` with a per-case code matching the UniFFI/NAPI
+/// bridges: `VALID_7000` for an invalid `expected_subject` DID, `VALID_7031`
+/// for malformed requirements JSON, `VALID_7030` for malformed profiles JSON,
+/// and `VALID_7032` if participation admission verification fails (with the
+/// specific failure reason from `ParticipationAdmissionError`).
 #[pyfunction]
 #[pyo3(name = "verify_participation_requirements")]
 pub fn py_verify_participation_requirements(
-    profile_json: &str,
+    expected_subject: &str,
     requirements_json: &str,
-) -> PyResult<bool> {
-    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(profile_json)
-        .map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "failed to parse participation profiles JSON: {e}"
-        ))
-    })?;
+    profile_json: &str,
+) -> PyResult<()> {
+    // VALID_7000 matches the UniFFI/NAPI bridges, which route this same
+    // check through the shared `scp_ffi_common::validate::ValidationError`
+    // conversion (generic validation code).
+    scp_ffi_common::validate::validate_did(expected_subject)
+        .map_err(|e| coded_validation_error(e.message, codes::VALID_7000))?;
 
     let requirements: Vec<scp_core::trust::RequireParticipation> =
         serde_json::from_str(requirements_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to parse participation requirements JSON: {e}"
-            ))
+            coded_validation_error(
+                format!("failed to parse participation requirements JSON: {e}"),
+                codes::VALID_7031,
+            )
         })?;
 
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-
-    scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
+    let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(profile_json)
         .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "participation admission verification failed: {e}"
-            ))
+        coded_validation_error(
+            format!("failed to parse participation profiles JSON: {e}"),
+            codes::VALID_7030,
+        )
+    })?;
+
+    // Fail-closed clock: a pre-epoch host clock is an unrecoverable environment
+    // failure and must not silently read as time 0, which would make every
+    // participation statement appear maximally fresh and bypass `max_age_secs`.
+    // Matches the SystemClock invariant used on the verify-on-ingest path.
+    let current_time = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+
+    scp_core::trust::verify_participation_requirements(
+        current_time,
+        expected_subject,
+        &requirements,
+        &profiles,
+    )
+    .map_err(|e| {
+        // VALID_7032 mirrors the UniFFI bridge's code for a failed
+        // participation admission check, so every native bridge surfaces the
+        // identical code for the same logical failure.
+        coded_validation_error(
+            format!("participation admission verification failed: {e}"),
+            codes::VALID_7032,
+        )
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// check_capability_requirements (§7.3.4.4, SCP-ACR-008)
+// ---------------------------------------------------------------------------
+
+/// Verifies that an agent meets a context's capability requirements for
+/// admission, bound to the agent and context being admitted.
+///
+/// Inputs (all JSON except the two DID/context ids):
+/// - `context_id`: the context the agent is being admitted to. A challenge
+///   verification only satisfies a requirement when its signed `context_id`
+///   equals this value.
+/// - `subject_did`: the DID of the agent being admitted. Only challenge
+///   verifications whose signed `subject_did` equals this value can satisfy a
+///   requirement — a genuine result minted for another subject MUST NOT admit
+///   this agent (cross-subject attribution).
+/// - `requirements_json`: JSON array of `CapabilityRequirement` objects.
+/// - `agent_capabilities_json`: JSON array of capability-URI strings the agent
+///   self-attests.
+/// - `challenge_verifications_json`: JSON array of `ChallengeVerification`
+///   records; each is signature-verified against `resolver`/`clock` and only
+///   counts if authentic, in-context, in-subject, passed, and unexpired.
+///
+/// Uses the production `IdentityDidPublicKeyResolver` for verifier-DID key
+/// resolution and the fail-closed system clock for expiry. Returns `Ok(())` on
+/// success — success is indicated by returning without exception. Raises
+/// `ScpError` with a diagnostic message if any requirement is unmet or if the
+/// JSON is malformed.
+///
+/// SECURITY (verifier legitimacy): a passing `ChallengeVerified` check proves
+/// the verifier's signature is authentic and bound to this subject/context, NOT
+/// that the verifier is authorized/trusted. A `verifier_did` is self-certifying;
+/// establish verifier legitimacy separately (see spec §7.3.4.4 / §7.4).
+///
+/// See spec §7.3.4.4.
+///
+/// # Errors
+///
+/// Returns `ValidationError` with a per-case code matching the UniFFI/NAPI
+/// bridges: `VALID_7000` for an invalid `subject_did`, `VALID_7073`/
+/// `VALID_7074`/`VALID_7075` for malformed requirements / agent-capabilities /
+/// challenge-verifications JSON, and `VALID_7076`/`VALID_7077` if an
+/// admission requirement is unmet (with the specific reason from
+/// `AdmissionError`).
+#[pyfunction]
+#[pyo3(name = "check_capability_requirements")]
+pub fn py_check_capability_requirements(
+    context_id: &str,
+    subject_did: &str,
+    requirements_json: &str,
+    agent_capabilities_json: &str,
+    challenge_verifications_json: &str,
+) -> PyResult<()> {
+    // VALID_7000 matches the UniFFI/NAPI bridges, which route this same
+    // check through the shared `scp_ffi_common::validate::ValidationError`
+    // conversion (generic validation code).
+    scp_ffi_common::validate::validate_did(subject_did)
+        .map_err(|e| coded_validation_error(e.message, codes::VALID_7000))?;
+
+    let requirements: Vec<scp_core::trust::CapabilityRequirement> =
+        serde_json::from_str(requirements_json).map_err(|e| {
+            coded_validation_error(
+                format!("failed to parse capability requirements JSON: {e}"),
+                codes::VALID_7073,
+            )
         })?;
 
-    Ok(true)
+    let agent_capabilities: Vec<scp_core::trust::CapabilityUri> =
+        serde_json::from_str(agent_capabilities_json).map_err(|e| {
+            coded_validation_error(
+                format!("failed to parse agent capabilities JSON: {e}"),
+                codes::VALID_7074,
+            )
+        })?;
+
+    let challenge_verifications: Vec<scp_core::trust::ChallengeVerification> =
+        serde_json::from_str(challenge_verifications_json).map_err(|e| {
+            coded_validation_error(
+                format!("failed to parse challenge verifications JSON: {e}"),
+                codes::VALID_7075,
+            )
+        })?;
+
+    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+    let clock = scp_clock::SystemClock;
+
+    scp_core::trust::check_capability_requirements(
+        &requirements,
+        &agent_capabilities,
+        &challenge_verifications,
+        context_id,
+        subject_did,
+        &resolver,
+        &clock,
+    )
+    .map_err(|e| {
+        // Mirror the UniFFI/NAPI bridges' per-variant code mapping so every
+        // native bridge surfaces identical per-variant 707x codes for the same
+        // failure case: empty subject → 7077; missing capability /
+        // verification-required → 7076.
+        let code = match e {
+            scp_core::trust::AdmissionError::EmptySubjectDid => codes::VALID_7077,
+            scp_core::trust::AdmissionError::MissingCapability { .. }
+            | scp_core::trust::AdmissionError::VerificationRequired { .. } => codes::VALID_7076,
+        };
+        coded_validation_error(
+            format!("capability admission verification failed: {e}"),
+            code,
+        )
+    })?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +488,7 @@ pub fn py_verify_participation_requirements(
 /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
 /// as a JSON string. Uses the `BridgeInstance` storage provider for persistent
 /// trust data when initialized (trust data survives across calls and restarts);
-/// falls back to an ephemeral in-memory store otherwise. See issue #502.
+/// falls back to an ephemeral in-memory store otherwise.
 ///
 /// # Errors
 ///
@@ -325,59 +508,80 @@ fn aggregate_trust_input_impl(
     cached_attestations_json: &str,
     challenge_results_json: &str,
 ) -> PyResult<String> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_did(subject_did)?;
+    // Per-argument codes match the UniFFI bridge's `aggregate_trust_input`
+    // (context id → VALID_7040, subject DID → VALID_7041, then one code per
+    // JSON input, VALID_7042..=VALID_7049) so the same logical failure
+    // carries the same code on every native bridge. The PyO3 boundary
+    // additionally rejects malformed (non-empty) ids under the same
+    // per-argument code.
+    scp_ffi_common::validate::validate_context_id(context_id)
+        .map_err(|e| coded_validation_error(e.message, codes::VALID_7040))?;
+    scp_ffi_common::validate::validate_did(subject_did)
+        .map_err(|e| coded_validation_error(e.message, codes::VALID_7041))?;
 
     // Parse all JSON inputs.
     let events: Vec<scp_event_log::Event> = serde_json::from_str(events_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("failed to parse events JSON: {e}"))
+        coded_validation_error(
+            format!("failed to parse events JSON: {e}"),
+            codes::VALID_7042,
+        )
     })?;
 
     let merkle_root_vec: Vec<u8> = serde_json::from_str(merkle_root_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("failed to parse merkle_root JSON: {e}"))
+        coded_validation_error(
+            format!("failed to parse merkle_root JSON: {e}"),
+            codes::VALID_7043,
+        )
     })?;
     let merkle_root: [u8; 32] = merkle_root_vec.try_into().map_err(|v: Vec<u8>| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "merkle_root must be exactly 32 bytes, got {}",
-            v.len()
-        ))
+        coded_validation_error(
+            format!("merkle_root must be exactly 32 bytes, got {}", v.len()),
+            codes::VALID_7044,
+        )
     })?;
 
     let consequence_rules: Vec<scp_core::trust::ConsequenceRule> =
         serde_json::from_str(consequence_rules_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to parse consequence_rules JSON: {e}"
-            ))
+            coded_validation_error(
+                format!("failed to parse consequence_rules JSON: {e}"),
+                codes::VALID_7045,
+            )
         })?;
 
     let threshold_requirements: std::collections::HashMap<
         scp_core::trust::AttestationType,
         scp_core::trust::ThresholdRequirement,
     > = serde_json::from_str(threshold_requirements_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "failed to parse threshold_requirements JSON: {e}"
-        ))
+        coded_validation_error(
+            format!("failed to parse threshold_requirements JSON: {e}"),
+            codes::VALID_7046,
+        )
     })?;
 
     let attestor_sets: std::collections::HashMap<
         scp_core::trust::AttestationType,
         Vec<scp_core::trust::AttestorInfo>,
     > = serde_json::from_str(attestor_sets_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("failed to parse attestor_sets JSON: {e}"))
+        coded_validation_error(
+            format!("failed to parse attestor_sets JSON: {e}"),
+            codes::VALID_7047,
+        )
     })?;
 
     let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
         serde_json::from_str(cached_attestations_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to parse cached_attestations JSON: {e}"
-            ))
+            coded_validation_error(
+                format!("failed to parse cached_attestations JSON: {e}"),
+                codes::VALID_7048,
+            )
         })?;
 
     let challenge_results: Vec<scp_core::trust::ChallengeVerification> =
         serde_json::from_str(challenge_results_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "failed to parse challenge_results JSON: {e}"
-            ))
+            coded_validation_error(
+                format!("failed to parse challenge_results JSON: {e}"),
+                codes::VALID_7049,
+            )
         })?;
 
     aggregate_with_storage(
@@ -399,7 +603,7 @@ fn aggregate_trust_input_impl(
 /// If the `BridgeInstance` storage provider is initialized, builds a
 /// `ProtocolRepositoryTrustBridge` over the concrete storage backend
 /// (`InMemoryEncrypted` or `Sqlite`) so cached attestations, revocation
-/// states, and challenge results survive process restarts (issue #502).
+/// states, and challenge results survive process restarts.
 /// Otherwise falls back to an ephemeral in-memory store.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_with_storage(
@@ -425,60 +629,311 @@ fn aggregate_with_storage(
     // The former path swapped in an ephemeral `InMemoryFfiTrustStore` so
     // aggregations against a `SCP({storage: sqlite})` caller's configured
     // SQLCipher store invisibly landed in an empty ephemeral store. See
-    // `with_storage_py` / PR #1690 review.
+    // `with_storage_py`.
     let provider = crate::runtime::get_storage(bi).map_err(|_| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "{}: bridge storage not initialized — trust aggregation is \
+        coded_validation_error(
+            "bridge storage not initialized — trust aggregation is \
              unreachable until this PyBridgeInstance has allocated its \
-             storage provider (bridge init bug)",
-            scp_ffi_common::error_codes::VALID_7005
-        ))
+             storage provider (bridge init bug)"
+                .to_owned(),
+            codes::VALID_7005,
+        )
     })?;
     let handle = crate::runtime()?.handle().clone();
-    match provider {
+    // The aggregation logic lives ONCE in `run_aggregation` (generic over the
+    // concrete `EncryptedStorage` backend). The match is pure type dispatch: the
+    // sealed `EncryptedStorage` bound on `ProtocolRepository::new` cannot be
+    // satisfied by the `StorageProvider` enum itself (the marker trait lives in
+    // `scp-platform`), so the concrete `Arc<S>` must be recovered per variant.
+    // Both arms route through the single generic body — no duplicated logic.
+    let inputs = AggregationInputs {
+        context_id,
+        subject_did,
+        cached_attestations,
+        challenge_results,
+        events,
+        merkle_root,
+        consequence_rules,
+        threshold_requirements,
+        attestor_sets,
+    };
+    let result = match provider {
         StorageProvider::InMemoryEncrypted(storage) => {
-            let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
-                storage,
-            )));
-            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
-            scp_ffi_common::trust_store::populate_and_aggregate(
-                bridge,
-                context_id,
-                subject_did,
-                cached_attestations,
-                challenge_results,
-                events,
-                merkle_root,
-                consequence_rules,
-                threshold_requirements,
-                attestor_sets,
-            )
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            run_aggregation(Arc::clone(storage), handle, inputs)
         }
-        StorageProvider::Sqlite(storage) => {
-            let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
-                storage,
-            )));
-            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
-            scp_ffi_common::trust_store::populate_and_aggregate(
-                bridge,
-                context_id,
-                subject_did,
-                cached_attestations,
-                challenge_results,
-                events,
-                merkle_root,
-                consequence_rules,
-                threshold_requirements,
-                attestor_sets,
-            )
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        StorageProvider::Sqlite(storage) => run_aggregation(Arc::clone(storage), handle, inputs),
+    };
+    // VALID_7052 mirrors the UniFFI bridge's code for a failed trust
+    // aggregation, so every native bridge surfaces the identical code for
+    // the same logical failure.
+    result.map_err(|e| coded_validation_error(e.to_string(), codes::VALID_7052).into())
+}
+
+/// Owned + borrowed inputs for [`run_aggregation`], grouped to keep the generic
+/// helper's signature manageable.
+struct AggregationInputs<'a> {
+    context_id: &'a str,
+    subject_did: &'a str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+    challenge_results: &'a [scp_core::trust::ChallengeVerification],
+    events: &'a [scp_event_log::Event],
+    merkle_root: [u8; 32],
+    consequence_rules: &'a [scp_core::trust::ConsequenceRule],
+    threshold_requirements: &'a std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    >,
+    attestor_sets: &'a std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        Vec<scp_core::trust::AttestorInfo>,
+    >,
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete encrypted backend
+/// and runs `populate_and_aggregate`. Single source of truth for the per-backend
+/// aggregation path (both `StorageProvider` variants route through this).
+fn run_aggregation<S: scp_platform::EncryptedStorage + 'static>(
+    storage: Arc<S>,
+    handle: tokio::runtime::Handle,
+    inputs: AggregationInputs<'_>,
+) -> Result<String, scp_core::trust::TrustError> {
+    let repo = Arc::new(scp_core::store::ProtocolRepository::new(storage));
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
+    scp_ffi_common::trust_store::populate_and_aggregate(
+        bridge,
+        inputs.context_id,
+        inputs.subject_did,
+        inputs.cached_attestations,
+        inputs.challenge_results,
+        inputs.events,
+        inputs.merkle_root,
+        inputs.consequence_rules,
+        inputs.threshold_requirements,
+        inputs.attestor_sets,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// PyParticipationRecord
+// ---------------------------------------------------------------------------
+
+/// Structured participation facts (§7.3.2) for a subject DID in a context.
+///
+/// The scalar projection of scp-core's
+/// [`ParticipationRecord`](scp_core::trust::ParticipationRecord), produced by
+/// [`PyScp::participation_record`]. Counts are flattened ONCE in the shared Rust
+/// core (`ParticipationFacts`) so Python RECEIVES the facts rather than
+/// re-aggregating event-log collections — eliminating cross-binding divergence
+/// by construction.
+///
+/// See `scp_core::trust::ParticipationFacts` and ADR-017.
+#[pyclass(name = "ParticipationRecord")]
+#[derive(Debug, Clone)]
+pub struct PyParticipationRecord {
+    /// The DID whose participation is summarized.
+    #[pyo3(get)]
+    pub subject_did: String,
+    /// Total seconds of context participation (§7.3.2).
+    #[pyo3(get)]
+    pub participation_duration_secs: u64,
+    /// Count of governance actions taken against this identity (projected
+    /// `target_did` is the subject).
+    #[pyo3(get)]
+    pub governance_actions_against: u64,
+    /// Count of governance actions initiated by this identity.
+    #[pyo3(get)]
+    pub governance_actions_by: u64,
+    /// Total outlet invocations across all outlet types.
+    #[pyo3(get)]
+    pub outlet_invocation_count: u64,
+    /// Whether `outlet_invocation_count` is anchored in the canonical Merkle log.
+    /// `false` until ADR-051 makes `OutletInvoked` a convergent leaf (§7.3.2) —
+    /// consumers MUST NOT treat the count as Merkle-proven while this is `false`.
+    #[pyo3(get)]
+    pub outlet_invocation_count_anchored: bool,
+    /// Number of contexts created by the subject (`ChildContextCreated`).
+    #[pyo3(get)]
+    pub context_creation_count: u64,
+    /// Number of role transitions for the subject.
+    #[pyo3(get)]
+    pub role_progression_count: u64,
+    /// Number of accessible, currently-valid credential-layer attestations
+    /// (§7.4) for the subject. Verifier-relative.
+    #[pyo3(get)]
+    pub attestation_count: u64,
+    /// Whether `attestation_count` is anchored in / verifiable against a context
+    /// Merkle root. Always `false` — it is a credential-layer, verifier-relative
+    /// fact (§7.4), never a context-event-log count (§7.3.2). The parallel of
+    /// `outlet_invocation_count_anchored`, surfaced so the non-anchored nature is
+    /// mechanically visible.
+    #[pyo3(get)]
+    pub attestation_count_anchored: bool,
+    /// Unix timestamp (seconds) when the record was computed.
+    #[pyo3(get)]
+    pub computed_at: u64,
+    /// Merkle root (hex) of the event log at computation time.
+    #[pyo3(get)]
+    pub event_log_root: String,
+}
+
+impl From<&scp_core::trust::ParticipationFacts> for PyParticipationRecord {
+    fn from(f: &scp_core::trust::ParticipationFacts) -> Self {
+        Self {
+            subject_did: f.subject_did.to_string(),
+            participation_duration_secs: f.participation_duration_secs,
+            governance_actions_against: f.governance_actions_against,
+            governance_actions_by: f.governance_actions_by,
+            outlet_invocation_count: f.outlet_invocation_count,
+            outlet_invocation_count_anchored: f.outlet_invocation_count_anchored,
+            context_creation_count: f.context_creation_count,
+            role_progression_count: f.role_progression_count,
+            attestation_count: f.attestation_count,
+            attestation_count_anchored: f.attestation_count_anchored,
+            computed_at: f.computed_at,
+            event_log_root: encode_hex(&f.event_log_root),
         }
     }
 }
 
+#[pymethods]
+impl PyParticipationRecord {
+    fn __repr__(&self) -> String {
+        format!(
+            "ParticipationRecord(subject_did={}, participation_duration_secs={}, \
+             governance_actions_against={}, governance_actions_by={}, \
+             outlet_invocation_count={}, outlet_invocation_count_anchored={}, \
+             context_creation_count={}, role_progression_count={}, \
+             attestation_count={}, attestation_count_anchored={})",
+            self.subject_did,
+            self.participation_duration_secs,
+            self.governance_actions_against,
+            self.governance_actions_by,
+            self.outlet_invocation_count,
+            self.outlet_invocation_count_anchored,
+            self.context_creation_count,
+            self.role_progression_count,
+            self.attestation_count,
+            self.attestation_count_anchored,
+        )
+    }
+}
+
+/// Sources the subject's verified attestations from this bridge instance's
+/// persistent trust store, then computes the participation record via the
+/// shared Supervisor.
+///
+/// Mirrors `aggregate_with_storage`'s attestation handling: caller-supplied
+/// `cached_attestations` are populated into the bridge's
+/// `ProtocolRepositoryTrustBridge` over the concrete storage backend, and the
+/// subject's accessible, currently-valid attestations are read back via
+/// `get_verified_attestations` — the REAL credential-layer source, not `&[]`.
+/// Those attestations feed `attestation_count` (§7.4); the Supervisor gathers
+/// the full event log + Merkle root for every other fact.
+fn participation_record_impl(
+    bi: &crate::runtime::PyBridgeInstance,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations_json: &str,
+) -> PyResult<PyParticipationRecord> {
+    use crate::runtime::StorageProvider;
+
+    // VALID_7000 matches the UniFFI/NAPI bridges, which route these same
+    // checks through the shared `scp_ffi_common::validate::ValidationError`
+    // conversion (generic validation code).
+    scp_ffi_common::validate::validate_context_id(context_id)
+        .map_err(|e| coded_validation_error(e.message, codes::VALID_7000))?;
+    scp_ffi_common::validate::validate_did(subject_did)
+        .map_err(|e| coded_validation_error(e.message, codes::VALID_7000))?;
+
+    let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
+        serde_json::from_str(cached_attestations_json).map_err(|e| {
+            coded_validation_error(
+                format!("failed to parse cached_attestations JSON: {e}"),
+                codes::VALID_7059,
+            )
+        })?;
+
+    // Source verified attestations from this instance's persistent trust store
+    // (same backend as context/event-log writes). The sourcing
+    // logic lives ONCE in `run_verified_attestations` (generic over the concrete
+    // `EncryptedStorage` backend); the match is pure type dispatch because the
+    // sealed `EncryptedStorage` bound cannot be satisfied by the `StorageProvider`
+    // enum itself. Both arms route through the single generic body.
+    let provider = crate::runtime::get_storage(bi)?;
+    let handle = crate::runtime()?.handle().clone();
+    let verified = match provider {
+        StorageProvider::InMemoryEncrypted(storage) => run_verified_attestations(
+            Arc::clone(storage),
+            handle,
+            context_id,
+            subject_did,
+            cached_attestations,
+        ),
+        StorageProvider::Sqlite(storage) => run_verified_attestations(
+            Arc::clone(storage),
+            handle,
+            context_id,
+            subject_did,
+            cached_attestations,
+        ),
+    }
+    // An error from `verified_attestations` is an INFRA fault (trust-store read,
+    // signature-verification infrastructure) — NOT a caller-input validation
+    // error. Code it as a context-layer fault (CTX_2000), consistent with the
+    // generic-failure arm of `participation_record` below, and keep it propagating
+    // (fail-closed): it must never be folded into the empty-log CTX_2076 path.
+    .map_err(|e| crate::error::ScpPyError::ContextError {
+        message: e.to_string(),
+        code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
+    })?;
+
+    let record = crate::runtime::supervisor(bi)?
+        .participation_record(context_id, subject_did, &verified)
+        // Map the empty-log condition to its dedicated, stable code (CTX_2076) so
+        // SDKs can branch on "no recorded participation facts" without string-
+        // matching; genuine failures stay on the generic context code (CTX_2000),
+        // matching NAPI/UniFFI. `ScpPyError::context` would emit CTX_2001,
+        // diverging from the other bridges for the same condition.
+        .map_err(|e| {
+            let code = match e {
+                scp_core::context::ContextError::NoParticipationFacts { .. } => {
+                    scp_ffi_common::error_codes::CTX_2076
+                }
+                _ => scp_ffi_common::error_codes::CTX_2000,
+            };
+            crate::error::ScpPyError::ContextError {
+                message: e.to_string(),
+                code: code.to_owned(),
+            }
+        })?;
+
+    let facts = scp_core::trust::ParticipationFacts::from(&record);
+    Ok(PyParticipationRecord::from(&facts))
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete encrypted backend
+/// and reads back the subject's verified attestations. Single source of truth for
+/// the per-backend attestation-sourcing path (both `StorageProvider` variants
+/// route through this).
+fn run_verified_attestations<S: scp_platform::EncryptedStorage + 'static>(
+    storage: Arc<S>,
+    handle: tokio::runtime::Handle,
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+) -> Result<Vec<scp_core::trust::attestation::Attestation>, scp_core::trust::TrustError> {
+    let repo = Arc::new(scp_core::store::ProtocolRepository::new(storage));
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
+    scp_ffi_common::trust_store::verified_attestations(
+        bridge,
+        context_id,
+        subject_did,
+        cached_attestations,
+    )
+}
+
 // ---------------------------------------------------------------------------
-// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4).
 // ---------------------------------------------------------------------------
 
 #[pymethods]
@@ -516,7 +971,7 @@ impl crate::scp::PyScp {
     /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
     /// as a JSON string. Uses the `BridgeInstance` storage provider for persistent
     /// trust data when initialized (trust data survives across calls and restarts);
-    /// falls back to an ephemeral in-memory store otherwise. See issue #502.
+    /// falls back to an ephemeral in-memory store otherwise.
     ///
     /// # Errors
     ///
@@ -551,6 +1006,35 @@ impl crate::scp::PyScp {
             challenge_results_json,
         )
     }
+
+    /// Computes the structured participation record (§7.3.2) for `subject_did`
+    /// in `context_id`.
+    ///
+    /// The bridge sources the subject's accessible, currently-valid attestations
+    /// from this instance's persistent trust store (populating any
+    /// caller-supplied `cached_attestations_json` first, exactly as
+    /// `aggregate_trust_input` does), and the shared Supervisor gathers the FULL
+    /// event log to derive every other fact. Returns a typed
+    /// [`PyParticipationRecord`] — the SDK receives the flattened facts and never
+    /// re-aggregates event-log collections.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError` if validation fails, `cached_attestations_json` is
+    /// malformed, storage is uninitialized, or the record computation fails
+    /// (e.g. an empty event log).
+    ///
+    /// See ADR-017 and spec §7.3.2.
+    #[pyo3(name = "participation_record", signature = (context_id, subject_did, cached_attestations_json="[]"))]
+    pub fn participation_record(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+        cached_attestations_json: &str,
+    ) -> PyResult<PyParticipationRecord> {
+        let bi = &*self.inner;
+        participation_record_impl(bi, context_id, subject_did, cached_attestations_json)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,10 +1049,12 @@ impl crate::scp::PyScp {
 /// response verification, participation requirement verification) remain as
 /// free `#[pyfunction]` exports.
 pub fn register_trust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyParticipationRecord>()?;
     m.add_function(wrap_pyfunction!(py_trust_verify_attestation, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_create_challenge, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_verify_response, m)?)?;
     m.add_function(wrap_pyfunction!(py_verify_participation_requirements, m)?)?;
+    m.add_function(wrap_pyfunction!(py_check_capability_requirements, m)?)?;
     Ok(())
 }
 
@@ -592,6 +1078,12 @@ mod tests {
             // Empty DID should fail validation.
             let result = default_scp().trust_query_score(py, "", "ctx-1");
             assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7010),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7010
+            );
         });
     }
 
@@ -602,6 +1094,12 @@ mod tests {
             // Empty context ID should fail validation.
             let result = default_scp().trust_query_score(py, "did:key:test", "");
             assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7011),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7011
+            );
         });
     }
 
@@ -625,6 +1123,12 @@ mod tests {
         Python::with_gil(|py| {
             let result = py_trust_verify_attestation(py, "not valid json");
             assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7012),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7012
+            );
         });
     }
 
@@ -634,6 +1138,12 @@ mod tests {
         Python::with_gil(|py| {
             let result = py_trust_create_challenge(py, "");
             assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7013),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7013
+            );
         });
     }
 
@@ -651,29 +1161,309 @@ mod tests {
     }
 
     #[test]
-    fn trust_verify_response_rejects_invalid_json() {
-        let result = py_trust_verify_response("bad", "bad");
-        assert!(result.is_err());
+    fn trust_verify_response_rejects_invalid_challenge_json() {
+        // Malformed JSON in the CHALLENGE position.
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let result = py_trust_verify_response("bad", "bad");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7016),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7016
+            );
+        });
+    }
+
+    #[test]
+    fn trust_verify_response_rejects_invalid_response_json() {
+        // Malformed JSON in the RESPONSE position: the challenge parses, so
+        // the failure is attributed to the response argument.
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let challenge = py_trust_create_challenge(py, "did:key:target").unwrap();
+            let challenge_json: String = challenge
+                .bind(py)
+                .get_item("challenge_json")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            let result = py_trust_verify_response(&challenge_json, "bad");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7017),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7017
+            );
+        });
     }
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_profile_json() {
-        let result = py_verify_participation_requirements("not json", "[]");
-        assert!(result.is_err());
+        // Malformed JSON in the PROFILE position (now the 3rd arg).
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let result = py_verify_participation_requirements("did:key:alice", "[]", "not json");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7030),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7030
+            );
+        });
     }
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_requirements_json() {
-        let result = py_verify_participation_requirements("[]", "not json");
-        assert!(result.is_err());
+        // Malformed JSON in the REQUIREMENTS position (now the 2nd arg).
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let result = py_verify_participation_requirements("did:key:alice", "not json", "[]");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7031),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7031
+            );
+        });
     }
 
     #[test]
     fn verify_participation_requirements_empty_inputs_succeeds() {
         // Empty requirements = no constraints = always passes.
-        let result = py_verify_participation_requirements("[]", "[]");
+        let result = py_verify_participation_requirements("did:key:alice", "[]", "[]");
         assert!(result.is_ok());
-        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn verify_participation_requirements_rejects_invalid_subject() {
+        // A malformed subject DID is rejected at the FFI boundary.
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let result = py_verify_participation_requirements("not-a-did", "[]", "[]");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7000),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7000
+            );
+        });
+    }
+
+    #[test]
+    fn verify_participation_requirements_unmet_requirement_fails_with_admission_code() {
+        // A requirement with no satisfying profiles fails the admission check
+        // itself (not JSON parsing), which carries its own per-case code.
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let requirements = r#"[{"fact":"ParticipationDuration","threshold":{"AtLeast":1},"max_age_secs":3600,"min_contexts":0}]"#;
+            let result = py_verify_participation_requirements("did:key:alice", requirements, "[]");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7032),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7032
+            );
+        });
+    }
+
+    // -- check_capability_requirements (§7.3.4.4, SCP-ACR-008) --
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_requirements_json() {
+        Python::with_gil(|_py| {
+            let result =
+                py_check_capability_requirements("ctx-1", "did:key:alice", "not json", "[]", "[]");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7073),
+                "error should contain SCP-VALID-7073, got: {err_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_capabilities_json() {
+        Python::with_gil(|_py| {
+            let result =
+                py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "not json", "[]");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7074),
+                "error should contain SCP-VALID-7074, got: {err_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_invalid_verifications_json() {
+        Python::with_gil(|_py| {
+            let result =
+                py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "[]", "not json");
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7075),
+                "error should contain SCP-VALID-7075, got: {err_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn check_capability_requirements_empty_inputs_succeeds() {
+        // No requirements = no constraints = always passes.
+        let result = py_check_capability_requirements("ctx-1", "did:key:alice", "[]", "[]", "[]");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_malformed_subject() {
+        pyo3::prepare_freethreaded_python();
+        let result = py_check_capability_requirements("ctx-1", "not-a-did", "[]", "[]", "[]");
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7000),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7000
+        );
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_empty_subject() {
+        // An empty subject is rejected at the FFI boundary (validate_did).
+        pyo3::prepare_freethreaded_python();
+        let result = py_check_capability_requirements("ctx-1", "", "[]", "[]", "[]");
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7000),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7000
+        );
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_present_succeeds() {
+        // A SelfAttested requirement is satisfied by a declared capability — no
+        // challenge verification (and thus no signature check) is needed.
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        let capabilities = r#"["scp:capability:schema-validation/v1"]"#;
+        let result = py_check_capability_requirements(
+            "ctx-1",
+            "did:key:alice",
+            requirements,
+            capabilities,
+            "[]",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_self_attested_missing_fails() {
+        // A SelfAttested requirement with no matching declared capability and no
+        // verification record fails as an admission (runtime) error.
+        let requirements = r#"[{"capability":"scp:capability:schema-validation/v1","verification_level":"SelfAttested"}]"#;
+        Python::with_gil(|_py| {
+            let result = py_check_capability_requirements(
+                "ctx-1",
+                "did:key:alice",
+                requirements,
+                "[]",
+                "[]",
+            );
+            assert!(result.is_err());
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7076),
+                "error should contain SCP-VALID-7076, got: {err_str}"
+            );
+        });
+    }
+
+    /// Builds a genuinely verifier-signed `ChallengeVerification` JSON array
+    /// (single record) bound to `subject_did`/`context_id`, with a far-future
+    /// expiry so it survives the production `SystemClock`. The verifier DID is
+    /// derived from a fixed key so the production `IdentityDidPublicKeyResolver`
+    /// (did:dht:z, offline-resolvable) authenticates the signature.
+    fn signed_cv_json(uri: &str, subject_did: &str, context_id: &str) -> String {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let verifier_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifier_pub = verifier_key.verifying_key().to_bytes();
+        let verifier_did = scp_did::did_dht_from_public_key(&verifier_pub);
+        let cap: scp_core::trust::CapabilityUri = uri.parse().unwrap();
+
+        let mut cv = scp_core::trust::ChallengeVerification {
+            verification_id: "bridge-test-challenge".to_owned(),
+            verifier_did,
+            subject_did: subject_did.into(),
+            capability_uri: uri.to_owned(),
+            challenge_type: scp_core::trust::ChallengeType::Uri(cap.clone()),
+            verification_method: scp_core::trust::VerificationMethod::ChallengeVerified {
+                challenge_type: scp_core::trust::ChallengeType::Uri(cap),
+            },
+            passed: true,
+            score: None,
+            test_count: 1,
+            pass_count: 1,
+            result: serde_json::Value::Bool(true),
+            completed_at: 1_700_000_000,
+            verified_at: 1_700_000_000,
+            expires_at: 4_000_000_000,
+            context_id: Some(context_id.to_owned()),
+            verifier_signature: Vec::new(),
+        };
+        let canonical = scp_core::trust::canonical_challenge_verification_bytes(&cv).unwrap();
+        cv.verifier_signature = verifier_key.sign(&canonical).to_bytes().to_vec();
+        serde_json::to_string(&vec![cv]).unwrap()
+    }
+
+    #[test]
+    fn check_capability_requirements_challenge_verified_happy_path() {
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let subject = "did:dht:zResponder";
+        let ctx = "ctx-admission";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, subject, ctx);
+        let result = py_check_capability_requirements(ctx, subject, &requirements, "[]", &cvs);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_cross_subject_replay() {
+        // The verification is genuinely signed, but for a DIFFERENT subject.
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let ctx = "ctx-admission";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, "did:dht:zVictim", ctx);
+        let result =
+            py_check_capability_requirements(ctx, "did:dht:zAttacker", &requirements, "[]", &cvs);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_capability_requirements_rejects_cross_context_replay() {
+        // The verification is genuinely signed, but bound to a DIFFERENT context.
+        let uri = "scp:capability:prompt-injection-resistance/v1";
+        let subject = "did:dht:zResponder";
+        let requirements =
+            format!(r#"[{{"capability":"{uri}","verification_level":"ChallengeVerified"}}]"#);
+        let cvs = signed_cv_json(uri, subject, "ctx-other");
+        let result =
+            py_check_capability_requirements("ctx-admission", subject, &requirements, "[]", &cvs);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -690,6 +1480,12 @@ mod tests {
             "[]",
         );
         assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7042),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7042
+        );
     }
 
     #[test]
@@ -706,6 +1502,12 @@ mod tests {
             "[]",
         );
         assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7044),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7044
+        );
     }
 
     #[test]
@@ -722,5 +1524,244 @@ mod tests {
             "[]",
         );
         assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7041),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7041
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_empty_context() {
+        pyo3::prepare_freethreaded_python();
+        let result = default_scp().aggregate_trust_input(
+            "",
+            "did:key:test",
+            "[]",
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7040),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7040
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_merkle_root_json() {
+        pyo3::prepare_freethreaded_python();
+        let result = default_scp().aggregate_trust_input(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "not json",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7043),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7043
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_consequence_rules_json() {
+        pyo3::prepare_freethreaded_python();
+        let result = default_scp().aggregate_trust_input(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+            "not json",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7045),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7045
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_threshold_requirements_json() {
+        pyo3::prepare_freethreaded_python();
+        let result = default_scp().aggregate_trust_input(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+            "[]",
+            "not json",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7046),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7046
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_attestor_sets_json() {
+        pyo3::prepare_freethreaded_python();
+        let result = default_scp().aggregate_trust_input(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+            "[]",
+            "{}",
+            "not json",
+            "[]",
+            "[]",
+        );
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7047),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7047
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_cached_attestations_json() {
+        pyo3::prepare_freethreaded_python();
+        let result = default_scp().aggregate_trust_input(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+            "[]",
+            "{}",
+            "{}",
+            "not json",
+            "[]",
+        );
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7048),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7048
+        );
+    }
+
+    #[test]
+    fn aggregate_trust_input_rejects_invalid_challenge_results_json() {
+        pyo3::prepare_freethreaded_python();
+        let result = default_scp().aggregate_trust_input(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "not json",
+        );
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7049),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7049
+        );
+    }
+
+    #[test]
+    fn participation_record_validates_context_id() {
+        pyo3::prepare_freethreaded_python();
+        let result = default_scp().participation_record("", "did:key:test", "[]");
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7000),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7000
+        );
+    }
+
+    #[test]
+    fn participation_record_validates_did() {
+        pyo3::prepare_freethreaded_python();
+        let result = default_scp().participation_record("ctx-1", "not-a-did", "[]");
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7000),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7000
+        );
+    }
+
+    #[test]
+    fn participation_record_rejects_invalid_attestations_json() {
+        pyo3::prepare_freethreaded_python();
+        let result = default_scp().participation_record("ctx-1", "did:key:test", "not json");
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7059),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7059
+        );
+    }
+
+    /// The typed `PyParticipationRecord` surfaces every flattened fact from the
+    /// shared `ParticipationFacts` projection with byte-identical values.
+    #[test]
+    fn participation_record_view_exposes_all_facts() {
+        let facts = scp_core::trust::ParticipationFacts {
+            subject_did: "did:key:bob".into(),
+            participation_duration_secs: 300,
+            governance_actions_against: 1,
+            governance_actions_by: 2,
+            outlet_invocation_count: 5,
+            outlet_invocation_count_anchored: false,
+            context_creation_count: 1,
+            role_progression_count: 3,
+            attestation_count: 2,
+            attestation_count_anchored: false,
+            computed_at: 42,
+            event_log_root: [7u8; 32],
+        };
+        let view = PyParticipationRecord::from(&facts);
+        assert_eq!(view.subject_did, "did:key:bob");
+        assert_eq!(view.participation_duration_secs, 300);
+        assert_eq!(view.governance_actions_against, 1);
+        assert_eq!(view.governance_actions_by, 2);
+        assert_eq!(view.outlet_invocation_count, 5);
+        assert!(!view.outlet_invocation_count_anchored);
+        assert_eq!(view.context_creation_count, 1);
+        assert_eq!(view.role_progression_count, 3);
+        assert_eq!(view.attestation_count, 2);
+        assert!(!view.attestation_count_anchored);
+        assert_eq!(view.computed_at, 42);
+        assert_eq!(view.event_log_root, encode_hex(&[7u8; 32]));
     }
 }

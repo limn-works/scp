@@ -9,7 +9,7 @@ delegate, validate) now lives on :class:`scp_sdk.SCP` as
 
 UCAN (User Controlled Authorization Networks) tokens are the capability
 enforcement mechanism for SCP. Every protocol action — message send,
-tool invocation, member management — requires a valid UCAN token.
+outlet invocation, member management — requires a valid UCAN token.
 
 See ``.docs/adrs/phase-3.md`` ADR-016 for the full UCAN validation
 specification and ADR-048 for the façade consolidation rationale.

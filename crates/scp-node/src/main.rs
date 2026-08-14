@@ -23,14 +23,13 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
-use scp_identity::cache::SystemClock;
+use scp_identity::DidCache;
 use scp_identity::dht::SequenceStore;
-use scp_identity::{DidCache, DidDht, InMemoryDhtClient, InMemorySequenceStore};
 use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach, TlsMode};
 use scp_platform::EncryptedStorage;
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
 use scp_transport::native::server::RelayServer;
+use scp_transport::native::storage::BlobStorageBackend;
 use scp_transport::startup;
 
 // ---------------------------------------------------------------------------
@@ -142,7 +141,7 @@ OPTIONS:
     --self-host             Host a static site entirely on SCP (no DNS name required).
                             Opens an inbound port to the PUBLIC INTERNET and
                             publishes the host's IP to the DHT by default
-                            (`SCP_NODE_DHT_MODE=memory` skips publication).
+                            (`SCP_NODE_DHT_MODE=disabled` skips publication).
                             Self-signed HTTPS by default (SCP_NODE_SELF_HOST_PLAINTEXT=1
                             for plain HTTP). See the loud startup banner for the full warning.
     --site-dir <PATH>       Directory of static files to host in --self-host mode
@@ -171,10 +170,11 @@ ENVIRONMENT VARIABLES:
     SCP_NODE_TLS_SELF_SIGNED    Set to '1' for self-signed TLS (development only)
     SCP_NODE_PROJECTION_RATE_LIMIT  Per-IP rate limit for projection endpoints (default: 60)
     SCP_NODE_DHT_MODE           DHT client: 'production' (default) publishes this
-                                node's address to the Mainline DHT; 'memory' does
-                                NOT publish (reachable but not DHT-discoverable —
-                                share the address out-of-band). Works with or
-                                without NAT probing.
+                                node's address to the Mainline DHT; 'disabled'
+                                does NOT publish (reachable but not
+                                DHT-discoverable — share the address out-of-band;
+                                honoured by --self-host). Works with or without
+                                NAT probing.
     SCP_NODE_DHT_GATEWAYS       Comma-separated DHT HTTP gateway URLs
     SCP_STORAGE_PATH            SQLite database directory (same as --storage-path)
     SCP_STORAGE_KEY             Hex-encoded 32-byte SQLCipher encryption key
@@ -301,12 +301,46 @@ async fn run_relay_only() {
 // Full node mode — ephemeral
 // ---------------------------------------------------------------------------
 
+/// The blob backend for ephemeral mode: always in-memory, no persistence, env
+/// overrides deliberately IGNORED.
+///
+/// This is the ephemeral caller's explicit selection at its own boundary
+/// (SCP-CAPINJECT-010). It is a named function — not an inline literal — so the
+/// "ephemeral ⇒ in-memory blob" contract is pinned by a unit test
+/// (`ephemeral_uses_in_memory_blob`) and cannot silently regress to a durable /
+/// env-driven backend (which would violate the all-in-memory contract documented
+/// on [`run_full_node_ephemeral`] and re-persist blobs to disk).
+///
+/// Gated to `any(test, feature = "testing")` because that is exactly where it is
+/// used and nowhere else: the ephemeral entry point [`run_full_node_ephemeral`]
+/// is itself `#[cfg(feature = "testing")]`, and the regression test is
+/// `#[cfg(test)]`. Under a plain default-feature build it would be dead code; the
+/// regression test still runs under `cargo test` (which enables `cfg(test)`).
+#[cfg(any(test, feature = "testing"))]
+#[must_use]
+fn ephemeral_blob_backend() -> BlobStorageBackend {
+    BlobStorageBackend::in_memory()
+}
+
 /// Runs the full node with all in-memory subsystems (no persistence).
 ///
 /// In ephemeral mode, ALL subsystems use in-memory implementations regardless
 /// of environment variable overrides. No mixed mode is permitted — if you want
 /// persistent storage or production DHT, omit the `--ephemeral` flag.
+///
+/// **Test-harness-only.** This path wires the `InMemoryDhtClient` (a §17.17.3
+/// resolve nullifier) and `InMemoryKeyCustody`, so it is compiled only under the
+/// `testing` feature (ADR-062 §Decision 1) — a shipped `scp-node` binary carries
+/// no in-memory DHT client. A production build reached with `--ephemeral` exits
+/// with an error (see the dispatch in `main`).
+#[cfg(feature = "testing")]
 async fn run_full_node_ephemeral() {
+    use scp_clock::SystemClock;
+    use scp_dht::InMemoryDhtClient;
+    use scp_identity::{DidDht, InMemorySequenceStore};
+    use scp_platform::in_memory::InMemoryStorage;
+    use scp_platform::testing::InMemoryKeyCustody;
+
     let domain = require_domain();
     let http_addr = node_http_addr();
 
@@ -330,7 +364,7 @@ async fn run_full_node_ephemeral() {
 
     let custody = Arc::new(InMemoryKeyCustody::new());
     let cache = Arc::new(DidCache::new());
-    let sequence_store = Arc::new(InMemorySequenceStore::new());
+    let sequence_store = Arc::new(InMemorySequenceStore::default());
 
     // Ephemeral mode: always use in-memory DHT. Ignore SCP_NODE_DHT_MODE to
     // prevent mixed mode (in-memory storage + production DHT is inconsistent).
@@ -361,6 +395,8 @@ async fn run_full_node_ephemeral() {
         seq_init,
         did_method,
         encrypted_storage,
+        // Ephemeral contract: in-memory blob, no persistence, env ignored.
+        ephemeral_blob_backend(),
     )
     .await;
 }
@@ -466,9 +502,21 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
     // the production DHT, which would publish the host's address to the network.
     match parse_dht_mode_or_exit() {
+        // `parse_dht_mode_or_exit` never returns `Disabled` for the full relay
+        // node (it exits with guidance to use `--self-host`); this arm exists
+        // only to keep the match exhaustive and fails closed if ever reached.
+        scp_node::DhtMode::Disabled => {
+            tracing::error!(
+                "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
+                 Use --self-host for a non-publishing hosted site."
+            );
+            std::process::exit(1);
+        }
+        #[cfg(feature = "testing")]
         scp_node::DhtMode::Memory => {
             tracing::warn!(
-                "using InMemoryDhtClient — DID documents will NOT be published to the network"
+                "using InMemoryDhtClient — DID documents will NOT be published to the network \
+                 (test-harness-only; DhtMode::Disabled is the shipped no-publish value)"
             );
             let (did_method, seq_init) = scp_node::self_host::build_memory_did_method(
                 Arc::clone(&custody),
@@ -484,6 +532,11 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 seq_init,
                 did_method,
                 Arc::clone(&node_storage_arc),
+                // Persistent mode: operator-configured durable blob backend
+                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
+                // `SCP_RELAY_STORAGE_PATH` — the same explicit selection
+                // relay-only mode makes (SCP-CAPINJECT-010).
+                startup::storage_from_env().await,
             )
             .await;
         }
@@ -512,6 +565,10 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 seq_init,
                 did_method,
                 Arc::clone(&node_storage_arc),
+                // Persistent mode: operator-configured durable blob backend
+                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
+                // `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
+                startup::storage_from_env().await,
             )
             .await;
         }
@@ -525,14 +582,30 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
 /// values. The fail-closed exit prevents a typo (e.g. "memroy") from silently
 /// falling through to the production DHT and publishing the host's address.
 fn parse_dht_mode_or_exit() -> scp_node::DhtMode {
+    // The full relay node publishes its DID so peers can discover it, so its
+    // shipped DHT mode is `production`. `memory` (the in-memory §17.17.3
+    // nullifier) is a test-harness value compiled only under `testing`. The
+    // non-publishing `DhtMode::Disabled` value belongs to the `--self-host`
+    // path (`host_site`), which resolves via the relay layer without publishing;
+    // a relay node with no published DID cannot be found, so it is not offered
+    // here. (The library-level `NodeConfig`/`HostSiteConfig::defaults` fail-safe
+    // is `Disabled` per ADR-062 §Decision 1; this binary default is the operator
+    // running a public server.)
     let raw = env::var("SCP_NODE_DHT_MODE").unwrap_or_else(|_| "production".into());
     match raw.as_str() {
-        "memory" => scp_node::DhtMode::Memory,
         "production" => scp_node::DhtMode::Production,
+        // `disabled` (DHT layer off, no publish) is honoured by the `--self-host`
+        // path (`serve_hosted_site` resolves via the relay layer without
+        // publishing). The full relay node rejects it in its own match — it must
+        // publish its DID to be discoverable.
+        "disabled" => scp_node::DhtMode::Disabled,
+        // `memory` compiles only under the `testing` feature — never shipped.
+        #[cfg(feature = "testing")]
+        "memory" => scp_node::DhtMode::Memory,
         other => {
             tracing::error!(
                 value = %other,
-                "unrecognized SCP_NODE_DHT_MODE (expected 'memory' or 'production'); \
+                "unrecognized SCP_NODE_DHT_MODE (expected 'production' or 'disabled'); \
                  refusing to default to production DHT to avoid unintended IP publication"
             );
             std::process::exit(1);
@@ -585,7 +658,7 @@ fn self_host_banner(port: u16, plaintext: bool, publishes_dht: bool) -> String {
         "  * Your host's PUBLIC IP will be published to the global Mainline DHT, bound to\n\
          \x20    this node's DID. This is an IP<->identity disclosure (approximate-location dox)."
     } else {
-        "  * DHT publishing is OFF (SCP_NODE_DHT_MODE=memory): your host's address is NOT\n\
+        "  * DHT publishing is OFF (SCP_NODE_DHT_MODE=disabled): your host's address is NOT\n\
          \x20    published to the Mainline DHT. The node is reachable on the opened port but is\n\
          \x20    NOT DHT-discoverable -- share its address out-of-band."
     };
@@ -838,6 +911,15 @@ async fn run_node_with<
     seq_init: scp_node::self_host::SeqInitFn,
     did_method: Arc<D>,
     storage: S,
+    // The relay's blob backend, selected by each caller at ITS OWN boundary
+    // (SCP-CAPINJECT-010 / spec §17.17.1). Threaded as a required parameter —
+    // exactly like `storage` — so this shared helper NEVER manufactures a backend
+    // (that would re-introduce the SCP-CAPSEL-8002 anti-pattern the story kills,
+    // and would break ephemeral mode's all-in-memory contract). Ephemeral mode
+    // passes `ephemeral_blob_backend()` (in-memory, no persistence, env-ignoring);
+    // persistent mode passes `startup::storage_from_env()` (durable, default
+    // SQLite, honors env).
+    blob_storage: BlobStorageBackend,
 ) {
     let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
 
@@ -919,6 +1001,7 @@ async fn run_node_with<
                 did_method,
             },
             storage,
+            blob_storage,
         )
     })
     .await
@@ -1033,7 +1116,21 @@ async fn main() {
     } else if config.self_host {
         run_self_host(config.storage_path.as_ref(), config.site_dir.as_ref()).await;
     } else if config.ephemeral {
+        // Ephemeral mode wires in-memory subsystems (incl. the §17.17.3 in-memory
+        // DHT nullifier), so it is compiled only under the `testing` feature
+        // (ADR-062 §Decision 1). A shipped binary reached with `--ephemeral`
+        // fails closed rather than silently running a nullifier-backed node.
+        #[cfg(feature = "testing")]
         run_full_node_ephemeral().await;
+        #[cfg(not(feature = "testing"))]
+        {
+            eprintln!(
+                "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
+                 available in this build. Run without --ephemeral for a persistent node, or set \
+                 SCP_NODE_DHT_MODE=disabled for a non-publishing node."
+            );
+            std::process::exit(1);
+        }
     } else {
         run_full_node_persistent(config.storage_path.as_ref()).await;
     }
@@ -1046,6 +1143,22 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard (SCP-CAPINJECT-010): ephemeral mode MUST select the
+    /// in-memory blob backend — no persistence, env overrides ignored. This pins
+    /// the ephemeral caller's boundary selection so it cannot silently regress to
+    /// a durable / env-driven backend (`startup::storage_from_env`, which defaults
+    /// to `Sqlite`), which would break the all-in-memory contract documented on
+    /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
+    /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.
+    #[test]
+    fn ephemeral_uses_in_memory_blob() {
+        assert!(
+            matches!(ephemeral_blob_backend(), BlobStorageBackend::InMemory(_)),
+            "ephemeral mode must use the in-memory blob backend (no persistence, \
+             env ignored) — see the all-in-memory contract on run_full_node_ephemeral"
+        );
+    }
 
     /// `SCP_NODE_SELF_HOST_NO_NAT` (and every opt-in self-host flag) is truthy
     /// only for the exact values `"1"` and `"true"`. This is the parsing rule

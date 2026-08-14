@@ -12,8 +12,8 @@ public enum GovernanceActionResult: String, Sendable {
     case memberAdded = "MemberAdded"
     case memberRemoved = "MemberRemoved"
     case roleChanged = "RoleChanged"
-    case toolRegistered = "ToolRegistered"
-    case toolRemoved = "ToolRemoved"
+    case outletRegistered = "OutletRegistered"
+    case outletRemoved = "OutletRemoved"
     case ceilingModified = "CeilingModified"
     case contextClosed = "ContextClosed"
     case ttlExtended = "TtlExtended"
@@ -23,7 +23,7 @@ public enum GovernanceActionResult: String, Sendable {
     case signerRemoved = "SignerRemoved"
     case thresholdModified = "ThresholdModified"
     case childContextCreated = "ChildContextCreated"
-    case toolInterfaceEstablished = "ToolInterfaceEstablished"
+    case outletInterfaceEstablished = "OutletInterfaceEstablished"
     case memberReset = "MemberReset"
     case conflictResolved = "ConflictResolved"
     case contextPromoted = "ContextPromoted"
@@ -179,12 +179,16 @@ func validateContentPath(_ rawPath: String) throws {
     try rejectForbiddenPathChars(path)
     try rejectPathControlChars(path)
     try rejectPathUnicodeFormatting(path)
-    if path.contains("//") { throw contentPathError("ContentPath must not contain '//'") }
+    if path.contains("//") {
+        throw contentPathError("ContentPath must not contain '//'")
+    }
     if path.count > 1, path.hasSuffix("/") {
         throw contentPathError("ContentPath must not have trailing slash (except root '/')")
     }
     for segment in path.split(separator: "/", omittingEmptySubsequences: false).dropFirst() {
-        if segment == "." { throw contentPathError("ContentPath must not contain '.' segments") }
+        if segment == "." {
+            throw contentPathError("ContentPath must not contain '.' segments")
+        }
         if segment == ".." {
             throw contentPathError("ContentPath must not contain '..' segments (directory traversal)")
         }
@@ -526,17 +530,24 @@ public extension Context {
     ///
     /// - Parameters:
     ///   - subscriberDid: The DID subscribing to broadcasts.
-    ///   - subscribeFn: Bridge function override for testing.
+    ///   - messagesReadUcanJwt: For a GATED broadcast context, the `messages:read`
+    ///     UCAN JWT issued to `subscriberDid` by the context admin/creator (spec
+    ///     §5.14.4). Unused for an OPEN context.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or not a broadcast context.
     func broadcastSubscribe(
-        subscriberDid: String
+        subscriberDid: String,
+        messagesReadUcanJwt: String? = nil
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        try await scp.broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
+        try await scp.broadcastSubscribe(
+            handle: handle,
+            subscriberDid: subscriberDid,
+            messagesReadUcanJwt: messagesReadUcanJwt
+        )
     }
 
     /// Unsubscribes a DID from this broadcast context.
@@ -849,13 +860,16 @@ public extension Context {
 
     /// Resets the TTL timer after a successful unanimous extension.
     ///
-    /// Cancels the old timer and spawns a new one with the given duration.
+    /// EXTENDS the existing convergent TTL deadline by `newSeconds`
+    /// (`oldDeadline + newSeconds`), not a local `now + newSeconds`, so the
+    /// re-armed expiry timestamp stays convergent across members (§7.3.1). It
+    /// does not cancel/respawn a task — the TTL timer is an actor-owned arm.
+    /// A no-op on a context with no armed TTL (no recorded deadline to extend).
     /// Call this after ``proposeTtlExtension(memberDid:proposedSeconds:proposeTtlExtensionFn:)``
     /// returns `true`.
     ///
     /// - Parameters:
-    ///   - newSeconds: The new TTL duration in seconds.
-    ///   - resetTtlTimerFn: Bridge function override for testing.
+    ///   - newSeconds: The additional TTL duration in seconds to extend by.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func resetTtlTimer(
         newSeconds: UInt64

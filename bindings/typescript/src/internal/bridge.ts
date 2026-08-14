@@ -1,27 +1,27 @@
 /**
- * Runtime detection and unified bridge interface for the SCP TypeScript SDK.
+ * Unified bridge interface for the SCP TypeScript SDK.
  *
- * This module selects the correct FFI backend at import time based on the
- * runtime environment:
+ * This SDK (`@limn-works/scp-ts`) has a single FFI backend: the napi-rs native
+ * addon (`./native.js`), which runs in Bun/Node.js. Browser clients run the full
+ * protocol in-tab (keys on-device) via the sibling `@limn-works/scp-ts-wasm`
+ * package over `scp-client-wasm` (ADR-057, which amends ADR-055's remote-thin-
+ * client browser model) — a different package, not this napi bridge.
  *
- * - **Bun/Node.js** -> napi-rs native addon (`./native.js`)
- * - **Browser** -> wasm-bindgen WASM module (`./wasm.js`)
- *
- * Bridge selection is synchronous — no top-level await — to preserve CJS
- * compatibility. The actual bridge module is loaded lazily on first use via
- * `getBridge()`.
+ * The actual bridge module is loaded lazily on first use via `getBridge()`.
  *
  * Application code never imports from `internal/`. The public API classes
  * (`Identity`, `Context`, etc.) call `getBridge()` internally on their async
  * factory methods.
  *
- * See ADR-022 in `.docs/adrs/phase-4.md` and ADR-048.
+ * See ADR-022 in `.docs/adrs/phase-4.md`, ADR-048, and ADR-055.
  */
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
+import { mapBridgeError } from "../errors";
 import type { SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
+  CapabilityValidation,
   Checkpoint,
   DIDDocument,
   Event,
@@ -29,20 +29,47 @@ import type {
   EventFilter,
   MemberRole,
   Message,
+  OutletDefinition,
+  OutletVerificationResult,
   Proof,
-  ToolDefinition,
-  ToolVerificationResult,
+  SagaResult,
   TransportStatus,
   UcanToken,
 } from "../types";
+import { assertTestEnvironment } from "./test-guard";
 
 // ---------------------------------------------------------------------------
-// Bridge interface — the contract both native and WASM bridges implement
+// Shared CapabilityValidation projection
 // ---------------------------------------------------------------------------
 
 /**
- * Unified bridge interface that both the native (napi-rs) and WASM
- * (wasm-bindgen) bridges must satisfy.
+ * Projects a bridge `ucan_evaluate` result onto the SDK
+ * {@link CapabilityValidation} shape.
+ *
+ * The NAPI bridge result (`NapiCapabilityValidation`) already exposes the six
+ * camelCase booleans, so this is a field-for-field copy that pins the canonical
+ * six-field shape in ONE place — the native bridge factory calls it, so a field
+ * can never be silently dropped or re-spelled (ADR-059 / spec §7.2.4). The copy
+ * (rather than returning `raw`) keeps the SDK object's own identity and strips
+ * any extra bridge fields.
+ */
+export function toCapabilityValidation(raw: CapabilityValidation): CapabilityValidation {
+  return {
+    tokensValid: raw.tokensValid,
+    signaturesValid: raw.signaturesValid,
+    withinCeiling: raw.withinCeiling,
+    nonceValid: raw.nonceValid,
+    notRevoked: raw.notRevoked,
+    timeBoundsValid: raw.timeBoundsValid,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Bridge interface — the contract the native bridge implements
+// ---------------------------------------------------------------------------
+
+/**
+ * Unified bridge interface that the native (napi-rs) bridge satisfies.
  *
  * Each method maps to a flat bridge function exposed by the Rust FFI crate.
  * The TypeScript wrapper classes (`Identity`, `Context`, etc.) delegate to
@@ -65,18 +92,15 @@ export interface Bridge {
    * setup. The remaining context methods (`contextJoin`, `contextLeave`, etc.)
    * take a plain `identityDid: string` since they operate on an already-
    * established context.
-   *
-   * WASM bridge implementers: the underlying `context_create` WASM export
-   * still accepts a DID string — extract `identity.did` before calling it.
    */
   contextCreate(identity: BridgeIdentityHandle, paramsJson: string): Promise<BridgeContextHandle>;
   /**
    * Joins an existing context.
    *
    * `spendingUcanJwt` is optional and may be omitted, `undefined`, or
-   * explicitly `null`. The bridge implementations (NAPI, WASM, mock) all
+   * explicitly `null`. The bridge implementations (NAPI, mock) all
    * normalize the absent case so consumers can call without a third argument
-   * for the common no-payment join. See ADR-033 §19 and #1531 for the
+   * for the common no-payment join. See ADR-033 §19 for the
    * join-cost AND-composition flow.
    *
    * Note: this is the SDK's internal contract — SDK wrappers always normalize
@@ -118,7 +142,11 @@ export interface Bridge {
   contextMemberRole(handle: BridgeContextHandle, did: string): Promise<MemberRole | null>;
 
   // Broadcast operations
-  broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void>;
+  broadcastSubscribe(
+    handle: BridgeContextHandle,
+    subscriberDid: string,
+    messagesReadUcanJwt?: string,
+  ): Promise<void>;
   broadcastUnsubscribe(
     handle: BridgeContextHandle,
     subscriberDid: string,
@@ -221,7 +249,6 @@ export interface Bridge {
   contextGovernanceListProposals(handle: BridgeContextHandle): Promise<string>;
 
   // TTL operations
-  contextTtlRemaining(handle: BridgeContextHandle): Promise<number | null>;
   contextExtendTtl(handle: BridgeContextHandle, additionalSecs: number): Promise<boolean>;
   contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void>;
   contextProposeTtlExtension(
@@ -238,14 +265,12 @@ export interface Bridge {
   // Context export/import
   contextExport(handle: BridgeContextHandle): Promise<Uint8Array>;
   // §9.10.4: `importerDid` identifies the importing member so the native
-  // bridge can derive that identity's per-context pseudonym routing ID. The
-  // WASM bridge ignores it (ADR-034: shared routing IDs, no pseudonym path).
+  // bridge can derive that identity's per-context pseudonym routing ID.
   contextImport(data: Uint8Array, importerDid: string): Promise<string>;
 
   // §9.10.4 test-only: inject a peer's per-member pseudonym routing ID into this
   // context's registry (simulating the peer's PseudonymAnnouncement) so a
-  // co-located encrypted send can fan out to it. Native-only; feature-gated to
-  // dev/test builds. Not present on the WASM bridge.
+  // co-located encrypted send can fan out to it. Feature-gated to dev/test builds.
   contextSeedPeerPseudonym(
     handle: BridgeContextHandle,
     peerDid: string,
@@ -255,34 +280,34 @@ export interface Bridge {
   // Drain events
   contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]>;
 
-  // Tools
-  toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string>;
-  toolInvoke(
+  // Outlets
+  outletRegister(handle: BridgeContextHandle, definition: OutletDefinition): Promise<string>;
+  outletInvoke(
     handle: BridgeContextHandle,
-    toolId: string,
+    outletId: string,
     inputJson: string,
     identityDid: string,
     ucanToken: string,
     proofTokens?: readonly string[],
     spendingUcan?: string,
   ): Promise<string>;
-  toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult>;
+  outletVerify(handle: BridgeContextHandle, outletId: string): Promise<OutletVerificationResult>;
 
   // Bidirectional consent protocol (§6.2.0.1)
-  toolInterfaceExpose(
+  outletInterfaceExpose(
     handle: BridgeContextHandle,
-    toolId: string,
+    outletId: string,
     targetContextId: string,
     rateLimitJson?: string,
   ): Promise<string>;
-  toolInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string>;
-  toolInterfaceRevoke(handle: BridgeContextHandle, interfaceIdHex: string): Promise<string>;
+  outletInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string>;
+  outletInterfaceRevoke(handle: BridgeContextHandle, interfaceIdHex: string): Promise<string>;
 
-  // Cross-context tool invocation (spec section 6.2)
-  toolInvokeCrossContext(
+  // Cross-context outlet invocation (spec section 6.2)
+  outletInvokeCrossContext(
     sourceHandle: BridgeContextHandle,
     targetHandle: BridgeContextHandle,
-    toolId: string,
+    outletId: string,
     inputJson: string,
     invokerDid: string,
     ucanToken: string,
@@ -290,14 +315,27 @@ export interface Bridge {
     proofTokens?: readonly string[],
   ): Promise<string>;
 
-  // Stateful tool sessions (spec section 6.2.1)
-  toolSessionCreate(
+  // The §6.2.4 atomic cross-context outlet-invocation saga (ADR-049 §3a)
+  outletInvokeCrossContextSaga(
+    sourceHandle: BridgeContextHandle,
+    targetHandle: BridgeContextHandle,
+    callerDid: string,
+    outletRegistrationId: string,
+    inputJson: string,
+    assertedNonceHex: string,
+    timestampMs: bigint,
+    chainDepth: number,
+    ucanProofId?: string,
+  ): Promise<SagaResult>;
+
+  // Stateful outlet sessions (spec section 6.2.1)
+  outletSessionCreate(
     handle: BridgeContextHandle,
-    toolId: string,
+    outletId: string,
     sourceContextId: string,
     ttlSeconds?: number,
   ): Promise<string>;
-  toolSessionInvoke(
+  outletSessionInvoke(
     handle: BridgeContextHandle,
     sessionId: string,
     inputJson: string,
@@ -305,7 +343,7 @@ export interface Bridge {
     ucanToken: string,
     proofTokens?: readonly string[],
   ): Promise<string>;
-  toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void>;
+  outletSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void>;
 
   // Transport
   transportConnect(relayUrl: string): Promise<BridgeTransportHandle>;
@@ -313,7 +351,38 @@ export interface Bridge {
   transportDisconnect(handle: BridgeTransportHandle): Promise<void>;
 
   // UCAN
-  ucanValidate(handle: BridgeContextHandle, token: string, capability: string): Promise<void>;
+  /**
+   * Enforcing UCAN gate. FAIL CLOSED: `presentingAgentDid` is required by the
+   * bridge (it will not default to the token's own `aud`, which would make the
+   * step-5 audience check a tautology and inflate trust). Omitting it makes the
+   * bridge reject the call.
+   */
+  ucanValidate(
+    handle: BridgeContextHandle,
+    token: string,
+    capability: string,
+    presentingAgentDid?: string,
+    proofTokens?: readonly string[],
+  ): Promise<void>;
+  /**
+   * Read-only, structured counterpart to {@link ucanValidate}: runs the same
+   * 11-step ADR-016 pipeline but resolves to a {@link CapabilityValidation}
+   * (six per-stage booleans) instead of throwing on a capability outcome, and
+   * never records the token's nonce (spec §7.2.4, ADR-059). It still rejects
+   * for malformed FFI inputs (bad token / capability / DID strings).
+   *
+   * `capability` is OPTIONAL: `null`/`undefined` (or empty) evaluates the
+   * token's intrinsic validity with no invoked-capability grant-match challenge
+   * — the mode the trust signal uses; a value additionally requires the token
+   * grants it.
+   */
+  ucanEvaluate(
+    handle: BridgeContextHandle,
+    token: string,
+    capability?: string | null,
+    presentingAgentDid?: string,
+    proofTokens?: readonly string[],
+  ): Promise<CapabilityValidation>;
   ucanMint(
     handle: BridgeContextHandle,
     memberDid: string,
@@ -519,7 +588,7 @@ export interface Bridge {
     issuerPublicKeyHex: string,
   ): Promise<boolean>;
 
-  // Recovery and custody migration (#632, spec §9.12, §3.2.1)
+  // Recovery and custody migration (spec §9.12, §3.2.1)
   identityExecuteRecovery(did: string, tier: string, contextIds: string[]): Promise<string>;
   identityExecuteCustodyMigration(
     did: string,
@@ -565,26 +634,26 @@ export interface Bridge {
   validateContextParams(paramsJson: string): string | null;
 
   // Economy (§19, ADR-033)
-  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): number;
+  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): bigint;
   economyPolicyRequiresPayment(policyJson: string): boolean;
   economyAutoAcceptBlocked(policyJson: string): boolean;
   economyCheckPolicyLock(policyJson: string): boolean;
   economyValidatePolicyChange(currentJson: string, proposedJson: string): boolean;
-  economyEvaluateFormula(formulaJson: string, metricsJson: string): number;
-  economyBudgetRemaining(contextId: string, did: string): number;
-  economyBudgetGrant(contextId: string, did: string, amount: number): void;
-  economyBudgetRecordSpend(contextId: string, did: string, amount: number): void;
+  economyEvaluateFormula(formulaJson: string, metricsJson: string): bigint;
+  economyBudgetRemaining(contextId: string, did: string): bigint;
+  economyBudgetGrant(contextId: string, did: string, amount: bigint): void;
+  economyBudgetRecordSpend(contextId: string, did: string, amount: bigint): void;
   economyAntispamRecord(contextId: string, senderDid: string, timestamp: number): void;
   economyAntispamVelocity(contextId: string, senderDid: string, now: number): number;
   economyAntispamEscalatedCost(
     contextId: string,
     senderDid: string,
     now: number,
-    baseCost: number,
+    baseCost: bigint,
     thresholdsJson: string,
-    floor: number | null,
-    cap: number | null,
-  ): number;
+    floor: bigint | null,
+    cap: bigint | null,
+  ): bigint;
   economyVerifyPaymentReceipts(receiptsJson: string): string;
 
   // Media (ADR-024)
@@ -618,7 +687,20 @@ export interface Bridge {
   scpidVerify(responseJson: string, challengeJson: string): string;
 
   // Trust — participation verification (SCP-BA-004, §7.3.2.1)
-  verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean;
+  verifyParticipationRequirements(
+    expectedSubject: string,
+    requirementsJson: string,
+    profileJson: string,
+  ): void;
+
+  // Trust — capability admission verification (§7.3.4.4, SCP-ACR-008)
+  checkCapabilityRequirements(
+    contextId: string,
+    subjectDid: string,
+    requirementsJson: string,
+    agentCapabilitiesJson: string,
+    challengeVerificationsJson: string,
+  ): void;
 
   // Lifecycle
   version(): string;
@@ -628,7 +710,7 @@ export interface Bridge {
    * Awaits in-flight tasks up to `timeoutMillis` milliseconds, aborts any
    * remaining tasks when the deadline expires, clears registries,
    * disconnects transport, and runs shutdown hooks. The unit is
-   * milliseconds after the #1549 Phase 4 unit unification — pass `1000`
+   * milliseconds (Phase 4 unit unification) — pass `1000`
    * for a 1-second deadline, not `1`.
    *
    * Returns a `Promise<void>` — **callers must `await` it**. Previously
@@ -640,12 +722,9 @@ export interface Bridge {
   shutdown(timeoutMillis: number): Promise<void>;
   suspend(): void;
   /**
-   * Resumes the bridge. On the NAPI path this is a real async call
-   * (#1678) — the bridge reconnects transport from pending relay URLs
-   * and restores persisted context snapshots before the promise
-   * settles. The WASM path is a no-op, but still returns a resolved
-   * promise to keep the interface uniform and to let callers
-   * `await bridge.resume()` without branching on target.
+   * Resumes the bridge. On the NAPI path this is a real async call —
+   * the bridge reconnects transport from pending relay URLs and
+   * restores persisted context snapshots before the promise settles.
    */
   resume(): Promise<void>;
 }
@@ -659,10 +738,10 @@ export interface BridgeIdentityHandle {
   readonly did: string;
   readonly custodyType: string;
   /**
-   * JSON-serialized `scp_identity::DidRotationEvent`, present only on
+   * JSON-serialized `scp_did::DidRotationEvent`, present only on
    * handles produced by `identityMigrate` (spec §9.12, ADR-003 §4b/4c).
    * SDK callers MUST distribute this event to active context members
-   * per spec §3.2.1 step 4b. `undefined` for any handle minted by
+   * per spec §9.12 (Identity Key migration). `undefined` for any handle minted by
    * other operations (`identityCreate`, `identityRotateKey`, agent-key
    * ops, external load) — those do not change the DID, so no
    * `DidRotationEvent` is constructed.
@@ -694,37 +773,95 @@ export interface MessageCallback {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime detection
+// Bridge target
 // ---------------------------------------------------------------------------
-
-/** The detected bridge target: `"native"` for Bun/Node, `"wasm"` for browser. */
-export type BridgeTarget = "native" | "wasm";
 
 /**
- * Detects the runtime environment synchronously.
- *
- * - Bun exposes `process.versions.bun`.
- * - Node.js exposes `process.versions.node` but not `bun`.
- * - Browsers have neither.
- *
- * This function contains no top-level await and no I/O — it is safe to call
- * at module import time, preserving CJS compatibility.
+ * The bridge target. The SDK has a single in-process backend — the napi-rs
+ * native addon (Bun/Node.js). Retained as a diagnostics constant on the
+ * public surface.
  */
-function detectBridge(): BridgeTarget {
-  if (typeof process !== "undefined" && process.versions?.bun) {
-    return "native";
-  }
-  if (typeof process !== "undefined" && process.versions?.node) {
-    return "native";
-  }
-  return "wasm";
-}
+export type BridgeTarget = "native";
 
-/** The detected bridge target, computed once at import time. */
-export const BRIDGE_TARGET: BridgeTarget = detectBridge();
+/** The bridge target. Always `"native"` — the SDK is napi-only (ADR-055). */
+export const BRIDGE_TARGET: BridgeTarget = "native";
 
 // ---------------------------------------------------------------------------
-// Per-SCP native bridge cache + WASM singleton bridge cache
+// Single bridge-error chokepoint
+// ---------------------------------------------------------------------------
+
+/**
+ * Wraps a bridge object so that every raw FFI error thrown by one of its own
+ * function-valued properties is converted into a typed {@link ScpError}
+ * subclass via the single {@link mapBridgeError} function, applied at one site
+ * per dispatch surface — here, this `wrapBridgeErrors` Proxy over both bridge
+ * factories (and, separately, the SCP-class methods that dispatch through the
+ * raw addon directly).
+ *
+ * {@link createNativeBridge} returns its bridge object through this wrapper, so
+ * callers (e.g. `discovery.ts`, `trust.ts`) no longer need per-method
+ * `try/catch { throw mapBridgeError(e) }` sprinkled across the SDK — the
+ * conversion happens once, here.
+ *
+ * Behaviour:
+ * - Only the bridge's **own function properties** are wrapped. Non-function
+ *   properties (and inherited/runtime-hook lookups) pass through untouched.
+ * - Sync-vs-async is preserved without ahead-of-time knowledge: the wrapper
+ *   calls the method, and if the result is a thenable it attaches a `.catch`
+ *   that re-maps the rejection; otherwise it returns the synchronous value as
+ *   is (mapping any synchronous throw). A synchronous throw from an `async`
+ *   bridge method (e.g. an argument guard that throws before the first
+ *   `await`) is still mapped.
+ * - Returned **handle objects are NOT deep-proxied.** Methods like
+ *   `identityRotateKey` resolve to a live NAPI handle whose own methods
+ *   (`handle.rotateKey()`) must keep their identity for handle-affinity
+ *   enforcement; wrapping only the bridge surface leaves those handles intact.
+ *
+ * @param bridge The freshly constructed bridge object to guard.
+ * @returns A `Proxy` over `bridge` whose function members map their errors.
+ */
+export function wrapBridgeErrors(bridge: Bridge): Bridge {
+  return new Proxy(bridge, {
+    get(target, prop, receiver): unknown {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== "function") {
+        return value;
+      }
+      // Re-bind to the underlying bridge so `this` inside a method (and any
+      // closure captured at factory time) stays correct.
+      const method = value as (...args: unknown[]) => unknown;
+      return (...args: unknown[]): unknown => {
+        let result: unknown;
+        try {
+          result = method.apply(target, args);
+        } catch (error) {
+          // Synchronous throw — including a guard that fires before the first
+          // `await` inside an async bridge method.
+          throw mapBridgeError(error);
+        }
+        // Preserve async vs sync: only attach error mapping when the method
+        // actually returned a thenable. A plain (sync) return value — including
+        // a returned handle object — passes through verbatim, never deep-proxied.
+        if (
+          result !== null &&
+          typeof result === "object" &&
+          typeof (result as { then?: unknown }).then === "function"
+        ) {
+          return (result as Promise<unknown>).then(
+            (v) => v,
+            (error: unknown) => {
+              throw mapBridgeError(error);
+            },
+          );
+        }
+        return result;
+      };
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Per-SCP native bridge cache
 // ---------------------------------------------------------------------------
 
 /**
@@ -740,12 +877,8 @@ export const BRIDGE_TARGET: BridgeTarget = detectBridge();
  */
 const _nativeBridgeForScp = new WeakMap<SCP, Bridge>();
 
-/** WASM singleton bridge — the WASM runtime is inherently process-wide. */
-let _wasmBridge: Bridge | null = null;
-
 /**
- * Returns the cached bridge instance synchronously, scoped to an SCP on
- * native targets.
+ * Returns the cached bridge instance synchronously, scoped to an SCP.
  *
  * This is safe to call only after at least one async SDK method has completed
  * (which triggers `getBridge()` and caches the bridge). If called before
@@ -754,37 +887,25 @@ let _wasmBridge: Bridge | null = null;
  * Used by synchronous SDK functions (`ScopedHandle.hasCapability`,
  * `validateCapabilityDeclaration`) that cannot await.
  *
- * @param scp The SCP instance whose bridge should be returned on native
- *   targets. Ignored on WASM.
+ * @param scp The SCP instance whose bridge should be returned.
  * @returns The cached `Bridge` instance.
  * @throws {Error} If the bridge has not been initialized yet.
  */
 export function getBridgeSync(scp: SCP): Bridge {
-  if (BRIDGE_TARGET === "native") {
-    const bridge = _nativeBridgeForScp.get(scp);
-    if (bridge === undefined) {
-      throw new Error("Bridge not initialized — call an async SCP function first");
-    }
-    return bridge;
-  }
-  if (_wasmBridge === null) {
+  const bridge = _nativeBridgeForScp.get(scp);
+  if (bridge === undefined) {
     throw new Error("Bridge not initialized — call an async SCP function first");
   }
-  return _wasmBridge;
+  return bridge;
 }
 
 /**
  * Returns the initialized bridge instance for the given {@link SCP},
  * loading it lazily on first call.
  *
- * - For `"native"` targets: dynamically imports `./native.js` and
- *   instantiates a per-SCP bridge keyed against the supplied wrapper.
- * - For `"wasm"` targets: dynamically imports `./wasm.js` and calls
- *   `initWasm()` for one-time WASM initialization. The WASM bridge is
- *   a process-wide singleton — the `scp` parameter is unused.
- *
- * Subsequent calls for the same `SCP` return the cached instance — no
- * re-initialization.
+ * Dynamically imports `./native.js` and instantiates a per-SCP bridge keyed
+ * against the supplied wrapper. Subsequent calls for the same `SCP` return
+ * the cached instance — no re-initialization.
  *
  * Each `SCP` instance owns an independent bridge (ADR-048 multi-
  * instance routing), which eliminates cross-test state poisoning in
@@ -793,20 +914,35 @@ export function getBridgeSync(scp: SCP): Bridge {
  * @returns The initialized `Bridge` instance.
  */
 export async function getBridge(scp: SCP): Promise<Bridge> {
-  if (BRIDGE_TARGET === "native") {
-    let bridge = _nativeBridgeForScp.get(scp);
-    if (bridge === undefined) {
-      const mod = await import("./native.js");
-      bridge = mod.createNativeBridge(scp);
-      _nativeBridgeForScp.set(scp, bridge);
-    }
-    return bridge;
+  let bridge = _nativeBridgeForScp.get(scp);
+  if (bridge === undefined) {
+    const mod = await import("./native.js");
+    bridge = mod.createNativeBridge(scp);
+    _nativeBridgeForScp.set(scp, bridge);
   }
+  return bridge;
+}
 
-  if (_wasmBridge === null) {
-    const mod = await import("./wasm.js");
-    await mod.initWasm();
-    _wasmBridge = mod.createWasmBridge();
-  }
-  return _wasmBridge;
+/**
+ * **Test-only.** Injects a pre-built `Bridge` into the per-instance WeakMap
+ * so that `getBridge(scp)` returns it without loading any platform addon.
+ *
+ * Guarded by a positive test-environment check: throws unless `NODE_ENV` is
+ * `"test"` or `"development"`, or `BUN_TEST` is set (which `bun:test` sets
+ * automatically). The primary security boundary is the production bundle:
+ * tsup dead-code-eliminates this helper entirely from `dist/` (it is not
+ * re-exported from `src/index.ts`), and the `package.json` `exports` map
+ * prevents deep imports of `internal/bridge`. The env guard is defence-in-depth
+ * for non-bundled / dev-server usage.
+ *
+ * Intended use: construct a mock `Bridge` with spy stubs for specific
+ * operations (e.g. `bridgeEvaluateTrust`), then call
+ * `__setBridgeForTests(scp, mockBridge)` before invoking module-level helpers
+ * (`evaluateTrust`, `bridgeCreateShadow`, …) under test.
+ *
+ * @internal Phase 4 PR 4 — used by `identity-lifecycle.test.ts` routing tests.
+ */
+export function __setBridgeForTests(scp: SCP, bridge: Bridge): void {
+  assertTestEnvironment("__setBridgeForTests");
+  _nativeBridgeForScp.set(scp, bridge);
 }

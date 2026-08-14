@@ -19,13 +19,12 @@ use std::sync::Arc;
 use futures::StreamExt;
 
 use scp_core::context::builder::ContextEventLogProvider;
-use scp_core::context::governance::KeyResolver;
 use scp_core::context::membership::ContextEvent;
 use scp_core::context::{
     Capability, ContextMode, ContextParams, ContextState, context_id_bytes, context_routing_id,
 };
 use scp_core::envelope::outer::create_outer_envelope;
-use scp_identity::DID;
+use scp_did::DID;
 use scp_testing::fullstack::FullStackNetwork;
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer, ShutdownHandle};
@@ -40,17 +39,6 @@ use scp_transport::traits::{RoutingId, TransportAdapter, TransportEvent};
 const ALICE_DID: &str = "did:dht:z6MkAliceFullStack";
 const BOB_DID: &str = "did:dht:z6MkBobFullStack";
 const CAROL_DID: &str = "did:dht:z6MkCarolFullStack";
-
-/// Returns a key resolver that always resolves (tests don't verify governance
-/// vote signatures — that's covered by `governance_integration.rs`).
-fn permissive_key_resolver() -> KeyResolver {
-    Arc::new(|_did: &DID, _kid: scp_identity::SigningKeyId| {
-        // Return a deterministic key derived from the DID string so
-        // governance operations that require signature verification can
-        // proceed (even though we don't exercise that path here).
-        None
-    })
-}
 
 /// Returns `ContextParams` for an encrypted context with the capability ceiling
 /// needed for full-stack tests (admin needs `RoleAssign` to add members, etc.).
@@ -81,8 +69,8 @@ async fn fullstack_alice_to_bob_encrypted_message() {
 
     // 1. Create network and nodes.
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
-    let bob = network.create_node(BOB_DID, permissive_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
 
     println!("  [1] Created Alice ({ALICE_DID}) and Bob ({BOB_DID})");
 
@@ -93,7 +81,7 @@ async fn fullstack_alice_to_bob_encrypted_message() {
     let ctx_bytes = context_id_bytes(ctx_id);
 
     println!("  [2] Alice created context '{ctx_id}'");
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 
     // 3. Alice adds Bob (internally: add_member + distribute_sender_key).
     //    The Welcome and sender key are deposited in the shared KeyExchange.
@@ -101,7 +89,7 @@ async fn fullstack_alice_to_bob_encrypted_message() {
     println!("  [3] Alice added Bob to the context");
 
     // 4. Bob joins by retrieving the Welcome from the KeyExchange.
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
     println!("  [4] Bob joined the context via Welcome message");
 
     // 4b. Seed Bob's per-member pseudonym routing ID into Alice's manager
@@ -156,6 +144,7 @@ async fn fullstack_alice_to_bob_encrypted_message() {
     // 7. Bob decrypts through the full envelope pipeline.
     let decrypted = bob
         .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(
         decrypted.as_slice(),
@@ -201,8 +190,8 @@ async fn fullstack_heartbeat_send_does_not_advance_application_sequence() {
     use scp_core::envelope::inner::MessageType;
 
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
-    let bob = network.create_node(BOB_DID, permissive_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
 
     let ctx_id = "e2e-heartbeat-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
@@ -211,7 +200,7 @@ async fn fullstack_heartbeat_send_does_not_advance_application_sequence() {
         .await
         .unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
 
     let bob_pseudonym = [0x42u8; 32];
     alice
@@ -236,9 +225,18 @@ async fn fullstack_heartbeat_send_does_not_advance_application_sequence() {
     );
 
     // Open each captured inner envelope (peer side) and classify it.
-    let inner0 = bob.open_inner_envelope(&ctx_bytes, &sent[0].1).unwrap();
-    let inner_hb = bob.open_inner_envelope(&ctx_bytes, &sent[1].1).unwrap();
-    let inner2 = bob.open_inner_envelope(&ctx_bytes, &sent[2].1).unwrap();
+    let inner0 = bob
+        .open_inner_envelope(ctx_id, &ctx_bytes, &sent[0].1)
+        .await
+        .unwrap();
+    let inner_hb = bob
+        .open_inner_envelope(ctx_id, &ctx_bytes, &sent[1].1)
+        .await
+        .unwrap();
+    let inner2 = bob
+        .open_inner_envelope(ctx_id, &ctx_bytes, &sent[2].1)
+        .await
+        .unwrap();
 
     // AC2: the middle send is a heartbeat — heartbeat discriminator, no
     // content. (Empty user payload survives as a minimal wrapped+padded blob,
@@ -282,9 +280,9 @@ async fn fullstack_three_party_group() {
     println!("\n=== C3: Three-party MLS group ===\n");
 
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
-    let bob = network.create_node(BOB_DID, permissive_key_resolver());
-    let carol = network.create_node(CAROL_DID, permissive_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
+    let carol = network.create_node(CAROL_DID);
 
     let ctx_id = "three-party-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
@@ -296,12 +294,12 @@ async fn fullstack_three_party_group() {
 
     // Alice adds Bob (Welcome #1).
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
     println!("  [2] Bob joined");
 
     // Alice adds Carol (Welcome #2).
     alice.add_member(&handle, CAROL_DID).await.unwrap();
-    carol.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    carol.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
     println!("  [3] Carol joined");
 
     // Seed each peer's per-member pseudonym routing ID into Alice's manager
@@ -356,6 +354,7 @@ async fn fullstack_three_party_group() {
     // Bob decrypts his own captured ciphertext.
     let bob_decrypted = bob
         .decrypt_message(ctx_id, &ctx_bytes, &bob_ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(bob_decrypted.as_slice(), msg.as_slice());
     println!("  [5] Bob decrypted successfully");
@@ -363,6 +362,7 @@ async fn fullstack_three_party_group() {
     // Carol decrypts her own captured ciphertext.
     let carol_decrypted = carol
         .decrypt_message(ctx_id, &ctx_bytes, &carol_ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(carol_decrypted.as_slice(), msg.as_slice());
     println!("  [6] Carol decrypted successfully");
@@ -379,8 +379,8 @@ async fn fullstack_governance_with_real_crypto() {
     println!("\n=== C4: Governance + real MLS crypto ===\n");
 
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
-    let bob = network.create_node(BOB_DID, permissive_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
 
     let ctx_id = "governance-crypto-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
@@ -388,7 +388,7 @@ async fn fullstack_governance_with_real_crypto() {
 
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
     println!("  [1] Context created, Bob joined");
 
     // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
@@ -423,6 +423,7 @@ async fn fullstack_governance_with_real_crypto() {
     );
     let decrypted1 = bob
         .decrypt_message(ctx_id, &ctx_bytes, sent1_ct, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(decrypted1.as_slice(), msg1.as_slice());
     println!("  [2] Pre-governance message roundtrip verified");
@@ -465,7 +466,9 @@ async fn fullstack_governance_with_real_crypto() {
     // cannot derive the post-removal epoch's keys (MLS forward secrecy). The
     // first captured management blob is the epoch-advance Commit.
     let commit_bytes = &removal_traffic[0].1;
-    let commit_decrypt = bob.decrypt_message(ctx_id, &ctx_bytes, commit_bytes, ALICE_DID);
+    let commit_decrypt = bob
+        .decrypt_message(ctx_id, &ctx_bytes, commit_bytes, ALICE_DID)
+        .await;
     assert!(
         commit_decrypt.is_err(),
         "Bob must NOT decrypt post-removal traffic (MLS forward secrecy)"
@@ -500,8 +503,8 @@ async fn fullstack_event_log_merkle_chain() {
     println!("\n=== C5: Event log Merkle chain ===\n");
 
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
-    let bob = network.create_node(BOB_DID, permissive_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
 
     let ctx_id = "merkle-chain-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
@@ -509,7 +512,7 @@ async fn fullstack_event_log_merkle_chain() {
 
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
 
     // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
     // Encrypted app-data fans out to each peer's pseudonym routing ID; without
@@ -547,11 +550,11 @@ async fn fullstack_event_log_merkle_chain() {
 
     // Verify chain integrity via import (import verifies Merkle chain).
     let bob_event_log = scp_core::context::providers::event_log::MerkleEventLogProvider::new();
-    bob_event_log.init_event_log(&ctx_bytes).unwrap();
+    bob_event_log.init_event_log(&ctx_bytes).await.unwrap();
     // Import into a fresh log should fail because it already has an init entry.
     // Instead verify chain by re-importing from scratch.
     let fresh_log = scp_core::context::providers::event_log::MerkleEventLogProvider::new();
-    let import_result = fresh_log.import_event_log_data(&ctx_bytes, &exported);
+    let import_result = fresh_log.import_event_log_data(&ctx_bytes, &exported).await;
     assert!(
         import_result.is_ok(),
         "import should succeed with valid Merkle chain"
@@ -575,8 +578,8 @@ async fn fullstack_multiple_messages_roundtrip() {
     println!("\n=== C6: Multiple messages roundtrip ===\n");
 
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
-    let bob = network.create_node(BOB_DID, permissive_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
 
     let ctx_id = "multi-msg-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
@@ -584,7 +587,7 @@ async fn fullstack_multiple_messages_roundtrip() {
 
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
 
     // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
     // Pseudonyms persist, so this is seeded once before the loop; every message
@@ -619,6 +622,7 @@ async fn fullstack_multiple_messages_roundtrip() {
 
         let decrypted = bob
             .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+            .await
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&decrypted),
@@ -640,8 +644,8 @@ async fn fullstack_ciphertext_is_nondeterministic() {
     println!("\n=== Ciphertext non-determinism ===\n");
 
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
-    let bob = network.create_node(BOB_DID, permissive_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
 
     let ctx_id = "nondet-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
@@ -649,7 +653,7 @@ async fn fullstack_ciphertext_is_nondeterministic() {
 
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
 
     // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
     // Encrypted app-data fans out to Bob's pseudonym routing ID; without this
@@ -680,9 +684,11 @@ async fn fullstack_ciphertext_is_nondeterministic() {
     // Both must still decrypt to the same plaintext.
     let d1 = bob
         .decrypt_message(ctx_id, &ctx_bytes, &sent1[0].1, ALICE_DID)
+        .await
         .unwrap();
     let d2 = bob
         .decrypt_message(ctx_id, &ctx_bytes, &sent2[0].1, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(d1.as_slice(), msg.as_slice());
     assert_eq!(d2.as_slice(), msg.as_slice());
@@ -767,8 +773,8 @@ async fn full_stack_relay_encrypted_roundtrip() {
 
     // 2. Create network and nodes with real MLS crypto.
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
-    let bob = network.create_node(BOB_DID, permissive_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
     println!("  [2] Created Alice ({ALICE_DID}) and Bob ({BOB_DID}) with real MLS");
 
     // 3. Alice creates encrypted context, adds Bob.
@@ -776,10 +782,10 @@ async fn full_stack_relay_encrypted_roundtrip() {
     let ctx_bytes = context_id_bytes(ctx_id);
     let params = encrypted_params();
     let handle = alice.create_context(ctx_id, params).await.unwrap();
-    assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
+    assert_eq!(handle.state(), ContextState::Active);
 
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
     println!("  [3] Context created and Bob joined via Welcome");
 
     // 3b. Seed Bob's per-member pseudonym routing ID into Alice's manager
@@ -861,7 +867,7 @@ async fn full_stack_relay_encrypted_roundtrip() {
     assert_eq!(blob_id.as_bytes().len(), 32, "blob_id must be 32 bytes");
     println!(
         "  [6] Published to relay (blob_id: {}...)",
-        &hex::encode(&blob_id.as_bytes()[..8])
+        hex::encode(&blob_id.as_bytes()[..8])
     );
 
     // 7. Bob receives envelope from the relay.
@@ -888,6 +894,7 @@ async fn full_stack_relay_encrypted_roundtrip() {
     //    The relay roundtrip above verified the encrypted_blob survived intact.
     let decrypted = bob
         .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(
         decrypted.as_slice(),
@@ -939,15 +946,15 @@ async fn full_stack_relay_multiple_messages() {
     let relay_url = format!("ws://{relay_addr}/scp/v1");
 
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
-    let bob = network.create_node(BOB_DID, permissive_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
 
     let ctx_id = "relay-multi-msg-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
     let params = encrypted_params();
     let handle = alice.create_context(ctx_id, params).await.unwrap();
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
 
     // Seed Bob's per-member pseudonym routing ID into Alice's manager (§9.10.4).
     // Pseudonyms persist, so this is seeded once before the send loop; every
@@ -1019,6 +1026,7 @@ async fn full_stack_relay_multiple_messages() {
         );
         let decrypted = bob
             .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+            .await
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&decrypted),
@@ -1058,9 +1066,9 @@ async fn full_stack_relay_three_party() {
     let relay_url = format!("ws://{relay_addr}/scp/v1");
 
     let network = FullStackNetwork::new();
-    let alice = network.create_node(ALICE_DID, permissive_key_resolver());
-    let bob = network.create_node(BOB_DID, permissive_key_resolver());
-    let carol = network.create_node(CAROL_DID, permissive_key_resolver());
+    let alice = network.create_node(ALICE_DID);
+    let bob = network.create_node(BOB_DID);
+    let carol = network.create_node(CAROL_DID);
 
     let ctx_id = "relay-three-party-ctx";
     let ctx_bytes = context_id_bytes(ctx_id);
@@ -1069,9 +1077,9 @@ async fn full_stack_relay_three_party() {
 
     // Alice adds Bob, then Carol.
     alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    bob.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
     alice.add_member(&handle, CAROL_DID).await.unwrap();
-    carol.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
+    carol.join_from_welcome(ctx_id, &ctx_bytes).await.unwrap();
     println!("  [1] Three-party context established");
 
     // Seed each peer's per-member pseudonym routing ID into Alice's manager
@@ -1175,6 +1183,7 @@ async fn full_stack_relay_three_party() {
     );
     let bob_decrypted = bob
         .decrypt_message(ctx_id, &ctx_bytes, &bob_ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(bob_decrypted.as_slice(), msg.as_slice());
     println!("  [3] Bob decrypted from relay");
@@ -1187,6 +1196,7 @@ async fn full_stack_relay_three_party() {
     );
     let carol_decrypted = carol
         .decrypt_message(ctx_id, &ctx_bytes, &carol_ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(carol_decrypted.as_slice(), msg.as_slice());
     println!("  [4] Carol decrypted from relay");
@@ -1214,22 +1224,6 @@ async fn full_stack_relay_three_party() {
 //     direct execute-by-id of the same id is then replay-rejected.
 // ---------------------------------------------------------------------------
 
-/// A governance key resolver backed by a shared DID→verifying-key map, so the
-/// real engine can verify propose/approve vote signatures against each
-/// fullstack node's `#active` key. Populate the map after the nodes exist.
-fn shared_key_resolver(
-    keys: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, ed25519_dalek::VerifyingKey>>,
-    >,
-) -> scp_core::context::governance::KeyResolver {
-    std::sync::Arc::new(move |did: &DID, _kid: scp_identity::SigningKeyId| {
-        keys.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(did.as_ref())
-            .copied()
-    })
-}
-
 fn majority_governance_params(voters: &[&str]) -> ContextParams {
     ContextParams {
         governance: scp_core::context::params::GovernanceModel::Majority {
@@ -1242,23 +1236,20 @@ fn majority_governance_params(voters: &[&str]) -> ContextParams {
 #[tokio::test]
 async fn fullstack_direct_execute_rejects_forged_proposal_and_applies_no_change() {
     let network = FullStackNetwork::new();
-    let keys = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let alice = network.create_node(ALICE_DID, shared_key_resolver(keys.clone()));
-    let bob = network.create_node(BOB_DID, shared_key_resolver(keys.clone()));
-    {
-        let mut k = keys.lock().unwrap();
-        k.insert(ALICE_DID.to_owned(), alice.verifying_key());
-        k.insert(BOB_DID.to_owned(), bob.verifying_key());
-    }
+    let alice = network.create_node(ALICE_DID);
 
+    // Single-voter Majority context (creator only). A governed (non-SingleAdmin)
+    // context does NOT authorize a unilateral `invite_member`, so a second MLS
+    // member is admitted via the governance vote path — exercised end-to-end by
+    // the native `governance_integration.rs` KATs and the deferred governed
+    // invite (#2027). Here the forged execute-by-id trust boundary is what we
+    // pin, and it does not depend on a second member: the fabricated proposal id
+    // is rejected against the real, quorum-validated engine regardless.
     let ctx_id = "gov-direct-forgery-ctx";
-    let ctx_bytes = context_id_bytes(ctx_id);
-    let handle = alice
-        .create_context(ctx_id, majority_governance_params(&[ALICE_DID, BOB_DID]))
+    alice
+        .create_context(ctx_id, majority_governance_params(&[ALICE_DID]))
         .await
         .unwrap();
-    alice.add_member(&handle, BOB_DID).await.unwrap();
-    bob.join_from_welcome(ctx_id, &ctx_bytes).unwrap();
 
     let victim = "did:dht:z6MkForgeryVictimNeverAdded";
     assert!(
@@ -1289,12 +1280,7 @@ async fn fullstack_direct_execute_genuine_runs_once_then_replay_rejected() {
     use scp_core::context::governance::{GovernanceAction, ProposalStatus};
 
     let network = FullStackNetwork::new();
-    let keys = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let alice = network.create_node(ALICE_DID, shared_key_resolver(keys.clone()));
-    {
-        let mut k = keys.lock().unwrap();
-        k.insert(ALICE_DID.to_owned(), alice.verifying_key());
-    }
+    let alice = network.create_node(ALICE_DID);
 
     // Single-voter Majority context (creator only): Alice's own approval is 1/1
     // = a majority, so the proposal reaches quorum and auto-executes WITHOUT

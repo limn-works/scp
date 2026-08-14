@@ -1,12 +1,12 @@
 //! Shared constants for the signed context-export preimage (§23.16.8, ADR-050).
 //!
-//! These live in `scp-protocol` (the pure, `wasm32`-compatible crate) so that
-//! both the native runtime (`scp-runtime`, which owns the `ExportScope` enum and
-//! the `ContextExport` envelope) and the WASM reference bridge
-//! (`scp-ffi-wasm`, which cannot depend on `scp-runtime` per ADR-034) bind the
-//! **same** scope discriminant byte into the signed digest. Without a single
-//! source of truth, the two implementations could disagree on the byte value and
-//! produce mutually-unverifiable signatures.
+//! These live in `scp-protocol` (the pure, `wasm32`-compatible crate that holds
+//! protocol constants independent of the async runtime) so that every consumer
+//! of the signed context-export preimage binds the **same** scope discriminant
+//! byte into the signed digest. The native runtime (`scp-runtime`) owns the
+//! `ExportScope` enum and the `ContextExport` envelope and references these
+//! constants here. Without a single source of truth, independent producers could
+//! disagree on the byte value and produce mutually-unverifiable signatures.
 
 /// Scope discriminant byte for a **full** context export, folded into the
 /// signed snapshot preimage (§23.16.8, ADR-050).

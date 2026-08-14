@@ -15,11 +15,10 @@ crates/
   scp-ffi/
     pyo3/             # Python FFI bridge (PyO3 + maturin)
     uniffi/           # Swift + Kotlin FFI bridge (UniFFI UDL)
-    wasm/             # Browser TypeScript FFI (wasm-bindgen)
     napi/             # Node/Bun TypeScript FFI (napi-rs)
 bindings/
   python/             # scp-python (PyPI) — scp_sdk package
-  typescript/         # @limn-works/scp-ts (npm) — dual target: browser WASM + Bun/Node native
+  typescript/         # @limn-works/scp-ts (npm, Bun/Node native napi) + @limn-works/scp-ts-wasm (browser/edge, in-tab SCP client over scp-client-wasm, keys on-device, ADR-057)
   swift/              # SCP (Swift Package Manager)
   kotlin/             # works.limn:scp-kt (Maven Central)
 ```
@@ -32,18 +31,19 @@ bindings/
 | `scp-transport` | Transport trait + adapters. Native relay server/client. Multi-transport routing | tokio, tokio-tungstenite, futures |
 | `scp-platform` | Platform abstraction traits + in-memory testing adapters | ed25519-dalek, rand |
 | `scp-mcp` | MCP JSON-RPC server/client for tool exposition | serde_json, tokio, axum |
-| `crates/scp-ffi/*` | Language-specific FFI bridges. Thin translation layers only — zero protocol logic | pyo3, uniffi, wasm-bindgen, napi-rs |
+| `crates/scp-ffi/*` | Language-specific FFI bridges. Thin translation layers only — zero protocol logic | pyo3, uniffi, napi-rs |
 
 ## FFI Bridge Strategy
 
-Three bridges serve five languages:
+Three bridges serve four languages:
 
 | Bridge | Crate | Target languages | Mechanism |
 |--------|-------|------------------|-----------|
 | **PyO3** | `crates/scp-ffi/pyo3` | Python | Direct Rust-Python interop via `#[pyfunction]`/`#[pyclass]` |
 | **UniFFI** | `crates/scp-ffi/uniffi` | Swift, Kotlin | Single UDL definition generates Swift + Kotlin bindings |
-| **wasm-bindgen** | `crates/scp-ffi/wasm` | TypeScript (browser) | WASM module loaded in browser |
 | **napi-rs** | `crates/scp-ffi/napi` | TypeScript (Bun/Node) | Native addon for server-side JS runtimes |
+
+Browser/edge clients run the protocol **in-tab** over the wasm-bindgen surface `scp-client-wasm` (a participant-subset engine, distinct from the three FFI bridges above), with keys on-device and the server untrusted (ADR-057, which amends ADR-055's browser-deployment conclusion; ADR-055's removal of the WASM **bridge** stands).
 
 Every FFI bridge crate:
 - Depends on `scp-core`, `scp-transport`, `scp-platform`
@@ -196,8 +196,8 @@ Binary artifact build, sign, and distribute workflow. Conformance gate (100% pas
 |----------|---------|----------|----------|
 | Rust | `scp-core`, `scp-transport`, `scp-platform` | crates.io | Source crate |
 | Python | `scp-python` | PyPI | maturin-built wheel (includes compiled Rust) |
-| TypeScript (browser) | `@limn-works/scp-ts` | npm | WASM bundle |
-| TypeScript (Node/Bun) | `@limn-works/scp-ts-node` | npm | napi-rs native addon |
+| TypeScript (Node/Bun) | `@limn-works/scp-ts` | npm | napi-rs native addon (full-capability `ScpClient`) |
+| TypeScript (browser/edge) | `@limn-works/scp-ts-wasm` | npm | In-browser SCP client over `scp-client-wasm` (wasm-bindgen), keys on-device, participant subset (ADR-057) |
 | Swift | `SCP` | Swift Package Manager | XCFramework binary target |
 | Kotlin | `works.limn:scp-kt` | Maven Central | AAR with bundled .so |
 

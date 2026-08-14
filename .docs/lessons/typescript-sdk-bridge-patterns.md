@@ -1,5 +1,7 @@
 # TypeScript SDK Bridge Patterns
 
+> **ADR-055 (2026-06-29):** the WASM bridge was removed and the TypeScript SDK is now NAPI-only — the browser is served by a remote thin client, not an in-process WASM backend. The "WASM ambient module declarations" section and the WASM-deferral/`@limn-works/scp-ts-wasm` references below are historical (they describe the prior dual NAPI+WASM-fallback backend). The non-WASM TypeScript patterns in this lesson remain evergreen.
+
 Lessons from implementing `bindings/typescript/` (SCP-081).
 
 ## exactOptionalPropertyTypes requires conditional assignment

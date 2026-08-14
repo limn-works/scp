@@ -22,7 +22,7 @@ Read `.docs/architecture.md` for system overview and `.docs/specs/` for protocol
    ```bash
    cargo fmt --all
    cargo clippy --workspace --all-targets \
-     --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing \
+     --features scp-ffi-uniffi/testing,scp-ffi/testing,scp-ffi-napi/testing,scp-core/testing \
      -- -D warnings
    ./scripts/test.sh
    ```

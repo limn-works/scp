@@ -3,7 +3,7 @@
 //! criterion.
 //!
 //! `OwnedIdentityDid` is the unforgeable token that proves the bearer's
-//! identity owns a particular [`ContextActor`]. The unforgeability
+//! identity owns a particular [`ContextActor`](crate::context::actor::ContextActor). The unforgeability
 //! guarantee — *a value of `OwnedIdentityDid` for a given DID can only
 //! come into existence via supervisor-module code* — rides on TWO
 //! mechanisms, both of which are real type-system enforcement, not
@@ -86,7 +86,7 @@
 //! security over the type system + the two compiler lints + review. See
 //! ADR-049 §5 and spec §9.4.1.
 
-use scp_identity::DID;
+use scp_did::DID;
 
 /// Proof that the bearer's identity owns this actor.
 ///
@@ -115,6 +115,12 @@ use scp_identity::DID;
 /// (`&OwnedIdentityDid`) to `SupervisorHandle` methods that touch
 /// per-identity state. There is no `&DID`-keyed surface; the only identity
 /// an actor can read is the one that owns it.
+///
+/// If you want this type in a crate-`pub` signature, you are on the wrong
+/// axis — the compiler will stop you (`pub(in crate::context)`), by design.
+/// A bridge-callable per-identity op takes a bare `DID` on `Supervisor`
+/// instead (see [`crate::context::supervisor::Supervisor::create_context`]).
+/// See ADR-049 §5 placement invariant.
 pub(in crate::context) struct OwnedIdentityDid {
     did: DID,
 }

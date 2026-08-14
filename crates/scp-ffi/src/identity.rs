@@ -43,46 +43,102 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use scp_identity::{
-    DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
-    NoOpRelayQuerier, ScpIdentity,
-};
+use scp_clock::Clock;
+use scp_did::DidDocument;
+// Production DHT construction (real fail-closed Pkarr) and the `testing`
+// in-memory seam are both encapsulated in the single cfg-gated
+// `scp_ffi_common::dht::build_ffi_dht_client`; this bridge only maps its error.
+use scp_ffi_common::dht::FfiDhtClient;
+use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier};
+// Only the testing-gated `identity_migrate` path constructs a `ScpIdentity`
+// value directly (production migration is unreachable — ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
+use scp_identity::ScpIdentity;
 use scp_platform::file::FileKeyCustody;
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, Storage};
-use scp_primitives::Clock;
 
 use crate::custody::FfiKeyCustody;
 use crate::error::ScpPyError;
-use crate::runtime::{IdentityEntry, PyBridgeInstance};
+// `IdentityEntry` is only constructed on the testing-gated create/migrate paths
+// (production create fails closed before building an entry — ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
+use crate::runtime::IdentityEntry;
+use crate::runtime::PyBridgeInstance;
 use crate::validate;
 
 use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
+/// Builds the shared [`FfiDhtClient`] for this bridge instance, **failing
+/// closed**.
+///
+/// Delegates to the single cfg-gated [`scp_ffi_common::dht::build_ffi_dht_client`]
+/// (shared by all three bridges) and maps its [`DhtInitError`] to a `ScpPyError`.
+/// A shipped (non-`testing`) build constructs the real Mainline Pkarr client; a
+/// malformed gateway or a Mainline build failure surfaces as the dedicated
+/// `IDENT_1058` DHT-init-failure code (distinct from the generic `IDENT_1001`),
+/// never an in-memory or no-op substitute (ADR-062 §Decision 1 / spec §17.17.3).
+/// The in-memory arm is reachable only through the common test seam under
+/// `testing`.
+pub(crate) fn build_ffi_dht_client() -> Result<FfiDhtClient, ScpPyError> {
+    scp_ffi_common::dht::build_ffi_dht_client().map_err(|e| {
+        ScpPyError::identity_with_code(
+            format!("failed to initialize production DHT client for DID resolution: {e}"),
+            scp_ffi_common::error_codes::IDENT_1058,
+        )
+    })
+}
+
+/// Fail-closed error for a production identity-creation path when no real
+/// pre-rotation custody backend is available (ADR-062 §Decision 6).
+///
+/// Every identity commits a pre-rotation commitment at creation (spec §9.7.4.1
+/// §3 — mandatory), which requires a `PreRotationCustody` backend. The only
+/// implementation is the test-harness `InMemoryPreRotationCustody` nullifier, so
+/// a shipped (no-`testing`) build returns this typed [`IDENT_1059`] error rather
+/// than silently minting the nullifier. See #1729 / RFC #2130 for the real
+/// backend; Option A (non-committing create) is #1553, out of scope.
+///
+/// [`IDENT_1059`]: scp_ffi_common::error_codes::IDENT_1059
+#[cfg(not(feature = "testing"))]
+pub(crate) fn no_pre_rotation_backend() -> ScpPyError {
+    ScpPyError::identity_with_code(
+        scp_identity::IdentityError::NoPreRotationBackend.to_string(),
+        scp_ffi_common::error_codes::IDENT_1059,
+    )
+}
+
 /// Ensures the given bridge instance's production DID resolver is initialized.
 ///
-/// Creates a `DualLayerResolver` backed by `InMemoryDhtClient` and
-/// `NoOpRelayQuerier` (relay resolution will be upgraded when a production
-/// relay querier is available). The resolver is shared across all UCAN
-/// validation and attestation verification calls on the same bridge.
+/// Creates a `DualLayerResolver` backed by the shared [`FfiDhtClient`] (the
+/// real Mainline Pkarr client in a shipped build, or the in-memory test seam
+/// under `testing`) and `NoOpRelayQuerier` (relay resolution will be upgraded
+/// when a production relay querier is available). The resolver is shared across
+/// all UCAN validation and attestation verification calls on the same bridge.
 ///
 /// This is idempotent: subsequent calls are no-ops.
 ///
-/// See #311 for the DID resolver unification design.
-fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runtime::Handle) {
+/// Fails closed: when the production DHT client cannot be built, this returns
+/// the [`DhtInitError`](scp_ffi_common::dht::DhtInitError)-derived
+/// [`ScpPyError`] rather than substituting a nullifier.
+///
+/// See #311 for the DID resolver unification design and ADR-062 §Decision 1.
+fn ensure_did_resolver_initialized_on(
+    bi: &PyBridgeInstance,
+    handle: tokio::runtime::Handle,
+) -> Result<(), ScpPyError> {
     if crate::runtime::did_resolver(bi).is_some() {
-        return;
+        return Ok(());
     }
 
     // Retain the DHT client on the instance so `identity_create` can publish
-    // freshly minted in-memory DID documents into the SAME client the resolver
-    // reads from. Without a shared client, in-memory identities are never
+    // freshly minted DID documents into the SAME client the resolver reads
+    // from. Without a shared client, freshly minted identities are never
     // resolvable and any DID-resolving verification (UCAN validation,
-    // governance vote verification) fails with "unknown voter". This mirrors
-    // the NAPI bridge's shared-DHT publish design, scoped per-instance
-    // to match where the resolver itself is stored.
-    let dht_client = Arc::new(InMemoryDhtClient::new());
+    // governance vote verification) fails with "unknown voter". Scoped
+    // per-instance to match where the resolver itself is stored.
+    let dht_client = Arc::new(build_ffi_dht_client()?);
     let relay_querier = Arc::new(NoOpRelayQuerier);
     let cache = Arc::new(DidCache::new());
     let bootstrap_relays = Vec::new();
@@ -100,6 +156,27 @@ fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runt
     // re-publishes can invalidate the stale cached document (see
     // `invalidate_resolver_cache`).
     crate::runtime::set_resolver_cache(bi, cache);
+    Ok(())
+}
+
+/// Builds a [`DidDht`] over the instance's shared DHT client, for **minting**
+/// (`create`) and **resolution** alike.
+///
+/// Both paths use the shared per-instance client (the one
+/// `identity_create`/rotation published into) when the resolver is initialized,
+/// and otherwise build the production client fail-closed via
+/// [`build_ffi_dht_client`]. Never substitutes an in-memory/no-op client on a
+/// shipped path. The returned method has no `sign_fn` — that is fine for
+/// `create` (which does not publish; publishing is a separate
+/// [`publish_to_resolver_dht_for`] step) and for `resolve` (which never signs).
+fn shared_did_method(
+    bi: &PyBridgeInstance,
+) -> Result<DidDht<FfiDhtClient, scp_clock::SystemClock>, ScpPyError> {
+    let client = match crate::runtime::resolver_dht_client(bi) {
+        Some(client) => client,
+        None => Arc::new(build_ffi_dht_client()?),
+    };
+    Ok(DidDht::with_client(client))
 }
 
 /// Publishes a newly created in-memory DID document into the instance's
@@ -113,7 +190,7 @@ fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runt
 ///
 /// Constructs a BEP44 signed mutable item (32-byte public key, 64-byte
 /// signature, document JSON, sequence number 1) and calls
-/// [`scp_identity::dht_client::DhtClient::publish`]. Best-effort: errors are
+/// [`scp_dht::DhtClient::publish`]. Best-effort: errors are
 /// logged but never fail identity creation (the document is still registered
 /// locally; only resolver discoverability is affected).
 ///
@@ -126,13 +203,17 @@ fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runt
 /// the prior record and advances the resolver's downgrade tracker.
 ///
 /// Mirrors the NAPI bridge's `publish_to_shared_dht_for`.
+///
+/// Only reached from the testing-gated identity-create paths (production create
+/// fails closed before publishing — ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
 async fn publish_to_resolver_dht_for(
     bi: &PyBridgeInstance,
     identity: &ScpIdentity,
     document: &DidDocument,
     custody: &FfiKeyCustody,
 ) {
-    use scp_identity::dht_client::DhtClient as _;
+    use scp_dht::DhtClient as _;
 
     let Some(dht_client) = crate::runtime::resolver_dht_client(bi) else {
         // Resolver not initialized on this instance; nothing to seed.
@@ -160,7 +241,7 @@ async fn publish_to_resolver_dht_for(
 
     // Build the BEP44 signable payload and sign it with the identity key.
     let seq: u64 = 1;
-    let signable = scp_identity::dht::bep44_signable(value, seq);
+    let signable = scp_dht::bep44_signable(value, seq);
     let sig_bytes = match custody.sign(&identity.identity_key, &signable).await {
         Ok(sig) => sig.into_bytes(),
         Err(e) => {
@@ -195,14 +276,24 @@ async fn publish_to_resolver_dht_for(
 /// permanently serving the stale, pre-rotation document, silently defeating
 /// rotation's revocation purpose.
 ///
-/// Returns the shared resolver client when the resolver is initialized on this
-/// instance. When it is not (e.g. before any `identity_create`, or in a
-/// bridge configuration without DID resolution), there is nothing to keep in
-/// sync, so a fresh in-memory client is returned: the in-place document update
-/// in the registry still happens, and no stale state can be served because no
-/// resolver exists.
-fn rotation_publish_client(bi: &PyBridgeInstance) -> Arc<InMemoryDhtClient> {
-    crate::runtime::resolver_dht_client(bi).unwrap_or_else(|| Arc::new(InMemoryDhtClient::new()))
+/// Returns the shared resolver client. Rotation / agent-key / migration
+/// operations only run against an identity already in the registry, which is
+/// only populated by `identity_create` — and `identity_create` initializes the
+/// resolver DHT client first. So by the time any re-publish runs, the shared
+/// client is always present.
+///
+/// Fails closed if the client is somehow absent: fabricating a throwaway
+/// in-memory client would let the re-published document land somewhere the
+/// resolver never reads, silently defeating rotation's revocation purpose (and,
+/// in a shipped build, the in-memory arm does not even exist). A typed error is
+/// strictly better than a lie.
+fn rotation_publish_client(bi: &PyBridgeInstance) -> Result<Arc<FfiDhtClient>, ScpPyError> {
+    crate::runtime::resolver_dht_client(bi).ok_or_else(|| {
+        ScpPyError::identity(
+            "DID resolver DHT client is not initialized on this instance — \
+             create an identity (identity_create) before publishing document updates",
+        )
+    })
 }
 
 /// Runs the migration publish chain against the SHARED resolver DHT client.
@@ -215,6 +306,9 @@ fn rotation_publish_client(bi: &PyBridgeInstance) -> Arc<InMemoryDhtClient> {
 /// old-document republish strictly overwrites the pre-migration record (the new
 /// DID is fresh and starts at sequence 1). A failure is logged loudly because
 /// it leaves the resolver potentially serving the pre-migration document.
+// Only reached from the testing-gated `identity_migrate` path (production
+// migration is unreachable — no identity can be created — ADR-062 §Decision 6).
+#[cfg(feature = "testing")]
 #[allow(clippy::too_many_arguments)] // Mirrors `DidDht::migrate_identity`'s arity (FFI seam).
 async fn run_migrate_publish<C>(
     bi: &PyBridgeInstance,
@@ -229,10 +323,9 @@ async fn run_migrate_publish<C>(
 where
     C: KeyCustody + Send + Sync + 'static,
 {
-    let sign_fn = DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
-        Arc::clone(key_custody),
-    );
-    let publish_client = rotation_publish_client(bi);
+    let sign_fn =
+        DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(Arc::clone(key_custody));
+    let publish_client = rotation_publish_client(bi)?;
     let did_method =
         DidDht::with_client_and_signer(publish_client, Arc::new(DidCache::new()), sign_fn);
     did_method
@@ -299,16 +392,13 @@ pub struct PyIdentity {
     /// bytes. Populated for identities created via `PyScp::identity_create`;
     /// `None` for identities loaded from storage without a live custody.
     ///
-    /// Why `#0` (`identity_key`), not `#active`: the WASM bridge uses a
-    /// simplified single-key model in production where the DID-deriving
-    /// key *is* the signing key, while scp-core uses three distinct keys
-    /// per [`ScpIdentity`]. Exposing the identity key gives a byte-
-    /// identical value across all four bridges under a deterministic
-    /// `seed` (ADR-046). SCPID signatures use `#active`; under the
-    /// `testing` feature WASM *also* derives a distinct `#active` key
-    /// from `seed[32..64]` so `#active`-signed signatures are byte-
-    /// identical across all four bridges under the `signed_at_override`
-    /// affordance.
+    /// Why `#0` (`identity_key`), not `#active`: the DID-deriving identity
+    /// key is exposed (scp-core uses three distinct keys per
+    /// [`ScpIdentity`]) so the value is byte-identical across all bridges
+    /// under a deterministic `seed` (ADR-046). SCPID signatures use
+    /// `#active`, derived from `seed[32..64]`, so `#active`-signed
+    /// signatures are likewise byte-identical across all bridges under the
+    /// `signed_at_override` affordance.
     verifying_key_hex: Option<String>,
     /// Bridge instance affinity id (Phase 4 PR 1 — #1549). Consumed by
     /// [`crate::pyscp_check_handle!`] at every entry point that accepts this
@@ -631,7 +721,7 @@ fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyErr
 /// A non-`None` seed on any custody type other than `"in_memory"` is a
 /// validation error (`SCP-VALID-7009`) — seeded determinism is only
 /// meaningful for the in-process testing custody.
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 fn parse_custody_with_seed(
     custody: &str,
     testing_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
@@ -659,15 +749,14 @@ fn parse_custody_with_seed(
     }
 }
 
-#[cfg(not(feature = "allow_in_memory_custody"))]
+#[cfg(not(feature = "testing"))]
 fn parse_custody_with_seed(
     custody: &str,
     testing_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     if testing_seed.is_some() {
         return Err(ScpPyError::ValidationError {
-            message: "`testing_seed` parameter requires the allow_in_memory_custody feature"
-                .to_owned(),
+            message: "`testing_seed` parameter requires the testing feature".to_owned(),
             code: scp_ffi_common::error_codes::VALID_7008.to_owned(),
         });
     }
@@ -676,14 +765,16 @@ fn parse_custody_with_seed(
 
 fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     match custody {
-        #[cfg(feature = "allow_in_memory_custody")]
+        #[cfg(feature = "testing")]
         "in_memory" => {
             let kc = Arc::new(FfiKeyCustody::InMemory(InMemoryKeyCustody::new()));
             Ok((kc, custody.to_owned()))
         }
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        "in_memory" => Err(ScpPyError::validation(
-            "in_memory custody is not available in this build -- enable the              allow_in_memory_custody feature for dev/desktop use",
+        #[cfg(not(feature = "testing"))]
+        "in_memory" => Err(ScpPyError::identity_with_code(
+            "in_memory custody is not available in this build -- use \"file\" or \
+             \"platform\" custody for production key storage",
+            scp_ffi_common::error_codes::IDENT_1008,
         )),
         // "file" is the canonical name; "platform" is a backward-compat alias
         // (SCP-294a). Both resolve to FileKeyCustody.
@@ -759,6 +850,7 @@ fn identity_state_key(did: &str) -> String {
 /// Uses a simple `did\ncustody` text format. When `ProtocolRepository`'s identity
 /// module lands (spec 17.4), this will migrate to `StoredValue<T>` with
 /// `MessagePack` serialization.
+#[cfg(feature = "testing")]
 fn serialize_identity_state(did: &str, custody: &str) -> Vec<u8> {
     format!("{did}\n{custody}").into_bytes()
 }
@@ -788,7 +880,7 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
     Ok((did, custody))
 }
 
-/// Serializes a [`scp_identity::DidRotationEvent`] to JSON for return
+/// Serializes a [`scp_did::DidRotationEvent`] to JSON for return
 /// across the `PyO3` boundary, wrapping serialization errors in
 /// `ScpPyError::IdentityError` with code `IDENT_1004`.
 ///
@@ -796,7 +888,8 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
 /// `too_many_lines` clippy threshold after the recovery-handle
 /// refactor moved the call to `migrate_identity` to a struct
 /// destructure.
-fn serialize_rotation_event(event: &scp_identity::DidRotationEvent) -> Result<String, ScpPyError> {
+#[cfg(feature = "testing")]
+fn serialize_rotation_event(event: &scp_did::DidRotationEvent) -> Result<String, ScpPyError> {
     serde_json::to_string(event).map_err(|e| ScpPyError::IdentityError {
         message: format!("failed to serialize rotation event: {e}"),
         code: scp_ffi_common::error_codes::IDENT_1004.to_owned(),
@@ -826,7 +919,7 @@ fn serialize_rotation_event(event: &scp_identity::DidRotationEvent) -> Result<St
 /// Raises `IdentityError` if base64 decoding fails.
 ///
 /// See §9.3.
-#[cfg(feature = "allow_in_memory_custody")]
+#[cfg(feature = "testing")]
 #[pyfunction]
 pub fn identity_verify_device_attestation(
     py: Python<'_>,
@@ -856,6 +949,36 @@ pub fn identity_verify_device_attestation(
         Ok(result)
     })
     .map_err(PyErr::from)
+}
+
+/// Fail-closed device attestation verification on a shipped (no-`testing`)
+/// build.
+///
+/// Spec §9:187 — device attestation (Apple App Attest / Google Play Integrity)
+/// is an optional SDK-level trust signal whose absence is expected and
+/// non-penalizing. No production device-attestation backend is wired yet: App
+/// Attest / Play Integrity are hardware/platform-backed and are intentionally
+/// deferred (with hardware keychain custody) until an e2e-driven integration
+/// lands (ADR-062 §Decision 3 severs the test-harness
+/// `InMemoryDeviceAttestation` nullifier from every production path). So a
+/// shipped build returns a typed
+/// [`IDENT_1016`](scp_ffi_common::error_codes::IDENT_1016) honest-absent error
+/// rather than a silently-valid `true`. This is a module-level `#[pyfunction]`
+/// free fn (no receiver), so ADR-048 §1 imposes no self-dereference obligation.
+/// See ADR-025 and #2171 for the real backend.
+#[cfg(not(feature = "testing"))]
+#[pyfunction]
+pub fn identity_verify_device_attestation(_did: &str, token_base64: &str) -> PyResult<bool> {
+    let _ = token_base64;
+    Err(PyErr::from(ScpPyError::identity_with_code(
+        "device attestation verification unavailable: no production \
+         device-attestation backend is wired yet — Apple App Attest / \
+         Google Play Integrity are hardware/platform-backed and are \
+         intentionally deferred (with hardware keychain custody) until an \
+         e2e-driven integration lands (spec §9:187). See #2171."
+            .to_owned(),
+        scp_ffi_common::error_codes::IDENT_1016,
+    )))
 }
 
 /// Verifies the Ed25519 signature on an identity link attestation.
@@ -955,7 +1078,7 @@ impl crate::scp::PyScp {
         // `InMemoryKeyCustody::from_seed_bytes`, so the same hygiene
         // we apply to other private-key material applies here.
         //
-        // Unlike the UniFFI / NAPI / WASM bridges, PyO3 hands us a
+        // Unlike the UniFFI / NAPI bridges, PyO3 hands us a
         // `&[u8]` borrow straight from the caller's `PyBytes` — the
         // narrowing below copies through `expect_fixed_bytes::<32>`
         // with no intermediate `Vec` on the Rust side, so there is no
@@ -980,80 +1103,101 @@ impl crate::scp::PyScp {
 
         // Ensure the production DID resolver is initialized on this bridge
         // (idempotent). #311.
-        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone());
+        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone()).map_err(PyErr::from)?;
 
         py.allow_threads(|| {
             rt.block_on(async {
-                let did_method = DidDht::new();
-                // Mint a fresh per-identity pre-rotation custody. ADR-003
-                // §4b: the pre-rotation key lives in a separate substrate
-                // from operational `key_custody`. The same `Arc` is
-                // preserved across migrations.
-                let pre_rotation_custody =
-                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let (identity, document, pre_rotation_handle) = did_method
-                    .create(key_custody.as_ref(), pre_rotation_custody.as_ref())
-                    .await
-                    .map_err(ScpPyError::from)?;
+                let did_method = shared_did_method(&bi_arc)?;
 
-                let did = identity.did.clone();
-                let document_for_handle = document.clone();
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3), which
+                // requires a `PreRotationCustody` backend. The only implementation
+                // is the test-harness `InMemoryPreRotationCustody` nullifier, so a
+                // shipped build FAILS CLOSED (ADR-062 §Decision 6, IDENT_1059)
+                // rather than silently minting it.
+                #[cfg(not(feature = "testing"))]
+                {
+                    let _ = (&bi_arc, &key_custody, &custody_str, &did_method);
+                    Err::<PyIdentity, pyo3::PyErr>(
+                        crate::identity::no_pre_rotation_backend().into(),
+                    )
+                }
+                #[cfg(feature = "testing")]
+                {
+                    // Mint a fresh per-identity pre-rotation custody. ADR-003
+                    // §4b: the pre-rotation key lives in a separate substrate
+                    // from operational `key_custody`. The same `Arc` is
+                    // preserved across migrations.
+                    let pre_rotation_custody =
+                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                    let (identity, document, pre_rotation_handle) = did_method
+                        .create(key_custody.as_ref(), pre_rotation_custody.as_ref())
+                        .await
+                        .map_err(ScpPyError::from)?;
 
-                // Extract the verifying-key bytes for the identity (`#0`)
-                // signing key BEFORE moving the custody into the registry.
-                // Under a deterministic `seed`, this value is byte-identical
-                // across every bridge (ADR-046).
-                let pk = key_custody
-                    .public_key(&identity.identity_key)
-                    .await
-                    .map_err(|e| {
-                        ScpPyError::identity(format!(
-                            "failed to read identity key after identity create: {e}"
-                        ))
-                    })?;
-                let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+                    let did = identity.did.clone();
+                    let document_for_handle = document.clone();
 
-                // Publish the DID document into this instance's resolver DHT so
-                // the document is resolvable for signature verification (UCAN
-                // validation, governance vote verification). Best-effort; the
-                // document is still registered locally regardless. Done BEFORE
-                // moving `identity`/`key_custody`/`document` into the registry.
-                publish_to_resolver_dht_for(&bi_arc, &identity, &document, key_custody.as_ref())
+                    // Extract the verifying-key bytes for the identity (`#0`)
+                    // signing key BEFORE moving the custody into the registry.
+                    // Under a deterministic `seed`, this value is byte-identical
+                    // across every bridge (ADR-046).
+                    let pk = key_custody
+                        .public_key(&identity.identity_key)
+                        .await
+                        .map_err(|e| {
+                            ScpPyError::identity(format!(
+                                "failed to read identity key after identity create: {e}"
+                            ))
+                        })?;
+                    let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+
+                    // Publish the DID document into this instance's resolver DHT so
+                    // the document is resolvable for signature verification (UCAN
+                    // validation, governance vote verification). Best-effort; the
+                    // document is still registered locally regardless. Done BEFORE
+                    // moving `identity`/`key_custody`/`document` into the registry.
+                    publish_to_resolver_dht_for(
+                        &bi_arc,
+                        &identity,
+                        &document,
+                        key_custody.as_ref(),
+                    )
                     .await;
 
-                // Register the identity in this instance's registry so that
-                // subsequent bridge methods (UCAN minting, pseudonym
-                // derivation, signing, key rotation) can access the retained
-                // KeyCustody and KeyHandle references. See SCP-214 criterion 3.
-                crate::runtime::register_identity(
-                    &bi_arc,
-                    &did,
-                    IdentityEntry {
-                        identity,
-                        custody: key_custody,
-                        document,
-                        identity_link_attestations: Vec::new(),
-                        pre_rotation_handle,
-                        pre_rotation_custody,
-                    },
-                );
+                    // Register the identity in this instance's registry so that
+                    // subsequent bridge methods (UCAN minting, pseudonym
+                    // derivation, signing, key rotation) can access the retained
+                    // KeyCustody and KeyHandle references. See SCP-214 criterion 3.
+                    crate::runtime::register_identity(
+                        &bi_arc,
+                        &did,
+                        IdentityEntry {
+                            identity,
+                            custody: key_custody,
+                            document,
+                            identity_link_attestations: Vec::new(),
+                            pre_rotation_handle,
+                            pre_rotation_custody,
+                        },
+                    );
 
-                // Persist identity state if storage is initialized (SCP-217).
-                if let Ok(storage) = crate::runtime::get_storage(&bi_arc) {
-                    let key = identity_state_key(&did);
-                    let data = serialize_identity_state(&did, &custody_str);
-                    storage.store(&key, &data).await.map_err(|e| {
-                        ScpPyError::identity(format!("failed to persist identity state: {e}"))
-                    })?;
+                    // Persist identity state if storage is initialized (SCP-217).
+                    if let Ok(storage) = crate::runtime::get_storage(&bi_arc) {
+                        let key = identity_state_key(&did);
+                        let data = serialize_identity_state(&did, &custody_str);
+                        storage.store(&key, &data).await.map_err(|e| {
+                            ScpPyError::identity(format!("failed to persist identity state: {e}"))
+                        })?;
+                    }
+
+                    Ok(PyIdentity::from_document(
+                        &bi_arc,
+                        did,
+                        custody_str,
+                        &document_for_handle,
+                        verifying_key_hex,
+                    ))
                 }
-
-                Ok(PyIdentity::from_document(
-                    &bi_arc,
-                    did,
-                    custody_str,
-                    &document_for_handle,
-                    verifying_key_hex,
-                ))
             })
         })
     }
@@ -1088,71 +1232,89 @@ impl crate::scp::PyScp {
 
         // Ensure the production DID resolver is initialized on this bridge
         // (idempotent). #311.
-        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone());
+        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone()).map_err(PyErr::from)?;
 
         py.allow_threads(|| {
             rt.block_on(async {
-                let did_method = DidDht::new();
-                // Fresh per-identity pre-rotation custody (see
-                // `identity_create` for rationale).
-                let pre_rotation_custody =
-                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let (identity, document, pre_rotation_handle) = did_method
-                    .create_with_agent_key(key_custody.as_ref(), pre_rotation_custody.as_ref())
-                    .await
-                    .map_err(ScpPyError::from)?;
+                let did_method = shared_did_method(&bi_arc)?;
 
-                let did = identity.did.clone();
-                let document_for_handle = document.clone();
+                // FAIL CLOSED on a shipped build — no real pre-rotation backend
+                // (ADR-062 §Decision 6, IDENT_1059). See `identity_create`.
+                #[cfg(not(feature = "testing"))]
+                {
+                    let _ = (&bi_arc, &key_custody, &custody_str, &did_method);
+                    Err::<PyIdentity, pyo3::PyErr>(
+                        crate::identity::no_pre_rotation_backend().into(),
+                    )
+                }
+                #[cfg(feature = "testing")]
+                {
+                    // Fresh per-identity pre-rotation custody (see
+                    // `identity_create` for rationale).
+                    let pre_rotation_custody =
+                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                    let (identity, document, pre_rotation_handle) = did_method
+                        .create_with_agent_key(key_custody.as_ref(), pre_rotation_custody.as_ref())
+                        .await
+                        .map_err(ScpPyError::from)?;
 
-                // Extract the verifying-key bytes for the identity (`#0`)
-                // signing key BEFORE moving the custody into the registry
-                // (ADR-046 parity).
-                let pk = key_custody
-                    .public_key(&identity.identity_key)
-                    .await
-                    .map_err(|e| {
-                        ScpPyError::identity(format!(
-                            "failed to read identity key after identity create: {e}"
-                        ))
-                    })?;
-                let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+                    let did = identity.did.clone();
+                    let document_for_handle = document.clone();
 
-                // Publish into the resolver DHT (best-effort) so the DID is
-                // resolvable for signature verification, before moving owned
-                // state into the registry. See `identity_create`.
-                publish_to_resolver_dht_for(&bi_arc, &identity, &document, key_custody.as_ref())
+                    // Extract the verifying-key bytes for the identity (`#0`)
+                    // signing key BEFORE moving the custody into the registry
+                    // (ADR-046 parity).
+                    let pk = key_custody
+                        .public_key(&identity.identity_key)
+                        .await
+                        .map_err(|e| {
+                            ScpPyError::identity(format!(
+                                "failed to read identity key after identity create: {e}"
+                            ))
+                        })?;
+                    let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+
+                    // Publish into the resolver DHT (best-effort) so the DID is
+                    // resolvable for signature verification, before moving owned
+                    // state into the registry. See `identity_create`.
+                    publish_to_resolver_dht_for(
+                        &bi_arc,
+                        &identity,
+                        &document,
+                        key_custody.as_ref(),
+                    )
                     .await;
 
-                crate::runtime::register_identity(
-                    &bi_arc,
-                    &did,
-                    IdentityEntry {
-                        identity,
-                        custody: key_custody,
-                        document,
-                        identity_link_attestations: Vec::new(),
-                        pre_rotation_handle,
-                        pre_rotation_custody,
-                    },
-                );
+                    crate::runtime::register_identity(
+                        &bi_arc,
+                        &did,
+                        IdentityEntry {
+                            identity,
+                            custody: key_custody,
+                            document,
+                            identity_link_attestations: Vec::new(),
+                            pre_rotation_handle,
+                            pre_rotation_custody,
+                        },
+                    );
 
-                // Persist identity state if storage is initialized (SCP-217).
-                if let Ok(storage) = crate::runtime::get_storage(&bi_arc) {
-                    let key = identity_state_key(&did);
-                    let data = serialize_identity_state(&did, &custody_str);
-                    storage.store(&key, &data).await.map_err(|e| {
-                        ScpPyError::identity(format!("failed to persist identity state: {e}"))
-                    })?;
+                    // Persist identity state if storage is initialized (SCP-217).
+                    if let Ok(storage) = crate::runtime::get_storage(&bi_arc) {
+                        let key = identity_state_key(&did);
+                        let data = serialize_identity_state(&did, &custody_str);
+                        storage.store(&key, &data).await.map_err(|e| {
+                            ScpPyError::identity(format!("failed to persist identity state: {e}"))
+                        })?;
+                    }
+
+                    Ok(PyIdentity::from_document(
+                        &bi_arc,
+                        did,
+                        custody_str,
+                        &document_for_handle,
+                        verifying_key_hex,
+                    ))
                 }
-
-                Ok(PyIdentity::from_document(
-                    &bi_arc,
-                    did,
-                    custody_str,
-                    &document_for_handle,
-                    verifying_key_hex,
-                ))
             })
         })
     }
@@ -1216,7 +1378,7 @@ impl crate::scp::PyScp {
 
         // Ensure the production DID resolver is initialized on this bridge
         // (idempotent).
-        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone());
+        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone()).map_err(PyErr::from)?;
 
         // CRITICAL: a single top-level `py.allow_threads` releases the GIL for
         // the whole async DID-creation flow. The provider's custody methods
@@ -1226,68 +1388,88 @@ impl crate::scp::PyScp {
         // the GIL.
         py.allow_threads(|| {
             rt.block_on(async {
-                let did_method = DidDht::new();
-                // Fresh per-identity pre-rotation custody (see
-                // `identity_create` for rationale). The pre-rotation key lives
-                // in a separate in-memory substrate from the caller's
-                // operational custody (ADR-003 §4b).
-                let pre_rotation_custody =
-                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-                let (identity, document, pre_rotation_handle) = did_method
-                    .create(key_custody.as_ref(), pre_rotation_custody.as_ref())
-                    .await
-                    .map_err(ScpPyError::from)?;
+                let did_method = shared_did_method(&bi_arc)?;
 
-                let did = identity.did.clone();
-                let document_for_handle = document.clone();
+                // FAIL CLOSED on a shipped build — no real pre-rotation backend
+                // (ADR-062 §Decision 6, IDENT_1059). This callback-custody path
+                // funnels through the same pre-rotation commitment as every other
+                // create path, so it fails closed identically. See `identity_create`.
+                #[cfg(not(feature = "testing"))]
+                {
+                    let _ = (&bi_arc, &key_custody, &custody_str, &did_method);
+                    Err::<PyIdentity, pyo3::PyErr>(
+                        crate::identity::no_pre_rotation_backend().into(),
+                    )
+                }
+                #[cfg(feature = "testing")]
+                {
+                    // Fresh per-identity pre-rotation custody (see
+                    // `identity_create` for rationale). The pre-rotation key lives
+                    // in a separate in-memory substrate from the caller's
+                    // operational custody (ADR-003 §4b).
+                    let pre_rotation_custody =
+                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                    let (identity, document, pre_rotation_handle) = did_method
+                        .create(key_custody.as_ref(), pre_rotation_custody.as_ref())
+                        .await
+                        .map_err(ScpPyError::from)?;
 
-                // Snapshot the #0 (identity) verifying key for ADR-046 parity
-                // BEFORE moving the custody into the registry.
-                let pk = key_custody
-                    .public_key(&identity.identity_key)
-                    .await
-                    .map_err(|e| {
-                        ScpPyError::identity(format!(
-                            "failed to read identity key after identity create: {e}"
-                        ))
-                    })?;
-                let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+                    let did = identity.did.clone();
+                    let document_for_handle = document.clone();
 
-                // Publish into the resolver DHT (best-effort) so the DID is
-                // resolvable for signature verification, before moving owned
-                // state into the registry. See `identity_create`.
-                publish_to_resolver_dht_for(&bi_arc, &identity, &document, key_custody.as_ref())
+                    // Snapshot the #0 (identity) verifying key for ADR-046 parity
+                    // BEFORE moving the custody into the registry.
+                    let pk = key_custody
+                        .public_key(&identity.identity_key)
+                        .await
+                        .map_err(|e| {
+                            ScpPyError::identity(format!(
+                                "failed to read identity key after identity create: {e}"
+                            ))
+                        })?;
+                    let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+
+                    // Publish into the resolver DHT (best-effort) so the DID is
+                    // resolvable for signature verification, before moving owned
+                    // state into the registry. See `identity_create`.
+                    publish_to_resolver_dht_for(
+                        &bi_arc,
+                        &identity,
+                        &document,
+                        key_custody.as_ref(),
+                    )
                     .await;
 
-                crate::runtime::register_identity(
-                    &bi_arc,
-                    &did,
-                    IdentityEntry {
-                        identity,
-                        custody: key_custody,
-                        document,
-                        identity_link_attestations: Vec::new(),
-                        pre_rotation_handle,
-                        pre_rotation_custody,
-                    },
-                );
+                    crate::runtime::register_identity(
+                        &bi_arc,
+                        &did,
+                        IdentityEntry {
+                            identity,
+                            custody: key_custody,
+                            document,
+                            identity_link_attestations: Vec::new(),
+                            pre_rotation_handle,
+                            pre_rotation_custody,
+                        },
+                    );
 
-                // Persist identity state if storage is initialized.
-                if let Ok(storage) = crate::runtime::get_storage(&bi_arc) {
-                    let key = identity_state_key(&did);
-                    let data = serialize_identity_state(&did, &custody_str);
-                    storage.store(&key, &data).await.map_err(|e| {
-                        ScpPyError::identity(format!("failed to persist identity state: {e}"))
-                    })?;
+                    // Persist identity state if storage is initialized.
+                    if let Ok(storage) = crate::runtime::get_storage(&bi_arc) {
+                        let key = identity_state_key(&did);
+                        let data = serialize_identity_state(&did, &custody_str);
+                        storage.store(&key, &data).await.map_err(|e| {
+                            ScpPyError::identity(format!("failed to persist identity state: {e}"))
+                        })?;
+                    }
+
+                    Ok(PyIdentity::from_document(
+                        &bi_arc,
+                        did,
+                        custody_str,
+                        &document_for_handle,
+                        verifying_key_hex,
+                    ))
                 }
-
-                Ok(PyIdentity::from_document(
-                    &bi_arc,
-                    did,
-                    custody_str,
-                    &document_for_handle,
-                    verifying_key_hex,
-                ))
             })
         })
     }
@@ -1445,7 +1627,7 @@ impl crate::scp::PyScp {
 
         py.allow_threads(|| {
             rt.block_on(async {
-                let did_method = DidDht::new();
+                let did_method = shared_did_method(&bi)?;
                 let document = did_method
                     .resolve(&did_owned)
                     .await
@@ -1488,11 +1670,11 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
-        let publish_client = rotation_publish_client(&self.inner);
+        let publish_client = rotation_publish_client(&self.inner).map_err(PyErr::from)?;
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the rotated document into the SHARED resolver DHT
@@ -1583,11 +1765,11 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
-        let publish_client = rotation_publish_client(&self.inner);
+        let publish_client = rotation_publish_client(&self.inner).map_err(PyErr::from)?;
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the agent-key-bearing document into the SHARED
@@ -1675,11 +1857,11 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
-        let publish_client = rotation_publish_client(&self.inner);
+        let publish_client = rotation_publish_client(&self.inner).map_err(PyErr::from)?;
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the rotated-agent-key document into the SHARED
@@ -1766,11 +1948,11 @@ impl crate::scp::PyScp {
         let custody_str = identity.custody.clone();
         let rt = crate::runtime()?;
 
-        let publish_client = rotation_publish_client(&self.inner);
+        let publish_client = rotation_publish_client(&self.inner).map_err(PyErr::from)?;
         let result: Result<PyIdentity, ScpPyError> = py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did, |entry| {
                 let sign_fn =
-                    DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(
+                    DidDht::<FfiDhtClient, scp_clock::SystemClock>::make_sign_fn(
                         Arc::clone(&entry.custody),
                     );
                 // Publish the agent-key-removed document into the SHARED
@@ -1878,10 +2060,13 @@ impl crate::scp::PyScp {
     ///
     /// See ADR-003 acceptance criterion 4b and SCP-214 criterion 10.
     /// Returns `(new_identity, rotation_event_json)`. The JSON shape is
-    /// `serde_json::to_string(&scp_identity::DidRotationEvent)` so JS-,
+    /// `serde_json::to_string(&scp_did::DidRotationEvent)` so JS-,
     /// Python-, Swift-, or Kotlin-side consumers parse it directly. The
-    /// SDK distributes the event to context members (spec §3.2.1
-    /// step 4b).
+    /// SDK distributes the event to context members (spec §9.12,
+    /// ADR-003 §4b).
+    // The fail-closed/testing cfg split adds a few lines over the 100-line lint
+    // budget; the body is otherwise a single linear migration flow.
+    #[allow(clippy::too_many_lines)]
     pub fn identity_migrate(
         &self,
         py: Python<'_>,
@@ -1896,116 +2081,133 @@ impl crate::scp::PyScp {
 
         py.allow_threads(|| {
             rt.block_on(async {
-                // Extract what we need from the registry entry. The
-                // pre-rotation handle points into the cold-storage
-                // `pre_rotation_custody`; revealing it must yield a public
-                // key whose SHA-256 matches `pre_rotation_commitment`
-                // (spec §9.7.4.1 §6) — using a fresh handle here would
-                // break that invariant.
-                let (
-                    custody,
-                    old_identity_key,
-                    old_active_key,
-                    old_agent_key,
-                    pre_rotation_commitment,
-                    pre_rotation_handle,
-                    pre_rotation_custody,
-                    old_doc,
-                ) = crate::runtime::with_identity(&bi_arc, &old_did, |entry| {
-                    Ok((
-                        Arc::clone(&entry.custody),
-                        entry.identity.identity_key,
-                        entry.identity.active_signing_key,
-                        entry.identity.agent_signing_key,
-                        entry.identity.pre_rotation_commitment,
-                        entry.pre_rotation_handle,
-                        Arc::clone(&entry.pre_rotation_custody),
-                        entry.document.clone(),
-                    ))
-                })?;
-
-                let rotated_at = scp_primitives::SystemClock.now_secs();
-
-                let old_identity = ScpIdentity {
-                    identity_key: old_identity_key,
-                    active_signing_key: old_active_key,
-                    agent_signing_key: old_agent_key,
-                    pre_rotation_commitment,
-                    did: old_did.clone(),
-                };
-
-                let outcome = run_migrate_publish(
-                    &bi_arc,
-                    &old_did,
-                    &old_identity,
-                    &old_doc,
-                    &pre_rotation_handle,
-                    pre_rotation_custody.as_ref(),
-                    &custody,
-                    rotated_at,
-                )
-                .await?;
-                let rotation_event_json = serialize_rotation_event(&outcome.rotation_event)?;
-                let scp_identity::MigrationOutcome {
-                    new_identity,
-                    new_document,
-                    new_pre_rotation_handle,
-                    ..
-                } = outcome;
-                let new_did = new_identity.did.clone();
-                let document_for_handle = new_document.clone();
-
-                // Snapshot the migrated identity's verifying-key BEFORE the
-                // identity / custody move into the registry (ADR-046 parity).
-                let verifying_key_hex = custody
-                    .public_key(&new_identity.identity_key)
-                    .await
-                    .ok()
-                    .map(|pk| hex::encode(pk.as_bytes()));
-
-                // Preserve existing attestations from the old DID across migration.
-                let existing_attestations = crate::runtime::with_identity(&bi_arc, &old_did, |e| {
-                    Ok(e.identity_link_attestations.clone())
-                })
-                .unwrap_or_default();
-
-                // Remove old identity and register the new one. We carry
-                // the SAME pre-rotation custody Arc forward — only the
-                // handle changes per migration (ADR-003 §4b: each
-                // migration mints a fresh pre-rotation key).
-                crate::runtime::remove_identity(&bi_arc, &old_did);
-                crate::runtime::register_identity(
-                    &bi_arc,
-                    &new_did,
-                    IdentityEntry {
-                        identity: new_identity,
-                        custody,
-                        document: new_document,
-                        identity_link_attestations: existing_attestations,
-                        pre_rotation_handle: new_pre_rotation_handle,
-                        pre_rotation_custody,
-                    },
-                );
-
-                // Migration re-published BOTH documents at higher sequences:
-                // the new DID's document and the old DID's `alsoKnownAs`
-                // update. Drop both stale cache entries so resolution follows
-                // the migration forward instead of serving pre-migration docs.
-                if let Some(cache) = crate::runtime::resolver_cache(&bi_arc) {
-                    cache.remove(&old_did).await;
-                    cache.remove(&new_did).await;
+                // FAIL CLOSED on a shipped build: DID migration reads the
+                // retained pre-rotation custody, which is test-harness-only
+                // (ADR-062 §Decision 6). Production create fails closed, so no
+                // migratable identity ever exists — this path is unreachable and
+                // returns the typed IDENT_1059 error rather than referencing the
+                // gated machinery.
+                #[cfg(not(feature = "testing"))]
+                {
+                    let _ = (&bi_arc, &old_did, &custody_str);
+                    Err::<(PyIdentity, String), pyo3::PyErr>(
+                        crate::identity::no_pre_rotation_backend().into(),
+                    )
                 }
+                #[cfg(feature = "testing")]
+                {
+                    // Extract what we need from the registry entry. The
+                    // pre-rotation handle points into the cold-storage
+                    // `pre_rotation_custody`; revealing it must yield a public
+                    // key whose SHA-256 matches `pre_rotation_commitment`
+                    // (spec §9.7.4.1 §6) — using a fresh handle here would
+                    // break that invariant.
+                    let (
+                        custody,
+                        old_identity_key,
+                        old_active_key,
+                        old_agent_key,
+                        pre_rotation_commitment,
+                        pre_rotation_handle,
+                        pre_rotation_custody,
+                        old_doc,
+                    ) = crate::runtime::with_identity(&bi_arc, &old_did, |entry| {
+                        Ok((
+                            Arc::clone(&entry.custody),
+                            entry.identity.identity_key,
+                            entry.identity.active_signing_key,
+                            entry.identity.agent_signing_key,
+                            entry.identity.pre_rotation_commitment,
+                            entry.pre_rotation_handle,
+                            Arc::clone(&entry.pre_rotation_custody),
+                            entry.document.clone(),
+                        ))
+                    })?;
 
-                Ok((
-                    PyIdentity::from_document(
+                    let rotated_at = scp_clock::SystemClock.now_secs();
+
+                    let old_identity = ScpIdentity {
+                        identity_key: old_identity_key,
+                        active_signing_key: old_active_key,
+                        agent_signing_key: old_agent_key,
+                        pre_rotation_commitment,
+                        did: old_did.clone(),
+                    };
+
+                    let outcome = run_migrate_publish(
                         &bi_arc,
-                        new_did,
-                        custody_str,
-                        &document_for_handle,
-                        verifying_key_hex,
-                    ),
-                    rotation_event_json,
-                ))
+                        &old_did,
+                        &old_identity,
+                        &old_doc,
+                        &pre_rotation_handle,
+                        pre_rotation_custody.as_ref(),
+                        &custody,
+                        rotated_at,
+                    )
+                    .await?;
+                    let rotation_event_json = serialize_rotation_event(&outcome.rotation_event)?;
+                    let scp_identity::MigrationOutcome {
+                        new_identity,
+                        new_document,
+                        new_pre_rotation_handle,
+                        ..
+                    } = outcome;
+                    let new_did = new_identity.did.clone();
+                    let document_for_handle = new_document.clone();
+
+                    // Snapshot the migrated identity's verifying-key BEFORE the
+                    // identity / custody move into the registry (ADR-046 parity).
+                    let verifying_key_hex = custody
+                        .public_key(&new_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
+
+                    // Preserve existing attestations from the old DID across migration.
+                    let existing_attestations =
+                        crate::runtime::with_identity(&bi_arc, &old_did, |e| {
+                            Ok(e.identity_link_attestations.clone())
+                        })
+                        .unwrap_or_default();
+
+                    // Remove old identity and register the new one. We carry
+                    // the SAME pre-rotation custody Arc forward — only the
+                    // handle changes per migration (ADR-003 §4b: each
+                    // migration mints a fresh pre-rotation key).
+                    crate::runtime::remove_identity(&bi_arc, &old_did);
+                    crate::runtime::register_identity(
+                        &bi_arc,
+                        &new_did,
+                        IdentityEntry {
+                            identity: new_identity,
+                            custody,
+                            document: new_document,
+                            identity_link_attestations: existing_attestations,
+                            pre_rotation_handle: new_pre_rotation_handle,
+                            pre_rotation_custody,
+                        },
+                    );
+
+                    // Migration re-published BOTH documents at higher sequences:
+                    // the new DID's document and the old DID's `alsoKnownAs`
+                    // update. Drop both stale cache entries so resolution follows
+                    // the migration forward instead of serving pre-migration docs.
+                    if let Some(cache) = crate::runtime::resolver_cache(&bi_arc) {
+                        cache.remove(&old_did).await;
+                        cache.remove(&new_did).await;
+                    }
+
+                    Ok((
+                        PyIdentity::from_document(
+                            &bi_arc,
+                            new_did,
+                            custody_str,
+                            &document_for_handle,
+                            verifying_key_hex,
+                        ),
+                        rotation_event_json,
+                    ))
+                }
             })
         })
     }
@@ -2017,7 +2219,7 @@ impl crate::scp::PyScp {
     /// Generates a device attestation token for an identity.
     ///
     /// Uses `InMemoryDeviceAttestation` (available only with
-    /// `allow_in_memory_custody` feature) to produce a synthetic attestation
+    /// `testing` feature) to produce a synthetic attestation
     /// token, then attaches it to the identity's DID document via
     /// [`DidDht::attach_device_attestation`].
     ///
@@ -2035,7 +2237,7 @@ impl crate::scp::PyScp {
     /// attestation fails.
     ///
     /// See §9.3.
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     pub fn identity_attest_device(&self, py: Python<'_>, identity_did: &str) -> PyResult<String> {
         let bi_arc = Arc::clone(&self.inner);
         validate::validate_did(identity_did)?;
@@ -2045,7 +2247,7 @@ impl crate::scp::PyScp {
         py.allow_threads(|| {
             crate::runtime::with_identity_mut(&bi_arc, &did_owned, |entry| {
                 let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
-                let dht = DidDht::new();
+                let dht = shared_did_method(&bi_arc)?;
 
                 let new_document = rt
                     .block_on(async {
@@ -2075,6 +2277,46 @@ impl crate::scp::PyScp {
                 entry.document = new_document;
 
                 Ok(token_b64)
+            })
+        })
+        .map_err(PyErr::from)
+    }
+
+    /// Fail-closed device attestation on a shipped (no-`testing`) build.
+    ///
+    /// Spec §9:187 — device attestation (Apple App Attest / Google Play
+    /// Integrity) is an optional SDK-level trust signal whose absence is
+    /// expected and non-penalizing. No production device-attestation backend is
+    /// wired yet: App Attest / Play Integrity are hardware/platform-backed and
+    /// are intentionally deferred (with hardware keychain custody) until an
+    /// e2e-driven integration lands (ADR-062 §Decision 3 severs the test-harness
+    /// `InMemoryDeviceAttestation` nullifier from every production path). So a
+    /// shipped build returns a typed
+    /// [`IDENT_1015`](scp_ffi_common::error_codes::IDENT_1015) honest-absent
+    /// error rather than a silently-valid attestation. See ADR-025 and #2171 for
+    /// the real backend.
+    #[cfg(not(feature = "testing"))]
+    pub fn identity_attest_device(&self, py: Python<'_>, identity_did: &str) -> PyResult<String> {
+        let bi_arc = Arc::clone(&self.inner);
+        validate::validate_did(identity_did)?;
+        let did_owned = identity_did.to_owned();
+
+        // Resolve the identity against THIS instance's registry first: an
+        // unregistered DID surfaces the bridge's standard not-found identity
+        // error, so a caller can distinguish "unknown identity" from "backend
+        // unavailable". A registered DID then fails closed with the typed
+        // honest-absent IDENT_1015 rather than a silently-valid attestation.
+        py.allow_threads(move || {
+            crate::runtime::with_identity(&bi_arc, &did_owned, |_entry| {
+                Err(ScpPyError::identity_with_code(
+                    "device attestation unavailable: no production device-attestation \
+                     backend is wired yet — Apple App Attest / Google Play Integrity are \
+                     hardware/platform-backed and are intentionally deferred (with hardware \
+                     keychain custody) until an e2e-driven integration lands (spec §9:187). \
+                     See #2171."
+                        .to_owned(),
+                    scp_ffi_common::error_codes::IDENT_1015,
+                ))
             })
         })
         .map_err(PyErr::from)
@@ -2304,7 +2546,7 @@ impl crate::scp::PyScp {
             RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
             agent_key_rotation_outcome,
         };
-        use scp_identity::DID;
+        use scp_did::DID;
 
         validate::validate_did(did)?;
         let did_owned = did.to_owned();
@@ -2326,7 +2568,7 @@ impl crate::scp::PyScp {
             };
 
             // Build key rotation outcome (step 1 is pre-completed by caller).
-            let now_ms = scp_primitives::SystemClock.now_millis();
+            let now_ms = scp_clock::SystemClock.now_millis();
             let key_rotation = match compromise_tier {
                 CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
                 CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
@@ -2344,29 +2586,30 @@ impl crate::scp::PyScp {
 
             // Use a simple backend that succeeds for all operations.
             struct FfiRecoveryBackend;
+            #[async_trait::async_trait(?Send)]
             impl RecoveryBackend for FfiRecoveryBackend {
-                fn mls_update(
+                async fn mls_update(
                     &self,
                     _context_id: &str,
                     _key_rotation: &KeyRotationOutcome,
                 ) -> Result<(), RecoveryStepError> {
                     Ok(())
                 }
-                fn revoke_ucans(
+                async fn revoke_ucans(
                     &self,
                     _context_id: &str,
                     _key_rotation: &KeyRotationOutcome,
                 ) -> Result<(), RecoveryStepError> {
                     Ok(())
                 }
-                fn rotate_key_packages(
+                async fn rotate_key_packages(
                     &self,
                     _context_id: &str,
                     _key_rotation: &KeyRotationOutcome,
                 ) -> Result<(), RecoveryStepError> {
                     Ok(())
                 }
-                fn notify_contacts(
+                async fn notify_contacts(
                     &self,
                     _did: &DID,
                     _tier: CompromiseTier,
@@ -2375,7 +2618,7 @@ impl crate::scp::PyScp {
                 ) -> bool {
                     true
                 }
-                fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+                async fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
                     true
                 }
             }
@@ -2391,7 +2634,7 @@ impl crate::scp::PyScp {
                     &contacts,
                     None,
                     &backend,
-                    &scp_primitives::SystemClock,
+                    &scp_clock::SystemClock,
                 ))
                 .map_err(|e| ScpPyError::identity(format!("recovery failed: {e}")))?;
 
@@ -2442,7 +2685,7 @@ impl crate::scp::PyScp {
             CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
             CustodyMigrationTarget,
         };
-        use scp_identity::DID;
+        use scp_did::DID;
 
         validate::validate_did(did)?;
         let did_owned = did.to_owned();
@@ -2503,7 +2746,7 @@ impl crate::scp::PyScp {
             let backend = NotConfiguredMigrationBackend;
 
             let result = rt
-                .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
+                .block_on(orchestrator.execute(&backend, &scp_clock::SystemClock))
                 .map_err(|e| ScpPyError::identity(format!("custody migration failed: {e}")))?;
 
             // Serialize to JSON and return — the Python layer converts to dict.
@@ -2539,13 +2782,15 @@ impl crate::scp::PyScp {
 pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIdentity>()?;
     m.add_class::<PyDIDDocument>()?;
-    #[cfg(feature = "allow_in_memory_custody")]
+    // Registered unconditionally: a `testing` build gets the real verifier, a
+    // shipped build gets the fail-closed (IDENT_1016) free fn. Both cfg arms
+    // define `identity_verify_device_attestation`, so the name always resolves.
     m.add_function(wrap_pyfunction!(identity_verify_device_attestation, m)?)?;
     m.add_function(wrap_pyfunction!(verify_identity_link_attestation, m)?)?;
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "testing"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
@@ -2573,7 +2818,7 @@ mod tests {
     /// confirm the signer is properly wired and migration produces a
     /// valid new identity.
     #[test]
-    #[cfg(feature = "allow_in_memory_custody")]
+    #[cfg(feature = "testing")]
     fn py_identity_migrate_succeeds_with_signer() {
         setup();
 
@@ -2609,8 +2854,8 @@ mod tests {
 
             // Rotation event JSON deserializes into the canonical
             // `DidRotationEvent` shape (spec §9.12, ADR-003 §4b/4c) so the
-            // SDK can distribute it to context members per §3.2.1 step 4b.
-            let event: scp_identity::DidRotationEvent =
+            // SDK can distribute it to context members per spec §9.12, ADR-003 §4b.
+            let event: scp_did::DidRotationEvent =
                 serde_json::from_str(&rotation_event_json).unwrap();
             assert_eq!(event.old_did, old_did);
             assert_eq!(event.new_did, new_did);

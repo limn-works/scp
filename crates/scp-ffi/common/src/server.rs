@@ -6,18 +6,27 @@
 //! FFI consumers. All functions bind to `127.0.0.1:0` (OS-assigned port) so
 //! tests can run in parallel without port conflicts.
 //!
-//! Gated behind the `server` feature. Not available for WASM (ADR-034).
+//! Gated behind the `server` feature.
 
 use std::net::SocketAddr;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
+use scp_clock::SystemClock;
 use scp_core::context::supervisor::Supervisor;
-use scp_identity::cache::SystemClock;
+use scp_did::DidDocument;
+use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
-use scp_identity::{DidDocument, InMemoryDhtClient, ScpIdentity};
 use scp_node::{DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, NodeError, Reach};
-use scp_platform::testing::{InMemoryKeyCustody, InMemoryStorage};
+use scp_platform::file::FileKeyCustody;
+use scp_platform::in_memory::InMemoryStorage;
+
+use crate::dht::{DhtInitError, FfiDhtClient};
+// `ClientDhtConfig` is only referenced by the production (non-test) fail-closed
+// node DHT client in `start_node_local`; the test-harness build uses the
+// in-memory double instead, so the import would otherwise be unused.
+#[cfg(not(any(test, feature = "testing")))]
+use crate::dht::ClientDhtConfig;
 use scp_transport::native::server::{RelayConfig, RelayError, RelayServer, ShutdownHandle};
 use scp_transport::native::storage::{BlobStorageBackend, StorageError};
 use zeroize::Zeroizing;
@@ -28,9 +37,10 @@ use zeroize::Zeroizing;
 
 /// Concrete DID method type used by all FFI bridges for node identity.
 ///
-/// Parameterized over `InMemoryDhtClient` (no real DHT network — suitable
-/// for local development and testing) and `SystemClock` (wall-clock time).
-pub type ConcreteDidMethod = DidDht<InMemoryDhtClient, SystemClock>;
+/// Parameterized over the shared [`FfiDhtClient`] — the real Mainline
+/// `PkarrDhtClient` in shipped builds (an in-memory arm only under `testing`,
+/// ADR-062 §Decision 1) — and `SystemClock` (wall-clock time).
+pub type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>;
 
 /// Pre-existing identity to use when starting an application node.
 ///
@@ -85,6 +95,16 @@ pub enum ServerError {
     /// The platform storage backend could not be initialized.
     #[error("platform error: {0}")]
     Platform(#[from] scp_platform::error::PlatformError),
+
+    /// The production DHT client could not be built (fail-closed — never an
+    /// in-memory substitution; ADR-062 §Decision 1).
+    #[error("DHT init error: {0}")]
+    DhtInit(#[from] DhtInitError),
+
+    /// A node identity auto-generation was requested on a shipped build, where
+    /// the in-memory test-harness node is not compiled (fail-closed; ADR-062).
+    #[error("auto-generated in-memory node identity is unavailable in this build")]
+    AutoGenerateUnavailable,
 }
 
 impl ServerError {
@@ -103,6 +123,10 @@ impl ServerError {
             Self::Platform(_) => "platform error during server operation".to_owned(),
             Self::MissingPassphrase => {
                 "passphrase required for persistent node identity".to_owned()
+            }
+            Self::DhtInit(_) => "DHT client initialization failed".to_owned(),
+            Self::AutoGenerateUnavailable => {
+                "auto-generated in-memory node identity is unavailable in this build".to_owned()
             }
         }
     }
@@ -277,12 +301,15 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 
 /// Starts a full application node with in-memory storage.
 ///
-/// When `identity` is `None` (auto-generate):
-/// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
-/// - [`InMemoryStorage`](scp_platform::testing::InMemoryStorage)
-/// - [`InMemoryDhtClient`](scp_identity::InMemoryDhtClient) (no real DHT network)
-/// - Self-signed TLS (for the localhost domain)
-/// - Relay bound to `127.0.0.1:0` (OS-assigned port)
+/// When `identity` is `None` (auto-generate): available ONLY in a `testing`
+/// build via the test-harness `ApplicationNode::dev` (in-memory key custody,
+/// [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage), and the
+/// [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
+/// network). A shipped (no-`testing`) build FAILS CLOSED with
+/// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
+/// node (ADR-062 §Decision 1/6); production callers pass an explicit
+/// `Some(NodeIdentity)`. Self-signed TLS (localhost); relay bound to
+/// `127.0.0.1:0` (OS-assigned port).
 ///
 /// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
 /// identity instead of generating a fresh one. This enables identity
@@ -299,7 +326,14 @@ pub async fn start_node_in_memory(
     identity: Option<NodeIdentity>,
 ) -> Result<scp_node::ApplicationNode<InMemoryStorage>, ServerError> {
     let node = match identity {
+        // Auto-generate uses the test-harness `ApplicationNode::dev` (in-memory
+        // DHT nullifier), compiled only under `testing` (ADR-062 §Decision 1).
+        // A shipped build fails closed rather than running a nullifier-backed
+        // node; callers pass an explicit `Some(NodeIdentity)` in production.
+        #[cfg(any(test, feature = "testing"))]
         None => scp_node::ApplicationNode::dev(0).await?,
+        #[cfg(not(any(test, feature = "testing")))]
+        None => return Err(ServerError::AutoGenerateUnavailable),
         Some(id) => {
             // Migrated to the ADR-052 flat-config front door (Phase B-P2).
             // The dropped explicit `SelfSignedTlsProvider::new("localhost")` is
@@ -308,16 +342,16 @@ pub async fn start_node_in_memory(
             // in P1 — the in-memory DHT client publishes nothing).
             Node::start_for_testing(NodeConfig {
                 bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-                blob_storage: Some(BlobStorageBackend::in_memory()),
                 dht: DhtMode::Production,
                 ..NodeConfig::defaults(
                     Reach::Domain {
                         domain: "localhost".to_owned(),
                     },
                     // `Explicit` carries no custody, so `K` is unconstrained by
-                    // the variant; annotate it to the bridge's in-memory custody
-                    // type (matching `ApplicationNode::dev`'s `K`).
-                    IdentitySource::<InMemoryKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
+                    // the variant; annotate it to a production custody type
+                    // (`FileKeyCustody`) so no test-only nullifier type appears
+                    // on this shipped `server`-feature path (ADR-062 §Decision 6).
+                    IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
                         ExplicitIdentity {
                             identity: id.identity,
                             document: id.document,
@@ -325,6 +359,10 @@ pub async fn start_node_in_memory(
                         },
                     )),
                     InMemoryStorage::new(),
+                    // Explicit durability-only selection for this in-memory
+                    // server front door (SCP-CAPINJECT-010): the blob backend is
+                    // a required selection, never a runtime default.
+                    BlobStorageBackend::in_memory(),
                 )
             })
             .await?
@@ -347,7 +385,7 @@ pub async fn start_node_in_memory(
 ///   `<data_dir>/storage/` — persistent key-value storage for protocol state
 /// - [`BlobStorageBackend::redb`] at `<data_dir>/blobs.redb` — persistent
 ///   relay blob storage
-/// - [`InMemoryDhtClient`](scp_identity::InMemoryDhtClient) (no real DHT
+/// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT
 ///   network — suitable for local-only use)
 /// - Self-signed TLS (for the localhost domain)
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)
@@ -420,17 +458,16 @@ pub async fn start_node_local(
     let node = if let Some(id) = identity {
         Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            blob_storage: Some(blob_storage),
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
                     domain: "localhost".to_owned(),
                 },
                 // `Explicit` carries no custody, so `K` is unconstrained by the
-                // variant; annotate it to the bridge's in-memory custody type
-                // (the persisted arm below uses `FileKeyCustody`, but the
-                // `Explicit` arm has no custody to derive `K` from).
-                IdentitySource::<InMemoryKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
+                // variant; annotate it to `FileKeyCustody` (matching the
+                // persisted arm below), so no test-only nullifier type appears on
+                // this shipped `server`-feature path (ADR-062 §Decision 6).
+                IdentitySource::<FileKeyCustody, ConcreteDidMethod>::Explicit(Box::new(
                     ExplicitIdentity {
                         identity: id.identity,
                         document: id.document,
@@ -438,6 +475,9 @@ pub async fn start_node_local(
                     },
                 )),
                 storage,
+                // The operator-chosen durable redb blob backend (opened above),
+                // passed as the required selection (SCP-CAPINJECT-010).
+                blob_storage,
             )
         })
         .await?
@@ -450,7 +490,19 @@ pub async fn start_node_local(
             &passphrase,
         )?);
 
-        let dht_client = Arc::new(InMemoryDhtClient::new());
+        // Build the node's DHT client for its DID method. A shipped build uses
+        // the real Mainline Pkarr client, fail-closed (never an in-memory
+        // substitution; ADR-062 §Decision 1) — the node's dht gateways would
+        // thread in here; the local path uses direct Mainline DHT (no gateways).
+        // A test-harness build (`testing`) uses the in-memory §17.17.3 double so
+        // `Node::start_for_testing`'s mandatory startup publish (a full relay node
+        // always publishes; see `scp_node`) stays offline instead of timing out
+        // against live Mainline. The client backs both this node's DID
+        // publication and its `did:dht` resolution.
+        #[cfg(not(any(test, feature = "testing")))]
+        let dht_client = Arc::new(ClientDhtConfig::default().into_client()?);
+        #[cfg(any(test, feature = "testing"))]
+        let dht_client = Arc::new(FfiDhtClient::InMemory(scp_dht::InMemoryDhtClient::new()));
         let cache = Arc::new(DidCache::new());
         let sign_fn = ConcreteDidMethod::make_sign_fn(Arc::clone(&key_custody));
         let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
@@ -459,7 +511,6 @@ pub async fn start_node_local(
 
         Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-            blob_storage: Some(blob_storage),
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -470,6 +521,9 @@ pub async fn start_node_local(
                     did_method,
                 },
                 storage,
+                // The operator-chosen durable redb blob backend (opened above),
+                // passed as the required selection (SCP-CAPINJECT-010).
+                blob_storage,
             )
         })
         .await?
@@ -606,7 +660,7 @@ impl RunningNode {
     /// this node's webhook dispatcher, and supervises the consumer under the
     /// bridge instance's lifecycle (spec §12.10.5).
     ///
-    /// This is the shared seam for all three non-WASM bridges (`PyO3`, `NAPI`,
+    /// This is the shared seam for all three FFI bridges (`PyO3`, `NAPI`,
     /// `UniFFI`). Each bridge's node-startup path calls it once, after the
     /// `Supervisor` is attached, passing the instance's `JoinSet` guard and
     /// cancellation token. Consolidating the subscribe → wire → supervise block
@@ -750,7 +804,7 @@ impl RunningNode {
 /// or [`RunningNode::wire_context_events`]) under the bridge instance's
 /// `JoinSet`, bound to its cancellation token.
 ///
-/// This is the single shared supervision wire for all three non-WASM bridges
+/// This is the single shared supervision wire for all three FFI bridges
 /// (`PyO3` reference, `NAPI`, `UniFFI`). Each bridge subscribes to its
 /// `Supervisor` event channel and wires the consumer via its node, then hands
 /// the resulting `JoinHandle` here so the supervision policy lives in one place
@@ -1254,22 +1308,22 @@ mod tests {
     // NodeIdentity (pre-existing identity) tests
     // -----------------------------------------------------------------------
 
-    /// Helper: creates a test identity using `InMemoryKeyCustody` and `DidDht`.
+    /// Helper: creates a test identity over the shared [`ConcreteDidMethod`]
+    /// (`DidDht<FfiDhtClient>`) with the in-memory DHT arm (test-harness-only).
     async fn create_test_identity() -> NodeIdentity {
-        use scp_identity::cache::SystemClock;
-        use scp_identity::dht::DidDht;
-        use scp_identity::{DidCache, DidMethod, InMemoryDhtClient};
+        use scp_dht::InMemoryDhtClient;
+        use scp_identity::{DidCache, DidMethod};
         use scp_platform::testing::InMemoryKeyCustody;
-
-        type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
         let custody = Arc::new(InMemoryKeyCustody::new());
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
-        let dht_client = Arc::new(InMemoryDhtClient::new());
+        // The bridge's concrete DID method is `DidDht<FfiDhtClient>`; construct
+        // its `InMemory` arm directly (a test seam, never `ClientDhtConfig`).
+        let dht_client = Arc::new(FfiDhtClient::InMemory(InMemoryDhtClient::new()));
         let cache = Arc::new(DidCache::new());
-        let sign_fn = DevDidDht::make_sign_fn(Arc::clone(&custody));
-        let did_method = Arc::new(DevDidDht::with_client_and_signer(
+        let sign_fn = ConcreteDidMethod::make_sign_fn(Arc::clone(&custody));
+        let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
             dht_client, cache, sign_fn,
         ));
         let (identity, document, _pre_rotation_handle) = did_method

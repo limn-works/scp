@@ -1,13 +1,13 @@
 //! Shared identity link attestation construction for FFI bridges.
 //!
-//! All non-WASM FFI bridges (`PyO3`, napi-rs, `UniFFI`) create identity link
+//! All FFI bridges (`PyO3`, napi-rs, `UniFFI`) create identity link
 //! attestations with identical logic: parse verification method, compute the
 //! attestation ID, build the unsigned struct, validate structure, and compute
 //! canonical signing bytes. This module extracts that shared pipeline so each
 //! bridge only needs to handle custody access, signing, and storage — the
 //! bridge-specific parts.
 //!
-//! Gated behind the `resolvers` feature (not available for WASM — ADR-034).
+//! Gated behind the `resolvers` feature.
 //!
 //! See spec §3.5.1, §3.5.2.
 
@@ -19,7 +19,7 @@ use scp_core::identity::attestation::{
     VerificationMethod,
 };
 use scp_core::trust::attestation::RevocationStatus;
-use scp_identity::DID;
+use scp_did::DID;
 
 // ---------------------------------------------------------------------------
 // Error type

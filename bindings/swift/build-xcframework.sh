@@ -16,7 +16,7 @@
 #
 # Prerequisites:
 #   - Rust toolchain with Apple targets (auto-installed if missing)
-#   - Xcode command-line tools (xcodebuild, lipo)
+#   - Xcode command-line outlets (xcodebuild, lipo)
 
 set -euo pipefail
 
@@ -81,11 +81,11 @@ done
 if [ "$DEV_MODE" = true ]; then
     ALL_TARGETS=("$TARGET_MACOS_ARM")
     log_mode="dev (macOS arm64 only)"
-    # Dev builds enable in-memory custody and the testing feature for the
-    # cross-bridge parity harness (ADR-046). Production builds
-    # (iOS XCFramework, Android .aar) MUST NOT enable either feature.
+    # Dev builds enable the testing feature (which now gates the in-memory
+    # custody arm) for the cross-bridge parity harness (ADR-046). Production
+    # builds (iOS XCFramework, Android .aar) MUST NOT enable it.
     # See GitHub issue #88.
-    EXTRA_FEATURES="--features allow_in_memory_custody,testing"
+    EXTRA_FEATURES="--features testing"
 else
     EXTRA_FEATURES=""
     ALL_TARGETS=(
@@ -129,8 +129,8 @@ mkdir -p "$BINDINGS_DIR"
 # ---------------------------------------------------------------------------
 
 command -v cargo >/dev/null 2>&1 || die "cargo not found. Install the Rust toolchain."
-command -v xcodebuild >/dev/null 2>&1 || die "xcodebuild not found. Install Xcode command-line tools."
-command -v lipo >/dev/null 2>&1 || die "lipo not found. Install Xcode command-line tools."
+command -v xcodebuild >/dev/null 2>&1 || die "xcodebuild not found. Install Xcode command-line outlets."
+command -v lipo >/dev/null 2>&1 || die "lipo not found. Install Xcode command-line outlets."
 
 # Verify all Rust targets are installed
 for target in "${ALL_TARGETS[@]}"; do

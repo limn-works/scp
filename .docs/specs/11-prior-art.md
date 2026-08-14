@@ -381,7 +381,7 @@ GNUnet's approach uses three cooperating daemons (VPN service, DNS service, prot
 | **Fault isolation** | Per-communicator process isolation | In-process (trait implementations share process) |
 | **Scope** | Full network stack replacement | Message delivery only |
 
-**The key architectural parallel:** Both solve protocol bridging without coupling to any single transport. GNUnet answers at the IP layer (zero application changes, but requires TUN device and raw socket privileges). SCP answers at the message layer (requires SDK integration, but runs in browsers via WASM, works on mobile, needs no OS privileges). The trade-off maps to scope: GNUnet aims to be the entire network stack; SCP aims to be the interaction protocol atop any network stack.
+**The key architectural parallel:** Both solve protocol bridging without coupling to any single transport. GNUnet answers at the IP layer (zero application changes, but requires TUN device and raw socket privileges). SCP answers at the message layer (requires SDK integration, but runs in browsers as an in-tab client over shared MLS code with keys on-device per ADR-057, works on mobile, needs no OS privileges). The trade-off maps to scope: GNUnet aims to be the entire network stack; SCP aims to be the interaction protocol atop any network stack.
 
 ### 11.3.7 Transport Architecture
 

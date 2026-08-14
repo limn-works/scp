@@ -74,7 +74,22 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **RED-905 (LOW)**: MissingPassphrase → VALID-7004 (UniFFI only). Combined with pre-existing CustodyError("decryption failed (wrong passphrase?)") vs Io differential, gives 3-way oracle for identity file state.
 - **RED-906 (LOW)**: NaN guard in TS uses Number.isFinite but not Number.isSafeInteger. Unsafe-integer verified_at (>=2^53) silently truncates on re-serialize, causing cross-peer signature consistency failure.
 
+## PR `fix/sdk-coverage-fail-closed-and-parity` (2026-06-20, commit 6f356f8dc)
+See [pr_sdk_coverage_fail_closed_parity.md](pr_sdk_coverage_fail_closed_parity.md) for full chains.
+- **RED-1101 (LOW)**: test-guard freeze-order — env set BEFORE first eval flips guard, but `__setBridgeForTests` not exported + `exports` map only `"."` blocks deep import. Not exploitable except prod NODE_ENV=test bleed.
+- **RED-1102 (LOW, premise disproven)**: `[SCP-PERM-0000]` -> "unknown" -> empty PASSED set -> all fields FALSE. Fail-closed. Real residual only via compromised bridge (resolve-on-forged / late-stage-error elevation).
+- **RED-1103 (MEDIUM, PROVEN)**: coverage gate checks symbol EXISTENCE not REACHABILITY. Routed `true` op to dead stub via stale ALIASES — gate passed clean. Same class as OwnedIdentityDid name-vs-definition lesson.
+- **RED-1104 (NON-ISSUE)**: receipt JSON.stringify/parse — no injection, no proto pollution (native parse `__proto__` = own key).
+
+## PR #2235 App Bind/Unbind Assessment (2026-08-03)
+See [pr2235-app-bound-unbound.md](pr2235-app-bound-unbound.md). §8.4 AppBound/AppUnbound durable appends.
+- **RED-2235-1 (BLOCKER)**: bound_apps map never rehydrated from durable log. Restart ⇒ permanent divergence: unbind wall (CTX_2059), lost enforcement, duplicate re-bind.
+- **RED-2235-2 (WARNING)**: was-bound check TOCTOU — not atomic with durable append. Concurrent unbinds → double AppUnbound; bind/unbind race → durable=bound/memory=unbound window.
+- **RED-2235-3 (WARNING)**: no AppBound replay protection (no nonce/expiry/ctx-bind in signed decl; caller timestamp; no append dedup).
+- **RED-2235-4 (WARNING, chain)**: app_id self-asserted — sig = integrity not authz; real gate is unauthenticated actor_did.
+
 ## Key Attack Patterns for This Codebase
+- **In-memory-map vs durable-log decoupling**: when an FFI op appends to the durable event log AND mutates an in-memory map (bound_apps) in SEPARATE lock scopes with the async append in between, they diverge on crash/restart and race under concurrency. No rehydration + no atomic persist-then-ack (Class-S) = BLOCKER. Check any new "durable append + in-memory registry" pair.
 - **Bridge parity gap**: WASM bridge cannot depend on scp-core (tokio incompatibility), so it re-implements validation partially. ALWAYS check WASM bridge when core validation changes.
 - **Two UcanToken types**: `roles::UcanToken` (stub, no sig/expiry) vs `crypto::ucan::UcanToken` (full, has sig/encoded). Broadcast uses the stub. Any code accepting the stub has no sig verification.
 - **CID computation divergence**: `compute_cid` (JWT hash + bafyrei prefix) vs `compute_revocation_cid` (payload JSON hash, hex). PyO3/UniFFI use `compute_cid` for proofs (correct); NAPI uses `compute_revocation_cid` (wrong). Cross-bridge delegation chains break.
@@ -88,6 +103,8 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **Replay without nonce**: BRIDGE_REGISTER uses timestamp-only replay protection (60s window). No nonce, no connection binding. Captured frames are replayable within window.
 - **Unbounded event-driven loops**: tier re-evaluation loop has no debounce. Any channel sender can trigger unlimited STUN probes + DID publishes.
 - **Structural fallback bypass (FIXED)**: check_projection_auth now hard-rejects empty member_keys with 401. Dead `None` arm remains but is unreachable. Latent risk only.
+- **TS test-seam tree-shaking (r12 2026-06-20)**: tsup `splitting:false` + entry=src/index.ts dead-code-eliminates anything not in the index export graph. `__setBridgeForTests`/`__constructScpWithNativeForTests` are grep-count-0 in dist/index.js — the env guard (`assertTestEnvironment`) is defense-in-depth #2, the bundle elimination is the real barrier. BUN_TEST="0" DOES flip the guard open (`"0".length>0`) but it gates nothing reachable. To re-check after any change: build, then `node -e 'import("./dist/index.js").then(m=>console.log("__setBridgeForTests" in m))'` must print false. Residual risk only if a future change adds `splitting:true` or an `./internal` subpath to `exports`.
+- **JS regex `^` without `m` = string-start only**: `/^\[SCP-PERM-\d+\]/.test(msg)` on a multi-line msg with the code on line 2 returns FALSE → error re-thrown (fail-closed). Used in trust.ts for SCP-PERM/SCP-CTX error classification. Not a downgrade/forgery vector — worst case is over-propagation (real UCAN error escapes as a throw instead of populating weaker Layer-1 fields). Safe by construction; an attacker controlling the Rust error text cannot use newlines to SUPPRESS a hard throw.
 
 ## Critical Files
 - `crates/scp-ffi/wasm/src/ucan.rs` -- Missing 5 validation steps (RED-101), wildcard bypass (RED-105)
@@ -109,3 +126,17 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **RED-906 (MEDIUM)**: UniFFI identity custody NOT in BridgeInstance (separate OnceLock). Weaker cleanup vs PyO3/NAPI.
 - **RED-907 (MEDIUM)**: Post-shutdown re-registration possible. register_identity() has no is_shutdown() check.
 - Fix priority: (1) bridge_instance() should reject post-shutdown with Err, (2) clear storage_provider/protocol_repository, (3) UniFFI identity into BridgeInstance.
+
+## PR #2234 rotate-content-keys / KEA fail-closed (2026-08-03, pass 1)
+See [pr2234-rotate-content-keys-kea.md](pr2234-rotate-content-keys-kea.md). Commit 432691d70.
+- **RED-2234-1 (MEDIUM)**: fail-closed KEA tail → `vote_on_proposal_inner` early-returns → trailing `persist_state_best_effort` skipped → approval vote (Class-C, non-persisting view) lost while ban/rotation is durable. Re-approval double-rotates ⇒ permanent hole in the KEA epoch chain.
+- **RED-2234-2 (MEDIUM)**: `SeedBroadcastAuthor` grants `messages:write` (`can_write` == `authors.contains_key`) but is gated on broad `testing`, which leaks into all bridge test builds. Repo's own Cargo.toml carves `test_grant_member_capability` out into `outlet-capability-test-grant` for exactly this reason.
+- **RED-2234-3 (MEDIUM)**: "ADR-011 → fail-closed" is phantom provenance. ADR-011 governs leaf INCLUSION, not append error propagation. Spec §2033 fail-closed text was written by this PR then cited by the code.
+- **RED-2234-4 (LOW)**: `checkpoint_events_since` never enters the signed checkpoint — `build_checkpoint` reads the log directly. "§9.9.3 Merkle determinism" comments overstate it.
+- **RED-2234-5 (LOW)**: zero negative-path tests; no failing-event-log harness exists in `crates/`.
+
+### New reusable patterns (from #2234)
+- **Fail-closed on a TRAILING audit leaf is an anti-pattern**: when the append sits after all authority-relevant state is already committed, `?` converts a succeeded security action into a reported failure AND skips the caller's trailing coalesced persist. Always ask: (a) what does the caller skip on the early return, (b) is re-execution idempotent? If the op re-rotates keys / re-appends leaves, fail-closed *creates* divergence.
+- **Non-persisting `class_c_view()` + trailing `persist_state_best_effort`**: any `?` between the Class-C mutation and the tail persist silently discards that mutation. Grep for `?` in the span between them.
+- **`bounded_reply_await` is stateless** (`actor/handle.rs:117`) — 2 min timeout, no rate limiter, no shared state. The hard-rate-limit is a separate outlets token bucket that merely consumes its result. No cross-operation DoS via reply-await.
+- **Test-seam feature classification**: `testing` leaks via `scp-ffi/testing → scp-core/testing → scp-runtime/testing` into every bridge test build. Authority-granting seams MUST get a dedicated feature named in the test target's `required-features` (precedent: `saga-witness-test-mint`, `outlet-capability-test-grant`). Check every new `#[cfg(feature = "testing")]` seam for whether it grants capability.

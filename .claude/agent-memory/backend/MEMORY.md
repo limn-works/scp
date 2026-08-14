@@ -1,5 +1,15 @@
 # Backend Agent Memory (scoped)
 
+- [project-1341-mcp-subscribe-rolestate-parity](project_1341_mcp_subscribe_rolestate_parity.md) — #1341: real AC4 defect = FFI role_state mirror vs Supervisor split; scp-ffi/** is EXCLUDED from check-block-in-place.py; register_context populates mirror only, not Supervisor
+
+- [project-pr2155-dev-profile-line-tables](project_pr2155_dev_profile_line_tables.md) — #2155 line-tables-only = 26% target/ saving (NOT "halves"); root-Cargo.toml profile conflict recipe vs ADR-057 [profile.release]; ci.yml lacks CARGO_INCREMENTAL=0
+- [project-2069-f2-recovery-ucan-failclosed](project_2069_f2_recovery_ucan_failclosed.md) — F2 branch removes the §9.12 step-3 nullifier but does NOT close #2069 (1/6 reqs); both gates untouched; recovery has no prod entry point; keep #2069 OPEN
+- [feedback-recover-stranded-worktree-in-place](feedback_recover_stranded_worktree_in_place.md) — recover stranded branches in the DEAD SESSION'S worktree; it holds uncommitted work a fresh worktree would strand again
+
+- [project-1933-authoritative-event-log-proof](project_1933_authoritative_event_log_proof.md) — #1933 event_log_verify → ONE authoritative snapshot per call; no second tree, no two-replay commitment; CTX-2138 fail-closed; check-*.sh need CARGO_TARGET_DIR
+
+- [project-adr057-transport-jssocket](project_adr057_transport_jssocket.md) — ADR-057 JsSocket relay-transport slice; Step-2 finding: MLS SignatureKeyPair ED25519 private = 32-byte seed, recover via serde (private() is test-utils-gated); send_message()→() break analysis
+
 - [project-eventlog-committer-assigned-timestamp](project_eventlog_committer_assigned_timestamp.md) — event-log convergence: committer-assigned leaf timestamps replace per-member now(); per-class sourcing rules + CommitMeta refactor + chokepoints; spec 2ecfa23fb, impl 88c856360
 
 - [project-convergent-timer-deadline-bases](project_convergent_timer_deadline_bases.md) — timer leaves (TTL/freeze/deferred-change) anchored on convergent bases not local now; new PerContextState::creation_timestamp_secs + anchor flag; restore/import stays local (signed-snapshot creation-time = ADR-051); WASM gov-execute fails loud (CTX-2041) vs silent 0; extension-override gotcha
@@ -17,9 +27,13 @@
 - [feedback-worktree-absolute-path](feedback_worktree_absolute_path.md) — always use worktree path for edits; bare /Users/alec/Developer/limn/scp/ is main
 - [feedback-no-git-checkout-paths](feedback_no_git_checkout_paths.md) — never `git stash` + `git checkout origin/X -- path/` to verify baseline; destroys uncommitted edits silently
 - [feedback-read-tool-stale-verify-with-awk](feedback_read_tool_stale_verify_with_awk.md) — Read tool can return stale content disagreeing with disk; verify load-bearing lines with awk/grep before editing
+- [feedback-check-scripts-need-cargo-target-dir](feedback_check_scripts_need_cargo_target_dir.md) — scripts/check-*.sh spawn their own cargo; export CARGO_TARGET_DIR for them too or the shared-target poison fakes a gate failure
 - [project-adr-049-storage-foundation-step2](project_adr_049_storage_foundation_step2.md) — storage-foundation Step 2 (PyO3): mls_storage threading, fail-closed, SqliteKeyMaterial passphrase; NAPI/UniFFI only remaining broken; 3+3+4 pre-existing failures flagged
 - [project-adr-049-storage-foundation-step3](project_adr_049_storage_foundation_step3.md) — storage-foundation Step 3 (UniFFI + Swift/Kotlin): un-swallow Arc-repo type shift, fail-closed Result, binding regen, Kotlin ktlint baseline drift, worktree Edit-tool corruption workaround; NAPI Step-4-only broken
 - [project-adr-049-phase2a-finalization-dispatch-step](project_adr_049_phase2a_finalization_dispatch_step.md) — Phase 2A finalization first step (1bce95bdf): bootstrap arms→actor-shape, receiver→Arc<Self> ripple (5 methods, 0 bridge edits); the 6 "expected-to-flip" tests are pre-existing failures (verified vs baseline); kept dead import/restore legacy bodies under #[allow(dead_code)]
 - [project-adr-049-phase2a-membership-test-blocker](project_adr_049_phase2a_membership_test_blocker.md) — STOP @ 86c4b2011: 3 e2e_bridge membership tests fail because the actor task dies with the ephemeral test_runtime(), NOT because queries read the DashMap (recon §1.8 premise wrong; queries already mailbox-first). Production fine (long-lived global runtime). Escalated 2 options; did NOT write code.
 - [project-adr-049-phase2a-timer-blocker](project_adr_049_phase2a_timer_blocker.md) — Part A (e2e_bridge shared runtime, 54/0) + Part B additive (ReportBufferLen/FireTimer cmds + gauge-sweep→actor-registry) LANDED+pushed @ 7a9a54937; STOPPED at Step D (TTL/governance timer→mailbox) — hard prereq for bootstrap spawn-switch, ballooned beyond authorized scope (plan Step 9, own Shuttle gate). Remaining B-G work map + dependency order recorded.
 - [project-adr-049-phase2a-step-d-timers](project_adr_049_phase2a_step_d_timers.md) — Step D DONE (30c444b93+d519ad41c): TTL+governance timers→actor registry+mailbox tick. SupervisorHandle lookup/tracked_spawn/dispatch_start_ttl_timer; new GovernanceCommand::StartTimeoutTask + GovernanceTimeoutTask::install; spawn_ttl_timer actor-shape. shim_supervisor 2→0 at ttl_close. Legacy timer bodies NOT deleted (only callers = Step C create_context_legacy chain). 1573/6, e2e 54/0, +2 pipeline assertions (39→41).
+
+- [project-relay-write-path-review-round](project_relay_write_path_review_round.md) — #482 relay WRITE path: branch is deliberately UNPUSHED/no-PR; AC-6 publish-seam guarantee is OPEN by escalation; sanitizer lives in scp-relay-client
+- [feedback-spin-yield-invalid-on-multi-thread-tests](feedback_spin_yield_invalid_on_multi_thread_tests.md) — `for _ in 0..N { yield_now() }` waits flake on multi_thread under load; bound by std::time::Instant, never tokio sleep

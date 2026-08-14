@@ -169,8 +169,8 @@ mod tests {
         MessageType, Provenance, enforce_inner_envelope_category_a, validate_inner_version,
         verify_inner_signature,
     };
+    use scp_did::SigningKeyId;
     use scp_protocol::envelope::padding::strip_padding;
-    use scp_protocol::identity::SigningKeyId;
 
     async fn setup() -> (InMemoryKeyCustody, KeyHandle) {
         let custody = InMemoryKeyCustody::new();
@@ -228,7 +228,7 @@ mod tests {
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
         let provenance = Provenance {
-            source: "test-tool".into(),
+            source: "test-outlet".into(),
             upstream_hash: Some("abc123".into()),
         };
 
@@ -327,7 +327,7 @@ mod tests {
         let pubkey = custody.public_key(&signing_key).await.unwrap();
 
         let provenance = Provenance {
-            source: "original-tool".into(),
+            source: "original-outlet".into(),
             upstream_hash: None,
         };
 

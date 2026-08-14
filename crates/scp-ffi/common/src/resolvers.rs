@@ -2,7 +2,6 @@
 //!
 //! These adapters bridge `scp-core`'s validation traits to the FFI runtime.
 //! Requires the `resolvers` feature (scp-core, scp-identity, tokio).
-//! NOT available for WASM (ADR-034).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -11,6 +10,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use tracing::{debug, info, warn};
 
+use scp_clock::Clock;
 use scp_core::crypto::ucan::UcanError as CoreUcanError;
 use scp_core::crypto::ucan::UcanToken;
 use scp_core::crypto::ucan::validate::{
@@ -18,10 +18,9 @@ use scp_core::crypto::ucan::validate::{
 };
 use scp_core::trust::TrustError;
 use scp_core::trust::attestation::DidPublicKeyResolver;
+use scp_did::decode_multibase_key;
 use scp_identity::IdentityError;
-use scp_identity::decode_multibase_key;
 use scp_identity::resolver::ResolvedDidDocument;
-use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------
 // BridgeDidResolver
@@ -39,45 +38,53 @@ use scp_primitives::Clock;
 ///
 /// **Limitation:** This resolver does NOT validate the DID document (no BEP44
 /// signature verification, no self-certification check, no sequence number
-/// comparison). Use [`IdentityBackedDidResolver`] for production non-WASM
+/// comparison). Use [`IdentityBackedDidResolver`] for production
 /// contexts. See #311.
 pub struct BridgeDidResolver;
 
 impl DidResolver for BridgeDidResolver {
     fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], CoreUcanError> {
-        if let Some(suffix) = did.strip_prefix("did:dht:z") {
-            let decoded = zbase32::decode(suffix).map_err(|_| {
-                CoreUcanError::MalformedToken(format!("z-base-32 decode failed for DID: {did}"))
-            })?;
-            let bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-                CoreUcanError::MalformedToken(format!(
-                    "DID public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-            return Ok(bytes);
+        // Narrow, fail-closed did:key gate — asserted LOCALLY, not borrowed
+        // from scp-did's feature state.
+        //
+        // Everything below delegates to the single hardened `scp-did` parser
+        // (`extract_public_key_from_did`) rather than a hand-rolled decode, so
+        // this UCAN-validation path gets the same did:dht:z z-base-32
+        // **canonicality** guard as every other native did:dht decoder: the
+        // parser re-encodes the decoded 32-byte key and rejects any input that
+        // does not round-trip to the canonical encoding, closing the
+        // trailing-bit-padding non-injectivity that would otherwise let two DID
+        // strings resolve to the same key.
+        //
+        // That parser also accepts the non-standard `did:key:{hex}`
+        // test-convenience form — but ONLY when `scp-did/testing` is enabled.
+        // Crucially, `scp-did/testing` is turned on TRANSITIVELY by *custody*
+        // opt-ins (dep:scp-testing → scp-core/testing → scp-protocol/testing →
+        // scp-did/testing). Custody opt-ins (e.g. `testing`,
+        // which controls where private key material may live) are an
+        // ORTHOGONAL concern from "this bridge is compiled for UCAN testing".
+        // If we relied solely on scp-did's gate, an in-memory-custody *source*
+        // build would silently begin accepting did:key UCAN issuers — a
+        // DID-format acceptance surface that has nothing to do with custody.
+        // did:key must never ride in on a custody flag. So we re-assert the
+        // gate against THIS crate's own `testing` feature: when
+        // scp-ffi-common's `testing` is off — which is every shipped artifact,
+        // since releases build with default features (`testing` is a dev-only
+        // opt-in and is never a shipped feature) — reject `did:key:` up front
+        // with the same `MalformedToken`/unsupported-format error class the
+        // parser emits for any other unsupported method, regardless of
+        // scp-did's feature state. This is a pure string-prefix check; it
+        // introduces no zbase32 (or any other) decode in production. did:dht
+        // and all other inputs still flow through the one shared parser, so
+        // there is exactly one canonicality authority and no drift.
+        #[cfg(not(any(test, feature = "testing")))]
+        if did.starts_with("did:key:") {
+            return Err(CoreUcanError::MalformedToken(format!(
+                "unsupported DID format: {did}"
+            )));
         }
 
-        // did:key:{hex} is a non-standard test convenience. Gated behind the
-        // `testing` feature (or #[cfg(test)]) to prevent acceptance in release
-        // builds. See: https://github.com/limn-works/scp/issues/128
-        #[cfg(any(test, feature = "testing"))]
-        if let Some(hex_str) = did.strip_prefix("did:key:") {
-            let bytes = hex::decode(hex_str).map_err(|e| {
-                CoreUcanError::MalformedToken(format!("hex decode failed for did:key DID: {e}"))
-            })?;
-            let pk: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-                CoreUcanError::MalformedToken(format!(
-                    "DID public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-            return Ok(pk);
-        }
-
-        Err(CoreUcanError::MalformedToken(format!(
-            "unsupported DID method: {did} (expected did:dht:)"
-        )))
+        scp_did::extract_public_key_from_did(did).map_err(CoreUcanError::MalformedToken)
     }
 }
 
@@ -210,7 +217,7 @@ pub struct IdentityBackedDidResolver {
     /// sync `DidResolver`/`DidPublicKeyResolver` trait methods.
     ///
     /// This is a HOT, SHARED path: a single UCAN delegation-chain validation
-    /// resolves up to `MAX_CHAIN_DEPTH` (32) DIDs, and every non-WASM bridge
+    /// resolves up to `MAX_CHAIN_DEPTH` (32) DIDs, and every FFI bridge
     /// routes all DID resolution through here. Building a fresh tokio runtime
     /// per call (current-thread `Builder::...build()`) was a per-resolution
     /// allocation of an entire reactor + thread, amplified 32x per validation.
@@ -363,7 +370,7 @@ impl IdentityBackedDidResolver {
     /// tokio runtime — and the result is handed back through `join()`. There is
     /// NO per-call runtime construction: the reactor + worker threads are built
     /// exactly once across the whole process (this is a hot, shared path —
-    /// every non-WASM bridge resolves all DIDs here, and a single UCAN
+    /// every FFI bridge resolves all DIDs here, and a single UCAN
     /// delegation chain resolves up to `MAX_CHAIN_DEPTH` = 32 DIDs).
     ///
     /// Why drive from a spawned scoped thread rather than the calling thread:
@@ -488,7 +495,7 @@ impl IdentityBackedDidResolver {
     /// signature verification and self-certification, sequence-number rotation
     /// tracking / downgrade prevention — then extracts the requested
     /// verification method (`#active` or `#agent`, via
-    /// [`SigningKeyId::fragment`](scp_identity::SigningKeyId::fragment)) and
+    /// [`SigningKeyId::fragment`](scp_did::SigningKeyId::fragment)) and
     /// parses the public key bytes into an [`ed25519_dalek::VerifyingKey`].
     ///
     /// This is the VM-aware accessor the FFI `KeyResolver` closure wraps so the
@@ -535,8 +542,8 @@ impl IdentityBackedDidResolver {
     ///   number (possible downgrade attack).
     pub fn verifying_key_for(
         &self,
-        did: &scp_identity::DID,
-        key_id: scp_identity::SigningKeyId,
+        did: &scp_did::DID,
+        key_id: scp_did::SigningKeyId,
     ) -> Result<ed25519_dalek::VerifyingKey, ResolutionError> {
         let did = did.as_ref();
         let resolved = self.resolve_sync(did)?;
@@ -642,7 +649,11 @@ impl scp_identity::resolver::DidResolver for IdentityBackedDidResolver {
 pub enum DispatchDidResolver<'a> {
     /// Production resolver with full DID document validation.
     Identity(&'a IdentityBackedDidResolver),
-    /// Fallback resolver: z-base-32 decode only, no document validation.
+    /// Fallback resolver: delegates DID→key extraction to the canonicality-
+    /// enforcing `scp-did` parser (`extract_public_key_from_did`), so it rejects
+    /// non-canonical did:dht spellings exactly as the native decoders do. Still
+    /// performs no DID *document* validation (no BEP44 signature check, no
+    /// self-certification, no sequence-number comparison).
     Bridge(BridgeDidResolver),
 }
 
@@ -846,23 +857,19 @@ impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationE
         };
 
         // Build payload via the shared producer so the leaf preimage is
-        // byte-identical to the WASM bridge's `ucan_revoke` (§9.9.3 cross-platform
+        // byte-identical across all honest members (§9.9.3 cross-platform
         // convergence). JSON object: {token_cid, revoker_did, context_id}.
         let payload_data = scp_core::crypto::ucan::revoke::token_revoked_payload(
             context_id,
             token_cid,
             revoker_did,
-        );
+        )?;
 
-        // Unix timestamp seconds fit in u64 for centuries.
-        #[allow(clippy::cast_possible_truncation)]
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        let timestamp = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
 
         let event = scp_event_log::Event {
             event_type: scp_event_log::EventType::TokenRevoked,
-            actor_did: scp_event_log::DID(revoker_did.to_owned()),
+            actor_did: scp_did::DID(revoker_did.to_owned()),
             timestamp,
             sequence,
             payload: scp_event_log::EventPayload { data: payload_data },
@@ -900,10 +907,11 @@ impl scp_core::crypto::ucan::revoke::RevocationEventLogger for BridgeRevocationE
 mod tests {
     use super::*;
     use scp_core::crypto::ucan::validate::DidResolver as CoreDidResolver;
+    use scp_dht::InMemoryDhtClient;
+    use scp_did::DidDocument;
     use scp_identity::cache::DidCache;
-    use scp_identity::document::DidDocument;
     use scp_identity::resolver::{ResolutionSource, ResolvedDidDocument};
-    use scp_identity::{DidMethod, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier};
+    use scp_identity::{DidMethod, DualLayerResolver, NoOpRelayQuerier};
     use std::sync::Arc;
 
     /// Helper: create a `DualLayerResolver` with in-memory backends for testing.
@@ -1014,7 +1022,12 @@ mod tests {
         let custody = scp_platform::testing::InMemoryKeyCustody::new();
         let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
         let (identity, document, _pre_rotation_handle) = rt
-            .block_on(scp_identity::DidDht::new().create(&custody, &pre_rotation_custody))
+            .block_on(
+                scp_identity::DidDht::with_client(std::sync::Arc::new(
+                    scp_dht::InMemoryDhtClient::new(),
+                ))
+                .create(&custody, &pre_rotation_custody),
+            )
             .unwrap();
 
         let resolved = ResolvedDidDocument {
@@ -1082,6 +1095,53 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn bridge_resolver_rejects_non_canonical_zbase32() {
+        // The UCAN-validation resolver MUST reject a non-canonical z-base-32
+        // spelling of a valid key: z-base-32 of a 32-byte payload is not
+        // injective on its trailing bit-padding (the 52nd char carries 1
+        // payload bit + 4 padding bits → 16 alternate encodings decode to the
+        // same key). Two distinct DID strings resolving to the same key would
+        // otherwise enable petname squatting / log-spoofing. This mirrors the
+        // native `scp_identity::dht::extract_public_key` and `scp_did` parser
+        // tests, pinning single-parser parity across the UCAN path.
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        let pk: [u8; 32] = [0xAB; 32];
+        let canonical_encoded = zbase32::encode(&pk);
+        let canonical_did = format!("did:dht:z{canonical_encoded}");
+
+        // Canonical form is accepted and yields the key.
+        let ok = CoreDidResolver::resolve_public_key(&BridgeDidResolver, &canonical_did).unwrap();
+        assert_eq!(ok, pk);
+
+        // Build a non-canonical alternate by toggling a padding bit of the
+        // trailing char.
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[last_idx ^ 1];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the mutated input still decodes to the same 32 bytes (a real
+        // non-canonical alternate, not a typo).
+        let raw_decoded = zbase32::decode(&mutated_encoded).expect("alternate decodes");
+        assert_eq!(raw_decoded.as_slice(), &pk[..]);
+
+        // The canonicality guard MUST reject it.
+        let err = CoreDidResolver::resolve_public_key(&BridgeDidResolver, &mutated_did);
+        assert!(
+            err.is_err(),
+            "non-canonical did:dht spelling must be rejected by the UCAN resolver"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // DidPublicKeyResolver for attestation
     // -----------------------------------------------------------------------
@@ -1124,7 +1184,7 @@ mod tests {
     /// (`verify_self_certification`) the real resolver enforces.
     #[allow(clippy::similar_names)]
     async fn seed_identity(dht: &InMemoryDhtClient, with_agent: bool) -> SeededIdentity {
-        use scp_identity::DhtClient;
+        use scp_dht::DhtClient;
 
         // All RNG-bound key generation and signing happens synchronously and is
         // scoped into this block so the non-`Send` `ThreadRng` is dropped before
@@ -1161,7 +1221,7 @@ mod tests {
             // BEP44-sign the serialized document with the identity key (seq = 1),
             // matching DidDht::publish_document.
             let value = doc.to_json().unwrap().into_bytes();
-            let signable = scp_identity::dht::bep44_signable(&value, 1);
+            let signable = scp_dht::bep44_signable(&value, 1);
             let signature: [u8; 64] = identity_sk.sign(&signable).to_bytes();
 
             (
@@ -1219,8 +1279,8 @@ mod tests {
         let key_resolver = crate::bridge_runtime::document_vm_key_resolver(did_resolver);
 
         // (DID, Active) → Some(vk) equal to the document's #active key.
-        let with_agent_did = scp_identity::DID::from(with_agent.did.clone());
-        let active = key_resolver(&with_agent_did, scp_identity::SigningKeyId::Active);
+        let with_agent_did = scp_did::DID::from(with_agent.did.clone());
+        let active = key_resolver(&with_agent_did, scp_did::SigningKeyId::Active);
         assert_eq!(
             active,
             Some(with_agent.active_vk),
@@ -1229,7 +1289,7 @@ mod tests {
 
         // (DID, Agent) → Some(vk) equal to the document's #agent key, distinct
         // from #active.
-        let agent = key_resolver(&with_agent_did, scp_identity::SigningKeyId::Agent);
+        let agent = key_resolver(&with_agent_did, scp_did::SigningKeyId::Agent);
         assert_eq!(
             agent, with_agent.agent_vk,
             "Agent VM must resolve to the document's #agent key"
@@ -1241,28 +1301,27 @@ mod tests {
         );
 
         // (DID with no #agent VM, Agent) → None.
-        let no_agent_did = scp_identity::DID::from(no_agent.did.clone());
+        let no_agent_did = scp_did::DID::from(no_agent.did.clone());
         assert!(
-            key_resolver(&no_agent_did, scp_identity::SigningKeyId::Agent).is_none(),
+            key_resolver(&no_agent_did, scp_did::SigningKeyId::Agent).is_none(),
             "Agent VM lookup must fail closed when the document has no #agent key"
         );
         // Sanity: the no-agent identity still resolves its #active key.
         assert_eq!(
-            key_resolver(&no_agent_did, scp_identity::SigningKeyId::Active),
+            key_resolver(&no_agent_did, scp_did::SigningKeyId::Active),
             Some(no_agent.active_vk),
             "the no-agent identity must still resolve its #active key"
         );
 
         // (unknown DID, either VM) → None.
         let unknown_pk: [u8; 32] = [0x11; 32];
-        let unknown_did =
-            scp_identity::DID::from(format!("did:dht:z{}", zbase32::encode(&unknown_pk)));
+        let unknown_did = scp_did::DID::from(format!("did:dht:z{}", zbase32::encode(&unknown_pk)));
         assert!(
-            key_resolver(&unknown_did, scp_identity::SigningKeyId::Active).is_none(),
+            key_resolver(&unknown_did, scp_did::SigningKeyId::Active).is_none(),
             "unknown DID (Active) must resolve to None"
         );
         assert!(
-            key_resolver(&unknown_did, scp_identity::SigningKeyId::Agent).is_none(),
+            key_resolver(&unknown_did, scp_did::SigningKeyId::Agent).is_none(),
             "unknown DID (Agent) must resolve to None"
         );
     }
@@ -1286,8 +1345,8 @@ mod tests {
         let did_resolver = identity_resolver_over(Arc::clone(&dht), rt.handle().clone());
         let key_resolver = crate::bridge_runtime::document_vm_key_resolver(did_resolver);
 
-        let did = scp_identity::DID::from(identity.did.clone());
-        let active = key_resolver(&did, scp_identity::SigningKeyId::Active);
+        let did = scp_did::DID::from(identity.did.clone());
+        let active = key_resolver(&did, scp_did::SigningKeyId::Active);
         assert_eq!(
             active,
             Some(identity.active_vk),

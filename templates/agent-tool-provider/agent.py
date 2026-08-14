@@ -267,8 +267,8 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
     async with await Context.create(
         creator=identity,
         ceiling=[
-            Capability.TOOL_REGISTER,
-            Capability.TOOL_INVOKE_ALL,
+            Capability.OUTLET_REGISTER,
+            Capability.OUTLET_CALL_ALL,
             Capability.MESSAGES_READ,
             Capability.MESSAGES_WRITE,
         ],
@@ -286,9 +286,7 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
         logger.info("Registering tools in context...")
         tools = [CALCULATOR_TOOL, SEARCH_TOOL]
         for tool in tools:
-            logger.info(
-                "  Registered: %s -- %s", tool.name, tool.description
-            )
+            logger.info("  Registered: %s -- %s", tool.name, tool.description)
 
         # 4. Attach handler functions so tool invocations execute Python code.
         register_tool_handler(ctx, "calculator", handle_calculator)
@@ -296,14 +294,16 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
         logger.info("Tool handlers attached")
 
         # 5. Mint a UCAN token authorizing tool invocations.
-        #    In production, tokens are scoped per-tool; here we grant
-        #    ToolInvokeAll for demo convenience.
+        #    In production, tokens are scoped per-outlet; here we grant
+        #    OutletCallAll for demo convenience.
         token = await ucan_mint(
             audience=identity.did,
-            capabilities=["tool_invoke:*"],
+            capabilities=["outlet_call:*"],
             context=ctx.context_id,
         )
-        logger.info("Minted UCAN token: %s (expires=%s)", token.token_id, token.expires_at)
+        logger.info(
+            "Minted UCAN token: %s (expires=%s)", token.token_id, token.expires_at
+        )
 
         # 6. Invoke tools programmatically.
         logger.info("\n--- Calculator invocations ---")
@@ -340,9 +340,7 @@ async def run_agent(*, enable_mcp: bool = False, mcp_transport: str = "stdio") -
             token.token_id,
             identity=identity,
         )
-        logger.info(
-            "  'encryption MLS': %d results", search_result.get("total", 0)
-        )
+        logger.info("  'encryption MLS': %d results", search_result.get("total", 0))
         for hit in search_result.get("results", []):
             logger.info("    %.2f  %s", hit["score"], hit["title"])
 

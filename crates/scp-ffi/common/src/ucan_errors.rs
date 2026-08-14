@@ -1,18 +1,18 @@
 //! Canonical `UcanError` → `error_code` mapping shared by all FFI bridges.
 //!
-//! Every bridge (`PyO3`, `napi-rs`, `UniFFI`, WASM) previously inlined
+//! Every bridge (`PyO3`, `napi-rs`, `UniFFI`) previously inlined
 //! its own `From<UcanError>` impl, all returning the same `SCP-PERM-3001`
 //! code. That duplication let the bridges silently drift (as they did
-//! before the round-11 fix that consolidated the WASM / `UniFFI`
-//! ad-hoc paths onto this code).
+//! before the round-11 fix that consolidated the ad-hoc
+//! paths onto this code).
 //!
 //! This module exposes one function — [`ucan_error_code`] — that every
 //! bridge routes through. Any change to the UCAN error classification
 //! (e.g. splitting `TokenExpired` off `PERM_3001` onto `PERM_3007`)
 //! happens here exactly once and propagates to every bridge.
 //!
-//! `UcanError` lives in `scp-protocol`, which every bridge (including
-//! WASM) already depends on, so this function has no additional
+//! `UcanError` lives in `scp-protocol`, which every bridge
+//! already depends on, so this function has no additional
 //! feature gate.
 //!
 //! Provenance: `.docs/adrs/ADR-046-bridge-parity-harness.md` round 11
@@ -75,10 +75,15 @@ pub const fn ucan_error_code(err: &UcanError) -> &'static str {
         | UcanError::NonceFormatInvalid(_)
         | UcanError::NonceTrackerFull(_) => codes::PERM_3001,
 
-        // Capability / delegation failures.
+        // Capability / delegation failures. The two caveat variants are
+        // per-edge caveat-narrowing (§7.3.8 Step 7b) and time-box (Step 11b)
+        // enforcement failures surfaced by the outlet-invocation validation
+        // path's `TokenNbCaveatResolver`.
         UcanError::CapabilityOutsideCeiling(_)
         | UcanError::CapabilityNotGranted(_)
         | UcanError::AttenuationViolation(_)
+        | UcanError::CaveatAttenuationViolation(_)
+        | UcanError::CaveatTimeBoxViolation(_)
         | UcanError::DelegationChainBroken(_)
         | UcanError::CircularDelegation(_) => codes::PERM_3001,
 
@@ -98,21 +103,80 @@ pub const fn ucan_error_code(err: &UcanError) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Exhaustive coverage: one instance of every `UcanError` variant is
+    /// passed to `ucan_error_code` and asserted to equal `PERM_3001`.
+    ///
+    /// This test serves two purposes:
+    ///
+    /// 1. **Runtime correctness guard** — if a match arm returns a raw string
+    ///    literal instead of a `codes::` constant, the static regex sync test in
+    ///    `trust.test.ts` passes but this test will catch a value mismatch.
+    ///
+    /// 2. **Runtime coverage spot-list** — this array is NOT compiler-checked;
+    ///    a missing variant silently passes. The real exhaustiveness guarantee
+    ///    is the `match` in `ucan_error_code` (no `_ =>` arm), which the
+    ///    compiler enforces. This test exists solely to catch raw-literal drift:
+    ///    a match arm returning `"SCP-PERM-3009"` instead of `codes::PERM_3009`
+    ///    looks correct to the regex sync test in `trust.test.ts` but will
+    ///    produce a wrong value here.
     #[test]
-    fn every_mapped_variant_currently_routes_to_perm_3001() {
-        // Spot-check one per classification bucket. The exhaustive
-        // match in `ucan_error_code` is the primary guard — this test
-        // is a secondary belt-and-braces check that the current
-        // classification is coherent.
-        for err in [
+    fn all_variants_route_to_perm_3001() {
+        let variants: &[UcanError] = &[
+            // Structural / signature failures
             UcanError::MalformedToken("bad".to_owned()),
+            UcanError::DeserializationFailed("json err".to_owned()),
+            UcanError::UnsupportedAlgorithm("RS256".to_owned()),
+            UcanError::UnsupportedVersion("0.9.0".to_owned()),
             UcanError::SignatureInvalid,
+            // Issuer / audience / scope mismatches
+            UcanError::InvalidIssuer {
+                expected: "did:dht:expected".to_owned(),
+                actual: "did:dht:actual".to_owned(),
+            },
+            UcanError::AudienceMismatch {
+                expected: "did:dht:expected".to_owned(),
+                actual: "did:dht:actual".to_owned(),
+            },
+            UcanError::KeyScopeMismatch {
+                expected_scope: "#agent".to_owned(),
+                actual_kid: "#active".to_owned(),
+            },
+            UcanError::SelfDelegationWithoutKeyScope,
+            UcanError::CategoryAViolation {
+                action: "did_document:update".to_owned(),
+                kid: "#agent".to_owned(),
+            },
+            // Expiry / validity window
+            UcanError::ExpiryTooFar(90_000_u64),
             UcanError::TokenExpired,
-            UcanError::NonceReused("nonce".to_owned()),
-            UcanError::CapabilityNotGranted("cap".to_owned()),
-            UcanError::TokenRevoked("cid".to_owned()),
-        ] {
-            assert_eq!(ucan_error_code(&err), codes::PERM_3001);
+            UcanError::TokenNotYetValid,
+            UcanError::InvalidTimeRange { nbf: 100, exp: 50 },
+            // Nonce failures
+            UcanError::NonceReused("abc123".to_owned()),
+            UcanError::NonceTooOld("abc123".to_owned()),
+            UcanError::NonceFuture("abc123".to_owned()),
+            UcanError::NonceFormatInvalid("bad-nonce".to_owned()),
+            UcanError::NonceTrackerFull(1024_usize),
+            // Capability / delegation failures
+            UcanError::CapabilityOutsideCeiling("scp:ctx:x/msg:write".to_owned()),
+            UcanError::CapabilityNotGranted("scp:ctx:x/msg:write".to_owned()),
+            UcanError::AttenuationViolation("widened scope".to_owned()),
+            UcanError::DelegationChainBroken("aud/iss mismatch".to_owned()),
+            UcanError::CircularDelegation("A->B->A".to_owned()),
+            // Revocation
+            UcanError::TokenRevoked("bafkreiabc".to_owned()),
+            UcanError::RevocationUnauthorized("not issuer".to_owned()),
+            UcanError::RevocationFailed("store write failed".to_owned()),
+            // Capability URI parsing
+            UcanError::InvalidCapabilityUri("*".to_owned()),
+        ];
+
+        for variant in variants {
+            assert_eq!(
+                ucan_error_code(variant),
+                codes::PERM_3001,
+                "variant {variant:?} did not return PERM_3001",
+            );
         }
     }
 }

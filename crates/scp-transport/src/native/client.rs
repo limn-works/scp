@@ -24,7 +24,7 @@
 //! [`NativeRelayAdapter`]: super::adapter::NativeRelayAdapter
 //! [`TransportAdapter`]: crate::TransportAdapter
 
-use scp_primitives::Clock;
+use scp_clock::Clock;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -41,10 +41,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use zeroize::Zeroizing;
 
-use super::protocol::{ClientMessage, RelayMessage};
 use crate::backoff::ReconnectBackoff;
 use crate::error::TransportError;
 use crate::subscription::TransportSubscriptionMap;
+use scp_relay_client::{ClientMessage, RelayMessage};
 
 /// Keepalive interval: client sends PING every 30 seconds.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -462,7 +462,7 @@ impl NativeRelayClient {
                 //    significantly from local wall-clock time. Independent of
                 //    dedup; runs whether or not the routing_id is subscribed.
                 {
-                    let local_now = scp_primitives::SystemClock.now_secs();
+                    let local_now = scp_clock::SystemClock.now_secs();
                     let deviation = local_now.abs_diff(*stored_at);
                     if deviation > RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS {
                         tracing::warn!(
@@ -564,7 +564,7 @@ impl NativeRelayClient {
                         break;
                     }
 
-                    let ts = scp_primitives::SystemClock.now_secs();
+                    let ts = scp_clock::SystemClock.now_secs();
 
                     let ping = ClientMessage::Ping { ts };
                     if let Ok(bytes) = ping.to_bytes() {
@@ -907,7 +907,7 @@ impl NativeRelayClient {
                         // manipulation) to compute the reconnect window.
                         let since = last_local_receive.map(|instant| {
                             let elapsed = instant.elapsed();
-                            let now_unix = scp_primitives::SystemClock.now_secs();
+                            let now_unix = scp_clock::SystemClock.now_secs();
                             now_unix
                                 .saturating_sub(elapsed.as_secs())
                                 .saturating_sub(RECONNECT_OVERLAP.as_secs())

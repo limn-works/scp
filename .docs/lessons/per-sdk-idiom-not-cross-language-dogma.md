@@ -1,13 +1,15 @@
 # Per-SDK idiom — language constraints stay local
 
+> **ADR-055 (2026-06-29):** the WASM bridge was removed; references below to a fourth WASM/wasm-bindgen bridge are historical. SCP now ships four language SDKs (Python, TypeScript, Swift, Kotlin) over three FFI bridges (PyO3, NAPI, UniFFI); the browser is a remote thin client. The per-SDK-idiom rule below remains evergreen.
+
 ## Principle
 
 > "I don't want optimizations or constraints for one language to dictate what
 > happens in another's SDK. That's bad dogma."
 > — Alec, 2026-04-25
 
-SCP ships SDKs in five languages (Python, TypeScript, Swift, Kotlin, WASM)
-over four FFI bridges (PyO3, NAPI, UniFFI, wasm-bindgen). Each binding tool
+SCP ships SDKs in four languages (Python, TypeScript, Swift, Kotlin)
+over three FFI bridges (PyO3, NAPI, UniFFI). Each binding tool
 has its own constraints. **Those constraints must not propagate across
 languages.** When a binding tool in language A forces an API shape, that
 shape is local to A — it does not become the universal shape for B, C, D.
@@ -20,8 +22,8 @@ single shape was a deliberate architectural goal. It wasn't. The shape came
 from Kotlin: `CoroutineBridge` requires object-bound coroutine scope, which
 made free-function APIs awkward to compose with structured concurrency.
 Python and TypeScript inherited Kotlin's shape without independent
-justification; Swift (UniFFI generator) and WASM (wasm-bindgen) opted out
-because they couldn't implement it. The "one surface" claim was Kotlin's
+justification; Swift (UniFFI generator) opted out
+because it couldn't implement it. The "one surface" claim was Kotlin's
 idiom dressed up as a project-wide architectural decision.
 
 ## The rules
