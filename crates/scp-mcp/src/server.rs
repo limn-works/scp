@@ -1245,6 +1245,14 @@ impl<P: ContextProvider> McpServer<P> {
         }
 
         if affected.tools {
+            // Deliberate asymmetry with the per-resource `resources/updated`
+            // re-authorization above, not an oversight: list-changed signals
+            // are content-free (no URI, no payload), and the re-read they
+            // prompt — `tools/list` / `resources/list` — is capability-
+            // filtered at request time, so they can name nothing the client
+            // may not see. A member's own revocation genuinely changes their
+            // filtered list, so notifying them is correct, not an activity
+            // oracle. Do NOT add per-event auth gating here.
             out.push(Self::tools_list_changed_notification());
             // The resource *set* is derived from `active_context_ids()`, and
             // the events classified as `tools` are exactly the membership and
@@ -1295,6 +1303,13 @@ impl<P: ContextProvider> McpServer<P> {
         // tool list, so signal both. `notifications_for_event` pairs
         // `tools/list_changed` with `resources/list_changed` for exactly those
         // events; the lag path, unable to tell which fired, must assume they did.
+        //
+        // Emitting them unconditionally — unlike the per-URI re-authorization
+        // below — is deliberate: list-changed signals are content-free, the
+        // re-read they prompt is capability-filtered at request time, and a
+        // member's own revocation genuinely changes their filtered list, so
+        // notifying them is correct, not an activity oracle. Do NOT add
+        // per-event auth gating here.
         let mut out = vec![
             Self::resources_list_changed_notification(),
             Self::tools_list_changed_notification(),
