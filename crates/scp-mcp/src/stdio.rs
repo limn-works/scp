@@ -282,9 +282,11 @@ async fn pump_events<P, C>(
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 // The dropped events are gone; nothing can reconstruct which
                 // resources they touched. Over-notify — one
-                // resources/list_changed plus one resources/updated per
-                // still-authorized subscription — so a lagged client re-reads,
-                // exactly as the pump promises. Never fall silent.
+                // resources/list_changed plus one tools/list_changed (the
+                // capability-filtered tool list may also have shifted) plus one
+                // resources/updated per still-authorized subscription — so a
+                // lagged client re-reads, exactly as the pump promises. Never
+                // fall silent.
                 tracing::warn!("MCP stdio event pump lagged, {skipped} events dropped");
                 let notifications = match server.lock() {
                     Ok(srv) => srv.lagged_resync_notifications(),

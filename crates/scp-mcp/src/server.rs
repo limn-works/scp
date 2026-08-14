@@ -365,15 +365,18 @@ impl std::fmt::Debug for ContextEventPump {
 ///   *and* the pump — produced together by [`McpServer::with_event_source`].
 /// - [`Self::Unwired`] holds a server whose flag is `false` and no pump.
 ///
-/// There is no seam at which a caller could hold the flag and the pump as two
-/// separable things, so one server's flag can never be paired with another
-/// server's pump. The old transports re-checked this pairing at entry and failed
-/// closed on a mismatch; that runtime guard is gone because the type now makes
-/// the mismatch unconstructable.
-///
-/// The variants are `#[non_exhaustive]` so only this crate can construct them:
-/// external callers obtain the bundle from [`McpServer::with_optional_event_source`]
-/// and hand it straight to a transport, never assembling one by hand.
+/// No transport or downstream (cross-crate) caller can separate a server's
+/// `resources.subscribe` advertisement from its delivery pump: the advertisement
+/// rides the server's `event_source_wired` *field* while the pump rides the enum
+/// *variant*, and [`McpServer::with_optional_event_source`] is the sole builder
+/// that ties the two together, [`Self::into_parts`] is `pub(crate)`, and the
+/// variants are `#[non_exhaustive]` so no external caller can assemble one by
+/// hand. Within `scp-mcp`, the field⟺variant correspondence is established at
+/// that single construction site — not enforced by the type system — and
+/// cross-checked by a `debug_assert!` in [`Self::into_parts`]. The old transports
+/// re-checked this pairing at entry and failed closed on a mismatch; that runtime
+/// guard is gone because the bundle is only ever built at the one site that keeps
+/// field and variant in sync.
 #[must_use = "hand this to a transport (run_stdio / run_sse) — dropping it leaves \
               a wired server's pump unspawned and resources.subscribe advertised \
               with nothing delivering notifications"]
@@ -398,8 +401,24 @@ impl<P: ContextProvider> McpServerForTransport<P> {
     /// one atomic argument.
     pub(crate) fn into_parts(self) -> (McpServer<P>, Option<ContextEventPump>) {
         match self {
-            Self::Unwired(server) => (server, None),
-            Self::Wired(server, pump) => (server, Some(pump)),
+            Self::Unwired(server) => {
+                // Defense-in-depth: the field⟺variant correspondence is
+                // established at the sole construction site
+                // (`with_optional_event_source`), not by the type system. Trip an
+                // internal mis-wrap in any debug/test build at zero release cost.
+                debug_assert!(
+                    !server.event_source_wired(),
+                    "Unwired bundle must hold a server that does not advertise resources.subscribe"
+                );
+                (server, None)
+            }
+            Self::Wired(server, pump) => {
+                debug_assert!(
+                    server.event_source_wired(),
+                    "Wired bundle must hold a server that advertises resources.subscribe"
+                );
+                (server, Some(pump))
+            }
         }
     }
 }
@@ -441,6 +460,12 @@ impl<P: ContextProvider> McpServer<P> {
     /// Because the flag and the pump are produced by this one call, the server
     /// is structurally unable to advertise a subscription it cannot deliver:
     /// there is no setter to desynchronize them.
+    ///
+    /// Prefer [`Self::with_optional_event_source`], which returns the
+    /// transport-ready bundle. This lower-level constructor exists for
+    /// cross-crate tests that inspect [`Self::event_source_wired`] directly; the
+    /// returned [`ContextEventPump`] cannot be handed to a transport.
+    #[doc(hidden)]
     pub fn with_event_source(
         provider: P,
         rx: broadcast::Receiver<ContextEventEnvelope>,
