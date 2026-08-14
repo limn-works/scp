@@ -35,11 +35,22 @@
 //!   test hook exists.
 //! * Budget / velocity are read back through the public `dispatch_query`
 //!   mailbox commands `RemainingBudgetForTest` / `VelocityForTest`.
-//! * The budget-rejection test passes a VALIDLY-SIGNED spending UCAN: signature
-//!   validation now runs BEFORE the budget gate, so an empty-signature token
-//!   would fail with a different (signature) error rather than reaching the
-//!   budget gate — which surfaces as `SCP-OUTLET-6150 economic.budget-exceeded`
-//!   (the canonical economic-class outlet code the caller observes).
+//! * The budget-rejection test passes a spending UCAN carrying a covering
+//!   `SpendingCapability` (`max_per_action` ≥ cost). The only UCAN check that
+//!   runs before the budget gate is the pre-budget capability-field check
+//!   (`economy_pre_check` → `check_outlet_spending_capability` →
+//!   `check_spending_capability`), which validates capability FIELDS only —
+//!   presence for a paid action and the `max_per_action` per-action limit — and
+//!   NOT the Ed25519 signature. Cryptographic signature validation
+//!   (`validate_spending_ucan_or_error`) runs LATER, inside the Class-S commit
+//!   combinator that executes only AFTER the budget gate passes; on the
+//!   zero-budget path it is never reached (an empty-signature token with the
+//!   same covering capability facts would hit the budget gate too and produce
+//!   the same rejection). The UCAN is validly signed only for realism and parity
+//!   with the happy-path helper, not because the signature is load-bearing on
+//!   this path. The rejection surfaces as `SCP-OUTLET-6150
+//!   economic.budget-exceeded` (the canonical economic-class outlet code the
+//!   caller observes).
 
 use std::sync::Arc;
 
@@ -490,9 +501,16 @@ async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
     let mut registry = OutletRegistry::new();
     registry.insert(echo_outlet());
 
-    // A validly-signed UCAN: signature validation now runs BEFORE the budget
-    // gate, so the rejection we assert is genuinely the budget gate, not a
-    // signature failure.
+    // A UCAN carrying a covering SpendingCapability (max_per_action ≥ cost). The
+    // only UCAN check before the budget gate is the pre-budget capability-field
+    // check (check_spending_capability), which validates capability FIELDS —
+    // presence + max_per_action — NOT the Ed25519 signature. Signature
+    // validation runs later, inside the Class-S commit combinator that executes
+    // only after the budget gate passes, so it is never reached on this
+    // zero-budget path: it is the covering capability facts (not the signature)
+    // that let control reach the budget gate, and the rejection we assert is
+    // genuinely the budget gate. The token is validly signed only for realism /
+    // parity with the happy-path helper.
     let spending_ucan = signed_spending_ucan_for(&invoker);
 
     let result = sup
