@@ -61,7 +61,7 @@ use scp_core::context::membership::ContextEventEnvelope;
 use crate::protocol::{
     JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, PARSE_ERROR, RequestId,
 };
-use crate::server::{ContextEventPump, ContextProvider, McpServer};
+use crate::server::{ContextEventPump, ContextProvider, McpServer, McpServerForTransport};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -124,24 +124,6 @@ pub enum SseError {
     /// An I/O error occurred starting or running the HTTP server.
     #[error("SSE server error: {0}")]
     Io(#[from] std::io::Error),
-
-    /// The server and pump are not a matched pair: a server that advertises
-    /// `resources.subscribe` arrived without its pump, or an unwired server
-    /// arrived with one. The two are produced together by
-    /// [`McpServer::with_event_source`](crate::server::McpServer::with_event_source);
-    /// this fails closed rather than serve an advertise-but-never-deliver lie
-    /// (wired, no pump) or run a delivery loop the server never advertised
-    /// (unwired, spare pump).
-    #[error(
-        "MCP SSE: server/pump mismatch (event_source_wired={wired}, pump_present={has_pump}); \
-         a wired server must be driven with its pump and an unwired server must not be given one"
-    )]
-    PumpServerMismatch {
-        /// Whether the server advertises `resources.subscribe`.
-        wired: bool,
-        /// Whether a pump was supplied.
-        has_pump: bool,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -397,20 +379,18 @@ async fn bearer_auth_middleware(
 ///
 /// # Resource subscriptions
 ///
-/// `server` and `pump` are a **matched pair produced at construction**:
-/// [`McpServer::with_event_source`](crate::server::McpServer::with_event_source)
-/// (and the `with_optional_event_source` convenience) yield the wired server and
-/// its [`ContextEventPump`] from one call. A wired server advertises
-/// `resources.subscribe: true`; its pump turns each [`ContextEvent`] into
-/// `notifications/resources/updated` for the subscribed resources it
-/// invalidates. An unwired server ([`McpServer::new`](crate::server::McpServer::new))
-/// advertises `resources.subscribe: false`, rejects `resources/subscribe`, and
-/// has no pump (`None`).
+/// `server` is the single [`McpServerForTransport`] bundle
+/// [`McpServer::with_optional_event_source`](crate::server::McpServer::with_optional_event_source)
+/// produces: a wired server *and* its [`ContextEventPump`] as one value, or an
+/// unwired server alone. A wired server advertises `resources.subscribe: true`;
+/// its pump turns each [`ContextEvent`] into `notifications/resources/updated`
+/// for the subscribed resources it invalidates. An unwired server
+/// ([`McpServer::new`](crate::server::McpServer::new)) advertises
+/// `resources.subscribe: false`, rejects `resources/subscribe`, and has no pump.
 ///
-/// The transport takes the two as *separate* arguments, so it MUST drive both.
-/// It verifies the pairing at entry and fails closed with
-/// [`SseError::PumpServerMismatch`] if a wired server arrives without its pump
-/// (an advertise-but-never-deliver lie) or an unwired server with one.
+/// The server's advertisement and its pump are one value, consumed atomically —
+/// a wired server cannot be transported without its pump, so there is no runtime
+/// pairing check to perform: the mismatch is unconstructable by type.
 ///
 /// # Sessions
 ///
@@ -420,28 +400,15 @@ async fn bearer_auth_middleware(
 /// # Errors
 ///
 /// Returns [`SseError::Io`] if the server cannot bind or encounters an I/O
-/// error, or [`SseError::PumpServerMismatch`] if `server` and `pump` are not a
-/// matched pair.
+/// error.
 pub async fn run_sse<P: ContextProvider + 'static>(
-    server: McpServer<P>,
+    server: McpServerForTransport<P>,
     config: SseConfig,
     shutdown: ShutdownHandle,
-    pump: Option<ContextEventPump>,
 ) -> Result<(), SseError> {
-    // Fail closed on a server/pump pairing the constructor could not have
-    // produced: `event_source_wired` must hold exactly when a pump is present.
-    // A wired server with no pump would advertise resources.subscribe with
-    // nothing delivering; an unwired server with a spare pump would run a
-    // delivery loop it never advertised. This catches multi-server mixups the
-    // `#[must_use]` on `ContextEventPump` cannot — it only forces the pump to be
-    // consumed *somewhere*, not driven with *its own* server.
-    let wired = server.event_source_wired();
-    if wired != pump.is_some() {
-        return Err(SseError::PumpServerMismatch {
-            wired,
-            has_pump: pump.is_some(),
-        });
-    }
+    // `Some(pump)` exactly when the server is wired — the bundle guarantees it,
+    // so no pairing check is needed here.
+    let (server, pump) = server.into_parts();
 
     let (router, pump) = router_with_pump(server, &config, pump);
     // Hold the pump under a guard that aborts it on EVERY exit from this future:
@@ -1267,7 +1234,8 @@ mod tests {
         let handle = ShutdownHandle::new();
 
         let run_handle = handle.clone();
-        let task = tokio::spawn(async move { run_sse(server, config, run_handle, None).await });
+        let bundle = McpServerForTransport::Unwired(server);
+        let task = tokio::spawn(async move { run_sse(bundle, config, run_handle).await });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.shutdown();
