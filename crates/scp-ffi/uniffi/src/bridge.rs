@@ -3330,9 +3330,25 @@ pub struct ContextHandle {
     /// Capability ceiling strings for UCAN mint-time enforcement (#339).
     pub(crate) ceiling_strings: Vec<String>,
     /// Outlet registry for this context.
-    pub(crate) outlet_registry: tokio::sync::Mutex<scp_core::context::outlets::OutletRegistry>,
+    ///
+    /// Deliberately a `std::sync::Mutex`, NOT `tokio::sync::Mutex`: every
+    /// holder takes the guard for a short, `.await`-free critical section, and
+    /// the sync [`scp_mcp::server::ContextProvider`] methods
+    /// (`McpUniFfiBridgeProvider::context_tools` / `validate_capability` /
+    /// `invoke_outlet`) run INSIDE the async MCP serve loop, where a tokio
+    /// `blocking_lock()` panics ("Cannot block the current thread from within
+    /// a runtime") and kills the serve task. A std mutex cannot express that
+    /// bug, and its `!Send` guard makes the compiler reject any future holder
+    /// that crosses an `.await` inside the `Send` futures the bridge spawns.
+    /// Poisoning is recovered via `PoisonError::into_inner` at every lock
+    /// site: critical sections perform single-step map/registry mutations, so
+    /// a panicking holder cannot leave partial state behind.
+    pub(crate) outlet_registry: std::sync::Mutex<scp_core::context::outlets::OutletRegistry>,
     /// Registered outlet handlers keyed by outlet ID.
-    pub(crate) outlet_handlers: tokio::sync::Mutex<OutletHandlerMap>,
+    ///
+    /// `std::sync::Mutex` for the same reasons as
+    /// [`Self::outlet_registry`] — see its field doc.
+    pub(crate) outlet_handlers: std::sync::Mutex<OutletHandlerMap>,
     /// Session store for stateful outlet sessions (spec section 6.2.1).
     pub(crate) session_store: tokio::sync::Mutex<scp_core::context::outlets::SessionStore>,
     /// Optional economic policy as a JSON string (§19.3, ADR-033).
@@ -4989,7 +5005,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let Some(handle) = registry.get(context_id) else {
             return Vec::new();
         };
-        let outlet_registry = handle.outlet_registry.blocking_lock();
+        let outlet_registry = handle
+            .outlet_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         outlet_registry
             .registrations()
             .map(|t| scp_mcp::server::ContextOutletInfo {
@@ -5043,7 +5062,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                         format!("context '{context_id}' not found in handle registry")
                     })?;
                 bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
-                let registry = handle.outlet_registry.blocking_lock();
+                let registry = handle
+                    .outlet_registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
                     format!("outlet '{outlet_name}' not registered in context '{context_id}'")
                 })?
@@ -5148,7 +5170,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             let handle = context_handle_registry(&bi)
                 .get(context_id)
                 .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
-            let registry = handle.outlet_registry.blocking_lock();
+            let registry = handle
+                .outlet_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             registry
                 .get(outlet_name)
                 .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind)
@@ -5197,7 +5222,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 .get(context_id)
                 .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
 
-            let outlet_registry = handle.outlet_registry.blocking_lock();
+            let outlet_registry = handle
+                .outlet_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let registration = outlet_registry.get(outlet_name).ok_or_else(|| {
                 format!("outlet '{outlet_name}' not found in context '{context_id}'")
             })?;
@@ -5212,7 +5240,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             let input_hash = scp_core::context::outlets::sha256_json(&arguments);
 
             let handler_dispatch = {
-                let outlet_handlers = handle.outlet_handlers.blocking_lock();
+                let outlet_handlers = handle
+                    .outlet_handlers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 outlet_handlers
                     .get(outlet_name)
                     .map(|handler| (handler.clone(), registration.schema.output_schema.clone()))
@@ -10227,10 +10258,10 @@ impl Scp {
                                 .map(|c| c.ucan_capability_name())
                         })
                         .collect(),
-                    outlet_registry: tokio::sync::Mutex::new(
+                    outlet_registry: std::sync::Mutex::new(
                         scp_core::context::outlets::OutletRegistry::new(),
                     ),
-                    outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                    outlet_handlers: std::sync::Mutex::new(std::collections::HashMap::new()),
                     session_store: tokio::sync::Mutex::new(
                         scp_core::context::outlets::SessionStore::new(),
                     ),
@@ -10642,10 +10673,10 @@ impl Scp {
                     // context binding — NOT caller input (there is none). Reuse the
                     // exact set already synced into the UCAN state above.
                     ceiling_strings: authed_ceiling.into_iter().collect(),
-                    outlet_registry: tokio::sync::Mutex::new(
+                    outlet_registry: std::sync::Mutex::new(
                         scp_core::context::outlets::OutletRegistry::new(),
                     ),
-                    outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                    outlet_handlers: std::sync::Mutex::new(std::collections::HashMap::new()),
                     session_store: tokio::sync::Mutex::new(
                         scp_core::context::outlets::SessionStore::new(),
                     ),
@@ -13432,7 +13463,7 @@ impl Scp {
                 });
 
                 let core_registration = scp_core::context::outlets::OutletRegistration {
-                    outlet_id: outlet_id.clone(),
+                    outlet_id,
                     // §5.4.2: caller-supplied semantic class selects the
                     // invocation capability stem (`outlet_query:` vs `outlet_call:`).
                     kind: definition.kind.into(),
@@ -13466,7 +13497,7 @@ impl Scp {
                     code: codes::OUTLET_6003.to_owned(),
                 })?;
 
-                let mut registry = handle.outlet_registry.lock().await;
+                let mut registry = handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (registered_id, _event) = scp_core::context::outlets::register_outlet(
                     &mut registry,
                     &role_state,
@@ -13547,7 +13578,7 @@ impl Scp {
                 // outlet's registered kind — `outlet_query:{id}` for Query
                 // outlets, `outlet_call:{id}` for Action outlets.
                 let outlet_kind_for_ucan = {
-                    let registry = handle.outlet_registry.lock().await;
+                    let registry = handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     registry
                         .get(&outlet_id)
                         .map(|r| r.kind)
@@ -13635,11 +13666,11 @@ impl Scp {
                 // `outlet_registry` mutex is released before Phase 1 of
                 // `invoke_outlet_with_economy` acquires the manager mutex.
                 let registry = {
-                    let reg = handle.outlet_registry.lock().await;
+                    let reg = handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     reg.clone()
                 };
                 let handler = {
-                    let handlers = handle.outlet_handlers.lock().await;
+                    let handlers = handle.outlet_handlers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     handlers.get(&outlet_id).cloned()
                 };
 
@@ -13839,7 +13870,7 @@ impl Scp {
                 // registered kind — the outlet being invoked lives in the
                 // target context.
                 let outlet_kind_for_ucan = {
-                    let registry = target_handle.outlet_registry.lock().await;
+                    let registry = target_handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     registry
                         .get(&outlet_id)
                         .map(|r| r.kind)
@@ -13871,7 +13902,7 @@ impl Scp {
                         code: codes::OUTLET_6002.to_owned(),
                     })?;
 
-                let registry = target_handle.outlet_registry.lock().await;
+                let registry = target_handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let registration = registry.get(&outlet_id).ok_or_else(|| ScpError::Outlet {
                     msg: format!(
                         "outlet '{outlet_id}' not found in target context '{}'",
@@ -13892,11 +13923,11 @@ impl Scp {
                 let output_schema = registration.schema.output_schema.clone();
                 drop(registry);
 
-                let handlers = target_handle.outlet_handlers.lock().await;
+                let handlers = target_handle.outlet_handlers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let output = if let Some(handler) = handlers.get(&outlet_id) {
                     let handler = handler.clone();
                     drop(handlers);
-                    let out = handler(input_value.clone()).map_err(|e| ScpError::Outlet {
+                    let out = handler(input_value).map_err(|e| ScpError::Outlet {
                         msg: format!("cross-context outlet handler for '{outlet_id}' failed: {e}"),
                         code: codes::OUTLET_6002.to_owned(),
                     })?;
@@ -14101,7 +14132,7 @@ impl Scp {
                 // `FnOnce` executor the supervisor runs supervisor-side at
                 // Commit-B (off the actor mailbox). Read directly off the
                 // owned `target_handle` — no DashMap `Ref` is held across the
-                // `outlet_handlers.lock().await`. Falls back to a schema-only
+                // `outlet_handlers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)`. Falls back to a schema-only
                 // echo when no handler is registered, matching the synchronous
                 // cross-context path. The supervisor validates the output
                 // against the outlet's registered output schema at Commit-B, so
@@ -14109,7 +14140,7 @@ impl Scp {
                 let handler = target_handle
                     .outlet_handlers
                     .lock()
-                    .await
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&outlet_registration_id)
                     .cloned();
                 let outlet_id_for_echo = outlet_registration_id.clone();
@@ -14302,7 +14333,7 @@ impl Scp {
                 // SCP-OUT-014: select the split capability stem from the
                 // session outlet's registered kind.
                 let outlet_kind_for_ucan = {
-                    let registry = handle.outlet_registry.lock().await;
+                    let registry = handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     registry
                         .get(&outlet_id_for_ucan)
                         .map(|r| r.kind)
@@ -14355,32 +14386,46 @@ impl Scp {
                         code: codes::OUTLET_6002.to_owned(),
                     })?;
 
-                // Validate input against outlet's input schema if outlet is registered.
-                let registry = handle.outlet_registry.lock().await;
-                if let Some(registration) = registry.get(&outlet_id) {
-                    scp_core::context::outlets::validate_value_against_schema(
-                        &input_value,
-                        &registration.schema.input_schema,
-                    )
-                    .map_err(|e| ScpError::Outlet {
-                        msg: format!("input validation failed: {e}"),
-                        code: codes::OUTLET_6002.to_owned(),
-                    })?;
+                // Validate input against outlet's input schema if outlet is
+                // registered. The registry guard is lexically scoped (a
+                // branch-arm `drop()` is not enough for the async lowering's
+                // conservative `Send` analysis) so it provably ends before the
+                // `session_store.lock().await` below.
+                {
+                    let registry = handle
+                        .outlet_registry
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(registration) = registry.get(&outlet_id) {
+                        scp_core::context::outlets::validate_value_against_schema(
+                            &input_value,
+                            &registration.schema.input_schema,
+                        )
+                        .map_err(|e| ScpError::Outlet {
+                            msg: format!("input validation failed: {e}"),
+                            code: codes::OUTLET_6002.to_owned(),
+                        })?;
+                    }
                 }
-                drop(registry);
 
-                // Execute via handler or echo mode.
-                let handlers = handle.outlet_handlers.lock().await;
-                let (new_state, output) = if let Some(handler) = handlers.get(&outlet_id) {
-                    let handler = handler.clone();
-                    drop(handlers);
+                // Execute via handler or echo mode. Snapshot the handler
+                // (`Arc<dyn Fn>` — a refcount bump) inside a lexical scope so
+                // the handlers guard ends before the handler runs and before
+                // the `session_store.lock().await` below.
+                let handler = {
+                    let handlers = handle
+                        .outlet_handlers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    handlers.get(&outlet_id).cloned()
+                };
+                let (new_state, output) = if let Some(handler) = handler {
                     let out = handler(input_value.clone()).map_err(|e| ScpError::Outlet {
                         msg: format!("outlet handler for '{outlet_id}' failed: {e}"),
                         code: codes::OUTLET_6002.to_owned(),
                     })?;
                     (current_state, out)
                 } else {
-                    drop(handlers);
                     let out = serde_json::json!({
                         "outlet": outlet_id,
                         "session_id": session_id,
@@ -14503,7 +14548,7 @@ impl Scp {
                     scp_core::context::ContextParams::default(),
                 );
 
-                let registry = handle.outlet_registry.lock().await;
+                let registry = handle.outlet_registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
                 let interface = scp_core::context::outlets::interface::expose_outlet(
                     context_handle.context_id(),
@@ -20523,10 +20568,10 @@ mod tests {
             callback_custody: None,
             signing_key: None,
             ceiling_strings: Vec::new(),
-            outlet_registry: tokio::sync::Mutex::new(
+            outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
-            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            outlet_handlers: std::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
@@ -20643,10 +20688,10 @@ mod tests {
             callback_custody: None,
             signing_key: Some(active_handle),
             ceiling_strings: Vec::new(),
-            outlet_registry: tokio::sync::Mutex::new(
+            outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
-            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            outlet_handlers: std::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
@@ -20805,10 +20850,10 @@ mod tests {
             callback_custody: None,
             signing_key: Some(active_handle),
             ceiling_strings: Vec::new(),
-            outlet_registry: tokio::sync::Mutex::new(
+            outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
-            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            outlet_handlers: std::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
@@ -20997,10 +21042,10 @@ mod tests {
             callback_custody: Some(callback_custody),
             signing_key: Some(key_handle),
             ceiling_strings: Vec::new(),
-            outlet_registry: tokio::sync::Mutex::new(
+            outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
-            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            outlet_handlers: std::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
@@ -21926,7 +21971,10 @@ mod tests {
             .await
             .expect("outlet_register should succeed");
 
-        let registry = handle.outlet_registry.lock().await;
+        let registry = handle
+            .outlet_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let reg = registry
             .get(&outlet_id)
             .expect("outlet should exist in registry after registration");
@@ -21964,7 +22012,10 @@ mod tests {
             .await
             .expect("outlet_register should succeed");
 
-        let registry = handle.outlet_registry.lock().await;
+        let registry = handle
+            .outlet_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let reg = registry.get(&outlet_id).expect("registered");
         assert_eq!(reg.kind, scp_core::context::outlets::OutletKind::Query);
     }
@@ -23115,6 +23166,120 @@ mod tests {
             server
                 .notifications_for_event("ctx-unserved", &message_sent_event())
                 .is_empty()
+        );
+    }
+
+    /// `tools/list` against a registry-backed context must survive dispatch
+    /// from the SHIPPED async serve context — a plain task on the tokio
+    /// runtime, exactly where `mcp_server_create` → `runtime().spawn` →
+    /// `run_mcp_stdio_server_uniffi` → `scp_mcp::stdio::run_stdio` invokes
+    /// `handle_request`. Deliberately NO `spawn_blocking` dodge: the sync
+    /// `ContextProvider` methods (`context_tools` first among them) run inside
+    /// the async loop in production, and a `tokio::sync::Mutex::blocking_lock`
+    /// there panics ("Cannot block the current thread from within a runtime"),
+    /// killing the serve task on the FIRST `tools/list` — stdio goes
+    /// permanently silent, every SSE tools POST dies. The
+    /// `ContextHandle::outlet_registry` / `outlet_handlers` fields are
+    /// `std::sync::Mutex` precisely so that failure mode is inexpressible;
+    /// this test pins it at the transport-dispatch level.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uniffi_mcp_tools_list_registry_backed_survives_shipped_async_dispatch() {
+        let scp = scp_test();
+        let bi = Arc::clone(&scp.inner);
+
+        // A live supervisor-backed context whose creator is the DID the MCP
+        // provider serves, with a ceiling wide enough that the creator-admin
+        // holds `outlet_call:*` — so `tools/list` both reads the outlet
+        // registry (`context_tools`) AND passes the role-state capability
+        // filter (`validate_capability`), the two provider paths that read
+        // the handle's outlet mutexes during listing.
+        bi.init_context_manager_with_did("did:dht:z6MkSubscriber");
+        bi.context_manager_or_error()
+            .expect("supervisor must be attached")
+            .clone()
+            .create_context(
+                "ctx-test".to_owned(),
+                scp_core::context::ContextParams {
+                    ceiling: vec![
+                        scp_core::context::roles::Capability::MessagesRead,
+                        scp_core::context::roles::Capability::MessagesWrite,
+                        scp_core::context::roles::Capability::OutletCallAll,
+                    ],
+                    ..scp_core::context::ContextParams::default()
+                },
+                scp_did::DID("did:dht:z6MkSubscriber".to_owned()),
+                None,
+            )
+            .await
+            .expect("context creation must succeed");
+
+        // Publish a registry-backed handle for that context — the exact state
+        // `McpUniFfiBridgeProvider::context_tools` reads — and register a real
+        // outlet into it through the shipped registration path.
+        let handle = test_handle_for(&scp);
+        register_context_handle(&bi, &handle);
+        let def = OutletDefinition {
+            name: "async-probe".to_owned(),
+            description: "pins async-dispatch outlet listing".to_owned(),
+            kind: OutletKind::Action,
+            input_schema_json:
+                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                    .to_owned(),
+            output_schema_json: r#"{"type":"object"}"#.to_owned(),
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: "did:dht:z6MkTestUser".to_owned(),
+            cost: None,
+        };
+        scp.outlet_register(Arc::clone(&handle), def)
+            .await
+            .expect("outlet_register must succeed");
+
+        let mut server = uniffi_mcp_server(&bi, vec!["ctx-test".to_owned()]);
+        let provider = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: "did:dht:z6MkSubscriber".to_owned(),
+            context_ids: vec!["ctx-test".to_owned()],
+            outlet_timeout_ms: UNIFFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+
+        // Drive the MCP exchange from a spawned async task — the same
+        // execution context as the shipped serve loop's dispatch.
+        let serve = tokio::spawn(async move {
+            let _ = advertised_subscribe(&mut server);
+            let response = server
+                .handle_request(&mcp_request(
+                    scp_mcp::protocol::METHOD_TOOLS_LIST,
+                    serde_json::json!({}),
+                ))
+                .expect("tools/list must produce a response");
+            // Also drive the registry-reading provider method directly in the
+            // async context: `tools/list` calls it for every active context,
+            // and this is the exact call that used to `blocking_lock`-panic.
+            use scp_mcp::server::ContextProvider as _;
+            let outlets = provider.context_tools("ctx-test");
+            (response, outlets)
+        });
+        let (response, outlets) = serve.await.expect(
+            "the MCP dispatch task must not panic — a panic here is the shipped \
+             serve loop dying on its first registry-backed tools/list",
+        );
+
+        assert!(
+            response.error.is_none(),
+            "tools/list must succeed, got: {:?}",
+            response.error
+        );
+        // With no agent UCAN the capability filter fails closed, so the
+        // MCP-visible tool list is empty — but the registry-backed read
+        // itself must have served the real registration.
+        assert!(
+            outlets.iter().any(|o| o.name == "async-probe"),
+            "context_tools must serve the registered outlet from the handle \
+             registry, got: {:?}",
+            outlets.iter().map(|o| o.name.clone()).collect::<Vec<_>>()
         );
     }
 
@@ -24398,10 +24563,10 @@ mod tests {
             callback_custody: Some(callback_custody),
             signing_key: Some(signing_key),
             ceiling_strings: Vec::new(),
-            outlet_registry: tokio::sync::Mutex::new(
+            outlet_registry: std::sync::Mutex::new(
                 scp_core::context::outlets::OutletRegistry::new(),
             ),
-            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            outlet_handlers: std::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
@@ -25258,7 +25423,7 @@ mod tests {
                 .expect("target context B must be registered")
                 .outlet_handlers
                 .lock()
-                .await
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(outlet_id.clone(), handler);
 
             // Establish the bidirectionally-approved interface in A via governance.

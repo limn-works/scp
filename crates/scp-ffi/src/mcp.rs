@@ -3768,6 +3768,224 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // FfiBridgeProvider::validate_resource_access — answered from real role
+    // state (#1341 parity with the NAPI and UniFFI providers)
+    // -----------------------------------------------------------------------
+
+    /// Builds an [`FfiBridgeProvider`] over `bi` serving `context_id` on
+    /// behalf of `agent_did`, with no UCAN material.
+    fn pyo3_mcp_provider(
+        bi: &std::sync::Arc<crate::runtime::PyBridgeInstance>,
+        context_id: &str,
+        agent_did: &str,
+    ) -> FfiBridgeProvider {
+        FfiBridgeProvider {
+            bi: Arc::downgrade(bi),
+            agent_did: agent_did.to_owned(),
+            context_ids: vec![context_id.to_owned()],
+            outlet_timeout_ms: FFI_OUTLET_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        }
+    }
+
+    fn mcp_request(method: &str, params: serde_json::Value) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: scp_mcp::protocol::JSONRPC_VERSION.to_owned(),
+            method: method.to_owned(),
+            params: Some(params),
+            id: scp_mcp::protocol::RequestId::Number(1),
+        }
+    }
+
+    /// Completes the MCP handshake and returns the advertised
+    /// `capabilities.resources.subscribe` flag.
+    fn initialize_and_read_subscribe_flag(server: &mut McpServer<FfiBridgeProvider>) -> bool {
+        let response = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_INITIALIZE,
+                serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "pyo3-test" },
+                }),
+            ))
+            .expect("initialize must produce a response");
+        let result = response.result.expect("initialize must succeed");
+        result["capabilities"]["resources"]["subscribe"]
+            .as_bool()
+            .expect("resources.subscribe must be advertised as a bool")
+    }
+
+    /// `validate_resource_access` answers from the context's REAL role state:
+    /// the creator (an admin holding `messages:read` under the default
+    /// ceiling) reads every resource; a non-member is denied — the gate is
+    /// real, not a blanket allow.
+    #[test]
+    fn ffi_bridge_provider_validates_resource_access_from_role_state() {
+        use scp_mcp::server::ResourceKind;
+
+        let creator = "did:dht:z6MkCreatorResAccess";
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false);
+
+        let provider = pyo3_mcp_provider(&bi, &ctx_id, creator);
+        for kind in [
+            ResourceKind::Events,
+            ResourceKind::Members,
+            ResourceKind::Tools,
+        ] {
+            assert!(
+                provider.validate_resource_access(&ctx_id, kind).is_ok(),
+                "the context creator must be able to read scp://{ctx_id}/{}",
+                kind.uri_suffix()
+            );
+        }
+
+        // Negative control: a DID that is not a member of the context is
+        // denied every resource — `Events`/`Members` for lack of
+        // `messages:read`, `Tools` for lack of membership.
+        let outsider = pyo3_mcp_provider(&bi, &ctx_id, "did:dht:z6MkNotAMember");
+        for kind in [
+            ResourceKind::Events,
+            ResourceKind::Members,
+            ResourceKind::Tools,
+        ] {
+            assert!(
+                outsider.validate_resource_access(&ctx_id, kind).is_err(),
+                "a non-member must not be able to read scp://{ctx_id}/{}",
+                kind.uri_suffix()
+            );
+        }
+
+        // Unknown context: fails closed rather than defaulting open.
+        assert!(
+            provider
+                .validate_resource_access("ctx-does-not-exist", ResourceKind::Events)
+                .is_err(),
+            "an unknown context must be denied"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Resource subscriptions (#1341): honest advertisement + delivery.
+    // Mirrors the NAPI (`mcp_subscribe_*_napi`) and UniFFI test pairs — PyO3
+    // is the reference bridge, so it carries the same pair.
+    // -----------------------------------------------------------------------
+
+    /// Negative half of #1341. With no event receiver wired — what
+    /// `py_mcp_serve` produces when `Supervisor::subscribe_events()` yields
+    /// `None` — the server must advertise `resources.subscribe: false` AND
+    /// reject `resources/subscribe` with a typed `METHOD_NOT_FOUND`, never
+    /// accept-and-drop.
+    #[test]
+    fn mcp_subscribe_rejected_when_no_event_source_wired_pyo3() {
+        let creator = "did:dht:z6MkSubUnwired";
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false);
+        let uri = format!("scp://{ctx_id}/events");
+
+        let mut server = McpServer::new(pyo3_mcp_provider(&bi, &ctx_id, creator));
+        assert!(
+            !server.event_source_wired(),
+            "a server built by McpServer::new must fail closed on subscriptions"
+        );
+        assert!(
+            !initialize_and_read_subscribe_flag(&mut server),
+            "an unwired server must advertise resources.subscribe: false"
+        );
+
+        let response = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_RESOURCES_SUBSCRIBE,
+                serde_json::json!({ "uri": uri }),
+            ))
+            .expect("resources/subscribe must produce a response");
+        let error = response
+            .error
+            .expect("resources/subscribe must be rejected when no event source is wired");
+        assert_eq!(
+            error.code,
+            scp_mcp::protocol::METHOD_NOT_FOUND,
+            "rejection must be a typed method-not-found, got: {error:?}"
+        );
+        assert!(
+            !server.is_subscribed(&uri),
+            "a rejected subscribe must not register a subscription"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    /// Positive half of #1341. Wired with the REAL
+    /// `Supervisor::subscribe_events()` receiver — the exact source
+    /// `py_mcp_serve` hands to `McpServer::with_optional_event_source` — the
+    /// server advertises the capability, accepts the subscription, and
+    /// `notifications_for_event` (the function the transport pump drives per
+    /// received event) emits a real `notifications/resources/updated`.
+    #[test]
+    fn mcp_subscribe_delivers_notifications_when_event_source_wired_pyo3() {
+        let creator = "did:dht:z6MkSubWired";
+        let bi = __bi();
+        // `setup_test_context` attaches the supervisor (register_context →
+        // init_context_manager_for_test), whose event broadcast channel is
+        // always enabled.
+        let ctx_id = setup_test_context(&bi, creator, false);
+        let uri = format!("scp://{ctx_id}/events");
+
+        let receiver = crate::runtime::supervisor(&bi)
+            .expect("supervisor must be attached after setup_test_context")
+            .subscribe_events()
+            .expect("the PyO3 supervisor must expose a context event receiver");
+        // `with_event_source` is what `with_optional_event_source(Some(rx))`
+        // routes to; the bundle's `into_parts` is crate-private to scp-mcp,
+        // so cross-crate tests use the lower-level pair constructor.
+        let (mut server, _pump) =
+            McpServer::with_event_source(pyo3_mcp_provider(&bi, &ctx_id, creator), receiver);
+
+        assert!(
+            initialize_and_read_subscribe_flag(&mut server),
+            "a wired server must advertise resources.subscribe: true"
+        );
+
+        let response = server
+            .handle_request(&mcp_request(
+                scp_mcp::protocol::METHOD_RESOURCES_SUBSCRIBE,
+                serde_json::json!({ "uri": uri }),
+            ))
+            .expect("resources/subscribe must produce a response");
+        assert!(
+            response.error.is_none(),
+            "subscribe must succeed on a wired server, got: {:?}",
+            response.error
+        );
+        assert!(server.is_subscribed(&uri));
+
+        // `ContextEvent::Expired` invalidates the events/members/tools
+        // resources, so the pump must push an update for the subscribed URI.
+        let notifications = server.notifications_for_event(
+            &ctx_id,
+            &scp_core::context::membership::ContextEvent::Expired,
+        );
+        assert!(
+            notifications.iter().any(|n| {
+                n.method == scp_mcp::protocol::METHOD_RESOURCES_UPDATED
+                    && n.params
+                        .as_ref()
+                        .and_then(|p| p.get("uri"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(uri.as_str())
+            }),
+            "a subscribed resource must receive notifications/resources/updated, \
+             got: {notifications:?}"
+        );
+
+        crate::runtime::remove_context(&bi, &ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
     // #1549 round-2 regression: FfiBridgeProvider must hold a `Weak`, not
     // an `Arc`, so the MCP server task cannot pin `PyBridgeInstance` alive
     // past the caller's last `Arc` drop.
@@ -3850,6 +4068,26 @@ mod tests {
             vc.unwrap_err().contains("bridge instance has been dropped"),
             "error must mention the dropped bridge"
         );
+
+        // validate_resource_access: fails closed for every resource kind —
+        // a resource whose role state can no longer be read must be denied,
+        // never silently admitted.
+        for kind in [
+            scp_mcp::server::ResourceKind::Events,
+            scp_mcp::server::ResourceKind::Members,
+            scp_mcp::server::ResourceKind::Tools,
+        ] {
+            let vra = provider.validate_resource_access("ctx-dropped", kind);
+            assert!(
+                vra.is_err(),
+                "validate_resource_access must reject {kind:?} when bridge is dropped"
+            );
+            assert!(
+                vra.unwrap_err()
+                    .contains("bridge instance has been dropped"),
+                "error must mention the dropped bridge"
+            );
+        }
 
         // active_context_ids: empty. It now resolves live participation
         // through the bridge, so a dropped instance means nothing is served —

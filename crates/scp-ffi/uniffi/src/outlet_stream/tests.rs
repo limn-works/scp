@@ -387,7 +387,7 @@ async fn live_poll_next_drains_to_terminal() {
     handle
         .outlet_handlers
         .lock()
-        .await
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(outlet_id.clone(), handler);
 
     // Make the invoker a real member (clears §9.8.5) and grant it OutletCallAll
@@ -595,7 +595,7 @@ mod streaming_vectors_live {
         handle
             .outlet_handlers
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(outlet_id.clone(), handler);
 
         let supervisor = Arc::clone(
