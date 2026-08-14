@@ -379,13 +379,17 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
     // Fully signed UCAN bound to the invoker, matching mock_key_resolver.
     let spending_ucan = signed_spending_ucan_for(&invoker);
 
-    // Snapshot pre-call state.
+    // Snapshot pre-call state. The baseline velocity is read with a pre-call
+    // anchor; the "after" read (below) re-anchors AFTER the invocation so the
+    // 60s sliding window is guaranteed to cover the entry the call records even
+    // if the invocation crossed a wall-clock second boundary — otherwise a stale
+    // pre-call anchor could flake the comparison.
     let budget_before = remaining_budget(&sup, context_id, &invoker).await;
-    let now_secs = std::time::SystemTime::now()
+    let now_secs_before = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let velocity_before = velocity(&sup, context_id, &invoker, now_secs).await;
+    let velocity_before = velocity(&sup, context_id, &invoker, now_secs_before).await;
 
     // THE CRITICAL CALL — exactly the path the 3 FFI bridges route through.
     let outcome = sup
@@ -423,8 +427,13 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
         budget_after.value()
     );
 
-    // Velocity was recorded.
-    let velocity_after = velocity(&sup, context_id, &invoker, now_secs).await;
+    // Velocity was recorded. Re-anchor AFTER the call so the sliding window
+    // covers the just-recorded entry regardless of second-boundary timing.
+    let now_secs_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let velocity_after = velocity(&sup, context_id, &invoker, now_secs_after).await;
     assert!(
         velocity_after > velocity_before,
         "invoke_outlet_with_economy must record one velocity entry per call \
