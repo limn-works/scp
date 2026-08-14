@@ -179,6 +179,31 @@ impl Default for ShutdownHandle {
 #[derive(Clone)]
 pub(crate) struct McpNotifier {
     /// Broadcast sender for SSE messages to connected clients.
+    ///
+    /// **Shared across sequential sessions, not minted per session.** This
+    /// sender lives on [`AppState`] for the server's whole lifetime; each
+    /// admitted session subscribes a fresh receiver, but they all draw from
+    /// this one sender. Cross-session non-leakage therefore does *not* come
+    /// from channel identity — it comes from two facts that hold together,
+    /// both serialized on the `state.server` mutex:
+    /// 1. every server→client emission is computed *and* broadcast inside that
+    ///    mutex's critical section (see [`message_handler`] and [`pump_events`]),
+    ///    and
+    /// 2. [`reset_session`](McpServer::reset_session) runs under the *same*
+    ///    mutex at admission (see [`sse_handler`]).
+    ///
+    /// Even in the interleaving where a POST parked on the lock acquires it
+    /// just after a reset, `handle_request` then runs with `initialized ==
+    /// false` and returns only a "not initialized" error carrying no principal
+    /// content — so no prior session's decrypted data (member lists, tool
+    /// outputs, resource reads) can cross to the next client on this shared
+    /// channel.
+    ///
+    /// **Load-bearing:** this safety holds only while `reset_session` stays
+    /// atomic w.r.t. the server lock *and* emission never moves outside it. If
+    /// either changes, the shared channel becomes a cross-principal exposure
+    /// vector, and the fix at that point is per-session channel identity — mint
+    /// the channel at admission, drop it at reset.
     tx: broadcast::Sender<(u64, String)>,
     /// Monotonically increasing event ID counter.
     ///
@@ -444,6 +469,14 @@ async fn sse_handler<P: ContextProvider + 'static>(
     // admission itself the guarantee: a freshly admitted client can never
     // inherit another session's handshake or subscriptions, nor lose its own
     // to a stale reset that was scheduled but had not yet run.
+    //
+    // This reset is also the second half of the shared-broadcast-channel
+    // invariant documented on `McpNotifier::tx`: because it runs under the same
+    // `state.server` mutex that every emission serializes on, and post-reset
+    // `handle_request` is init-gated (returns only a "not initialized" error
+    // with no principal content until re-`initialize`), the broadcast channel
+    // shared across sessions never leaks one principal's decrypted responses to
+    // the next.
     state.server.lock().await.reset_session();
 
     let endpoint_event = Event::default()
@@ -532,6 +565,12 @@ async fn sse_handler<P: ContextProvider + 'static>(
 /// disconnect->reset->readmit window, delivering this principal's decrypted
 /// result (member lists, tool outputs, resource reads) to a *different*, later
 /// client.
+///
+/// The "computed under the lock" half is exact for the request and notification
+/// arms; the parse-error arm is the one exception — its response is parsed
+/// *before* the lock and only the broadcast is serialized under it. That is
+/// sound because the echoed input carries no session state or principal content
+/// (see the inner comment on that arm), so only the send needs ordering.
 async fn message_handler<P: ContextProvider + 'static>(
     State(state): State<Arc<AppState<P>>>,
     body: String,
