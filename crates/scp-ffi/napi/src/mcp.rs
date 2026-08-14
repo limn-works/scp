@@ -24,7 +24,7 @@ use napi_derive::napi;
 use scp_mcp::allowlist;
 use scp_mcp::client::{McpClient, McpTransport};
 use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
-use scp_mcp::server::{ContextEventPump, ContextProvider};
+use scp_mcp::server::{ContextProvider, McpServerForTransport};
 
 use crate::error::ScpNapiError;
 use crate::runtime::NapiBridgeInstance;
@@ -576,20 +576,28 @@ fn resource_access_from_role_state(
 /// bare `JsonRpcRequest` decode rejects them) and keeps stdout serialized
 /// between responses and subscription notifications.
 ///
-/// `pump` carries the honesty invariant: it exists only for a server built by
-/// `McpServer::with_event_source`, which is the only constructor that
-/// advertises `resources/subscribe`. `None` means the server was built by
-/// `McpServer::new`, advertises `resources.subscribe: false`, and rejects the
-/// request with a typed error. The capability cannot be advertised without the
-/// machinery, because one call produces both.
+/// `server` is the [`McpServerForTransport`] bundle: it carries its pump iff it
+/// advertises `resources/subscribe`. The bundle is built by
+/// `McpServer::with_optional_event_source`, so the advertised capability and the
+/// pump that honours it are one value — the loop cannot be handed one without the
+/// other.
+///
+/// Both `shutdown_rx` (`mcp_server_stop`) AND the bridge instance's
+/// `cancel_token` (`emergency_cancel_tasks` from `Drop`) terminate this task, so
+/// a caller that drops `Scp` without calling `mcp_server_stop` still tears the
+/// server and its pump down (#1549 round-2) — matching the SSE path and the
+/// PyO3/UniFFI bridges.
 async fn run_mcp_stdio_server(
-    server: Arc<Mutex<scp_mcp::server::McpServer<McpNapiBridgeProvider>>>,
+    server: McpServerForTransport<McpNapiBridgeProvider>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-    pump: Option<ContextEventPump>,
+    cancel_token: tokio_util::sync::CancellationToken,
 ) {
     tokio::select! {
         _ = shutdown_rx => {}
-        result = scp_mcp::stdio::run_stdio(&server, pump) => {
+        () = cancel_token.cancelled() => {
+            tracing::debug!("MCP stdio server task exiting — bridge instance cancelled");
+        }
+        result = scp_mcp::stdio::run_stdio(server) => {
             if let Err(e) = result {
                 tracing::error!("MCP stdio server error: {e}");
             }
@@ -664,25 +672,40 @@ pub(crate) async fn mcp_server_create_on(
         agent_did: config.identity_did,
         context_ids: config.context_ids,
     };
-    // One call decides both the advertisement and the delivery machinery.
-    let (server, pump) =
-        scp_mcp::server::McpServer::with_optional_event_source(provider, context_events);
+    // One call decides both the advertisement and the delivery machinery, folded
+    // into one `McpServerForTransport` bundle.
+    let server = scp_mcp::server::McpServer::with_optional_event_source(provider, context_events);
+
+    // The bridge instance's cancel token fires on `emergency_cancel_tasks()`
+    // from `Drop`, so an instance dropped without an explicit `mcp_server_stop`
+    // still tears down both the stdio and the SSE server + pump (#1549 round-2).
+    let cancel_token = bi.core.cancel_token();
 
     let task_handle = crate::runtime().spawn(async move {
         match transport_mode.as_str() {
             "stdio" => {
-                run_mcp_stdio_server(Arc::new(Mutex::new(server)), shutdown_rx, pump).await;
+                run_mcp_stdio_server(server, shutdown_rx, cancel_token).await;
             }
             "sse" => {
                 let sse_config =
                     scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
                 let sse_shutdown = scp_mcp::sse::ShutdownHandle::new();
                 let sse_shutdown_trigger = sse_shutdown.clone();
+                // Wire both `shutdown_rx` (mcp_server_stop) AND the bridge
+                // instance's `cancel_token` (emergency_cancel_tasks from Drop) so
+                // either signal tears down the SSE server + pump. Without the
+                // cancel_token arm, a caller that drops `Scp` without calling
+                // `mcp_server_stop` would leave this task running indefinitely
+                // (#1549 round-2), matching the stdio path and the PyO3/UniFFI
+                // bridges.
                 tokio::spawn(async move {
-                    let _ = shutdown_rx.await;
+                    tokio::select! {
+                        _ = shutdown_rx => {}
+                        () = cancel_token.cancelled() => {}
+                    }
                     sse_shutdown_trigger.shutdown();
                 });
-                let result = scp_mcp::sse::run_sse(server, sse_config, sse_shutdown, pump).await;
+                let result = scp_mcp::sse::run_sse(server, sse_config, sse_shutdown).await;
                 if let Err(e) = result {
                     tracing::error!("MCP SSE server error: {e}");
                 }

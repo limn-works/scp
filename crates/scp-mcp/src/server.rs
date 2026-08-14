@@ -320,16 +320,17 @@ pub struct McpServer<P: ContextProvider> {
 /// The receiving half of a wired [`ContextEvent`] source, produced by
 /// [`McpServer::with_event_source`] together with the server it feeds.
 ///
-/// **Pairing holds at construction.** This one call is the only way to obtain a
-/// server that advertises `resources.subscribe: true`, and it always hands back
-/// the pump alongside it — there is no setter that could produce the flag
-/// without the pump, or the pump without the flag. The two values are still
-/// passed *separately* to a transport ([`run_stdio`](crate::stdio::run_stdio) /
-/// [`run_sse`](crate::sse::run_sse)), so the transport does not get the pairing
-/// for free: it MUST drive both, and it re-checks the pairing at entry, failing
-/// closed if a wired server arrives without its pump (or an unwired server with
-/// one). Dropping the pump unspawned is additionally a bug the `#[must_use]`
-/// catches at compile time.
+/// **Pairing holds by construction.** [`McpServer::with_event_source`] is the
+/// only way to obtain a server that advertises `resources.subscribe: true`, and
+/// it always hands back the pump alongside it — there is no setter that could
+/// produce the flag without the pump, or the pump without the flag.
+/// [`McpServer::with_optional_event_source`] folds the two into a single
+/// [`McpServerForTransport`] value so a wired server and its pump are one thing,
+/// consumed atomically by a transport ([`run_stdio`](crate::stdio::run_stdio) /
+/// [`run_sse`](crate::sse::run_sse)): a wired server cannot be transported
+/// without its pump, and there is no seam at which a caller could pair one
+/// server's flag with another server's pump. Dropping the pump unspawned is
+/// additionally a bug the `#[must_use]` catches at compile time.
 #[must_use = "hand this to a transport (run_stdio / run_sse) — dropping it leaves \
               resources.subscribe advertised with nothing delivering notifications"]
 pub struct ContextEventPump {
@@ -347,6 +348,68 @@ impl ContextEventPump {
 impl std::fmt::Debug for ContextEventPump {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ContextEventPump")
+    }
+}
+
+/// A fully-built [`McpServer`] bound for a transport, carrying its
+/// [`ContextEventPump`] iff it advertises `resources.subscribe`.
+///
+/// This is the single value [`McpServer::with_optional_event_source`] returns
+/// and the single value [`run_stdio`](crate::stdio::run_stdio) /
+/// [`run_sse`](crate::sse::run_sse) consume. Folding "the server (with its
+/// advertisement flag)" and "the pump that honours the advertisement" into one
+/// enum makes the invariant **advertised ⟺ pump present** hold *by
+/// construction*:
+///
+/// - [`Self::Wired`] holds a server whose `event_source_wired` flag is `true`
+///   *and* the pump — produced together by [`McpServer::with_event_source`].
+/// - [`Self::Unwired`] holds a server whose flag is `false` and no pump.
+///
+/// There is no seam at which a caller could hold the flag and the pump as two
+/// separable things, so one server's flag can never be paired with another
+/// server's pump. The old transports re-checked this pairing at entry and failed
+/// closed on a mismatch; that runtime guard is gone because the type now makes
+/// the mismatch unconstructable.
+///
+/// The variants are `#[non_exhaustive]` so only this crate can construct them:
+/// external callers obtain the bundle from [`McpServer::with_optional_event_source`]
+/// and hand it straight to a transport, never assembling one by hand.
+#[must_use = "hand this to a transport (run_stdio / run_sse) — dropping it leaves \
+              a wired server's pump unspawned and resources.subscribe advertised \
+              with nothing delivering notifications"]
+pub enum McpServerForTransport<P: ContextProvider> {
+    /// A server with no event source: advertises `resources.subscribe: false`
+    /// and carries no pump.
+    #[non_exhaustive]
+    Unwired(McpServer<P>),
+    /// A server wired to a live event source: advertises
+    /// `resources.subscribe: true` and carries the pump that delivers its
+    /// notifications.
+    #[non_exhaustive]
+    Wired(McpServer<P>, ContextEventPump),
+}
+
+impl<P: ContextProvider> McpServerForTransport<P> {
+    /// Splits the bundle into the server and its optional pump for a transport's
+    /// delivery loop. `Some` exactly when the server advertises subscriptions.
+    ///
+    /// Crate-internal: the transports are the only consumers, and keeping the
+    /// single `match` here is what lets `run_stdio`/`run_sse` take the bundle as
+    /// one atomic argument.
+    pub(crate) fn into_parts(self) -> (McpServer<P>, Option<ContextEventPump>) {
+        match self {
+            Self::Unwired(server) => (server, None),
+            Self::Wired(server, pump) => (server, Some(pump)),
+        }
+    }
+}
+
+impl<P: ContextProvider> std::fmt::Debug for McpServerForTransport<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unwired(_) => f.write_str("McpServerForTransport::Unwired"),
+            Self::Wired(..) => f.write_str("McpServerForTransport::Wired"),
+        }
     }
 }
 
@@ -392,24 +455,28 @@ impl<P: ContextProvider> McpServer<P> {
         (server, ContextEventPump { rx })
     }
 
-    /// Creates an MCP server from an *optional* event source.
+    /// Creates an MCP server from an *optional* event source, returning the
+    /// transport-ready [`McpServerForTransport`] bundle.
     ///
     /// Convenience for bridge code holding
     /// `Option<broadcast::Receiver<ContextEventEnvelope>>` from
     /// `Supervisor::subscribe_events()`: `Some` routes to
-    /// [`Self::with_event_source`], `None` to [`Self::new`]. The returned
-    /// `Option<ContextEventPump>` is `Some` exactly when the server advertises
-    /// subscriptions.
+    /// [`Self::with_event_source`] and yields [`McpServerForTransport::Wired`]
+    /// (server-with-flag-true paired with its pump); `None` routes to
+    /// [`Self::new`] and yields [`McpServerForTransport::Unwired`]
+    /// (server-with-flag-false, no pump). The advertised capability and the pump
+    /// that honours it travel as one value, so a transport cannot receive one
+    /// without the other.
     pub fn with_optional_event_source(
         provider: P,
         rx: Option<broadcast::Receiver<ContextEventEnvelope>>,
-    ) -> (Self, Option<ContextEventPump>) {
+    ) -> McpServerForTransport<P> {
         match rx {
             Some(rx) => {
                 let (server, pump) = Self::with_event_source(provider, rx);
-                (server, Some(pump))
+                McpServerForTransport::Wired(server, pump)
             }
-            None => (Self::new(provider), None),
+            None => McpServerForTransport::Unwired(Self::new(provider)),
         }
     }
 
@@ -501,10 +568,12 @@ impl<P: ContextProvider> McpServer<P> {
 
         // Every advertised capability below is *derived* from
         // `event_source_wired`, never asserted. `notifications/tools/list_changed`
-        // and `notifications/resources/list_changed` have exactly one production
-        // emitter — `notifications_for_event`, driven by the pump — so without an
-        // event source they can never be sent, and claiming otherwise is the same
-        // false guarantee `resources.subscribe: true` used to make.
+        // and `notifications/resources/list_changed` are advertised iff wired; the
+        // pump — through `notifications_for_event` on a live event and through
+        // `lagged_resync_notifications` after a broadcast lag — is their only
+        // producer, so without an event source they can never be sent, and
+        // claiming otherwise is the same false guarantee `resources.subscribe:
+        // true` used to make.
         let wired = self.event_source_wired;
         let result = InitializeResult {
             protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
@@ -1167,9 +1236,15 @@ impl<P: ContextProvider> McpServer<P> {
     /// they touched — so instead of falling silent (which would strand the
     /// client on stale state with no signal to re-read), the pump *over-notifies*:
     /// one `notifications/resources/list_changed` (the served resource set may
-    /// have changed) plus one `notifications/resources/updated` per still-authorized
-    /// subscription. A lagged client then re-reads exactly the resources it cares
-    /// about.
+    /// have changed) and one `notifications/tools/list_changed` (the
+    /// capability-filtered tool list may have changed — the dropped events could
+    /// include the membership/lifecycle/capability transitions that
+    /// [`Self::notifications_for_event`] pairs a `tools/list_changed` with),
+    /// plus one `notifications/resources/updated` per still-authorized
+    /// subscription. A lagged client then re-reads exactly the resources — and
+    /// the tool list — it cares about. Emitting `tools/list_changed` here is
+    /// oracle-safe: `tools/list` is capability-filtered on re-read, so it names
+    /// nothing the agent may not invoke.
     ///
     /// Each subscribed URI is re-authorized through the same participation +
     /// [`ContextProvider::validate_resource_access`] check
@@ -1187,7 +1262,16 @@ impl<P: ContextProvider> McpServer<P> {
             return Vec::new();
         }
 
-        let mut out = vec![Self::resources_list_changed_notification()];
+        // Over-notify on the two list-changed channels the pump advertises: a
+        // lag can hide the membership/lifecycle/capability events that would have
+        // invalidated both the served resource set AND the capability-filtered
+        // tool list, so signal both. `notifications_for_event` pairs
+        // `tools/list_changed` with `resources/list_changed` for exactly those
+        // events; the lag path, unable to tell which fired, must assume they did.
+        let mut out = vec![
+            Self::resources_list_changed_notification(),
+            Self::tools_list_changed_notification(),
+        ];
 
         for uri in &self.subscriptions {
             let Ok((context_id, kind)) = parse_resource_uri(uri) else {
@@ -2345,8 +2429,8 @@ mod tests {
 
     /// On a broadcast lag the pump must NOT fall silent: it over-notifies so a
     /// lagged client re-reads. `lagged_resync_notifications` returns one
-    /// `resources/list_changed` plus one `resources/updated` per still-authorized
-    /// subscription.
+    /// `resources/list_changed`, one `tools/list_changed`, plus one
+    /// `resources/updated` per still-authorized subscription.
     #[test]
     fn lagged_resync_over_notifies_every_authorized_subscription() {
         let mut server = subscribing_server(MockProvider::default());
@@ -2369,6 +2453,39 @@ mod tests {
         assert!(updated.contains(&"scp://ctx_a/events"));
         assert!(updated.contains(&"scp://ctx_a/members"));
         assert_eq!(updated.len(), 2, "one updated per subscription, no more");
+    }
+
+    /// A lag can hide the membership/lifecycle/capability events that invalidate
+    /// the capability-filtered tool list, so the resync must also emit
+    /// `tools/list_changed` — otherwise a client that lags during membership or
+    /// capability churn keeps a stale `tools/list` with no signal to re-read it.
+    /// The normal path (`notifications_for_event`) always pairs
+    /// `tools/list_changed` with `resources/list_changed`; the lag path must not
+    /// drop that pairing. `tools/list` is capability-filtered on re-read, so the
+    /// over-notification is oracle-safe.
+    #[test]
+    fn lagged_resync_signals_tools_list_changed() {
+        let mut server = subscribing_server(MockProvider::default());
+        subscribe(&mut server, "scp://ctx_a/events");
+
+        let notifs = server.lagged_resync_notifications();
+
+        assert!(
+            notifs
+                .iter()
+                .any(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED),
+            "a lagged client must be told its tool list may be stale — a lag can \
+             hide the very membership/capability events that invalidate it"
+        );
+        // Exactly one, paired with the single resources/list_changed.
+        assert_eq!(
+            notifs
+                .iter()
+                .filter(|n| n.method == protocol::METHOD_TOOLS_LIST_CHANGED)
+                .count(),
+            1,
+            "one tools/list_changed on the resync, no more"
+        );
     }
 
     /// The lag path re-authorizes each subscription, so a subscription whose
