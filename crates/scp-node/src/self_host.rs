@@ -3835,7 +3835,9 @@ mod tests {
     // `apply_tier_change` — and assert the RUNNING arms follow it.
     // -----------------------------------------------------------------------
 
-    use crate::{DidPublisher, LiveSlot, NodeDidPublisher, NodePublishedState, apply_tier_change};
+    use crate::{
+        LiveSlot, NodePublishedState, NodePublisher, apply_tier_change, seed_from_startup_publish,
+    };
     use scp_did::DidDocument;
     use scp_identity::{DidMethod as _, ScpIdentity};
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
@@ -3868,37 +3870,30 @@ mod tests {
     }
 
     /// The node's publish seam over `did_method`, in a publishing `DhtMode`.
-    fn publish_seam(did_method: &Arc<SigningDidDht>) -> NodeDidPublisher<SigningDidDht> {
-        NodeDidPublisher {
-            inner: Arc::clone(did_method),
-            dht_mode: DhtMode::Memory,
-        }
+    fn publish_seam(did_method: &Arc<SigningDidDht>) -> NodePublisher {
+        NodePublisher::new(Arc::clone(did_method), DhtMode::Memory)
     }
 
     /// The node's live slot as the builders construct it: the startup publish's
-    /// document, address and signed record, together.
+    /// document, address and signed record, together — produced by the SAME
+    /// `seed_from_startup_publish` seam the production builders use, so the publish
+    /// and the slot seed are one indivisible step here too.
     async fn published_slot(
-        publisher: &NodeDidPublisher<SigningDidDht>,
+        publisher: &NodePublisher,
         identity: &ScpIdentity,
         document: DidDocument,
         relay_url: String,
     ) -> LiveSlot<NodePublishedState> {
-        let record = publisher
-            .publish(identity, &document)
+        seed_from_startup_publish(publisher, identity, document, &relay_url)
             .await
-            .expect("startup publish succeeds");
-        LiveSlot::new(NodePublishedState {
-            document,
-            relay_url,
-            record,
-        })
+            .expect("startup publish succeeds")
     }
 
     /// Drives ONE real tier change through the real writer, alternating the
     /// relay endpoint so every call genuinely re-publishes at a new sequence.
     async fn republish_via_tier_change(
         live_state: &LiveSlot<NodePublishedState>,
-        publisher: &NodeDidPublisher<SigningDidDht>,
+        publisher: &NodePublisher,
         identity: &ScpIdentity,
         nth: u32,
     ) {
