@@ -573,16 +573,31 @@ async fn end_to_end_network_demo() {
     }
     println!();
 
-    // Drain received messages.
-    let mut received_count = 0u32;
+    // Drain EXACTLY the 3 delivered messages (the relay drops #2, #4, #6). Each
+    // recv gets a generous timeout so scheduler jitter under CI parallelism can
+    // never truncate the count; a fixed 100ms inter-message gap could miscount a
+    // delayed in-memory delivery.
     let mut received_msgs = Vec::new();
-    while let Ok(Some(TransportEvent::Envelope(env))) =
-        tokio::time::timeout(std::time::Duration::from_millis(100), charlie_stream.next()).await
-    {
-        received_count += 1;
-        let content = String::from_utf8_lossy(&env.encrypted_blob);
-        received_msgs.push(content.to_string());
+    for _ in 0..3 {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), charlie_stream.next()).await {
+            Ok(Some(TransportEvent::Envelope(env))) => {
+                received_msgs.push(String::from_utf8_lossy(&env.encrypted_blob).to_string());
+            }
+            _ => panic!(
+                "suppressing relay must deliver 3 of 6 messages — only received {} before timeout",
+                received_msgs.len()
+            ),
+        }
     }
+    // No 4th message may arrive: the suppressed messages are dropped at send, so
+    // a short negative wait suffices to prove "exactly 3, no more".
+    let extra =
+        tokio::time::timeout(std::time::Duration::from_millis(500), charlie_stream.next()).await;
+    assert!(
+        matches!(extra, Err(_) | Ok(None)),
+        "suppressing relay must deliver exactly 3 of 6 messages — a 4th arrived"
+    );
+    let received_count = received_msgs.len() as u32;
 
     println!("  Results:");
     println!("    Sent:     {}", sent_ids.len());
@@ -667,12 +682,24 @@ async fn end_to_end_network_demo() {
     println!("  Replaying relay: delivers each message 3x (1 + 2 replays)");
     println!("  Sent 1 message");
 
+    // Drain EXACTLY the 3 copies (1 original + 2 replays), each enqueued at
+    // store time. A generous per-item timeout absorbs CI scheduler jitter; a
+    // fixed 100ms gap could miscount a delayed in-memory delivery.
     let mut replay_received = 0u32;
-    while let Ok(Some(_)) =
-        tokio::time::timeout(std::time::Duration::from_millis(100), replay_rx.recv()).await
-    {
-        replay_received += 1;
+    for _ in 0..3 {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), replay_rx.recv()).await {
+            Ok(Some(_)) => replay_received += 1,
+            _ => panic!(
+                "replaying relay must deliver 3 copies — only received {replay_received} before timeout"
+            ),
+        }
     }
+    // No 4th copy may arrive.
+    let extra = tokio::time::timeout(std::time::Duration::from_millis(500), replay_rx.recv()).await;
+    assert!(
+        matches!(extra, Err(_) | Ok(None)),
+        "replaying relay must deliver exactly 3 copies — a 4th arrived"
+    );
     println!("  Received: {replay_received} copies");
     assert_eq!(
         replay_received, 3,
@@ -749,8 +776,10 @@ async fn end_to_end_network_demo() {
     println!("━━━ PHASE 10: Time Control & TTL Expiry ━━━━━━━━━━━━━━━━━━━━━");
     println!();
 
-    // Store a blob with 60s TTL in relay-alpha.
-    let ttl_relay = sim.relay("relay-alpha").unwrap().clone();
+    // Store a blob with 60s TTL in a FRESH relay so the expiry assertion is
+    // unambiguous — reusing `relay-alpha` would mix in the Phase-5 TTL=3600 blob
+    // and make "how many expired" depend on unrelated state.
+    let ttl_relay = Arc::new(Mutex::new(InMemoryRelay::new()));
     let ttl_transport = InMemoryTransport::with_clock(Arc::clone(&ttl_relay), {
         let c = Arc::clone(sim.clock());
         Arc::new(move || c.now_secs())
@@ -768,9 +797,13 @@ async fn end_to_end_network_demo() {
     let blobs_before = { ttl_relay.lock().unwrap().blob_count() };
     println!("  Stored blob with TTL=60s at t={}", sim.clock().now_secs());
     println!("  Blobs in relay: {blobs_before}");
+    assert_eq!(
+        blobs_before, 1,
+        "the fresh relay must hold exactly the one TTL=60 blob just stored"
+    );
     println!();
 
-    // Advance 30s — blob should still exist.
+    // Advance 30s (< TTL) — the blob must still exist and nothing expires.
     sim.advance_time(30);
     let expired_30 = {
         ttl_relay
@@ -781,10 +814,14 @@ async fn end_to_end_network_demo() {
     let blobs_at_30 = { ttl_relay.lock().unwrap().blob_count() };
     println!("  Advanced 30s → t={}", sim.clock().now_secs());
     println!("  Expired: {expired_30}, Remaining: {blobs_at_30}");
-    assert!(blobs_at_30 > 0, "blob should still exist at t+30s");
+    assert_eq!(
+        expired_30, 0,
+        "nothing may expire before the TTL=60 boundary"
+    );
+    assert_eq!(blobs_at_30, 1, "the blob must still exist at t+30s (< TTL)");
     println!();
 
-    // Advance another 61s — blob should be expired.
+    // Advance another 61s (t+91, > TTL=60) — the blob MUST now expire.
     sim.advance_time(61);
     let expired_91 = {
         ttl_relay
@@ -795,9 +832,14 @@ async fn end_to_end_network_demo() {
     let blobs_at_91 = { ttl_relay.lock().unwrap().blob_count() };
     println!("  Advanced 61s more → t={}", sim.clock().now_secs());
     println!("  Expired: {expired_91}, Remaining: {blobs_at_91}");
-    // Note: the first blob from Phase 5 had TTL=3600 and is also stored here.
-    // The TTL=60 blob should be expired. The TTL=3600 blob from phase 5 may or
-    // may not be expired depending on clock alignment.
+    assert_eq!(
+        expired_91, 1,
+        "the TTL=60 blob must be expired once the clock passes the boundary"
+    );
+    assert_eq!(
+        blobs_at_91, 0,
+        "the fresh relay must be empty after its only blob expired"
+    );
     println!();
 
     // =====================================================================
