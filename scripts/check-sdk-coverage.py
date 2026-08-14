@@ -326,11 +326,19 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "typescript": ["eventLogQuery"],
         "kotlin": ["eventLogQuery"],
     },
+    # kotlin/swift aliases name the REAL verify symbols (#1933): the
+    # production Kotlin path is `Scp.eventLogVerify` (UniFFI-generated,
+    # wrapped in Scp.kt) and the Swift SDK surface is
+    # `EventLog.proveInclusion`. The previous bare "verify" alias was
+    # satisfied by unrelated symbols (kotlin: ScpId.verify /
+    # OutletBridge.verify; swift: ScpId.verify /
+    # AppleDeviceAttestation.verify) — false-positive matrix cells. This
+    # is a STRENGTHENING: the gate now checks the right symbol.
     ("EventLog", "verify"): {
         "python": ["event_log_verify"],
         "typescript": ["eventLogVerify"],
-        "kotlin": ["verify"],
-        "swift": ["verify"],
+        "kotlin": ["eventLogVerify"],
+        "swift": ["proveInclusion"],
     },
     ("EventLog", "checkpoint"): {
         "python": ["Checkpoint"],

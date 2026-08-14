@@ -1075,7 +1075,8 @@
           "python": true,
           "typescript": true,
           "kotlin": true,
-          "swift": true
+          "swift": true,
+          "notes": "Honest proof shape, identical across all bridges/SDKs (#1933): there is no `verified` field — a returned Proof (proof_type + checkable Merkle details from ONE authoritative-log snapshot) IS the positive answer, and throw/raise/reject IS the negative. Error taxonomy: SCP-CTX-2138 = authoritative log unreachable (FAILS CLOSED, never a fallback tree), SCP-CTX-2139 = claim rejected over a readable log (the honest negative — empty log, out-of-range index, absence claimed for a present event), SCP-VALID-7000 = malformed claim input rejected before any log is consulted. Kotlin/Swift ship this via the UniFFI-generated Scp.eventLogVerify / proveInclusion; the ADR-046 parity ops event_log_verify_inclusion and event_log_absence_of_lifecycle_event_rejected pin the shape and the 2139 rejection cross-bridge."
         },
         {
           "name": "checkpoint",

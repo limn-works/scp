@@ -1094,6 +1094,127 @@ OP_UNREGISTERED_DID_REJECTED = OpSpec(
 
 
 # ---------------------------------------------------------------------------
+# op 12: event_log_verify_inclusion
+#
+# Cross-bridge verify-path parity (GitHub #1933 / ADR-046). Every bridge
+# creates a context (all three emit `ContextCreated` at leaf 0 of the
+# AUTHORITATIVE supervisor log), then asks event_log_verify to prove
+# inclusion of leaf 0. The op pins the HONEST proof shape the branch
+# committed to: a returned proof IS the positive answer (there is no
+# producer-set `verified` flag on any bridge), and its details carry the
+# checkable Merkle material — leaf hash, sibling path, root — plus the
+# `leaf_count` of the ONE snapshot the proof was generated from.
+#
+# The comparison runs on shape booleans + the snapshot leaf count, not
+# raw hashes: context IDs (and therefore leaf hashes/roots) legitimately
+# differ per run, but WHICH fields the proof carries and HOW MANY leaves
+# the authoritative log holds after one create must be identical across
+# PyO3, NAPI, and UniFFI (Kotlin + Swift).
+# ---------------------------------------------------------------------------
+
+
+_VERIFY_CONTEXT_PARAMS = {"name": "parity-elog-v", "mode": "encrypted"}
+
+
+def _py_event_log_verify_inclusion(ctx: OpContext) -> dict[str, Any]:
+    scp, identity = ctx.attached_scp()
+    handle = scp.context_create(identity.did, dict(_VERIFY_CONTEXT_PARAMS))
+    proof = scp.event_log_verify(handle.context_id, {"type": "inclusion", "leaf_index": 0})
+    details = proof.details
+    return {
+        "proof_type": str(proof.proof_type),
+        "leaf_count": int(details["leaf_count"]),
+        "has_leaf_hash": "leaf_hash" in details,
+        "has_path": "path" in details,
+        "has_root": "root" in details,
+    }
+
+
+OP_EVENT_LOG_VERIFY_INCLUSION = OpSpec(
+    name="event_log_verify_inclusion",
+    py_call=_py_event_log_verify_inclusion,
+    node_call={"op": "event_log_verify_inclusion", "args": {}},
+    schema=OpSchema(
+        fields=(
+            FieldSpec("proof_type", "exact"),
+            FieldSpec("leaf_count", "exact"),
+            FieldSpec("has_leaf_hash", "exact"),
+            FieldSpec("has_path", "exact"),
+            FieldSpec("has_root", "exact"),
+        )
+    ),
+    # Pin the absolute proof type so joint drift (e.g. every bridge
+    # starting to answer "absence" or "" together) cannot pass parity
+    # silently.
+    expected_values=(("proof_type", "inclusion"),),
+)
+
+
+# ---------------------------------------------------------------------------
+# op 13: event_log_absence_of_lifecycle_event_rejected
+#
+# The literal cross-bridge assertion of GitHub #1933 acceptance
+# criterion 4: an absence proof for a REAL lifecycle event must FAIL
+# identically on every bridge. Each bridge creates a context, extracts
+# the `ContextCreated` leaf hash from its own inclusion proof (so the
+# absence claim provably names an event that IS in the authoritative
+# log), then claims that event is absent. Every bridge must reject the
+# claim with SCP-CTX-2139 — the committed "claim is false over a
+# readable log" code — never mint a verifying absence proof (the
+# repudiation primitive the issue closed) and never confuse the honest
+# negative with SCP-CTX-2138 ("cannot reach the log", fail-closed).
+# ---------------------------------------------------------------------------
+
+
+# The committed cross-bridge code for "the claim is false over a
+# readable log" — distinct from CTX-2138 ("cannot answer"). Pinned so
+# joint drift across bridges cannot pass parity silently.
+EXPECTED_ABSENCE_REJECTED_CODE = "SCP-CTX-2139"
+
+
+def _py_event_log_absence_rejected(ctx: OpContext) -> dict[str, Any]:
+    scp, identity = ctx.attached_scp()
+    handle = scp.context_create(identity.did, dict(_VERIFY_CONTEXT_PARAMS))
+    inclusion = scp.event_log_verify(handle.context_id, {"type": "inclusion", "leaf_index": 0})
+    leaf_hash = str(inclusion.details["leaf_hash"])
+    try:
+        scp.event_log_verify(handle.context_id, {"type": "absence", "event_hash": leaf_hash})
+    except Exception as err:  # we want the error shape — test surface
+        err_type = type(err).__name__
+        code = getattr(err, "code", None) or _extract_code(str(err))
+        return {
+            "error": {
+                "type": err_type,
+                "code": code or "UNKNOWN",
+                "message": str(err),
+            }
+        }
+    return {"error": {"type": "none", "code": "NONE", "message": "no error raised"}}
+
+
+OP_EVENT_LOG_ABSENCE_OF_LIFECYCLE_EVENT_REJECTED = OpSpec(
+    name="event_log_absence_of_lifecycle_event_rejected",
+    py_call=_py_event_log_absence_rejected,
+    node_call={"op": "event_log_absence_of_lifecycle_event_rejected", "args": {}},
+    schema=OpSchema(
+        fields=(
+            FieldSpec("error.type", "ignore"),
+            # `error.code` must match EXPECTED_ABSENCE_REJECTED_CODE
+            # exactly across every bridge; this is the whole point of
+            # this op. Mirrors OP_UNREGISTERED_DID_REJECTED.
+            FieldSpec("error.code", "exact"),
+            FieldSpec("error.message", "ignore"),
+        )
+    ),
+    # Pin the committed code. If all bridges silently drift together —
+    # or worse, all start SUCCEEDING (returning no error at all, i.e.
+    # minting the forgeable absence proof again) — exact-equality parity
+    # would still hold; this literal pin is what catches both modes.
+    expected_values=(("error.code", EXPECTED_ABSENCE_REJECTED_CODE),),
+)
+
+
+# ---------------------------------------------------------------------------
 # Why there is NO missing-signing-custody parity op here.
 #
 # The missing-signing-custody condition (a sign operation invoked for an
@@ -1129,4 +1250,6 @@ SEED_OPS: tuple[OpSpec, ...] = (
     OP_TRANSPORT_STATUS,
     OP_EVENT_LOG_FILTERED,
     OP_UNREGISTERED_DID_REJECTED,
+    OP_EVENT_LOG_VERIFY_INCLUSION,
+    OP_EVENT_LOG_ABSENCE_OF_LIFECYCLE_EVENT_REJECTED,
 )
