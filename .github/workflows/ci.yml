@@ -130,8 +130,9 @@ jobs:
         run: cargo test -p scp-node --lib pre_rotation_severance -- --nocapture
 
   # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
-  # Asserts every shipped FFI artifact's resolved SCP-crate feature set (dev-deps
-  # EXCLUDED) is a subset of an explicit durability-only allowlist — so NO
+  # Asserts every shipped FFI bridge and the scp-node/scp-relay binaries' resolved
+  # SCP-crate feature set (dev-deps EXCLUDED) is a subset of an explicit
+  # durability-only allowlist — so NO
   # in-memory nullifier (custody / attestation / pre-rotation / DHT / did:key)
   # feature can reach a production binary. Closed ⊆-whitelist, ZERO nullifier
   # exceptions. The fixture harness (a/b/c + soundness + allowlist hygiene) runs

@@ -7,7 +7,8 @@
 # ----------------
 # For every shipped artifact (the three FFI bridges plus the scp-node and
 # scp-relay binaries), the COMPLETE resolved feature set of the SCP
-# workspace crates is a SUBSET of an explicit per-artifact allowlist that permits
+# workspace crates is a SUBSET of a single explicit permitted-production allowlist
+# (one superset list covering all five artifacts) that permits
 # ONLY durability-only + real-backend features. Any resolved SCP-crate feature
 # that is NOT on the allowlist — named or novel, present or future — FAILS the
 # gate. This makes shipped-graph feature-absence equivalent to nullifier-type
@@ -46,7 +47,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # ---------------------------------------------------------------------------
-# Per-artifact permitted-production allowlist (EXPLICIT — the whitelist).
+# Single permitted-production allowlist (EXPLICIT — the whitelist).
 #
 # Durability-only (SCP-CAPSEL-8010/8011) + real-backend features ONLY. Contains
 # ZERO nullifier features, no exceptions (ADR-062 §Decision 6; PR #2132). The
@@ -113,6 +114,19 @@ EOF
 #     `default` block wiring one; scp-relay has no `[features]` table at all),
 #     so passing `--features server` here would ERROR — they are correctly gated
 #     with an empty feature-arg string, not with `--features server`.
+#
+# DRIFT CAVEAT: each entry's build-invocation string above MUST be kept in
+# lockstep with the actual shipped build config — the Dockerfile
+# `cargo build --release -p scp-node -p scp-relay` and the
+# `.github/workflows/release.yml` `cargo publish` steps. This gate checks the
+# feature config NAMED HERE, not whatever those workflows actually build; if the
+# two drift apart, coverage silently narrows (an artifact would be gated in a
+# config it no longer ships).
+#
+# uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
+# deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation
+# tool, not a shipped runtime artifact, and its dependencies are already covered
+# transitively by the `scp-ffi-uniffi` package entry above.
 ARTIFACTS=(
   "scp-ffi|--no-default-features --features server"
   "scp-ffi-napi|--no-default-features --features server"
@@ -166,12 +180,24 @@ resolve_scp_features() {
 # resolve_scp_testing_crate <crate> <features...>
 #   Emit "scp-testing" iff the full-stack test-harness crate is in the shipped
 #   (no-dev) dependency graph. Its mere presence is a nullifier and FAILS.
+#   Fails LOUD on a cargo error, mirroring resolve_scp_features: a swallowed
+#   `2>/dev/null` failure produces no output, which the grep would read as
+#   "scp-testing absent" — a FAIL-OPEN read that lets a cargo resolution error
+#   masquerade as nullifier-crate absence. Capture stdout+stderr and the exit
+#   status; on a cargo error, surface it and return non-zero so the caller fails
+#   loud instead of silently concluding the test-harness crate is not present.
 resolve_scp_testing_crate() {
   local crate="$1"; shift
   local features="$1"
+  local raw rc
   # shellcheck disable=SC2086
-  if cargo tree -e no-dev -p "$crate" $features 2>/dev/null \
-      | grep -qE '(^|[^a-z-])scp-testing v'; then
+  raw="$(cargo tree -e no-dev -p "$crate" $features 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree (scp-testing probe) failed for '$crate' (feature args: '$features'):"
+      printf '%s\n' "$raw"; } >&2
+    return 1
+  fi
+  if printf '%s\n' "$raw" | grep -qE '(^|[^a-z-])scp-testing v'; then
     echo "scp-testing"
   fi
 }
@@ -235,9 +261,16 @@ run_gate() {
       continue
     fi
     # A present scp-testing crate is itself a nullifier — fold it into the set so
-    # the ⊆ check rejects it (it is never on the allowlist).
+    # the ⊆ check rejects it (it is never on the allowlist). The probe fails loud
+    # (non-zero) on a cargo error; refuse to read a probe failure as "no
+    # test-harness crate present" (that would be fail-open).
     local testing_crate
-    testing_crate="$(resolve_scp_testing_crate "$crate" "$features")"
+    if ! testing_crate="$(resolve_scp_testing_crate "$crate" "$features")"; then
+      echo "   FAIL — scp-testing presence probe failed (cargo resolution error);"
+      echo "          refusing to read a probe failure as 'no nullifier crate present'."
+      failures=$((failures + 1))
+      continue
+    fi
     [[ -n "$testing_crate" ]] && resolved="$(printf '%s\n%s' "$resolved" "$testing_crate")"
 
     if offenders="$(check_subset "$resolved" "$PERMITTED_ALLOWLIST")"; then
