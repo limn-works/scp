@@ -1120,7 +1120,7 @@ pub struct ProofStep {
    **Algorithm:**
    1. Maintain a sorted index of leaf hashes alongside the append-order Merkle tree (`BTreeSet<([u8; 32], u64)>`).
    2. To prove absence of `query_hash`: find the two adjacent entries that bracket `query_hash`. Generate inclusion proofs for both.
-   3. The verifier confirms: (a) both adjacent leaves are in the tree, (b) they are truly adjacent in sorted order, (c) `query_hash` falls between them.
+   3. From the two inclusion proofs alone, a verifier can confirm off-box that (a) both bracketing leaves are in the tree the `root` commits to, and (b) `query_hash` sorts strictly between them. It CANNOT confirm off-box that the two leaves are truly adjacent in sorted order: the append-order Merkle root commits only to append order, not to the auxiliary sorted `BTreeSet`, so a producer could omit an intervening leaf and the omission would be invisible to a verifier who lacks the full leaf set. Adjacency therefore rests on the producer having scanned its own complete local log — this is NOT a self-contained, off-box non-membership proof. A sorted/sparse Merkle tree whose root commits to sorted order is the real fix; see #2314.
 
    **Privacy analysis:** This approach reveals exactly two leaf hashes (the neighbors of the query point). It does NOT require disclosing the full leaf hash set.
 

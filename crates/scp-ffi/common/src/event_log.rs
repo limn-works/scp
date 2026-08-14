@@ -530,4 +530,118 @@ mod tests {
             .try_into()
             .expect("32 bytes")
     }
+
+    /// Builds a real 3-leaf authoritative log via the append chain, so the
+    /// helper contract is pinned against a genuine `(count, root)` — not a
+    /// hand-rolled fixture.
+    fn build_nonempty_log() -> scp_event_log::EventLog {
+        use scp_event_log::{EventType, tree};
+        let mut log = scp_event_log::EventLog::new("ctx-helper-test".to_owned());
+        for (seq, base) in [
+            entry(EventType::ContextCreated, "did:example:alice"),
+            entry(EventType::MemberJoined, "did:example:bob"),
+            entry(EventType::MessageSent, "did:example:alice"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // The next event chains onto the last leaf hash; the genesis
+            // prev_hash is `[0u8; 32]` (an empty log has no leaves).
+            let prev_hash = log.leaves().last().copied().unwrap_or([0u8; 32]);
+            let event = Event {
+                sequence: seq as u64,
+                prev_hash,
+                ..base
+            };
+            tree::append_unsigned_event(&mut log, &event).expect("append_unsigned_event");
+        }
+        log
+    }
+
+    /// Helper contract arm (a): `Ok(non-empty log)` → the honest summary whose
+    /// `event_count` / `merkle_root` are byte-identical to `tree::event_count`
+    /// / `hex(tree::root)` over the SAME log — the #1933 authoritative pair.
+    #[test]
+    fn context_events_metadata_json_ok_nonempty_matches_tree() {
+        let log = build_nonempty_log();
+        let ok: Result<&scp_event_log::EventLog, std::convert::Infallible> = Ok(&log);
+        let out = context_events_metadata_json("ctx-helper-test", ok);
+
+        assert_eq!(scp_event_log::tree::event_count(&log), 3);
+        assert_eq!(
+            out.get("event_count").and_then(serde_json::Value::as_u64),
+            Some(scp_event_log::tree::event_count(&log)),
+            "event_count must equal tree::event_count over the same log"
+        );
+        assert_eq!(
+            out.get("merkle_root").and_then(serde_json::Value::as_str),
+            Some(hex::encode(scp_event_log::tree::root(&log)).as_str()),
+            "merkle_root must equal hex(tree::root) over the same log"
+        );
+        // Honest success object: never the fail-closed absent shape.
+        assert!(
+            out.get("error").is_none() && out.get("code").is_none(),
+            "a readable log must not carry the CTX-2138 absent object"
+        );
+    }
+
+    /// Helper contract arm (b): `Ok(empty LIVE log)` → an HONEST `{count: 0,
+    /// root}` where `root` is `SHA-256("")` (spec §25.8 Vector 15), NOT the
+    /// CTX-2138 error object. An empty readable log is a real answer; only an
+    /// UNREACHABLE log fails closed.
+    #[test]
+    fn context_events_metadata_json_ok_empty_is_honest_not_error() {
+        let log = scp_event_log::EventLog::new("ctx-helper-empty".to_owned());
+        let ok: Result<&scp_event_log::EventLog, std::convert::Infallible> = Ok(&log);
+        let out = context_events_metadata_json("ctx-helper-empty", ok);
+
+        assert_eq!(
+            out.get("event_count").and_then(serde_json::Value::as_u64),
+            Some(0),
+            "an empty live log reports event_count 0"
+        );
+        let empty_root_hex = hex::encode(scp_event_log::tree::root(&log));
+        assert_eq!(
+            out.get("merkle_root").and_then(serde_json::Value::as_str),
+            Some(empty_root_hex.as_str()),
+            "merkle_root must equal hex(tree::root) of the empty log"
+        );
+        assert_eq!(
+            empty_root_hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "the empty Merkle root is SHA-256(\"\"), not [0u8; 32]"
+        );
+        assert!(
+            out.get("error").is_none() && out.get("code").is_none(),
+            "an empty LIVE log is honest {{count:0, root}}, never the CTX-2138 absent object"
+        );
+    }
+
+    /// Helper contract arm (c): `Err(...)` (authoritative log unreachable) →
+    /// FAILS CLOSED to the honest absent object carrying `SCP-CTX-2138`, with
+    /// NO fabricated `event_count` / `merkle_root` a consumer could mistake for
+    /// a real (empty) log.
+    #[test]
+    fn context_events_metadata_json_err_fails_closed_2138() {
+        let err: Result<&scp_event_log::EventLog, String> =
+            Err("supervisor unreachable".to_owned());
+        let out = context_events_metadata_json("ctx-helper-err", err);
+
+        assert_eq!(
+            out.get("code").and_then(serde_json::Value::as_str),
+            Some(crate::error_codes::CTX_2138),
+            "the fail-closed object carries SCP-CTX-2138"
+        );
+        let error_msg = out
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("error key present on the fail-closed object");
+        assert!(
+            error_msg.contains("ctx-helper-err"),
+            "the honest error names the context that could not be reached"
+        );
+        assert!(
+            out.get("event_count").is_none() && out.get("merkle_root").is_none(),
+            "no fabricated zero count/root leaks on the fail-closed path"
+        );
+    }
 }
