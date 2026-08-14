@@ -105,6 +105,8 @@ ARTIFACTS=(
   "scp-ffi|--no-default-features --features server"
   "scp-ffi-napi|--no-default-features --features server"
   "scp-ffi-uniffi|--no-default-features --features server"
+  "scp-node|"
+  "scp-relay|"
 )
 
 # Nullifier features / crates used ONLY as positive-control fixture inputs and by
