@@ -37,8 +37,9 @@
 //!   mailbox commands `RemainingBudgetForTest` / `VelocityForTest`.
 //! * The budget-rejection test passes a VALIDLY-SIGNED spending UCAN: signature
 //!   validation now runs BEFORE the budget gate, so an empty-signature token
-//!   would fail with a different (signature) error rather than reaching
-//!   `SCP-ECON-12010`.
+//!   would fail with a different (signature) error rather than reaching the
+//!   budget gate — which surfaces as `SCP-OUTLET-6150 economic.budget-exceeded`
+//!   (the canonical economic-class outlet code the caller observes).
 
 use std::sync::Arc;
 
@@ -434,9 +435,13 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
         .unwrap_or_default()
         .as_secs();
     let velocity_after = velocity(&sup, context_id, &invoker, now_secs_after).await;
-    assert!(
-        velocity_after > velocity_before,
-        "invoke_outlet_with_economy must record one velocity entry per call \
+    // `velocity_before` is provably 0: the only prior action was the governance
+    // `grant_budget` (ApproveSpend), which records no velocity entry. Assert the
+    // EXACT +1 so a "2 entries per call" regression is caught, not just >.
+    assert_eq!(
+        velocity_after,
+        velocity_before + 1,
+        "invoke_outlet_with_economy must record EXACTLY one velocity entry per call \
          (before={velocity_before}, after={velocity_after})"
     );
 
@@ -508,9 +513,16 @@ async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
 
     let err = result.expect_err("expected budget-exceeded rejection");
     let msg = format!("{err}");
+    // `invoke_outlet_with_economy` surfaces `InvocationError::BudgetExceeded`,
+    // which maps to the canonical economic-class outlet code `SCP-OUTLET-6150`
+    // with the discriminating slug `economic.budget-exceeded`. Assert BOTH: the
+    // code pins the error class and the slug pins the specific economic fault,
+    // so a regression to a non-economic error OR to a different economic
+    // sub-fault (e.g. insufficient-funds) is caught. (The inner `SCP-ECON-12010`
+    // "no budget" string is remapped and never surfaces here.)
     assert!(
-        msg.contains("SCP-ECON-12010") || msg.contains("budget"),
-        "expected SCP-ECON-12010 budget-exceeded error, got: {msg}"
+        msg.contains("SCP-OUTLET-6150") && msg.contains("economic.budget-exceeded"),
+        "expected SCP-OUTLET-6150 economic.budget-exceeded error, got: {msg}"
     );
 
     // The velocity entry recorded during Phase-1 reserve must have been rolled

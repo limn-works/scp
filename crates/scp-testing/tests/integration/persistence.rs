@@ -25,7 +25,8 @@
 //!   [`ContextSnapshot`] and rehydrated into the live actor on restore.
 //! * `approved_proposals` (proposals approved and pending execution, kept for
 //!   conflict detection) is ALSO snapshotted — see
-//!   [`GovernanceState::approved_proposals`] (`state.rs`). Governance-proposal
+//!   [`ContextSnapshot::approved_proposals`] (`state.rs`), the public,
+//!   serde-serialized snapshot field that proves the claim. Governance-proposal
 //!   state is therefore NOT purely ephemeral.
 //!
 //! What is NOT persisted is the governance engine's own tracked-proposal map:
