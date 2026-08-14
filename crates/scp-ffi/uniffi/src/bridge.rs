@@ -14156,7 +14156,7 @@ impl Scp {
                 // `FnOnce` executor the supervisor runs supervisor-side at
                 // Commit-B (off the actor mailbox). Read directly off the
                 // owned `target_handle` — no DashMap `Ref` is held across the
-                // `outlet_handlers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)`. Falls back to a schema-only
+                // `outlet_handlers` lock. Falls back to a schema-only
                 // echo when no handler is registered, matching the synchronous
                 // cross-context path. The supervisor validates the output
                 // against the outlet's registered output schema at Commit-B, so
