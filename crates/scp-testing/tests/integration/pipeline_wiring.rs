@@ -3060,11 +3060,17 @@ fn mcp_resource_access_is_answered_from_real_role_state() {
             include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs"),
         ),
     ] {
+        // Scope to the PRODUCTION portion, exactly as the event-source gate
+        // above does: PyO3's and UniFFI's test modules also name
+        // `Capability::MessagesRead`, so a whole-file `contains` would stay
+        // green if the production authorization path regressed and only a test
+        // still named the symbol.
         assert!(
-            src.contains("Capability::MessagesRead"),
+            production_source(src).contains("Capability::MessagesRead"),
             "{bridge} must authorize the events/members resources against the real \
              capability catalogue (spec §5.3.1: `messages:read` is what lets an \
-             observer see content and membership), not a synthesized name"
+             observer see content and membership) on its PRODUCTION path — a \
+             test-module occurrence does not count"
         );
     }
 }
