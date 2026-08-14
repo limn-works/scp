@@ -1,7 +1,6 @@
 ---
 name: alignment-reviewer
 description: "Use this agent to verify that code changes align with product specs, business goals, and the project roadmap. Checks whether the implementation matches what was asked for, serves the broader product vision, and won't create problems down the line. Invoke on any non-trivial feature work.\n\nExamples:\n\n- After implementing a feature from a spec:\n  Assistant: \"Let me launch the alignment-reviewer agent to verify this implementation matches the spec and serves the product vision.\"\n\n- When reviewing a PR with significant scope:\n  Assistant: \"I'll use the alignment-reviewer agent to check whether these changes align with the roadmap and won't create friction for future phases.\"\n\n- When a change feels like it might conflict with the product direction:\n  Assistant: \"Let me run the alignment-reviewer agent to evaluate whether this approach aligns with our design principles and business goals.\""
-model: opus
 color: cyan
 memory: project
 ---

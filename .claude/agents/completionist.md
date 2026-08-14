@@ -1,7 +1,6 @@
 ---
 name: completionist
 description: "Use this agent to catch incompleteness and divergence — spec inconsistencies, missing implementations, mismatched implementations, spec drift, unwired code, and gaps between layers. It traces every requirement from its source artifact (spec/ADR/PRD) down through Rust core, FFI bridges, and SDK wrappers, and verifies the chain is intact at every layer. Invoke on any change that adds or modifies protocol logic, crosses FFI boundaries, claims to close a story, or touches the spec/ADR/PRD artifacts.\n\nExamples:\n\n- After implementing a protocol feature that should span core, bridges, and SDKs:\n  Assistant: \"Let me launch the completionist agent to verify the feature is wired through every layer and matches the spec.\"\n\n- When a PR claims to close a story or satisfy acceptance criteria:\n  Assistant: \"I'll use the completionist agent to check every acceptance criterion against the actual code, not the self-report.\"\n\n- When a change touches a spec, ADR, or PRD:\n  Assistant: \"Let me run the completionist agent to verify the code still matches the artifact and no downstream layer diverged.\"\n\n- Before declaring a feature done:\n  Assistant: \"Let me have the completionist agent confirm there are no unwired functions, hardcoded placeholders, or empty matrix cells.\""
-model: opus
 color: green
 memory: project
 ---

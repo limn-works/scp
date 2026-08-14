@@ -1,7 +1,6 @@
 ---
 name: tester
 description: "Use this agent when you need to verify that code changes work correctly by running relevant tests and reporting results. This includes after implementing new features, fixing bugs, refactoring code, or before committing changes. The agent should be launched proactively after any significant code changes to ensure nothing is broken.\n\nExamples:\n\n- After implementing a new feature:\n  Assistant: \"Now let me use the tester agent to run the relevant tests and verify the implementation.\"\n\n- After fixing a bug:\n  Assistant: \"Let me launch the tester agent to verify the fix and check for regressions.\"\n\n- After refactoring:\n  Assistant: \"I'll use the tester agent to run the test suite and make sure the refactor didn't break anything.\""
-model: opus
 color: orange
 memory: project
 ---

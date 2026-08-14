@@ -1,7 +1,6 @@
 ---
 name: security-reviewer
 description: "Use this agent when code has been written or modified that touches authentication, authorization, user input handling, API endpoints, error handling, secrets/credentials, or any security-sensitive surface. This agent should be proactively invoked after writing network layer code, authentication flows, API handlers, error responses, or any code that processes untrusted input.\n\nExamples:\n\n- After writing authentication code:\n  Assistant: \"Let me use the security-reviewer agent to audit this authentication code.\"\n\n- After writing an API client that handles auth tokens:\n  Assistant: \"Let me run the security-reviewer agent to check for token handling and secrets exposure issues.\"\n\n- After adding error handling:\n  Assistant: \"Let me have the security-reviewer agent verify the error handling doesn't expose sensitive data.\"\n\n- After writing code that processes user input:\n  Assistant: \"Let me launch the security-reviewer agent to audit the input handling for injection vulnerabilities.\""
-model: opus
 color: blue
 memory: project
 ---

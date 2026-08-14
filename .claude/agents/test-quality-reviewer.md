@@ -1,7 +1,6 @@
 ---
 name: test-quality-reviewer
 description: "Use this agent when you need to evaluate the quality, coverage ROI, and robustness of tests that have been recently written or modified. This includes reviewing new test files, assessing whether tests are testing behavior vs implementation details, identifying flakiness risks, and ensuring tests provide meaningful coverage without being brittle or redundant.\n\nExamples:\n\n- After writing tests:\n  Assistant: \"Let me use the test-quality-reviewer agent to evaluate the quality and coverage of those tests.\"\n\n- User wants a test suite reviewed:\n  Assistant: \"I'll launch the test-quality-reviewer agent to analyze for coverage ROI and potential issues.\"\n\n- User reports flaky tests:\n  Assistant: \"Let me use the test-quality-reviewer agent to analyze those tests for flakiness risks and suggest improvements.\""
-model: opus
 color: yellow
 memory: project
 ---
