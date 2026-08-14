@@ -2984,17 +2984,36 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
         ("NAPI", napi_mcp_src),
         ("UniFFI", uniffi_mcp_src),
     ] {
+        // Scope the source-text search to the PRODUCTION portion — everything
+        // before the trailing `#[cfg(test)]\nmod tests { ... }`. Each bridge's
+        // own unit tests call `subscribe_events()` and construct wired servers,
+        // so a whole-file `contains` would stay green even if a real regression
+        // moved the wiring out of the serve function and only a test still named
+        // the symbol. `mod tests {` is the single conventional test-module
+        // marker in all three files; the production serve functions precede it.
+        let prod = production_source(src);
         assert!(
-            src.contains("subscribe_events()"),
-            "{bridge} MCP serve must obtain the Supervisor ContextEvent receiver"
+            prod.contains("subscribe_events()"),
+            "{bridge} MCP serve must obtain the Supervisor ContextEvent receiver \
+             on its PRODUCTION path (a test-module occurrence does not count)"
         );
         assert!(
-            src.contains("with_optional_event_source"),
+            prod.contains("with_optional_event_source"),
             "{bridge} MCP serve must build its McpServer through the constructor \
              that pairs the advertised capability with the pump that honours it — \
              McpServer::new would silently downgrade to resources.subscribe: false"
         );
     }
+}
+
+/// Returns the production portion of a Rust source file: everything before the
+/// trailing `#[cfg(test)] mod tests { ... }`.
+///
+/// Source-text wiring gates must not be satisfiable by a bridge's own unit
+/// tests, which legitimately name the same production symbols. Splitting on the
+/// conventional `mod tests {` marker keeps the search on shipped code.
+fn production_source(src: &str) -> &str {
+    src.split_once("mod tests {").map_or(src, |(prod, _)| prod)
 }
 
 /// Resource authorization must run the SAME predicate for `resources/read` and
@@ -3017,14 +3036,16 @@ fn mcp_resource_subscriptions_are_backed_by_a_real_event_source() {
 /// bridge answers from context role state rather than a stand-in.
 #[test]
 fn mcp_resource_access_is_answered_from_real_role_state() {
-    let server_src = include_str!("../../../../crates/scp-mcp/src/server.rs");
-    assert!(
-        !server_src.contains("format!(\"resource:{"),
-        "the phantom `resource:{{kind}}` capability name must stay deleted — it \
-         resolves to a Custom capability no ceiling grants, so gating on it \
-         denies every client on every bridge"
-    );
-
+    // The former negative assertion — `!server_src.contains("format!(\"resource:{")`
+    // — was removed as redundant with a strictly stronger compile-time
+    // guarantee (the one legitimate reason to drop an enforcement assertion).
+    // `ContextProvider::validate_resource_access` takes a typed `ResourceKind`,
+    // not a string, so no `resource:{kind}` capability name can be synthesized
+    // from it at all; a source-text denylist chasing one spelling of a
+    // now-unrepresentable value is exactly the negative-value redundancy the
+    // over-engineering guard names. The positive wiring pins below — that each
+    // bridge answers from the real capability catalogue — are the part the
+    // types cannot see and are retained.
     for (bridge, src) in [
         (
             "PyO3",
