@@ -2429,13 +2429,13 @@ async fn create_and_broadcast_checkpoint_if_due(
             &*deps.event_log,
         ) {
             Ok(due) => due,
-            // FAIL CLOSED (#1933 follow-up): a checkpoint over an unreachable
-            // authoritative log must not be signed at all. Signing a fabricated
-            // `(0, [0u8; 32])` commitment would make honest peers raise
-            // `EquivocationDetected` against this member. The counters were left
-            // untouched, so the checkpoint stays due and is retried on the next
-            // send; the application send itself is unaffected (a checkpoint is
-            // an independent consistency-monitoring artifact, not part of the
+            // FAIL CLOSED: a checkpoint over an unreachable authoritative log
+            // must not be signed at all. Signing a fabricated `(0, [0u8; 32])`
+            // commitment would make honest peers raise `EquivocationDetected`
+            // against this member. The counters were left untouched, so the
+            // checkpoint stays due and is retried on the next send; the
+            // application send itself is unaffected (a checkpoint is an
+            // independent consistency-monitoring artifact, not part of the
             // message's delivery guarantee).
             Err(e) => {
                 tracing::error!(

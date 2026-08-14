@@ -752,7 +752,7 @@ pub fn create_checkpoint_if_due_view(
 
 /// Builds a signed checkpoint over the AUTHORITATIVE event log.
 ///
-/// # Security (GitHub #1933 follow-up)
+/// # Security
 ///
 /// A checkpoint is signed, non-repudiable evidence: peers that see the same
 /// `event_count` with a different `merkle_root` raise
@@ -770,7 +770,7 @@ pub fn create_checkpoint_if_due_view(
 ///   FABRICATED commitment: `[0u8; 32]` is not the empty-tree root (§25.8
 ///   Vector 15 is `SHA-256("")`), and an erroring root paired with a readable
 ///   count produced an all-zero root beside a real event count. Both are the
-///   "provider `None` means UNKNOWN, never empty" rule that #1933 established,
+///   the established "provider `None` means UNKNOWN, never empty" rule,
 ///   violated on the one path whose output carries a signature.
 ///
 /// The §9.9.3 field derivation and canonical hash come from
@@ -859,7 +859,7 @@ fn verify_remote_checkpoint_authenticity(
 /// (cell/view) and the receive path (`deliver_checkpoint_message`, bare state)
 /// share one classify path while each applies the field writes itself.
 ///
-/// # Security (GitHub #1933 follow-up) — the judging side of the commitment
+/// # Security — the judging side of the commitment
 ///
 /// [`build_checkpoint`] is the side that SIGNS a `(event_count, merkle_root)`
 /// commitment; this is the side that JUDGES a peer's. Both need the same two
@@ -1582,7 +1582,7 @@ mod checkpoint_authoritative_source_tests {
     //! `event_count` with a different `merkle_root` raise
     //! `EquivocationDetected` against its signer (§9.9.3). These tests pin the
     //! two properties [`build_checkpoint`] must establish by construction —
-    //! both were violated before the #1933 follow-up:
+    //! both were violated by the previous implementation:
     //!
     //! 1. The `(event_count, merkle_root)` pair comes from ONE authoritative
     //!    snapshot. It used to be read through two independent provider calls
@@ -1901,17 +1901,16 @@ mod remote_checkpoint_classification_tests {
     //! the producer side fabricating a commitment misleads its peers, while the
     //! judging side fabricating one FRAMES them.
     //!
-    //! Before the #1933 follow-up the local side was read through two
-    //! independent, individually fail-open provider calls
-    //! (`event_log_merkle_root(...).unwrap_or([0u8; 32])` and
-    //! `event_log_entries(...).ok().flatten().map_or(0, ...)`). An unreachable
-    //! provider therefore produced `(0, [0u8; 32])` — a count and a root that
-    //! describe no tree, `[0u8; 32]` not even being the empty-tree root — and
-    //! the resulting verdict was wrong in BOTH directions: a remote checkpoint
-    //! at count 0 was accused of equivocating, and a remote checkpoint at any
-    //! other count was quietly filed as a benign catch-up state (`Behind`,
-    //! since the fabricated `local_count = 0` is below every real count),
-    //! missing a real divergence.
+    //! Previously the local side was read through two independent, individually
+    //! fail-open provider calls (`event_log_merkle_root(...).unwrap_or([0u8;
+    //! 32])` and `event_log_entries(...).ok().flatten().map_or(0, ...)`). An
+    //! unreachable provider therefore produced `(0, [0u8; 32])` — a count and a
+    //! root that describe no tree, `[0u8; 32]` not even being the empty-tree
+    //! root — and the resulting verdict was wrong in BOTH directions: a remote
+    //! checkpoint at count 0 was accused of equivocating, and a remote
+    //! checkpoint at any other count was quietly filed as a benign catch-up
+    //! state (`Behind`, since the fabricated `local_count = 0` is below every
+    //! real count), missing a real divergence.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use std::sync::Arc;

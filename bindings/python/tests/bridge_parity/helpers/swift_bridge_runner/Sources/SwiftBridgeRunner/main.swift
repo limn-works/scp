@@ -750,11 +750,10 @@ func opEventLogVerifyInclusion(_ req: BridgeRequest) async throws -> [String: JS
     ]
 }
 
-// GitHub #1933 AC 4: an absence proof for a REAL lifecycle event must
-// FAIL with SCP-CTX-2139 identically on every bridge. Extracts the
-// `ContextCreated` leaf hash from this bridge's own inclusion proof so
-// the absence claim provably names an event that IS in the
-// authoritative log. Mirrors
+// An absence proof for a REAL lifecycle event must FAIL with SCP-CTX-2139
+// identically on every bridge. Extracts the `ContextCreated` leaf hash from
+// this bridge's own inclusion proof so the absence claim provably names an
+// event that IS in the authoritative log. Mirrors
 // `seed_operations.py::_py_event_log_absence_rejected`.
 func opEventLogAbsenceRejected(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     _ = req
@@ -795,15 +794,15 @@ func opEventLogAbsenceRejected(_ req: BridgeRequest) async throws -> [String: JS
     }
 }
 
-// Reproduces the F3 divergence precondition (GitHub #1933) through the
-// PUBLIC surface — the mechanical guard ops 12/13 CANNOT provide because
-// they run on a pristine context whose bridge-local tree still equals the
-// authoritative log. Diverges the trees via `provenanceAttach`, reads the
-// AUTHORITATIVE ContextCreated hash from the query path (independent of the
-// verify path under test), then claims it absent. A correct bridge proves
-// over the authoritative log where the hash IS present and rejects with
-// SCP-CTX-2139; a bridge regressed to the divergent local tree would mint a
-// verifying absence proof. Mirrors
+// Reproduces the authoritative-vs-bridge-local divergence precondition
+// through the PUBLIC surface — the mechanical guard ops 12/13 CANNOT
+// provide because they run on a pristine context whose bridge-local tree
+// still equals the authoritative log. Diverges the trees via
+// `provenanceAttach`, reads the AUTHORITATIVE ContextCreated hash from the
+// query path (independent of the verify path under test), then claims it
+// absent. A correct bridge proves over the authoritative log where the hash
+// IS present and rejects with SCP-CTX-2139; a bridge regressed to the
+// divergent local tree would mint a verifying absence proof. Mirrors
 // `seed_operations.py::_py_event_log_absence_over_divergent_local_tree_rejected`.
 func opEventLogAbsenceOverDivergentLocalTree(
     _ req: BridgeRequest
@@ -863,7 +862,7 @@ func opEventLogAbsenceOverDivergentLocalTree(
     }
 }
 
-// The mechanical cross-bridge guard for Fix 1 (GitHub #1933): a malformed
+// The mechanical cross-bridge guard for malformed claim input: a malformed
 // claim carries SCP-VALID-7000 on every bridge. Feeds a malformed inclusion
 // claim (missing `leaf_index`) over a readable log and reports the code.
 // Mirrors `seed_operations.py::_py_event_log_verify_malformed_claim`.
@@ -904,14 +903,15 @@ func opEventLogVerifyMalformedClaim(
     }
 }
 
-// The direct cross-bridge regression guard for the `context_events` twin
-// (GitHub #1933). Reads the AUTHORITATIVE root + count from the verify path,
-// diverges the bridge-local tree via `provenanceAttach` (a `ProvenanceReceived`
-// leaf NOT in the authoritative log), then asserts the `mcpContextEvents`
-// summary STILL commits to the authoritative log. Raw `merkle_root` bytes are
-// not compared cross-bridge (the fresh `ContextCreated` leaf carries a
-// wall-clock timestamp); the SEMANTIC `root_matches_authoritative` invariant is.
-// Mirrors `seed_operations.py::_py_mcp_context_events_authoritative`.
+// The direct cross-bridge regression guard for the `context_events` twin.
+// Reads the AUTHORITATIVE root + count from the verify path, diverges the
+// bridge-local tree via `provenanceAttach` (a `ProvenanceReceived` leaf NOT
+// in the authoritative log), then asserts the `mcpContextEvents` summary
+// STILL commits to the authoritative log. Raw `merkle_root` bytes are not
+// compared cross-bridge (the fresh `ContextCreated` leaf carries a
+// wall-clock timestamp); the SEMANTIC `root_matches_authoritative`
+// invariant is. Mirrors
+// `seed_operations.py::_py_mcp_context_events_authoritative`.
 func opMcpContextEventsAuthoritative(
     _ req: BridgeRequest
 ) async throws -> [String: JSONValue] {

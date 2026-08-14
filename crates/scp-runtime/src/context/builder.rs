@@ -577,7 +577,7 @@ pub trait ContextEventLogProvider: Send + Sync {
     /// and a `root` paired with a `leaf_count` from the other snapshot is a
     /// commitment that pins nothing.
     ///
-    /// # Security (GitHub #1933)
+    /// # Security
     ///
     /// FAILS CLOSED when the provider reports no log. `event_log_entries`
     /// returning `None` means UNKNOWN — a log that was never initialised, or

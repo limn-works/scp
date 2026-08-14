@@ -116,7 +116,9 @@ impl PyEvent {
 /// append order, and the sorted index the neighbours are drawn from is local
 /// state the root does not cover. Treat an `"absence"` answer as the log's own
 /// assertion plus checkable neighbour-inclusion, not as a self-contained
-/// non-membership proof (a sorted/sparse tree is the real fix — see #2314).
+/// non-membership proof (a sorted/sparse Merkle tree whose root commits to
+/// sorted order is the real fix; that construction change is tracked outside
+/// this crate).
 ///
 /// See ADR-011 (Merkle proofs) and ADR-013 §7 (bridge layer).
 #[pyclass(name = "Proof")]
@@ -208,17 +210,16 @@ impl PyCheckpoint {
 /// [`event_log_checkpoint`](PyScp::event_log_checkpoint) commits to. There is no
 /// bridge-local fallback.
 ///
-/// This function used to end
-/// `supervisor(bi).ok().and_then(|m| m.event_log_entries(..).ok().flatten())`
-/// and, on ANY failure or on an empty result, fall through to the bridge-local
-/// `FfiBridgeState::event_log` — publishing THAT tree's root as `merkle_root`
-/// in a synthesized `LogSummary` event, under the same field name the
-/// authoritative answers use. Two consequences (GitHub #1933): a consumer
-/// pinning a verify proof against a queried root could accept a root a caller
-/// had shaped through `provenance_attach` / outlet calls; and
-/// `entries.is_empty() -> fall through` collapsed the empty-but-live vs unknown
-/// distinction, so query and verify returned contradictory answers about the
-/// same context.
+/// This function used to end `supervisor(bi).ok().and_then(|m|
+/// m.event_log_entries(..).ok().flatten())` and, on ANY failure or on an empty
+/// result, fall through to the bridge-local `FfiBridgeState::event_log` —
+/// publishing THAT tree's root as `merkle_root` in a synthesized `LogSummary`
+/// event, under the same field name the authoritative answers use. Two
+/// consequences: a consumer pinning a verify proof against a queried root could
+/// accept a root a caller had shaped through `provenance_attach` / outlet
+/// calls; and `entries.is_empty() -> fall through` collapsed the empty-but-live
+/// vs unknown distinction, so query and verify returned contradictory answers
+/// about the same context.
 ///
 /// Now: an empty-but-live log returns an EMPTY list, and an unreachable or
 /// unknown log FAILS CLOSED with `SCP-CTX-2138`.
@@ -386,12 +387,12 @@ fn parse_event_query_filter(
 
 /// Maps a runtime authoritative-log failure into the fail-closed bridge error.
 ///
-/// GitHub #1933. Raised when the bridge cannot reach the context's
-/// AUTHORITATIVE event log at all — the instance is not ready (suspended or
-/// shut down), no supervisor / event-log provider is attached, or the provider
-/// reports NO LOG for the context (`Ok(None)`, which means UNKNOWN — a log
-/// destroyed on actor shutdown or create-rollback reads exactly the same as one
-/// that never existed; an empty-but-live log is `Ok(Some(vec![]))`).
+/// Raised when the bridge cannot reach the context's AUTHORITATIVE event log at
+/// all — the instance is not ready (suspended or shut down), no supervisor /
+/// event-log provider is attached, or the provider reports NO LOG for the
+/// context (`Ok(None)`, which means UNKNOWN — a log destroyed on actor shutdown
+/// or create-rollback reads exactly the same as one that never existed; an
+/// empty-but-live log is `Ok(Some(vec![]))`).
 ///
 /// Neither verification nor checkpointing may fall back to any bridge-local tree
 /// here: an absence proof over a non-authoritative or unknown log is a forgeable
@@ -425,7 +426,7 @@ fn authoritative_log_unreachable(
 ///
 /// This path must NOT use the generic [`ScpPyError::validation`] helper, whose
 /// `VALID_7001` would silently diverge the reference bridge from the contract
-/// it establishes (GitHub #1933).
+/// it establishes.
 fn malformed_claim(message: impl Into<String>) -> ScpPyError {
     ScpPyError::ValidationError {
         message: message.into(),
@@ -449,7 +450,7 @@ fn malformed_claim(message: impl Into<String>) -> ScpPyError {
 /// tree holding only bridge-local records (UCAN revocations, outlet
 /// invocations, provenance, media sessions) and whose leaves a caller can
 /// influence. Proving over that tree produced forgeable absence AND inclusion
-/// results (GitHub #1933).
+/// results.
 ///
 /// Because the proof and the reported `(leaf_count, root)` commitment come from
 /// that ONE snapshot, they describe the same tree state by construction — a
@@ -495,19 +496,19 @@ fn event_log_verify_impl(
     // Parse the claim dict.
     let claim_json = py_dict_to_json(claim)?;
 
-    // DELIBERATE ordering (black-hat NIT, #1933): the missing/invalid-`type`
-    // check runs BEFORE the `check_ready`/authoritative-log gate below, on
-    // purpose. Rejecting obviously-malformed claim shape is cheap; the log gate
-    // rebuilds the authoritative log, so validating input first avoids that work
-    // for a claim we would reject anyway. This yields a benign self-oracle — a
+    // DELIBERATE ordering: the missing/invalid-`type` check runs BEFORE the
+    // `check_ready`/authoritative-log gate below, on purpose. Rejecting
+    // obviously-malformed claim shape is cheap; the log gate rebuilds the
+    // authoritative log, so validating input first avoids that work for a claim
+    // we would reject anyway. This yields a benign self-oracle — a
     // malformed-`type` claim on a not-ready instance returns VALID-7000 while a
     // well-formed one returns CTX-2138 — but the caller CRAFTED the malformed
     // type, so learns nothing new, and can already probe readiness with a
     // well-formed claim (which returns CTX-2138). The malformed path therefore
     // leaks strictly less, never more. The remaining VALID-7000 sites (missing
     // `leaf_index`, malformed `event_hash`, unsupported type) sit in the match
-    // arms below, AFTER the gate — so an unreachable log surfaces CTX-2138 first
-    // for those; this split is the documented precedence.
+    // arms below, AFTER the gate — so an unreachable log surfaces CTX-2138
+    // first for those; this split is the documented precedence.
     let claim_type = claim_json
         .get("type")
         .and_then(|v| v.as_str())
@@ -515,10 +516,10 @@ fn event_log_verify_impl(
             malformed_claim("claim must include 'type' field ('inclusion' or 'absence')")
         })?;
 
-    // #1933 fail-closed gate. `check_ready` rejects BOTH suspended and
-    // shut-down instances (`supervisor()` only rejects suspended, and merely
-    // warns after shutdown — while a shut-down context's authoritative log has
-    // typically been destroyed).
+    // Fail-closed gate. `check_ready` rejects BOTH suspended and shut-down
+    // instances (`supervisor()` only rejects suspended, and merely warns after
+    // shutdown — while a shut-down context's authoritative log has typically
+    // been destroyed).
     bi.core
         .check_ready()
         .map_err(|e| authoritative_log_unreachable("verification", context_id, &e))?;
@@ -626,7 +627,7 @@ fn event_log_verify_impl(
 /// leaves a caller shapes at will through ordinary `provenance_attach` /
 /// `media_session_start` / outlet calls — let ANY member mint validly-signed
 /// equivocation evidence against honest peers, and left honest members'
-/// checkpoints simply wrong about their own history (GitHub #1933).
+/// checkpoints simply wrong about their own history.
 ///
 /// # Arguments
 ///
@@ -669,10 +670,10 @@ fn event_log_checkpoint_impl(
     let did_owned = did.to_owned();
     let sender_did = scp_did::DID(did_owned.clone());
 
-    // #1933 fail-closed gate, identical to `event_log_verify`. `check_ready`
-    // rejects BOTH suspended and shut-down instances (`supervisor()` only
-    // rejects suspended, and merely warns after shutdown — while a shut-down
-    // context's authoritative log has typically been destroyed).
+    // Fail-closed gate, identical to `event_log_verify`. `check_ready` rejects
+    // BOTH suspended and shut-down instances (`supervisor()` only rejects
+    // suspended, and merely warns after shutdown — while a shut-down context's
+    // authoritative log has typically been destroyed).
     bi.core
         .check_ready()
         .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))?;

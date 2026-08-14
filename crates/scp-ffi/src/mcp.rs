@@ -653,8 +653,8 @@ impl FfiBridgeProvider {
     }
 }
 
-/// Fetches the context's AUTHORITATIVE event log for the MCP `events` summary
-/// (GitHub #1933), mirroring the fail-closed gate `event_log_verify` uses.
+/// Fetches the context's AUTHORITATIVE event log for the MCP `events` summary,
+/// mirroring the fail-closed gate `event_log_verify` uses.
 ///
 /// `check_ready` rejects suspended AND shut-down instances, then the supervisor
 /// is resolved and the ONE authoritative snapshot replayed. Every failure maps
@@ -678,13 +678,14 @@ impl crate::scp::PyScp {
     /// context, as a JSON string.
     ///
     /// This is the exact metadata `ContextProvider::context_events` serves for
-    /// `scp://{context_id}/events` — `{"event_count": N, "merkle_root": "<hex>"}`
-    /// over the AUTHORITATIVE event log (`Supervisor::authoritative_event_log`),
-    /// the SAME `(count, root)` `event_log_verify` / `event_log_checkpoint`
-    /// commit to — routed through the ONE shared
-    /// [`scp_ffi_common::event_log::context_events_metadata_json`] helper so the
-    /// bytes are identical across all three bridges (GitHub #1933). It NEVER
-    /// reads the caller-influenceable bridge-local `FfiBridgeState::event_log`.
+    /// `scp://{context_id}/events` — `{"event_count": N, "merkle_root":
+    /// "<hex>"}` over the AUTHORITATIVE event log
+    /// (`Supervisor::authoritative_event_log`), the SAME `(count, root)`
+    /// `event_log_verify` / `event_log_checkpoint` commit to — routed through
+    /// the ONE shared
+    /// [`scp_ffi_common::event_log::context_events_metadata_json`] helper so
+    /// the bytes are identical across all three bridges. It NEVER reads the
+    /// caller-influenceable bridge-local `FfiBridgeState::event_log`.
     ///
     /// FAILS CLOSED: when the authoritative log is unreachable (instance
     /// suspended/shut down, no supervisor, or no log for the context) the
@@ -1233,15 +1234,15 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn context_events(&self, context_id: &str) -> serde_json::Value {
-        // #1933: the event-log summary the MCP `events` resource publishes MUST
-        // commit to the AUTHORITATIVE log — the same `(event_count, merkle_root)`
-        // pair `event_log_verify` / `event_log_checkpoint` commit to — NOT the
+        // The event-log summary the MCP `events` resource publishes MUST commit
+        // to the AUTHORITATIVE log — the same `(event_count, merkle_root)` pair
+        // `event_log_verify` / `event_log_checkpoint` commit to — NOT the
         // caller-influenceable bridge-local tree this used to read. Both this
-        // resource path and the `mcp_context_events` bridge method route through
-        // the ONE shared helper over the ONE authoritative snapshot, so the root
-        // is byte-identical to what the verify/checkpoint paths sign. An
-        // unreachable log FAILS CLOSED to an honest absent object (SCP-CTX-2138),
-        // never a fabricated zero root or count.
+        // resource path and the `mcp_context_events` bridge method route
+        // through the ONE shared helper over the ONE authoritative snapshot, so
+        // the root is byte-identical to what the verify/checkpoint paths sign.
+        // An unreachable log FAILS CLOSED to an honest absent object
+        // (SCP-CTX-2138), never a fabricated zero root or count.
         let log = self
             .upgrade_bi()
             .and_then(|bi| authoritative_log_for_mcp_events(&bi, context_id));
@@ -3884,8 +3885,8 @@ mod tests {
         // context_members: returns empty.
         assert!(provider.context_members("ctx-dropped").is_empty());
 
-        // context_events: FAILS CLOSED to the honest absent object (#1933) —
-        // NOT a fabricated zero root/count that a consumer could mistake for a
+        // context_events: FAILS CLOSED to the honest absent object — NOT a
+        // fabricated zero root/count that a consumer could mistake for a
         // genuinely-empty log. A dropped bridge cannot reach the authoritative
         // log, so the summary carries SCP-CTX-2138 and no `event_count` /
         // `merkle_root` key.

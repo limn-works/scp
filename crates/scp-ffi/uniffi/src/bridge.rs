@@ -298,12 +298,12 @@ fn no_pre_rotation_backend() -> ScpError {
 
 /// Maps a runtime authoritative-log failure into the fail-closed bridge error.
 ///
-/// GitHub #1933. Raised when the bridge cannot reach the context's
-/// AUTHORITATIVE event log at all — the instance is not ready (suspended or
-/// shut down), no supervisor / event-log provider is attached, or the provider
-/// reports NO LOG for the context (`Ok(None)`, which means UNKNOWN — a log
-/// destroyed on actor shutdown or create-rollback reads exactly the same as one
-/// that never existed; an empty-but-live log is `Ok(Some(vec![]))`).
+/// Raised when the bridge cannot reach the context's AUTHORITATIVE event log at
+/// all — the instance is not ready (suspended or shut down), no supervisor /
+/// event-log provider is attached, or the provider reports NO LOG for the
+/// context (`Ok(None)`, which means UNKNOWN — a log destroyed on actor shutdown
+/// or create-rollback reads exactly the same as one that never existed; an
+/// empty-but-live log is `Ok(Some(vec![]))`).
 ///
 /// Neither verification nor checkpointing may fall back to the UCAN-state tree
 /// here: an absence proof over a non-authoritative or unknown log is a forgeable
@@ -327,7 +327,7 @@ fn authoritative_log_unreachable(
 }
 
 /// Fetches the context's AUTHORITATIVE event log for the MCP `events` summary
-/// (GitHub #1933), mirroring the fail-closed gate `event_log_verify` uses.
+/// mirroring the fail-closed gate `event_log_verify` uses.
 ///
 /// `check_ready` rejects suspended AND shut-down instances, then the supervisor
 /// is resolved and the ONE authoritative snapshot replayed. Every failure maps
@@ -364,7 +364,7 @@ fn authoritative_log_for_mcp_events(
 /// a caller shapes at will through ordinary `provenance_attach` /
 /// `media_session_start` / outlet calls — let ANY member mint validly-signed
 /// equivocation evidence against honest peers, and left honest members'
-/// checkpoints simply wrong about their own history (GitHub #1933).
+/// checkpoints simply wrong about their own history.
 ///
 /// # Errors
 ///
@@ -379,11 +379,10 @@ fn unsigned_authoritative_checkpoint(
     sender_did: &scp_did::DID,
     epoch: u64,
 ) -> Result<scp_event_log::checkpoint::UnsignedCheckpoint, ScpError> {
-    // #1933 fail-closed gate, identical to `event_log_verify`. `check_ready`
-    // rejects BOTH suspended and shut-down instances
-    // (`context_manager_or_error` only rejects suspended, and merely warns after
-    // shutdown — while a shut-down context's authoritative log has typically
-    // been destroyed).
+    // Fail-closed gate, identical to `event_log_verify`. `check_ready` rejects
+    // BOTH suspended and shut-down instances (`context_manager_or_error` only
+    // rejects suspended, and merely warns after shutdown — while a shut-down
+    // context's authoritative log has typically been destroyed).
     bi.core
         .check_ready()
         .map_err(|e| authoritative_log_unreachable("checkpointing", context_id, &e))?;
@@ -2547,7 +2546,9 @@ pub struct Event {
 /// append order, and the sorted index the neighbours are drawn from is local
 /// state the root does not cover. Treat an `"absence"` answer as the log's own
 /// assertion plus checkable neighbour-inclusion, not as a self-contained
-/// non-membership proof (a sorted/sparse tree is the real fix — see #2314).
+/// non-membership proof (a sorted/sparse Merkle tree whose root commits to
+/// sorted order is the real fix; that construction change is tracked outside
+/// this crate).
 ///
 /// See ADR-011 (Event Log).
 #[derive(Debug, Clone, uniffi::Record)]
@@ -5471,14 +5472,14 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn context_events(&self, context_id: &str) -> serde_json::Value {
-        // #1933: the event-log summary the MCP `events` resource publishes MUST
-        // commit to the AUTHORITATIVE log — the same `(event_count, merkle_root)`
-        // pair `event_log_verify` / `event_log_checkpoint` commit to — NOT the
+        // The event-log summary the MCP `events` resource publishes MUST commit
+        // to the AUTHORITATIVE log — the same `(event_count, merkle_root)` pair
+        // `event_log_verify` / `event_log_checkpoint` commit to — NOT the
         // caller-influenceable per-context UCAN-state tree this used to read.
         // Both this resource path and the `mcp_context_events` bridge method
         // route through the ONE shared helper over the ONE authoritative
-        // snapshot, so the root is byte-identical to what verify/checkpoint sign.
-        // An unreachable log FAILS CLOSED to an honest absent object
+        // snapshot, so the root is byte-identical to what verify/checkpoint
+        // sign. An unreachable log FAILS CLOSED to an honest absent object
         // (SCP-CTX-2138), never a fabricated zero root or count.
         let log = self
             .upgrade_bi()
@@ -5867,7 +5868,7 @@ async fn event_log_checkpoint_impl(
             let context_id = handle.context_id.clone();
 
             // ONE authoritative snapshot — never the caller-shapeable
-            // UCAN-state tree (GitHub #1933).
+            // UCAN-state tree.
             let unsigned = unsigned_authoritative_checkpoint(&bi, &context_id, &sender_did, epoch)?;
 
             let signer = scp_core::event_log::KeyCustodySigner {
@@ -5969,7 +5970,7 @@ async fn event_log_checkpoint_by_did_impl(
             let context_id = handle.context_id.clone();
 
             // ONE authoritative snapshot — never the caller-shapeable
-            // UCAN-state tree (GitHub #1933).
+            // UCAN-state tree.
             let unsigned = unsigned_authoritative_checkpoint(&bi, &context_id, &sender_did, epoch)?;
 
             let signer = scp_core::event_log::KeyCustodySigner {
@@ -14956,8 +14957,8 @@ impl Scp {
     /// result fall through to the per-context UCAN-state `EventLog` —
     /// publishing THAT tree's root as `merkle_root` in a synthesized
     /// `LogSummary` event, under the same field name the authoritative answers
-    /// use. Two consequences (GitHub #1933): a consumer pinning a verify proof
-    /// against a queried root could accept a root a caller had shaped through
+    /// use. Two consequences: a consumer pinning a verify proof against a
+    /// queried root could accept a root a caller had shaped through
     /// `provenance_attach` / outlet calls; and the empty-result fall-through
     /// collapsed the empty-but-live vs unknown distinction, so query and verify
     /// returned contradictory answers about the same context.
@@ -15109,7 +15110,7 @@ impl Scp {
     /// same source [`Self::event_log_query`] reads. This method NEVER reads or
     /// mutates the per-context UCAN-state `EventLog`, a separate tree holding
     /// only bridge-local records whose leaves a caller can influence; proving
-    /// over it produced forgeable absence AND inclusion results (GitHub #1933).
+    /// over it produced forgeable absence AND inclusion results.
     ///
     /// Because the proof and the reported `(leaf_count, root)` commitment come
     /// from that ONE snapshot, they describe the same tree state by
@@ -15152,20 +15153,20 @@ impl Scp {
                         code: codes::VALID_7000.to_owned(),
                     })?;
 
-                // DELIBERATE ordering (black-hat NIT, #1933): the invalid-JSON
-                // and missing/invalid-`type` checks run BEFORE the
+                // DELIBERATE ordering: the invalid-JSON and
+                // missing/invalid-`type` checks run BEFORE the
                 // `check_ready`/authoritative-log gate below, on purpose —
                 // rejecting obviously-malformed claim shape is cheap, and a
                 // claim we cannot even parse or type cannot be answered against
                 // any log. The resulting self-oracle (a malformed-`type` claim
-                // on a not-ready instance returns VALID-7000 while a well-formed
-                // one returns CTX-2138) is benign: the caller crafted the
-                // malformed type and can already probe readiness with a
-                // well-formed claim, so the malformed path leaks strictly less.
-                // The remaining VALID-7000 sites (missing `leaf_index`,
-                // malformed `event_hash`, unsupported type) sit AFTER the gate,
-                // so an unreachable log surfaces CTX-2138 first for those — the
-                // documented precedence.
+                // on a not-ready instance returns VALID-7000 while a
+                // well-formed one returns CTX-2138) is benign: the caller
+                // crafted the malformed type and can already probe readiness
+                // with a well-formed claim, so the malformed path leaks
+                // strictly less. The remaining VALID-7000 sites (missing
+                // `leaf_index`, malformed `event_hash`, unsupported type) sit
+                // AFTER the gate, so an unreachable log surfaces CTX-2138 first
+                // for those — the documented precedence.
                 let claim_type = claim.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
                     ScpError::Context {
                         msg: "claim must include 'type' field ('inclusion' or 'absence')"
@@ -15176,9 +15177,9 @@ impl Scp {
 
                 let context_id = handle.context_id.clone();
 
-                // #1933 fail-closed gate. `check_ready` rejects BOTH suspended
-                // and shut-down instances (`context_manager_or_error` only
-                // rejects suspended, and merely warns after shutdown — while a
+                // Fail-closed gate. `check_ready` rejects BOTH suspended and
+                // shut-down instances (`context_manager_or_error` only rejects
+                // suspended, and merely warns after shutdown — while a
                 // shut-down context's authoritative log has typically been
                 // destroyed).
                 bi.core
@@ -15295,13 +15296,14 @@ impl Scp {
     /// context, as a JSON string.
     ///
     /// This is the exact metadata `ContextProvider::context_events` serves for
-    /// `scp://{context_id}/events` — `{"event_count": N, "merkle_root": "<hex>"}`
-    /// over the AUTHORITATIVE event log (`Supervisor::authoritative_event_log`),
-    /// the SAME `(count, root)` [`Self::event_log_verify`] /
-    /// [`Self::event_log_checkpoint`] commit to — routed through the ONE shared
-    /// [`scp_ffi_common::event_log::context_events_metadata_json`] helper so the
-    /// bytes are identical across all three bridges (GitHub #1933). It NEVER
-    /// reads the caller-influenceable per-context UCAN-state `EventLog`.
+    /// `scp://{context_id}/events` — `{"event_count": N, "merkle_root":
+    /// "<hex>"}` over the AUTHORITATIVE event log
+    /// (`Supervisor::authoritative_event_log`), the SAME `(count, root)`
+    /// [`Self::event_log_verify`] / [`Self::event_log_checkpoint`] commit to —
+    /// routed through the ONE shared
+    /// [`scp_ffi_common::event_log::context_events_metadata_json`] helper so
+    /// the bytes are identical across all three bridges. It NEVER reads the
+    /// caller-influenceable per-context UCAN-state `EventLog`.
     ///
     /// FAILS CLOSED: when the authoritative log is unreachable (instance
     /// suspended/shut down, no supervisor, or no log for the context) the
@@ -21006,7 +21008,7 @@ mod tests {
 
     /// Appends one typed event to the AUTHORITATIVE supervisor log.
     ///
-    /// The projection tests below need a leaf of a SPECIFIC type. Since #1933
+    /// The projection tests below need a leaf of a SPECIFIC type. Because
     /// `event_log_query` reads the authoritative log exclusively, and a full
     /// governance round-trip is not drivable from this harness (the governance
     /// key resolver only resolves DID-document-published identities; in-memory
@@ -21032,8 +21034,7 @@ mod tests {
     /// `target_did` into the returned event's `payload_json`, decoded through the
     /// shared `scp_event_log::payload::project_payload` so the value is
     /// byte-identical across the three native bridges. Driven over the
-    /// AUTHORITATIVE log — since #1933 there is no UCAN-state fallback to
-    /// project from.
+    /// AUTHORITATIVE log — there is no UCAN-state fallback to project from.
     #[tokio::test]
     #[cfg(feature = "testing")]
     async fn event_log_query_projects_governance_target_did() {
@@ -21136,9 +21137,9 @@ mod tests {
         );
     }
 
-    /// #1933 — an UNKNOWN authoritative log must FAIL CLOSED, not fall through
-    /// to the UCAN-state tree and publish its root as `merkle_root` in a
-    /// synthesized `LogSummary` event.
+    /// An UNKNOWN authoritative log must FAIL CLOSED, not fall through to the
+    /// UCAN-state tree and publish its root as `merkle_root` in a synthesized
+    /// `LogSummary` event.
     #[tokio::test]
     #[cfg(feature = "testing")]
     async fn event_log_query_fails_closed_when_the_authoritative_log_is_unknown() {
@@ -21166,7 +21167,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // event_log_verify — AUTHORITATIVE-log-only proofs (F3 / GitHub #1933)
+    // event_log_verify — AUTHORITATIVE-log-only proofs
     // -----------------------------------------------------------------------
 
     /// The AUTHORITATIVE supervisor event log.
@@ -21206,7 +21207,7 @@ mod tests {
         .expect("provenance_attach appends a bridge-local leaf");
     }
 
-    /// F3 / GitHub #1933 — proofs come from the AUTHORITATIVE log only.
+    /// Proofs come from the AUTHORITATIVE log only.
     ///
     /// Covers, in one supervisor-created context: an absence claim for a
     /// present authoritative event is rejected; every authoritative leaf proves
@@ -21341,9 +21342,8 @@ mod tests {
         );
     }
 
-    /// #1933 — the provider reporting NO LOG (`Ok(None)`) means UNKNOWN, never
-    /// "empty". Must fail closed rather than fall through to the UCAN-state
-    /// tree.
+    /// The provider reporting NO LOG (`Ok(None)`) means UNKNOWN, never "empty".
+    /// Must fail closed rather than fall through to the UCAN-state tree.
     #[tokio::test]
     #[cfg(feature = "testing")]
     async fn event_log_verify_fails_closed_when_the_authoritative_log_is_unknown() {
@@ -21374,7 +21374,7 @@ mod tests {
         }
     }
 
-    /// #1933 — a SHUT-DOWN instance must be rejected, not just a suspended one.
+    /// A SHUT-DOWN instance must be rejected, not just a suspended one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "testing")]
     async fn event_log_verify_fails_closed_after_shutdown_and_suspend() {
@@ -21425,7 +21425,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // event_log_checkpoint — the SIGNED commitment covers the AUTHORITATIVE
-    // log only (GitHub #1933 follow-up)
+    // log only
     //
     // A `ConsistencyCheckpoint` is signed, non-repudiable evidence: a peer that
     // sees the same `event_count` with a different `merkle_root` raises
@@ -23319,7 +23319,7 @@ mod tests {
         // context_members: returns empty.
         assert!(provider.context_members("ctx-dropped").is_empty());
 
-        // context_events: FAILS CLOSED to the honest absent object (#1933) —
+        // context_events: FAILS CLOSED to the honest absent object —
         // NOT a fabricated zero root/count that a consumer could mistake for a
         // genuinely-empty log. A dropped bridge cannot reach the authoritative
         // log, so the summary carries SCP-CTX-2138 and no `event_count` /
@@ -24741,11 +24741,11 @@ mod tests {
             .await
             .expect("identity_create_with_custody");
 
-        // A REAL supervisor-created context: since the #1933 follow-up the
-        // commitment is taken over the authoritative event log, so a synthetic
-        // handle (whose authoritative log is UNKNOWN) correctly fails closed
-        // with SCP-CTX-2138 and would test nothing about custody. Custody still
-        // comes from `identity`, not the handle.
+        // A REAL supervisor-created context: the commitment is taken over the
+        // authoritative event log, so a synthetic handle (whose authoritative
+        // log is UNKNOWN) correctly fails closed with SCP-CTX-2138 and would
+        // test nothing about custody. Custody still comes from `identity`, not
+        // the handle.
         let handle = scp
             .context_create(Arc::clone(&identity), encrypted_join_test_params())
             .await
@@ -24777,11 +24777,11 @@ mod tests {
             .await
             .expect("identity_create_with_custody");
 
-        // A REAL supervisor-created context: since the #1933 follow-up the
-        // commitment is taken over the authoritative event log, so a synthetic
-        // handle (whose authoritative log is UNKNOWN) correctly fails closed
-        // with SCP-CTX-2138 and would test nothing about custody. Custody still
-        // comes from `identity`, not the handle.
+        // A REAL supervisor-created context: the commitment is taken over the
+        // authoritative event log, so a synthetic handle (whose authoritative
+        // log is UNKNOWN) correctly fails closed with SCP-CTX-2138 and would
+        // test nothing about custody. Custody still comes from `identity`, not
+        // the handle.
         let handle = scp
             .context_create(Arc::clone(&identity), encrypted_join_test_params())
             .await
@@ -24832,10 +24832,10 @@ mod tests {
             .identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create");
-        // A REAL supervisor-created context: since the #1933 follow-up the
-        // commitment is taken over the authoritative event log, so the happy
-        // path below needs a context whose authoritative log exists. (The
-        // mismatch arm is rejected before any log is touched.)
+        // A REAL supervisor-created context: the commitment is taken over the
+        // authoritative event log, so the happy path below needs a context
+        // whose authoritative log exists. (The mismatch arm is rejected before
+        // any log is touched.)
         let handle = scp
             .context_create(Arc::clone(&identity), encrypted_join_test_params())
             .await

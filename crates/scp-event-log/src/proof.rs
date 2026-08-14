@@ -136,8 +136,8 @@ pub struct LeafWithProof {
 /// proofs cannot rule out a hidden leaf sorting between the neighbours. This is
 /// therefore NOT a self-contained, off-box non-membership proof — it is the
 /// log's own adjacency assertion plus checkable neighbour-inclusion. The real
-/// fix is a sorted/sparse Merkle tree whose root commits to sorted order; see
-/// #2314.
+/// fix is a sorted/sparse Merkle tree whose root commits to sorted order; this
+/// log is append-order by construction and therefore cannot provide it.
 ///
 /// **Privacy:** Reveals exactly two leaf hashes (the sorted neighbors).
 ///

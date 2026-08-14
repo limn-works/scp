@@ -1072,11 +1072,11 @@ async fn handle_build_local_checkpoint(
             &*deps.event_log,
         ) {
             Ok(cp) => cp,
-            // FAIL CLOSED (#1933 follow-up): an unreachable authoritative log
-            // means there is no honest `(event_count, merkle_root)` to sign.
-            // The reconnection driver is told so, rather than handed a signed
-            // fabricated commitment that would make peers raise
-            // `EquivocationDetected` against this member (§9.9.3).
+            // FAIL CLOSED: an unreachable authoritative log means there is no
+            // honest `(event_count, merkle_root)` to sign. The reconnection
+            // driver is told so, rather than handed a signed fabricated
+            // commitment that would make peers raise `EquivocationDetected`
+            // against this member (§9.9.3).
             Err(e) => {
                 tracing::error!(
                     context_id,
@@ -1134,10 +1134,10 @@ async fn handle_build_local_checkpoint(
 /// `EventLogFailed` error.
 ///
 /// An `EventLogFailed` here is a REFUSAL to judge — the LOCAL authoritative log
-/// was unreachable, so no honest verdict about the peer exists (#1933
-/// follow-up). It is forwarded as an error, never collapsed into a
-/// classification, and reports `Outcome::ok` (not `ok_mutated`) because
-/// `compare_remote_checkpoint` raises it before touching either Class-C field.
+/// was unreachable, so no honest verdict about the peer exists. It is forwarded
+/// as an error, never collapsed into a classification, and reports
+/// `Outcome::ok` (not `ok_mutated`) because `compare_remote_checkpoint` raises
+/// it before touching either Class-C field.
 fn handle_compare_remote_checkpoint(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,

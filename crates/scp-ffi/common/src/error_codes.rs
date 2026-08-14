@@ -506,8 +506,7 @@ pub const CTX_2136: &str = "SCP-CTX-2136";
 ///
 /// Maps from `ContextError::NothingToRestore`.
 pub const CTX_2137: &str = "SCP-CTX-2137";
-/// Event-log verification could not reach the AUTHORITATIVE log — fail closed
-/// (GitHub #1933).
+/// Event-log verification could not reach the AUTHORITATIVE log — fail closed.
 ///
 /// `event_log_verify` generates Merkle inclusion/absence proofs, and a proof is
 /// only meaningful against the context's authoritative event log (the

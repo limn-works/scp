@@ -65,7 +65,9 @@ pub struct NapiEvent {
 /// append order, and the sorted index the neighbours are drawn from is local
 /// state the root does not cover. Treat an `"absence"` answer as the log's own
 /// assertion plus checkable neighbour-inclusion, not as a self-contained
-/// non-membership proof (a sorted/sparse tree is the real fix — see #2314).
+/// non-membership proof (a sorted/sparse Merkle tree whose root commits to
+/// sorted order is the real fix; that construction change is tracked outside
+/// this crate).
 ///
 /// See ADR-011 (Event Log).
 #[napi(object)]
@@ -90,16 +92,16 @@ pub struct NapiProof {
 /// same source [`event_log_verify_on`] proves against and the checkpoint path
 /// commits to. There is no UCAN-state fallback.
 ///
-/// This function used to end
-/// `supervisor(bi).ok().and_then(|s| s.event_log_entries(..).ok().flatten())`
-/// and, on ANY failure or on an empty result, fall through to the per-context
-/// UCAN-state `EventLog` — publishing THAT tree's root as `merkle_root` in a
-/// synthesized `LogSummary` event, under the same field name the authoritative
-/// answers use. Two consequences (GitHub #1933): a consumer pinning a verify
-/// proof against a queried root could accept a root a caller had shaped through
-/// `provenance_attach` / outlet calls; and `entries.is_empty() -> fall through`
-/// collapsed the empty-but-live vs unknown distinction, so query and verify
-/// returned contradictory answers about the same context.
+/// This function used to end `supervisor(bi).ok().and_then(|s|
+/// s.event_log_entries(..).ok().flatten())` and, on ANY failure or on an empty
+/// result, fall through to the per-context UCAN-state `EventLog` — publishing
+/// THAT tree's root as `merkle_root` in a synthesized `LogSummary` event, under
+/// the same field name the authoritative answers use. Two consequences: a
+/// consumer pinning a verify proof against a queried root could accept a root a
+/// caller had shaped through `provenance_attach` / outlet calls; and
+/// `entries.is_empty() -> fall through` collapsed the empty-but-live vs unknown
+/// distinction, so query and verify returned contradictory answers about the
+/// same context.
 ///
 /// Now: an empty-but-live log returns an EMPTY list, and an unreachable or
 /// unknown log FAILS CLOSED with [`codes::CTX_2138`].
@@ -226,12 +228,12 @@ pub(crate) async fn event_log_query_on(
 
 /// Maps a runtime authoritative-log failure into the fail-closed bridge error.
 ///
-/// GitHub #1933. Raised when the bridge cannot reach the context's
-/// AUTHORITATIVE event log at all — the instance is not ready (suspended or
-/// shut down), no supervisor / event-log provider is attached, or the provider
-/// reports NO LOG for the context (`Ok(None)`, which means UNKNOWN — a log
-/// destroyed on actor shutdown or create-rollback reads exactly the same as one
-/// that never existed; an empty-but-live log is `Ok(Some(vec![]))`).
+/// Raised when the bridge cannot reach the context's AUTHORITATIVE event log at
+/// all — the instance is not ready (suspended or shut down), no supervisor /
+/// event-log provider is attached, or the provider reports NO LOG for the
+/// context (`Ok(None)`, which means UNKNOWN — a log destroyed on actor shutdown
+/// or create-rollback reads exactly the same as one that never existed; an
+/// empty-but-live log is `Ok(Some(vec![]))`).
 ///
 /// Neither verification nor checkpointing may fall back to the UCAN-state tree
 /// here: an absence proof over a non-authoritative or unknown log is a forgeable
@@ -264,7 +266,7 @@ fn authoritative_log_unreachable(
 /// function NEVER reads or mutates the per-context UCAN-state `EventLog`
 /// (`NapiContextRuntime::core.event_log`), a separate tree holding only
 /// bridge-local records whose leaves a caller can influence; proving over it
-/// produced forgeable absence AND inclusion results (GitHub #1933).
+/// produced forgeable absence AND inclusion results.
 ///
 /// Because the proof and the reported `(leaf_count, root)` commitment come from
 /// that ONE snapshot, they describe the same tree state by construction — a
@@ -302,17 +304,17 @@ pub(crate) async fn event_log_verify_on(
             code: codes::VALID_7000.to_owned(),
         })?;
 
-    // DELIBERATE ordering (black-hat NIT, #1933): the invalid-JSON and
-    // missing/invalid-`type` checks run BEFORE the `check_ready`/authoritative-log
-    // gate below, on purpose — rejecting obviously-malformed claim shape is cheap,
-    // and a claim we cannot even parse or type cannot be answered against any log.
-    // The resulting self-oracle (a malformed-`type` claim on a not-ready instance
-    // returns VALID-7000 while a well-formed one returns CTX-2138) is benign: the
+    // DELIBERATE ordering: the invalid-JSON and missing/invalid-`type` checks
+    // run BEFORE the `check_ready`/authoritative-log gate below, on purpose —
+    // rejecting obviously-malformed claim shape is cheap, and a claim we cannot
+    // even parse or type cannot be answered against any log. The resulting
+    // self-oracle (a malformed-`type` claim on a not-ready instance returns
+    // VALID-7000 while a well-formed one returns CTX-2138) is benign: the
     // caller crafted the malformed type and can already probe readiness with a
-    // well-formed claim, so the malformed path leaks strictly less. The remaining
-    // VALID-7000 sites (missing `leaf_index`, malformed `event_hash`, unsupported
-    // type) sit AFTER the gate, so an unreachable log surfaces CTX-2138 first for
-    // those — the documented precedence.
+    // well-formed claim, so the malformed path leaks strictly less. The
+    // remaining VALID-7000 sites (missing `leaf_index`, malformed `event_hash`,
+    // unsupported type) sit AFTER the gate, so an unreachable log surfaces
+    // CTX-2138 first for those — the documented precedence.
     let claim_type = claim
         .get("type")
         .and_then(|v| v.as_str())
@@ -324,10 +326,10 @@ pub(crate) async fn event_log_verify_on(
 
     let context_id = handle.context_id();
 
-    // #1933 fail-closed gate. `check_ready` rejects BOTH suspended and
-    // shut-down instances (`supervisor()` only rejects suspended, and merely
-    // warns after shutdown — while a shut-down context's authoritative log has
-    // typically been destroyed).
+    // Fail-closed gate. `check_ready` rejects BOTH suspended and shut-down
+    // instances (`supervisor()` only rejects suspended, and merely warns after
+    // shutdown — while a shut-down context's authoritative log has typically
+    // been destroyed).
     bi.core
         .check_ready()
         .map_err(|e| authoritative_log_unreachable("verification", &context_id, &e))?;
@@ -464,7 +466,7 @@ pub struct NapiCheckpoint {
 /// a caller shapes at will through ordinary `provenance_attach` /
 /// `media_session_start` / outlet calls — let ANY member mint validly-signed
 /// equivocation evidence against honest peers, and left honest members'
-/// checkpoints simply wrong about their own history (GitHub #1933).
+/// checkpoints simply wrong about their own history.
 ///
 /// # Errors
 ///
@@ -479,7 +481,7 @@ fn unsigned_authoritative_checkpoint(
     sender_did: &scp_did::DID,
     epoch: u64,
 ) -> napi::Result<scp_event_log::checkpoint::UnsignedCheckpoint> {
-    // #1933 fail-closed gate, identical to `event_log_verify_on`. `check_ready`
+    // Fail-closed gate, identical to `event_log_verify_on`. `check_ready`
     // rejects BOTH suspended and shut-down instances (`supervisor()` only
     // rejects suspended, and merely warns after shutdown — while a shut-down
     // context's authoritative log has typically been destroyed).
@@ -817,7 +819,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // event_log_verify — AUTHORITATIVE-log-only proofs (F3 / GitHub #1933)
+    // event_log_verify — AUTHORITATIVE-log-only proofs
     // -----------------------------------------------------------------------
 
     /// The AUTHORITATIVE supervisor event log.
@@ -867,7 +869,7 @@ mod tests {
         .expect("provenance_attach appends a bridge-local leaf");
     }
 
-    /// F3 / GitHub #1933 — proofs come from the AUTHORITATIVE log only.
+    /// Proofs come from the AUTHORITATIVE log only.
     ///
     /// Covers: an absence claim for a present authoritative event is rejected;
     /// every authoritative leaf proves included; a caller-injected UCAN-state
@@ -1012,9 +1014,8 @@ mod tests {
         );
     }
 
-    /// #1933 — the provider reporting NO LOG (`Ok(None)`) means UNKNOWN, never
-    /// "empty". Must fail closed rather than fall through to the UCAN-state
-    /// tree.
+    /// The provider reporting NO LOG (`Ok(None)`) means UNKNOWN, never "empty".
+    /// Must fail closed rather than fall through to the UCAN-state tree.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_verify_fails_closed_when_the_authoritative_log_is_unknown() {
@@ -1051,7 +1052,7 @@ mod tests {
         );
     }
 
-    /// #1933 — a SHUT-DOWN instance must be rejected, not just a suspended one.
+    /// A SHUT-DOWN instance must be rejected, not just a suspended one.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_verify_fails_closed_after_shutdown_and_suspend() {
@@ -1100,9 +1101,9 @@ mod tests {
         }
     }
 
-    /// #1933 — an UNKNOWN authoritative log must FAIL CLOSED, not fall through
-    /// to the UCAN-state tree and publish its root as `merkle_root` in a
-    /// synthesized `LogSummary` event.
+    /// An UNKNOWN authoritative log must FAIL CLOSED, not fall through to the
+    /// UCAN-state tree and publish its root as `merkle_root` in a synthesized
+    /// `LogSummary` event.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_query_fails_closed_when_the_authoritative_log_is_unknown() {
@@ -1137,7 +1138,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // event_log_checkpoint — the SIGNED commitment covers the AUTHORITATIVE
-    // log only (GitHub #1933 follow-up)
+    // log only
     //
     // A `ConsistencyCheckpoint` is signed, non-repudiable evidence: a peer that
     // sees the same `event_count` with a different `merkle_root` raises

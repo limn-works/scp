@@ -1096,14 +1096,14 @@ OP_UNREGISTERED_DID_REJECTED = OpSpec(
 # ---------------------------------------------------------------------------
 # op 12: event_log_verify_inclusion
 #
-# Cross-bridge verify-path parity (GitHub #1933 / ADR-046). Every bridge
-# creates a context (all three emit `ContextCreated` at leaf 0 of the
-# AUTHORITATIVE supervisor log), then asks event_log_verify to prove
-# inclusion of leaf 0. The op pins the HONEST proof shape the branch
-# committed to: a returned proof IS the positive answer (there is no
-# producer-set `verified` flag on any bridge), and its details carry the
-# checkable Merkle material — leaf hash, sibling path, root — plus the
-# `leaf_count` of the ONE snapshot the proof was generated from.
+# Cross-bridge verify-path parity (ADR-046). Every bridge creates a context
+# (all three emit `ContextCreated` at leaf 0 of the AUTHORITATIVE supervisor
+# log), then asks event_log_verify to prove inclusion of leaf 0. The op pins
+# the HONEST proof shape the branch committed to: a returned proof IS the
+# positive answer (there is no producer-set `verified` flag on any bridge),
+# and its details carry the checkable Merkle material — leaf hash, sibling
+# path, root — plus the `leaf_count` of the ONE snapshot the proof was
+# generated from.
 #
 # The comparison runs on shape booleans + the snapshot leaf count, not
 # raw hashes: context IDs (and therefore leaf hashes/roots) legitimately
@@ -1153,16 +1153,15 @@ OP_EVENT_LOG_VERIFY_INCLUSION = OpSpec(
 # ---------------------------------------------------------------------------
 # op 13: event_log_absence_of_lifecycle_event_rejected
 #
-# The literal cross-bridge assertion of GitHub #1933 acceptance
-# criterion 4: an absence proof for a REAL lifecycle event must FAIL
-# identically on every bridge. Each bridge creates a context, extracts
-# the `ContextCreated` leaf hash from its own inclusion proof (so the
-# absence claim provably names an event that IS in the authoritative
-# log), then claims that event is absent. Every bridge must reject the
-# claim with SCP-CTX-2139 — the committed "claim is false over a
-# readable log" code — never mint a verifying absence proof (the
-# repudiation primitive the issue closed) and never confuse the honest
-# negative with SCP-CTX-2138 ("cannot reach the log", fail-closed).
+# The literal cross-bridge assertion of ADR-011 acceptance criterion 4: an
+# absence proof for a REAL lifecycle event must FAIL identically on every
+# bridge. Each bridge creates a context, extracts the `ContextCreated` leaf
+# hash from its own inclusion proof (so the absence claim provably names an
+# event that IS in the authoritative log), then claims that event is absent.
+# Every bridge must reject the claim with SCP-CTX-2139 — the committed
+# "claim is false over a readable log" code — never mint a verifying absence
+# proof (the repudiation primitive the issue closed) and never confuse the
+# honest negative with SCP-CTX-2138 ("cannot reach the log", fail-closed).
 # ---------------------------------------------------------------------------
 
 
@@ -1217,13 +1216,13 @@ OP_EVENT_LOG_ABSENCE_OF_LIFECYCLE_EVENT_REJECTED = OpSpec(
 # ---------------------------------------------------------------------------
 # op 14: event_log_absence_over_divergent_local_tree_rejected
 #
-# Reproduces the F3 divergence precondition (GitHub #1933) through the
-# PUBLIC runner surface — the property the pristine-context ops 12/13
-# CANNOT catch. Ops 12/13 run on a context whose bridge-local
+# Reproduces the authoritative-vs-bridge-local divergence precondition
+# through the PUBLIC runner surface — the property the pristine-context ops
+# 12/13 CANNOT catch. Ops 12/13 run on a context whose bridge-local
 # (UCAN-state) tree still equals the authoritative log, so a bridge that
-# regressed to proving over the caller-influenceable local tree would
-# still answer identically and pass parity. This op forces the two trees
-# APART first:
+# regressed to proving over the caller-influenceable local tree would still
+# answer identically and pass parity. This op forces the two trees APART
+# first:
 #
 #   1. create a context (authoritative log gets `ContextCreated` @ leaf 0);
 #   2. call the public `provenance_attach` with a MISSING source context, so
@@ -1242,8 +1241,8 @@ OP_EVENT_LOG_ABSENCE_OF_LIFECYCLE_EVENT_REJECTED = OpSpec(
 # regressed to the divergent local tree — where the authoritative hash is
 # absent — would MINT a verifying absence proof (no error), which this op
 # catches as a parity + `expected_values` failure. This is the mechanical
-# guard that a reverted F3 fix, or a verify that proves over the local
-# tree, can no longer slip past parity.
+# guard that a verify path proving over the bridge-local tree can no longer
+# slip past parity.
 # ---------------------------------------------------------------------------
 
 
@@ -1308,14 +1307,14 @@ OP_EVENT_LOG_ABSENCE_OVER_DIVERGENT_LOCAL_TREE_REJECTED = OpSpec(
 # ---------------------------------------------------------------------------
 # op 15: event_log_verify_malformed_claim_rejected
 #
-# The mechanical cross-bridge guard for Fix 1 (GitHub #1933): malformed
+# The mechanical cross-bridge guard for malformed claim input: malformed
 # CLAIM input carries SCP-VALID-7000 on EVERY bridge — it is caller input
 # validation, distinct from the honest-negative SCP-CTX-2139 and the
-# fail-closed SCP-CTX-2138. The PyO3 reference bridge previously emitted
-# the generic SCP-VALID-7001 here while NAPI/UniFFI emitted SCP-VALID-7000,
-# and no parity op fed a malformed claim, so the drift went undetected.
-# This op feeds a malformed inclusion claim (missing `leaf_index`) over a
-# readable log and pins `error.code == SCP-VALID-7000` across all bridges.
+# fail-closed SCP-CTX-2138. The PyO3 reference bridge previously emitted the
+# generic SCP-VALID-7001 here while NAPI/UniFFI emitted SCP-VALID-7000, and
+# no parity op fed a malformed claim, so the drift went undetected. This op
+# feeds a malformed inclusion claim (missing `leaf_index`) over a readable
+# log and pins `error.code == SCP-VALID-7000` across all bridges.
 # ---------------------------------------------------------------------------
 
 
@@ -1366,16 +1365,15 @@ OP_EVENT_LOG_VERIFY_MALFORMED_CLAIM_REJECTED = OpSpec(
 # ---------------------------------------------------------------------------
 # op 16: mcp_context_events_authoritative
 #
-# The direct cross-bridge regression guard for the `context_events` twin
-# (GitHub #1933, BLACK-1933-1). The MCP `events` resource — and the
-# `mcp_context_events` bridge method that publishes the identical summary —
-# reports an event-log summary `{event_count, merkle_root}`. Before this fix
-# every bridge computed that root over its OWN caller-influenceable
-# bridge-local tree (PyO3/UniFFI) or returned an empty array (NAPI): the
-# exact forgeable-root class #1933 severs on verify/checkpoint/query, left
-# live on the agent-facing MCP surface, plus a THIRD cross-bridge
-# inconsistency. Ops 12/13/14 cover the verify path; NONE covers the MCP
-# summary surface, so the twin went unguarded.
+# The direct cross-bridge regression guard for the `context_events` twin.
+# The MCP `events` resource — and the `mcp_context_events` bridge method
+# that publishes the identical summary — reports an event-log summary
+# `{event_count, merkle_root}`. Before this fix every bridge computed that
+# root over its OWN caller-influenceable bridge-local tree (PyO3/UniFFI) or
+# returned an empty array (NAPI): the exact forgeable-root class severed on
+# verify/checkpoint/query, left live on the agent-facing MCP surface, plus a
+# THIRD cross-bridge inconsistency. Ops 12/13/14 cover the verify path; NONE
+# covers the MCP summary surface, so the twin went unguarded.
 #
 # This op:
 #   1. creates a context (authoritative log gets `ContextCreated` @ leaf 0);

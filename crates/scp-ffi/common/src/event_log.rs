@@ -178,8 +178,9 @@ pub fn filter_manager_entries<'a>(
 ///
 /// This closes the neighbour-inclusion HALF only: the append-order root does
 /// NOT commit to sorted adjacency, so an absence answer is not a self-contained,
-/// off-box non-membership proof (a sorted/sparse tree is the real fix; see
-/// #2314).
+/// off-box non-membership proof (a sorted/sparse Merkle tree whose root commits
+/// to sorted order is the real fix; that construction change is tracked outside
+/// this crate).
 #[must_use]
 pub fn inclusion_proof_json(proof: &scp_event_log::proof::InclusionProof) -> serde_json::Value {
     let path: Vec<serde_json::Value> = proof
@@ -225,7 +226,7 @@ pub fn absence_neighbor_json(
 }
 
 /// Builds the MCP `context_events` metadata JSON over the AUTHORITATIVE event
-/// log (GitHub #1933).
+/// log.
 ///
 /// The MCP `events` resource (`scp://{context_id}/events`, read through
 /// `ContextProvider::context_events`) and the `mcp_context_events` bridge
@@ -234,9 +235,9 @@ pub fn absence_neighbor_json(
 /// and identical to the commitment `event_log_verify` / `event_log_checkpoint`
 /// take over the SAME `Supervisor::authoritative_event_log` snapshot. The MCP
 /// tool previously computed its root over each bridge's own
-/// caller-influenceable bridge-local tree — the exact forgeable-root class
-/// #1933 severs on the verify / checkpoint / query paths, left live on the
-/// agent-facing MCP surface.
+/// caller-influenceable bridge-local tree — the exact forgeable-root class the
+/// verify / checkpoint / query paths sever, left live on the agent-facing MCP
+/// surface.
 ///
 /// `log` is the authoritative-log fetch result. On success the summary is the
 /// real `(count, root)` of that snapshot. On failure it FAILS CLOSED to an
@@ -560,7 +561,7 @@ mod tests {
 
     /// Helper contract arm (a): `Ok(non-empty log)` → the honest summary whose
     /// `event_count` / `merkle_root` are byte-identical to `tree::event_count`
-    /// / `hex(tree::root)` over the SAME log — the #1933 authoritative pair.
+    /// / `hex(tree::root)` over the SAME log — the authoritative pair.
     #[test]
     fn context_events_metadata_json_ok_nonempty_matches_tree() {
         let log = build_nonempty_log();

@@ -2502,8 +2502,8 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * result fall through to the per-context UCAN-state `EventLog` —
      * publishing THAT tree's root as `merkle_root` in a synthesized
      * `LogSummary` event, under the same field name the authoritative answers
-     * use. Two consequences (GitHub #1933): a consumer pinning a verify proof
-     * against a queried root could accept a root a caller had shaped through
+     * use. Two consequences: a consumer pinning a verify proof against a
+     * queried root could accept a root a caller had shaped through
      * `provenance_attach` / outlet calls; and the empty-result fall-through
      * collapsed the empty-but-live vs unknown distinction, so query and verify
      * returned contradictory answers about the same context.
@@ -2527,7 +2527,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * same source [`Self::event_log_query`] reads. This method NEVER reads or
      * mutates the per-context UCAN-state `EventLog`, a separate tree holding
      * only bridge-local records whose leaves a caller can influence; proving
-     * over it produced forgeable absence AND inclusion results (GitHub #1933).
+     * over it produced forgeable absence AND inclusion results.
      *
      * Because the proof and the reported `(leaf_count, root)` commitment come
      * from that ONE snapshot, they describe the same tree state by
@@ -2906,13 +2906,14 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * context, as a JSON string.
      *
      * This is the exact metadata `ContextProvider::context_events` serves for
-     * `scp://{context_id}/events` — `{"event_count": N, "merkle_root": "<hex>"}`
-     * over the AUTHORITATIVE event log (`Supervisor::authoritative_event_log`),
-     * the SAME `(count, root)` [`Self::event_log_verify`] /
-     * [`Self::event_log_checkpoint`] commit to — routed through the ONE shared
-     * [`scp_ffi_common::event_log::context_events_metadata_json`] helper so the
-     * bytes are identical across all three bridges (GitHub #1933). It NEVER
-     * reads the caller-influenceable per-context UCAN-state `EventLog`.
+     * `scp://{context_id}/events` — `{"event_count": N, "merkle_root":
+     * "<hex>"}` over the AUTHORITATIVE event log
+     * (`Supervisor::authoritative_event_log`), the SAME `(count, root)`
+     * [`Self::event_log_verify`] / [`Self::event_log_checkpoint`] commit to —
+     * routed through the ONE shared
+     * [`scp_ffi_common::event_log::context_events_metadata_json`] helper so
+     * the bytes are identical across all three bridges. It NEVER reads the
+     * caller-influenceable per-context UCAN-state `EventLog`.
      *
      * FAILS CLOSED: when the authoritative log is unreachable (instance
      * suspended/shut down, no supervisor, or no log for the context) the
@@ -5138,8 +5139,8 @@ open func eventLogCheckpointByDid(handle: ContextHandle, identity: Identity, did
      * result fall through to the per-context UCAN-state `EventLog` —
      * publishing THAT tree's root as `merkle_root` in a synthesized
      * `LogSummary` event, under the same field name the authoritative answers
-     * use. Two consequences (GitHub #1933): a consumer pinning a verify proof
-     * against a queried root could accept a root a caller had shaped through
+     * use. Two consequences: a consumer pinning a verify proof against a
+     * queried root could accept a root a caller had shaped through
      * `provenance_attach` / outlet calls; and the empty-result fall-through
      * collapsed the empty-but-live vs unknown distinction, so query and verify
      * returned contradictory answers about the same context.
@@ -5178,7 +5179,7 @@ open func eventLogQuery(handle: ContextHandle, filterJson: String?)async throws 
      * same source [`Self::event_log_query`] reads. This method NEVER reads or
      * mutates the per-context UCAN-state `EventLog`, a separate tree holding
      * only bridge-local records whose leaves a caller can influence; proving
-     * over it produced forgeable absence AND inclusion results (GitHub #1933).
+     * over it produced forgeable absence AND inclusion results.
      *
      * Because the proof and the reported `(leaf_count, root)` commitment come
      * from that ONE snapshot, they describe the same tree state by
@@ -5986,13 +5987,14 @@ open func mcpConfigureStdioAllowlist(additionalBinaries: [String])throws   {try 
      * context, as a JSON string.
      *
      * This is the exact metadata `ContextProvider::context_events` serves for
-     * `scp://{context_id}/events` — `{"event_count": N, "merkle_root": "<hex>"}`
-     * over the AUTHORITATIVE event log (`Supervisor::authoritative_event_log`),
-     * the SAME `(count, root)` [`Self::event_log_verify`] /
-     * [`Self::event_log_checkpoint`] commit to — routed through the ONE shared
-     * [`scp_ffi_common::event_log::context_events_metadata_json`] helper so the
-     * bytes are identical across all three bridges (GitHub #1933). It NEVER
-     * reads the caller-influenceable per-context UCAN-state `EventLog`.
+     * `scp://{context_id}/events` — `{"event_count": N, "merkle_root":
+     * "<hex>"}` over the AUTHORITATIVE event log
+     * (`Supervisor::authoritative_event_log`), the SAME `(count, root)`
+     * [`Self::event_log_verify`] / [`Self::event_log_checkpoint`] commit to —
+     * routed through the ONE shared
+     * [`scp_ffi_common::event_log::context_events_metadata_json`] helper so
+     * the bytes are identical across all three bridges. It NEVER reads the
+     * caller-influenceable per-context UCAN-state `EventLog`.
      *
      * FAILS CLOSED: when the authoritative log is unreachable (instance
      * suspended/shut down, no supervisor, or no log for the context) the
@@ -11428,7 +11430,9 @@ public func FfiConverterTypeParticipationRecordView_lower(_ value: Participation
  * append order, and the sorted index the neighbours are drawn from is local
  * state the root does not cover. Treat an `"absence"` answer as the log's own
  * assertion plus checkable neighbour-inclusion, not as a self-contained
- * non-membership proof (a sorted/sparse tree is the real fix — see #2314).
+ * non-membership proof (a sorted/sparse Merkle tree whose root commits to
+ * sorted order is the real fix; that construction change is tracked outside
+ * this crate).
  *
  * See ADR-011 (Event Log).
  */
@@ -17989,10 +17993,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint_by_did() != 22488) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 27330) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 31807) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_verify() != 35930) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_verify() != 62150) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_finalize_close() != 12188) {
@@ -18097,7 +18101,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_configure_stdio_allowlist() != 7937) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_context_events() != 7166) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_context_events() != 4297) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_disable_stdio_allowlist() != 42656) {

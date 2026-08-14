@@ -729,12 +729,12 @@ pub async fn close_context_with_key(
                     event_count = cp.event_count,
                     "final checkpoint created on close (§9.9.3)"
                 ),
-                // FAIL CLOSED (#1933 follow-up): no honest `(event_count,
-                // merkle_root)` is available, so no checkpoint is signed. An
-                // ABSENT final checkpoint is an honest state peers can detect;
-                // a signed fabricated `(0, [0u8; 32])` commitment would make
-                // them raise `EquivocationDetected` against the closing member.
-                // Close itself still proceeds — the checkpoint is an independent
+                // FAIL CLOSED: no honest `(event_count, merkle_root)` is
+                // available, so no checkpoint is signed. An ABSENT final
+                // checkpoint is an honest state peers can detect; a signed
+                // fabricated `(0, [0u8; 32])` commitment would make them raise
+                // `EquivocationDetected` against the closing member. Close
+                // itself still proceeds — the checkpoint is an independent
                 // consistency-monitoring artifact and the context is terminal.
                 Err(e) => tracing::error!(
                     context_id = %context_id,
