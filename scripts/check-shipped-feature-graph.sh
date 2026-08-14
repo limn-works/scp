@@ -49,10 +49,13 @@ cd "$REPO_ROOT"
 # ---------------------------------------------------------------------------
 # Single permitted-production allowlist (EXPLICIT — the whitelist).
 #
-# Durability-only (SCP-CAPSEL-8010/8011) + real-backend features ONLY. Contains
-# ZERO nullifier features, no exceptions (ADR-062 §Decision 6; PR #2132). The
-# `assert_allowlist_has_no_nullifier` self-test enforces that invariant so a
-# future edit cannot quietly add a nullifier exception.
+# Durability-only (SCP-CAPSEL-8010/8011) + real-backend features. ZERO nullifier
+# features is the design mandate (ADR-062 §Decision 6; PR #2132) — with one
+# disclosed deviation: the three `scp-*/allow_unencrypted_storage` entries below
+# are a known confidentiality-nullifier residue (ADR-062 §Status), tracked for
+# removal in Track B / #2292. The `assert_allowlist_has_no_nullifier` self-test
+# enforces that no NULLIFIER_CONTROL_FEATURES entry is added, so a future edit
+# cannot quietly add a *new* nullifier exception.
 #
 # Five artifacts are gated: the three shipped FFI bridges (built
 # `--no-default-features --features server`) plus the scp-node and scp-relay
@@ -276,11 +279,11 @@ run_gate() {
     if offenders="$(check_subset "$resolved" "$PERMITTED_ALLOWLIST")"; then
       echo "   OK — resolved SCP-crate feature set ⊆ permitted-production allowlist"
     else
-      echo "   FAIL — resolved features NOT on the durability-only allowlist:"
+      echo "   FAIL — resolved features NOT on the durability-only + real-backend allowlist:"
       printf '%s\n' "$offenders" | sed 's/^/       ✗ /'
       echo "   These are test-harness / nullifier features that must NOT reach a"
-      echo "   shipped artifact. A shipped build carries durability-only features"
-      echo "   only (ADR-062 §Decision 6, ZERO nullifier exceptions)."
+      echo "   shipped artifact. A shipped build carries only durability-only +"
+      echo "   real-backend features (ADR-062 §Decision 6; ZERO-nullifier mandate)."
       failures=$((failures + 1))
     fi
   done
@@ -341,7 +344,7 @@ run_fixtures() {
   # (AC8 soundness) A synthetic consumer whose graph carries a `testing` nullifier
   #     feature (e.g. a mis-wired bridge, or a future consumer that fails to keep
   #     the nullifier behind dev-deps) → REJECTED, because no `testing` feature is
-  #     on the durability-only allowlist. Feature-absence ≡ nullifier-absence.
+  #     on the durability-only + real-backend allowlist. Feature-absence ≡ nullifier-absence.
   local nf leaked
   for nf in "scp-platform/testing" "scp-dht/testing" "scp-did/testing" "scp-testing"; do
     leaked="$(printf '%s\n%s' "$PERMITTED_ALLOWLIST" "$nf")"
@@ -383,7 +386,7 @@ main() {
   echo
   if run_gate; then
     echo
-    echo "G1 PASSED: every shipped artifact's SCP-crate feature set is durability-only."
+    echo "G1 PASSED: every shipped artifact's SCP-crate feature set ⊆ the permitted-production allowlist (durability-only + real-backend)."
     exit 0
   fi
   echo
