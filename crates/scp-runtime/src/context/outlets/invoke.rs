@@ -20,6 +20,7 @@ use futures::FutureExt;
 use tokio::sync::mpsc;
 
 use crate::context::ContextHandle;
+use crate::context::outlets::signer::{StreamSigner, StreamSignerError};
 use scp_did::DID;
 use scp_protocol::context::ContextState;
 use scp_protocol::context::outlets::OutletId;
@@ -35,6 +36,7 @@ use scp_protocol::context::outlets::schema::validate_value_against_schema;
 use scp_protocol::context::outlets::stream::{
     ChunkPayload, OutletStreamChunk, RequestId, StreamTerminalStatus,
 };
+use scp_protocol::context::params::MemoryScope;
 use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::validate::{
@@ -3382,16 +3384,48 @@ fn executor_error_to_terminal_payload(err: &OutletExecutorError) -> ChunkPayload
     }
 }
 
-/// Builds a placeholder `DataProvenance` used by the framework's
-/// terminal `ChunkPayload::End` chunk when the streaming
-/// `invoke_outlet` returns successfully (SCP-OUT-033 AC5).
+/// Builds the `DataProvenance` for the framework's terminal
+/// `ChunkPayload::End` chunk emitted when the streaming `invoke_outlet`
+/// returns successfully (SCP-OUT-033 AC5, spec §5.4.5:
+/// `End { aggregate, provenance, execution_time_ms }`).
 ///
-/// Spec §5.4.5: `End { aggregate, provenance, execution_time_ms }`.
-/// The free function `invoke_outlet` does not have access to the
-/// hosting context's full provenance metadata — the manager wrapper
-/// is responsible for richer attachment when crossing context
-/// boundaries.
-fn placeholder_data_provenance(context_id: &str) -> scp_protocol::provenance::DataProvenance {
+/// Every field carries a value that is genuinely true of an in-context,
+/// first-hop, freshly-generated, best-effort (zero-escrow) stream output —
+/// NOT a fabricated stand-in. In particular `memory_scope` is threaded
+/// through from the hosting `ContextHandle::params()` so it reflects the
+/// context's REAL retention policy (`Ephemeral` / `Summary` / `Full`). The
+/// prior implementation hardcoded `MemoryScope::Full`, which — because the
+/// End chunk is operator-signed under `SCP-OUTLET-CHUNK-SIG-V1:` — shipped a
+/// cryptographically-attested FALSE claim that an ephemeral stream's output
+/// was permanently retainable (the §5 / §7.7 "Moltbook" memory-scope signal
+/// inverted). The absence of a fabricated over-claim is the whole point: a
+/// consumer that later re-introduces this data carries the honest scope.
+///
+/// The remaining fields are the honest structural facts this layer knows:
+/// - `source_context` — the hosting context id (real).
+/// - `source_type` — `Persistent`: the context is `Active` (verified at open
+///   in [`invoke_outlet`], and `End` is emitted only on successful executor
+///   completion), i.e. "still open and verifiable" per
+///   [`SourceType::Persistent`](scp_protocol::provenance::SourceType::Persistent).
+/// - `counterparties` — empty: the End chunk is delivered IN-context to
+///   existing members; it exports no cross-context counterparty list. A
+///   cross-context hop re-derives counterparties under the source context's
+///   [`CounterpartyPolicy`](scp_protocol::provenance::CounterpartyPolicy) at
+///   `attach_provenance` time (§7.7.1) — this in-context terminal never
+///   over-claims membership.
+/// - `discovery_method` — `OutOfBand`: no protocol-level cross-context
+///   discovery path produced this output.
+/// - `age` — zero: the output is generated live by the executor for this
+///   stream.
+/// - `chain_depth` / `chain_path` — `0` / `None`: first hop, no
+///   intermediaries.
+/// - `payment_*` — `None`: the best-effort *outlet stream* is zero-escrow
+///   (§5.4.5 / ADR-061); a paid, metered stream flows through the streaming
+///   saga (§6.2.4), not this path.
+fn stream_output_provenance(
+    context_id: &str,
+    memory_scope: scp_protocol::context::params::MemoryScope,
+) -> scp_protocol::provenance::DataProvenance {
     scp_protocol::provenance::DataProvenance {
         source_context: context_id.to_owned(),
         source_type: scp_protocol::provenance::SourceType::Persistent,
@@ -3399,7 +3433,7 @@ fn placeholder_data_provenance(context_id: &str) -> scp_protocol::provenance::Da
         purpose: None,
         discovery_method: scp_protocol::provenance::DiscoveryMethod::OutOfBand,
         age: std::time::Duration::from_secs(0),
-        memory_scope: scp_protocol::context::params::MemoryScope::Full,
+        memory_scope,
         chain_depth: 0,
         chain_path: None,
         payment_amount: None,
@@ -3413,28 +3447,35 @@ fn placeholder_data_provenance(context_id: &str) -> scp_protocol::provenance::Da
 /// [`OutletStreamChunk`] with the next monotonic sequence number for
 /// this `request_id` (SCP-OUT-033 AC4).
 ///
-/// Signs the chunk under the §5.4.5 `SCP-OUTLET-CHUNK-SIG-V1:`
-/// preimage with the supplied operator signing key when present. When
-/// `signing_ctx.operator_signer` is `None`, emits the all-zero
-/// placeholder and logs `tracing::error!` so the gap is visible —
-/// production native paths always pass `Some`.
+/// Signs the chunk under the §5.4.5 `SCP-OUTLET-CHUNK-SIG-V1:` preimage
+/// with the pinned operator signer. Returns `Err(StreamSignerError)` when
+/// signing fails (JCS canonicalization of the payload, or a custody-side
+/// signer fault) — the caller then FAILS CLOSED (logs + stops the pump
+/// without emitting) rather than shipping a chunk bearing a forged all-zero
+/// signature. A `[0u8; 64]` sig is a false attestation the §5.4.5
+/// receiver-side verifier would reject anyway; emitting it would corrupt the
+/// wire and let a receiver bill chunks under a sig no operator ever produced.
+/// The sequence cursor is only advanced when a signed chunk is actually
+/// produced, so a signing failure never burns a sequence number.
 async fn wrap_chunk(
     signing_ctx: &InnerPumpSigningContext,
     request_id: RequestId,
     sequence: &mut u64,
     payload: ChunkPayload,
-) -> OutletStreamChunk {
+) -> Result<OutletStreamChunk, StreamSignerError> {
     let seq = *sequence;
-    *sequence = sequence.saturating_add(1);
     let sig = signing_ctx
         .sign_inner_chunk(&request_id, seq, &payload)
-        .await;
-    OutletStreamChunk {
+        .await?;
+    // Advance ONLY after a successful sign — a failed sign leaves the cursor
+    // untouched so no gap appears in the emitted sequence.
+    *sequence = sequence.saturating_add(1);
+    Ok(OutletStreamChunk {
         request_id,
         sequence: seq,
         payload,
         sig,
-    }
+    })
 }
 
 /// Identity-and-key bundle the inner pump uses to sign every chunk
@@ -3446,10 +3487,15 @@ async fn wrap_chunk(
 /// pump (`dispatch.rs`, owns admission + credit + cancel-ack).
 #[derive(Clone)]
 pub(crate) struct InnerPumpSigningContext {
-    /// Operator streaming signer. `None` for legacy / test callers that
-    /// did not wire a signer — `wrap_chunk` falls back to the all-zero
-    /// placeholder + a `tracing::error!` log so the gap is visible.
-    pub(crate) operator_signer: Option<std::sync::Arc<dyn super::signer::StreamSigner>>,
+    /// Operator streaming signer. REQUIRED — a stream that cannot sign its
+    /// chunks must not open. Making this non-optional (mirroring
+    /// [`dispatch::PumpSigningContext`](super::dispatch)) removes at the type
+    /// level the former `None` escape hatch that emitted an all-zero
+    /// (forged) signature: a signer-absent stream is now unrepresentable, so
+    /// the nullifier cannot be reached on any path — production, WASM, or
+    /// test. Native FFI bridges supply a custody-backed adapter (ADR-006);
+    /// tests / WASM supply an `InProcessStreamSigner`.
+    pub(crate) operator_signer: std::sync::Arc<dyn super::signer::StreamSigner>,
     /// Hosting context id (committed into the preimage).
     pub(crate) context_id: String,
     /// Outlet id (committed into the preimage).
@@ -3459,62 +3505,36 @@ pub(crate) struct InnerPumpSigningContext {
 }
 
 impl InnerPumpSigningContext {
-    /// Signs a `(request_id, sequence, payload)` triple under the
-    /// pinned `(context_id, outlet_id, caveats_binding)`. Returns the
-    /// 64-byte signature, or the all-zero placeholder + a
-    /// `tracing::error!` log when the signer is `None` / when JCS or the
-    /// signer fails.
+    /// Signs a `(request_id, sequence, payload)` triple under the pinned
+    /// `(context_id, outlet_id, caveats_binding)`, returning the 64-byte
+    /// Ed25519 signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamSignerError::Jcs`] when JCS canonicalization of the
+    /// payload fails while composing the preimage (a structural invariant
+    /// violation for a well-formed `ChunkPayload`), or
+    /// [`StreamSignerError::Custody`] when the backing operator signer fails.
+    /// The caller MUST fail closed on `Err` — never substitute an all-zero
+    /// placeholder, which would be a forged attestation. This mirrors the
+    /// sibling [`dispatch::PumpSigningContext::sign_outer_chunk`](super::dispatch)
+    /// contract.
     async fn sign_inner_chunk(
         &self,
         request_id: &RequestId,
         sequence: u64,
         payload: &ChunkPayload,
-    ) -> [u8; 64] {
-        let Some(signer) = self.operator_signer.as_ref() else {
-            tracing::error!(
-                request_id = %hex::encode(request_id),
-                outlet_id = %self.outlet_id,
-                context_id = %self.context_id,
-                sequence,
-                "invoke pump: operator_signer is None — emitting unsigned chunk (legacy/test path)"
-            );
-            return [0u8; 64];
-        };
-        let preimage = match scp_protocol::context::outlets::stream::compute_chunk_sig_preimage(
+    ) -> Result<[u8; 64], StreamSignerError> {
+        let preimage = scp_protocol::context::outlets::stream::compute_chunk_sig_preimage(
             &self.context_id,
             &self.outlet_id,
             request_id,
             sequence,
             &self.caveats_binding,
             payload,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(
-                    request_id = %hex::encode(request_id),
-                    outlet_id = %self.outlet_id,
-                    context_id = %self.context_id,
-                    sequence,
-                    error = %e,
-                    "invoke pump: failed to compute chunk preimage — emitting unsigned placeholder"
-                );
-                return [0u8; 64];
-            }
-        };
-        match signer.sign(&preimage).await {
-            Ok(sig) => sig,
-            Err(e) => {
-                tracing::error!(
-                    request_id = %hex::encode(request_id),
-                    outlet_id = %self.outlet_id,
-                    context_id = %self.context_id,
-                    sequence,
-                    error = %e,
-                    "invoke pump: signer failed to sign chunk — emitting unsigned placeholder"
-                );
-                [0u8; 64]
-            }
-        }
+        )
+        .map_err(StreamSignerError::Jcs)?;
+        self.operator_signer.sign(&preimage).await
     }
 }
 
@@ -3612,12 +3632,13 @@ pub async fn invoke_outlet<E>(
     handler_panic_sink: Option<std::sync::Arc<dyn HandlerPanicSink>>,
     invoked_event_sink: Option<std::sync::Arc<dyn OutletInvokedEventSink>>,
     // Operator streaming signer used to sign every chunk under §5.4.5
-    // `SCP-OUTLET-CHUNK-SIG-V1:`. `None` is reserved for legacy / test
-    // callers; production native paths always supply `Some`. A
-    // `StreamSigner` trait object so the inner pump signs through the same
-    // custody-injectable seam as the dispatch pump. See
-    // `InnerPumpSigningContext` for the fallback behaviour.
-    operator_signer: Option<std::sync::Arc<dyn super::signer::StreamSigner>>,
+    // `SCP-OUTLET-CHUNK-SIG-V1:`. REQUIRED — a stream that cannot sign its
+    // chunks must not open, so this is non-optional (mirroring the dispatch
+    // pump's `OpenStreamParams::operator_signer`). Removing the former
+    // `Option` closes the signer-absent path that emitted an all-zero
+    // (forged) signature. A `StreamSigner` trait object so the inner pump
+    // signs through the same custody-injectable seam as the dispatch pump.
+    operator_signer: std::sync::Arc<dyn StreamSigner>,
     // 32-byte `caveats_binding` pinned at acceptance — committed into
     // the per-chunk-signature preimage. `[0u8; 32]` for legacy / test
     // callers; production paths supply the real binding.
@@ -3677,6 +3698,13 @@ where
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
 
+    // Item 4: capture the hosting context's REAL retention policy so the
+    // terminal `End` chunk's provenance carries the true `memory_scope`
+    // instead of a hardcoded `Full` (which would be a signed false claim for
+    // an ephemeral/summary context). `context.params()` is the immutable
+    // creation-time parameter set (promotion mutates it in place), so this is
+    // the authoritative scope at stream time.
+    let memory_scope = context.params().memory_scope;
     let signing_ctx = InnerPumpSigningContext {
         operator_signer,
         context_id: context_id_owned.clone(),
@@ -3704,6 +3732,7 @@ where
         timeout_duration,
         effective_timeout,
         signing_ctx,
+        memory_scope,
     };
     tokio::spawn(run_streaming_executor_task(task_inputs));
 
@@ -3751,6 +3780,10 @@ struct StreamingTaskInputs<E: ?Sized> {
     /// callers that bypass the dispatch pump (manager-direct or test
     /// callers).
     signing_ctx: InnerPumpSigningContext,
+    /// Hosting context's real retention policy (`ContextParams::memory_scope`),
+    /// stamped into the terminal `End` chunk's provenance so it reflects the
+    /// context's true scope rather than a hardcoded `Full` (Item 4).
+    memory_scope: MemoryScope,
 }
 
 /// Drives the streaming executor under panic guard + timeout, pumps
@@ -3790,6 +3823,7 @@ where
         timeout_duration,
         effective_timeout,
         signing_ctx,
+        memory_scope,
     } = inputs;
 
     let start = std::time::Instant::now();
@@ -3842,6 +3876,19 @@ where
     )
     .await;
 
+    if pump_outcome.signing_failed {
+        // A chunk failed to sign inside the pump. We FAIL CLOSED: a chunk can
+        // only cross the wire bearing a valid `SCP-OUTLET-CHUNK-SIG-V1:`
+        // signature, and we will not substitute an all-zero forgery. The
+        // pump already logged the signer error; no terminal chunk is emitted
+        // (a terminal `Error` would itself need signing under the same signer
+        // that just failed), and the §5.4.5 event is skipped because no
+        // terminal was delivered. This is the sibling dispatch pump's
+        // "break-without-emitting" contract (dispatch.rs
+        // `try_build_signed_chunk` → `None`). See `pump_payload_stream_capture`.
+        return;
+    }
+
     if !pump_outcome.chunk_tx_alive {
         // Receiver dropped mid-stream; no terminal chunk is emitted.
         // The §5.4.5 event-log shape says one event per stream, but
@@ -3856,7 +3903,22 @@ where
     // where the executor finished simultaneously with the deadline.
     if !pump_outcome.timed_out {
         while let Ok(payload) = payload_rx.try_recv() {
-            let chunk = wrap_chunk(&signing_ctx, request_id, &mut sequence, payload).await;
+            let chunk = match wrap_chunk(&signing_ctx, request_id, &mut sequence, payload).await {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    // Fail closed: cannot sign this late-drain chunk, so do
+                    // not emit it (or any terminal, which would need the same
+                    // signer). No forged all-zero sig ever reaches the wire.
+                    tracing::error!(
+                        request_id = %hex::encode(request_id),
+                        outlet_id = %outlet_id_for_emit,
+                        context_id = %context_id,
+                        error = %e,
+                        "invoke pump: late-drain chunk signing failed — failing closed without emitting"
+                    );
+                    return;
+                }
+            };
             ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
             if chunk_tx.send(chunk).await.is_err() {
                 // Receiver dropped during late drain; same rationale
@@ -3876,10 +3938,28 @@ where
         effective_timeout,
         start,
         handler_panic_sink: handler_panic_sink.as_deref(),
+        memory_scope,
     });
 
     let terminal_chunk =
-        wrap_chunk(&signing_ctx, request_id, &mut sequence, terminal_payload).await;
+        match wrap_chunk(&signing_ctx, request_id, &mut sequence, terminal_payload).await {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                // Fail closed: the terminal chunk itself could not be signed.
+                // Emitting it with an all-zero sig would ship a forged
+                // attestation; the receiver's §5.4.5 verifier would reject it
+                // regardless. No terminal is delivered and the event is
+                // skipped.
+                tracing::error!(
+                    request_id = %hex::encode(request_id),
+                    outlet_id = %outlet_id_for_emit,
+                    context_id = %context_id,
+                    error = %e,
+                    "invoke pump: terminal chunk signing failed — failing closed without emitting"
+                );
+                return;
+            }
+        };
     ingest_stream_chunk(&mut frontier, &mut terminal_summary, &terminal_chunk);
     let delivered = chunk_tx.send(terminal_chunk).await.is_ok();
 
@@ -4111,6 +4191,7 @@ where
     > = None;
     let mut timed_out = false;
     let mut chunk_tx_alive = true;
+    let mut signing_failed = false;
 
     loop {
         tokio::select! {
@@ -4123,8 +4204,26 @@ where
             next_payload = payload_rx.recv() => {
                 match next_payload {
                     Some(payload) => {
-                        let chunk =
-                            wrap_chunk(signing_ctx, request_id, sequence, payload).await;
+                        let chunk = match wrap_chunk(signing_ctx, request_id, sequence, payload).await {
+                            Ok(chunk) => chunk,
+                            Err(e) => {
+                                // Fail closed: this chunk could not be signed.
+                                // Never emit an all-zero (forged) signature —
+                                // stop the pump and let the caller skip the
+                                // terminal emission. `sequence` was NOT advanced
+                                // (wrap_chunk only advances on a successful sign).
+                                tracing::error!(
+                                    request_id = %hex::encode(request_id),
+                                    outlet_id = %signing_ctx.outlet_id,
+                                    context_id = %signing_ctx.context_id,
+                                    sequence = *sequence,
+                                    error = %e,
+                                    "invoke pump: chunk signing failed — failing closed, pump stops without emitting an unsigned chunk"
+                                );
+                                signing_failed = true;
+                                break;
+                            }
+                        };
                         ingest_stream_chunk(frontier, terminal, &chunk);
                         if chunk_tx.send(chunk).await.is_err() {
                             chunk_tx_alive = false;
@@ -4150,6 +4249,7 @@ where
         timed_out,
         chunk_tx_alive,
         executor_outcome,
+        signing_failed,
     }
 }
 
@@ -4250,6 +4350,10 @@ struct PumpOutcome {
     /// `Some(Err(payload))` for a recovered panic.
     executor_outcome:
         Option<Result<Result<(), OutletExecutorError>, Box<dyn std::any::Any + Send>>>,
+    /// `true` when a chunk failed to sign inside the pump. The caller fails
+    /// closed (skips terminal emission + event) rather than shipping a chunk
+    /// with a forged all-zero signature.
+    signing_failed: bool,
 }
 
 /// Inputs for [`build_terminal_chunk`] — the framework's terminal
@@ -4263,6 +4367,9 @@ struct BuildTerminalChunkInputs<'a> {
     effective_timeout: u32,
     start: std::time::Instant,
     handler_panic_sink: Option<&'a dyn HandlerPanicSink>,
+    /// Hosting context's real retention policy, stamped into the successful
+    /// `End` chunk's provenance (Item 4).
+    memory_scope: MemoryScope,
 }
 
 /// Builds the §5.4.5 terminal chunk for a streaming outlet invocation
@@ -4291,7 +4398,7 @@ fn build_terminal_chunk(inputs: BuildTerminalChunkInputs<'_>) -> ChunkPayload {
             let execution_time_ms = elapsed_ms(inputs.start);
             ChunkPayload::End {
                 aggregate: serde_json::Value::Null,
-                provenance: placeholder_data_provenance(inputs.context_id),
+                provenance: stream_output_provenance(inputs.context_id, inputs.memory_scope),
                 execution_time_ms,
             }
         }
@@ -5839,10 +5946,41 @@ mod tests {
     }
 
     /// Creates an active context handle (transitions from Creating to Active).
+    ///
+    /// `ContextParams::default()` uses `MemoryScope::Ephemeral`, so the
+    /// terminal `End` chunk's provenance built from this handle carries
+    /// `Ephemeral` — the item-4 assertion that the scope is the REAL param,
+    /// not a hardcoded `Full`.
     fn active_context() -> ContextHandle {
         let handle = ContextHandle::new("ctx-invoke-test".to_owned(), ContextParams::default());
         handle.transition_to(&ContextState::Active).unwrap();
         handle
+    }
+
+    /// Creates an active context handle whose params carry the given
+    /// `memory_scope`. Used to assert the terminal `End` provenance tracks
+    /// the context's real retention policy (Item 4).
+    fn active_context_with_scope(memory_scope: MemoryScope) -> ContextHandle {
+        let params = ContextParams {
+            memory_scope,
+            ..ContextParams::default()
+        };
+        let handle = ContextHandle::new("ctx-invoke-test".to_owned(), params);
+        handle.transition_to(&ContextState::Active).unwrap();
+        handle
+    }
+
+    /// An in-process operator [`StreamSigner`] for tests, backed by a fixed
+    /// Ed25519 key. Every streaming `invoke_outlet` open in the unit tests
+    /// wires one of these — the signer is REQUIRED (a stream that cannot sign
+    /// its chunks must not open), so there is no `None` path to a forged
+    /// all-zero signature.
+    fn test_signer() -> std::sync::Arc<dyn StreamSigner> {
+        use crate::context::outlets::signer::InProcessStreamSigner;
+        use ed25519_dalek::SigningKey;
+        std::sync::Arc::new(InProcessStreamSigner::new(SigningKey::from_bytes(
+            &[0x5c; 32],
+        )))
     }
 
     /// A simple async executor that adds two numbers.
@@ -7054,7 +7192,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            test_signer(),
             [0u8; 32],
         )
         .await
@@ -7080,6 +7218,185 @@ mod tests {
         );
         // PRD AC4: both chunks share the same request_id.
         assert_eq!(chunks[0].request_id, chunks[1].request_id);
+    }
+
+    /// A single-value executor whose `exec_action` returns a fixed value —
+    /// yields a two-chunk (`Data` + `End`) stream. Shared by the item-4
+    /// provenance tests below.
+    struct FixedValueExecutor;
+    #[async_trait::async_trait]
+    impl super::OutletExecutor for FixedValueExecutor {
+        async fn exec_action(
+            &self,
+            _ctx: &mut super::MutableInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, super::OutletExecutorError> {
+            Ok(serde_json::json!({ "result": 1.0 }))
+        }
+    }
+
+    /// Item 4 (fail-closed provenance): the terminal `End` chunk's provenance
+    /// MUST carry the hosting context's REAL `memory_scope`, not a hardcoded
+    /// `Full`. The prior `placeholder_data_provenance` stamped `Full`
+    /// unconditionally, so an ephemeral/summary stream's operator-signed `End`
+    /// falsely attested that its output was permanently retainable (the §5 /
+    /// §7.7 memory-scope signal inverted). Here every scope round-trips.
+    #[tokio::test]
+    async fn streaming_end_chunk_provenance_reflects_real_memory_scope() {
+        for scope in [
+            MemoryScope::Ephemeral,
+            MemoryScope::Summary,
+            MemoryScope::Full,
+        ] {
+            let creator_did = "did:dht:z6MkCreator";
+            let role_state = test_role_state(creator_did);
+            let registry = setup_registry_with_outlet(&role_state, creator_did);
+            let context = active_context_with_scope(scope);
+            let outlet_id_owned: OutletId = "calculator".to_owned();
+            let executor: std::sync::Arc<dyn super::OutletExecutor> =
+                std::sync::Arc::new(FixedValueExecutor);
+
+            let rx = super::invoke_outlet(
+                &context,
+                &registry,
+                &role_state,
+                &outlet_id_owned,
+                serde_json::json!({"a": 1, "b": 2}),
+                &DID::from(creator_did),
+                None,
+                executor,
+                None,
+                None,
+                None,
+                test_signer(),
+                [0u8; 32],
+            )
+            .await
+            .expect("invoke_outlet should accept a well-formed open");
+
+            let chunks = drain_stream_with_sequence_invariant(rx).await;
+            let end = chunks
+                .iter()
+                .find_map(|c| match &c.payload {
+                    ChunkPayload::End { provenance, .. } => Some(provenance),
+                    _ => None,
+                })
+                .expect("stream must terminate with an End chunk");
+
+            assert_eq!(
+                end.memory_scope, scope,
+                "End provenance memory_scope must equal the context's real ContextParams::memory_scope ({scope}), not a hardcoded Full"
+            );
+            // The honest source context is the hosting context.
+            assert_eq!(end.source_context, context.context_id());
+            // First-hop, in-context, unpaid: no fabricated chain / payment.
+            assert_eq!(end.chain_depth, 0);
+            assert!(end.chain_path.is_none());
+            assert!(end.payment_amount.is_none());
+            assert!(end.counterparties.is_empty());
+
+            // Every chunk carries a real (non-forged) operator signature.
+            for chunk in &chunks {
+                assert_ne!(
+                    chunk.sig, [0u8; 64],
+                    "no chunk may carry the all-zero forged signature"
+                );
+            }
+        }
+    }
+
+    /// A [`StreamSigner`] whose `sign` always fails with a custody error, to
+    /// exercise the fail-closed signing path (Item 1). `verifying_key` returns
+    /// a real key so construction succeeds; only signing fails.
+    struct FailingStreamSigner {
+        vk: ed25519_dalek::VerifyingKey,
+    }
+    impl FailingStreamSigner {
+        fn new() -> Self {
+            use ed25519_dalek::SigningKey;
+            Self {
+                vk: SigningKey::from_bytes(&[0x5c; 32]).verifying_key(),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl StreamSigner for FailingStreamSigner {
+        async fn sign(&self, _preimage: &[u8]) -> Result<[u8; 64], StreamSignerError> {
+            Err(StreamSignerError::Custody {
+                category:
+                    crate::context::outlets::signer::StreamSignerCustodyCategory::BackendFault,
+            })
+        }
+        fn verifying_key(&self) -> &ed25519_dalek::VerifyingKey {
+            &self.vk
+        }
+    }
+
+    /// Item 1 (fail-closed signing): when the operator signer fails, the pump
+    /// MUST NOT ship a chunk bearing the all-zero forged signature. It fails
+    /// closed — no chunk (data or terminal) is emitted, so the receiver
+    /// observes a clean end-of-stream with zero forged chunks on the wire.
+    #[tokio::test]
+    async fn streaming_signer_failure_fails_closed_no_forged_chunk() {
+        struct ThreeDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for ThreeDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..3u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "tick": i }),
+                        })
+                        .await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(ThreeDataExecutor);
+        let failing_signer: std::sync::Arc<dyn StreamSigner> =
+            std::sync::Arc::new(FailingStreamSigner::new());
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            failing_signer,
+            [0u8; 32],
+        )
+        .await
+        .expect("open succeeds; the signing failure surfaces during the pump");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        // Fail-closed: no forged all-zero-signature chunk ever reaches the
+        // wire. With every sign failing, the pump emits nothing at all.
+        assert!(
+            chunks.iter().all(|c| c.sig != [0u8; 64]),
+            "no emitted chunk may carry the all-zero forged signature; got {chunks:?}"
+        );
+        assert!(
+            chunks.is_empty(),
+            "a total signer failure emits zero chunks (fail closed); got {chunks:?}"
+        );
     }
 
     /// AC9 — a streaming executor produces multiple `Data` chunks followed
@@ -7128,7 +7445,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            test_signer(),
             [0u8; 32],
         )
         .await
@@ -7208,7 +7525,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            test_signer(),
             [0u8; 32],
         )
         .await
@@ -7275,7 +7592,7 @@ mod tests {
             None,
             Some(panic_sink_dyn),
             None,
-            None,
+            test_signer(),
             [0u8; 32],
         )
         .await
@@ -7401,7 +7718,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            test_signer(),
             [0u8; 32],
         )
         .await
@@ -7478,7 +7795,7 @@ mod tests {
             None,
             None,
             Some(sink),
-            None,
+            test_signer(),
             [0u8; 32],
         )
         .await
@@ -7547,7 +7864,7 @@ mod tests {
             None,
             None,
             Some(sink),
-            None,
+            test_signer(),
             [0u8; 32],
         )
         .await
@@ -7622,7 +7939,7 @@ mod tests {
             None,
             None,
             Some(sink),
-            None,
+            test_signer(),
             [0u8; 32],
         )
         .await
@@ -7696,7 +8013,7 @@ mod tests {
             None,
             None,
             Some(sink),
-            None,
+            test_signer(),
             [0u8; 32],
         )
         .await
@@ -8287,7 +8604,7 @@ mod tests {
                 None,
                 None,
                 Some(b_sink),
-                Some(signer),
+                signer,
                 CB,
             )
             .await
@@ -8833,7 +9150,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
+                    test_signer(),
                     [0u8; 32],
                 )
                 .await;
