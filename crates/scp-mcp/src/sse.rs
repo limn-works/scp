@@ -124,6 +124,24 @@ pub enum SseError {
     /// An I/O error occurred starting or running the HTTP server.
     #[error("SSE server error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The server and pump are not a matched pair: a server that advertises
+    /// `resources.subscribe` arrived without its pump, or an unwired server
+    /// arrived with one. The two are produced together by
+    /// [`McpServer::with_event_source`](crate::server::McpServer::with_event_source);
+    /// this fails closed rather than serve an advertise-but-never-deliver lie
+    /// (wired, no pump) or run a delivery loop the server never advertised
+    /// (unwired, spare pump).
+    #[error(
+        "MCP SSE: server/pump mismatch (event_source_wired={wired}, pump_present={has_pump}); \
+         a wired server must be driven with its pump and an unwired server must not be given one"
+    )]
+    PumpServerMismatch {
+        /// Whether the server advertises `resources.subscribe`.
+        wired: bool,
+        /// Whether a pump was supplied.
+        has_pump: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -379,18 +397,20 @@ async fn bearer_auth_middleware(
 ///
 /// # Resource subscriptions
 ///
-/// `pump` is the [`ContextEventPump`] that
+/// `server` and `pump` are a **matched pair produced at construction**:
 /// [`McpServer::with_event_source`](crate::server::McpServer::with_event_source)
-/// returned alongside `server`. Passing it means the server advertises
-/// `resources.subscribe: true` and the pump turns each [`ContextEvent`] into
+/// (and the `with_optional_event_source` convenience) yield the wired server and
+/// its [`ContextEventPump`] from one call. A wired server advertises
+/// `resources.subscribe: true`; its pump turns each [`ContextEvent`] into
 /// `notifications/resources/updated` for the subscribed resources it
-/// invalidates.
+/// invalidates. An unwired server ([`McpServer::new`](crate::server::McpServer::new))
+/// advertises `resources.subscribe: false`, rejects `resources/subscribe`, and
+/// has no pump (`None`).
 ///
-/// `None` is only constructible for a server built with
-/// [`McpServer::new`](crate::server::McpServer::new), which advertises
-/// `resources.subscribe: false` and rejects `resources/subscribe` with a typed
-/// error. The capability cannot be advertised without the machinery to honour
-/// it, because the same call produces both.
+/// The transport takes the two as *separate* arguments, so it MUST drive both.
+/// It verifies the pairing at entry and fails closed with
+/// [`SseError::PumpServerMismatch`] if a wired server arrives without its pump
+/// (an advertise-but-never-deliver lie) or an unwired server with one.
 ///
 /// # Sessions
 ///
@@ -399,44 +419,49 @@ async fn bearer_auth_middleware(
 ///
 /// # Errors
 ///
-/// Returns [`SseError`] if the server cannot bind or encounters an I/O error.
+/// Returns [`SseError::Io`] if the server cannot bind or encounters an I/O
+/// error, or [`SseError::PumpServerMismatch`] if `server` and `pump` are not a
+/// matched pair.
 pub async fn run_sse<P: ContextProvider + 'static>(
     server: McpServer<P>,
     config: SseConfig,
     shutdown: ShutdownHandle,
     pump: Option<ContextEventPump>,
 ) -> Result<(), SseError> {
-    let (router, pump) = router_with_pump(server, &config, pump);
+    // Fail closed on a server/pump pairing the constructor could not have
+    // produced: `event_source_wired` must hold exactly when a pump is present.
+    // A wired server with no pump would advertise resources.subscribe with
+    // nothing delivering; an unwired server with a spare pump would run a
+    // delivery loop it never advertised. This catches multi-server mixups the
+    // `#[must_use]` on `ContextEventPump` cannot — it only forces the pump to be
+    // consumed *somewhere*, not driven with *its own* server.
+    let wired = server.event_source_wired();
+    if wired != pump.is_some() {
+        return Err(SseError::PumpServerMismatch {
+            wired,
+            has_pump: pump.is_some(),
+        });
+    }
 
-    let listener = match tokio::net::TcpListener::bind(config.bind_addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            // Bind failed — stop the pump rather than leaving it running
-            // against a server that never started.
-            if let Some(handle) = pump {
-                handle.abort();
-            }
-            return Err(SseError::Io(e));
-        }
-    };
+    let (router, pump) = router_with_pump(server, &config, pump);
+    // Hold the pump under a guard that aborts it on EVERY exit from this future:
+    // a bind error, graceful shutdown, *and* the cancellation-drop when a bridge
+    // aborts the task running `run_sse`. A bare `JoinHandle` dropped without
+    // `abort()` only detaches the task, which — holding an `Arc<AppState>` —
+    // would outlive the server and pin the whole session alive.
+    let _pump_guard = pump.map(crate::stdio::AbortOnDrop);
+
+    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     tracing::info!("MCP SSE server listening on {}", config.bind_addr);
 
     let token = shutdown.token.clone();
-    let result = axum::serve(listener, router)
+    axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             token.cancelled().await;
             tracing::info!("MCP SSE server shutting down");
         })
-        .await;
+        .await?;
 
-    // The pump holds an `Arc<AppState>`; without this it would outlive the
-    // server and keep the whole session alive until the runtime's broadcast
-    // sender is dropped.
-    if let Some(handle) = pump {
-        handle.abort();
-    }
-
-    result.map_err(SseError::Io)?;
     Ok(())
 }
 
@@ -608,10 +633,19 @@ async fn pump_events<P: ContextProvider + 'static>(
         let ContextEventEnvelope { context_id, event } = match events.recv().await {
             Ok(v) => v,
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                // Clients may have missed a change. Nothing here can
-                // reconstruct which resources the dropped events touched, so
-                // log and continue; clients re-read on the next notification.
+                // The dropped events are gone; nothing can reconstruct which
+                // resources they touched. Over-notify — one
+                // resources/list_changed plus one resources/updated per
+                // still-authorized subscription — so a lagged client re-reads,
+                // exactly as the pump promises. Never fall silent.
                 tracing::warn!("MCP SSE event pump lagged, {skipped} events dropped");
+                let notifications = {
+                    let server = state.server.lock().await;
+                    server.lagged_resync_notifications()
+                };
+                for notification in &notifications {
+                    state.notifier.notify(notification).await;
+                }
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => return,
