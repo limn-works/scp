@@ -1,7 +1,6 @@
 ---
 name: architecture-reviewer
 description: "Use this agent to review code for architectural soundness \u2014 completeness, scalability, maintainability, ADR compliance, and decision quality. Verifies that the approach is correct, not just the implementation. Invoke on structural changes, new modules, protocol modifications, or any change that establishes a pattern.\n\nExamples:\n\n- After implementing a new module or pattern:\n  Assistant: \"Let me launch the architecture-reviewer agent to validate this approach against our ADRs and architecture patterns.\"\n\n- When a change modifies protocols or module boundaries:\n  Assistant: \"I'll use the architecture-reviewer agent to check whether this structural change maintains our architectural invariants.\"\n\n- When reviewing a significant refactor:\n  Assistant: \"Let me run the architecture-reviewer agent to verify the refactor improves maintainability without breaking architectural decisions.\""
-model: opus
 color: red
 memory: project
 ---

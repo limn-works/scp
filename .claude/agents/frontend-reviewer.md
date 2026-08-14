@@ -1,7 +1,6 @@
 ---
 name: frontend-reviewer
 description: "Use this agent to review UI code for interaction quality, animation smoothness, accessibility, brand alignment, design system adherence, and localization readiness. Invoke when changes touch views, components, navigation, or any user-facing surface.\n\nExamples:\n\n- After implementing a new view or modifying an existing one:\n  Assistant: \"Let me launch the frontend-reviewer agent to check this view for accessibility, brand alignment, and design system adherence.\"\n\n- When adding animations or transitions:\n  Assistant: \"I'll use the frontend-reviewer agent to evaluate the interaction quality and smoothness of these transitions.\"\n\n- When reviewing a PR that touches UI:\n  Assistant: \"Let me run the frontend-reviewer agent to verify the UI changes meet our design system and accessibility standards.\""
-model: opus
 color: purple
 memory: project
 ---

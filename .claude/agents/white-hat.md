@@ -1,7 +1,6 @@
 ---
 name: white-hat
 description: "Use this agent for defensive security architecture — designing robust defenses, hardening systems, building security monitoring, and ensuring defense-in-depth. This agent thinks like a security architect: it designs systems that are secure by construction, not by accident. Use when you need to build or verify defenses, design secure architectures, or establish security invariants.\n\nExamples:\n\n- When designing security architecture for a new feature:\n  Assistant: \"Let me launch the white-hat agent to design the security architecture for this feature.\"\n\n- When hardening an existing implementation:\n  Assistant: \"Let me use the white-hat agent to identify hardening opportunities and design defense-in-depth.\"\n\n- When establishing security invariants and monitoring:\n  Assistant: \"Let me have the white-hat agent define the security invariants and detection strategy.\"\n\n- When reviewing whether defenses are sufficient:\n  Assistant: \"Let me use the white-hat agent to assess whether the defensive controls are adequate.\""
-model: opus
 color: green
 memory: project
 ---

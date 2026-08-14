@@ -1,7 +1,6 @@
 ---
 name: performance-optimizer
 description: "Use this agent when you need to identify and fix performance issues including N+1 queries, blocking operations, memory leaks, expensive hot paths, thread management problems, concurrency issues, and resource allocation inefficiencies. Use proactively after implementing data-heavy features, database queries, complex async flows, or when performance degradation is suspected.\n\nExamples:\n\n- After implementing a data feed:\n  Assistant: \"Let me launch the performance-optimizer agent to analyze for N+1 queries and memory efficiency.\"\n\n- When the app feels sluggish:\n  Assistant: \"I'll use the performance-optimizer agent to identify what's causing the performance issue.\"\n\n- When reviewing concurrency in a sync implementation:\n  Assistant: \"I'll launch the performance-optimizer agent to audit for thread safety and concurrency correctness.\""
-model: opus
 color: orange
 memory: project
 ---

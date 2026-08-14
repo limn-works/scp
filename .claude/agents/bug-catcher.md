@@ -1,7 +1,6 @@
 ---
 name: bug-catcher
 description: "Use this agent when you want to scrutinize recently written or modified code for real bugs \u2014 concurrency issues, crashes, compilation errors, incorrect assumptions, subtle gotchas, and logic errors. This is NOT a style or convention reviewer; it hunts actual defects. Launch it after writing or modifying a meaningful chunk of code, after resolving a merge conflict, or when something feels off but you can't pinpoint why.\n\nExamples:\n\n- After implementing a feature involving async data fetching and caching:\n  Assistant: \"Let me use the bug-catcher agent to scrutinize this code for concurrency issues, data races, and subtle bugs.\"\n\n- After refactoring persistence logic:\n  Assistant: \"Let me launch the bug-catcher agent to review this refactor for data loss scenarios and threading issues.\"\n\n- When debugging a crash:\n  Assistant: \"Let me launch the bug-catcher agent to deeply analyze this code path for the root cause.\""
-model: opus
 color: green
 memory: project
 ---

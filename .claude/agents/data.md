@@ -1,7 +1,6 @@
 ---
 name: data
 description: "Use this agent for data persistence, models, repositories, and caching. Spin up when defining or modifying models, persistence logic, migrations, queries, or any work touching stored data.\n\nExamples:\n- User: \"Create a data model\"\n  Assistant: Uses data agent to define the model, relationships, and repository.\n\n- User: \"Add a new field to track status\"\n  Assistant: Uses data agent to update model and handle migration.\n\n- User: \"How do I query by category?\"\n  Assistant: Uses data agent to implement query logic."
-model: opus
 color: blue
 memory: project
 ---

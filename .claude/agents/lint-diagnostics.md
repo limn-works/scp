@@ -1,7 +1,6 @@
 ---
 name: lint-diagnostics
 description: "Use this agent when you need to check code quality, find type errors, unresolved references, or collect compiler/linter diagnostics. This agent should be used proactively after writing or modifying code to catch issues before they reach review. It runs builds and linters to surface errors and warnings, and analyzes the output for actionable feedback.\n\nExamples:\n\n- After writing a new module or modifying a model:\n  Assistant: \"Now let me use the lint-diagnostics agent to check for any type errors or issues.\"\n\n- After refactoring or renaming types:\n  Assistant: \"Let me run the lint-diagnostics agent to verify there are no unresolved references.\"\n\n- After any significant code change, proactively verify compilation:\n  Assistant: \"Let me launch the lint-diagnostics agent to verify everything compiles cleanly.\""
-model: opus
 color: blue
 memory: project
 ---
