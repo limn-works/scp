@@ -10,18 +10,25 @@
 //! - `GET /sse` -- SSE stream for server-to-client messages (responses,
 //!   notifications). The server sends an initial `endpoint` event with the
 //!   POST URL, then streams `message` events containing JSON-RPC responses.
-//!   Each event carries a sequential `id:` field so reconnecting clients can
-//!   resume via the `Last-Event-ID` header.
+//!   Each event carries a sequential `id:` field for wire framing and
+//!   diagnostics only — it does not support resume (see below).
 //! - `POST /message` -- Accepts JSON-RPC requests from the client. Responses
 //!   are delivered via the SSE stream, not in the HTTP response body.
 //!
 //! ## Reconnection
 //!
-//! The server assigns monotonically increasing IDs to every `message` event.
-//! When a client reconnects with a `Last-Event-ID` header, events that were
-//! broadcast after that ID are replayed from a bounded ring buffer before
-//! live streaming resumes. The server also emits a `retry:` field so clients
-//! respect a server-controlled reconnection interval.
+//! Reconnection is a full resync, not a resume. Every admission resets the
+//! MCP session (see [`AppState::session_slot`] and [`sse_handler`]), so a
+//! reconnecting client re-initializes, re-subscribes, and re-reads state;
+//! any event broadcast before that reset belongs to the prior logical
+//! session. Cross-session replay is therefore deliberately absent: the
+//! standard SSE `Last-Event-ID` header is ignored — honoring it would stream
+//! a previous session's decrypted JSON-RPC responses (member lists, tool
+//! outputs, resource reads) to whichever client connects next. The server
+//! emits a `retry:` field so clients respect a server-controlled
+//! reconnection interval, and a client that falls behind the broadcast
+//! channel has its stream terminated so it reconnects into a clean session
+//! rather than silently missing events.
 //!
 //! ## Keep-alive
 //!
@@ -35,7 +42,6 @@
 //!
 //! See ADR-015 in `.docs/adrs/phase-3.md` for the full design.
 
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -45,15 +51,16 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, broadcast};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_util::sync::CancellationToken;
 
 use scp_core::context::membership::ContextEventEnvelope;
@@ -70,9 +77,6 @@ use crate::server::{ContextEventPump, ContextProvider, McpServer, McpServerForTr
 /// Default retry interval (milliseconds) sent to SSE clients.
 const DEFAULT_RETRY_MS: u64 = 3000;
 
-/// Default capacity for the replay buffer (number of events retained).
-const DEFAULT_REPLAY_CAPACITY: usize = 256;
-
 /// Configuration for the SSE transport server.
 #[derive(Debug, Clone)]
 pub struct SseConfig {
@@ -87,10 +91,6 @@ pub struct SseConfig {
     /// Clients should wait this long before reconnecting after a dropped
     /// connection. Defaults to 3000 (3 seconds).
     pub retry_ms: u64,
-
-    /// Maximum number of events retained in the replay buffer for
-    /// reconnecting clients. Defaults to 256.
-    pub replay_capacity: usize,
 
     /// Optional bearer token for authenticating SSE and message requests.
     /// When `Some(token)`, all requests to `/sse` and `/message` must include
@@ -108,7 +108,6 @@ impl SseConfig {
             bind_addr,
             channel_capacity: 256,
             retry_ms: DEFAULT_RETRY_MS,
-            replay_capacity: DEFAULT_REPLAY_CAPACITY,
             auth_token: None,
         }
     }
@@ -168,64 +167,27 @@ impl Default for ShutdownHandle {
 }
 
 // ---------------------------------------------------------------------------
-// Replay buffer
-// ---------------------------------------------------------------------------
-
-/// A bounded ring buffer of recent SSE events for reconnection replay.
-#[derive(Debug)]
-struct ReplayBuffer {
-    events: VecDeque<ReplayEntry>,
-    capacity: usize,
-}
-
-/// A single entry in the replay buffer.
-#[derive(Debug, Clone)]
-struct ReplayEntry {
-    id: u64,
-    data: String,
-}
-
-impl ReplayBuffer {
-    fn new(capacity: usize) -> Self {
-        Self {
-            events: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn push(&mut self, id: u64, data: String) {
-        if self.events.len() == self.capacity {
-            self.events.pop_front();
-        }
-        self.events.push_back(ReplayEntry { id, data });
-    }
-
-    fn events_after(&self, last_id: u64) -> Vec<ReplayEntry> {
-        self.events
-            .iter()
-            .filter(|e| e.id > last_id)
-            .cloned()
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
 /// The server→client push fabric for an SSE session.
 ///
-/// Notifications share the SSE event-ID sequence and replay buffer with
-/// request responses, so a client reconnecting with `Last-Event-ID` replays
-/// missed notifications exactly as it replays missed responses.
+/// Notifications share the SSE event-ID sequence with request responses. The
+/// ids exist for wire framing and diagnostics only: reconnection is a full
+/// resync into a freshly reset session (see the module docs), so there is no
+/// replay machinery and no resume path for the ids to serve.
 #[derive(Clone)]
 pub(crate) struct McpNotifier {
     /// Broadcast sender for SSE messages to connected clients.
     tx: broadcast::Sender<(u64, String)>,
     /// Monotonically increasing event ID counter.
+    ///
+    /// `fetch_add` makes every assigned id unique, which is all the two
+    /// consumers — SSE `id:` framing and synthetic request ids for incoming
+    /// notifications — require. Two concurrent broadcasts may publish out of
+    /// id order; nothing observes or depends on wire-order ids because
+    /// resume does not exist.
     next_event_id: Arc<AtomicU64>,
-    /// Replay buffer for reconnecting clients.
-    replay_buffer: Arc<RwLock<ReplayBuffer>>,
 }
 
 impl McpNotifier {
@@ -235,28 +197,13 @@ impl McpNotifier {
         Self {
             tx,
             next_event_id: Arc::new(AtomicU64::new(1)),
-            replay_buffer: Arc::new(RwLock::new(ReplayBuffer::new(config.replay_capacity))),
         }
     }
 
-    /// Broadcasts a JSON payload to all connected SSE clients and records it
-    /// in the replay buffer. Returns the assigned event ID.
-    //
-    // The lint wants the guard dropped before `tx.send` — precisely the gap
-    // this critical section exists to close (see the comment inside).
-    #[allow(clippy::significant_drop_tightening)]
-    async fn broadcast(&self, data: String) -> u64 {
-        // One critical section: id assignment, the replay-buffer push and the
-        // live send all happen under the replay-buffer write guard. Split
-        // apart, two concurrent broadcasts could interleave — publishing out
-        // of id order — and a client disconnecting between a lower id's
-        // `fetch_add` and its buffer push would advance `Last-Event-ID` past
-        // an id that was not yet buffered, losing that event from both the
-        // live stream and the replay path forever. Nothing below the guard
-        // acquisition `.await`s: `push` and `send` are synchronous.
-        let mut buffer = self.replay_buffer.write().await;
-        let id = self.next_event_id.fetch_add(1, Ordering::Relaxed);
-        buffer.push(id, data.clone());
+    /// Broadcasts a JSON payload to all connected SSE clients. Returns the
+    /// assigned event ID.
+    fn broadcast(&self, data: String) -> u64 {
+        let id = self.next_event_id.fetch_add(1, Ordering::SeqCst);
         let _ = self.tx.send((id, data));
         id
     }
@@ -265,13 +212,14 @@ impl McpNotifier {
     ///
     /// Returns the number of connected clients the notification was
     /// broadcast to, or 0 if serialization fails or nobody is connected.
-    /// A return of 0 is not an error: the notification is still recorded in
-    /// the replay buffer and reaches a client that reconnects with
-    /// `Last-Event-ID`.
-    async fn notify(&self, notification: &JsonRpcNotification) -> usize {
+    /// A return of 0 with nobody connected is not an error: the transport is
+    /// single-session and every admission resets the session, so a later
+    /// client starts from a fresh handshake and re-reads current state
+    /// rather than depending on notifications sent before it attached.
+    fn notify(&self, notification: &JsonRpcNotification) -> usize {
         match serde_json::to_string(notification) {
             Ok(json) => {
-                self.broadcast(json).await;
+                self.broadcast(json);
                 self.tx.receiver_count()
             }
             Err(e) => {
@@ -451,32 +399,30 @@ pub async fn run_sse<P: ContextProvider + 'static>(
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// Parses the `Last-Event-ID` header value into a `u64`, returning `None` if
-/// the header is absent or cannot be parsed.
-fn parse_last_event_id(headers: &HeaderMap) -> Option<u64> {
-    headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-}
-
 /// SSE endpoint handler. Streams server-to-client messages.
 ///
 /// Sends an initial `endpoint` event containing the POST URL for the client
-/// to use, then (if the client sent a `Last-Event-ID` header) replays any
-/// buffered events missed during the disconnection, and finally streams live
-/// `message` events with JSON-RPC responses.
+/// to use, then streams live `message` events with JSON-RPC responses.
 ///
-/// Each `message` event carries a sequential `id:` field and the stream
-/// includes a `retry:` directive so clients use a server-controlled
-/// reconnection interval.
+/// Each `message` event carries a sequential `id:` field (framing and
+/// diagnostics only) and the stream includes a `retry:` directive so clients
+/// use a server-controlled reconnection interval. The standard SSE
+/// `Last-Event-ID` request header is deliberately ignored: admission resets
+/// the session, so anything a resume could replay predates the reset and
+/// belongs to the prior logical session — honoring the header would hand one
+/// client's buffered decrypted responses to the next (see the module docs).
 async fn sse_handler<P: ContextProvider + 'static>(
     State(state): State<Arc<AppState<P>>>,
-    headers: HeaderMap,
 ) -> axum::response::Response {
     // One session at a time. Without this the second client would inherit the
     // first client's completed handshake and resource subscriptions, and would
     // receive the first client's JSON-RPC responses off the shared broadcast.
+    //
+    // Admission note: any process that can reach the bind address can claim
+    // (or contend for) this single slot — with `SseConfig::auth_token` unset
+    // there is no authentication in front of it. Hardened deployments set
+    // `auth_token`, which the bearer middleware enforces before a request can
+    // touch the slot.
     let Ok(permit) = Arc::clone(&state.session_slot).try_acquire_owned() else {
         tracing::warn!("MCP SSE: refusing a second concurrent session");
         return (
@@ -495,58 +441,39 @@ async fn sse_handler<P: ContextProvider + 'static>(
     // to a stale reset that was scheduled but had not yet run.
     state.server.lock().await.reset_session();
 
-    let last_event_id = parse_last_event_id(&headers);
-
     let endpoint_event = Event::default()
         .event("endpoint")
         .data("/message")
         .retry(Duration::from_millis(state.retry_ms));
 
-    // Subscribe to the live broadcast BEFORE snapshotting the replay buffer.
-    // In the reverse order, an event broadcast between the two operations
-    // lands in neither the snapshot nor the live receiver, and the client's
-    // `Last-Event-ID` advances past it forever — a silent gap. Subscribing
-    // first turns that race into a harmless duplicate (present in both the
-    // snapshot and the live stream), which the id filter below suppresses.
     let rx = state.notifier.tx.subscribe();
 
-    let replayed: Vec<ReplayEntry> = if let Some(last_id) = last_event_id {
-        tracing::debug!(last_id, "SSE client reconnecting");
-        let buf = state.notifier.replay_buffer.read().await;
-        buf.events_after(last_id)
-    } else {
-        Vec::new()
-    };
-    // Ids are assigned in ascending order and `events_after` preserves buffer
-    // order, so the last replayed entry carries the highest replayed id. Live
-    // events at or below it were already delivered via the replay and are
-    // suppressed from the live stream.
-    let last_replayed_id = replayed.last().map(|entry| entry.id);
-    let replay_events: Vec<Result<Event, Infallible>> = replayed
-        .into_iter()
-        .map(|entry| {
-            Ok(Event::default()
+    // A client that falls behind the broadcast channel has lost events that
+    // nothing can reconstruct. Rather than skipping the gap silently — a
+    // client believing it is current while it is not — END the stream. The
+    // client observes the disconnect, reconnects (honoring `retry:`), is
+    // admitted into a clean session (admission resets session state, above),
+    // re-initializes, re-subscribes, and re-reads capability-filtered state:
+    // a full resync by construction. "Never fall silent" is satisfied by an
+    // explicit signal instead of replay.
+    let message_stream = BroadcastStream::new(rx).map_while(|result| match result {
+        Ok((id, data)) => Some(Ok::<_, Infallible>(
+            Event::default()
                 .event("message")
-                .id(entry.id.to_string())
-                .data(entry.data))
-        })
-        .collect();
-
-    let message_stream = BroadcastStream::new(rx).filter_map(move |result| {
-        result
-            .ok()
-            .filter(|(id, _)| last_replayed_id.is_none_or(|max| *id > max))
-            .map(|(id, data)| {
-                Ok(Event::default()
-                    .event("message")
-                    .id(id.to_string())
-                    .data(data))
-            })
+                .id(id.to_string())
+                .data(data),
+        )),
+        Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+            tracing::warn!(
+                skipped,
+                "MCP SSE client lagged; terminating its stream to force a clean-session resync"
+            );
+            None
+        }
     });
 
     let initial = tokio_stream::once(Ok(endpoint_event));
-    let replay = tokio_stream::iter(replay_events);
-    let stream = initial.chain(replay).chain(message_stream);
+    let stream = initial.chain(message_stream);
 
     // Hold a session guard for the lifetime of the stream. When the client
     // disconnects the stream is dropped, dropping the guard, which resets the
@@ -578,9 +505,9 @@ async fn sse_handler<P: ContextProvider + 'static>(
 /// the actual response is delivered via SSE.
 ///
 /// Requires a live session (`GET /sse`): the response goes out on the SSE
-/// stream and into the replay buffer, so accepting a request with no session
-/// attached would leave that response waiting for whichever client connects
-/// next — a different client reading an answer it never asked for.
+/// broadcast, so accepting a request with no session attached would drop the
+/// response unheard — and a response computed now could only ever be read by
+/// a *different*, later client.
 async fn message_handler<P: ContextProvider + 'static>(
     State(state): State<Arc<AppState<P>>>,
     body: String,
@@ -619,7 +546,7 @@ async fn message_handler<P: ContextProvider + 'static>(
     if let Some(resp) = response
         && let Ok(json) = serde_json::to_string(&resp)
     {
-        state.notifier.broadcast(json).await;
+        state.notifier.broadcast(json);
     }
 
     StatusCode::ACCEPTED
@@ -651,7 +578,7 @@ async fn pump_events<P: ContextProvider + 'static>(
                     server.lagged_resync_notifications()
                 };
                 for notification in &notifications {
-                    state.notifier.notify(notification).await;
+                    state.notifier.notify(notification);
                 }
                 continue;
             }
@@ -676,7 +603,7 @@ async fn pump_events<P: ContextProvider + 'static>(
         };
 
         for notification in &notifications {
-            state.notifier.notify(notification).await;
+            state.notifier.notify(notification);
         }
     }
 }
@@ -861,8 +788,8 @@ mod tests {
 
     /// Shared state with the single-session slot ALREADY CLAIMED, standing in
     /// for a live `GET /sse` client. `message_handler` refuses requests with no
-    /// session attached, since their responses would otherwise sit in the
-    /// replay buffer waiting for whoever connects next.
+    /// session attached, since their responses would otherwise be broadcast
+    /// with no client listening and silently dropped.
     fn test_state() -> Arc<AppState<MockProvider>> {
         let state = Arc::new(AppState {
             server: Mutex::new(McpServer::new(MockProvider::default())),
@@ -951,7 +878,7 @@ mod tests {
         assert_eq!(resp.id, RequestId::Number(1));
 
         let json = serde_json::to_string(&resp).unwrap();
-        state.notifier.broadcast(json.clone()).await;
+        state.notifier.broadcast(json.clone());
 
         let (_id, received) = rx.recv().await.unwrap();
         assert_eq!(received, json);
@@ -1036,7 +963,6 @@ mod tests {
         assert_eq!(config.bind_addr, addr);
         assert_eq!(config.channel_capacity, 256);
         assert_eq!(config.retry_ms, DEFAULT_RETRY_MS);
-        assert_eq!(config.replay_capacity, DEFAULT_REPLAY_CAPACITY);
         assert!(config.auth_token.is_none());
     }
 
@@ -1046,7 +972,7 @@ mod tests {
         let mut rx = state.notifier.tx.subscribe();
 
         let notif = McpServer::<MockProvider>::tools_list_changed_notification();
-        let count = state.notifier.notify(&notif).await;
+        let count = state.notifier.notify(&notif);
         assert_eq!(count, 1);
 
         let (_id, received) = rx.recv().await.unwrap();
@@ -1060,7 +986,7 @@ mod tests {
         let state = test_state();
 
         let notif = McpServer::<MockProvider>::tools_list_changed_notification();
-        let count = state.notifier.notify(&notif).await;
+        let count = state.notifier.notify(&notif);
         assert_eq!(count, 0);
     }
 
@@ -1173,47 +1099,6 @@ mod tests {
         pump.abort();
     }
 
-    // -- Replay buffer --------------------------------------------------------
-
-    #[test]
-    fn replay_buffer_stores_and_retrieves() {
-        let mut buf = ReplayBuffer::new(4);
-        buf.push(1, "event-1".to_owned());
-        buf.push(2, "event-2".to_owned());
-        buf.push(3, "event-3".to_owned());
-
-        let after_0 = buf.events_after(0);
-        assert_eq!(after_0.len(), 3);
-        assert_eq!(after_0[0].id, 1);
-        assert_eq!(after_0[2].data, "event-3");
-
-        let after_2 = buf.events_after(2);
-        assert_eq!(after_2.len(), 1);
-        assert_eq!(after_2[0].id, 3);
-
-        let after_3 = buf.events_after(3);
-        assert!(after_3.is_empty());
-    }
-
-    #[test]
-    fn replay_buffer_evicts_oldest_when_full() {
-        let mut buf = ReplayBuffer::new(2);
-        buf.push(1, "a".to_owned());
-        buf.push(2, "b".to_owned());
-        buf.push(3, "c".to_owned());
-
-        let all = buf.events_after(0);
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].id, 2);
-        assert_eq!(all[1].id, 3);
-    }
-
-    #[test]
-    fn replay_buffer_empty() {
-        let buf = ReplayBuffer::new(4);
-        assert!(buf.events_after(0).is_empty());
-    }
-
     // -- Broadcast with event IDs ---------------------------------------------
 
     #[tokio::test]
@@ -1221,8 +1106,8 @@ mod tests {
         let state = test_state();
         let mut rx = state.notifier.tx.subscribe();
 
-        let id1 = state.notifier.broadcast("msg-1".to_owned()).await;
-        let id2 = state.notifier.broadcast("msg-2".to_owned()).await;
+        let id1 = state.notifier.broadcast("msg-1".to_owned());
+        let id2 = state.notifier.broadcast("msg-2".to_owned());
 
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
@@ -1233,42 +1118,6 @@ mod tests {
         assert_eq!(recv_data1, "msg-1");
         assert_eq!(recv_id2, 2);
         assert_eq!(recv_data2, "msg-2");
-    }
-
-    #[tokio::test]
-    async fn broadcast_populates_replay_buffer() {
-        let state = test_state();
-
-        state.notifier.broadcast("first".to_owned()).await;
-        state.notifier.broadcast("second".to_owned()).await;
-        state.notifier.broadcast("third".to_owned()).await;
-
-        let missed = state.notifier.replay_buffer.read().await.events_after(1);
-        assert_eq!(missed.len(), 2);
-        assert_eq!(missed[0].data, "second");
-        assert_eq!(missed[1].data, "third");
-    }
-
-    // -- Last-Event-ID parsing ------------------------------------------------
-
-    #[test]
-    fn parse_last_event_id_valid() {
-        let mut headers = HeaderMap::new();
-        headers.insert("last-event-id", "42".parse().unwrap());
-        assert_eq!(parse_last_event_id(&headers), Some(42));
-    }
-
-    #[test]
-    fn parse_last_event_id_missing() {
-        let headers = HeaderMap::new();
-        assert_eq!(parse_last_event_id(&headers), None);
-    }
-
-    #[test]
-    fn parse_last_event_id_non_numeric() {
-        let mut headers = HeaderMap::new();
-        headers.insert("last-event-id", "abc".parse().unwrap());
-        assert_eq!(parse_last_event_id(&headers), None);
     }
 
     // -- Shutdown handle ------------------------------------------------------
@@ -1694,7 +1543,7 @@ mod tests {
 
         // First client attaches through the real handler, then disconnects,
         // dropping its stream and with it the `SessionGuard`.
-        let first = sse_handler(State(Arc::clone(&state)), HeaderMap::new()).await;
+        let first = sse_handler(State(Arc::clone(&state))).await;
         assert_eq!(first.status(), StatusCode::OK);
         drop(first);
 
@@ -1702,7 +1551,7 @@ mod tests {
         // holds the permit; the slot must free once the reset completes.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let second = loop {
-            let resp = sse_handler(State(Arc::clone(&state)), HeaderMap::new()).await;
+            let resp = sse_handler(State(Arc::clone(&state))).await;
             if resp.status() == StatusCode::OK {
                 break resp;
             }
@@ -1756,22 +1605,120 @@ mod tests {
         drop(second);
     }
 
-    // -- Replay/live ordering -------------------------------------------------
+    // -- No cross-session replay (leak regression) ----------------------------
 
-    /// The handler must subscribe to the live broadcast BEFORE snapshotting the
-    /// replay buffer, and suppress the duplicates that ordering can produce.
-    ///
-    /// Deterministic interleaving: the test holds the replay buffer's write
-    /// lock so the handler parks at its snapshot read — provably *after*
-    /// subscribing, observed via `receiver_count` rising to 1 — then publishes
-    /// an event into both the buffer and the live channel (the racy window),
-    /// releases the lock, and asserts the client sees the event exactly once.
-    /// Under the old snapshot-first ordering the handler would park *before*
-    /// subscribing, `receiver_count` would never rise, and an event broadcast
-    /// in that window reached neither the snapshot nor the live stream — a
-    /// silent, permanent gap.
+    /// A newly admitted session must receive NOTHING from a prior session,
+    /// even when it presents `Last-Event-ID: 0` — the strongest possible
+    /// replay request. The removed replay machinery streamed the previous
+    /// client's buffered decrypted JSON-RPC responses (member lists, tool
+    /// outputs, resource reads) to whichever client connected next; admission
+    /// resets the session, so anything replayable predates the reset and
+    /// belongs to the prior logical session. This test fails if replay is
+    /// ever served again.
     #[tokio::test]
-    async fn replay_snapshot_follows_live_subscribe_and_suppresses_duplicates() {
+    async fn new_admission_never_receives_prior_session_messages() {
+        use tower::ServiceExt;
+
+        let router = noauth_router();
+
+        // Client A attaches and completes an initialize round-trip; its
+        // JSON-RPC response goes out on the SSE broadcast.
+        let first = router
+            .clone()
+            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_INITIALIZE,
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "client-a" }
+            },
+            "id": 1
+        })
+        .to_string();
+        let post = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message")
+                    .header("content-type", "application/json")
+                    .body(Body::from(init_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post.status(), StatusCode::ACCEPTED);
+
+        // A disconnects without reading its response.
+        drop(first);
+
+        // Client B is admitted (polling past the reset-in-flight 409 window)
+        // and presents `Last-Event-ID: 0`, requesting everything ever
+        // broadcast.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let second = loop {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/sse")
+                        .header("last-event-id", "0")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if resp.status() == StatusCode::OK {
+                break resp;
+            }
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session slot never freed after client A disconnected"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+
+        // Read B's stream for a bounded window: it must carry the endpoint
+        // event and NO `message` frames — in particular, none of A's
+        // initialize response.
+        let mut body = second.into_body().into_data_stream();
+        let mut seen = String::new();
+        let read_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while let Ok(Some(Ok(bytes))) = tokio::time::timeout_at(read_deadline, body.next()).await {
+            seen.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        assert!(
+            seen.contains("event: endpoint"),
+            "the fresh session must receive its endpoint event; stream was:\n{seen}"
+        );
+        assert!(
+            !seen.contains("event: message"),
+            "a fresh admission replayed a prior session's messages; stream was:\n{seen}"
+        );
+        assert!(
+            !seen.contains("protocolVersion"),
+            "client A's initialize response leaked to client B; stream was:\n{seen}"
+        );
+    }
+
+    // -- Wire lag terminates the stream ---------------------------------------
+
+    /// A client that falls behind the broadcast channel must have its stream
+    /// TERMINATED, not silently continued past the gap. Termination is the
+    /// resync signal: the client observes the disconnect, reconnects, is
+    /// admitted into a freshly reset session, re-initializes, re-subscribes,
+    /// and re-reads state. Under the old behavior the lag error was dropped
+    /// in a `filter_map` and the client kept streaming, silently missing
+    /// events.
+    #[tokio::test]
+    async fn wire_lag_terminates_the_stream() {
         let state = Arc::new(AppState {
             server: Mutex::new(McpServer::new(MockProvider::default())),
             notifier: McpNotifier::new(&test_config()),
@@ -1779,54 +1726,55 @@ mod tests {
             session_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
-        // Park the handler at its replay snapshot.
-        let mut buffer = state.notifier.replay_buffer.write().await;
+        // A client attaches; the handler subscribes its broadcast receiver.
+        let response = sse_handler(State(Arc::clone(&state))).await;
+        assert_eq!(response.status(), StatusCode::OK);
 
-        // Reconnecting client: `Last-Event-ID: 0` requests a full replay.
-        let mut headers = HeaderMap::new();
-        headers.insert("last-event-id", "0".parse().unwrap());
-        let handler = tokio::spawn({
-            let state = Arc::clone(&state);
-            async move { sse_handler(State(state), headers).await }
-        });
+        // With the stream unpolled, drive the channel far past its capacity
+        // (`test_config` uses 16) so the receiver is deterministically lagged.
+        for i in 0..64 {
+            state.notifier.broadcast(format!("event-{i}"));
+        }
 
-        // The handler must have subscribed before it blocks on the snapshot.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while state.notifier.tx.receiver_count() == 0 {
+        // Poll the body: after the endpoint event, the first broadcast poll
+        // observes the lag and must END the stream rather than resume past it.
+        let mut body = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut terminated = false;
+        loop {
+            match tokio::time::timeout_at(deadline, body.next()).await {
+                Ok(Some(Ok(bytes))) => seen.push_str(&String::from_utf8_lossy(&bytes)),
+                Ok(Some(Err(_)) | None) => {
+                    terminated = true;
+                    break;
+                }
+                Err(_) => break, // window closed with the stream still open
+            }
+        }
+        assert!(
+            terminated,
+            "a lagged SSE stream must terminate so the client resyncs into a \
+             clean session; it stayed open. Frames seen:\n{seen}"
+        );
+        // None of the lagged events may be delivered as if the client were
+        // current.
+        assert!(
+            !seen.contains("event: message"),
+            "a lagged stream resumed past its gap; frames seen:\n{seen}"
+        );
+
+        // Termination completes the recovery loop: dropping the stream drops
+        // the session guard, whose reset task frees the slot for readmission.
+        drop(body);
+        let free_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.session_slot.available_permits() == 0 {
             assert!(
-                std::time::Instant::now() < deadline,
-                "handler never subscribed while the snapshot was blocked — \
-                 snapshot-before-subscribe ordering regressed"
+                std::time::Instant::now() < free_deadline,
+                "the session slot never freed after the lagged stream terminated"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-
-        // An event lands in BOTH the replay buffer and the live channel while
-        // the handler sits between subscribe and snapshot — the racy window.
-        // (Manual push + send rather than `broadcast()`: the test itself holds
-        // the write guard `broadcast()` would need.)
-        buffer.push(1, "racy-event".to_owned());
-        let _ = state.notifier.tx.send((1, "racy-event".to_owned()));
-        drop(buffer);
-
-        let response = handler.await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // Read the SSE body: the event must appear exactly once — replayed,
-        // with the live duplicate suppressed by id.
-        let mut body = response.into_body().into_data_stream();
-        let mut seen = String::new();
-        let read_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        // Collect frames until the stream ends, errors, or the window closes.
-        while let Ok(Some(Ok(bytes))) = tokio::time::timeout_at(read_deadline, body.next()).await {
-            seen.push_str(&String::from_utf8_lossy(&bytes));
-        }
-        assert_eq!(
-            seen.matches("racy-event").count(),
-            1,
-            "the racy event must be delivered exactly once (replayed, live \
-             duplicate suppressed); SSE stream was:\n{seen}"
-        );
     }
 
     // -- Cancel-abort teardown ------------------------------------------------
