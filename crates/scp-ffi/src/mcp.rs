@@ -740,10 +740,11 @@ impl ContextProvider for FfiBridgeProvider {
                         ))
                     })?;
 
-                let production_resolver = crate::runtime::did_resolver(&bi);
-                let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
-                    production_resolver.map(std::convert::AsRef::as_ref),
-                );
+                let installed_resolver = crate::runtime::did_resolver(&bi);
+                let did_resolver = crate::bridge_adapters::require_did_resolver(
+                    installed_resolver.map(std::convert::AsRef::as_ref),
+                )
+                .map_err(ScpPyError::ucan)?;
                 let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
                     revocation_list: &rt.revocation_list,
                 };
@@ -752,7 +753,7 @@ impl ContextProvider for FfiBridgeProvider {
                 };
 
                 let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                    did_resolver: &did_resolver,
+                    did_resolver,
                     nonce_tracker: &mut nonce_adapter,
                     revocation_checker: &revocation_checker,
                     proof_resolver: &proof_resolver,

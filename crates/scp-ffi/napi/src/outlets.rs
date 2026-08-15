@@ -42,10 +42,14 @@ pub(crate) fn validate_ucan_for_outlet(
                 code: codes::PERM_3001.to_owned(),
             })?;
 
-        let production_resolver = crate::runtime::did_resolver(bi);
-        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-            production_resolver.map(std::convert::AsRef::as_ref),
-        );
+        let installed_resolver = crate::runtime::did_resolver(bi);
+        let did_resolver = scp_ffi_common::require_did_resolver(
+            installed_resolver.map(std::convert::AsRef::as_ref),
+        )
+        .map_err(|reason| ScpNapiError::Permission {
+            message: reason.to_owned(),
+            code: codes::PERM_3031.to_owned(),
+        })?;
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
             revocation_list: &rt.core.revocation_list,
         };
@@ -54,7 +58,7 @@ pub(crate) fn validate_ucan_for_outlet(
         };
 
         let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-            did_resolver: &did_resolver,
+            did_resolver,
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver,

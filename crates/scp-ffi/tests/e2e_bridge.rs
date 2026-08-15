@@ -1345,11 +1345,35 @@ fn cross_domain_identity_context_outlet_eventlog_provenance() {
         let events = scp.event_log_query(py, &ctx_id, None).unwrap();
         assert!(!events.is_empty());
 
-        // Revoke a token (revoker is the context creator).
+        // Revoke a token as the context creator. The bridge layer has no MLS
+        // application-message broadcast, so `revoke_ucan` reports the
+        // undistributed revocation, rolls the pending entry back, and the
+        // bridge raises. The caller learns the token is still valid instead of
+        // being told the revocation reached the other members.
         let dummy = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
             eyJpc3MiOiJkaWQ6a2V5OnRlc3QiLCJhdWQiOiJkaWQ6a2V5OnRlc3QyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
             dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw";
-        scp.ucan_revoke(&ctx_id, dummy, &did_a).unwrap();
+        let revoke_error = scp
+            .ucan_revoke(&ctx_id, dummy, &did_a)
+            .expect_err("an undistributed revocation must not report success");
+        let revoke_message = revoke_error.to_string();
+        assert!(
+            revoke_message.contains("did not distribute the revocation"),
+            "the error must say the revocation was not distributed: {revoke_message}"
+        );
+
+        // The rollback left no local record of a revocation the other members
+        // never received.
+        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(dummy);
+        let recorded_as_revoked = runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
+            Ok(rt.revocation_list.is_revoked(&token_cid))
+        })
+        .unwrap();
+        assert!(
+            !recorded_as_revoked,
+            "an undistributed revocation must roll back, leaving the revoker in agreement \
+             with the other members"
+        );
 
         // Evaluate provenance (pure helper — module-level free fn per ADR-048 §1).
         let q = _scp_core::provenance::evaluate_provenance_quality(

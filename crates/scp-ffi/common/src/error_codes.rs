@@ -599,6 +599,25 @@ pub const PERM_3022: &str = "SCP-PERM-3022";
 pub const PERM_3023: &str = "SCP-PERM-3023";
 /// Handle affinity violation — handle from a different SCP instance.
 pub const PERM_3030: &str = "SCP-PERM-3030";
+/// UCAN validation refused: this bridge instance has no verifying DID
+/// resolver, so it cannot resolve the key a token's signature is checked
+/// against.
+///
+/// Surfaced by every UCAN-validating bridge surface — the `PyO3`
+/// `ucan_validate` / `ucan_evaluate` methods and the outlet-invocation and MCP
+/// capability paths, the NAPI `ucan_validate` / `ucan_evaluate` and outlet
+/// paths, and the `UniFFI` `ucan_validate` / `ucan_evaluate` and outlet paths —
+/// when the caller reaches validation before creating an identity on that
+/// instance. Identity creation installs `IdentityBackedDidResolver`, which
+/// resolves the signer's DID document and verifies its BEP44 signature, its
+/// self-certification, and its sequence number.
+///
+/// The predecessor of this error was a substitute resolver that read the
+/// identity key out of the `did:dht:z…` string and returned it unverified, so a
+/// token signed by a key the DID document had since retired still passed
+/// signature verification. Reporting the absence keeps that outcome
+/// distinguishable from a verified one.
+pub const PERM_3031: &str = "SCP-PERM-3031";
 
 // -------------------------------------------------------------------------
 // Crypto (SCP-CRYPTO- 4000--4999)

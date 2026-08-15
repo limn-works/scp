@@ -4387,8 +4387,12 @@ pub(crate) fn validate_outlet_ucan_uniffi(
     );
 
     bi.with_ucan_state(&handle.context_id, |ucan_state| {
-        let production_resolver = bi.did_resolver();
-        let did_resolver = scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
+        let installed_resolver = bi.did_resolver();
+        let did_resolver = scp_ffi_common::require_did_resolver(installed_resolver.as_deref())
+            .map_err(|reason| ScpError::Permission {
+                msg: reason.to_owned(),
+                code: codes::PERM_3031.to_owned(),
+            })?;
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
             revocation_list: &ucan_state.revocation_list,
         };
@@ -4397,7 +4401,7 @@ pub(crate) fn validate_outlet_ucan_uniffi(
         };
 
         let mut ctx = ValidationContext {
-            did_resolver: &did_resolver,
+            did_resolver,
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
@@ -4986,9 +4990,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
             let agent_did = self.agent_did.clone();
             bi.with_ucan_state(context_id, |ucan_state| {
-                let production_resolver = bi.did_resolver();
+                let installed_resolver = bi.did_resolver();
                 let did_resolver =
-                    scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
+                    scp_ffi_common::require_did_resolver(installed_resolver.as_deref())
+                        .map_err(std::borrow::ToOwned::to_owned)?;
                 let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                     revocation_list: &ucan_state.revocation_list,
                 };
@@ -4997,7 +5002,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 };
 
                 let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                    did_resolver: &did_resolver,
+                    did_resolver,
                     nonce_tracker: &mut nonce_adapter,
                     revocation_checker: &revocation_checker,
                     proof_resolver: &proof_resolver,
@@ -15464,10 +15469,13 @@ impl Scp {
                 // Execute the full 11-step validation pipeline via per-context state.
                 let validation_result = bi
                     .with_ucan_state(&handle.context_id, |ucan_state| {
-                        let production_resolver = bi.did_resolver();
-                        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-                            production_resolver.as_deref(),
-                        );
+                        let installed_resolver = bi.did_resolver();
+                        let did_resolver =
+                            scp_ffi_common::require_did_resolver(installed_resolver.as_deref())
+                                .map_err(|reason| ScpError::Permission {
+                                    msg: reason.to_owned(),
+                                    code: codes::PERM_3031.to_owned(),
+                                })?;
                         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                             revocation_list: &ucan_state.revocation_list,
                         };
@@ -15476,7 +15484,7 @@ impl Scp {
                         };
 
                         let mut ctx = ValidationContext {
-                            did_resolver: &did_resolver,
+                            did_resolver,
                             nonce_tracker: &mut nonce_adapter,
                             revocation_checker: &revocation_checker,
                             proof_resolver: &proof_resolver,
@@ -15627,10 +15635,13 @@ impl Scp {
                 // so per-context UCAN state is not mutated.
                 let evaluation = bi
                     .with_ucan_state(&handle.context_id, |ucan_state| {
-                        let production_resolver = bi.did_resolver();
-                        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-                            production_resolver.as_deref(),
-                        );
+                        let installed_resolver = bi.did_resolver();
+                        let did_resolver =
+                            scp_ffi_common::require_did_resolver(installed_resolver.as_deref())
+                                .map_err(|reason| ScpError::Permission {
+                                    msg: reason.to_owned(),
+                                    code: codes::PERM_3031.to_owned(),
+                                })?;
                         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                             revocation_list: &ucan_state.revocation_list,
                         };
@@ -15639,7 +15650,7 @@ impl Scp {
                         };
 
                         let ctx = ValidationContext {
-                            did_resolver: &did_resolver,
+                            did_resolver,
                             nonce_tracker: &mut nonce_adapter,
                             revocation_checker: &revocation_checker,
                             proof_resolver: &proof_resolver,
@@ -15655,12 +15666,12 @@ impl Scp {
                             caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
                         };
 
-                        evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx)
+                        Ok::<_, ScpError>(evaluate_ucan(&parsed_token, required_cap.as_ref(), &ctx))
                     })
                     .ok_or_else(|| ScpError::Permission {
                         msg: format!("context '{}' not found in UCAN registry", handle.context_id),
                         code: codes::PERM_3002.to_owned(),
-                    })?;
+                    })??;
 
                 Ok(CapabilityValidationRecord::from(evaluation))
             })
@@ -15726,8 +15737,8 @@ impl Scp {
             .spawn(async move {
                 use scp_core::crypto::ucan::validate::parse_ucan;
                 use scp_ffi_common::{
-                    BridgeRevocationAuthorizer, BridgeRevocationDistributor,
-                    BridgeRevocationEventLogger,
+                    BridgeRevocationAuthorizer, BridgeRevocationEventLogger,
+                    UnavailableRevocationDistributor,
                 };
                 use std::cell::RefCell;
 
@@ -15747,7 +15758,7 @@ impl Scp {
                         issuer_did: parsed.payload.iss.clone(),
                         creator_did: ucan_state.creator_did.clone(),
                     };
-                    let distributor = BridgeRevocationDistributor;
+                    let distributor = UnavailableRevocationDistributor;
                     let event_log_cell = RefCell::new(&mut ucan_state.event_log);
                     let event_logger = BridgeRevocationEventLogger {
                         event_log: &event_log_cell,

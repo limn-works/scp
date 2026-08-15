@@ -23,72 +23,6 @@ use scp_identity::IdentityError;
 use scp_identity::resolver::ResolvedDidDocument;
 
 // ---------------------------------------------------------------------------
-// BridgeDidResolver
-// ---------------------------------------------------------------------------
-
-/// In-memory DID resolver for FFI bridges.
-///
-/// Supports:
-/// - `did:dht:z{z-base-32-encoded-pubkey}` -- production format.
-/// - `did:key:{hex-encoded-pubkey}` -- testing only (requires `testing` feature).
-///
-/// This resolver operates in-memory with no network calls. `did:dht:` DIDs
-/// encode the public key directly in the DID string using z-base-32, so
-/// resolution is a simple decode operation.
-///
-/// **Limitation:** This resolver does NOT validate the DID document (no BEP44
-/// signature verification, no self-certification check, no sequence number
-/// comparison). Use [`IdentityBackedDidResolver`] for production
-/// contexts. See #311.
-pub struct BridgeDidResolver;
-
-impl DidResolver for BridgeDidResolver {
-    fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], CoreUcanError> {
-        // Narrow, fail-closed did:key gate — asserted LOCALLY, not borrowed
-        // from scp-did's feature state.
-        //
-        // Everything below delegates to the single hardened `scp-did` parser
-        // (`extract_public_key_from_did`) rather than a hand-rolled decode, so
-        // this UCAN-validation path gets the same did:dht:z z-base-32
-        // **canonicality** guard as every other native did:dht decoder: the
-        // parser re-encodes the decoded 32-byte key and rejects any input that
-        // does not round-trip to the canonical encoding, closing the
-        // trailing-bit-padding non-injectivity that would otherwise let two DID
-        // strings resolve to the same key.
-        //
-        // That parser also accepts the non-standard `did:key:{hex}`
-        // test-convenience form — but ONLY when `scp-did/testing` is enabled.
-        // Crucially, `scp-did/testing` is turned on TRANSITIVELY by *custody*
-        // opt-ins (dep:scp-testing → scp-core/testing → scp-protocol/testing →
-        // scp-did/testing). Custody opt-ins (e.g. `testing`,
-        // which controls where private key material may live) are an
-        // ORTHOGONAL concern from "this bridge is compiled for UCAN testing".
-        // If we relied solely on scp-did's gate, an in-memory-custody *source*
-        // build would silently begin accepting did:key UCAN issuers — a
-        // DID-format acceptance surface that has nothing to do with custody.
-        // did:key must never ride in on a custody flag. So we re-assert the
-        // gate against THIS crate's own `testing` feature: when
-        // scp-ffi-common's `testing` is off — which is every shipped artifact,
-        // since releases build with default features (`testing` is a dev-only
-        // opt-in and is never a shipped feature) — reject `did:key:` up front
-        // with the same `MalformedToken`/unsupported-format error class the
-        // parser emits for any other unsupported method, regardless of
-        // scp-did's feature state. This is a pure string-prefix check; it
-        // introduces no zbase32 (or any other) decode in production. did:dht
-        // and all other inputs still flow through the one shared parser, so
-        // there is exactly one canonicality authority and no drift.
-        #[cfg(not(any(test, feature = "testing")))]
-        if did.starts_with("did:key:") {
-            return Err(CoreUcanError::MalformedToken(format!(
-                "unsupported DID format: {did}"
-            )));
-        }
-
-        scp_did::extract_public_key_from_did(did).map_err(CoreUcanError::MalformedToken)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // IdentityBackedDidResolver (#311)
 // ---------------------------------------------------------------------------
 
@@ -635,54 +569,46 @@ impl scp_identity::resolver::DidResolver for IdentityBackedDidResolver {
 }
 
 // ---------------------------------------------------------------------------
-// DispatchDidResolver (#311)
+// require_did_resolver
 // ---------------------------------------------------------------------------
 
-/// Dispatches DID resolution to either the production [`IdentityBackedDidResolver`]
-/// or the fallback [`BridgeDidResolver`] (string-only, no document validation).
+/// The message every bridge reports when a caller reaches UCAN validation
+/// before the identity layer installed a verifying DID resolver.
 ///
-/// This enum enables the FFI bridges to use the production resolver when the
-/// identity layer is initialized, falling back to `BridgeDidResolver` otherwise
-/// (e.g., in tests or before `identity_create` is called).
+/// Each bridge wraps this text in its own error type, so the three bridges
+/// describe the same absent capability in the same words.
+pub const NO_VERIFYING_DID_RESOLVER: &str = "no verifying DID resolver is installed on this bridge instance, so this bridge cannot \
+     resolve the signing key a UCAN signature is checked against. Create an identity on this \
+     bridge instance first — identity creation installs the resolver that reads the signer's \
+     DID document, verifies its BEP44 signature and self-certification, and rejects a \
+     sequence-number downgrade.";
+
+/// Returns the verifying DID resolver, or the reason there is none.
 ///
-/// Implements `DidResolver` by delegating to the active variant.
-pub enum DispatchDidResolver<'a> {
-    /// Production resolver with full DID document validation.
-    Identity(&'a IdentityBackedDidResolver),
-    /// Fallback resolver: delegates DID→key extraction to the canonicality-
-    /// enforcing `scp-did` parser (`extract_public_key_from_did`), so it rejects
-    /// non-canonical did:dht spellings exactly as the native decoders do. Still
-    /// performs no DID *document* validation (no BEP44 signature check, no
-    /// self-certification, no sequence-number comparison).
-    Bridge(BridgeDidResolver),
-}
-
-impl DispatchDidResolver<'_> {
-    /// Creates a dispatch resolver that uses the production resolver if
-    /// available, otherwise falls back to `BridgeDidResolver`.
-    #[must_use]
-    pub const fn new(production: Option<&IdentityBackedDidResolver>) -> DispatchDidResolver<'_> {
-        match production {
-            Some(resolver) => DispatchDidResolver::Identity(resolver),
-            None => DispatchDidResolver::Bridge(BridgeDidResolver),
-        }
-    }
-}
-
-impl DidResolver for DispatchDidResolver<'_> {
-    fn resolve_public_key(&self, did: &str) -> Result<[u8; 32], CoreUcanError> {
-        match self {
-            Self::Identity(r) => DidResolver::resolve_public_key(*r, did),
-            Self::Bridge(r) => r.resolve_public_key(did),
-        }
-    }
-
-    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], CoreUcanError> {
-        match self {
-            Self::Identity(r) => DidResolver::resolve_public_key_by_kid(*r, did, kid),
-            Self::Bridge(r) => r.resolve_public_key_by_kid(did, kid),
-        }
-    }
+/// # Why a caller cannot proceed without one
+///
+/// [`IdentityBackedDidResolver`] is the only [`DidResolver`] in this crate. It
+/// answers "which key signed this?" by resolving the signer's DID document
+/// through `scp-identity`, which verifies the document's BEP44 signature, checks
+/// its self-certification, and rejects a lower sequence number than one already
+/// seen.
+///
+/// Before this change, `DispatchDidResolver::new(None)` substituted a resolver
+/// that read the 32-byte identity key straight out of the `did:dht:z…` string
+/// and never fetched a document. That substitute returned an unverified key,
+/// and because the key is baked into the DID string, it kept returning the same
+/// key after the DID document rotated or removed it — so a UCAN signed by a
+/// retired key still passed signature verification. A caller could not tell
+/// that outcome apart from a verified one, which is why no substitute resolver
+/// exists now and why absence is reported instead.
+///
+/// # Errors
+///
+/// Returns [`NO_VERIFYING_DID_RESOLVER`] when `installed` is `None`.
+pub fn require_did_resolver(
+    installed: Option<&IdentityBackedDidResolver>,
+) -> Result<&IdentityBackedDidResolver, &'static str> {
+    installed.ok_or(NO_VERIFYING_DID_RESOLVER)
 }
 
 // ---------------------------------------------------------------------------
@@ -791,32 +717,55 @@ impl scp_core::crypto::ucan::revoke::RevocationAuthorizer for BridgeRevocationAu
 }
 
 // ---------------------------------------------------------------------------
-// BridgeRevocationDistributor (issue #499)
+// UnavailableRevocationDistributor
 // ---------------------------------------------------------------------------
 
-/// No-op `RevocationDistributor` for FFI bridges.
+/// `RevocationDistributor` that reports the absence of a revocation broadcast
+/// on the FFI bridges.
 ///
-/// FFI bridges do not have direct access to MLS group state for distributing
-/// revocations to context members. In the full runtime, revocations would be
-/// broadcast as MLS application messages. In the bridge layer, the local
-/// revocation list is updated immediately and distribution is deferred to the
-/// transport layer (when connected).
+/// # Why this returns an error rather than success
 ///
-/// This distributor always succeeds, logging the revocation for observability.
-pub struct BridgeRevocationDistributor;
+/// [`revoke_ucan`](scp_core::crypto::ucan::revoke::revoke_ucan) marks a token
+/// `RevocationPending`, calls `distribute_revocation`, and commits the token to
+/// `Revoked` only when that call returns `Ok`. The resolved "UCAN revocation
+/// mechanism" entry in `.docs/specs/00-open-questions.md` states the required
+/// behavior when the call fails: "If MLS distribution of the revocation fails,
+/// the local revocation is rolled back (transactional) so there is no
+/// split-brain between the revoker and other members."
+///
+/// No type in this workspace broadcasts a revocation as an MLS application
+/// message, so an FFI caller's revocation reaches no other member. The
+/// predecessor of this type logged the revocation and returned `Ok`, which
+/// committed the revoker's own list to `Revoked` while every other member kept
+/// accepting the token — the split-brain the spec entry forbids — and told the
+/// caller that distribution had happened. Returning
+/// [`CoreUcanError::RevocationFailed`] instead makes `revoke_ucan` roll the
+/// pending entry back and hand the caller a typed error, so the caller learns
+/// that the token is still live.
+///
+/// When a revocation broadcast lands, replace this type at its three bridge
+/// call sites with the type that performs the broadcast. Do not change this
+/// method to return `Ok`.
+pub struct UnavailableRevocationDistributor;
 
-impl scp_core::crypto::ucan::revoke::RevocationDistributor for BridgeRevocationDistributor {
+impl scp_core::crypto::ucan::revoke::RevocationDistributor for UnavailableRevocationDistributor {
     fn distribute_revocation(
         &self,
         context_id: &str,
         token_cid: &str,
     ) -> Result<(), CoreUcanError> {
-        info!(
+        warn!(
             context_id = context_id,
             token_cid = token_cid,
-            "revocation recorded locally (bridge-layer distribution — MLS broadcast deferred to transport)"
+            "refusing to report a revocation as distributed: the FFI bridge layer has no MLS \
+             application-message broadcast, so this revocation reached no other context member"
         );
-        Ok(())
+        Err(CoreUcanError::RevocationFailed(format!(
+            "the FFI bridge layer did not distribute the revocation of token '{token_cid}' in \
+             context '{context_id}', because no MLS application-message broadcast for \
+             revocations exists. The local revocation rolled back, so the revoker and the other \
+             members still agree, and the token remains valid."
+        )))
     }
 }
 
@@ -933,34 +882,138 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // DispatchDidResolver
+    // require_did_resolver
     // -----------------------------------------------------------------------
 
     #[test]
-    fn dispatch_resolver_uses_bridge_when_no_production_resolver() {
+    fn require_did_resolver_reports_absence_instead_of_substituting_one() {
+        // The defect this pins: `DispatchDidResolver::new(None)` used to hand
+        // back a resolver that decoded the identity key out of the DID string
+        // and answered `Ok(key)` for any well-formed did:dht DID, without
+        // fetching or verifying the DID document. A caller could not tell that
+        // answer apart from a verified one.
         let pk_bytes: [u8; 32] = [0x42; 32];
         let did = format!("did:dht:z{}", zbase32::encode(&pk_bytes));
 
-        let dispatch = DispatchDidResolver::new(None);
-        let result = CoreDidResolver::resolve_public_key(&dispatch, &did).unwrap();
-        assert_eq!(result, pk_bytes);
+        let outcome = require_did_resolver(None);
+        let Err(reason) = outcome else {
+            panic!("an absent DID resolver must be reported, never substituted");
+        };
+        assert_eq!(reason, NO_VERIFYING_DID_RESOLVER);
+
+        // No type in this crate resolves that DID to its key without a
+        // document, so the key encoded in the DID string is unreachable here.
+        assert!(
+            !NO_VERIFYING_DID_RESOLVER.is_empty(),
+            "the reported reason must name what is missing"
+        );
+        drop(did);
     }
 
     #[test]
-    fn dispatch_resolver_delegates_to_identity_when_available() {
-        // The identity resolver will fail because the DID doesn't exist in the
-        // in-memory DHT, which is the expected behavior — it proves delegation
-        // is happening (BridgeDidResolver would succeed for any did:dht:z DID).
+    fn require_did_resolver_returns_the_verifying_resolver_when_installed() {
         let resolver = make_identity_resolver();
+        let returned = require_did_resolver(Some(&resolver)).expect("resolver is installed");
+
+        // The returned resolver verifies: it resolves the DID document rather
+        // than decoding the DID string, so an unpublished DID fails.
         let pk_bytes: [u8; 32] = [0x42; 32];
         let did = format!("did:dht:z{}", zbase32::encode(&pk_bytes));
-
-        let dispatch = DispatchDidResolver::new(Some(&resolver));
-        let result = CoreDidResolver::resolve_public_key(&dispatch, &did);
-        // The identity resolver returns NotFound because the DID is not in the DHT.
+        let result = CoreDidResolver::resolve_public_key(returned, &did);
         assert!(
             result.is_err(),
-            "expected error from identity resolver for unknown DID"
+            "a DID absent from the DHT must not resolve to the key spelled in its own string"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // UnavailableRevocationDistributor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unavailable_distributor_reports_failure_rather_than_success() {
+        use scp_core::crypto::ucan::revoke::RevocationDistributor;
+
+        let outcome =
+            UnavailableRevocationDistributor.distribute_revocation("ctx-1", "cid-deadbeef");
+        let err = outcome.expect_err("undistributed revocation must not report success");
+        assert!(
+            matches!(err, CoreUcanError::RevocationFailed(_)),
+            "distribution failure must be typed as RevocationFailed, got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("cid-deadbeef") && message.contains("ctx-1"),
+            "the error must name the token and the context it left undistributed: {message}"
+        );
+    }
+
+    #[test]
+    fn revoke_ucan_rolls_back_when_distribution_is_unavailable() {
+        use scp_core::crypto::ucan::revoke::{
+            RevocationAuthorizer, RevocationEventLogger, RevocationList, RevocationState,
+            compute_revocation_cid, revoke_ucan,
+        };
+
+        struct AlwaysAuthorized;
+        impl RevocationAuthorizer for AlwaysAuthorized {
+            fn authorize_revocation(
+                &self,
+                _cid: &str,
+                _revoker: &str,
+            ) -> Result<(), CoreUcanError> {
+                Ok(())
+            }
+        }
+
+        struct RecordingLogger {
+            called: std::cell::Cell<bool>,
+        }
+        impl RevocationEventLogger for RecordingLogger {
+            fn log_token_revoked(
+                &self,
+                _context_id: &str,
+                _token_cid: &str,
+                _revoker_did: &str,
+            ) -> Result<(), CoreUcanError> {
+                self.called.set(true);
+                Ok(())
+            }
+        }
+
+        let mut list = RevocationList::new("ctx-rollback".to_owned());
+        let logger = RecordingLogger {
+            called: std::cell::Cell::new(false),
+        };
+        let token = "header.payload.signature";
+
+        let outcome = revoke_ucan(
+            &mut list,
+            token,
+            "did:dht:zRevoker",
+            &AlwaysAuthorized,
+            &UnavailableRevocationDistributor,
+            &logger,
+        );
+
+        assert!(
+            outcome.is_err(),
+            "revoke_ucan must fail when the revocation is not distributed"
+        );
+        let cid = compute_revocation_cid(token);
+        assert_eq!(
+            list.state(&cid),
+            RevocationState::Active,
+            "the pending revocation must roll back, leaving no local record that other \
+             members do not share"
+        );
+        assert!(
+            !list.is_revoked(&cid),
+            "an undistributed revocation must not make the token appear revoked locally"
+        );
+        assert!(
+            !logger.called.get(),
+            "no TokenRevoked event may be logged for a revocation that was never distributed"
         );
     }
 
@@ -1074,71 +1127,6 @@ mod tests {
         assert!(
             result.is_err(),
             "should fail for missing verification method"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // BridgeDidResolver (basic sanity)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn bridge_resolver_resolves_did_dht() {
-        let pk: [u8; 32] = [0xAB; 32];
-        let did = format!("did:dht:z{}", zbase32::encode(&pk));
-        let result = CoreDidResolver::resolve_public_key(&BridgeDidResolver, &did).unwrap();
-        assert_eq!(result, pk);
-    }
-
-    #[test]
-    fn bridge_resolver_rejects_unknown_method() {
-        let result = CoreDidResolver::resolve_public_key(&BridgeDidResolver, "did:web:example.com");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn bridge_resolver_rejects_non_canonical_zbase32() {
-        // The UCAN-validation resolver MUST reject a non-canonical z-base-32
-        // spelling of a valid key: z-base-32 of a 32-byte payload is not
-        // injective on its trailing bit-padding (the 52nd char carries 1
-        // payload bit + 4 padding bits → 16 alternate encodings decode to the
-        // same key). Two distinct DID strings resolving to the same key would
-        // otherwise enable petname squatting / log-spoofing. This mirrors the
-        // native `scp_identity::dht::extract_public_key` and `scp_did` parser
-        // tests, pinning single-parser parity across the UCAN path.
-        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
-
-        let pk: [u8; 32] = [0xAB; 32];
-        let canonical_encoded = zbase32::encode(&pk);
-        let canonical_did = format!("did:dht:z{canonical_encoded}");
-
-        // Canonical form is accepted and yields the key.
-        let ok = CoreDidResolver::resolve_public_key(&BridgeDidResolver, &canonical_did).unwrap();
-        assert_eq!(ok, pk);
-
-        // Build a non-canonical alternate by toggling a padding bit of the
-        // trailing char.
-        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
-        let last_idx = ALPHABET
-            .iter()
-            .position(|&c| c == last_char)
-            .expect("canonical char must be in alphabet");
-        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
-        let last_pos = mutated_bytes.len() - 1;
-        mutated_bytes[last_pos] = ALPHABET[last_idx ^ 1];
-        let mutated_encoded =
-            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
-        let mutated_did = format!("did:dht:z{mutated_encoded}");
-
-        // Sanity: the mutated input still decodes to the same 32 bytes (a real
-        // non-canonical alternate, not a typo).
-        let raw_decoded = zbase32::decode(&mutated_encoded).expect("alternate decodes");
-        assert_eq!(raw_decoded.as_slice(), &pk[..]);
-
-        // The canonicality guard MUST reject it.
-        let err = CoreDidResolver::resolve_public_key(&BridgeDidResolver, &mutated_did);
-        assert!(
-            err.is_err(),
-            "non-canonical did:dht spelling must be rejected by the UCAN resolver"
         );
     }
 

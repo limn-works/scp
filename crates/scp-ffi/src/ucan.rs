@@ -51,7 +51,7 @@ use scp_core::crypto::ucan::validate::{
 };
 
 use crate::bridge_adapters::{
-    BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker, DispatchDidResolver,
+    BridgeNonceTracker, BridgeProofResolver, BridgeRevocationChecker, require_did_resolver,
 };
 use crate::error::ScpPyError;
 use crate::validate;
@@ -308,11 +308,14 @@ impl crate::scp::PyScp {
         let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
 
         // Execute the full 11-step validation pipeline within the context runtime.
-        // Use production DID resolver when available (#311), fallback to string-only.
+        // Step 5 checks the token's signature against the key this resolver
+        // returns, so validation fails closed when no verifying resolver is
+        // installed rather than accepting a key nothing verified.
         crate::runtime::with_context(bi, context_id, |rt| {
-            let production_resolver = crate::runtime::did_resolver(bi);
+            let installed_resolver = crate::runtime::did_resolver(bi);
             let did_resolver =
-                DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+                require_did_resolver(installed_resolver.map(std::convert::AsRef::as_ref))
+                    .map_err(ScpPyError::ucan)?;
             let revocation_checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
             };
@@ -321,7 +324,7 @@ impl crate::scp::PyScp {
             };
 
             let mut ctx = ValidationContext {
-                did_resolver: &did_resolver,
+                did_resolver,
                 nonce_tracker: &mut nonce_adapter,
                 revocation_checker: &revocation_checker,
                 proof_resolver: &proof_resolver,
@@ -445,9 +448,10 @@ impl crate::scp::PyScp {
         // evaluate_ucan takes `&ValidationContext` and never records the nonce,
         // so a read-only probe of the nonce tracker suffices.
         let result = crate::runtime::with_context(bi, context_id, |rt| {
-            let production_resolver = crate::runtime::did_resolver(bi);
+            let installed_resolver = crate::runtime::did_resolver(bi);
             let did_resolver =
-                DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+                require_did_resolver(installed_resolver.map(std::convert::AsRef::as_ref))
+                    .map_err(ScpPyError::ucan)?;
             let revocation_checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
             };
@@ -456,7 +460,7 @@ impl crate::scp::PyScp {
             };
 
             let ctx = ValidationContext {
-                did_resolver: &did_resolver,
+                did_resolver,
                 nonce_tracker: &mut nonce_adapter,
                 revocation_checker: &revocation_checker,
                 proof_resolver: &proof_resolver,
@@ -707,12 +711,23 @@ impl crate::scp::PyScp {
     ///
     /// 1. **Authorization** -- Verifies the revoker is the token's issuer or the
     ///    context creator via `BridgeRevocationAuthorizer`.
-    /// 2. **Local revocation** -- Adds the token CID to the context's
-    ///    `RevocationList` (fail-closed via `RevocationPending` state).
-    /// 3. **Distribution** -- Logs the revocation for transport-layer broadcast
-    ///    (MLS distribution deferred to transport connection).
+    /// 2. **Local revocation** -- Marks the token CID `RevocationPending` in the
+    ///    context's `RevocationList`.
+    /// 3. **Distribution** -- Broadcasts the revocation to the other context
+    ///    members.
     /// 4. **Event logging** -- Appends a `TokenRevoked` event to the context's
     ///    Merkle event log.
+    ///
+    /// # This bridge cannot perform step 3
+    ///
+    /// No type in this workspace broadcasts a revocation as an MLS application
+    /// message, so [`UnavailableRevocationDistributor`](crate::bridge_adapters::UnavailableRevocationDistributor)
+    /// reports step 3 as failed. `revoke_ucan` then rolls the pending entry back
+    /// and this method raises `UcanError`. The token stays valid, and the caller
+    /// reads that fact from the error rather than being told the revocation
+    /// succeeded. The resolved "UCAN revocation mechanism" entry in
+    /// `.docs/specs/00-open-questions.md` requires that rollback, so that the
+    /// revoker and the other members do not disagree about the token.
     ///
     /// # Arguments
     ///
@@ -724,7 +739,8 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Raises `UcanError` if revocation fails: unauthorized revoker, context not
-    /// found, malformed token, or event log append failure.
+    /// found, malformed token, undistributed revocation, or event log append
+    /// failure.
     ///
     /// See ADR-016 acceptance criterion 5. Closes #499.
     pub fn ucan_revoke(&self, context_id: &str, token: &str, revoker_did: &str) -> PyResult<()> {
@@ -738,8 +754,8 @@ impl crate::scp::PyScp {
 
         crate::runtime::with_context(bi, context_id, |rt| {
             use crate::bridge_adapters::{
-                BridgeRevocationAuthorizer, BridgeRevocationDistributor,
-                BridgeRevocationEventLogger,
+                BridgeRevocationAuthorizer, BridgeRevocationEventLogger,
+                UnavailableRevocationDistributor,
             };
             use std::cell::RefCell;
 
@@ -747,7 +763,7 @@ impl crate::scp::PyScp {
                 issuer_did: parsed.payload.iss.clone(),
                 creator_did: rt.creator_did.clone(),
             };
-            let distributor = BridgeRevocationDistributor;
+            let distributor = UnavailableRevocationDistributor;
             let event_log_cell = RefCell::new(&mut rt.event_log);
             let event_logger = BridgeRevocationEventLogger {
                 event_log: &event_log_cell,
@@ -860,51 +876,24 @@ mod tests {
     use scp_clock::Clock;
     use scp_core::crypto::ucan::UcanToken;
     use scp_core::crypto::ucan::validate::{
-        DidResolver, NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
+        NonceTracker as NonceTrackerTrait, ProofResolver, RevocationChecker,
     };
-    use scp_ffi_common::BridgeDidResolver;
+    use scp_ffi_common::{NO_VERIFYING_DID_RESOLVER, require_did_resolver};
 
     // -----------------------------------------------------------------------
-    // BridgeDidResolver
+    // DID resolver availability
     // -----------------------------------------------------------------------
 
     #[test]
-    fn bridge_did_resolver_resolves_did_dht() {
-        let pk_bytes: [u8; 32] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
-            0x1d, 0x1e, 0x1f, 0x20,
-        ];
-        let did = format!("did:dht:z{}", zbase32::encode(&pk_bytes));
-
-        let resolver = BridgeDidResolver;
-        let result = resolver.resolve_public_key(&did).unwrap();
-        assert_eq!(result, pk_bytes);
-    }
-
-    #[test]
-    fn bridge_did_resolver_resolves_did_key_hex() {
-        let pk_bytes: [u8; 32] = [0xab; 32];
-        let hex_str = hex::encode(pk_bytes);
-        let did = format!("did:key:{hex_str}");
-
-        let resolver = BridgeDidResolver;
-        let result = resolver.resolve_public_key(&did).unwrap();
-        assert_eq!(result, pk_bytes);
-    }
-
-    #[test]
-    fn bridge_did_resolver_rejects_unknown_method() {
-        let resolver = BridgeDidResolver;
-        let result = resolver.resolve_public_key("did:web:example.com");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn bridge_did_resolver_rejects_invalid_zbase32() {
-        let resolver = BridgeDidResolver;
-        let result = resolver.resolve_public_key("did:dht:zinvalid");
-        assert!(result.is_err());
+    fn ucan_validation_has_no_did_resolver_before_identity_creation() {
+        // `PyScp::ucan_validate` and `PyScp::ucan_evaluate` route the
+        // bridge instance's installed resolver through `require_did_resolver`,
+        // so a bridge instance that has not created an identity reports the
+        // absence instead of resolving a signer key nothing verified.
+        let Err(reason) = require_did_resolver(None) else {
+            panic!("a bridge instance without an identity has no verifying DID resolver");
+        };
+        assert_eq!(reason, NO_VERIFYING_DID_RESOLVER);
     }
 
     // -----------------------------------------------------------------------

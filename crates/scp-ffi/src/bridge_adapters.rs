@@ -4,7 +4,7 @@
 //! `crate::bridge_adapters` continue to work.
 
 pub use scp_ffi_common::{
-    BridgeDidResolver, BridgeNonceTracker, BridgeProofResolver, BridgeRevocationAuthorizer,
-    BridgeRevocationChecker, BridgeRevocationDistributor, BridgeRevocationEventLogger,
-    DidRotatedEvent, DispatchDidResolver, IdentityBackedDidResolver, ResolutionError,
+    BridgeNonceTracker, BridgeProofResolver, BridgeRevocationAuthorizer, BridgeRevocationChecker,
+    BridgeRevocationEventLogger, DidRotatedEvent, IdentityBackedDidResolver, ResolutionError,
+    UnavailableRevocationDistributor, require_did_resolver,
 };

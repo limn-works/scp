@@ -766,10 +766,68 @@ async fn ucan_mint_and_revoke() {
     let caps = token.capabilities();
     assert!(!caps.is_empty(), "Capabilities should be non-empty");
 
-    // Revoke the token (revoker is the context creator).
-    let revoke_result = scp.ucan_revoke(handle, token.encoded(), alice.did()).await;
-    // Revocation may succeed or fail based on implementation, but should not panic.
-    let _ = revoke_result;
+    // Revoke the token as the context creator. The bridge layer has no MLS
+    // application-message broadcast, so the revocation reaches no other member.
+    // `revoke_ucan` reports that, rolls the pending entry back, and this call
+    // raises — the caller learns the token is still valid rather than being
+    // told the revocation propagated.
+    let revoke_error = scp
+        .ucan_revoke(handle, token.encoded(), alice.did())
+        .await
+        .expect_err("an undistributed revocation must not report success");
+    let message = revoke_error.to_string();
+    assert!(
+        message.contains("did not distribute the revocation"),
+        "the error must say the revocation was not distributed: {message}"
+    );
+}
+
+/// Removing the non-verifying fallback resolver must not close the happy path:
+/// `identity_create` installs `IdentityBackedDidResolver`, and step 5 of the
+/// ADR-016 pipeline resolves the issuer's published DID document through it and
+/// accepts a token that document's `#active` key signed.
+///
+/// Without this test, every remaining UCAN assertion on this bridge expects an
+/// error, so a change that made *all* validation fail would still pass the
+/// suite.
+#[tokio::test]
+async fn ucan_validate_accepts_a_minted_token_through_the_verifying_resolver() {
+    let scp = Scp::new_in_memory_for_test();
+    let alice = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .unwrap();
+    let bob = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .unwrap();
+    let handle = scp
+        .context_create(alice.clone(), default_encrypted_params())
+        .await
+        .unwrap();
+
+    let token = scp
+        .ucan_mint(
+            handle.clone(),
+            bob.did(),
+            vec!["messages:read".to_owned()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let capability = token
+        .capabilities()
+        .first()
+        .expect("the minted token carries the requested capability")
+        .clone();
+
+    scp.ucan_validate(handle, token.encoded(), capability, bob.did(), None)
+        .await
+        .expect(
+            "a token minted by an identity this bridge instance created must validate against \
+             that identity's published DID document",
+        );
 }
 
 // ---------------------------------------------------------------------------
