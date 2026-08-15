@@ -3,9 +3,10 @@
 # Generates and publishes API reference docs for all language SDKs
 # on every release tag. Also runs on PRs for validation.
 #
-# When a PR doesn't touch doc-relevant paths (bindings/, crates/scp-core/src/,
-# crates/scp-ffi/), all doc jobs skip via `if` condition. GitHub reports
-# skipped jobs as passing for required status checks.
+# When a change doesn't touch doc-relevant paths (see the `docs:` filter in the
+# `changes` job), all doc jobs skip via an `if` condition. This whole workflow
+# is ADVISORY: `ci` is the sole required status check, so nothing here can block
+# a merge -- see the note on the `push` trigger below.
 #
 # Source: .docs/scaffold/shared.md section "SDK Documentation Requirements"
 # Story: SCP-139
@@ -21,10 +22,12 @@ name: SDK Docs
 
 on:
   push:
-    # `main` is included so a merge that breaks rustdoc is caught on the branch
-    # that broke it. Without it this workflow could only ever fail on someone
-    # else's PR: three broken intra-doc links rode `main` undetected for ten
-    # days because the merge itself was never doc-tested.
+    # Also run on `main` so the post-merge tip is doc-tested. NOTE: this run is
+    # ADVISORY -- `ci` is the only required status check on the Default ruleset,
+    # which is why PR #2274's failing `Rust API docs (rustdoc)` job (run
+    # 30878568409, attempt 1, never re-run) did not block its merge and three
+    # broken intra-doc links rode `main` for ten days. Making rustdoc a required
+    # check is the actual fix; this trigger only shortens time-to-detection.
     branches: [main]
     tags:
       - "scp-core@*"
