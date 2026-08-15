@@ -2604,14 +2604,38 @@ fn b3_merkle_proof_verification_wired() {
         "compare_remote_checkpoint must delegate the Merkle/divergence comparison \
          to classify_remote_checkpoint"
     );
+    // The emit is reached through the deduped `record_equivocation_if_fresh`
+    // gate, so pin BOTH links of that chain. Routing through the gate is what
+    // makes the §9.9.3 replay-dedup / `MAX_SEQUENTIAL_COMMITS` bounding semantics
+    // production behavior rather than test-only: before this, the judge inlined
+    // its own `divergence_is_fresh` + `emit_equivocation_alert` pair and the
+    // documented gate had no production caller.
     assert!(
         fn_body_contains(
             MANAGER_SRC,
             "compare_remote_checkpoint",
+            "record_equivocation_if_fresh",
+        ),
+        "compare_remote_checkpoint must route a divergent checkpoint through the \
+         deduped record_equivocation_if_fresh gate (§9.9.3 replay defense)"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "record_equivocation_if_fresh",
             "emit_equivocation_alert",
         ),
-        "compare_remote_checkpoint must emit an equivocation alert on a divergent \
-         checkpoint (§9.9.4)"
+        "record_equivocation_if_fresh must emit an equivocation alert on a fresh \
+         divergent checkpoint (§9.9.4)"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "record_equivocation_if_fresh",
+            "divergence_is_fresh",
+        ),
+        "record_equivocation_if_fresh must gate the emit on the divergence-freshness \
+         dedup check (§9.9.3)"
     );
 
     // Real call-site assertion: the receive path must actually REACH the

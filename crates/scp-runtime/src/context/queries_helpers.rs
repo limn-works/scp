@@ -1053,20 +1053,14 @@ pub fn compare_remote_checkpoint(
         classify_remote_checkpoint(sender_is_member, deps, context_id, remote)?;
 
     // Record an EquivocationDetected event in the receive buffer when divergent
-    // (NOT appended to the durable Merkle log — see `emit_equivocation_alert`) —
-    // deduped per distinct divergent checkpoint (replay defense). The two Class-C
-    // `&mut` fields are touched SEQUENTIALLY through the view: the freshness gate
-    // over `last_seen_remote_checkpoint` completes before the receive-buffer emit.
-    if let Some(local_root) = divergence_root
-        && divergence_is_fresh(view.last_seen_remote_checkpoint_mut(), context_id, remote)
-    {
-        emit_equivocation_alert(
-            view.receive_buffer_mut(),
-            deps,
-            context_id,
-            remote,
-            local_root,
-        );
+    // (NOT appended to the durable Merkle log — see `emit_equivocation_alert`),
+    // deduped per distinct divergent checkpoint (replay defense). The dedup +
+    // emit pair is `record_equivocation_if_fresh`, whose doc carries the §9.9.3
+    // replay/bounding semantics — it is the ONE implementation of that pair, so
+    // the documented semantics are the production path (and the unit tests that
+    // pin them exercise production, not a parallel copy).
+    if let Some(local_root) = divergence_root {
+        record_equivocation_if_fresh(view, deps, context_id, remote, local_root);
     }
 
     Ok(comparison)
@@ -1101,24 +1095,31 @@ pub fn compare_remote_checkpoint(
 /// alert is still EMITTED (a §9.9.4 security event is never silently
 /// discarded) but no further `(count, root)` is inserted, so a malicious
 /// sender cannot pin unbounded memory.
+///
+/// Called by [`compare_remote_checkpoint`] — the sole production judge — on
+/// every divergent verdict, so the semantics documented above ARE the shipped
+/// behavior and the unit tests below pin production, not a parallel copy.
 fn record_equivocation_if_fresh(
-    last_seen_remote_checkpoint: &mut std::collections::HashMap<
-        DID,
-        std::collections::HashSet<(u64, [u8; 32])>,
-    >,
-    receive_buffer: &mut ReceiveBuffer,
+    view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
     local_root: [u8; 32],
 ) {
-    // Field-disjoint split so the two `&mut` Class-C fields are touched
-    // SEQUENTIALLY — the freshness/dedup step over `last_seen_remote_checkpoint`
-    // completes (its borrow ends) before the receive-buffer emit. This lets the
-    // actor handler thread each `&mut` from a `ClassCMut` view in turn (the view
-    // hands out one field `&mut` at a time), with no whole `&mut PerContextState`.
-    if divergence_is_fresh(last_seen_remote_checkpoint, context_id, remote) {
-        emit_equivocation_alert(receive_buffer, deps, context_id, remote, local_root);
+    // The two Class-C `&mut` fields are touched SEQUENTIALLY through the view:
+    // the freshness/dedup step over `last_seen_remote_checkpoint` completes (its
+    // borrow ends) before the receive-buffer emit. The view hands out one field
+    // `&mut` at a time, so no whole `&mut PerContextState` is needed — and the
+    // ordering is load-bearing, not incidental: the alert must be emitted only
+    // after the divergence has been judged fresh.
+    if divergence_is_fresh(view.last_seen_remote_checkpoint_mut(), context_id, remote) {
+        emit_equivocation_alert(
+            view.receive_buffer_mut(),
+            deps,
+            context_id,
+            remote,
+            local_root,
+        );
     }
 }
 
@@ -1304,9 +1305,17 @@ mod equivocation_dedup_tests {
     //! their roots and false-positive the very detection it records). With no
     //! durable append there is no `local_count` advance, so the gate's
     //! keyed-on-`(count, root)` behavior is the only thing standing between a
-    //! re-presented divergence and a duplicate alert. These tests assert it by
-    //! constructing state directly and calling the helper at a stable count,
-    //! never advancing through `compare_remote_checkpoint`.
+    //! re-presented divergence and a duplicate alert.
+    //!
+    //! `record_equivocation_if_fresh` is the PRODUCTION dedup+emit pair —
+    //! `compare_remote_checkpoint` calls it on every divergent verdict — so these
+    //! tests pin shipped behavior, not a parallel copy. They drive it through the
+    //! same [`ClassCMut`] view the judge hands it, but construct the state
+    //! directly and hold the count stable rather than advancing through
+    //! `compare_remote_checkpoint`: the judge's authenticity gates (membership,
+    //! signature, `context_id`) and its local-log snapshot are orthogonal to the
+    //! dedup semantics under test and are covered by
+    //! `remote_checkpoint_classification_tests`.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use std::sync::Arc;
@@ -1314,7 +1323,7 @@ mod equivocation_dedup_tests {
 
     use scp_did::DID;
 
-    use super::record_equivocation_if_fresh;
+    use super::{ClassCMut, record_equivocation_if_fresh};
     use crate::context::actor::deps::ActorDeps;
     use crate::context::actor::state::PerContextState;
     use crate::context::supervisor::supervisor::Supervisor;
@@ -1426,6 +1435,25 @@ mod equivocation_dedup_tests {
         }
     }
 
+    /// Drives the production dedup gate over a bare `PerContextState` through
+    /// the SAME [`ClassCMut`] view `compare_remote_checkpoint` hands it. The
+    /// view's borrow of `state` ends with this call, so each test can read the
+    /// state fields back directly between invocations.
+    fn record(
+        state: &mut PerContextState,
+        deps: &ActorDeps,
+        remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+        local_root: [u8; 32],
+    ) {
+        record_equivocation_if_fresh(
+            &mut ClassCMut::from_state(state),
+            deps,
+            "ctx",
+            remote,
+            local_root,
+        );
+    }
+
     /// (a) The same `(count, root)` recorded twice yields exactly ONE
     /// buffered alert — the exact-divergence replay is suppressed by the
     /// per-sender `(count, root)` dedup set (now the SOLE dedup, since the
@@ -1437,23 +1465,9 @@ mod equivocation_dedup_tests {
         let remote = checkpoint("did:example:bob", 5, [0xAB; 32]);
         let local_root = [0xCD; 32];
 
-        record_equivocation_if_fresh(
-            &mut state.last_seen_remote_checkpoint,
-            &mut state.receive_buffer,
-            &deps,
-            "ctx",
-            &remote,
-            local_root,
-        );
+        record(&mut state, &deps, &remote, local_root);
         // Identical re-presentation: same sender, same count, same root.
-        record_equivocation_if_fresh(
-            &mut state.last_seen_remote_checkpoint,
-            &mut state.receive_buffer,
-            &deps,
-            "ctx",
-            &remote,
-            local_root,
-        );
+        record(&mut state, &deps, &remote, local_root);
 
         assert_eq!(
             appends.load(Ordering::SeqCst),
@@ -1480,22 +1494,8 @@ mod equivocation_dedup_tests {
 
         let first = checkpoint("did:example:bob", 5, [0x11; 32]);
         let second = checkpoint("did:example:bob", 5, [0x22; 32]);
-        record_equivocation_if_fresh(
-            &mut state.last_seen_remote_checkpoint,
-            &mut state.receive_buffer,
-            &deps,
-            "ctx",
-            &first,
-            local_root,
-        );
-        record_equivocation_if_fresh(
-            &mut state.last_seen_remote_checkpoint,
-            &mut state.receive_buffer,
-            &deps,
-            "ctx",
-            &second,
-            local_root,
-        );
+        record(&mut state, &deps, &first, local_root);
+        record(&mut state, &deps, &second, local_root);
 
         assert_eq!(
             appends.load(Ordering::SeqCst),
@@ -1525,27 +1525,13 @@ mod equivocation_dedup_tests {
         // later replay; because the set is full by then, that first
         // `(count, root)` is NOT retained, so the replay re-appends.
         let first = checkpoint("did:example:mallory", 0, [0x00; 32]);
-        record_equivocation_if_fresh(
-            &mut state.last_seen_remote_checkpoint,
-            &mut state.receive_buffer,
-            &deps,
-            "ctx",
-            &first,
-            local_root,
-        );
+        record(&mut state, &deps, &first, local_root);
         for i in 1..cap {
             let mut root = [0u8; 32];
             root[0] = (i & 0xFF) as u8;
             root[1] = ((i >> 8) & 0xFF) as u8;
             let cp = checkpoint("did:example:mallory", i, root);
-            record_equivocation_if_fresh(
-                &mut state.last_seen_remote_checkpoint,
-                &mut state.receive_buffer,
-                &deps,
-                "ctx",
-                &cp,
-                local_root,
-            );
+            record(&mut state, &deps, &cp, local_root);
         }
 
         let seen_len = state
@@ -1565,14 +1551,7 @@ mod equivocation_dedup_tests {
         // the set does NOT grow. Equivocation is buffer-only, so observe the
         // buffered alert rather than a Merkle append.
         let over = checkpoint("did:example:mallory", cap + 1, [0xFF; 32]);
-        record_equivocation_if_fresh(
-            &mut state.last_seen_remote_checkpoint,
-            &mut state.receive_buffer,
-            &deps,
-            "ctx",
-            &over,
-            local_root,
-        );
+        record(&mut state, &deps, &over, local_root);
         assert_eq!(
             state.receive_buffer.drain_equivocation_alerts().len(),
             1,
