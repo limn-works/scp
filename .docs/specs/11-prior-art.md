@@ -157,7 +157,7 @@ This means SCP identities stay resolvable even if:
 - All of an identity's SCP relays are down — Mainline serves the bootstrap core (§18.2.2C), so `#active`, the pre-rotation commitment and the relay list stay resolvable. Every entry outside the core is unresolved until a relay answers.
 - An attacker suppresses one layer — the other still answers, with what that layer carries.
 
-Each layer resists suppression for its own contents. Suppressing the full document requires suppressing it on ALL of an identity's relays; suppressing the bootstrap core requires suppressing it on all reachable Mainline nodes. What Mainline contributes against relay suppression is a second, independently-suppression-resistant copy of the **relay list**, which is how a resolver reaches a relay the attacker missed — not a second copy of the document. §3.10.8 of the identity spec carries the full analysis.
+Each layer resists suppression for its own contents. Suppressing the full document requires suppressing it on ALL of an identity's relays; suppressing the bootstrap core requires suppressing it on all reachable Mainline nodes. What Mainline contributes against relay suppression is a second, independently-suppression-resistant copy of the **relay list**, which is how a resolver reaches a relay the attacker missed — not a second copy of the document. §3.10.8 of the identity spec carries the full analysis, including why the two suppression targets have separate bars.
 
 **2. Multi-key verification method architecture (§3.9, ADR-039).** Standard did:dht uses a single Ed25519 keypair (the one encoded in the DID string) for everything — signing documents, authenticating, operating. SCP defines multiple verification methods per DID document:
 

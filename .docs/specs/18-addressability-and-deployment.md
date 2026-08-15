@@ -345,7 +345,7 @@ Each additional `SCPRelay` entry costs 79 bytes with the short hostname and 98 b
 
 An identity SHOULD publish at least 3 `SCPRelay` entries for suppression resistance (§9.9.2). `TransportManager` reads all `SCPRelay` entries from a resolved DID document and routes to all of them. The relay set partitioning logic (ADR-012) operates on top of the published relay list.
 
-Relay entries are ordered by preference (first entry = preferred relay). Clients SHOULD respect ordering when selecting a subset. When adding or removing relays, the identity updates its DID document and publishes with an incremented BEP44 sequence number. Peers that re-resolve the DID document discover the updated relay list.
+Relay entries are ordered by preference (first entry = preferred relay). Clients SHOULD respect ordering when selecting a subset. When adding or removing relays, the identity updates its DID document and republishes to both layers, each in its own encoding and each advancing its own sequence number (§3.10.5, §18.2.1). Peers that re-resolve the DID document discover the updated relay list.
 
 ## 18.3 .well-known/scp
 

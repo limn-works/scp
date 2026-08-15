@@ -148,7 +148,7 @@ every bridge, routed to a deterministic RNG behind `#[cfg(feature =
 
 **MVP decision**: use **shape-only comparators** (regex / ignore) for
 crypto-generated identifiers on `identity_create_deterministic` and
-`sign_message`. The DID must match `did:dht:z[1-9a-km-np-zA-HJ-NP-Z]+`,
+`sign_message`. The DID must match `did:dht:[ybndrfg8ejkmcpqxot1uwisza345h769]{52}` — z-base-32's alphabet, 52 characters, no prepended `z`. This regex previously read `did:dht:z[1-9a-km-np-zA-HJ-NP-Z]+`, which was wrong twice: it baked in the leading `z` §18.2.2A names as a defect, and its character class is **base58btc**, which excludes `0`, `O`, `I` and `l` while admitting nothing outside them — so it rejects a valid SCP DID containing `o` and admits characters z-base-32 never emits.
 the verifying key must be 32-byte base64, the signature must be 64-byte
 base64 — but we do not require cross-bridge byte equality.
 
