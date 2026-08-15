@@ -152,12 +152,12 @@ SCP extends did:dht significantly. These extensions are additive — a standard 
 
 **1. Dual-layer resolution (§3.10).** did:dht has one resolution path: Mainline DHT. SCP adds a second: SCP relays. DID documents are published as standard relay blobs (routing_id = `SHA-256("scp:did:" || did_string)`). Both layers are queried in parallel. Each layer carries its own encoding under its own signature and its own sequence number, so a BEP44 sequence number resolves conflicts **within** a layer and never between layers (§3.10.7); the relay layer answers for the full document and Mainline for the bootstrap core. The anti-segmentation invariant (§3.10.6) makes dual-layer publishing a MUST, not a SHOULD.
 
-This means SCP identities are resolvable even if:
-- The entire Mainline DHT is unreachable (relay layer serves)
-- All of an identity's SCP relays are down (DHT layer serves)
-- An attacker suppresses documents on one layer (the other layer serves)
+This means SCP identities stay resolvable even if:
+- The entire Mainline DHT is unreachable — the relay layer serves the full document, and a resolver that already holds a relay list needs nothing from Mainline.
+- All of an identity's SCP relays are down — Mainline serves the bootstrap core (§18.2.2C), so `#active`, the pre-rotation commitment and the relay list stay resolvable. Every entry outside the core is unresolved until a relay answers.
+- An attacker suppresses one layer — the other still answers, with what that layer carries.
 
-An attacker must suppress a DID document on ALL relays AND ALL reachable DHT nodes to prevent resolution. This is a strictly harder attack than suppressing on either layer alone.
+Each layer resists suppression for its own contents. Suppressing the full document requires suppressing it on ALL of an identity's relays; suppressing the bootstrap core requires suppressing it on all reachable Mainline nodes. What Mainline contributes against relay suppression is a second, independently-suppression-resistant copy of the **relay list**, which is how a resolver reaches a relay the attacker missed — not a second copy of the document. §3.10.8 of the identity spec carries the full analysis.
 
 **2. Multi-key verification method architecture (§3.9, ADR-039).** Standard did:dht uses a single Ed25519 keypair (the one encoded in the DID string) for everything — signing documents, authenticating, operating. SCP defines multiple verification methods per DID document:
 

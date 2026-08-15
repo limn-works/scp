@@ -57,7 +57,7 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | §3.3, §9.11 |
 | **Preconditions** | DID with established `#active` key. Existing messages signed with old key. |
-| **Steps** | 1. Generate new Ed25519 keypair for `#active`. 2. Update DID document with new `#active` key. 3. Publish to both layers, each in its own encoding, incrementing each layer's own sequence number (§3.10.5). 4. Resolve the DID from the relay layer again. 5. Verify old `#active` key is no longer in document. 6. Verify key continuity fingerprint changed. |
+| **Steps** | 1. Generate new Ed25519 keypair for `#active`. 2. Update DID document with new `#active` key. 3. Publish to both layers, each in its own encoding, incrementing each layer's own sequence number (§3.10.5). 4. Resolve the DID from the relay layer again. 5. Verify old `#active` key is no longer in document. 6. Verify key continuity fingerprint changed. 7. Resolve the DID from Mainline and assert its bootstrap core carries the NEW `#active` key — a publisher that rotated on one layer only fails here, and the relay-layer assertion in step 5 cannot catch it. |
 | **Expected Outcome** | New DID document has new `#active` key. Old `#active` key is absent. Key continuity fingerprint (§9.11) reflects the change. Messages signed with old key still verify against the old key (retained by recipients). |
 
 ### CONF-004: Agent Binding (Human DID Attests Agent DID)

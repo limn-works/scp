@@ -1128,7 +1128,7 @@ These events are appended to the identity private state event log (§3.7). They 
 
 | Variant | Tag | Fields | Semantics |
 |---------|-----|--------|-----------|
-| `DhtDidDocument` | `"dht_did_document"` | — | Found via `SCPBroadcastContext` service in publisher's DID doc. |
+| `DidDocumentBroadcastList` | `"did_document_broadcast_list"` | — | Found by resolving the publisher's DID, reading its single `SCPBroadcastContext` service entry, and fetching the signed broadcast-context list it names (§5.14.11). The entry lives on the relay layer, so a Mainline-only resolution does not carry it (§18.2.2C). The variant was named `DhtDidDocument`, which asserted a layer that never serves this entry. |
 | `WellKnown` | `"well_known"` | — | Found via `.well-known/scp` on a domain. |
 | `HandleRegistry` | `"handle_registry"` | `context_id: String` | Found via search in a context with discovery outlets. |
 | `ContextUri` | `"context_uri"` | — | Found via `scp://` URI. |

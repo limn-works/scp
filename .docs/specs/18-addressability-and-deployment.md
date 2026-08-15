@@ -689,7 +689,7 @@ End-to-end deployment of an SCP-enabled agent on a dedicated machine:
    a. Creates SqliteStorage at default path
    b. Generates a new DID identity
    c. Starts relay server at wss://agent.example.com/scp/v1
-   d. Publishes DID document with SCPRelay entry to DHT
+   d. Publishes to both layers, each in its own encoding (§3.10.5): the full document carrying the `SCPRelay` entry to SCP relays, and the DNS-encoded bootstrap core carrying the same entry to Mainline
    e. Provisions TLS certificate via ACME
    f. Serves .well-known/scp at https://agent.example.com/.well-known/scp
 

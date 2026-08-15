@@ -618,7 +618,7 @@
         "DidMethod trait defined with methods: create, publish, resolve, rotate, verify",
         "DidDht struct implements DidMethod trait",
         "ScpIdentity struct matches the specified structure: identity_key (KeyHandle), active_signing_key (KeyHandle), pre_rotation_commitment ([u8; 32]), did (String)",
-        "DID Document construction follows W3C DID Document JSON-LD format with Ed25519 verification methods",
+        "DID Document construction produces both layer encodings (\u00a718.2.2A): the relay layer's W3C DID Document with Ed25519 verification methods, serialized as RFC 8785 canonical JSON, and the Mainline layer's did:dht DNS packet carrying the bootstrap core (\u00a718.2.2C)",
         "All public items have /// doc comments",
         "Unit tests for create_identity, verify_did, DID document construction",
         "No unwrap() or expect() in library code"
