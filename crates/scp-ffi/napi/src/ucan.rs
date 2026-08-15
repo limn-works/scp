@@ -294,7 +294,7 @@ pub(crate) async fn ucan_validate_on(
     // and nonce tracker from the runtime registry. This ensures:
     // - Revoked tokens are rejected across calls (persistent RevocationList).
     // - Replayed nonces are detected across calls (persistent NonceTracker).
-    crate::runtime::with_context(bi, &context_id, |rt| {
+    let validated = crate::runtime::with_context(bi, &context_id, |rt| {
         // Build validation context using persistent runtime state.
         // Use production DID resolver when available (#311), fallback to string-only.
         let production_resolver = crate::runtime::did_resolver(bi);
@@ -327,8 +327,15 @@ pub(crate) async fn ucan_validate_on(
         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpNapiError::from)?;
 
         Ok(())
-    })
-    .map_err(napi::Error::from)?;
+    });
+
+    // Step 9 of the pipeline records the token's nonce, so write the context's
+    // nonce entries to durable storage before returning. A rejected token keeps
+    // its own error: the caller is already denied, so a durability failure on
+    // that path grants nothing.
+    let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, &context_id);
+    validated.map_err(napi::Error::from)?;
+    persisted.map_err(napi::Error::from)?;
 
     Ok(())
 }
@@ -712,6 +719,11 @@ pub(crate) async fn ucan_revoke_on(
         Ok(())
     })
     .map_err(napi::Error::from)?;
+
+    // Make the revocation durable before returning. The in-memory list already
+    // denies the token, so a failure here leaves the instance in the more
+    // restrictive state and tells the caller the record did not land.
+    crate::runtime::persist_ucan_revocation_blocking(bi, &context_id).map_err(napi::Error::from)?;
 
     Ok(())
 }

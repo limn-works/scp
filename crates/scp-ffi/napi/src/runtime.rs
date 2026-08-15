@@ -53,7 +53,7 @@ use crate::error::ScpNapiError;
 ///
 /// Two variants are supported:
 /// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
-/// - [`StorageConfig::Sqlite`] — SQLCipher-encrypted storage on disk at
+/// - [`StorageConfig::Sqlite`] — `SQLCipher`-encrypted storage on disk at
 ///   `{path}/scp.db`, wired through [`scp_platform::sqlite::SqliteStorage`].
 ///
 /// Kept here (not in `scp-ffi-common`) because each bridge owns its own
@@ -63,7 +63,7 @@ pub enum StorageConfig {
     /// Encrypted in-memory storage.
     #[default]
     InMemory,
-    /// SQLCipher-encrypted on-disk storage at `{path}/scp.db`.
+    /// `SQLCipher`-encrypted on-disk storage at `{path}/scp.db`.
     ///
     /// Persists context snapshots, identity state, and the event log
     /// across process restarts. The encryption key material is selected via
@@ -1259,7 +1259,7 @@ pub fn init_supervisor_with_relay_transport(
 ///
 /// Used by the trust aggregation bridge to construct a
 /// `ProtocolRepositoryTrustBridge` backed by the configured storage (either
-/// encrypted in-memory or SQLCipher-on-disk).
+/// encrypted in-memory or `SQLCipher`-on-disk).
 #[must_use]
 pub const fn protocol_repository(bi: &NapiBridgeInstance) -> &ProtocolRepoVariant {
     &bi.protocol_repository
@@ -1635,11 +1635,22 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
 /// is seeded from `default_ceiling()` with `creator_did` as admin, and the
 /// caller ceiling drives only the UCAN `ceiling_strings`.
 ///
+/// The revocation list and nonce tracker are rebuilt from this instance's
+/// durable store before the state is returned (see
+/// [`hydrate_ucan_state_blocking`]), so a token revoked before the process
+/// restarted is already revoked in the state this function hands back. Both
+/// registration paths run through here, which is why hydration lives here
+/// rather than at each caller.
+///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Validation` if a ceiling entry violates the §5.3.1.1
-/// grammar, or `ScpNapiError::Context` if role-state construction fails.
+/// grammar, `ScpNapiError::Context` if role-state construction fails, and
+/// `ScpNapiError::Context` if the durable UCAN state cannot be read — the
+/// bridge fails closed rather than answering validations from an empty
+/// revocation list.
 fn build_ucan_context_state(
+    bi: &NapiBridgeInstance,
     context_id: &str,
     creator_did: &str,
     user_ceiling: &[String],
@@ -1703,18 +1714,119 @@ fn build_ucan_context_state(
         code: codes::CTX_2023.to_owned(),
     })?;
 
+    let mut core = scp_ffi_common::bridge_runtime::UcanContextStateCore {
+        revocation_list: RevocationList::new(context_id.to_owned()),
+        nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
+        ceiling_strings,
+        creator_did: creator_did.to_owned(),
+        event_log: EventLog::new(context_id.to_owned()),
+    };
+    hydrate_ucan_state_blocking(bi, context_id, &mut core)?;
+
     Ok(UcanContextState {
-        core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
-            revocation_list: RevocationList::new(context_id.to_owned()),
-            nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
-            event_log: EventLog::new(context_id.to_owned()),
-        },
+        core,
         role_state,
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
+    })
+}
+
+/// Rebuilds a freshly constructed [`UcanContextStateCore`] from this instance's
+/// durable revocation and nonce records.
+///
+/// `build_ucan_context_state` is synchronous and both of its callers are
+/// synchronous, while `Storage` is async, so this bridges the two through
+/// [`scp_ffi_common::ucan_durable_state::block_on_storage`].
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the durable record cannot be read or
+/// decoded, or if the call arrives from inside a current-thread tokio runtime
+/// where the sync-to-async bridge cannot run. Either way the bridge fails
+/// closed: an unreadable revocation record must not present as "nothing was
+/// revoked".
+fn hydrate_ucan_state_blocking(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    core: &mut scp_ffi_common::bridge_runtime::UcanContextStateCore,
+) -> Result<(), ScpNapiError> {
+    let repo = protocol_repository(bi);
+    scp_ffi_common::ucan_durable_state::block_on_storage(
+        crate::runtime().handle(),
+        repo.hydrate_ucan_state(context_id, core),
+    )
+    .map_err(|e| ScpNapiError::Context {
+        message: format!("failed to rebuild durable UCAN state for '{context_id}': {e}"),
+        code: codes::CTX_2023.to_owned(),
+    })?
+    .map_err(|e| ScpNapiError::Context {
+        message: format!("failed to rebuild durable UCAN state for '{context_id}': {e}"),
+        code: codes::CTX_2023.to_owned(),
+    })
+}
+
+/// Writes the context's UCAN revocation list to this instance's durable store.
+///
+/// Called by `ucan_revoke` once the core revocation pipeline has succeeded, so
+/// the durable record agrees with the in-memory list before `ucan_revoke`
+/// returns.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the write fails. The caller propagates
+/// the failure instead of reporting a revocation that the next process start
+/// would forget.
+pub(crate) fn persist_ucan_revocation_blocking(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpNapiError> {
+    let list = with_context(bi, context_id, |rt| Ok(rt.core.revocation_list.clone()))?;
+    let repo = protocol_repository(bi);
+    scp_ffi_common::ucan_durable_state::block_on_storage(
+        crate::runtime().handle(),
+        repo.persist_ucan_revocation_list(context_id, &list),
+    )
+    .map_err(|e| ScpNapiError::Context {
+        message: format!("failed to persist UCAN revocation for '{context_id}': {e}"),
+        code: codes::CTX_2023.to_owned(),
+    })?
+    .map_err(|e| ScpNapiError::Context {
+        message: format!("failed to persist UCAN revocation for '{context_id}': {e}"),
+        code: codes::CTX_2023.to_owned(),
+    })
+}
+
+/// Writes the context's UCAN nonce tracker to this instance's durable store.
+///
+/// Called after every UCAN-validation pipeline run, because that pipeline is
+/// the only writer of nonce state. A nonce accepted now is therefore still
+/// refused after the bridge instance is rebuilt.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the write fails. The caller propagates
+/// the failure rather than reporting a validation whose replay record did not
+/// become durable.
+pub(crate) fn persist_ucan_nonces_blocking(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpNapiError> {
+    let entries = with_context(bi, context_id, |rt| {
+        Ok(rt.core.nonce_tracker.snapshot_entries())
+    })?;
+    let repo = protocol_repository(bi);
+    scp_ffi_common::ucan_durable_state::block_on_storage(
+        crate::runtime().handle(),
+        repo.persist_ucan_nonce_entries(context_id, &entries),
+    )
+    .map_err(|e| ScpNapiError::Context {
+        message: format!("failed to persist UCAN nonce state for '{context_id}': {e}"),
+        code: codes::CTX_2023.to_owned(),
+    })?
+    .map_err(|e| ScpNapiError::Context {
+        message: format!("failed to persist UCAN nonce state for '{context_id}': {e}"),
+        code: codes::CTX_2023.to_owned(),
     })
 }
 
@@ -1752,7 +1864,7 @@ pub fn register_ffi_state(
             code: codes::CTX_2023.to_owned(),
         }),
         Entry::Vacant(vacant) => {
-            let state = build_ucan_context_state(context_id, creator_did, user_ceiling)?;
+            let state = build_ucan_context_state(bi, context_id, creator_did, user_ceiling)?;
             vacant.insert(state);
             Ok(())
         }
@@ -1780,7 +1892,8 @@ pub fn ensure_registered(
         return Ok(());
     }
 
-    let state = build_ucan_context_state(&context_id, &handle.creator_did(), &handle.ceiling())?;
+    let state =
+        build_ucan_context_state(bi, &context_id, &handle.creator_did(), &handle.ceiling())?;
     map.entry(context_id).or_insert(state);
     Ok(())
 }

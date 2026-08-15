@@ -726,7 +726,7 @@ impl ContextProvider for FfiBridgeProvider {
                 crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
                     .map_err(|e| format!("failed to build proof resolver: {e}"))?;
 
-            crate::runtime::with_context(&bi, context_id, |rt| {
+            let validated = crate::runtime::with_context(&bi, context_id, |rt| {
                 // SCP-OUT-014: select the split capability stem from the
                 // outlet's registered kind — `outlet_query:{id}` for Query
                 // outlets, `outlet_call:{id}` for Action outlets.
@@ -789,8 +789,15 @@ impl ContextProvider for FfiBridgeProvider {
                         "UCAN authorization failed for outlet '{outlet_name}': {e}"
                     ))
                 })
-            })
-            .map_err(|e| format!("{e}"))?;
+            });
+
+            // Step 9 of the pipeline records the token's nonce, so write the
+            // context's nonce entries to durable storage before returning. A
+            // rejected token keeps its own error: the caller is already denied,
+            // so a durability failure on that path grants nothing.
+            let persisted = crate::runtime::persist_ucan_nonces_blocking(&bi, context_id);
+            validated.map_err(|e| format!("{e}"))?;
+            persisted.map_err(|e| format!("{e}"))?;
         } else {
             tracing::warn!(
                 agent = %self.agent_did,

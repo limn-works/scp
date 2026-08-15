@@ -7554,4 +7554,126 @@ mod tests {
             "expected SCP-IDENT-1017, got: {reason}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Durable UCAN revocation across a bridge-instance restart
+    // -----------------------------------------------------------------------
+
+    /// Builds a `NapiBridgeInstance` over the `SQLCipher` database in `dir`.
+    fn sqlite_instance(dir: &std::path::Path) -> Arc<crate::runtime::NapiBridgeInstance> {
+        use crate::runtime::{SqliteKeyMaterial, StorageConfig};
+        Arc::new(
+            crate::runtime::NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+                path: dir.to_path_buf(),
+                key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x5au8; 32])),
+            })
+            .expect("opening the SQLCipher database must succeed"),
+        )
+    }
+
+    /// Builds a handle bound to `bi` for `context_id`, carrying the metadata the
+    /// UCAN entry points read (creator DID and ceiling).
+    fn handle_for(
+        bi: &Arc<crate::runtime::NapiBridgeInstance>,
+        context_id: &str,
+        creator_did: &str,
+    ) -> super::NapiContextHandle {
+        use super::{CancellationToken, ContextState};
+        super::NapiContextHandle {
+            context_id: context_id.to_owned(),
+            state: std::sync::Mutex::new(ContextState::Active),
+            creator_did: creator_did.to_owned(),
+            mode: "Encrypted".to_owned(),
+            ceiling: vec![],
+            ceiling_policy: "immutable".to_owned(),
+            ttl_seconds: None,
+            promotion_policy: None,
+            governance: "single_admin".to_owned(),
+            economic_policy: None,
+            in_memory_custody: None,
+            signing_key: None,
+            core_handle: None,
+            subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
+            subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bi: Arc::clone(bi),
+            instance_id: bi.instance_id(),
+        }
+    }
+
+    /// Reads the predicate that step 10 of the ADR-016 validation pipeline
+    /// consults, through the same `RevocationChecker` the pipeline builds.
+    fn checker_reports_revoked(
+        bi: &crate::runtime::NapiBridgeInstance,
+        context_id: &str,
+        token_cid: &str,
+    ) -> bool {
+        use scp_core::crypto::ucan::validate::RevocationChecker as _;
+        crate::runtime::with_context(bi, context_id, |rt| {
+            let checker = scp_ffi_common::BridgeRevocationChecker {
+                revocation_list: &rt.core.revocation_list,
+            };
+            Ok(checker.is_revoked(token_cid))
+        })
+        .expect("the context is registered")
+    }
+
+    /// A syntactically valid UCAN issued by the context creator, so
+    /// `BridgeRevocationAuthorizer` authorizes the creator to revoke it.
+    const RESTART_TEST_TOKEN: &str = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
+        eyJpc3MiOiJkaWQ6a2V5OnRlc3QiLCJhdWQiOiJkaWQ6a2V5OnRlc3QyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
+        dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw";
+
+    const RESTART_CREATOR_DID: &str = "did:key:test";
+
+    /// The contract: revoke on instance A through `ucan_revoke`, drop A, build
+    /// instance B over the same database, and the token stays revoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_revocation_survives_a_bridge_instance_restart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let context_id = format!("ctx-restart-{}", uuid::Uuid::new_v4());
+        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(RESTART_TEST_TOKEN);
+
+        {
+            let bi_a = sqlite_instance(dir.path());
+            let handle_a = handle_for(&bi_a, &context_id, RESTART_CREATOR_DID);
+            crate::runtime::ensure_registered(&bi_a, &handle_a)
+                .expect("registering UCAN state must succeed");
+            assert!(
+                !checker_reports_revoked(&bi_a, &context_id, &token_cid),
+                "a fresh context must start with nothing revoked"
+            );
+
+            crate::ucan::ucan_revoke_on(
+                &bi_a,
+                &handle_a,
+                RESTART_TEST_TOKEN.to_owned(),
+                RESTART_CREATOR_DID.to_owned(),
+            )
+            .await
+            .expect("the context creator may revoke a token it issued");
+            assert!(
+                checker_reports_revoked(&bi_a, &context_id, &token_cid),
+                "the revoking instance must refuse the token immediately"
+            );
+            bi_a.protocol_repository.close();
+        }
+
+        let bi_b = sqlite_instance(dir.path());
+        let handle_b = handle_for(&bi_b, &context_id, RESTART_CREATOR_DID);
+        crate::runtime::ensure_registered(&bi_b, &handle_b)
+            .expect("registering UCAN state must succeed");
+        assert!(
+            checker_reports_revoked(&bi_b, &context_id, &token_cid),
+            "a token revoked before the restart must still be revoked after it"
+        );
+        assert!(
+            !checker_reports_revoked(
+                &bi_b,
+                &context_id,
+                &scp_core::crypto::ucan::revoke::compute_revocation_cid("another-token")
+            ),
+            "hydration must restore only the CIDs that were revoked"
+        );
+        bi_b.protocol_repository.close();
+    }
 }

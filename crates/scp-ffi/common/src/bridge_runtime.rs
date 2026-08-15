@@ -253,7 +253,7 @@ pub enum ProtocolRepoVariant {
     /// `mls_storage` view (spec §17.6 — one chosen backend, derived
     /// consumers). Data is lost when the instance drops.
     InMemory(Arc<EventLogInMemoryRepo>),
-    /// SQLCipher-backed repository. Event log and trust aggregation share the
+    /// `SQLCipher`-backed repository. Event log and trust aggregation share the
     /// same `Arc<SqliteStorage>` that backs `CoreFields::persistence`, so
     /// context snapshots, trust attestations, and event log entries all
     /// survive restart and share a single `SQLCipher` connection.
@@ -348,6 +348,107 @@ impl ProtocolRepoVariant {
                     request_id,
                 )
                 .await
+            }
+        }
+    }
+
+    /// Writes the context's UCAN revocation list to whichever `Storage` backend
+    /// this repository wraps, so a token revoked now stays revoked after the
+    /// bridge instance is rebuilt.
+    ///
+    /// The napi-rs and `UniFFI` bridges call this from `ucan_revoke` once
+    /// `scp_core::crypto::ucan::revoke::revoke_ucan` has succeeded; the `PyO3`
+    /// bridge calls
+    /// [`persist_revocation_list`](crate::ucan_durable_state::persist_revocation_list)
+    /// directly against its `StorageProvider`. The record lands in the same
+    /// per-instance backend that already holds the event log and the context
+    /// snapshots (spec §17.6).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UcanDurableStateError`](crate::ucan_durable_state::UcanDurableStateError)
+    /// if the context id is not a safe key component, the list cannot be
+    /// encoded, or the storage write fails.
+    pub async fn persist_ucan_revocation_list(
+        &self,
+        context_id: &str,
+        list: &scp_core::crypto::ucan::revoke::RevocationList,
+    ) -> Result<(), crate::ucan_durable_state::UcanDurableStateError> {
+        match self {
+            Self::InMemory(repo) => {
+                crate::ucan_durable_state::persist_revocation_list(repo.storage(), context_id, list)
+                    .await
+            }
+            Self::Sqlite(repo) => {
+                crate::ucan_durable_state::persist_revocation_list(repo.storage(), context_id, list)
+                    .await
+            }
+        }
+    }
+
+    /// Writes the context's UCAN nonce entries to whichever `Storage` backend
+    /// this repository wraps, so a nonce seen now is still refused after the
+    /// bridge instance is rebuilt.
+    ///
+    /// The napi-rs and `UniFFI` bridges call this after every UCAN-validation
+    /// pipeline run, because that pipeline is the only writer of nonce state.
+    /// Callers pass `NonceTracker::snapshot_entries`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UcanDurableStateError`](crate::ucan_durable_state::UcanDurableStateError)
+    /// if the context id is not a safe key component, the entries cannot be
+    /// encoded, or the storage write fails.
+    pub async fn persist_ucan_nonce_entries<H: std::hash::BuildHasher + Sync>(
+        &self,
+        context_id: &str,
+        entries: &std::collections::HashMap<String, (u64, u64), H>,
+    ) -> Result<(), crate::ucan_durable_state::UcanDurableStateError> {
+        match self {
+            Self::InMemory(repo) => {
+                crate::ucan_durable_state::persist_nonce_entries(
+                    repo.storage(),
+                    context_id,
+                    entries,
+                )
+                .await
+            }
+            Self::Sqlite(repo) => {
+                crate::ucan_durable_state::persist_nonce_entries(
+                    repo.storage(),
+                    context_id,
+                    entries,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Rebuilds a freshly constructed [`UcanContextStateCore`] from the durable
+    /// revocation and nonce records held by this repository's backend.
+    ///
+    /// The napi-rs and `UniFFI` bridges call this at the point where they insert
+    /// a new per-context UCAN state into their registry, which is the point at
+    /// which the instance first becomes able to answer a UCAN validation for
+    /// that context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UcanDurableStateError`](crate::ucan_durable_state::UcanDurableStateError)
+    /// if either storage read fails or either persisted value cannot be decoded.
+    /// The caller fails closed rather than answering validations from an
+    /// empty revocation list.
+    pub async fn hydrate_ucan_state(
+        &self,
+        context_id: &str,
+        core: &mut UcanContextStateCore,
+    ) -> Result<(), crate::ucan_durable_state::UcanDurableStateError> {
+        match self {
+            Self::InMemory(repo) => {
+                crate::ucan_durable_state::hydrate_core(repo.storage(), context_id, core).await
+            }
+            Self::Sqlite(repo) => {
+                crate::ucan_durable_state::hydrate_core(repo.storage(), context_id, core).await
             }
         }
     }

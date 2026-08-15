@@ -4384,46 +4384,62 @@ pub(crate) fn validate_outlet_ucan_uniffi(
         &handle.context_id,
         &handle.creator_did,
         &handle.ceiling_strings,
-    );
+    )?;
 
-    bi.with_ucan_state(&handle.context_id, |ucan_state| {
-        let production_resolver = bi.did_resolver();
-        let did_resolver = scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
-        let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-            revocation_list: &ucan_state.revocation_list,
-        };
-        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-            inner: &mut ucan_state.nonce_tracker,
-        };
+    let validated = bi
+        .with_ucan_state(&handle.context_id, |ucan_state| {
+            let production_resolver = bi.did_resolver();
+            let did_resolver =
+                scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
+            let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                revocation_list: &ucan_state.revocation_list,
+            };
+            let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                inner: &mut ucan_state.nonce_tracker,
+            };
 
-        let mut ctx = ValidationContext {
-            did_resolver: &did_resolver,
-            nonce_tracker: &mut nonce_adapter,
-            revocation_checker: &revocation_checker,
-            proof_resolver: &proof_resolver,
-            ceiling: &ucan_state.ceiling_strings,
-            context_creator_did: &ucan_state.creator_did,
-            presenting_agent_did: identity_did,
-            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_clock::SystemClock,
-            // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
-            // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
-            // and Step 11b (time-box) run over the proof chain's VALIDATED-
-            // NARROWED caveat set. Generic validate/evaluate sites stay on
-            // `NoCaveatResolver`.
-            caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
-        };
+            let mut ctx = ValidationContext {
+                did_resolver: &did_resolver,
+                nonce_tracker: &mut nonce_adapter,
+                revocation_checker: &revocation_checker,
+                proof_resolver: &proof_resolver,
+                ceiling: &ucan_state.ceiling_strings,
+                context_creator_did: &ucan_state.creator_did,
+                presenting_agent_did: identity_did,
+                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_clock::SystemClock,
+                // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
+                // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
+                // and Step 11b (time-box) run over the proof chain's VALIDATED-
+                // NARROWED caveat set. Generic validate/evaluate sites stay on
+                // `NoCaveatResolver`.
+                caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+            };
 
-        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, kind, &mut ctx)
+            validate_outlet_invocation_ucan(
+                ucan_token,
+                &handle.context_id,
+                outlet_id,
+                kind,
+                &mut ctx,
+            )
             .map_err(|e| ScpError::Permission {
                 msg: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
                 code: codes::PERM_3002.to_owned(),
             })
-    })
-    .ok_or_else(|| ScpError::Permission {
-        msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-        code: codes::PERM_3002.to_owned(),
-    })?
+        })
+        .ok_or_else(|| ScpError::Permission {
+            msg: format!("context '{}' not found in UCAN registry", handle.context_id),
+            code: codes::PERM_3002.to_owned(),
+        });
+
+    // Step 9 of the pipeline records the token's nonce, so write the context's
+    // nonce entries to durable storage before returning. A rejected token keeps
+    // its own error: the caller is already denied, so a durability failure on
+    // that path grants nothing.
+    let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id);
+    validated??;
+    persisted
 }
 
 // ---------------------------------------------------------------------------
@@ -4977,7 +4993,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     .ok_or_else(|| {
                         format!("context '{context_id}' not found in handle registry")
                     })?;
-                bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
+                bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings)
+                    .map_err(|e| e.to_string())?;
                 let registry = handle.outlet_registry.blocking_lock();
                 registry.get(outlet_name).map(|r| r.kind).ok_or_else(|| {
                     format!("outlet '{outlet_name}' not registered in context '{context_id}'")
@@ -4985,55 +5002,66 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             };
 
             let agent_did = self.agent_did.clone();
-            bi.with_ucan_state(context_id, |ucan_state| {
-                let production_resolver = bi.did_resolver();
-                let did_resolver =
-                    scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
-                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-                    revocation_list: &ucan_state.revocation_list,
-                };
-                let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                    inner: &mut ucan_state.nonce_tracker,
-                };
+            let validated = bi
+                .with_ucan_state(context_id, |ucan_state| {
+                    let production_resolver = bi.did_resolver();
+                    let did_resolver =
+                        scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
+                    let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                        revocation_list: &ucan_state.revocation_list,
+                    };
+                    let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                        inner: &mut ucan_state.nonce_tracker,
+                    };
 
-                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                    did_resolver: &did_resolver,
-                    nonce_tracker: &mut nonce_adapter,
-                    revocation_checker: &revocation_checker,
-                    proof_resolver: &proof_resolver,
-                    ceiling: &ucan_state.ceiling_strings,
-                    context_creator_did: &ucan_state.creator_did,
-                    presenting_agent_did: &agent_did,
-                    clock_skew_tolerance_secs:
-                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                    clock: &scp_clock::SystemClock,
-                    // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
-                    // caveats from each token's `nb` field so §7.3.8 Step 7b
-                    // (per-edge narrow) and Step 11b (time-box) run over the
-                    // proof chain's VALIDATED-NARROWED caveat set. Generic
-                    // validate/evaluate sites stay on `NoCaveatResolver`.
-                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
-                };
+                    let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                        did_resolver: &did_resolver,
+                        nonce_tracker: &mut nonce_adapter,
+                        revocation_checker: &revocation_checker,
+                        proof_resolver: &proof_resolver,
+                        ceiling: &ucan_state.ceiling_strings,
+                        context_creator_did: &ucan_state.creator_did,
+                        presenting_agent_did: &agent_did,
+                        clock_skew_tolerance_secs:
+                            scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                        clock: &scp_clock::SystemClock,
+                        // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
+                        // caveats from each token's `nb` field so §7.3.8 Step 7b
+                        // (per-edge narrow) and Step 11b (time-box) run over the
+                        // proof chain's VALIDATED-NARROWED caveat set. Generic
+                        // validate/evaluate sites stay on `NoCaveatResolver`.
+                        caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+                    };
 
-                scp_core::context::outlets::validate_outlet_invocation_ucan(
-                    token,
-                    context_id,
-                    outlet_name,
-                    outlet_kind_for_ucan,
-                    &mut ctx,
-                )
-                .map_err(|e| {
-                    tracing::warn!(
-                        agent = %agent_did,
-                        outlet = %outlet_name,
-                        context = %context_id,
-                        error = %e,
-                        "UCAN validation failed for outlet invocation"
-                    );
-                    format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
+                    scp_core::context::outlets::validate_outlet_invocation_ucan(
+                        token,
+                        context_id,
+                        outlet_name,
+                        outlet_kind_for_ucan,
+                        &mut ctx,
+                    )
+                    .map_err(|e| {
+                        tracing::warn!(
+                            agent = %agent_did,
+                            outlet = %outlet_name,
+                            context = %context_id,
+                            error = %e,
+                            "UCAN validation failed for outlet invocation"
+                        );
+                        format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
+                    })
                 })
-            })
-            .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))??;
+                .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"));
+
+            // Step 9 of the pipeline records the token's nonce, so write the
+            // context's nonce entries to durable storage before returning. A
+            // rejected token keeps its own error: the caller is already denied,
+            // so a durability failure on that path grants nothing.
+            let persisted = bi
+                .persist_ucan_nonces_blocking(context_id)
+                .map_err(|e| e.to_string());
+            validated??;
+            persisted?;
         } else {
             tracing::warn!(
                 agent = %self.agent_did,
@@ -5238,7 +5266,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
         // Ensure UCAN state is registered before appending the event.
         if let Some(handle) = context_handle_registry(&bi).get(context_id) {
-            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
+            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings)
+                .map_err(|e| e.to_string())?;
         }
 
         let append_result = bi.with_ucan_state(context_id, |ucan_state| {
@@ -5347,7 +5376,20 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             return serde_json::json!({ "event_count": 0 });
         };
         if let Some(handle) = context_handle_registry(&bi).get(context_id) {
-            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
+            // `ContextProvider::context_events` returns a bare JSON value with
+            // no error channel. Report the same zero-count shape used when the
+            // bridge instance has been dropped, and log the cause, rather than
+            // registering UCAN state whose revocation list was never rebuilt.
+            if let Err(e) =
+                bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings)
+            {
+                tracing::warn!(
+                    context = %context_id,
+                    error = %e,
+                    "durable UCAN state could not be rebuilt; reporting an empty event log"
+                );
+                return serde_json::json!({ "event_count": 0 });
+            }
         }
 
         bi.with_ucan_state(context_id, |ucan_state| {
@@ -5744,7 +5786,7 @@ async fn event_log_checkpoint_impl(
                 &handle.context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
-            );
+            )?;
 
             let sender_did = scp_did::DID(identity.did.clone());
             let context_id = handle.context_id.clone();
@@ -5869,7 +5911,7 @@ async fn event_log_checkpoint_by_did_impl(
                 &handle.context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
-            );
+            )?;
 
             let sender_did = scp_did::DID(did);
             let context_id = handle.context_id.clone();
@@ -10167,7 +10209,7 @@ impl Scp {
 
                 // Register per-context UCAN validation state (revocation list,
                 // nonce tracker, event log) for the UCAN pipeline on this instance.
-                bi.ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
+                bi.ensure_ucan_registered(&context_id, &identity.did, &params.ceiling)?;
 
                 // §9.10.4: Send pseudonym announcement to inform other members of
                 // the creator's per-context routing ID. For freshly created
@@ -14882,7 +14924,7 @@ impl Scp {
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
-                );
+                )?;
 
                 // Parse optional filter JSON.
                 let filter: Option<serde_json::Value> =
@@ -15165,7 +15207,7 @@ impl Scp {
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
-                );
+                )?;
 
                 match claim_type {
                     "inclusion" => {
@@ -15459,7 +15501,7 @@ impl Scp {
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
-                );
+                )?;
 
                 // Execute the full 11-step validation pipeline via per-context state.
                 let validation_result = bi
@@ -15502,8 +15544,16 @@ impl Scp {
                     .ok_or_else(|| ScpError::Permission {
                         msg: format!("context '{}' not found in UCAN registry", handle.context_id),
                         code: codes::PERM_3002.to_owned(),
-                    })?;
-                validation_result?;
+                    });
+
+                // Step 9 of the pipeline records the token's nonce, so write
+                // the context's nonce entries to durable storage before
+                // returning. A rejected token keeps its own error: the caller
+                // is already denied, so a durability failure on that path
+                // grants nothing.
+                let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id);
+                validation_result??;
+                persisted?;
 
                 Ok(())
             })
@@ -15620,7 +15670,7 @@ impl Scp {
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
-                );
+                )?;
 
                 // evaluate_ucan takes `&ValidationContext` and is read-only — it
                 // probes the nonce tracker via check_replay but never records,
@@ -15739,7 +15789,7 @@ impl Scp {
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
-                );
+                )?;
 
                 // Execute the full revocation pipeline within the UCAN state closure.
                 bi.with_ucan_state(&handle.context_id, |ucan_state| {
@@ -15767,6 +15817,12 @@ impl Scp {
                     msg: format!("context '{}' not found in UCAN registry", handle.context_id),
                     code: codes::PERM_3006.to_owned(),
                 })??;
+
+                // Make the revocation durable before returning. The in-memory
+                // list already denies the token, so a failure here leaves the
+                // instance in the more restrictive state and tells the caller
+                // the record did not land.
+                bi.persist_ucan_revocation_blocking(&handle.context_id)?;
 
                 Ok(())
             })
@@ -21007,7 +21063,8 @@ mod tests {
 
         // Register UCAN state and append a GovernanceActionExecuted leaf to the
         // per-context event log (the fallback path event_log_query reads).
-        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[])
+            .expect("registering UCAN state must succeed");
         let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
             let payload = scp_event_log::payload::encode_payload(
                 &scp_event_log::payload::GovernanceActionExecutedPayload {
@@ -21059,7 +21116,8 @@ mod tests {
 
         // Register UCAN state and append a RoleAssigned leaf to the per-context
         // event log (the fallback path event_log_query reads).
-        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[]);
+        bi.ensure_ucan_registered(&handle.context_id, &handle.creator_did, &[])
+            .expect("registering UCAN state must succeed");
         let append = bi.with_ucan_state(&handle.context_id, |ucan_state| {
             let payload = scp_event_log::payload::encode_payload(
                 &scp_event_log::payload::RoleAssignedPayload {
@@ -25528,5 +25586,129 @@ mod tests {
                 other => panic!("expected SagaAborted (axis a), got {other:?}"),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable UCAN revocation across a bridge-instance restart
+    // -----------------------------------------------------------------------
+
+    /// Builds an `Scp` over the `SQLCipher` database in `dir`.
+    fn restart_sqlite_scp(dir: &std::path::Path) -> Arc<crate::scp::Scp> {
+        use crate::runtime::{SqliteKeyMaterial, StorageConfig};
+        crate::scp::Scp::with_storage(StorageConfig::Sqlite {
+            path: dir.to_string_lossy().into_owned(),
+            key: SqliteKeyMaterial::Raw {
+                key: vec![0x5au8; 32],
+            },
+        })
+        .expect("opening the SQLCipher database must succeed")
+    }
+
+    /// Builds a handle bound to `scp` for `context_id`, carrying the metadata
+    /// the UCAN entry points read (creator DID and ceiling).
+    fn restart_handle(
+        scp: &crate::scp::Scp,
+        context_id: &str,
+        creator_did: &str,
+    ) -> Arc<ContextHandle> {
+        Arc::new(ContextHandle {
+            context_id: context_id.to_owned(),
+            state: tokio::sync::Mutex::new(ContextState::Active),
+            creator_did: creator_did.to_owned(),
+            #[cfg(feature = "testing")]
+            in_memory_custody: None,
+            callback_custody: None,
+            signing_key: None,
+            ceiling_strings: Vec::new(),
+            outlet_registry: tokio::sync::Mutex::new(
+                scp_core::context::outlets::OutletRegistry::new(),
+            ),
+            outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
+            economic_policy: std::sync::Mutex::new(None),
+            core_context_params: scp_core::context::ContextParams::default(),
+            instance_id: scp.instance_id(),
+        })
+    }
+
+    /// A syntactically valid UCAN issued by the context creator, so
+    /// `BridgeRevocationAuthorizer` authorizes the creator to revoke it.
+    const RESTART_TEST_TOKEN: &str = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
+        eyJpc3MiOiJkaWQ6a2V5OnRlc3QiLCJhdWQiOiJkaWQ6a2V5OnRlc3QyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
+        dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw";
+
+    const RESTART_CREATOR_DID: &str = "did:key:test";
+
+    /// Reads the predicate that step 10 of the ADR-016 validation pipeline
+    /// consults, through the same `RevocationChecker` the pipeline builds.
+    fn restart_checker_reports_revoked(
+        scp: &crate::scp::Scp,
+        context_id: &str,
+        token_cid: &str,
+    ) -> bool {
+        use scp_core::crypto::ucan::validate::RevocationChecker as _;
+        scp.inner
+            .with_ucan_state(context_id, |state| {
+                let checker = scp_ffi_common::BridgeRevocationChecker {
+                    revocation_list: &state.revocation_list,
+                };
+                checker.is_revoked(token_cid)
+            })
+            .expect("the context is registered in the UCAN registry")
+    }
+
+    /// The contract: revoke on instance A through `ucan_revoke`, drop A, build
+    /// instance B over the same database, and the token stays revoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ucan_revocation_survives_a_bridge_instance_restart() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let context_id = format!("ctx-restart-{}", uuid::Uuid::new_v4());
+        let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(RESTART_TEST_TOKEN);
+
+        {
+            let scp_a = restart_sqlite_scp(dir.path());
+            let handle_a = restart_handle(&scp_a, &context_id, RESTART_CREATOR_DID);
+            scp_a
+                .inner
+                .ensure_ucan_registered(&context_id, RESTART_CREATOR_DID, &[])
+                .expect("registering UCAN state must succeed");
+            assert!(
+                !restart_checker_reports_revoked(&scp_a, &context_id, &token_cid),
+                "a fresh context must start with nothing revoked"
+            );
+
+            scp_a
+                .ucan_revoke(
+                    handle_a,
+                    RESTART_TEST_TOKEN.to_owned(),
+                    RESTART_CREATOR_DID.to_owned(),
+                )
+                .await
+                .expect("the context creator may revoke a token it issued");
+            assert!(
+                restart_checker_reports_revoked(&scp_a, &context_id, &token_cid),
+                "the revoking instance must refuse the token immediately"
+            );
+            scp_a.inner.protocol_repository().close();
+        }
+
+        let scp_b = restart_sqlite_scp(dir.path());
+        scp_b
+            .inner
+            .ensure_ucan_registered(&context_id, RESTART_CREATOR_DID, &[])
+            .expect("registering UCAN state must succeed");
+        assert!(
+            restart_checker_reports_revoked(&scp_b, &context_id, &token_cid),
+            "a token revoked before the restart must still be revoked after it"
+        );
+        assert!(
+            !restart_checker_reports_revoked(
+                &scp_b,
+                &context_id,
+                &scp_core::crypto::ucan::revoke::compute_revocation_cid("another-token")
+            ),
+            "hydration must restore only the CIDs that were revoked"
+        );
+        scp_b.inner.protocol_repository().close();
     }
 }

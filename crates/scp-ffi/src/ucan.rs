@@ -309,7 +309,7 @@ impl crate::scp::PyScp {
 
         // Execute the full 11-step validation pipeline within the context runtime.
         // Use production DID resolver when available (#311), fallback to string-only.
-        crate::runtime::with_context(bi, context_id, |rt| {
+        let validated = crate::runtime::with_context(bi, context_id, |rt| {
             let production_resolver = crate::runtime::did_resolver(bi);
             let did_resolver =
                 DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
@@ -337,7 +337,15 @@ impl crate::scp::PyScp {
             };
 
             validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)
-        })?;
+        });
+
+        // Step 9 of the pipeline records the token's nonce, so write the
+        // context's nonce entries to durable storage before returning. A
+        // rejected token keeps its own error: the caller is already denied, so
+        // a durability failure on that path grants nothing.
+        let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id);
+        validated?;
+        persisted?;
 
         Ok(())
     }
@@ -763,6 +771,12 @@ impl crate::scp::PyScp {
             )
             .map_err(ScpPyError::from)
         })?;
+
+        // Make the revocation durable before returning. The in-memory list
+        // already denies the token, so a failure here leaves the instance in
+        // the more restrictive state and tells the caller the record did not
+        // land.
+        crate::runtime::persist_ucan_revocation_blocking(bi, context_id)?;
 
         Ok(())
     }
