@@ -21,6 +21,11 @@ name: SDK Docs
 
 on:
   push:
+    # `main` is included so a merge that breaks rustdoc is caught on the branch
+    # that broke it. Without it this workflow could only ever fail on someone
+    # else's PR: three broken intra-doc links rode `main` undetected for ten
+    # days because the merge itself was never doc-tested.
+    branches: [main]
     tags:
       - "scp-core@*"
   pull_request:
