@@ -1179,9 +1179,9 @@ The dual-layer architecture is designed to be self-reinforcing as the SCP networ
 
 ## 3.11 DID Authentication for External Services (SCPID)
 
-SCP identities can authenticate to services outside the protocol. A relying party — SCP-native or not — can verify that a request comes from the holder of a specific DID without joining a context, understanding MLS, or running SCP infrastructure. The only requirement is the ability to resolve a `did:dht` document (a single DHT lookup) and verify an Ed25519 signature.
+SCP identities can authenticate to services outside the protocol. A relying party — SCP-native or not — can verify that a request comes from the holder of a specific DID without joining a context, understanding MLS, or running SCP infrastructure. The only requirement is the ability to resolve the identity's `#active` or `#agent` verification method — for `#active` a single Mainline lookup plus a did:dht DNS-packet decode, and for `#agent` that lookup followed by a relay QUERY (§3.11.9) and verify an Ed25519 signature.
 
-This is analogous to "Sign in with Ethereum" (EIP-4361) but simpler: no blockchain state, no gas, no wallet abstraction. The DID document is the identity provider, self-certified via BEP44 signatures on the DHT.
+This is analogous to "Sign in with Ethereum" (EIP-4361) but simpler: no blockchain state, no gas, no wallet abstraction. The DID document is the identity provider, self-certified via BEP44 signatures on whichever layer served it (§3.10).
 
 **Relationship to existing DID-auth patterns.** SCP already uses DID-signed requests internally for context reader authentication (§6.2.2B) and handle outlet requests (§22.3.1). SCPID extracts and generalizes this pattern into a standalone protocol that external services can implement without SCP SDK dependencies.
 
@@ -1299,13 +1299,21 @@ The relying party verifies a response:
 4. Check the challenge has not expired: current_time <= expires_at.
    Check signed_at is within the challenge's [issued_at, expires_at] window.
 5. Resolve the DID document:
-   a. Resolve did via DHT (BEP44 lookup) or SCP relay QUERY (§3.10.4).
-   b. Verify the BEP44 signature on the DID document (§9.6.1).
-   c. Cache policy: the DID document MUST be fresh — fetched within the last
-      300 seconds or cached with valid TTL. Stale documents MUST trigger
-      a fresh resolution.
-6. Extract the public key for signing_key_id from the DID document's
-   verificationMethod array.
+   a. Resolve did via Mainline (BEP44 lookup, yielding the bootstrap core)
+      or SCP relay QUERY (yielding the full document) — §3.10.4.
+   b. Verify the BEP44 signature on the record the layer returned (§9.6.1).
+   c. Cache policy: the record MUST be fresh — fetched within the last
+      300 seconds or cached with valid TTL. Stale records MUST trigger
+      a fresh resolution. A Mainline record the resolver marked
+      Staleness::Stale does not satisfy this step (§3.10.4 step 5e).
+6. Extract the public key for signing_key_id from the resolved record's
+   verificationMethod entries. The bootstrap core carries #active and NOT
+   #agent (§18.2.2C), so when signing_key_id names #agent and only Mainline
+   answered, the relying party MUST fetch the full document from a relay in
+   the core's relay list before completing this step. It MUST NOT read the
+   core's silence as evidence that #agent is absent (§3.10.10); if no relay
+   answers, verification fails closed with DID_RESOLUTION_FAILED
+   (SCP-IDENT-1033) rather than KEY_NOT_AUTHORIZED.
 7. Confirm signing_key_id is one of "#active" or "#agent". Reject any
    other value with KEY_NOT_AUTHORIZED.
 8. Confirm signing_key_id is listed in the DID document's "authentication"
@@ -1455,24 +1463,30 @@ pub struct ScpIdAuthentication {
 }
 ```
 
-**Non-SCP relying parties** can implement verification without the SCP SDK. The only dependencies are:
-1. A `did:dht` resolver (BEP44 lookup — libraries exist for most languages).
+**Non-SCP relying parties** can implement verification without the SCP SDK. The dependencies are:
+1. A `did:dht` resolver (BEP44 lookup plus a did:dht DNS-packet decode — the packet is what the method's own resolvers already parse).
 2. SHA-256 (standard, available everywhere).
 3. An Ed25519 signature verifier (PureEdDSA per RFC 8032 §5.1.6).
-4. JSON parsing.
+4. An HTTPS client and a JSON parser, needed only to accept `#agent`-signed responses (§3.11.9 step 1b).
 
-This is intentional. SCPID is designed to be implementable by services that have no other relationship with SCP.
+This is intentional. SCPID is designed to be implementable by services that have no other relationship with SCP. A relying party that accepts `#active` only needs the first three.
 
 ### 3.11.9 Implementation Notes for Non-SCP Relying Parties
 
 A service that wants to accept SCP DID authentication without running SCP software:
 
-1. **DID resolution.** Use any `did:dht` resolver library. The DID document is a BEP44 signed mutable item on Mainline DHT. Libraries: `did-dht` (Rust), `@decentralized-identity/did-dht` (JS), or raw BEP44 lookups via any DHT client. For SCPID verification, DID documents MUST be cached for no more than 300 seconds. The general §3.10.4 caching policy (24h/7d) does NOT apply to SCPID verification — authentication requires current key state.
+1. **DID resolution, in two parts.**
 
-2. **DID document parsing.** The document is W3C DID Core JSON (§18.2.2A). Extract the `verificationMethod` array and `authentication` relationship. Match `signing_key_id` to a verification method, confirm it appears in `authentication`, extract `publicKeyMultibase`. Decoding: strip the `z` prefix (multibase indicator for base58btc), base58btc-decode the remainder to get the raw 32-byte Ed25519 public key.
+   a. *The Mainline lookup gives you the bootstrap core, not the whole document.* Use any `did:dht` resolver library — `did-dht` (Rust), `@decentralized-identity/did-dht` (JS), or raw BEP44 lookups via any DHT client. What the BEP44 value carries is a **bencoded DNS packet compressed per RFC 1035 §4.1.4**, which is what the did:dht method specifies and what its resolver libraries already decode. It is **not** JSON, and a JSON parser applied to it fails. The decoded core carries the identity's `#active` verification method, its pre-rotation commitment and its relay list (§18.2.2C) — enough to verify an `#active`-signed response and nothing more.
+
+   b. *An `#agent`-signed response needs one more fetch.* `#agent` lives on SCP's relay layer, not on Mainline. Take a relay URL from the core's `SCPRelay` entries and QUERY it for the full document, which is canonical JSON (§18.2.2A) and does parse with a JSON parser. **The core's silence about `#agent` is not evidence that the identity has no agent key** — a relying party that treats it that way rejects valid authentications (§3.10.10). If no relay answers, fail the verification rather than concluding anything.
+
+   For SCPID verification, records MUST be cached for no more than 300 seconds. The general §3.10.4 caching policy (24h/7d) does NOT apply to SCPID verification — authentication requires current key state.
+
+2. **Parsing.** The relay-layer document is W3C DID Core JSON (§18.2.2A); the Mainline core is the DNS packet from step 1a, whose `_kN._did.` TXT records carry the verification methods and whose root record's `auth=` field carries the authentication relationship (§18.2.2C). From whichever form you hold, extract the verification methods and the authentication relationship. Match `signing_key_id` to a verification method, confirm it appears in `authentication`, extract `publicKeyMultibase`. Decoding from the JSON form: strip the `z` multibase prefix, base58btc-decode the remainder, then strip the two-byte `0xed01` multicodec header to get the raw 32-byte Ed25519 public key (§18.2.2A). From the DNS form the `k=` field is the unpadded base64url of those 32 bytes directly, with no multibase or multicodec wrapper.
 
 3. **Signature verification.** Reconstruct `signed_bytes` per §3.11.3: concatenate the domain separator `"SCP-DID-AUTH-V1:"`, length-prefixed `did`, length-prefixed `signing_key_id`, raw 32-byte `nonce`, length-prefixed `audience`, and 8-byte big-endian `signed_at`. Compute SHA-256 of the concatenation. Verify the Ed25519 signature (PureEdDSA, RFC 8032 §5.1.6) over the resulting 32-byte hash. Standard libraries: `ring`, `ed25519-dalek` (Rust), `tweetnacl` (JS), `pynacl` (Python), `Crypto.Sign` (Swift).
 
 4. **Nonce management.** Store issued nonces with their `expires_at`. Reject duplicates. Prune expired entries. For distributed deployments, use a strongly-consistent store or HMAC-based nonce generation (§3.11.6).
 
-No SCP SDK, no MLS, no context management, no relay connections. The entire verification path is: one DHT lookup + one JSON parse + one SHA-256 + one Ed25519 verify.
+No SCP SDK, no MLS, no context management. For an `#active`-signed response the entire verification path is: one Mainline lookup + one did:dht DNS-packet decode + one SHA-256 + one Ed25519 verify. An `#agent`-signed response adds one relay QUERY and one JSON parse.
