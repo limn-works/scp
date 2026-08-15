@@ -3393,20 +3393,38 @@ fn executor_error_to_terminal_payload(err: &OutletExecutorError) -> ChunkPayload
 /// first-hop, freshly-generated, best-effort (zero-escrow) stream output —
 /// NOT a fabricated stand-in. In particular `memory_scope` is threaded
 /// through from the hosting `ContextHandle::params()` so it reflects the
-/// context's REAL retention policy (`Ephemeral` / `Summary` / `Full`). The
-/// prior implementation hardcoded `MemoryScope::Full`, which — because the
-/// End chunk is operator-signed under `SCP-OUTLET-CHUNK-SIG-V1:` — shipped a
-/// cryptographically-attested FALSE claim that an ephemeral stream's output
-/// was permanently retainable (the §5 / §7.7 "Moltbook" memory-scope signal
-/// inverted). The absence of a fabricated over-claim is the whole point: a
-/// consumer that later re-introduces this data carries the honest scope.
+/// context's REAL retention policy (`Ephemeral` / `Summary` / `Full`).
+/// §7.7.1 of the trust spec defines `memoryScope` as "what memory scope the
+/// source context had", and §24.3.1 of the provenance spec populates it from
+/// "the source context's memory scope setting". The prior implementation
+/// hardcoded `MemoryScope::Full`, which — because the End chunk is
+/// operator-signed under `SCP-OUTLET-CHUNK-SIG-V1:` — attested under the
+/// operator's key that an ephemeral stream's output was permanently
+/// retainable. A consumer that later re-introduces this data now carries the
+/// scope the context actually declared.
 ///
 /// The remaining fields are the honest structural facts this layer knows:
 /// - `source_context` — the hosting context id (real).
-/// - `source_type` — `Persistent`: the context is `Active` (verified at open
-///   in [`invoke_outlet`], and `End` is emitted only on successful executor
-///   completion), i.e. "still open and verifiable" per
-///   [`SourceType::Persistent`](scp_protocol::provenance::SourceType::Persistent).
+/// - `source_type` — `Persistent`, and deliberately NOT derived from
+///   `memory_scope`. §7.7.1 of the trust spec governs both fields and
+///   separates them in one note: "`sourceType` describes the current
+///   availability of the source data, not the context's creation-time memory
+///   scope setting", and it states the deciding question as "can the source
+///   data be independently verified right now?". [`invoke_outlet`] rejects
+///   the open unless `context.state()` is `ContextState::Active`, so while a
+///   stream runs the hosting context is open and its event log is readable —
+///   the source data is verifiable right now whether the context declared
+///   `Ephemeral`, `Summary`, or `Full` retention. The protocol layer already
+///   encodes exactly that rule:
+///   [`update_source_type`](scp_protocol::provenance::evaluate::update_source_type)
+///   maps `SourceContextState::Active` to
+///   [`SourceType::Persistent`](scp_protocol::provenance::SourceType::Persistent)
+///   for every context, and
+///   [`evaluate_quality`](scp_protocol::provenance::evaluate::evaluate_quality) treats
+///   an `Active` context bearing any other `source_type` as an inconsistent
+///   record and degrades its tier. Stamping `Ephemeral` here to mirror an
+///   ephemeral `memory_scope` would therefore trip that degradation on a
+///   stream whose source is open and verifiable.
 /// - `counterparties` — empty (cross-context-safe redacted default). The
 ///   operator-signed terminal `End` chunk is forwarded VERBATIM across the
 ///   cross-context streaming bridge (`run_cross_context_bridge` calls
@@ -3454,6 +3472,212 @@ fn stream_output_provenance(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Receiver-visible stream fault (§5.4.5 fail-closed signing)
+// ---------------------------------------------------------------------------
+
+/// Why an outlet stream ended without delivering a terminal chunk.
+///
+/// A streaming [`invoke_outlet`] channel carries [`OutletStreamItem`], so a
+/// receiver draining it distinguishes three outcomes without inspecting any
+/// chunk's contents: `Some(Ok(chunk))` is a signed chunk, `Some(Err(fault))`
+/// is this typed fault, and `None` after a terminal chunk is a completed
+/// stream. Before this type existed the pump answered a signing failure by
+/// dropping its sender, so a receiver read a signing failure and a completed
+/// stream as the same event — the channel closing.
+///
+/// A fault never carries a chunk and never crosses the §5.4.5 wire: it is an
+/// in-process control value the runtime hands its own caller, so it cannot be
+/// forwarded, re-signed, or mistaken for operator-attested output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamFault {
+    /// The operator signer produced no signature for a chunk, and produced
+    /// none for the terminal `ChunkPayload::Error` the pump then attempted,
+    /// so the pump emitted neither and the stream carries no terminal chunk.
+    ///
+    /// Both fields record a distinct signing attempt that the operator's
+    /// signer refused. The pump never substitutes an all-zero signature for
+    /// either one.
+    Unsigned {
+        /// The signer's error on the chunk that stopped the stream — an
+        /// executor payload, or the framework's own `End` / `Error` terminal.
+        stream: StreamSignerError,
+        /// The signer's error on the terminal `ChunkPayload::Error` the pump
+        /// attempted next in order to report `stream` to the receiver under a
+        /// valid signature.
+        terminal: StreamSignerError,
+    },
+}
+
+impl core::fmt::Display for StreamFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unsigned { stream, terminal } => write!(
+                f,
+                "outlet stream ended with no terminal chunk: the operator signer refused the \
+                 stream chunk ({stream}) and refused the terminal error chunk ({terminal})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StreamFault {}
+
+/// One item a streaming [`invoke_outlet`] receiver observes: a signed
+/// [`OutletStreamChunk`], or the [`StreamFault`] that ended the stream.
+///
+/// The `Err` arm is the last item the channel yields — the pump sends it and
+/// returns, so the receiver reads it and then reads `None`.
+pub type OutletStreamItem = Result<OutletStreamChunk, StreamFault>;
+
+/// Human message the pump writes into the terminal `ChunkPayload::Error` it
+/// emits after refusing to sign a chunk.
+///
+/// The text is a compile-time constant. The signer's own error text —
+/// [`StreamSignerError::Jcs`] carries a canonicalization message derived from
+/// the executor's payload — reaches `tracing` only, never this signed,
+/// verbatim-forwarded chunk, so no payload-derived bytes cross the context
+/// boundary the terminal chunk is forwarded across (§9.10 metadata privacy).
+const SIGNING_FAULT_TERMINAL_MESSAGE: &str =
+    "operator produced no per-chunk stream signature; the stream closed without further chunks";
+
+/// The §5.4.4 `message` cap applies to this constant like any other operator
+/// message, so a future edit that lengthens it fails the build instead of
+/// producing an over-long terminal chunk at run time.
+const _: () = assert!(SIGNING_FAULT_TERMINAL_MESSAGE.len() <= MESSAGE_MAX_BYTES);
+
+/// Builds the terminal `ChunkPayload::Error` the pump closes a stream with
+/// after it refused to sign a chunk.
+///
+/// The payload is three constant scalars — an `SCP-OUTLET-NNNN` code, a fixed
+/// message, and `terminal: true` — so it canonicalizes under RFC 8785
+/// whatever payload the refused chunk carried.
+///
+/// The code is [`CODE_EXECUTION_FAULT`] (`SCP-OUTLET-6130`, the §5.4.4
+/// Execution class): the operator's own execution of the stream failed, which
+/// is the class §5.4.4 assigns to an operator-side fault. This matches the
+/// code [`StreamTerminalSummary::default`] already records for a stream that
+/// ends without a terminal chunk, so the chunk a receiver holds and the
+/// `stream_terminal_status` the §5.4.5 event records name the same condition.
+/// The alternative codes name conditions that did not occur: `SCP-OUTLET-6160`
+/// (Transport) describes a relay or bridge failure, which is how the
+/// cross-context bridge classifies a *vanished upstream* it cannot see the
+/// cause of, and asserting it from the operator's own pump would record a
+/// transport failure that never happened.
+fn signing_fault_terminal_payload() -> ChunkPayload {
+    ChunkPayload::Error {
+        code: CODE_EXECUTION_FAULT.to_owned(),
+        message: SIGNING_FAULT_TERMINAL_MESSAGE.to_owned(),
+        terminal: true,
+    }
+}
+
+/// Produces the signed terminal chunk a stream closes with, falling back to
+/// the constant fault terminal when the preferred terminal cannot be signed.
+///
+/// **What this decides:** whether the operator's signer can still produce a
+/// signature. It decides that by asking the signer to sign the fault terminal
+/// and reading the answer — never by inferring the signer's health from which
+/// [`StreamSignerError`] variant the previous refusal carried. A
+/// [`StreamSignerError::Jcs`] refusal indicates a payload that failed RFC 8785
+/// canonicalization while the signer stayed healthy, and a
+/// [`StreamSignerError::Custody`] refusal indicates a custody-side fault, but
+/// those are indicators: a custody backend that refused one chunk may sign the
+/// next (a transient [`StreamSignerCustodyCategory::BackendFault`](crate::context::outlets::signer::StreamSignerCustodyCategory::BackendFault)),
+/// and a receiver that would have gotten a signed terminal must not lose it to
+/// a variant match. The attempt is the test.
+///
+/// `pending` is `Some` when an earlier chunk already failed to sign. In that
+/// case `preferred` is skipped and the fault terminal is attempted directly,
+/// so the pump makes at most two signing attempts per stream close and each
+/// [`StreamFault::Unsigned`] field records a distinct refused attempt.
+///
+/// # Errors
+///
+/// Returns [`StreamFault::Unsigned`] when the signer refuses the fault
+/// terminal as well. The caller then hands that fault to the receiver as the
+/// channel's last item.
+async fn sign_terminal_or_fault(
+    signing_ctx: &InnerPumpSigningContext,
+    request_id: RequestId,
+    sequence: &mut u64,
+    pending: Option<StreamSignerError>,
+    preferred: ChunkPayload,
+) -> Result<OutletStreamChunk, StreamFault> {
+    let stream = match pending {
+        None => match wrap_chunk(signing_ctx, request_id, sequence, preferred).await {
+            Ok(chunk) => return Ok(chunk),
+            Err(e) => {
+                tracing::error!(
+                    request_id = %hex::encode(request_id),
+                    outlet_id = %signing_ctx.outlet_id,
+                    context_id = %signing_ctx.context_id,
+                    sequence = *sequence,
+                    error = %e,
+                    "invoke pump: terminal chunk signing refused — attempting the constant fault terminal"
+                );
+                e
+            }
+        },
+        Some(e) => e,
+    };
+    match wrap_chunk(
+        signing_ctx,
+        request_id,
+        sequence,
+        signing_fault_terminal_payload(),
+    )
+    .await
+    {
+        Ok(chunk) => Ok(chunk),
+        Err(terminal) => Err(StreamFault::Unsigned { stream, terminal }),
+    }
+}
+
+/// Why [`run_streaming_executor_task`] stopped, named so the spawning task
+/// records one close reason per stream instead of scattering a log call at
+/// each exit.
+#[derive(Debug)]
+enum StreamClose {
+    /// A signed terminal chunk reached the receiver and the §5.4.5
+    /// `OutletInvokedEvent` was recorded.
+    TerminalDelivered,
+    /// The receiver dropped its half of the channel before a terminal chunk
+    /// landed, so no terminal was delivered and no event was recorded.
+    ReceiverDropped,
+    /// The operator signer refused both a stream chunk and the terminal error
+    /// chunk, so the pump handed the receiver the typed fault instead.
+    Unsigned(StreamFault),
+}
+
+impl StreamClose {
+    /// Writes one `tracing` record for this close reason, at the task
+    /// boundary.
+    ///
+    /// A signer refusal is an operator-actionable fault, so it logs at `error`.
+    /// A dropped receiver is caller behaviour the runtime cannot influence, so
+    /// it logs at `debug`. A delivered terminal is the ordinary close and logs
+    /// nothing.
+    fn log(&self, request_id: RequestId, outlet_id: &str, context_id: &str) {
+        match self {
+            Self::TerminalDelivered => {}
+            Self::ReceiverDropped => tracing::debug!(
+                request_id = %hex::encode(request_id),
+                outlet_id,
+                context_id,
+                "invoke pump: receiver dropped before a terminal chunk landed — no §5.4.5 event recorded"
+            ),
+            Self::Unsigned(fault) => tracing::error!(
+                request_id = %hex::encode(request_id),
+                outlet_id,
+                context_id,
+                error = %fault,
+                "invoke pump: stream closed with no terminal chunk — receiver was handed the typed StreamFault"
+            ),
+        }
+    }
+}
+
 /// Wraps an inner `ChunkPayload` produced by the executor (or by the
 /// framework's terminal-emission path) into a fully-formed
 /// [`OutletStreamChunk`] with the next monotonic sequence number for
@@ -3462,12 +3686,12 @@ fn stream_output_provenance(
 /// Signs the chunk under the §5.4.5 `SCP-OUTLET-CHUNK-SIG-V1:` preimage
 /// with the pinned operator signer. Returns `Err(StreamSignerError)` when
 /// signing fails (JCS canonicalization of the payload, or a custody-side
-/// signer fault) — the caller then FAILS CLOSED (logs + stops the pump
-/// without emitting) rather than shipping a chunk bearing a forged all-zero
-/// signature.
+/// signer fault) — the caller then routes the stream through
+/// [`sign_terminal_or_fault`] rather than shipping a chunk bearing a forged
+/// all-zero signature.
 ///
-/// The protection this fail-closed path provides is **emit-side**, not a
-/// receiver backstop: the operator pump simply never puts a chunk bearing a
+/// The protection this refusal provides is **emit-side**, not a receiver
+/// backstop: the operator pump simply never puts a chunk bearing a
 /// `[0u8; 64]` sig on the wire. A downstream per-chunk check is NOT a reliable
 /// second line — the shipped SDK drain (SCP-OUT-045) does not verify per-chunk
 /// operator signatures, and the cross-context bridge deliberately ACCEPTS
@@ -3476,7 +3700,8 @@ fn stream_output_provenance(
 /// could bill chunks against under a signature no operator ever produced.
 /// Refusing to emit it at this boundary is the guarantee. The sequence cursor
 /// is only advanced when a signed chunk is actually produced, so a signing
-/// failure never burns a sequence number.
+/// failure never burns a sequence number — the terminal chunk the pump emits
+/// next takes the slot the refused chunk would have used.
 async fn wrap_chunk(
     signing_ctx: &InnerPumpSigningContext,
     request_id: RequestId,
@@ -3615,11 +3840,35 @@ pub type CaveatPostInputCheck<'a> = Box<
 
 /// Streaming entry point for outlet invocation (SCP-OUT-033).
 ///
-/// Returns a `mpsc::Receiver<OutletStreamChunk>` that yields the chunks
+/// Returns a `mpsc::Receiver<OutletStreamItem>` that yields the chunks
 /// produced by the executor (`Data` / `Progress`), terminated by a
 /// single terminal chunk (`End` on success, `Error { terminal: true }`
 /// on failure). The framework spawns a tokio task that drives the
 /// executor and pumps chunks into the channel.
+///
+/// # Reading the channel
+///
+/// Each item is an [`OutletStreamItem`], so the receiver reads three
+/// outcomes apart:
+///
+/// - `Some(Ok(chunk))` — one signed chunk. `chunk.payload.is_terminal()`
+///   marks the last one.
+/// - `Some(Err(fault))` — the [`StreamFault`] that ended the stream. The
+///   pump could not sign a chunk and could not sign a terminal error chunk
+///   to report that, so it emitted neither and handed over this value
+///   instead. It is always the channel's last item.
+/// - `None` — the channel closed. After a terminal chunk this is a
+///   completed stream; without one the receiver dropped its own half, so
+///   nothing was left to deliver.
+///
+/// ```ignore
+/// while let Some(item) = rx.recv().await {
+///     match item {
+///         Ok(chunk) => handle(chunk),
+///         Err(fault) => return Err(fault),
+///     }
+/// }
+/// ```
 ///
 /// This is the streaming counterpart of the unary
 /// [`invoke_outlet_aggregating`] (best-effort *outlet stream* mode per
@@ -3681,7 +3930,7 @@ pub async fn invoke_outlet<E>(
     // the per-chunk-signature preimage. `[0u8; 32]` for legacy / test
     // callers; production paths supply the real binding.
     caveats_binding: [u8; 32],
-) -> Result<mpsc::Receiver<OutletStreamChunk>, InvocationError>
+) -> Result<mpsc::Receiver<OutletStreamItem>, InvocationError>
 where
     E: OutletExecutor + ?Sized + 'static,
 {
@@ -3716,7 +3965,7 @@ where
     // Open the stream. The channel capacity matches the §5.4.5
     // `credit_window` default (32). When the buffer fills, the executor
     // back-pressures until a downstream consumer drains a slot.
-    let (chunk_tx, chunk_rx) = mpsc::channel::<OutletStreamChunk>(DEFAULT_STREAM_CHANNEL_CAPACITY);
+    let (chunk_tx, chunk_rx) = mpsc::channel::<OutletStreamItem>(DEFAULT_STREAM_CHANNEL_CAPACITY);
     let (payload_tx, payload_rx) = mpsc::channel::<ChunkPayload>(DEFAULT_STREAM_CHANNEL_CAPACITY);
 
     let request_id = fresh_request_id();
@@ -3772,7 +4021,18 @@ where
         signing_ctx,
         memory_scope,
     };
-    tokio::spawn(run_streaming_executor_task(task_inputs));
+    // The task consumes `task_inputs`, so clone the two identifiers the close
+    // record names before the move. `StreamClose::log` is the one place a
+    // stream's close reason is written.
+    let close_outlet_id = task_inputs.outlet_id.clone();
+    let close_context_id = task_inputs.context_id.clone();
+    tokio::spawn(async move {
+        run_streaming_executor_task(task_inputs).await.log(
+            request_id,
+            &close_outlet_id,
+            &close_context_id,
+        );
+    });
 
     Ok(chunk_rx)
 }
@@ -3806,7 +4066,7 @@ struct StreamingTaskInputs<E: ?Sized> {
     /// `OutletInvokedEvent` at stream close. `None` disables emission
     /// entirely (legacy callers who don't append events to the log).
     invoked_event_sink: Option<std::sync::Arc<dyn OutletInvokedEventSink>>,
-    chunk_tx: mpsc::Sender<OutletStreamChunk>,
+    chunk_tx: mpsc::Sender<OutletStreamItem>,
     payload_tx: mpsc::Sender<ChunkPayload>,
     payload_rx: mpsc::Receiver<ChunkPayload>,
     timeout_duration: Duration,
@@ -3832,11 +4092,17 @@ struct StreamingTaskInputs<E: ?Sized> {
 /// the `clippy::too_many_lines` ceiling. The task runs on the tokio
 /// runtime; when it finishes, the chunk channel closes and the
 /// receiver returned to the caller observes EOS.
+///
+/// The returned [`StreamClose`] names which of the three exits the stream
+/// took, so the spawning task records one close reason per stream. Every
+/// exit that leaves the receiver without a terminal chunk first sends the
+/// receiver either a signed terminal `ChunkPayload::Error` or the typed
+/// [`StreamFault`] — the channel never closes silently on a signing refusal.
 #[allow(
     clippy::too_many_lines,
     reason = "single linear drive→pump→terminal→emit sequence; splitting further would thread the frontier/terminal-summary/signing-ctx state across seams for no clarity gain"
 )]
-async fn run_streaming_executor_task<E>(inputs: StreamingTaskInputs<E>)
+async fn run_streaming_executor_task<E>(inputs: StreamingTaskInputs<E>) -> StreamClose
 where
     E: OutletExecutor + ?Sized + 'static,
 {
@@ -3914,60 +4180,61 @@ where
     )
     .await;
 
-    if pump_outcome.signing_failed {
-        // A chunk failed to sign inside the pump. We FAIL CLOSED: a chunk can
-        // only cross the wire bearing a valid `SCP-OUTLET-CHUNK-SIG-V1:`
-        // signature, and we will not substitute an all-zero forgery. The
-        // pump already logged the signer error; no terminal chunk is emitted
-        // (a terminal `Error` would itself need signing under the same signer
-        // that just failed), and the §5.4.5 event is skipped because no
-        // terminal was delivered. This is the sibling dispatch pump's
-        // "break-without-emitting" contract (dispatch.rs
-        // `try_build_signed_chunk` → `None`). See `pump_payload_stream_capture`.
-        return;
-    }
-
     if !pump_outcome.chunk_tx_alive {
         // Receiver dropped mid-stream; no terminal chunk is emitted.
         // The §5.4.5 event-log shape says one event per stream, but
         // the contract is "after terminal chunk is delivered to the
         // receiver" — when the receiver disconnects there is no
         // delivery. Skip emission to keep the audit log honest.
-        return;
+        return StreamClose::ReceiverDropped;
     }
+
+    // A chunk the pump refused to sign. The pump logged the refusal and left
+    // `sequence` unadvanced; the terminal chunk below reports the refusal to
+    // the receiver, under a signature when the signer can still produce one
+    // and as a typed `StreamFault` when it cannot.
+    let mut pending_fault = pump_outcome.signing_fault;
 
     // After exiting the pump, drain any payloads the executor already
     // pushed but the pump did not yet observe. Guards against the race
-    // where the executor finished simultaneously with the deadline.
-    if !pump_outcome.timed_out {
+    // where the executor finished simultaneously with the deadline. A
+    // pending signing refusal skips the drain: the stream is already
+    // closing, and a chunk emitted after a refused one would leave the
+    // receiver a sequence whose gap it cannot account for.
+    if pending_fault.is_none() && !pump_outcome.timed_out {
         while let Ok(payload) = payload_rx.try_recv() {
             let chunk = match wrap_chunk(&signing_ctx, request_id, &mut sequence, payload).await {
                 Ok(chunk) => chunk,
                 Err(e) => {
-                    // Fail closed: cannot sign this late-drain chunk, so do
-                    // not emit it (or any terminal, which would need the same
-                    // signer). No forged all-zero sig ever reaches the wire.
                     tracing::error!(
                         request_id = %hex::encode(request_id),
                         outlet_id = %outlet_id_for_emit,
                         context_id = %context_id,
+                        sequence,
                         error = %e,
-                        "invoke pump: late-drain chunk signing failed — failing closed without emitting"
+                        "invoke pump: late-drain chunk signing refused — closing the stream on a terminal error chunk"
                     );
-                    return;
+                    pending_fault = Some(e);
+                    break;
                 }
             };
             ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
-            if chunk_tx.send(chunk).await.is_err() {
+            if chunk_tx.send(Ok(chunk)).await.is_err() {
                 // Receiver dropped during late drain; same rationale
                 // as above — skip the event-log emission.
-                return;
+                return StreamClose::ReceiverDropped;
             }
         }
     }
 
-    // Emit the terminal chunk based on the executor outcome / timeout
-    // / panic.
+    // Build the terminal chunk this stream would close with absent any
+    // signing refusal. This runs even when `pending_fault` is set, because
+    // it also records a recovered handler panic to `handler_panic_sink` —
+    // an operator-attributable behavioural record that a later signing
+    // refusal does not undo. `sign_terminal_or_fault` then drops the payload
+    // when a refusal is pending: the receiver's most useful fact is that a
+    // chunk was dropped without a signature, and the panic sink plus the
+    // pump's log already hold the executor's own outcome.
     let terminal_payload = build_terminal_chunk(BuildTerminalChunkInputs {
         timed_out: pump_outcome.timed_out,
         executor_outcome: pump_outcome.executor_outcome,
@@ -3979,34 +4246,34 @@ where
         memory_scope,
     });
 
-    let terminal_chunk =
-        match wrap_chunk(&signing_ctx, request_id, &mut sequence, terminal_payload).await {
-            Ok(chunk) => chunk,
-            Err(e) => {
-                // Fail closed: the terminal chunk itself could not be signed.
-                // Emitting it with an all-zero sig would ship a forged
-                // attestation. The guarantee is EMIT-SIDE — we never put the
-                // forged sig on the wire — NOT a receiver backstop (the SDK
-                // drain does not verify per-chunk sigs, and the bridge accepts
-                // all-zero fault terminals by design, §5.4.5). No terminal is
-                // delivered and the event is skipped.
-                tracing::error!(
-                    request_id = %hex::encode(request_id),
-                    outlet_id = %outlet_id_for_emit,
-                    context_id = %context_id,
-                    error = %e,
-                    "invoke pump: terminal chunk signing failed — failing closed without emitting"
-                );
-                return;
-            }
-        };
+    let terminal_chunk = match sign_terminal_or_fault(
+        &signing_ctx,
+        request_id,
+        &mut sequence,
+        pending_fault,
+        terminal_payload,
+    )
+    .await
+    {
+        Ok(chunk) => chunk,
+        Err(fault) => {
+            // The signer refused the terminal error chunk too, so no signed
+            // chunk can report the close. The receiver learns the stream ended
+            // abnormally from this typed value — never from an unsigned chunk,
+            // and never from a silent channel close. `send` failing here means
+            // the receiver already dropped, and the close reason is still the
+            // signer refusal, so it is reported either way.
+            let _ = chunk_tx.send(Err(fault.clone())).await;
+            return StreamClose::Unsigned(fault);
+        }
+    };
     ingest_stream_chunk(&mut frontier, &mut terminal_summary, &terminal_chunk);
-    let delivered = chunk_tx.send(terminal_chunk).await.is_ok();
+    let delivered = chunk_tx.send(Ok(terminal_chunk)).await.is_ok();
 
     if !delivered {
         // Receiver dropped before the terminal chunk landed — same
         // rationale as the early-exit branch above.
-        return;
+        return StreamClose::ReceiverDropped;
     }
 
     // SCP-OUT-035 §5.4.5: emit ONE OutletInvokedEvent at stream close,
@@ -4032,6 +4299,8 @@ where
         );
         sink.record(event);
     }
+
+    StreamClose::TerminalDelivered
 }
 
 /// Builds the §5.4.5 `OutletInvokedEvent` from a complete recorded
@@ -4211,7 +4480,7 @@ pub(crate) fn build_streaming_outlet_event(
 #[allow(clippy::too_many_arguments)] // signing_ctx is the wire-signing addition; bundling it would require a wrapper struct that obscures the small parameter set.
 async fn pump_payload_stream_capture<F>(
     payload_rx: &mut mpsc::Receiver<ChunkPayload>,
-    chunk_tx: &mpsc::Sender<OutletStreamChunk>,
+    chunk_tx: &mpsc::Sender<OutletStreamItem>,
     sequence: &mut u64,
     request_id: RequestId,
     executor_future: std::pin::Pin<&mut F>,
@@ -4231,7 +4500,7 @@ where
     > = None;
     let mut timed_out = false;
     let mut chunk_tx_alive = true;
-    let mut signing_failed = false;
+    let mut signing_fault: Option<StreamSignerError> = None;
 
     loop {
         tokio::select! {
@@ -4247,25 +4516,28 @@ where
                         let chunk = match wrap_chunk(signing_ctx, request_id, sequence, payload).await {
                             Ok(chunk) => chunk,
                             Err(e) => {
-                                // Fail closed: this chunk could not be signed.
-                                // Never emit an all-zero (forged) signature —
-                                // stop the pump and let the caller skip the
-                                // terminal emission. `sequence` was NOT advanced
-                                // (wrap_chunk only advances on a successful sign).
+                                // The signer refused this chunk. Never emit an
+                                // all-zero (forged) signature — stop the pump and
+                                // hand the refusal to the caller, which closes the
+                                // stream on a terminal error chunk. `sequence` was
+                                // NOT advanced (wrap_chunk only advances on a
+                                // successful sign), so that terminal takes this
+                                // chunk's slot and the receiver reads a contiguous
+                                // sequence.
                                 tracing::error!(
                                     request_id = %hex::encode(request_id),
                                     outlet_id = %signing_ctx.outlet_id,
                                     context_id = %signing_ctx.context_id,
                                     sequence = *sequence,
                                     error = %e,
-                                    "invoke pump: chunk signing failed — failing closed, pump stops without emitting an unsigned chunk"
+                                    "invoke pump: chunk signing refused — pump stops without emitting an unsigned chunk"
                                 );
-                                signing_failed = true;
+                                signing_fault = Some(e);
                                 break;
                             }
                         };
                         ingest_stream_chunk(frontier, terminal, &chunk);
-                        if chunk_tx.send(chunk).await.is_err() {
+                        if chunk_tx.send(Ok(chunk)).await.is_err() {
                             chunk_tx_alive = false;
                             break;
                         }
@@ -4289,7 +4561,7 @@ where
         timed_out,
         chunk_tx_alive,
         executor_outcome,
-        signing_failed,
+        signing_fault,
     }
 }
 
@@ -4390,10 +4662,11 @@ struct PumpOutcome {
     /// `Some(Err(payload))` for a recovered panic.
     executor_outcome:
         Option<Result<Result<(), OutletExecutorError>, Box<dyn std::any::Any + Send>>>,
-    /// `true` when a chunk failed to sign inside the pump. The caller fails
-    /// closed (skips terminal emission + event) rather than shipping a chunk
-    /// with a forged all-zero signature.
-    signing_failed: bool,
+    /// The signer's error on a chunk the pump refused to emit unsigned.
+    /// `None` when every chunk the pump handled was signed. The caller closes
+    /// the stream on a terminal error chunk carrying this refusal rather than
+    /// shipping a chunk with a forged all-zero signature.
+    signing_fault: Option<StreamSignerError>,
 }
 
 /// Inputs for [`build_terminal_chunk`] — the framework's terminal
@@ -7160,23 +7433,62 @@ mod tests {
     // `invoke_outlet<E>` machinery ported in chunk 2a.
     // =======================================================================
 
-    /// Drains a `mpsc::Receiver<OutletStreamChunk>` into a `Vec` until
-    /// EOS, asserting that sequence numbers are strictly monotonic
-    /// starting at `0` (PRD AC4).
-    async fn drain_stream_with_sequence_invariant(
-        mut rx: tokio::sync::mpsc::Receiver<OutletStreamChunk>,
-    ) -> Vec<OutletStreamChunk> {
+    /// Everything a receiver observed after draining a streaming
+    /// [`invoke_outlet`](super::invoke_outlet) channel to EOS.
+    #[derive(Debug)]
+    struct DrainedStream {
+        /// Every signed chunk the pump delivered, in emission order.
+        chunks: Vec<OutletStreamChunk>,
+        /// The typed fault the pump delivered as the channel's last item.
+        /// `None` when the channel closed without one.
+        fault: Option<StreamFault>,
+    }
+
+    /// Drains a streaming `invoke_outlet` receiver to EOS, recording both the
+    /// signed chunks and the terminating [`StreamFault`] if one arrived.
+    ///
+    /// Asserts the two invariants a receiver relies on: chunk sequence numbers
+    /// are strictly monotonic from `0` (PRD AC4), and a fault is the channel's
+    /// last item (nothing follows it).
+    async fn drain_stream_items(
+        mut rx: tokio::sync::mpsc::Receiver<OutletStreamItem>,
+    ) -> DrainedStream {
         let mut chunks = Vec::new();
+        let mut fault = None;
         let mut expected_seq: u64 = 0;
-        while let Some(chunk) = rx.recv().await {
-            assert_eq!(
-                chunk.sequence, expected_seq,
-                "sequence must be strictly monotonic per request_id (PRD AC4)"
+        while let Some(item) = rx.recv().await {
+            assert!(
+                fault.is_none(),
+                "a StreamFault must be the channel's last item; got {item:?} after it"
             );
-            expected_seq = expected_seq.saturating_add(1);
-            chunks.push(chunk);
+            match item {
+                Ok(chunk) => {
+                    assert_eq!(
+                        chunk.sequence, expected_seq,
+                        "sequence must be strictly monotonic per request_id (PRD AC4)"
+                    );
+                    expected_seq = expected_seq.saturating_add(1);
+                    chunks.push(chunk);
+                }
+                Err(f) => fault = Some(f),
+            }
         }
-        chunks
+        DrainedStream { chunks, fault }
+    }
+
+    /// Drains a streaming `invoke_outlet` receiver that is expected to run to a
+    /// terminal chunk, returning its chunks. Fails the test when the pump
+    /// delivered a [`StreamFault`] instead.
+    async fn drain_stream_with_sequence_invariant(
+        rx: tokio::sync::mpsc::Receiver<OutletStreamItem>,
+    ) -> Vec<OutletStreamChunk> {
+        let drained = drain_stream_items(rx).await;
+        assert!(
+            drained.fault.is_none(),
+            "stream must reach a terminal chunk, not a signing fault; got {:?}",
+            drained.fault
+        );
+        drained.chunks
     }
 
     /// A [`HandlerPanicSink`] that forwards each event over an unbounded
@@ -7329,6 +7641,22 @@ mod tests {
             );
             // The honest source context is the hosting context.
             assert_eq!(end.source_context, context.context_id());
+            // §7.7.1 separates `source_type` from `memory_scope` in the note
+            // that governs both: `sourceType` answers "can the source data be
+            // independently verified right now?", not what retention the
+            // context declared at creation. `invoke_outlet` rejects a
+            // non-`Active` open, so the hosting context is open and its data
+            // is verifiable for every scope — which is the same mapping
+            // `scp_protocol::provenance::evaluate::update_source_type` applies
+            // to `SourceContextState::Active`. Stamping `Ephemeral` to mirror
+            // an ephemeral `memory_scope` would make
+            // `evaluate_quality(.., Active)` read the record as inconsistent
+            // and degrade its tier.
+            assert_eq!(
+                end.source_type,
+                scp_protocol::provenance::SourceType::Persistent,
+                "source_type tracks the source's current verifiability (the context is Active), not memory_scope ({scope})"
+            );
             // First-hop, in-context, unpaid: no fabricated chain / payment.
             assert_eq!(end.chain_depth, 0);
             assert!(end.chain_path.is_none());
@@ -7380,12 +7708,13 @@ mod tests {
         }
     }
 
-    /// Item 1 (fail-closed signing): when the operator signer fails, the pump
-    /// MUST NOT ship a chunk bearing the all-zero forged signature. It fails
-    /// closed — no chunk (data or terminal) is emitted, so the receiver
-    /// observes a clean end-of-stream with zero forged chunks on the wire.
+    /// Item 1 (fail-closed signing): when the operator signer refuses every
+    /// chunk, the pump MUST NOT ship a chunk bearing the all-zero forged
+    /// signature, and the receiver MUST be able to tell that refusal from a
+    /// completed stream. No chunk is emitted, and the channel's last item is
+    /// the typed [`StreamFault::Unsigned`] carrying both refused attempts.
     #[tokio::test]
-    async fn streaming_signer_failure_fails_closed_no_forged_chunk() {
+    async fn streaming_signer_failure_delivers_typed_fault_and_no_forged_chunk() {
         struct ThreeDataExecutor;
         #[async_trait::async_trait]
         impl super::OutletExecutor for ThreeDataExecutor {
@@ -7434,16 +7763,104 @@ mod tests {
         .await
         .expect("open succeeds; the signing failure surfaces during the pump");
 
-        let chunks = drain_stream_with_sequence_invariant(rx).await;
-        // Fail-closed: no forged all-zero-signature chunk ever reaches the
-        // wire. With every sign failing, the pump emits nothing at all.
+        let drained = drain_stream_items(rx).await;
+        // No forged all-zero-signature chunk ever reaches the wire. With every
+        // signing attempt refused, the pump emits no chunk at all.
         assert!(
-            chunks.iter().all(|c| c.sig != [0u8; 64]),
-            "no emitted chunk may carry the all-zero forged signature; got {chunks:?}"
+            drained.chunks.iter().all(|c| c.sig != [0u8; 64]),
+            "no emitted chunk may carry the all-zero forged signature; got {:?}",
+            drained.chunks
         );
         assert!(
-            chunks.is_empty(),
-            "a total signer failure emits zero chunks (fail closed); got {chunks:?}"
+            drained.chunks.is_empty(),
+            "a signer that refuses every attempt emits zero chunks; got {:?}",
+            drained.chunks
+        );
+        // The receiver distinguishes this from a completed stream: it reads a
+        // typed fault, not a bare channel close.
+        let Some(StreamFault::Unsigned { stream, terminal }) = drained.fault else {
+            panic!(
+                "receiver must observe StreamFault::Unsigned, not a silent close; got {:?}",
+                drained.fault
+            );
+        };
+        // Both fields record a real refused attempt — the Data chunk, then the
+        // terminal error chunk the pump tried in order to report it.
+        assert_eq!(
+            stream,
+            StreamSignerError::Custody {
+                category:
+                    crate::context::outlets::signer::StreamSignerCustodyCategory::BackendFault,
+            }
+        );
+        assert_eq!(
+            terminal,
+            StreamSignerError::Custody {
+                category:
+                    crate::context::outlets::signer::StreamSignerCustodyCategory::BackendFault,
+            }
+        );
+    }
+
+    /// The receiver-visible distinction the fail-closed path exists to make:
+    /// a completed stream ends with a signed terminal chunk and NO fault, and a
+    /// signer refusal ends with a fault and no terminal chunk. Both streams run
+    /// the same executor over the same context and outlet, so the signer is the
+    /// only variable.
+    #[tokio::test]
+    async fn receiver_tells_a_signing_refusal_apart_from_a_completed_stream() {
+        async fn run(signer: std::sync::Arc<dyn StreamSigner>) -> DrainedStream {
+            let creator_did = "did:dht:z6MkCreator";
+            let role_state = test_role_state(creator_did);
+            let registry = setup_registry_with_outlet(&role_state, creator_did);
+            let context = active_context();
+            let outlet_id_owned: OutletId = "calculator".to_owned();
+            let executor: std::sync::Arc<dyn super::OutletExecutor> =
+                std::sync::Arc::new(FixedValueExecutor);
+            let rx = super::invoke_outlet(
+                &context,
+                &registry,
+                &role_state,
+                &outlet_id_owned,
+                serde_json::json!({"a": 1, "b": 2}),
+                &DID::from(creator_did),
+                None,
+                executor,
+                None,
+                None,
+                None,
+                signer,
+                [0u8; 32],
+            )
+            .await
+            .expect("invoke_outlet should accept a well-formed open");
+            drain_stream_items(rx).await
+        }
+
+        let completed = run(test_signer()).await;
+        assert!(
+            completed.fault.is_none(),
+            "a completed stream carries no fault; got {:?}",
+            completed.fault
+        );
+        assert!(
+            completed
+                .chunks
+                .last()
+                .is_some_and(|c| c.payload.is_terminal()),
+            "a completed stream ends on a terminal chunk; got {:?}",
+            completed.chunks
+        );
+
+        let refused = run(std::sync::Arc::new(FailingStreamSigner::new())).await;
+        assert!(
+            refused.fault.is_some(),
+            "a signer refusal hands the receiver a typed fault"
+        );
+        assert!(
+            !refused.chunks.iter().any(|c| c.payload.is_terminal()),
+            "a signer refusal delivers no terminal chunk; got {:?}",
+            refused.chunks
         );
     }
 
@@ -7563,7 +7980,8 @@ mod tests {
         .await
         .expect("open succeeds; the terminal signing failure surfaces during the pump");
 
-        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        let drained = drain_stream_items(rx).await;
+        let chunks = &drained.chunks;
 
         // No forged all-zero signature ever reaches the wire.
         assert!(
@@ -7582,14 +8000,251 @@ mod tests {
                 .all(|c| matches!(c.payload, ChunkPayload::Data { .. })),
             "only Data chunks are delivered; got {chunks:?}"
         );
-        // ... but the terminal `End`/`Error` is NOT: the terminal sign failed,
-        // so the stream fails closed with no terminal chunk on the wire.
+        // ... but no terminal chunk is: the signer refused the `End` AND the
+        // fault terminal, so neither could be signed.
         assert!(
-            !chunks.iter().any(|c| matches!(
-                c.payload,
-                ChunkPayload::End { .. } | ChunkPayload::Error { .. }
-            )),
-            "no terminal chunk may be emitted when terminal signing fails closed; got {chunks:?}"
+            !chunks.iter().any(|c| c.payload.is_terminal()),
+            "no terminal chunk may be emitted when both terminal attempts are refused; got {chunks:?}"
+        );
+        // The receiver still learns the stream ended abnormally: it reads the
+        // typed fault, whose two fields record the refused `End` attempt and
+        // the refused fault-terminal attempt.
+        assert!(
+            matches!(drained.fault, Some(StreamFault::Unsigned { .. })),
+            "receiver must observe StreamFault::Unsigned after two refused terminal attempts; got {:?}",
+            drained.fault
+        );
+    }
+
+    /// A [`StreamSigner`] that refuses the `fail_at`th signing attempt
+    /// (1-based) and signs every other attempt under a real key.
+    ///
+    /// This is how a transient custody fault behaves: the backend refuses one
+    /// call and serves the next. It is the case that separates classifying the
+    /// signer's health by ATTEMPT from classifying it by
+    /// [`StreamSignerError`] variant — a variant match would read a `Custody`
+    /// refusal as "no signed terminal is possible" and deny the receiver a
+    /// terminal the signer would in fact have produced.
+    struct FailNthStreamSigner {
+        inner: crate::context::outlets::signer::InProcessStreamSigner,
+        fail_at: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl FailNthStreamSigner {
+        fn new(fail_at: usize) -> Self {
+            use ed25519_dalek::SigningKey;
+            Self {
+                inner: crate::context::outlets::signer::InProcessStreamSigner::new(
+                    SigningKey::from_bytes(&[0x5c; 32]),
+                ),
+                fail_at,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl StreamSigner for FailNthStreamSigner {
+        async fn sign(&self, preimage: &[u8]) -> Result<[u8; 64], StreamSignerError> {
+            use std::sync::atomic::Ordering;
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+            if attempt == self.fail_at {
+                return Err(StreamSignerError::Custody {
+                    category:
+                        crate::context::outlets::signer::StreamSignerCustodyCategory::BackendFault,
+                });
+            }
+            self.inner.sign(preimage).await
+        }
+        fn verifying_key(&self) -> &ed25519_dalek::VerifyingKey {
+            self.inner.verifying_key()
+        }
+    }
+
+    /// Asserts a chunk is the pump's signed signing-fault terminal: the
+    /// §5.4.4 Execution-class code, the constant message that carries no
+    /// payload-derived text, `terminal: true`, a non-zero signature, and a
+    /// signature that verifies over exactly this chunk under the operator key.
+    fn assert_signed_fault_terminal(
+        chunk: &OutletStreamChunk,
+        signer: &dyn StreamSigner,
+        context_id: &str,
+        outlet_id: &str,
+    ) {
+        let ChunkPayload::Error {
+            code,
+            message,
+            terminal,
+        } = &chunk.payload
+        else {
+            panic!("expected a terminal Error payload; got {:?}", chunk.payload);
+        };
+        assert_eq!(code, CODE_EXECUTION_FAULT);
+        assert_eq!(message, SIGNING_FAULT_TERMINAL_MESSAGE);
+        assert!(*terminal, "the fault terminal closes the stream");
+        assert_ne!(
+            chunk.sig, [0u8; 64],
+            "the fault terminal carries a real operator signature"
+        );
+        assert!(
+            verify_chunk_signature(
+                chunk,
+                signer.verifying_key(),
+                context_id,
+                outlet_id,
+                &[0u8; 32],
+            ),
+            "the fault terminal's signature must verify over this chunk under the operator key"
+        );
+    }
+
+    /// A signer that refuses ONE chunk and signs the next MUST leave the
+    /// receiver a signed terminal `Error`, not a bare channel close: the pump
+    /// decides the signer's health by asking it to sign the fault terminal, so
+    /// a transient refusal still closes the stream under a valid signature.
+    ///
+    /// The refused chunk burns no sequence number, so the terminal takes the
+    /// slot the refused chunk would have used and the receiver reads a
+    /// contiguous sequence.
+    #[tokio::test]
+    async fn a_refused_data_chunk_closes_the_stream_on_a_signed_terminal_error() {
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(FixedValueExecutor);
+        // Attempt 1 is the executor's single `Data` chunk; attempt 2 is the
+        // fault terminal, which this signer signs.
+        let signer = std::sync::Arc::new(FailNthStreamSigner::new(1));
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            std::sync::Arc::clone(&signer) as std::sync::Arc<dyn StreamSigner>,
+            [0u8; 32],
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let drained = drain_stream_items(rx).await;
+        assert!(
+            drained.fault.is_none(),
+            "a signer that signs the fault terminal leaves no StreamFault; got {:?}",
+            drained.fault
+        );
+        assert_eq!(
+            drained.chunks.len(),
+            1,
+            "the refused Data chunk is not emitted; only the fault terminal is; got {:?}",
+            drained.chunks
+        );
+        let terminal = &drained.chunks[0];
+        assert_eq!(
+            terminal.sequence, 0,
+            "the refused chunk burns no sequence number, so the terminal takes slot 0"
+        );
+        assert_signed_fault_terminal(
+            terminal,
+            signer.as_ref(),
+            context.context_id(),
+            &outlet_id_owned,
+        );
+    }
+
+    /// The same signed-terminal guarantee at the TERMINAL boundary: the signer
+    /// signs both `Data` chunks, refuses the framework's `End`, then signs the
+    /// fault terminal. The receiver reads two `Data` chunks and a signed
+    /// terminal `Error` at the sequence the refused `End` would have used.
+    #[tokio::test]
+    async fn a_refused_end_chunk_closes_the_stream_on_a_signed_terminal_error() {
+        struct TwoDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for TwoDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..2u32 {
+                    tx.send(ChunkPayload::Data {
+                        value: serde_json::json!({ "tick": i }),
+                    })
+                    .await
+                    .expect("pump receiver is alive for buffered Data sends");
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_outlet(&role_state, creator_did);
+        let context = active_context();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: std::sync::Arc<dyn super::OutletExecutor> =
+            std::sync::Arc::new(TwoDataExecutor);
+        // Attempts 1 and 2 are the two `Data` chunks, attempt 3 is the `End`
+        // (refused), attempt 4 is the fault terminal (signed).
+        let signer = std::sync::Arc::new(FailNthStreamSigner::new(3));
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            std::sync::Arc::clone(&signer) as std::sync::Arc<dyn StreamSigner>,
+            [0u8; 32],
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let drained = drain_stream_items(rx).await;
+        assert!(
+            drained.fault.is_none(),
+            "a signer that signs the fault terminal leaves no StreamFault; got {:?}",
+            drained.fault
+        );
+        assert_eq!(
+            drained.chunks.len(),
+            3,
+            "two Data chunks plus the fault terminal; got {:?}",
+            drained.chunks
+        );
+        assert!(
+            drained.chunks[..2]
+                .iter()
+                .all(|c| matches!(c.payload, ChunkPayload::Data { .. })),
+            "the first two chunks are the executor's Data chunks; got {:?}",
+            drained.chunks
+        );
+        let terminal = &drained.chunks[2];
+        assert_eq!(
+            terminal.sequence, 2,
+            "the refused End burns no sequence number, so the terminal takes slot 2"
+        );
+        assert_signed_fault_terminal(
+            terminal,
+            signer.as_ref(),
+            context.context_id(),
+            &outlet_id_owned,
         );
     }
 
@@ -9317,12 +9972,18 @@ mod tests {
         // persistent counter (SCP-OUT-047) — never a bridge-local counter.
         // -----------------------------------------------------------------
 
-        /// AC5 — the SAME-CONTEXT stream path is UNCHANGED: `invoke_outlet`
-        /// still returns a BARE `mpsc::Receiver<OutletStreamChunk>` — identical
-        /// to what the cross-context bridge now returns. Compile-level proof: the
-        /// explicit annotation fails to compile if the same-context return type
-        /// drifts. The existing same-context runtime drain tests are the
-        /// behavioural regression.
+        /// AC5 — the SAME-CONTEXT stream path carries BARE chunks: every
+        /// delivered item's `Ok` arm is an `OutletStreamChunk` itself, with no
+        /// wrapping envelope and therefore no field a bridge could mint a
+        /// send-sequence anchor into — identical to what the cross-context
+        /// bridge returns.
+        ///
+        /// Compile-level proof: the explicit annotation names
+        /// `Result<OutletStreamChunk, StreamFault>` as the item type, so
+        /// introducing an envelope around the chunk fails to compile here. The
+        /// `Err` arm is the §5.4.5 fail-closed signing fault, which carries no
+        /// chunk at all and so mints no anchor either. The existing
+        /// same-context runtime drain tests are the behavioural regression.
         #[allow(dead_code)]
         async fn out044_same_context_returns_bare_chunks(
             context: &ContextHandle,
@@ -9331,23 +9992,25 @@ mod tests {
             outlet_id: &OutletId,
             invoker_did: &DID,
         ) {
-            let out: Result<mpsc::Receiver<OutletStreamChunk>, InvocationError> =
-                invoke_outlet::<NoopExecutor>(
-                    context,
-                    registry,
-                    role_state,
-                    outlet_id,
-                    serde_json::json!({}),
-                    invoker_did,
-                    None,
-                    Arc::new(NoopExecutor),
-                    None,
-                    None,
-                    None,
-                    test_signer(),
-                    [0u8; 32],
-                )
-                .await;
+            let out: Result<
+                mpsc::Receiver<Result<OutletStreamChunk, StreamFault>>,
+                InvocationError,
+            > = invoke_outlet::<NoopExecutor>(
+                context,
+                registry,
+                role_state,
+                outlet_id,
+                serde_json::json!({}),
+                invoker_did,
+                None,
+                Arc::new(NoopExecutor),
+                None,
+                None,
+                None,
+                test_signer(),
+                [0u8; 32],
+            )
+            .await;
             drop(out);
         }
 

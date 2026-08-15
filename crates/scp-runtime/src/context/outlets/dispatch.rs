@@ -96,7 +96,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::context::ContextHandle;
 
 use super::invoke::{
-    HandlerPanicSink, InvocationError, OutletExecutor, OutletInvokedEventSink,
+    HandlerPanicSink, InvocationError, OutletExecutor, OutletInvokedEventSink, OutletStreamItem,
     QueryMisdeclarationSink, StreamGateOutcome, StreamSettlement, StreamSettlementSink,
     accrue_data_chunk_if_billable, apply_stream_chunk_gate, ingest_stream_chunk, invoke_outlet,
     release_stream_admission,
@@ -2047,7 +2047,7 @@ fn spawn_pump_task(
     grant_wake: Arc<Notify>,
     cancel_wake: Arc<Notify>,
     terminate_wake: Arc<Notify>,
-    inner_rx: mpsc::Receiver<OutletStreamChunk>,
+    inner_rx: mpsc::Receiver<OutletStreamItem>,
     outer_tx: mpsc::Sender<OutletStreamChunk>,
     summary_tx: tokio::sync::oneshot::Sender<StreamCloseSummary>,
     stream_credit_stall_secs: u32,
@@ -2817,7 +2817,7 @@ async fn run_stream_pump_v2(
     grant_wake: Arc<Notify>,
     cancel_wake: Arc<Notify>,
     terminate_wake: Arc<Notify>,
-    mut inner_rx: mpsc::Receiver<OutletStreamChunk>,
+    mut inner_rx: mpsc::Receiver<OutletStreamItem>,
     outer_tx: mpsc::Sender<OutletStreamChunk>,
     summary_tx: tokio::sync::oneshot::Sender<StreamCloseSummary>,
     stream_credit_stall: Duration,
@@ -3022,10 +3022,13 @@ async fn run_stream_pump_v2(
                     break;
                 }
                 () = grant_wake.notified() => {
-                    parked.take()
+                    // A parked chunk was already received and signed, so it
+                    // re-enters the loop as the `Ok` arm of the same item type
+                    // the inner receiver yields.
+                    parked.take().map(Ok)
                 }
                 () = cancel_wake.notified() => {
-                    parked.take()
+                    parked.take().map(Ok)
                 }
                 () = terminate_wake.notified() => {
                     // Loop back so the eager `pending_terminate`
@@ -3119,8 +3122,25 @@ async fn run_stream_pump_v2(
             }
         };
 
-        let Some(chunk) = chunk_opt else {
-            break; // upstream closed
+        let chunk = match chunk_opt {
+            None => break, // upstream closed
+            Some(Ok(chunk)) => chunk,
+            Some(Err(fault)) => {
+                // The inner invoke pump refused to sign a chunk AND refused to
+                // sign the terminal error chunk that would have reported it, so
+                // it handed over this typed fault instead of an unsigned chunk.
+                // Both pumps sign through the same `Arc<dyn StreamSigner>`, so
+                // this pump cannot sign a terminal of its own either: it stops
+                // here, and the escrow guard settles as it unwinds.
+                tracing::error!(
+                    request_id = %hex::encode(request_id),
+                    outlet_id = %signing_ctx.outlet_id,
+                    context_id = %signing_ctx.context_id,
+                    error = %fault,
+                    "dispatch pump: inner invoke pump could not sign — pump stops without emitting"
+                );
+                break;
+            }
         };
 
         // Per-chunk decision: delegate to the public gate helper in
@@ -3960,7 +3980,7 @@ mod tests {
         }));
 
         let sink = Arc::new(RecordingSettlementSink::default());
-        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(16);
         let (outer_tx, _outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
         let (summary_tx, _summary_rx) = tokio::sync::oneshot::channel();
         let request_id: RequestId = [0x99; 16];
@@ -3996,14 +4016,14 @@ mod tests {
 
         // Send one Data chunk — the pump's signing path will panic.
         inner_tx
-            .send(OutletStreamChunk {
+            .send(Ok(OutletStreamChunk {
                 request_id,
                 sequence: 0,
                 payload: ChunkPayload::Data {
                     value: serde_json::json!({ "x": 1 }),
                 },
                 sig: [0u8; 64],
-            })
+            }))
             .await
             .expect("inner send");
 
@@ -4062,7 +4082,7 @@ mod tests {
         let grant_wake = Arc::new(Notify::new());
         let cancel_wake = Arc::new(Notify::new());
         let terminate_wake = Arc::new(Notify::new());
-        let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(16);
         let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
         let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
         let request_id: RequestId = [0x77; 16];
@@ -4193,7 +4213,7 @@ mod tests {
         let grant_wake = Arc::new(Notify::new());
         let cancel_wake = Arc::new(Notify::new());
         let terminate_wake = Arc::new(Notify::new());
-        let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(16);
         let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
         let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
         let request_id: RequestId = [0x99; 16];
@@ -4314,7 +4334,7 @@ mod tests {
             let grant_wake = Arc::new(Notify::new());
             let cancel_wake = Arc::new(Notify::new());
             let terminate_wake = Arc::new(Notify::new());
-            let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+            let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(16);
             let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
             let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
             let request_id: RequestId = [0x55; 16];
@@ -4430,12 +4450,12 @@ mod tests {
         mpsc::Receiver<OutletStreamChunk>,
         tokio::sync::oneshot::Receiver<StreamCloseSummary>,
         tokio::task::JoinHandle<()>,
-        mpsc::Sender<OutletStreamChunk>,
+        mpsc::Sender<OutletStreamItem>,
     ) {
         let grant_wake = Arc::new(Notify::new());
         let cancel_wake = Arc::new(Notify::new());
         let terminate_wake = Arc::new(Notify::new());
-        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(16);
         let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
         let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
         // Set the snapshot recheck cadence on the state so the pump's
@@ -4555,7 +4575,7 @@ mod tests {
                     },
                     sig: [0u8; 64],
                 };
-                if inner_tx.send(chunk).await.is_err() {
+                if inner_tx.send(Ok(chunk)).await.is_err() {
                     break;
                 }
             }
@@ -4982,7 +5002,7 @@ mod tests {
         outer_rx: mpsc::Receiver<OutletStreamChunk>,
         summary_rx: tokio::sync::oneshot::Receiver<StreamCloseSummary>,
         pump_join: tokio::task::JoinHandle<()>,
-        inner_tx: mpsc::Sender<OutletStreamChunk>,
+        inner_tx: mpsc::Sender<OutletStreamItem>,
         event_rx: tokio::sync::mpsc::UnboundedReceiver<
             scp_protocol::context::outlets::lifecycle::OutletInvokedEvent,
         >,
@@ -5028,7 +5048,7 @@ mod tests {
         let grant_wake = Arc::new(Notify::new());
         let cancel_wake = Arc::new(Notify::new());
         let terminate_wake = Arc::new(Notify::new());
-        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(64);
+        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(64);
         let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamChunk>(64);
         let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5096,25 +5116,25 @@ mod tests {
 
     /// Sends one `Data` chunk with the given per-stream `sequence` on the inner
     /// channel (the pump re-numbers under its own outer cursor).
-    async fn send_inner_data(inner_tx: &mpsc::Sender<OutletStreamChunk>, seq: u64) {
+    async fn send_inner_data(inner_tx: &mpsc::Sender<OutletStreamItem>, seq: u64) {
         inner_tx
-            .send(OutletStreamChunk {
+            .send(Ok(OutletStreamChunk {
                 request_id: [0u8; 16],
                 sequence: seq,
                 payload: ChunkPayload::Data {
                     value: serde_json::json!({ "i": seq }),
                 },
                 sig: [0u8; 64],
-            })
+            }))
             .await
             .expect("inner send");
     }
 
     /// Sends a terminal `End` chunk on the inner channel.
-    async fn send_inner_end(inner_tx: &mpsc::Sender<OutletStreamChunk>, seq: u64) {
+    async fn send_inner_end(inner_tx: &mpsc::Sender<OutletStreamItem>, seq: u64) {
         use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
         inner_tx
-            .send(OutletStreamChunk {
+            .send(Ok(OutletStreamChunk {
                 request_id: [0u8; 16],
                 sequence: seq,
                 payload: ChunkPayload::End {
@@ -5136,7 +5156,7 @@ mod tests {
                     execution_time_ms: 0,
                 },
                 sig: [0u8; 64],
-            })
+            }))
             .await
             .expect("inner send end");
     }
@@ -5347,7 +5367,7 @@ mod tests {
 
         // Send a terminal Error with 0 credit available.
         pump.inner_tx
-            .send(OutletStreamChunk {
+            .send(Ok(OutletStreamChunk {
                 request_id: [0u8; 16],
                 sequence: 0,
                 payload: ChunkPayload::Error {
@@ -5357,7 +5377,7 @@ mod tests {
                     terminal: true,
                 },
                 sig: [0u8; 64],
-            })
+            }))
             .await
             .expect("inner send error");
 
@@ -5481,14 +5501,14 @@ mod tests {
         let feeder = tokio::spawn(async move {
             for seq in 0..100u64 {
                 if feeder_tx
-                    .send(OutletStreamChunk {
+                    .send(Ok(OutletStreamChunk {
                         request_id: [0u8; 16],
                         sequence: seq,
                         payload: ChunkPayload::Data {
                             value: serde_json::json!({ "i": seq }),
                         },
                         sig: [0u8; 64],
-                    })
+                    }))
                     .await
                     .is_err()
                 {
@@ -5628,14 +5648,14 @@ mod tests {
         for seq in 0..6u64 {
             let _ = pump
                 .inner_tx
-                .send(OutletStreamChunk {
+                .send(Ok(OutletStreamChunk {
                     request_id: [0u8; 16],
                     sequence: seq,
                     payload: ChunkPayload::Data {
                         value: serde_json::json!({ "i": seq }),
                     },
                     sig: [0u8; 64],
-                })
+                }))
                 .await;
         }
 
