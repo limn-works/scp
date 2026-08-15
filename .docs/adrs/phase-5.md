@@ -324,7 +324,7 @@ WebRTC library integration is platform-specific (webrtc-rs for native, browser W
 
 ## ADR-025: Apple Platform Adapter
 
-**Status:** Decided
+**Status:** Decided. **Amended 2026-08-15** — see [Amendment (2026-08-15): device attestation fails closed when App Attest is unavailable](#amendment-2026-08-15-device-attestation-fails-closed-when-app-attest-is-unavailable), which supersedes the software-only attestation fallback in the Decision and rewrites acceptance criterion 3.
 
 ### Context
 
@@ -352,7 +352,7 @@ Implement the Apple platform adapter in Swift (`bindings/swift/Sources/SCP/Platf
 
 **Key custody:** `AppleKeyCustody` stores Ed25519 and X25519 key material in the Apple Keychain as generic password items with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` protection. Keys are tagged with a `scp.key.<key_id>` label and access group `$(AppIdentifierPrefix).dev.limn.scp`. The Secure Enclave is not used for Ed25519/X25519 keys — the hardware does not support these key types. Signing operations and DH agreement are performed in software using the key material retrieved from Keychain. Private key bytes are never passed across the Swift/Rust FFI boundary; all signing and key agreement operations happen entirely within the Swift `AppleKeyCustody` implementation.
 
-**Device attestation:** `AppleDeviceAttestation` uses `DCAppAttestService` (App Attest). A Secure Enclave-backed P-256 key is generated via `generateKey(completionHandler:)`. Attestations are requested via `attestKey(_:clientDataHash:completionHandler:)` where `clientDataHash` is `SHA-256(challenge || deviceID)`. Assertions are generated via `generateAssertion(_:clientData:completionHandler:)` for subsequent operations. The attestation token is forwarded to the SCP relay for server-side verification via Apple's attestation service endpoints. On simulator and in environments where App Attest is unavailable, the adapter falls back to a software-only attestation with `method: .softwareOnly`.
+**Device attestation:** `AppleDeviceAttestation` uses `DCAppAttestService` (App Attest). A Secure Enclave-backed P-256 key is generated via `generateKey(completionHandler:)`. Attestations are requested via `attestKey(_:clientDataHash:completionHandler:)` where `clientDataHash` is `SHA-256(challenge || deviceID)`. Assertions are generated via `generateAssertion(_:clientData:completionHandler:)` for subsequent operations. The attestation token is forwarded to the SCP relay for server-side verification via Apple's attestation service endpoints. When `DCAppAttestService.shared.isSupported` reads `false` — on the simulator, and on any device or environment where App Attest is unavailable — `attest()` and `assertRequest()` throw `AttestationError.unsupported` and return no bytes. The adapter mints no token and no assertion on that path, and it holds no other implementation of device attestation to fall back to.
 
 **Push notifications:** `ApplePushProvider` wraps UNUserNotificationCenter and registers with APNs via `UIApplication.registerForRemoteNotifications()` / `NSApplication.registerForRemoteNotifications()`. The APNs payload is strictly opaque per §10.7: `{"aps": {"content-available": 1}}` with no additional fields. A content-available notification (silent push) wakes the app. The app then connects to its relay set and pulls all pending encrypted envelopes. No context ID, sender DID, message preview, or other metadata is included in the payload. Apple/Google learn only that the device received a notification at a specific time.
 
@@ -413,6 +413,20 @@ If the device has no biometric hardware (e.g., older iPads, Mac mini), `.biometr
 | SCP (`.required`) | Keychain (Ed25519/X25519) | Yes (App Attest P-256) | Yes (per-operation) |
 
 SCP with `.required` provides the strongest custody model achievable on Apple platforms for Curve25519 keys: Keychain encryption at rest + biometric gate at use time + hardware-backed device attestation via App Attest.
+
+### Amendment (2026-08-15): device attestation fails closed when App Attest is unavailable
+
+**What this amendment changes.** The Decision's "Device attestation" paragraph previously ended: "On simulator and in environments where App Attest is unavailable, the adapter falls back to a software-only attestation with `method: .softwareOnly`." Acceptance criterion 3 previously required `verify(token:)` to check "that the attestation bytes are non-empty and the key ID is present," and required the unavailable-service path to return "a synthetic token with `method: .softwareOnly`. Does not crash or throw; the caller receives a valid (but software-only) token." This amendment deletes the software-only fallback from the Decision, and rewrites acceptance criterion 3 so that `attest()` and `assertRequest()` throw `AttestationError.unsupported` when App Attest is unavailable, and so that `verify(token:)` decides acceptance against a stated structural criterion that a fabricated token fails. Acceptance criteria 7 and 10 and the Scope file table are amended to match.
+
+**Provenance of the superseded clauses.** On 2026-07-16 at 17:48 the maintainer granted the software-only fallback as a *"transient exemption but comment well"*, after establishing the premise *"oh is this hardware custody/identity"*. That premise placed device attestation inside the hardware-and-keychain family whose production backend the project had already deferred, on the reading that device attestation means App Attest or Play Integrity — hardware-backed — and that the capability fails closed while the hardware backend is unavailable. The shipped clauses did not fail closed: they minted a token on the unavailable-service path and specified a verifier with no rejecting branch. This amendment records the decay of the grant's premise. The grant covered a capability that reports its own absence; the clauses specified a capability that reports a hardware-backed guarantee it does not hold.
+
+**Why the superseded clauses cannot stand.** Three artifacts govern the unavailable-service path, and each one rules the same way.
+
+- The builder tenet in `CLAUDE.md`, "No dev/test-only stand-ins in production," names an always-succeeds verifier or attestation among the constructs that may never be reachable on a shipped production path, and requires the capability to fail closed with a typed error when the real backend is unavailable.
+- §17.17.2 of the persistence-and-storage spec classifies each capability's development arm. SCP-CAPSEL-8010, the rule that every development arm is either a durability-only affordance or a security nullifier, lists attestation among the properties whose nullification makes an arm a nullifier, and §17.17.2 names device attestation among the capabilities the classification binds. SCP-CAPSEL-8001, the rule that selection fails closed, forbids reaching a development arm as a degradation path from an unsatisfiable production selection, and the `isSupported == false` path is that degradation path. SCP-CAPSEL-8012, the rule that nullifier arms are provably absent from shipped production artifacts, then bars the software-only arm from the shipped adapter.
+- §16.12.4 of the test-infrastructure spec defines `attestation_conformance!()` with an `invalid_token_rejected` case that fabricates a token and asserts `verify` returns `false`. Acceptance criterion 7 requires `AppleDeviceAttestation` to pass that macro, so the superseded criterion-3 verifier contradicted a criterion in the same ADR.
+
+**What this amendment does not change.** `KeyDestructionAttestation.method = .softwareOnly` for Keychain-backed keys, specified under "Key destruction attestation (§9.15)" and in acceptance criterion 9, is a different mechanism and stands unchanged. That field reports the trust level of a destruction the adapter actually performed, and §9.15 of the security-model spec defines software-only as one of three recorded levels that the protocol carries as metadata without gating on it. Reporting a real destruction at its real trust level asserts nothing false, which is what separates it from a minted attestation token.
 
 ### Implementation
 
@@ -521,8 +535,17 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
 3. **`AppleDeviceAttestation` — App Attest:**
    - `attest() -> DeviceAttestationToken`: Generates an App Attest key via `DCAppAttestService.generateKey`, requests attestation with `clientDataHash = SHA256(clientDataJSON)` where `clientDataJSON = '{"challenge":"<base64(challenge)>","deviceId":"<base64(deviceId)>","type":"scp-device-attestation-v1"}'` (fields in this exact order, RFC 4648 base64, no line breaks). Returns a `DeviceAttestationToken` containing the raw attestation bytes and the key ID.
-   - `verify(token: DeviceAttestationToken) -> Bool`: Verifies the attestation token structure. Full verification is server-side (relay calls Apple's attestation endpoint). Client-side verification checks that the attestation bytes are non-empty and the key ID is present.
-   - On simulator or when App Attest is unavailable: `DCAppAttestService.shared.isSupported == false` → returns a synthetic token with `method: .softwareOnly`. Does not crash or throw; the caller receives a valid (but software-only) token.
+   - `verify(token: DeviceAttestationToken) -> Bool`: Decides whether the bytes are a well-formed Apple App Attest attestation object. The relay performs the cryptographic verification against Apple's attestation endpoint — it validates the certificate chain to Apple's App Attest root, the receipt, and the challenge binding. `verify` performs the structural half, and it returns `false` whenever the structure does not hold.
+
+     **The criterion.** `verify` returns `true` for a token that satisfies every clause below, and `false` for every token that does not. There is no other accepting branch.
+
+     1. The bytes decode as a CBOR map whose key set is exactly `{"fmt", "attStmt", "authData"}`.
+     2. `fmt` is the CBOR text string `apple-appattest`.
+     3. `attStmt` is a CBOR map whose key set is exactly `{"x5c", "receipt"}`. `x5c` is an array of at least two byte strings, each of which parses as a DER-encoded X.509 certificate; the first is the credential certificate and the second is the Apple App Attest intermediate certificate. `receipt` is a byte string.
+     4. `authData` is a byte string of at least 87 bytes, laid out as WebAuthn authenticator data carrying attested credential data: bytes 0–31 are the relying-party ID hash and equal `SHA-256` of the app's App ID (`<team ID>.<bundle ID>`); byte 32 is the flags byte; bytes 33–36 are the sign counter; bytes 37–52 are the AAGUID and equal the ASCII string `appattest` or `appattestdevelop` padded to 16 bytes with zero bytes; bytes 53–54 are the credential-ID length as a big-endian `UInt16` and equal `0x0020`; bytes 55–86 are the 32-byte credential ID.
+
+     **Three consequences of the criterion.** These follow from the four clauses; a reader applies the clauses, not this list. An empty token fails clause 1. A UTF-8 string fails clause 1. A CBOR map carrying an extra key alongside the three named keys fails clause 1, because clause 1 fixes the key set rather than requiring the three keys to be present.
+   - When `DCAppAttestService.shared.isSupported` reads `false`, `attest()` and `assertRequest()` throw `AttestationError.unsupported` and return no bytes. The adapter mints no attestation object, no assertion, and no stand-in for either. A caller that cannot obtain an attestation learns that from the thrown error, which is the honest absent state per `.docs/standards/sdk-common.md` §Stub and Placeholder Policy.
    - `generateAssertion(keyId: String, clientData: Data) -> Data`: Generates a per-request assertion via `DCAppAttestService.generateAssertion(_:clientData:)`. Used for subsequent authenticated operations after initial attestation.
 
 4. **`ApplePushProvider` — APNs:**
@@ -566,10 +589,11 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
 7. **Conformance test suite:**
    - All four providers pass the platform trait conformance macros defined in `scp-platform/testing/` (ADR-006): `key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`.
-   - Tests run on real devices (CI must include a physical iOS device lane for Keychain and App Attest tests). Simulator-only tests use `#if targetEnvironment(simulator)` fallback paths.
+   - `attestation_conformance!()` includes an `invalid_token_rejected` case (§16.12.4 of the test-infrastructure spec) that feeds `verify` a fabricated token and asserts `false`. `AppleDeviceAttestation.verify` satisfies that case through the acceptance-criterion-3 criterion, which rejects a fabricated token at clause 1 or clause 2.
+   - Tests run on real devices (CI must include a physical iOS device lane for Keychain and App Attest tests). On the simulator `DCAppAttestService.shared.isSupported` reads `false`, so the simulator lane asserts the fail-closed path rather than exercising a substitute attestation.
    - `AppleKeyCustody` round-trip test: `generateKeypair(.ed25519)` → `sign(data)` → `publicKey()` → verify signature → `destroyKey()` → confirm re-fetch fails.
    - `AppleStorage` round-trip test: `store(key, data)` → `retrieve(key)` → `listKeys(prefix)` → `delete(key)` → `exists(key) == false`.
-   - `AppleDeviceAttestation` test on real device: `attest()` returns non-empty token. On simulator: returns software-only token without crashing.
+   - `AppleDeviceAttestation` test on real device: `attest()` returns a token that `verify` accepts. On simulator: `attest()` throws `AttestationError.unsupported`, and the test asserts that thrown error.
    - `ApplePushProvider` test: `register()` returns a non-empty token string. `handleNotification` rejects non-opaque payloads.
 
 8. **No Secure Enclave signing key:**
@@ -584,7 +608,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 10. **Conditional compilation:**
     - All Apple platform APIs are gated behind `#if os(iOS) || os(macOS)`.
     - Background processing code is gated behind `#if canImport(UIKit)` (iOS) vs `#if canImport(AppKit)` (macOS).
-    - Simulator fallback paths are gated behind `#if targetEnvironment(simulator)`.
+    - `AppleDeviceAttestation` carries no simulator-gated code path. It decides App Attest availability at runtime from `DCAppAttestService.shared.isSupported` and throws `AttestationError.unsupported` when that reads `false`, so the simulator needs no separate compilation arm.
 
 ### Scope
 
@@ -593,7 +617,7 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 | File | Purpose |
 |------|---------|
 | `bindings/swift/Sources/SCP/Platform/AppleKeyCustody.swift` | `KeyCustodyProvider` — Keychain storage, Ed25519 signing, X25519 DH, pseudonym derivation, key destruction |
-| `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift` | `DeviceAttestationProvider` — App Attest key generation, attestation, assertion, simulator fallback |
+| `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift` | `DeviceAttestationProvider` — App Attest key generation, attestation, assertion, structural token verification, fail-closed error when App Attest is unavailable |
 | `bindings/swift/Sources/SCP/Platform/ApplePushProvider.swift` | `PushProvider` — APNs registration, opaque silent push payload enforcement |
 | `bindings/swift/Sources/SCP/Platform/AppleStorage.swift` | `StorageProvider` — SQLCipher-encrypted SQLite, Keychain key derivation, `NSFileProtection` |
 | `bindings/swift/Sources/SCP/Platform/PlatformAdapter.swift` | `ApplePlatformAdapter.make()` — aggregates all four providers, injected by `SCP.init()` |
