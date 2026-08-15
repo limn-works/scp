@@ -90,15 +90,12 @@ export {
 // Trust — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type {
-  AggregatedTrustInput,
-  AggregationInput,
-  Attestation,
-  BehavioralRecord,
-  ChallengeResult,
-  Endorsement,
-  TrustEvaluation,
-} from "./trust";
+// `BehavioralRecord` and `TrustEvaluation` are the canonical structured shapes
+// in `./types` — the ones `SCP.evaluateTrust` and `SCP.participationRecord`
+// return, and the ones the Python, Swift, and Kotlin SDKs mirror field for
+// field (ADR-059 Decision 1). `./trust` exported a second, incompatible pair of
+// interfaces under those names until this module stopped re-declaring them.
+export type { AggregatedTrustInput, AggregationInput } from "./trust";
 export { evaluateTrust } from "./trust";
 
 // ---------------------------------------------------------------------------
@@ -282,6 +279,7 @@ export type {
   AttestationType,
   AttestorInfo,
   BatchPublishResult,
+  BehavioralRecord,
   BroadcastAdmissionPolicy,
   CachedAttestation,
   CachedAttestationDuration,
@@ -331,6 +329,7 @@ export type {
   ThresholdRequirement,
   TransportConfig,
   TransportStatus,
+  TrustEvaluation,
   TrustLevel,
   UcanToken,
   VerificationLevel,
