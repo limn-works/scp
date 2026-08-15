@@ -1364,7 +1364,7 @@ Implement a complete addressability and deployment layer as specified in §18:
 
 1. **`SCPRelay` service entry type** exists in `DidDocument`. `add_relay_service(url)` adds an entry. `relay_service_urls()` returns all relay URLs. Serde roundtrip preserves SCPRelay entries alongside existing service types (PreRotationCommitment, IdentityPrivateState).
 
-2. **DID publish flow** accepts optional `relay_urls: Vec<Url>`. When provided, relay URLs appear as SCPRelay service entries in the published DID document. BEP44 signature covers relay entries. Sequence number monotonicity (§9.6.3) applies to relay list updates.
+2. **DID publish flow** accepts optional `relay_urls: Vec<Url>`. When provided, relay URLs appear as SCPRelay service entries in **both** published encodings — the relay layer's full JSON document and Mainline's DNS-encoded bootstrap core, which carries the relay list (§18.2.2B). Each layer's BEP44 signature covers that layer's own bytes, so the relay entries are signed twice, once per encoding (§3.10.5). Sequence number monotonicity (§9.6.3) applies to relay list updates per layer (§3.10.7).
 
 3. **`ScpUri` type** parses and serializes the universal context URI format: `scp://context/<hex>?relay=<url>[&relay=<url2>][&mode=...][&name=...]`. Legacy `scp://broadcast/<hex>?relay=<url>` accepted as alias. Invalid URIs return typed errors. Percent-encoding per RFC 3986. Parse/serialize roundtrip.
 

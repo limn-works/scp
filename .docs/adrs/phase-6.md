@@ -3421,7 +3421,7 @@ Reclassify protocol constants into three tiers:
 
 3. `MAX_NESTING_DEPTH` is removed as a protocol ceiling. Same rationale as chain depth — nesting costs are borne by participants, not the protocol. Contexts may set their own limit via `ContextParams::max_nesting_depth`.
 
-4. `DID_DOCUMENT_BLOB_TTL_SECS` (resolver.rs:344) is intentionally independent from `RELAY_BLOB_TTL_SECS`. It is the identity-layer publication TTL for DID documents, used by the healing publisher, and remains unchanged.
+4. `DID_DOCUMENT_BLOB_TTL_SECS` (resolver.rs:344) is intentionally independent from `RELAY_BLOB_TTL_SECS`. It is the identity-layer publication TTL for the **relay layer's** DID-document blob, and it remains unchanged. It bounds a relay blob's storage lifetime, so it has no Mainline counterpart: Mainline's bootstrap core is governed by BEP44 item expiry and the 2-hour republish cycle (§3.10.5). The healing publisher that would consume this constant re-publishes a layer's own encoding to that same layer (§3.10.7), and no production code constructs one today.
 
 ### Migration
 

@@ -780,6 +780,13 @@ SCP introduces a dual-layer resolution architecture:
 - **Primary: SCP relay-based resolution.** DID documents published to SCP relays via the existing PUBLISH/QUERY operations (ADR-004), addressed by a deterministic `routing_id`. An SCP-native relay validates each DID-record blob it stores and keeps a single highest-sequence slot per `routing_id` (§3.10.2), which is what makes the relay layer suppression-resistant (§3.10.8); foreign transports that cannot validate store the record opaquely and stay correct via client-side verification. Grows with the SCP network.
 - **Fallback: Mainline DHT.** Existing did:dht resolution via BEP44. Works from day one. Transitions from "only path" to "fallback path" as the relay network matures.
 
+**The two layers carry two encodings, and each layer is authoritative for what it carries.** The relay layer carries the **full DID document** as JSON inside a DID-record frame (§9.10.12), capped at `MAX_DID_RECORD_VALUE_LEN` = 262,039 bytes. Mainline carries the **bootstrap core** (§18.2.2B) as a did:dht-conformant DNS packet, capped at the 1,000 bytes BEP44 v1 permits. The two layers therefore carry different bytes rather than copies of one payload. The measured reason is in §18.2.2C: the smallest document §18.2.2A permits is 1,255 bytes as minified JSON, already over Mainline's cap, and attestations and further service entries grow it from there (§3.10.2 size budget). No single payload satisfies both caps. Consequences that every rule below depends on:
+
+- **The relay layer is authoritative for the full document.** Every field outside the bootstrap core — `SCPCapabilities`, `IdentityPrivateState`, `SCPBroadcastContext`, `ParticipationStatements`, `AttestationRevocations`, `ScpIdentityLinkAttestation`, `alsoKnownAs`, the `#agent` verification method — exists only there.
+- **Mainline is authoritative for the bootstrap core.** A resolver that reaches only Mainline holds `#active`, the pre-rotation commitment, and the relay list, which is what it needs to reach the relay layer.
+- **Each layer signs its own bytes.** A publisher computes one BEP44 signature over the relay-layer JSON and a second BEP44 signature over the Mainline DNS packet.
+- **Each layer advances its own sequence number, and no resolver compares one layer's sequence number against the other's.** A sequence comparison across layers would compare two different payloads and decide nothing.
+
 Both layers are self-certifying: the BEP44 signature on a DID document is verified against the public key encoded in the DID string itself (§9.6.1). The storage backend — whether an SCP relay or a DHT node — is untrusted. Trust derives from the cryptographic binding between the DID and its document, not from the infrastructure serving it. An SCP-native relay MAY additionally validate the records it stores (§3.10.2) — a validating relay keeps a single highest-sequence slot, which resists suppression — but this is an availability property layered on top, never a trust dependency: the resolver re-verifies every record independently and accepts nothing on the relay's word (§3.10.4).
 
 ### 3.10.1 Resolution Priority
@@ -789,9 +796,11 @@ Both layers are self-certifying: the BEP44 signature on a DID document is verifi
 | 1 | SCP relays | Low (few relays exist) | Low (relay QUERY, single hop) | Yes |
 | 2 | Mainline DHT | High (millions of nodes) | Higher (DHT traversal, 1-3s typical) | No |
 
-Resolution strategy: query both layers in parallel. The first valid response wins. "Valid" means the BEP44 signature verifies against the public key encoded in the target DID AND the sequence number is greater than or equal to the last known sequence number for that DID. When both layers return valid documents, the document with the highest sequence number is accepted.
+Resolution strategy: query both layers in parallel. "Valid" means the BEP44 signature verifies against the public key encoded in the target DID AND the sequence number is greater than or equal to the last sequence number the resolver observed **on that same layer**. A resolver that needs the full document takes the relay layer's answer, and falls back to the Mainline bootstrap core only when no relay answers. A resolver that needs only the bootstrap core takes whichever layer answers first, because both layers carry it.
 
-Parallel query means resolution latency is `min(relay_latency, dht_latency)`. The slower query is cancelled once the first valid response arrives.
+When both layers return valid records, the resolver does **not** compare their sequence numbers and does not pick a winner between them. The two records are different payloads under different signatures, so the comparison would decide nothing. The resolver keeps each layer's record as that layer's answer (§3.10.4 step 5).
+
+Parallel query means resolution latency is `min(relay_latency, dht_latency)` for the bootstrap core. Resolving the full document costs relay latency, because Mainline does not carry it.
 
 ### 3.10.2 Layer 1: SCP Relay-Based Resolution
 
@@ -825,7 +834,7 @@ QUERY {
 }
 ```
 
-`limit: N` (N = 16) **dominates `limit: 1`** and costs nothing where it does not help. Against a **validating** SCP-native relay the routing ID is slot-exclusive (below), so exactly one record is returned regardless of `N`. Against a **non-validating or foreign** transport that accumulates multiple blobs per `routing_id`, `limit: N` lets the resolver retrieve up to N candidates and sift them to the highest-sequence *valid* one (§3.10.4 step 5) — defeating an intra-relay shadowing attempt that a single-record fetch would miss, and giving a `DhtMode::Disabled` node (relay-only resolution, which the spec permits) a fighting chance against a non-validating relay. Under an *active* flood on a non-validating relay this remains best-effort (§3.10.8 residual): N candidates may all be junk. The resolver's highest-sequence-valid selection across relays and the DHT (§3.10.4) still returns the freshest genuine record whenever any queried source holds it.
+`limit: N` (N = 16) **dominates `limit: 1`** and costs nothing where it does not help. Against a **validating** SCP-native relay the routing ID is slot-exclusive (below), so exactly one record is returned regardless of `N`. Against a **non-validating or foreign** transport that accumulates multiple blobs per `routing_id`, `limit: N` lets the resolver retrieve up to N candidates and sift them to the highest-sequence *valid* one (§3.10.4 step 5) — defeating an intra-relay shadowing attempt that a single-record fetch would miss, and giving a `DhtMode::Disabled` node (relay-only resolution, which the spec permits) a fighting chance against a non-validating relay. Under an *active* flood on a non-validating relay this remains best-effort (§3.10.8 residual): N candidates may all be junk. The resolver's highest-sequence-valid selection **across relays** (§3.10.4 step 5) still returns the freshest genuine relay-layer record whenever any queried relay holds it. That selection stays inside the relay layer: Mainline carries the bootstrap core rather than the full document (§3.10), so a Mainline record is never a candidate in a relay-layer selection.
 
 **Relay-side validation (SCP-native relays).** The whole path sits behind the existing per-IP PUBLISH rate limit (ADR-004). On PUBLISH of a blob at a `routing_id`, an SCP-native relay performs the checks **cheapest-first**, so junk is rejected before any expensive work:
 
@@ -859,19 +868,19 @@ This mirrors, and extends to a stored public record, the exact check `BRIDGE_REG
 - **Why the frame carries `public_key`.** The relay holds only the one-way `routing_id` hash and cannot recover the DID or its key from it — so, exactly as `BRIDGE_REGISTER` carries `public_key` for the relay to verify against (§10.12.4), the DID-record frame carries `public_key` for the relay's binding + signature check. The client ignores this field and verifies with its own DID-derived key.
 - **Self-verifying blob payload.** The frame carries the BEP44 `(value, signature, seq)` triple, not the bare document bytes. Because the signature and sequence travel inside the blob, a resolver verifies the record from the blob alone — no DHT round-trip is required to obtain the signature.
 - **Multi-relay.** A resolver can QUERY any relay that stores the target DID document. Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for availability and suppression resistance.
-- **Size budget.** DID documents range from 2-30KB depending on attestation count and service endpoint list. The relay blob size limit is 256KB (ADR-004). Well within bounds.
+- **Size budget.** The relay layer carries the full JSON document, bounded by `MAX_DID_RECORD_VALUE_LEN` = 262,039 bytes (`MAX_BLOB_SIZE` 262,144, ADR-004 / §9.18.11, minus the frame's 105-byte fixed prefix). A publisher MUST reject a relay-layer document that exceeds that bound at publish time (§18.2.2C). Measured against the current JSON encoding, a document with `#0`, `#active`, a pre-rotation commitment and one `SCPRelay` entry is 1,467 bytes; attestations and additional service entries grow it, and the 262,039-byte bound is what caps that growth.
 - **TTL and republishing.** The maximum relay blob TTL is 604800 seconds (7 days). Identity owners MUST republish to relays at least every 6 days (1-day safety margin). The RepublishManager already handles periodic DHT republishing on a 2-hour cycle; relay republishing adds a separate 6-day cycle for relay-stored DID documents.
 
 ### 3.10.3 Layer 2: Mainline DHT (Fallback)
 
-Existing did:dht resolution via BEP44 signed mutable items on Mainline DHT. The mechanism is unchanged from §3.8 and §9.6.1. What changes is its role: from "only resolution path" to "fallback resolution path."
+did:dht resolution via BEP44 signed mutable items on Mainline DHT. The signature mechanism is unchanged from §3.8 and §9.6.1. Two things change: the layer's role moves from "only resolution path" to "fallback resolution path," and its payload is the **bootstrap core** encoded as a did:dht-conformant DNS packet (§18.2.2B), not the full JSON document. A resolver that reads Mainline gets `#active`, the pre-rotation commitment and the relay list, and fetches everything else from a relay.
 
 The DHT layer remains essential for:
 
-- **Day-one operation.** The SCP relay network starts small. Most DID documents will not be available on relays until the network grows. DHT availability is immediate.
-- **Resolution of identities not yet publishing to SCP relays.** Older identities or identities using minimal SDK configurations may only publish to DHT. The protocol MUST resolve them.
-- **Resilience when all of an identity's relays are down.** DHT provides a resolution path independent of any specific relay's availability.
-- **Cross-network interoperability.** Any BEP44-capable client can resolve SCP identities without running SCP software. The DHT layer preserves this property.
+- **Day-one operation.** The SCP relay network starts small. Most full DID documents will not be available on relays until the network grows. Mainline availability is immediate, so the bootstrap core is resolvable from day one.
+- **Resolution of identities not yet publishing to SCP relays.** Older identities or identities using minimal SDK configurations may publish only to Mainline. The protocol MUST resolve them, and a resolver that reaches such an identity holds the bootstrap core and nothing beyond it. A verifier that needs a field outside the core — an attestation entry, a capability endpoint, `alsoKnownAs` — MUST treat that field as unresolved rather than absent, and MUST NOT conclude from a bootstrap-core resolution that the identity declares no such field.
+- **Resilience when all of an identity's relays are down.** Mainline provides a resolution path independent of any specific relay's availability. What that path recovers is the relay list and the keys needed to verify a relay's answer once a relay returns.
+- **Cross-network interoperability.** Any BEP44-capable client can resolve an SCP identity's bootstrap core without running SCP software, because the Mainline payload is a conformant did:dht DNS packet. This property is the reason the Mainline encoding conforms to the method rather than carrying SCP's JSON: a conformant resolver fetching JSON would fail to parse it.
 
 ### 3.10.4 Resolution Protocol
 
@@ -895,15 +904,31 @@ The full resolution sequence:
    b. Verify the BEP44 signature over the BEP44-canonical bencoded buffer
       bencode(salt?, seq, value) — seq before value, per BEP44 (BitTorrent
       BEP 44 is authoritative for this ordering) — against public_key
-      (the key derived from the DID string in step 2)
-   c. Verify seq >= last_known_seq for this DID
-5. Accept the valid response with highest sequence number. Within the relay
-   layer, if more than one valid record is returned (a non-validating or
-   foreign relay that accumulated multiple blobs), the resolver takes the
-   highest-seq valid record; across layers, the overall highest-seq valid
-   record wins.
+      (the key derived from the DID string in step 2). Each layer carries
+      its own encoding under its own signature (§3.10, §18.2.2A): the relay
+      layer's value decodes as the full JSON document, the Mainline layer's
+      as the did:dht DNS-encoded bootstrap core.
+   c. Verify seq >= the last sequence number this resolver observed on the
+      SAME layer for this DID. A resolver keeps one last-known sequence
+      number per (DID, layer) pair.
+5. Select per layer, never across layers:
+   a. Relay layer. If more than one valid record is returned (a
+      non-validating or foreign relay that accumulated multiple blobs), take
+      the highest-seq valid record. This is the full document, and it is
+      authoritative for every field (§3.10).
+   b. Mainline layer. Take the valid record. This is the bootstrap core, and
+      it is authoritative for the core's four elements (§18.2.2B).
+   c. The resolver MUST NOT compare a relay-layer sequence number against a
+      Mainline sequence number, and MUST NOT discard one layer's record
+      because the other layer returned a higher number. The two layers carry
+      different payloads under different signatures, so the comparison
+      decides nothing.
+   d. When both layers answer and the caller asked for the full document,
+      the relay-layer record is the answer. When only Mainline answers, the
+      answer is the bootstrap core, and the caller learns which fields it
+      does not hold (§3.10.3).
 6. Cache result per §9.10.7 caching policy
-   (24h refresh for active contacts, 7d for inactive)
+   (24h refresh for active contacts, 7d for inactive), keyed per layer
 ```
 
 The relay query in step 3a targets relays in priority order: the identity's own relays (from a previously cached DID document), then bootstrap relays. If the resolver has no prior knowledge of the identity's relays, only bootstrap relays are queried for the relay layer — the DHT layer provides the backup.
@@ -912,13 +937,13 @@ The relay query in step 3a targets relays in priority order: the identity's own 
 
 The parallel query model (step 3) requires clear rules for when queries are cancelled, how contradictions are resolved, and what happens on failure:
 
-- **First-response optimization.** When the first valid response arrives, the resolver SHOULD continue waiting for the second layer's response for up to 2 seconds (not cancel immediately). This allows the resolver to detect stale documents: if both layers return valid documents, the higher sequence number is authoritative (step 5). Cancelling the slower query immediately would miss a fresher document on the slower layer.
-- **Both layers succeed, same sequence number.** The documents MUST be byte-identical (same key signs both, same content). If they differ despite identical sequence numbers, this indicates a bug in the publishing implementation. The resolver MUST log a warning and accept either document (they should be identical; if not, neither is more authoritative).
-- **Both layers succeed, different sequence numbers.** The higher sequence number is authoritative. The resolver MAY re-publish the fresher document to the layer that returned the stale one (protocol-level healing, §3.10.7).
-- **One layer fails, one succeeds.** The successful response is accepted. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
-- **Both layers fail.** If a cached document exists and is less than 7 days old, the cached document is returned with a `resolution_source: "cache"` indicator. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
+- **First-response optimization.** When Mainline answers first and the caller asked for the full document, the resolver SHOULD continue waiting for a relay response for up to 2 seconds rather than cancelling, because Mainline's answer is the bootstrap core and the caller asked for more than the core carries. When a relay answers first, the resolver MAY cancel the Mainline query, because the relay layer already carries everything Mainline would have supplied.
+- **Two valid records within one layer, same sequence number.** The two records MUST be byte-identical: one key signed both, over one encoding, at one sequence number. If they differ, a publishing implementation is defective. The resolver MUST log a warning and accept either record. This check applies **within a layer only**. The relay layer's bytes and the Mainline layer's bytes at the same sequence number are two different encodings of two different field sets, so comparing them is not a defect check and MUST NOT be performed.
+- **Both layers succeed, different sequence numbers.** Neither number overrules the other. Each layer's record stands as that layer's answer (step 5c). A resolver MAY re-publish a layer's own current encoding to that same layer when the layer returned a stale record (per-layer healing, §3.10.7); it MUST NOT copy one layer's bytes to the other layer, because the receiving layer's cap and encoding differ.
+- **One layer fails, one succeeds.** The successful response is accepted, and it carries that layer's payload: the full document when a relay answered, the bootstrap core when Mainline answered. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
+- **Both layers fail.** If a cached record for either layer exists and is less than 7 days old, the resolver returns it with a `resolution_source: "cache"` indicator and the completeness of the layer it was cached from (§3.10.10). If no cache exists or every cached record is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document, and MUST NOT present a cached bootstrap core as a full document.
 - **One layer returns invalid signature.** The response is discarded as if the layer had failed. An invalid signature is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the invalid document under any circumstances.
-- **Relay blob fails frame decoding.** A relay blob that does not decode as a valid DID-record frame (§9.10.12) — shorter than the 105-byte fixed prefix, carrying an empty `value`, exceeding the bounded `value` length, or an unrecognized `version` — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver falls through to the other layer exactly as for an invalid signature.
+- **Relay blob fails frame decoding.** A relay blob that does not decode as a valid DID-record frame (§9.10.12) — shorter than the 105-byte fixed prefix, carrying an empty `value`, exceeding the bounded `value` length, or an unrecognized `version` — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver discards the blob exactly as it discards an invalid signature. When no relay returns a decodable frame, the resolver's remaining answer is Mainline's bootstrap core, so a caller that asked for the full document gets an unresolved answer for every field outside the core rather than a substitute.
 - **Timeout.** Each layer query has a 5-second timeout. If a layer does not respond within 5 seconds, it is treated as a failure for that resolution attempt.
 
 ### 3.10.5 Publishing Protocol
@@ -927,30 +952,44 @@ Identity owners publish to both layers on every DID document create or update:
 
 ```
 On DID document create or update:
-1. Serialize DID document
-2. Sign via BEP44 (Ed25519 signature over the BEP44-canonical bencoded buffer
-   bencode(salt?, seq, value) — the sequence number precedes the value,
-   `3:seqi<seq>e1:v<value>`, per the BEP44 spec, which is authoritative for
-   this ordering; did:dht uses no salt)
+1. Serialize the document TWICE, once per layer (§18.2.2A):
+   a. relay_value = canonical JSON (RFC 8785) of the full document.
+      Reject at this step if len(relay_value) > MAX_DID_RECORD_VALUE_LEN
+      (262039), with a typed error (§18.2.2C).
+   b. dht_value = did:dht-conformant DNS packet of the bootstrap core
+      (§18.2.2B). Reject at this step if len(dht_value) > 1000, with a
+      typed error (§18.2.2C).
+2. Sign each value SEPARATELY via BEP44 (Ed25519 signature over the
+   BEP44-canonical bencoded buffer bencode(salt?, seq, value) — the sequence
+   number precedes the value, `3:seqi<seq>e1:v<value>`, per the BEP44 spec,
+   which is authoritative for this ordering; did:dht uses no salt). The two
+   signatures differ, because the two values differ. Each layer carries its
+   own sequence number, and a publisher advances each layer's number on that
+   layer's own publish.
 3. In parallel:
-   a. Wrap (public_key, seq, signature, value) in a DID-record frame
-      (§9.10.12) and PUBLISH the frame bytes to SCP relays (own relays +
-      bootstrap relays) via the existing PUBLISH operation, blob_ttl: 604800.
-      The frame is transport framing around `value` — it is NEVER part of the
-      bencoded signed bytes.
-   b. DhtClient.publish(public_key, signature, doc_bytes, seq) to Mainline DHT
+   a. Wrap (public_key, relay_seq, relay_signature, relay_value) in a
+      DID-record frame (§9.10.12) and PUBLISH the frame bytes to SCP relays
+      (own relays + bootstrap relays) via the existing PUBLISH operation,
+      blob_ttl: 604800. The frame is transport framing around `value` — it is
+      NEVER part of the bencoded signed bytes.
+   b. DhtClient.publish(public_key, dht_signature, dht_value, dht_seq) to
+      Mainline DHT
 4. RepublishManager schedules:
    - Relay republishing: every 6 days (blob_ttl is 7 days, 1-day margin)
    - DHT republishing: every 2 hours (existing cycle, unchanged)
 ```
 
-Both layers receive identical document bytes and identical BEP44 signatures. The signed payload is the same regardless of storage backend — this is a direct consequence of the self-certification property. A document retrieved from a relay and a document retrieved from the DHT are byte-identical and verify identically. The DID-record frame wraps `value` for transport but does not enter the signed bytes; the `(value, signature, seq)` triple carried to both layers is byte-identical (§9.10.12).
+**The two layers receive different bytes under different signatures.** The relay layer carries the full document as JSON; Mainline carries the bootstrap core as a DNS packet. A publisher signs each layer's bytes with the same identity key over a different payload, so a record retrieved from a relay and a record retrieved from Mainline are **not** byte-identical, and nothing in this protocol requires them to be. Self-certification still holds on both layers unchanged: each record's signature verifies against the public key encoded in the DID string (§9.6.1), which is what makes each layer's storage backend untrusted. The DID-record frame wraps the relay layer's `value` for transport and does not enter the signed bytes (§9.10.12).
+
+**Why two encodings rather than one.** As JSON, the smallest document §18.2.2A permits is 1,255 bytes minified, against BEP44's 1,000-byte cap. Reducing the field set does not close the gap either: the bootstrap core is still 1,000 bytes as minified JSON with the shortest relay URL this specification's own example uses (§18.2.2C gives the measurements). What brings the core under the cap is the did:dht DNS encoding, which carries no `@context` and uses relative fragment identifiers instead of repeating the absolute DID in every `id` and `controller`. Publishing one encoding to both layers is therefore unavailable, not merely inconvenient.
 
 ### 3.10.6 Anti-Segmentation Invariant
 
-**Publishing to both layers is a MUST, not a SHOULD.** Resolution from both layers is a SHOULD (performance optimization — parallel query is faster but not required for correctness).
+**Publishing to both layers is a MUST, not a SHOULD.** Each layer receives its own encoding: the full JSON document to relays, the DNS-encoded bootstrap core to Mainline (§3.10.5). Resolution from both layers is a SHOULD (performance optimization — parallel query is faster but not required for correctness).
 
 The risk: if the DHT layer works well enough and relay-based resolution is "just faster," developers may skip DHT publishing as unnecessary overhead. If this becomes widespread, identity resolution fragments — some DIDs resolvable only on relays, others only on DHT. A resolver that checks only one layer misses identities published only on the other. The network splits into two resolution namespaces without anyone intending it.
+
+**Two encodings are not two namespaces.** Both layers address the same identity by the same DID, both carry `#active`, the pre-rotation commitment and the relay list, and both verify against the key the DID string encodes. What differs is how much each layer carries beyond the core (§18.2.2B), so an identity present on both layers is resolvable from either. The invariant this section protects is presence on both layers, and it is unchanged.
 
 The SDK prevents this by default. RepublishManager publishes to both layers on every cycle. Disabling either layer requires explicit opt-out (`RepublishConfig::disable_dht()` or `RepublishConfig::disable_relay()`) and the SDK MUST log a warning when either is disabled. The warning states: "DID resolution layer disabled. This identity may not be resolvable by all peers."
 
@@ -958,11 +997,15 @@ The SDK prevents this by default. RepublishManager publishes to both layers on e
 
 ### 3.10.7 Version Resolution
 
-The BEP44 sequence number is the sole authority for document freshness. The highest valid sequence number wins, regardless of which layer served it. Split-brain is impossible: the sequence number is monotonically increasing, and only the identity owner (holder of the Ed25519 private key) can increment it.
+**The BEP44 sequence number is the sole authority for document freshness within a layer.** Within one layer the highest valid sequence number wins. Split-brain within a layer is impossible: the sequence number is monotonically increasing, and only the identity owner (holder of the Ed25519 private key) can increment it.
 
-Stale documents are detected by comparing the received sequence number against the last known sequence number for that DID. A relay or DHT node serving a stale document is not malicious — it simply has not received the latest publish. The stale document is overwritten on the next republish cycle.
+**The sequence number carries no authority across layers.** The relay layer and the Mainline layer sign different payloads and advance separate counters (§3.10.5), so a relay-layer sequence number and a Mainline sequence number are not comparable quantities. A resolver MUST keep one last-known sequence number per (DID, layer) pair, and MUST NOT let a number from one layer reject, supersede, or validate a record from the other.
 
-When both layers return valid documents with different sequence numbers, the higher sequence number is authoritative. The resolver SHOULD update its cache and MAY re-publish the fresher document to the layer that returned the stale one (protocol-level healing).
+Stale records are detected by comparing a received sequence number against the last number the resolver observed **on the layer that served it**. A relay or a Mainline node serving a stale record is not malicious — it simply has not received the latest publish. The stale record is overwritten on that layer's next republish cycle (6 days for relays, 2 hours for Mainline).
+
+**Healing is per layer, and it is a MAY.** When a layer returns a record whose sequence number is lower than the number the resolver already holds for that layer, the resolver SHOULD update its cache and MAY re-publish **that layer's own current encoding** to that layer. A resolver MUST NOT re-publish one layer's bytes to the other layer: the full JSON document exceeds Mainline's 1,000-byte cap, and the DNS-encoded bootstrap core is not the payload the relay layer is authoritative for. Cross-layer healing as this section previously described it — "re-publish the fresher document to the layer that returned the stale one" — is not performable under two encodings, and it is removed rather than reinterpreted.
+
+No production code performs healing today. `DualLayerResolver::new` (`crates/scp-identity/src/resolver.rs:372`) sets `healing_publisher: None`, and all 20 construction sites in the workspace call it; `DualLayerResolver::with_healing` is called only from the crate's own `#[cfg(test)]` module. The capability is therefore honestly absent rather than stubbed. Healing stays a MAY, and a resolver that never heals is conformant.
 
 ### 3.10.8 Security Analysis
 
@@ -980,8 +1023,8 @@ The dual-layer architecture preserves all security properties of §9.6.1 (self-c
 
   This is precisely why the relay layer is suppression-resistant: presence-in-the-QUERY-window is controlled by the validating relay's write rule, not by the attacker's PUBLISH volume or timing.
 - **Attacker DELETEs the slot blob (an integrity vector, closed by the DELETE gate).** DELETE is an unauthenticated relay operation addressing a blob by `blob_id` (`= SHA-256(blob)`), and a DID record is public — so an attacker can compute the genuine record's `blob_id` and issue `DELETE`. Left ungated this is an **integrity** attack, not merely availability: on a cold index (a restarted relay or a store-sharing peer, §3.10.2) the attacker DELETEs the genuine highest-`seq` record from durable storage, then PUBLISHes a captured older lower-`seq` genuine frame; cold-index establish reconciliation, finding the genuine record gone, **establishes that stale newcomer** (it has no higher-`seq` record left in storage to reconcile against) — rolling the victim's DID document back to a rotated-out/revoked key. Note the replayed frame is *owner-signed*, so it passes the client's BEP44 verification; what would otherwise reject it is the client's `seq`-monotonicity check, but that is defeated on a cold-cache first resolution — which is why the relay-side DELETE gate, not client re-verification, is the control that closes this vector. This is closed by **slot-exclusivity rule (d) (§3.10.2): the relay rejects a DELETE of the current slot blob**, and the gate is **storage-derived** (it re-reads and re-verifies the blob's self-certifying bytes), so it holds even against a cold index. The gate is rate-limited (its storage read + signature verify is not an unmetered amplification surface) and fails closed on a storage error. With rule (d), a DELETE cannot purge a genuine record and the rollback is foreclosed.
-- **Suppression resilience (validating SCP-native relays).** With single-slot validation, an attacker cannot evict the genuine record by flooding, and cannot reorder it out of a bounded QUERY window (there is at most one record to return). To prevent resolution, an attacker must suppress the DID document on ALL of an identity's validating relays AND all reachable DHT nodes — the DHT being independently suppression-resistant for the same structural reason (BEP44 nodes validate on write and keep one highest-`seq` slot per key). This "all relays AND the DHT" claim holds for validating relays. **On integrity:** relay misbehavior is availability-only, never integrity, *because* a set of controls hold together, each covering a distinct failure mode — the client's BEP44 re-verification against the DID-derived key (§9.6.1) rejects a **forged** record; the resolver's `seq`-monotonicity + highest-`seq`-across-relays-and-DHT selection (§3.10.4, §3.10.7) rejects a **stale/replayed genuine** record on any warm-cache or multi-source resolution; and the storage-derived, cold-index-immune establish reconciliation + **DELETE gate (rule (d))** close the **cold-cache DELETE-purge-then-replay rollback** that the first two do not cover on a single-source first contact. It is not an unconditional property of the relay: it is delivered by those controls together. A relay that omits them (a foreign/non-validating relay) provides no integrity control of its own — integrity there rests entirely on the client-side checks (§9.6.1 + seq-monotonicity + DHT).
-- **Residual: foreign / non-validating relays are best-effort.** A foreign transport or a non-validating relay that accumulates multiple blobs per `routing_id` can be flooded, and its bounded QUERY window can be made to omit the genuine record. Resolution over such storage alone is therefore best-effort for suppression; the resolver still recovers the genuine record via any validating relay, via multi-relay publishing (§9.9.2), or via the DHT, and its highest-seq-valid selection (§3.10.4) discards the junk. What foreign/non-validating storage contributes is availability, not anti-suppression.
+- **Suppression resilience (validating SCP-native relays).** With single-slot validation, an attacker cannot evict the genuine record by flooding, and cannot reorder it out of a bounded QUERY window (there is at most one record to return). To prevent resolution, an attacker must suppress the DID document on ALL of an identity's validating relays AND all reachable DHT nodes — the DHT being independently suppression-resistant for the same structural reason (BEP44 nodes validate on write and keep one highest-`seq` slot per key). This "all relays AND the DHT" claim holds for validating relays. **On integrity:** relay misbehavior is availability-only, never integrity, *because* a set of controls hold together, each covering a distinct failure mode — the client's BEP44 re-verification against the DID-derived key (§9.6.1) rejects a **forged** record; the resolver's per-layer `seq`-monotonicity plus its highest-`seq`-across-relays selection (§3.10.4 step 5a, §3.10.7) rejects a **stale/replayed genuine** relay record on any warm-cache or multi-relay resolution; and the storage-derived, cold-index-immune establish reconciliation + **DELETE gate (rule (d))** close the **cold-cache DELETE-purge-then-replay rollback** that the first two do not cover on a single-source first contact. Mainline does not contribute to that relay-layer selection, because it carries the bootstrap core rather than the full document (§3.10); what Mainline contributes against relay-layer suppression is a second, independently-suppression-resistant copy of the relay list, from which the resolver reaches a relay the attacker did not suppress. It is not an unconditional property of the relay: it is delivered by those controls together. A relay that omits them (a foreign/non-validating relay) provides no integrity control of its own — integrity there rests entirely on the client-side checks (§9.6.1 + seq-monotonicity + DHT).
+- **Residual: foreign / non-validating relays are best-effort.** A foreign transport or a non-validating relay that accumulates multiple blobs per `routing_id` can be flooded, and its bounded QUERY window can be made to omit the genuine record. Resolution over such storage alone is therefore best-effort for suppression; the resolver still recovers the genuine full document via any validating relay or via multi-relay publishing (§9.9.2), and its highest-seq-valid selection **within the relay layer** (§3.10.4 step 5a) discards the junk. Mainline recovers the bootstrap core rather than the full document, so it restores the relay list the resolver needs to reach an unsuppressed relay. What foreign/non-validating storage contributes is availability, not anti-suppression.
 
 ### 3.10.9 Privacy Properties
 
@@ -1010,10 +1053,23 @@ pub trait DidResolver: Send + Sync {
 pub struct ResolvedDidDocument {
     /// The verified DID document.
     pub document: DidDocument,
-    /// BEP44 sequence number. Monotonically increasing.
+    /// BEP44 sequence number, scoped to the layer named by `source`.
+    /// Never compared against a sequence number from the other layer
+    /// (§3.10.7).
     pub seq: u64,
     /// Which resolution layer served this document.
     pub source: ResolutionSource,
+    /// Whether `document` is the full document or the bootstrap core.
+    pub completeness: DocumentCompleteness,
+}
+
+/// How much of the DID document a resolution returned (§18.2.2B).
+pub enum DocumentCompleteness {
+    /// Every field the identity published. Only the relay layer serves this.
+    Full,
+    /// `#active`, the pre-rotation commitment and the relay list. Mainline
+    /// serves this. A field outside the core is unresolved, not absent.
+    BootstrapCore,
 }
 
 /// Provenance of a resolved DID document.
@@ -1027,13 +1083,15 @@ pub enum ResolutionSource {
 }
 ```
 
-`DidResolver` composes the relay QUERY path with `DhtClient::resolve()` internally. The existing `DidMethod::resolve()` interface continues to work for single-layer DHT resolution — `DidResolver` is an additive layer, not a replacement. Code that only needs DHT resolution (e.g., interoperability tools) can use `DidMethod` directly.
+`DidResolver` composes the relay QUERY path with `DhtClient::resolve()` internally. The existing `DidMethod::resolve()` interface continues to work for single-layer Mainline resolution — `DidResolver` is an additive layer, not a replacement. Code that only needs Mainline resolution (an interoperability tool, for instance) can use `DidMethod` directly, and what it receives is the bootstrap core.
+
+**A caller MUST be able to tell a bootstrap-core resolution from a full one.** `completeness` carries that answer, and a caller that reads a field outside the core from a `BootstrapCore` result MUST treat the field as unresolved. Without this distinction a caller cannot separate "the identity published no `SCPCapabilities` entry" from "Mainline does not carry `SCPCapabilities`," and the second reading would let a Mainline-only resolution silently deny a capability the identity actually declares.
 
 ### 3.10.11 Bootstrap and Network Growth
 
 The dual-layer architecture is designed to be self-reinforcing as the SCP network grows:
 
-- **Day one.** DHT dominates. Relay-layer queries mostly fail because few relays exist and few identities have published DID documents to relays. Resolution latency is DHT latency. The protocol works identically to the pre-§3.10 architecture.
+- **Day one.** Mainline dominates. Relay-layer queries mostly fail because few relays exist and few identities have published DID documents to relays. Resolution latency is Mainline latency, and what most resolutions return is the bootstrap core (§18.2.2B). A caller that needs a field outside the core — a capability endpoint, an attestation entry, `alsoKnownAs` — gets an unresolved answer for that field until the identity's relays answer (§3.10.3). This differs from the pre-§3.10 architecture, which attempted to carry the whole document on Mainline and failed the 1,000-byte BEP44 cap while reporting a timeout.
 - **Growth.** More relays come online. More identities publish to relays. Relay-layer resolution begins succeeding more often, and faster than DHT traversal. DHT queries still run in parallel as backup.
 - **Maturity.** Relay-layer resolution is primary for most identities. DHT latency becomes irrelevant because relay responses arrive first. DHT serves as an availability backstop and interoperability bridge for non-SCP clients.
 - **DHT is never removed.** The cost of maintaining DHT publishing is one BEP44 put every 2 hours — negligible. The benefit is permanent: a resolution path that works even if every SCP relay is unreachable. Removing it would violate the anti-segmentation invariant (§3.10.6).
@@ -1048,6 +1106,9 @@ The dual-layer architecture is designed to be self-reinforcing as the SCP networ
 | `DidResolver` trait | Phase 2 | `scp-core` | Unified interface composing relay + DHT resolution. |
 | Parallel dual-layer resolution | Phase 2 | `scp-core` | Orchestration of parallel queries with first-valid-wins semantics. |
 | DID-record relay frame (§9.10.12) | Phase 2 (#482) | `scp-protocol` | Deterministic binary encode/decode of the minimal fixed-layout DID-record frame (`DidRecordV1`). Pure sync wasm-compatible type; consumed by the relay publisher + DID resolver in `scp-identity` and by the relay-side validation path. |
+| Mainline bootstrap-core DNS encoder (§18.2.2B) | Phase 2 (#2297) | `scp-did` | did:dht-conformant DNS-packet encode/decode of the bootstrap core, the Mainline layer's payload. Pure sync wasm-compatible, so the in-browser client (ADR-057) can build and verify it. Consumed by the Mainline publisher and by `DidMethod::resolve`. |
+| Per-layer publish size gates (§18.2.2C) | Phase 2 (#2297) | `scp-did`, `scp-identity` | Rejects an over-cap encoding at publish time with a typed error: 1,000 bytes for Mainline, `MAX_DID_RECORD_VALUE_LEN` for the relay layer. Ships with fixtures at and above each cap. |
+| Relay-layer RFC 8785 canonicalization (§18.2.2A) | Phase 2 (#2297) | `scp-did` | Replaces `serde_json::to_string_pretty` in `DidDocument::to_json` on the publish path, so two SDKs sign the same octets. |
 
 ## 3.11 DID Authentication for External Services (SCPID)
 

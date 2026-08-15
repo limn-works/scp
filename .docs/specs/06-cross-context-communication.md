@@ -140,7 +140,7 @@ Discovery is built from two complementary mechanisms: DID document capabilities 
 
 #### A. DID Document Capabilities
 
-Every agent MAY publish structured capabilities in their DID document's `service` array. These are resolved via did:dht — always available, 0-setup, no context required. Any agent that knows a DID can resolve the document and inspect capabilities directly.
+Every agent MAY publish structured capabilities in their DID document's `service` array. `SCPCapabilities` entries live on the relay layer, which §3.10 makes authoritative for the full document; the Mainline bootstrap core does not carry them (§18.2.2B). A resolver reaches them by resolving the DID and querying a relay from the resolved relay list, so the path needs no context and no prior relationship. A resolver that reached only Mainline holds the relay list but not the capability entries, and MUST treat those entries as unresolved rather than concluding the agent publishes none (§3.10.10).
 
 ```json
 {

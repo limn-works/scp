@@ -561,7 +561,7 @@ agent_deregister(did) -> { removed }
 ```
 
 2. **DID document capability resolution:**
-   - `resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError>`: Resolve DID via did:dht, extract `SCPCapabilities` from service array, cache in local contact index. Resolution returns all verification methods including the optional `#agent` VM (ADR-039), enabling callers to determine whether a DID has agent delegation enabled.
+   - `resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError>`: Resolve the DID, extract `SCPCapabilities` from the service array, cache in local contact index. `SCPCapabilities` and the optional `#agent` verification method (ADR-039) live on the relay layer, which §3.10 makes authoritative for the full document, so this operation reads a relay-layer resolution. A resolution that returned only the Mainline bootstrap core (§18.2.2B) carries neither, and this operation MUST report that as unresolved rather than returning an empty capability set or reporting that agent delegation is disabled (§3.10.10).
 
 3. **Context standard outlets:**
    - `agent_search`, `agent_register`, `agent_deregister` implemented per schema.

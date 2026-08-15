@@ -1272,7 +1272,11 @@ DidDocument.verification_method = [
 
 **Structural constraint:** Exactly one `#agent` verification method per DID document. Verifiers reject documents with multiple `#agent` VMs. `#agent` is optional — not every DID needs an agent.
 
-**Agent key scope is global.** One persistent `#agent` key per DID, not per-context. DID documents are already ~1,140 bytes with 2 VMs (BEP44 v1 payload limit is 1,000 bytes, requiring bencode packing). Per-context agent keys would exceed document size constraints at scale. Context-specific restrictions on agent behavior use existing mechanisms: roles, capability ceilings, and context parameters — not separate keys.
+**Agent key scope is global.** One persistent `#agent` key per DID, not per-context. Context-specific restrictions on agent behavior use existing mechanisms: roles, capability ceilings, and context parameters — not separate keys.
+
+The size argument this decision originally gave — "DID documents are already ~1,140 bytes with 2 VMs (BEP44 v1 payload limit is 1,000 bytes, requiring bencode packing)" — was right about the overflow and wrong about the remedy. Measured through `DidDocument::new`, a two-verification-method document is 1,281 bytes as `DidDocument::to_json` emits it and 1,103 bytes minified; adding the `SCPRelay` service entry that §18.2.2 makes mandatory takes it to 1,467 and 1,255. Packing does not close that gap, and neither does reducing the field set: the bootstrap core is still 1,000 bytes as minified JSON (§18.2.2C). What closes it is a second encoding. Under the two-encoding model (§18.2.2A), the relay layer carries the full JSON document under a 262,039-byte bound and Mainline carries the DNS-encoded bootstrap core under the 1,000-byte BEP44 bound, so the relay layer's size is no longer what forbids per-context agent keys. The reason that survives is the one above: per-context keys duplicate authority that roles, ceilings and context parameters already express.
+
+The `#agent` verification method lives on the relay layer only. A resolver holding just the bootstrap core does not learn whether a DID has agent delegation enabled, and MUST treat that as unresolved rather than absent (§3.10.10).
 
 ### Permission Model
 
