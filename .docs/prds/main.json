@@ -901,7 +901,10 @@
       "details": {
         "sealPath": "seal_envelope: serialize inner envelope -> MLS encrypt -> wrap in outer envelope with routing_id, recipient_hint, blob_ttl",
         "openPath": "open_envelope: MLS decrypt -> deserialize inner envelope -> strip padding -> verify payload_hash == SHA256(stripped_payload) -> verify inner signature -> verify generation number -> return verified inner envelope",
-        "superseded_by": ["SCP-OUT-002", "SCP-OUT-003"]
+        "superseded_by": [
+          "SCP-OUT-002",
+          "SCP-OUT-003"
+        ]
       },
       "result": "seal_envelope and open_envelope with full integrity verification. 13 tests (12 + 1 proptest). All passing."
     },
@@ -1102,7 +1105,9 @@
         "hpkeAssembly": "HPKE: (1) generate ephemeral X25519 keypair (software-generated), (2) ECDH between ephemeral secret and requester wrapping pubkey, (3) HKDF to derive encryption key, (4) AES-128-GCM encrypt the sender key. Ephemeral public key included in response.",
         "hpkeOpen": "Uses key_custody.dh_agree(wrapping_key_handle, ephemeral_pk) to compute shared secret inside custody boundary, then KDF + AEAD in software to recover sender key. Wrapping private key never leaves KeyCustody.",
         "blockNotificationVerification": "Receiver MUST verify Ed25519 signature by resolving the public key identified by signing_key_id (#active or #agent) from the blocker's DID document per §9.16.3 and ADR-039. Discard without action if verification fails. Log discarded notification for anomaly detection.",
-        "superseded_by": ["SCP-OUT-002"]
+        "superseded_by": [
+          "SCP-OUT-002"
+        ]
       },
       "result": "Implemented pull-based sender key protocol: SenderKeyEpochAdvance, SenderKeyRequest/Response with HPKE, block notifications, rotate_sender_key_for_block. 15 tests."
     },
@@ -1433,7 +1438,9 @@
         "TemplateId enum": "```rust\npub enum TemplateId {\n    BilateralEphemeral,\n    BilateralPersistent,\n    Coordination,\n    GroupDiscussion,\n    PublicBroadcast,\n    GatedBroadcast,\n}\n```\nTemplates are protocol constants — not user-extensible. When present, all other ContextParams fields must match the template definition exactly.",
         "Implementation notes": "Language: Rust. Crate: scp-core. Module: scp-core/context/. Async runtime: tokio (TTL timers, MLS operations, transport). State persistence: Via ProtocolRepository (§17.4), which wraps the scp-platform Storage trait with typed domain methods. Context state is serialized and persisted on every transition so contexts survive process restarts. Key convention follows §17.3.",
         "Concurrency model": "All public handle types (Identity, Context, TransportManager) are safe to share across threads/tasks. In Rust: Send + Sync. In Python: safe to use from any asyncio task on the same event loop. In Swift: Sendable. In Go: safe for concurrent use. In Kotlin: safe across coroutines. Individual operations are serialized internally — concurrent sends on the same context are safe and ordered. No SDK user should ever need an external lock to use SCP types safely.",
-        "superseded_by": ["SCP-OUT-002"]
+        "superseded_by": [
+          "SCP-OUT-002"
+        ]
       },
       "result": "Implemented context types: ContextState FSM, ContextHandle, ContextParams, all parameter enums. 52 tests."
     },
@@ -2120,13 +2127,14 @@
         "crates/scp-event-log/src/checkpoint.rs",
         "crates/scp-runtime/src/context/queries_helpers.rs"
       ],
-      "description": "Implement consistency checkpoints (spec section 9.9.3) for detecting relay equivocation. Members periodically exchange signed Merkle roots. If two members have different roots for the same event count, the relay is equivocating (showing different histories to different members). Detection requires only two honest members. Checkpoints are generated every 50 events or every 10 minutes, whichever comes first, and sent as regular MLS application messages. Scope boundary: this story covers checkpoint PRODUCTION (struct, generate_checkpoint, scheduling) in scp-event-log and the eventCount/merkleRoot verdict plus its authenticity gates in the runtime judge `queries_helpers::compare_remote_checkpoint`. It does NOT cover the third comparison field spec section 9.9.3 specifies, `epoch` (“Must match. Divergence indicates a missed MLS Commit (possible suppression)”) — see the explicit scope criterion below; that gap is tracked in #2323 because implementing it changes protocol-observable verdicts. It also does NOT cover the second signing key spec section 9.9.3 permits: the judge resolves the sender's `#active` verification method only, so a checkpoint signed under `#agent` is refused fail-closed and equivocation by an `#agent`-key signer is undetectable — same scope criterion below; that gap is tracked in #2325.",
+      "description": "Implement consistency checkpoints (spec section 9.9.3) for detecting relay equivocation. Members periodically exchange signed Merkle roots. If two members have different roots for the same event count, the relay is equivocating (showing different histories to different members). Detection requires only two honest members. Checkpoints are generated every 50 events or every 10 minutes, whichever comes first, and sent as regular MLS application messages. Scope boundary: this story covers checkpoint PRODUCTION (struct, generate_checkpoint, scheduling) in scp-event-log and the eventCount/merkleRoot verdict plus its authenticity gates in the runtime judge `queries_helpers::compare_remote_checkpoint`. It does NOT cover the third comparison field spec section 9.9.3 specifies, `epoch` (“Must match. Divergence indicates a missed MLS Commit (possible suppression)”) — see the explicit scope criterion below; that gap is tracked in #2323 because implementing it changes protocol-observable verdicts. Both signing keys spec section 9.9.3 permits ARE covered: the judge resolves the verification method the sender DECLARED on the enclosing inner envelope (`InnerEnvelope.signing_key_id`, ADR-039) rather than assuming `#active`, so equivocation detection applies under `#agent` exactly as under `#active`, and each signature is bound to the persona that declared it.",
       "acceptanceCriteria": [
         "`ConsistencyCheckpoint` struct with fields: context_id (ContextId), sender_did (DID), event_count (u64), merkle_root ([u8; 32]), epoch (Option<u64> — current MLS epoch, None for Broadcast contexts), timestamp (u64), signature (Ed25519Signature)",
         "`generate_checkpoint(log: &EventLog, sender_did: &DID, epoch: u64, signer: &(impl EventLogSigner + ?Sized)) -> Result<ConsistencyCheckpoint, EventLogError>` in crates/scp-event-log/src/checkpoint.rs is `async` and creates and signs a checkpoint from the current log state; it takes NO `signing_key_id` parameter (the verification method is resolved from the signer's DID document — see the signing-key-identification note under ADR-011 criterion 1 in .docs/adrs/phase-2.md)",
         "Comparison of a RECEIVED checkpoint against local state returns Consistent, Divergent { first_divergent_event: Option<u64> }, Behind { missing_events: u64 }, or Ahead { extra_events: u64 }. The SOLE comparison path is the runtime judge `queries_helpers::compare_remote_checkpoint` in crates/scp-runtime/src/context/queries_helpers.rs. The originally-specified ungated `compare_checkpoint` free function in scp-event-log was REMOVED: with no signer, no roster, and no context binding in its signature it could not satisfy spec section 23.12 item 1 (“Clients MUST verify the signature on every received ConsistencyCheckpoint before accepting it for comparison”), and it would classify an unsigned checkpoint from a non-member as Divergent, letting any unauthenticated sender forge an equivocation alert. See the SUPERSEDED marker and correction under ADR-011 acceptance criterion 8 in .docs/adrs/phase-2.md and the Resolution clause in .docs/audits/adr-audit-phase-1-3.md",
-        "The judge REFUSES rather than judges when any authenticity gate fails, before the count/root arithmetic runs: a non-member sender returns ContextError::MemberNotFound; an unresolvable signing key or a signature that does not verify returns ContextError::CryptoFailed (spec section 23.12 items 1–2); a checkpoint bound to a different context_id than the one being judged returns ContextError::CryptoFailed. An unreachable LOCAL event log likewise returns ContextError::EventLogFailed rather than a fabricated verdict. On every refusal no ContextEvent::EquivocationDetected is emitted and no divergence is recorded",
-        "SCOPE — the judge compares eventCount and merkleRoot ONLY, and accepts checkpoints signed under the `#active` verification method ONLY. (a) EPOCH: spec section 9.9.3 lists a third comparison field, `epoch` (“Must match. Divergence indicates a missed MLS Commit (possible suppression)”), and `classify_remote_checkpoint` reads no `remote.epoch` (grep for `remote.epoch` in crates/scp-runtime/src/context/queries_helpers.rs returns nothing); the epoch comparison is the real fix, see #2323. (b) AGENT KEY: spec section 9.9.3 specifies the checkpoint signature as “signed by sender's #active or #agent key (ADR-039); equivocation detection applies to both”, but `verify_remote_checkpoint_authenticity` resolves `scp_did::SigningKeyId::Active` only (grep for `SigningKeyId::Agent` in crates/scp-runtime/src/context/queries_helpers.rs returns nothing), so an #agent-signed checkpoint is REFUSED with ContextError::CryptoFailed — fail-closed, a refusal to judge rather than a forgeable acceptance — and equivocation by an #agent-key signer is therefore undetectable; resolving both verification methods is the real fix, see #2325. No criterion in this story asserts the epoch comparison or #agent-key acceptance, and none may be read as claiming the full section 9.9.3 comparison-field set or signing-key set is implemented",
+        "The judge REFUSES rather than judges when any authenticity gate fails, before the count/root arithmetic runs: a non-member sender returns ContextError::MemberNotFound; a signature checked against the sender's DECLARED verification method (`InnerEnvelope.signing_key_id`, ADR-039) returns ContextError::CryptoFailed when that method is absent from the sender's DID document or when the signature does not verify against the key it resolves to — the judge never retries under the other method (spec section 23.12 items 1–2); a checkpoint bound to a different context_id than the one being judged returns ContextError::CryptoFailed. An unreachable LOCAL event log likewise returns ContextError::EventLogFailed rather than a fabricated verdict. On every refusal no ContextEvent::EquivocationDetected is emitted and no divergence is recorded",
+        "SCOPE — the judge compares eventCount and merkleRoot ONLY. Spec section 9.9.3 lists a third comparison field, `epoch` (“Must match. Divergence indicates a missed MLS Commit (possible suppression)”), and `classify_remote_checkpoint` reads no `remote.epoch` (grep for `remote.epoch` in crates/scp-runtime/src/context/queries_helpers.rs returns nothing); the epoch comparison is the real fix, see #2323. No criterion in this story asserts the epoch comparison, and none may be read as claiming the full section 9.9.3 comparison-field set is implemented",
+        "Both section 9.9.3 signing keys are judgeable, each bound to the method its sender declared: `verify_remote_checkpoint_authenticity` takes a `signing_key_id: scp_did::SigningKeyId` threaded from the enclosing `InnerEnvelope` (through `messaging_helpers::deliver_incoming` → `deliver_checkpoint_message` on the receive path, and through `Supervisor::compare_remote_checkpoint` / `MessagingCommand::CompareRemoteCheckpoint` on the actor-mailbox path) and resolves EXACTLY that verification method (ADR-039 — “Verifiers resolve the correct public key from the DID document based on this field”). It does NOT try `#active` then fall back to `#agent`: the `verify_remote_checkpoint_authenticity` body in crates/scp-runtime/src/context/queries_helpers.rs makes exactly ONE `deps.key_resolver` call and passes its `signing_key_id` parameter to it, naming no `SigningKeyId` variant literal. An `#agent`-signed divergent checkpoint is judged Divergent and raises EquivocationDetected; an `#agent`-signed consistent one returns Consistent; a signature under a key class that is neither, or under a method other than the declared one, is refused with ContextError::CryptoFailed",
         "Checkpoints generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3)",
         "Checkpoints sent as regular MLS application messages",
         "Divergent Merkle roots for the same event count indicate equivocation — trigger alert and divergence resolution",
@@ -2136,14 +2144,17 @@
         "Unit test: the judge returns Divergent for different roots at equal event count, and raises the EquivocationDetected alert — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::two_members_with_divergent_logs_at_equal_count_is_equivocation`",
         "Unit test: the judge returns Behind when local has fewer events, and raises no alert — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::local_behind_the_remote_is_behind_not_equivocation`",
         "Unit test: the judge returns Ahead when local has more events, and raises no alert — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::local_ahead_of_the_remote_is_ahead_not_equivocation`",
-        "Unit test: each authenticity gate refuses rather than judges, each with a positive control proving the refusal is that gate — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::a_non_member_checkpoint_is_refused_not_judged`, `...::a_forged_checkpoint_signature_is_refused_not_judged`, `...::a_foreign_context_checkpoint_is_refused_not_judged`, `...::an_unreachable_local_log_refuses_to_judge_a_peer`"
+        "Unit test: each authenticity gate refuses rather than judges, each with a positive control proving the refusal is that gate — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::a_non_member_checkpoint_is_refused_not_judged`, `...::a_forged_checkpoint_signature_is_refused_not_judged`, `...::a_foreign_context_checkpoint_is_refused_not_judged`, `...::an_unreachable_local_log_refuses_to_judge_a_peer`",
+        "Unit test: an `#agent`-signed divergent checkpoint is judged and alerts, and an `#agent`-signed consistent one is Consistent — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::an_agent_signed_divergent_checkpoint_is_judged_and_alerts`, `...::an_agent_signed_consistent_checkpoint_is_consistent`",
+        "Unit test: a checkpoint is verified only under the DECLARED verification method — a key class that is neither `#active` nor `#agent` is refused, a method absent from the sender's DID document is refused, and a signature under the non-declared method is refused (the try-both regression guard) — `scp_runtime::context::queries_helpers::remote_checkpoint_classification_tests::a_checkpoint_signed_by_neither_permitted_key_class_is_refused`, `...::a_declared_method_absent_from_the_did_document_is_refused`, `...::a_checkpoint_is_judged_only_under_the_declared_verification_method`"
       ],
       "actionItems": [
         "Create `crates/scp-event-log/src/checkpoint.rs` with the ConsistencyCheckpoint struct and the CheckpointComparison enum",
         "Implement generate_checkpoint: capture current root, event_count, epoch, sign with Ed25519",
         "Implement the received-checkpoint judge in the runtime as `queries_helpers::compare_remote_checkpoint`: apply the membership, signature, and context_id gates first, then return the appropriate CheckpointComparison variant from a single event-log snapshot. Do NOT add an ungated free-function comparator in scp-event-log",
         "Implement checkpoint scheduling logic: track events since last checkpoint, track time since last checkpoint, trigger at 50 events or 10 minutes",
-        "Write unit tests for checkpoint generation, for each CheckpointComparison variant against the production judge, and for each gate refusal"
+        "Write unit tests for checkpoint generation, for each CheckpointComparison variant against the production judge, and for each gate refusal",
+        "Thread the sender's declared `InnerEnvelope.signing_key_id` from the receive path and the actor-mailbox command into the judge, and resolve exactly that verification method in `verify_remote_checkpoint_authenticity` (ADR-039), so section 9.9.3 equivocation detection applies under `#active` and `#agent` alike without the two personas becoming interchangeable"
       ],
       "blockedBy": [
         "SCP-006",
@@ -2168,7 +2179,7 @@
         "CheckpointComparison enum": "Returns: Consistent, Divergent { first_divergent_event: Option<u64> }, Behind { missing_events: u64 }, or Ahead { extra_events: u64 }.",
         "Scheduling": "Checkpoints are generated every 50 events or every 10 minutes, whichever comes first (spec section 9.9.3). Checkpoints are sent as regular MLS application messages. Divergent Merkle roots for the same event count indicate equivocation — trigger alert and divergence resolution."
       },
-      "result": "ConsistencyCheckpoint struct, generate_checkpoint (async signing), CheckpointScheduler (50 events/10min) in scp-event-log. The received-checkpoint verdict is the gated runtime judge queries_helpers::compare_remote_checkpoint; the ungated compare_checkpoint free function was removed (spec section 23.12 item 1). eventCount/merkleRoot only — the section 9.9.3 epoch comparison is not implemented (#2323) — and #active-signed checkpoints only, not the #agent key section 9.9.3 equally permits (#2325)."
+      "result": "ConsistencyCheckpoint struct, generate_checkpoint (async signing), CheckpointScheduler (50 events/10min) in scp-event-log. The received-checkpoint verdict is the gated runtime judge queries_helpers::compare_remote_checkpoint; the ungated compare_checkpoint free function was removed (spec section 23.12 item 1). eventCount/merkleRoot only — the section 9.9.3 epoch comparison is not implemented (#2323). Both section 9.9.3 signing keys are judgeable: the judge resolves the verification method the sender declared on the enclosing inner envelope (ADR-039), so an #agent-signed checkpoint is judged rather than refused, and a signature under any other method or key class is refused fail-closed."
     },
     {
       "id": "SCP-033",
@@ -2573,7 +2584,9 @@
         }
       ],
       "details": {
-        "superseded_by": ["SCP-OUT-005"]
+        "superseded_by": [
+          "SCP-OUT-005"
+        ]
       },
       "result": "PyOutletRegistration, PyOutletVerificationResult, PyTransportStatus, PyUcanToken, PyEvent, PyProof types + 10 bridge functions across outlets.rs, transport.rs, ucan.rs, event_log.rs"
     },
@@ -2612,7 +2625,10 @@
         }
       ],
       "details": {
-        "superseded_by": ["SCP-OUT-005", "SCP-OUT-006"]
+        "superseded_by": [
+          "SCP-OUT-005",
+          "SCP-OUT-006"
+        ]
       },
       "result": "Implemented in iteration 3"
     },

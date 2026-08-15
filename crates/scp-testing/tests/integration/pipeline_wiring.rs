@@ -2660,6 +2660,42 @@ fn b3_merkle_proof_verification_wired() {
         "deliver_checkpoint_message must call compare_remote_checkpoint so a \
          received checkpoint is checked for equivocation (§9.9.3)"
     );
+
+    // ADR-039 declared-key threading. §9.9.3 makes equivocation detection apply
+    // under BOTH `#active` and `#agent`, and ADR-039 requires the verifier to
+    // resolve the method the sender DECLARED. That declaration only reaches the
+    // judge if the receive path forwards the enclosing envelope's
+    // `signing_key_id` — dropping it silently reinstated an `#active`-only judge,
+    // which refused honest `#agent` signers and exempted an `#agent`-key
+    // equivocator from tier-(a) detection entirely.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "deliver_incoming", "inner.signing_key_id"),
+        "deliver_incoming must forward the inner envelope's declared \
+         signing_key_id to deliver_checkpoint_message (§9.9.3 / ADR-039)"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "deliver_checkpoint_message", "signing_key_id"),
+        "deliver_checkpoint_message must pass the declared signing_key_id on to \
+         compare_remote_checkpoint so the judge resolves the sender's DECLARED \
+         verification method (§9.9.3 / ADR-039)"
+    );
+    // And the judge must resolve THAT parameter, not a hardcoded variant: a
+    // literal `SigningKeyId::Active` in the authenticity gate is the exact
+    // regression this closes.
+    let authenticity_body = extract_fn_body(MANAGER_SRC, "verify_remote_checkpoint_authenticity")
+        .expect("verify_remote_checkpoint_authenticity must exist in manager source");
+    assert!(
+        authenticity_body.contains("deps.key_resolver)(&remote.sender_did, signing_key_id)"),
+        "verify_remote_checkpoint_authenticity must resolve the DECLARED \
+         signing_key_id (ADR-039), never a hardcoded verification method"
+    );
+    assert!(
+        !authenticity_body.contains("SigningKeyId::Active")
+            && !authenticity_body.contains("SigningKeyId::Agent"),
+        "verify_remote_checkpoint_authenticity must name no SigningKeyId variant \
+         literal — hardcoding one re-narrows the judge, and trying both would \
+         decouple the persona stamp from the signing key (ADR-039)"
+    );
 }
 
 /// The suppression-detection heartbeat loop (§9.9.2) must be closed end to

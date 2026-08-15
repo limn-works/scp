@@ -181,8 +181,16 @@ pub(crate) async fn dispatch(
         MessagingCommand::CompareRemoteCheckpoint {
             context_id,
             remote,
+            signing_key_id,
             reply,
-        } => handle_compare_remote_checkpoint(cell, deps, &context_id, &remote, reply),
+        } => handle_compare_remote_checkpoint(
+            cell,
+            deps,
+            &context_id,
+            &remote,
+            signing_key_id,
+            reply,
+        ),
         MessagingCommand::SendHeartbeat {
             context_id,
             sender_did,
@@ -1124,8 +1132,11 @@ async fn handle_build_local_checkpoint(
 ///
 /// Compares a remote checkpoint against local event-log state via
 /// [`compare_remote_checkpoint`](crate::context::queries_helpers::compare_remote_checkpoint),
-/// which verifies membership + the checkpoint Ed25519 signature, compares
-/// Merkle roots, and emits `ContextEvent::EquivocationDetected` on a
+/// which verifies membership + the checkpoint Ed25519 signature (against the
+/// `signing_key_id` verification method the sender DECLARED on the enclosing
+/// envelope — `#active` or `#agent`, ADR-039 — so §9.9.3 detection applies under
+/// both), compares Merkle roots, and emits
+/// `ContextEvent::EquivocationDetected` on a
 /// `Divergent` result (§9.9.3). Synchronous; forwards the typed
 /// `Result<CheckpointComparison, ContextError>` verbatim so the caller
 /// sees the `Behind` (consistency-proof catch-up seam, specified
@@ -1143,6 +1154,7 @@ fn handle_compare_remote_checkpoint(
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    signing_key_id: scp_did::SigningKeyId,
     reply: crate::context::actor::commands::CompareRemoteCheckpointReply,
 ) -> Outcome<()> {
     // Coalesced Class-C mutation (the run loop persists on `mutated`); the
@@ -1154,6 +1166,7 @@ fn handle_compare_remote_checkpoint(
         deps,
         context_id,
         remote,
+        signing_key_id,
     );
     let mutated = result.is_ok();
     let _ = reply.send(result);

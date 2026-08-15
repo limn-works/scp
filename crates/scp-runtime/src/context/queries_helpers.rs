@@ -1,12 +1,9 @@
 // Module-level allow — `dead_code` is allowed module-wide because this
 // module is the authoritative home for query-domain free functions
-// consumed by FFI bridges (PyO3 / NAPI / UniFFI) and by external
-// test crates behind `feature = "testing"`. Several of the actor-shape
-// helpers wired here have no in-tree caller until the supervisor's
-// `dispatch_query` shim is deleted in Phase 2A finalization; until then
-// the live FFI / test path still flows through
-// [`crate::context::queries_helpers_legacy`] via the supervisor
-// passthroughs.
+// consumed by FFI bridges (PyO3 / NAPI / UniFFI) and by external test
+// crates behind `feature = "testing"`. Those callers live outside this
+// crate, so rustc's reachability analysis cannot see them and would
+// report several helpers here as unused.
 #![allow(clippy::significant_drop_tightening, dead_code)]
 
 //! Queries-domain helpers — actor-shape signatures
@@ -810,20 +807,62 @@ fn build_checkpoint(
     Ok(unsigned.into_signed(signature.to_bytes().to_vec()))
 }
 
-/// Fail-closed authenticity gate for a remote checkpoint: the sender must
-/// be a current member and the checkpoint's Ed25519 signature must verify
-/// against the sender's resolved public key.
+/// Fail-closed authenticity gate for a remote checkpoint: the sender must be a
+/// current member and the checkpoint's Ed25519 signature must verify against the
+/// sender's `signing_key_id` verification method, resolved from their DID
+/// document.
+///
+/// # The signing key is DECLARED, not guessed
+///
+/// Spec `.docs/specs/09-security-model.md` §9.9.3 specifies the checkpoint
+/// signature as "signed by sender's `#active` or `#agent` key (ADR-039);
+/// equivocation detection applies to both", so BOTH verification methods must be
+/// judgeable — accepting only `#active` would let a peer that equivocates while
+/// signing under `#agent` escape detection entirely.
+///
+/// The way to accept both is to resolve the one the sender DECLARED, not to try
+/// each in turn. ADR-039 (`.docs/adrs/phase-1.md`, MLS Impact) is explicit:
+/// "Verifiers resolve the correct public key from the DID document **based on
+/// this field**." Trying `#active` then `#agent` and accepting whichever
+/// verifies would decouple the persona stamp from the signing key — exactly the
+/// divergence ADR-039's Enforcement-Stack layer 2 exists to prevent, where the
+/// stamp and the key "are chosen together from one persona and cannot diverge".
+/// Under try-both, an `#agent`-signed checkpoint would be accepted while
+/// declaring the `#active` persona, laundering an agent action into a human
+/// attribution.
+///
+/// `signing_key_id` is therefore threaded from the enclosing
+/// [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope) that carried
+/// the checkpoint — the same field
+/// [`verify_and_unwrap`](crate::context::messaging_helpers::verify_and_unwrap)
+/// already uses for the envelope's own signature, so the checkpoint inside is
+/// judged under the same declared persona that authenticated the envelope
+/// around it. The [`ConsistencyCheckpoint`](scp_event_log::checkpoint::ConsistencyCheckpoint)
+/// struct itself carries no key id (neither as a field nor in the
+/// `SCP-CHECKPOINT-V1:` canonical-hash preimage) precisely because ADR-011
+/// criterion 8 places the verification method on the signature apparatus, not
+/// alongside the key.
+///
+/// # Key classes other than `#active` / `#agent`
+///
+/// Refused by construction, with no runtime re-check: [`scp_did::SigningKeyId`]
+/// admits exactly `Active` and `Agent`, so no other key class is nameable here.
+/// A checkpoint actually signed by some other key — a device key, a rotated-out
+/// key, a relay's key — does not verify against the declared method's resolved
+/// public key and is refused with [`ContextError::CryptoFailed`].
 ///
 /// # Errors
 ///
 /// - [`ContextError::MemberNotFound`] if the sender is not a member.
-/// - [`ContextError::CryptoFailed`] if the public key cannot be resolved
-///   or the signature verification fails.
+/// - [`ContextError::CryptoFailed`] if the declared verification method is absent
+///   from the sender's DID document (e.g. `#agent` declared but never added), or
+///   if the signature does not verify against the key it resolves to.
 fn verify_remote_checkpoint_authenticity(
     sender_is_member: bool,
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    signing_key_id: scp_did::SigningKeyId,
 ) -> Result<(), ContextError> {
     if !sender_is_member {
         return Err(ContextError::MemberNotFound(format!(
@@ -832,32 +871,41 @@ fn verify_remote_checkpoint_authenticity(
         )));
     }
 
-    // Consistency checkpoints are sent under `#active` (ADR-039); resolve the
-    // human signing key to verify the checkpoint signature.
-    let sender_pk = (deps.key_resolver)(&remote.sender_did, scp_did::SigningKeyId::Active)
-        .ok_or_else(|| {
-            ContextError::CryptoFailed(format!(
-                "cannot resolve public key for checkpoint sender {}",
-                remote.sender_did
-            ))
-        })?;
+    // Resolve EXACTLY the declared verification method (ADR-039). `None` means
+    // that method is absent from the sender's DID document — a refusal, never a
+    // reason to fall back to the other method.
+    let sender_pk = (deps.key_resolver)(&remote.sender_did, signing_key_id).ok_or_else(|| {
+        ContextError::CryptoFailed(format!(
+            "cannot resolve verification method {signing_key_id} for checkpoint \
+             sender {}",
+            remote.sender_did
+        ))
+    })?;
     scp_event_log::checkpoint::verify_checkpoint_signature(remote, &sender_pk).map_err(|reason| {
         ContextError::CryptoFailed(format!(
-            "checkpoint signature verification failed: {reason}"
+            "checkpoint signature verification failed under {signing_key_id}: {reason}"
         ))
     })
 }
 
 /// Verify-and-classify CORE of [`compare_remote_checkpoint`]: runs the
 /// membership + signature gate and the Merkle-root/count comparison WITHOUT
-/// touching per-context state. `sender_is_member` is read by the caller (so the
-/// caller chooses how it borrows the roster — a [`ClassCMut`] view accessor or a
-/// bare-state field). Returns the [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison) plus
-/// `Some(local_root)` when the result is `Divergent` (the caller then applies
-/// the two Class-C field mutations — dedup + receive-buffer emit — in whatever
-/// borrow shape it holds). This split is what lets BOTH the actor handler
-/// (cell/view) and the receive path (`deliver_checkpoint_message`, bare state)
-/// share one classify path while each applies the field writes itself.
+/// touching per-context state. Returns the
+/// [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison)
+/// plus `Some(local_root)` when the result is `Divergent`.
+///
+/// Splitting the state-free judgement out of
+/// [`compare_remote_checkpoint`] keeps the accusation-forming logic
+/// independently testable: it can be driven with a plain `sender_is_member`
+/// boolean and asserted on its verdict alone, with no `PerContextState` and no
+/// Class-C borrow in scope. `compare_remote_checkpoint` is its only caller; it
+/// reads membership from its [`ClassCMut`] view and, on a `Divergent` verdict,
+/// delegates the two Class-C field writes (dedup set + receive-buffer emit) to
+/// [`record_equivocation_if_fresh`].
+///
+/// `signing_key_id` is the verification method the sender DECLARED on the
+/// enclosing envelope; see [`verify_remote_checkpoint_authenticity`] for why the
+/// judge resolves that method rather than trying both.
 ///
 /// # Security — the judging side of the commitment
 ///
@@ -890,11 +938,12 @@ fn verify_remote_checkpoint_authenticity(
 /// # Errors
 ///
 /// - [`ContextError::MemberNotFound`] if the checkpoint sender is not a member.
-/// - [`ContextError::CryptoFailed`] if the public key cannot be resolved, the
-///   Ed25519 signature verification fails, or the checkpoint is bound to a
-///   DIFFERENT `context_id` than the one being judged (the signature covers the
-///   checkpoint's own `context_id`, so authenticity alone does not bind it to
-///   this context).
+/// - [`ContextError::CryptoFailed`] if the DECLARED verification method
+///   (`signing_key_id`) is absent from the sender's DID document, the Ed25519
+///   signature does not verify against the key it resolves to, or the checkpoint
+///   is bound to a DIFFERENT `context_id` than the one being judged (the
+///   signature covers the checkpoint's own `context_id`, so authenticity alone
+///   does not bind it to this context).
 /// - [`ContextError::EventLogFailed`] if the LOCAL authoritative log is
 ///   unreachable (never initialised, or destroyed on actor shutdown /
 ///   create-rollback) or its replayed events break the hash chain — the
@@ -904,6 +953,7 @@ fn classify_remote_checkpoint(
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    signing_key_id: scp_did::SigningKeyId,
 ) -> Result<
     (
         scp_event_log::checkpoint::CheckpointComparison,
@@ -912,7 +962,13 @@ fn classify_remote_checkpoint(
     ContextError,
 > {
     // Membership + Ed25519 signature gate (fail-closed before any compare).
-    verify_remote_checkpoint_authenticity(sender_is_member, deps, context_id, remote)?;
+    verify_remote_checkpoint_authenticity(
+        sender_is_member,
+        deps,
+        context_id,
+        remote,
+        signing_key_id,
+    )?;
 
     // Context binding. The signature above covers the checkpoint's OWN
     // `context_id`, so a validly-signed checkpoint naming a DIFFERENT context
@@ -1019,20 +1075,33 @@ fn classify_remote_checkpoint(
 /// equivocation detection (§9.9.3, ADR-011 AC-8).
 ///
 /// Actor-shape — uses `deps.event_log`, `deps.key_resolver`, and
-/// `deps.event_tx` directly. Reads membership and mutates two Class-C fields
-/// via the [`ClassCMut`] view: it records the divergent `(count, root)` in
+/// `deps.event_tx` directly. Reads membership through the restricted
+/// `MembershipClassCMut` sub-view, and on a divergent verdict mutates exactly
+/// two Class-C fields — it records the divergent `(count, root)` in
 /// `last_seen_remote_checkpoint` and pushes a
-/// `ContextEvent::EquivocationDetected` event into the receive buffer when
-/// divergent. The two `&mut` Class-C fields are touched SEQUENTIALLY through the
-/// view accessors (freshness gate over `last_seen_remote_checkpoint`, then the
-/// receive-buffer emit), so no whole `&mut PerContextState` is needed.
+/// `ContextEvent::EquivocationDetected` into the receive buffer. Those two
+/// writes are handed to [`record_equivocation_if_fresh`] as an
+/// [`EquivocationDedupSplit`], so the write surface is named in that helper's
+/// signature rather than being a whole `&mut ClassCMut` the reader has to audit
+/// the body for; no whole `&mut PerContextState` is needed anywhere on this path.
+///
+/// # Signing key
+///
+/// `signing_key_id` is the verification method the sender DECLARED on the
+/// enclosing [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope)
+/// that carried this checkpoint. Both §9.9.3 methods are judgeable — `#active`
+/// and `#agent` alike — but each checkpoint is verified against the ONE method
+/// its sender declared, never against whichever of the two happens to verify;
+/// see [`verify_remote_checkpoint_authenticity`].
 ///
 /// # Errors
 ///
 /// - [`ContextError::MemberNotFound`] if the checkpoint sender is not a
 ///   member of the context.
-/// - [`ContextError::CryptoFailed`] if the public key cannot be
-///   resolved or the Ed25519 signature verification fails.
+/// - [`ContextError::CryptoFailed`] if the declared `signing_key_id`
+///   verification method is absent from the sender's DID document, if the
+///   Ed25519 signature does not verify against the key that method resolves to,
+///   or if the checkpoint is bound to a different `context_id`.
 /// - [`ContextError::EventLogFailed`] if the LOCAL authoritative event log is
 ///   unreachable — see [`classify_remote_checkpoint`]. NOTHING is mutated on
 ///   that path: the error is raised before the divergence dedup set or the
@@ -1043,6 +1112,7 @@ pub fn compare_remote_checkpoint(
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
+    signing_key_id: scp_did::SigningKeyId,
 ) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
     // Membership read via the restricted `MembershipClassCMut` (this path never
     // mutates the roster); its borrow ends before the divergence recording below.
@@ -1050,7 +1120,7 @@ pub fn compare_remote_checkpoint(
         .membership_class_c_mut()
         .contains(remote.sender_did.as_ref());
     let (comparison, divergence_root) =
-        classify_remote_checkpoint(sender_is_member, deps, context_id, remote)?;
+        classify_remote_checkpoint(sender_is_member, deps, context_id, remote, signing_key_id)?;
 
     // Record an EquivocationDetected event in the receive buffer when divergent
     // (NOT appended to the durable Merkle log — see `emit_equivocation_alert`),
@@ -1060,10 +1130,45 @@ pub fn compare_remote_checkpoint(
     // the documented semantics are the production path (and the unit tests that
     // pin them exercise production, not a parallel copy).
     if let Some(local_root) = divergence_root {
-        record_equivocation_if_fresh(view, deps, context_id, remote, local_root);
+        record_equivocation_if_fresh(
+            view.equivocation_dedup_split(),
+            deps,
+            context_id,
+            remote,
+            local_root,
+        );
     }
 
     Ok(comparison)
+}
+
+/// The two disjoint Class-C `&mut` fields [`record_equivocation_if_fresh`]
+/// mutates, threaded as ONE struct so the caller holds both at once (they are
+/// distinct fields of [`PerContextState`], so the borrow checker accepts the
+/// simultaneous `&mut`). Produced by
+/// [`ClassCMut::equivocation_dedup_split`](crate::context::actor::class_s::ClassCMut::equivocation_dedup_split).
+///
+/// Replaces a whole `&mut ClassCMut` parameter. That view reaches the ENTIRE
+/// Class-C surface — members, role state, lifecycle state, epoch, access,
+/// handle, event log — where the dedup+emit pair touches exactly these two
+/// fields. Narrowing the parameter to the fields actually written keeps the
+/// ADR-049 §9 reviewer signal intact: a reader of this signature can see the
+/// whole mutation surface without reading the body, and a future edit that
+/// wanted to reach further would have to widen the type deliberately rather
+/// than doing it silently.
+///
+/// Both fields are Class-C (best-effort / coalesced), so this split hands out no
+/// Class-S reach: `last_seen_remote_checkpoint` is receiver-minted equivocation
+/// evidence rather than a sender-authenticated replay witness, and
+/// `receive_buffer` is local delivery scratch.
+pub struct EquivocationDedupSplit<'a> {
+    /// `&mut` to the per-sender `(event_count, remote_merkle_root)` divergence
+    /// dedup set (Class-C / §9.9.3).
+    pub last_seen_remote_checkpoint:
+        &'a mut std::collections::HashMap<DID, std::collections::HashSet<(u64, [u8; 32])>>,
+    /// `&mut` to the local receive buffer the `EquivocationDetected` alert is
+    /// minted into (Class-C / structural).
+    pub receive_buffer: &'a mut ReceiveBuffer,
 }
 
 /// Records a divergent remote checkpoint as an `EquivocationDetected`
@@ -1100,26 +1205,24 @@ pub fn compare_remote_checkpoint(
 /// every divergent verdict, so the semantics documented above ARE the shipped
 /// behavior and the unit tests below pin production, not a parallel copy.
 fn record_equivocation_if_fresh(
-    view: &mut ClassCMut,
+    dedup: EquivocationDedupSplit<'_>,
     deps: &ActorDeps,
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
     local_root: [u8; 32],
 ) {
-    // The two Class-C `&mut` fields are touched SEQUENTIALLY through the view:
-    // the freshness/dedup step over `last_seen_remote_checkpoint` completes (its
-    // borrow ends) before the receive-buffer emit. The view hands out one field
-    // `&mut` at a time, so no whole `&mut PerContextState` is needed — and the
-    // ordering is load-bearing, not incidental: the alert must be emitted only
-    // after the divergence has been judged fresh.
-    if divergence_is_fresh(view.last_seen_remote_checkpoint_mut(), context_id, remote) {
-        emit_equivocation_alert(
-            view.receive_buffer_mut(),
-            deps,
-            context_id,
-            remote,
-            local_root,
-        );
+    // The mutation surface is the two fields named in the parameter type and
+    // nothing else — no whole `&mut PerContextState` and no whole `&mut
+    // ClassCMut` is in scope here. Destructured up front (the
+    // `CommitBroadcastBorrows` idiom) so the body names each borrow directly.
+    // The ordering between them is load-bearing, not incidental: the alert is
+    // emitted only after the divergence has been judged fresh.
+    let EquivocationDedupSplit {
+        last_seen_remote_checkpoint,
+        receive_buffer,
+    } = dedup;
+    if divergence_is_fresh(last_seen_remote_checkpoint, context_id, remote) {
+        emit_equivocation_alert(receive_buffer, deps, context_id, remote, local_root);
     }
 }
 
@@ -1436,17 +1539,19 @@ mod equivocation_dedup_tests {
     }
 
     /// Drives the production dedup gate over a bare `PerContextState` through
-    /// the SAME [`ClassCMut`] view `compare_remote_checkpoint` hands it. The
-    /// view's borrow of `state` ends with this call, so each test can read the
-    /// state fields back directly between invocations.
+    /// the SAME [`EquivocationDedupSplit`] `compare_remote_checkpoint` hands it,
+    /// taken from the same [`ClassCMut`] view. The view's borrow of `state` ends
+    /// with this call, so each test can read the state fields back directly
+    /// between invocations.
     fn record(
         state: &mut PerContextState,
         deps: &ActorDeps,
         remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
         local_root: [u8; 32],
     ) {
+        let mut view = ClassCMut::from_state(state);
         record_equivocation_if_fresh(
-            &mut ClassCMut::from_state(state),
+            view.equivocation_dedup_split(),
             deps,
             "ctx",
             remote,
@@ -1520,10 +1625,12 @@ mod equivocation_dedup_tests {
         let local_root = [0xCD; 32];
         let cap = scp_protocol::sync::MAX_SEQUENTIAL_COMMITS;
 
-        // Pin the set full with `cap` distinct roots (distinct counts keep
-        // every entry distinct). The first divergence is the one we will
-        // later replay; because the set is full by then, that first
-        // `(count, root)` is NOT retained, so the replay re-appends.
+        // Pin the set full with exactly `cap` distinct divergences: the
+        // `count = 0` entry below plus `cap - 1` from the loop. Every count is
+        // distinct, so no entry is dedup-suppressed and each one is inserted
+        // while the set is still under the cap — leaving `seen.len() == cap`
+        // for the over-cap probe further down. Nothing here is replayed; the
+        // probe uses a divergence the set has never held.
         let first = checkpoint("did:example:mallory", 0, [0x00; 32]);
         record(&mut state, &deps, &first, local_root);
         for i in 1..cap {
@@ -1928,6 +2035,15 @@ mod remote_checkpoint_classification_tests {
 
     const SENDER: &str = "did:example:bob";
 
+    /// The `#active` verification method, as DECLARED by the enclosing envelope
+    /// (ADR-039). Judging is always relative to a declared method; there is no
+    /// "unspecified" case for the judge to guess at.
+    const ACTIVE: scp_did::SigningKeyId = scp_did::SigningKeyId::Active;
+
+    /// The `#agent` verification method. Spec §9.9.3 makes equivocation
+    /// detection apply under this method exactly as under `#active`.
+    const AGENT: scp_did::SigningKeyId = scp_did::SigningKeyId::Agent;
+
     fn ctx_bytes() -> [u8; 32] {
         crate::context::state::context_id_to_bytes(CTX_HEX)
     }
@@ -2024,12 +2140,19 @@ mod remote_checkpoint_classification_tests {
             .unwrap()
     }
 
-    /// Builds `ActorDeps` over `event_log`, with a key resolver that resolves
-    /// [`SENDER`] to `verifying_key` so the authenticity gate genuinely passes
-    /// and execution reaches the log read under test.
-    async fn deps_over(
+    /// Builds `ActorDeps` over `event_log`, with a key resolver that answers for
+    /// [`SENDER`] ONLY and, for that DID, resolves each verification method to
+    /// the key given for it: `active` for `#active`, `agent` for `#agent`.
+    ///
+    /// `None` models a DID document that carries no such verification method —
+    /// the ordinary shape for `#agent` on a human-only member. Modelling the two
+    /// methods as SEPARATE keys is what makes the ADR-039 declared-method
+    /// behaviour observable: a resolver that answered the same key for both would
+    /// make a persona mix-up indistinguishable from a correct resolution.
+    async fn deps_over_methods(
         event_log: Box<dyn ContextEventLogProvider>,
-        verifying_key: ed25519_dalek::VerifyingKey,
+        active: Option<ed25519_dalek::VerifyingKey>,
+        agent: Option<ed25519_dalek::VerifyingKey>,
     ) -> ActorDeps {
         use scp_platform::in_memory::InMemoryStorage;
 
@@ -2040,8 +2163,14 @@ mod remote_checkpoint_classification_tests {
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let key_resolver: scp_protocol::context::governance::KeyResolver =
-            Arc::new(move |did: &DID, _: scp_did::SigningKeyId| {
-                (did.as_ref() == SENDER).then_some(verifying_key)
+            Arc::new(move |did: &DID, key_id: scp_did::SigningKeyId| {
+                if did.as_ref() != SENDER {
+                    return None;
+                }
+                match key_id {
+                    scp_did::SigningKeyId::Active => active,
+                    scp_did::SigningKeyId::Agent => agent,
+                }
             });
         let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
             Arc::new(
@@ -2065,6 +2194,17 @@ mod remote_checkpoint_classification_tests {
             .build_actor_deps(&DID("did:example:local".to_owned()))
             .await
             .expect("build_actor_deps")
+    }
+
+    /// [`deps_over_methods`] for the ordinary human-only member: `verifying_key`
+    /// is [`SENDER`]'s `#active` key and their DID document carries no `#agent`
+    /// key. Every checkpoint judged against these deps must therefore declare
+    /// [`scp_did::SigningKeyId::Active`].
+    async fn deps_over(
+        event_log: Box<dyn ContextEventLogProvider>,
+        verifying_key: ed25519_dalek::VerifyingKey,
+    ) -> ActorDeps {
+        deps_over_methods(event_log, Some(verifying_key), None).await
     }
 
     /// A GENUINELY SIGNED remote checkpoint bound to `context_id` — the
@@ -2140,7 +2280,7 @@ mod remote_checkpoint_classification_tests {
             ),
         ] {
             let remote = signed_remote(&signing_key, event_count, [0xAB; 32]);
-            let err = classify_remote_checkpoint(true, &deps, CTX_HEX, &remote)
+            let err = classify_remote_checkpoint(true, &deps, CTX_HEX, &remote, ACTIVE)
                 .expect_err(&format!("{label}: an unreachable local log must not judge"));
             assert!(
                 matches!(err, ContextError::EventLogFailed(_)),
@@ -2165,8 +2305,9 @@ mod remote_checkpoint_classification_tests {
         // Count 0 is the arm that USED to be answered `Divergent` and therefore
         // emitted an alert against this (honest) peer.
         let remote = signed_remote(&signing_key, 0, [0xAB; 32]);
-        let err = compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote)
-            .expect_err("an unreachable local log must not judge");
+        let err =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote, ACTIVE)
+                .expect_err("an unreachable local log must not judge");
         assert!(matches!(err, ContextError::EventLogFailed(_)));
 
         let mut view = cell.class_c_view();
@@ -2201,7 +2342,7 @@ mod remote_checkpoint_classification_tests {
         let remote = signed_remote(&signing_key, 3, [0xAB; 32]);
         assert_ne!(local_root, [0xAB; 32]);
         let comparison =
-            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote)
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote, ACTIVE)
                 .expect("a readable local log yields a verdict");
         assert!(
             matches!(
@@ -2237,7 +2378,7 @@ mod remote_checkpoint_classification_tests {
 
         let agreeing = signed_remote(&signing_key, 0, empty_root);
         let (comparison, divergence_root) =
-            classify_remote_checkpoint(true, &deps, CTX_HEX, &agreeing)
+            classify_remote_checkpoint(true, &deps, CTX_HEX, &agreeing, ACTIVE)
                 .expect("an empty-but-live log yields a verdict");
         assert!(matches!(
             comparison,
@@ -2248,7 +2389,7 @@ mod remote_checkpoint_classification_tests {
         // And a peer claiming the fabricated all-zero root at the same count is
         // correctly Divergent — the sentinel is not a valid empty-log root.
         let sentinel = signed_remote(&signing_key, 0, [0u8; 32]);
-        let (comparison, _) = classify_remote_checkpoint(true, &deps, CTX_HEX, &sentinel)
+        let (comparison, _) = classify_remote_checkpoint(true, &deps, CTX_HEX, &sentinel, ACTIVE)
             .expect("an empty-but-live log yields a verdict");
         assert!(matches!(
             comparison,
@@ -2289,7 +2430,7 @@ mod remote_checkpoint_classification_tests {
             ),
         ] {
             let foreign = signed_remote_for(&signing_key, FOREIGN_CTX_HEX, 3, merkle_root);
-            let err = classify_remote_checkpoint(true, &deps, CTX_HEX, &foreign)
+            let err = classify_remote_checkpoint(true, &deps, CTX_HEX, &foreign, ACTIVE)
                 .expect_err(&format!("{label}: a foreign checkpoint must be refused"));
             assert!(
                 matches!(err, ContextError::CryptoFailed(_)),
@@ -2304,7 +2445,7 @@ mod remote_checkpoint_classification_tests {
 
         // Control: the SAME shape, correctly bound to this context, is judged.
         let native = signed_remote_for(&signing_key, CTX_HEX, 3, local_root);
-        let (comparison, _) = classify_remote_checkpoint(true, &deps, CTX_HEX, &native)
+        let (comparison, _) = classify_remote_checkpoint(true, &deps, CTX_HEX, &native, ACTIVE)
             .expect("a correctly-bound checkpoint still yields a verdict");
         assert!(
             matches!(
@@ -2341,7 +2482,7 @@ mod remote_checkpoint_classification_tests {
 
             let agreeing = signed_remote(&signing_key, n, local_root);
             let (comparison, divergence_root) =
-                classify_remote_checkpoint(true, &deps, CTX_HEX, &agreeing)
+                classify_remote_checkpoint(true, &deps, CTX_HEX, &agreeing, ACTIVE)
                     .expect("a readable local log yields a verdict");
             assert_eq!(
                 comparison,
@@ -2386,7 +2527,7 @@ mod remote_checkpoint_classification_tests {
 
         let remote = signed_remote(&signing_key, 5, other_root);
         let comparison =
-            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote)
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote, ACTIVE)
                 .expect("a readable local log yields a verdict");
         assert_eq!(
             comparison,
@@ -2423,7 +2564,7 @@ mod remote_checkpoint_classification_tests {
 
         let remote = signed_remote(&signing_key, 10, remote_root);
         let comparison =
-            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote)
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote, ACTIVE)
                 .expect("a readable local log yields a verdict");
         assert_eq!(
             comparison,
@@ -2459,7 +2600,7 @@ mod remote_checkpoint_classification_tests {
 
         let remote = signed_remote(&signing_key, 4, remote_root);
         let comparison =
-            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote)
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote, ACTIVE)
                 .expect("a readable local log yields a verdict");
         assert_eq!(
             comparison,
@@ -2497,8 +2638,14 @@ mod remote_checkpoint_classification_tests {
 
         let mut cell =
             crate::context::actor::class_s::ClassSCell::new(state_without_sender_as_member());
-        let err = compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &disagreeing)
-            .expect_err("a non-member's checkpoint must be refused");
+        let err = compare_remote_checkpoint(
+            &mut cell.class_c_view(),
+            &deps,
+            CTX_HEX,
+            &disagreeing,
+            ACTIVE,
+        )
+        .expect_err("a non-member's checkpoint must be refused");
         assert!(
             matches!(err, ContextError::MemberNotFound(_)),
             "expected MemberNotFound, got: {err}"
@@ -2525,6 +2672,7 @@ mod remote_checkpoint_classification_tests {
             &deps,
             CTX_HEX,
             &disagreeing,
+            ACTIVE,
         )
         .expect("a member's checkpoint is judged");
         assert!(matches!(
@@ -2557,8 +2705,9 @@ mod remote_checkpoint_classification_tests {
         // Signed by the forger, but claiming to be from SENDER.
         let forged = signed_remote(&forger_key, 3, [0xAB; 32]);
         assert_ne!(local_root, [0xAB; 32]);
-        let err = compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &forged)
-            .expect_err("a checkpoint with an unverifiable signature must be refused");
+        let err =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &forged, ACTIVE)
+                .expect_err("a checkpoint with an unverifiable signature must be refused");
         assert!(
             matches!(err, ContextError::CryptoFailed(_)),
             "expected CryptoFailed, got: {err}"
@@ -2580,11 +2729,350 @@ mod remote_checkpoint_classification_tests {
         // IS judged — so the refusal above is the signature gate.
         let genuine = signed_remote(&honest_key, 3, [0xAB; 32]);
         let comparison =
-            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &genuine)
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &genuine, ACTIVE)
                 .expect("a genuinely signed checkpoint is judged");
         assert!(matches!(
             comparison,
             scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
         ));
+    }
+
+    // =====================================================================
+    // The `#agent` verification method (§9.9.3 / ADR-039).
+    //
+    // Spec §9.9.3 specifies the checkpoint signature as "signed by sender's
+    // `#active` or `#agent` key (ADR-039); equivocation detection applies to
+    // both", and its tier-(a) requirement is normative: "a conformant member
+    // MUST detect the divergence and surface it". The judge previously resolved
+    // `SigningKeyId::Active` unconditionally, so an equivocating peer that
+    // signed its checkpoints under `#agent` was never JUDGED at all — its
+    // checkpoints were refused before the comparison ran, and it escaped
+    // tier-(a) detection entirely, while honest `#agent` signers were locked
+    // out.
+    //
+    // The fix threads the verification method the sender DECLARED on the
+    // enclosing inner envelope. The tests below pin both halves of that: the
+    // `#agent` method is now judgeable, AND it is judged only when it is the
+    // declared one (ADR-039 — the persona stamp and the signing key are chosen
+    // together and must not diverge, so a try-both resolver would be a
+    // regression, not an equivalent fix).
+    // =====================================================================
+
+    /// An `#agent`-signed checkpoint that DIVERGES is judged `Divergent` and
+    /// raises the `EquivocationDetected` alert — the §9.9.3 tier-(a) MUST that
+    /// the `#active`-only resolution used to exempt an `#agent` signer from.
+    ///
+    /// The remote root is the REAL root of a REAL second log at the same event
+    /// count, mirroring
+    /// `two_members_with_divergent_logs_at_equal_count_is_equivocation` — the
+    /// same two-honest-members shape, differing only in the signing persona.
+    #[tokio::test]
+    async fn an_agent_signed_divergent_checkpoint_is_judged_and_alerts() {
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&[17u8; 32]);
+        let agent_key = ed25519_dalek::SigningKey::from_bytes(&[18u8; 32]);
+        assert_ne!(active_key.verifying_key(), agent_key.verifying_key());
+
+        let local_provider = readable_provider(5).await;
+        let local_root = local_provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+        let other_root = readable_provider_from(5, 1_800_000_000)
+            .await
+            .event_log_merkle_root(&ctx_bytes())
+            .unwrap();
+        assert_ne!(
+            local_root, other_root,
+            "the two logs must genuinely diverge for this to be the §9.9.3 test"
+        );
+
+        let deps = deps_over_methods(
+            Box::new(local_provider),
+            Some(active_key.verifying_key()),
+            Some(agent_key.verifying_key()),
+        )
+        .await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        let remote = signed_remote(&agent_key, 5, other_root);
+        let comparison =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote, AGENT)
+                .expect("an #agent-signed checkpoint must be JUDGED, not refused (§9.9.3)");
+        assert_eq!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Divergent {
+                first_divergent_event: None
+            },
+            "equal count + different root is Divergent under #agent exactly as under #active"
+        );
+        assert_eq!(
+            cell.class_c_view()
+                .receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .len(),
+            1,
+            "an #agent-key equivocator must raise EquivocationDetected (§9.9.3 tier (a))"
+        );
+    }
+
+    /// An `#agent`-signed checkpoint that AGREES is `Consistent` — the honest
+    /// `#agent` signer the `#active`-only resolution used to lock out with
+    /// `CryptoFailed`. No alert, no divergence recorded.
+    #[tokio::test]
+    async fn an_agent_signed_consistent_checkpoint_is_consistent() {
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&[19u8; 32]);
+        let agent_key = ed25519_dalek::SigningKey::from_bytes(&[20u8; 32]);
+        assert_ne!(active_key.verifying_key(), agent_key.verifying_key());
+
+        let provider = readable_provider(5).await;
+        let local_root = provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+        let deps = deps_over_methods(
+            Box::new(provider),
+            Some(active_key.verifying_key()),
+            Some(agent_key.verifying_key()),
+        )
+        .await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        let agreeing = signed_remote(&agent_key, 5, local_root);
+        let comparison =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &agreeing, AGENT)
+                .expect("an honest #agent-signed checkpoint must be judged, not refused");
+        assert_eq!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Consistent,
+            "equal count + equal root is Consistent under #agent (§9.9.3)"
+        );
+
+        let mut view = cell.class_c_view();
+        assert!(
+            view.receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .is_empty(),
+            "an agreeing peer must raise no EquivocationDetected"
+        );
+        assert!(
+            view.last_seen_remote_checkpoint_mut().is_empty(),
+            "an agreeing peer must record no divergence"
+        );
+    }
+
+    /// A checkpoint signed by a key that is NEITHER of the sender's two
+    /// permitted verification methods — a device key, a rotated-out key, a
+    /// relay's key — is refused with `CryptoFailed` under either declaration.
+    ///
+    /// [`scp_did::SigningKeyId`] admits only `Active` and `Agent`, so a third
+    /// key class is not nameable in the DECLARATION; what this pins is that a
+    /// third key class cannot get in through the SIGNATURE either, under either
+    /// declared method.
+    #[tokio::test]
+    async fn a_checkpoint_signed_by_neither_permitted_key_class_is_refused() {
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&[21u8; 32]);
+        let agent_key = ed25519_dalek::SigningKey::from_bytes(&[22u8; 32]);
+        // A key the sender's DID document does not publish under EITHER
+        // verification method.
+        let other_class_key = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+
+        let provider = readable_provider(3).await;
+        let local_root = provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+        assert_ne!(local_root, [0xAB; 32]);
+        let deps = deps_over_methods(
+            Box::new(provider),
+            Some(active_key.verifying_key()),
+            Some(agent_key.verifying_key()),
+        )
+        .await;
+
+        for (declared, label) in [(ACTIVE, "declared #active"), (AGENT, "declared #agent")] {
+            let mut cell =
+                crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+            let foreign_class = signed_remote(&other_class_key, 3, [0xAB; 32]);
+            let err = compare_remote_checkpoint(
+                &mut cell.class_c_view(),
+                &deps,
+                CTX_HEX,
+                &foreign_class,
+                declared,
+            )
+            .expect_err(&format!(
+                "{label}: a key outside #active/#agent must never be accepted"
+            ));
+            assert!(
+                matches!(err, ContextError::CryptoFailed(_)),
+                "{label}: expected CryptoFailed, got: {err}"
+            );
+
+            let mut view = cell.class_c_view();
+            assert!(
+                view.receive_buffer_mut()
+                    .drain_equivocation_alerts()
+                    .is_empty(),
+                "{label}: a refused checkpoint must raise no EquivocationDetected"
+            );
+            assert!(
+                view.last_seen_remote_checkpoint_mut().is_empty(),
+                "{label}: a refused checkpoint must record no divergence"
+            );
+        }
+
+        // Control: the SAME divergent claim, signed by a key the DID document
+        // DOES publish and declared under that method, IS judged — so the
+        // refusals above are the key-class boundary and not some other stop.
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+        let genuine = signed_remote(&agent_key, 3, [0xAB; 32]);
+        let comparison =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &genuine, AGENT)
+                .expect("a checkpoint under a published verification method is judged");
+        assert!(matches!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+        ));
+    }
+
+    /// A checkpoint is verified against the DECLARED verification method and no
+    /// other: an `#agent`-signed checkpoint declared `#active` is REFUSED, and
+    /// an `#active`-signed one declared `#agent` is REFUSED — even though the
+    /// other method would have verified in each case.
+    ///
+    /// This is the regression guard against "resolve `#active`, else try
+    /// `#agent`, accept if either verifies". Try-both would pass both arms
+    /// below, and in doing so would decouple the persona stamp from the signing
+    /// key — the divergence ADR-039's Enforcement-Stack layer 2 exists to
+    /// prevent, where the stamp and the key "are chosen together from one
+    /// persona and cannot diverge". Under try-both an agent-signed checkpoint
+    /// would be accepted while declaring the human persona, laundering an agent
+    /// action into a human attribution.
+    #[tokio::test]
+    async fn a_checkpoint_is_judged_only_under_the_declared_verification_method() {
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&[24u8; 32]);
+        let agent_key = ed25519_dalek::SigningKey::from_bytes(&[25u8; 32]);
+        assert_ne!(active_key.verifying_key(), agent_key.verifying_key());
+
+        let provider = readable_provider(3).await;
+        let local_root = provider.event_log_merkle_root(&ctx_bytes()).unwrap();
+        assert_ne!(local_root, [0xAB; 32]);
+        let deps = deps_over_methods(
+            Box::new(provider),
+            Some(active_key.verifying_key()),
+            Some(agent_key.verifying_key()),
+        )
+        .await;
+
+        // Both verification methods resolve, so a refusal here can only be the
+        // declared-method binding — not an absent key.
+        for (signer, declared, label) in [
+            (
+                &agent_key,
+                ACTIVE,
+                "#agent-signed but declared #active — accepting this would attribute \
+                 an agent action to the human persona",
+            ),
+            (
+                &active_key,
+                AGENT,
+                "#active-signed but declared #agent — accepting this would attribute \
+                 a human action to the agent persona",
+            ),
+        ] {
+            let mut cell =
+                crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+            let mismatched = signed_remote(signer, 3, [0xAB; 32]);
+            let err = compare_remote_checkpoint(
+                &mut cell.class_c_view(),
+                &deps,
+                CTX_HEX,
+                &mismatched,
+                declared,
+            )
+            .expect_err(&format!("{label}: must be refused"));
+            assert!(
+                matches!(err, ContextError::CryptoFailed(_)),
+                "{label}: expected CryptoFailed, got: {err}"
+            );
+
+            let mut view = cell.class_c_view();
+            assert!(
+                view.receive_buffer_mut()
+                    .drain_equivocation_alerts()
+                    .is_empty(),
+                "{label}: a refused checkpoint must raise no EquivocationDetected"
+            );
+            assert!(
+                view.last_seen_remote_checkpoint_mut().is_empty(),
+                "{label}: a refused checkpoint must record no divergence"
+            );
+        }
+
+        // Controls: each key under ITS OWN declared method is judged, so the two
+        // refusals above are the declared-method binding and nothing else.
+        for (signer, declared, label) in [
+            (&active_key, ACTIVE, "#active-signed, declared #active"),
+            (&agent_key, AGENT, "#agent-signed, declared #agent"),
+        ] {
+            let mut cell =
+                crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+            let matched = signed_remote(signer, 3, [0xAB; 32]);
+            let comparison = compare_remote_checkpoint(
+                &mut cell.class_c_view(),
+                &deps,
+                CTX_HEX,
+                &matched,
+                declared,
+            )
+            .expect(label);
+            assert!(
+                matches!(
+                    comparison,
+                    scp_event_log::checkpoint::CheckpointComparison::Divergent { .. }
+                ),
+                "{label}: must be judged"
+            );
+        }
+    }
+
+    /// A declared verification method that the sender's DID document does NOT
+    /// carry is refused with `CryptoFailed` naming that method — never silently
+    /// retried against the other one.
+    ///
+    /// This is the ordinary human-only member: `#active` published, no `#agent`
+    /// key. A checkpoint arriving declared `#agent` has no key to check against,
+    /// and "no key to check against" is a refusal to judge.
+    #[tokio::test]
+    async fn a_declared_method_absent_from_the_did_document_is_refused() {
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&[26u8; 32]);
+        let agent_key = ed25519_dalek::SigningKey::from_bytes(&[27u8; 32]);
+
+        let provider = readable_provider(3).await;
+        // Human-only member: `#active` resolves, `#agent` is absent.
+        let deps =
+            deps_over_methods(Box::new(provider), Some(active_key.verifying_key()), None).await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        let remote = signed_remote(&agent_key, 3, [0xAB; 32]);
+        let err =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote, AGENT)
+                .expect_err("an unresolvable declared verification method must be refused");
+        assert!(
+            matches!(err, ContextError::CryptoFailed(_)),
+            "expected CryptoFailed, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("#agent"),
+            "the refusal must name the verification method that could not be \
+             resolved, got: {err}"
+        );
+
+        let mut view = cell.class_c_view();
+        assert!(
+            view.receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .is_empty(),
+            "a refused checkpoint must raise no EquivocationDetected"
+        );
+        assert!(
+            view.last_seen_remote_checkpoint_mut().is_empty(),
+            "a refused checkpoint must record no divergence"
+        );
     }
 }

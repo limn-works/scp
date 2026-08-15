@@ -11077,20 +11077,29 @@ impl Supervisor {
     /// result has already emitted `ContextEvent::EquivocationDetected`
     /// inside the handler. Used by the reconnection driver's Phase 3.
     ///
+    /// `signing_key_id` is the verification method the checkpoint's sender
+    /// DECLARED — the `signing_key_id` of the inner envelope that carried it
+    /// (ADR-039). The judge resolves exactly that method from the sender's DID
+    /// document, so §9.9.3 equivocation detection applies under `#active` and
+    /// `#agent` alike without the two personas being interchangeable.
+    ///
     /// # Errors
     ///
     /// Propagates [`ContextError`] from the handler (e.g.
-    /// `MemberNotFound`, `CryptoFailed`);
-    /// [`ContextError::TransportFailed`] if the reply channel is dropped.
+    /// `MemberNotFound`, `CryptoFailed` — including an unresolvable declared
+    /// verification method); [`ContextError::TransportFailed`] if the reply
+    /// channel is dropped.
     pub async fn compare_remote_checkpoint(
         &self,
         context_id: &str,
         remote: scp_event_log::checkpoint::ConsistencyCheckpoint,
+        signing_key_id: scp_did::SigningKeyId,
     ) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = MessagingCommand::CompareRemoteCheckpoint {
             context_id: context_id.to_owned(),
             remote: Box::new(remote),
+            signing_key_id,
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;

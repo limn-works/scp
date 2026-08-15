@@ -365,9 +365,12 @@ async fn reconnect_detects_forged_divergent_checkpoint() {
 
     // Compare against Alice's local state — divergent at equal count ⇒
     // EquivocationDetected emitted into Alice's receive buffer.
+    // Declared `#active` (ADR-039): the forged checkpoint is signed with Bob's
+    // deterministic `#active` key, which is what the network resolver answers
+    // for that verification method.
     let comparison = alice
         .manager
-        .compare_remote_checkpoint(ctx_id, forged)
+        .compare_remote_checkpoint(ctx_id, forged, scp_did::SigningKeyId::Active)
         .await
         .expect("compare succeeds (signature valid)");
     assert!(
@@ -469,7 +472,7 @@ async fn runtime_equivocation_dispatch_and_targeted_drain() {
     // Runtime dispatch #1 — through the actor mailbox command.
     let comparison = alice
         .manager
-        .compare_remote_checkpoint(ctx_id, forged.clone())
+        .compare_remote_checkpoint(ctx_id, forged.clone(), scp_did::SigningKeyId::Active)
         .await
         .expect("compare via actor mailbox succeeds (valid signature)");
     assert!(
@@ -491,7 +494,7 @@ async fn runtime_equivocation_dispatch_and_targeted_drain() {
     // is covered by the focused runtime unit tests.)
     let _replay = alice
         .manager
-        .compare_remote_checkpoint(ctx_id, forged)
+        .compare_remote_checkpoint(ctx_id, forged, scp_did::SigningKeyId::Active)
         .await
         .expect("replayed compare still returns a verdict without error");
 
