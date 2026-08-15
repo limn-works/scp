@@ -17,4 +17,8 @@ SCP publishes a DID document in two encodings, one per resolution layer. The SCP
 - The DID suffix is `Z-BASE-32(raw-public-key-bytes)` with no prepended character. The method states no length; 52 is what 32 bytes yield. `z` is a valid z-base-32 data character, so SCP's 53-character suffix passes the method's character class and fails only the transformation.
 - Root record `_did.<ID>.` TXT carries `v=;vm=;auth=;asm=;inv=;del=;svc=`, with `vm` "always containing at least `k0`". Verification methods are `_kN._did.` TXT, services `_sN._did.` TXT, recommended TTL 7,200s.
 
+**Measured Mainline packet sizes (bencoded BEP44 `v`, constructed from wire bytes and round-trip parsed, not extrapolated):** 479 bytes at 1 relay entry with `wss://relay.example.com/scp/v1`; 619 at 3; 676 at 3 with a realistic operator hostname; 854 at 5 realistic. Each further relay entry costs 70 bytes (short hostname) or 89 (realistic). The 1,000-byte cap admits 8 relay entries short, 6 realistic. §18.2.3's recommended minimum of 3 fits with 324 bytes spare. Two consequences: the design has real headroom, and RFC 1035 compression saves only 12–28 bytes here because only the root record's name carries the 52-character DID — compression is not what makes the core fit.
+
+**SCP's one mapping choice, decided in §18.2.2C:** the service record's `t=` carries the SCP service type string verbatim (`t=SCPRelay`, `t=PreRotationCommitment`).
+
 **How to apply:** treat all of the above as settled and cited in `.docs/specs/18-addressability-and-deployment.md` §18.2.2A–§18.2.2D. Read those sections rather than re-deriving. See [[did-document-membership-criteria]] for what belongs in the document at all.
