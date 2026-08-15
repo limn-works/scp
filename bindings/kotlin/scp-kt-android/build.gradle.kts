@@ -115,6 +115,21 @@ dependencies {
     testImplementation("androidx.compose.ui:ui-test-manifest")
 }
 
+// Run the unit-test tasks on the JUnit Platform.
+//
+// Without this call Gradle runs the JUnit 4 runner, which discovers only the
+// classes annotated `@RunWith(RobolectricTestRunner::class)` and silently
+// ignores every `org.junit.jupiter.api.Test` in the module. Six JUnit 5 test
+// classes compiled and never executed under that configuration:
+// AndroidStorageTest, AndroidKeyCustodyTest, StorageConformanceTest,
+// AndroidPushProviderTest, ContextLifecycleTest, ScpViewModelTest. The
+// `junit-vintage-engine` dependency declared above keeps the two Robolectric
+// JUnit 4 classes running under the same platform. `:scp-kt` makes the same
+// call in scp-kt/build.gradle.kts.
+tasks.withType<Test>().configureEach {
+    useJUnitPlatform()
+}
+
 detekt {
     config.setFrom("../detekt.yml")
     buildUponDefaultConfig = true

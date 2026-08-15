@@ -54,6 +54,10 @@ jobs:
               - 'bindings/python/**'
               - 'crates/scp-ffi/src/**'
               - 'crates/scp-ffi/common/**'
+              # Two pytest suites live outside bindings/python. Without these
+              # entries an edit to either one triggers no Python job.
+              - 'examples/reference-agent/**'
+              - 'tests/integration/**'
             typescript:
               - 'bindings/typescript/**'
               - 'crates/scp-ffi/napi/**'
@@ -128,6 +132,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: scp-node self-host create paths fail closed
         run: cargo test -p scp-node --lib pre_rotation_severance -- --nocapture
+      # scp-identity and the pyo3 bridge carry the same `#[cfg(not(feature =
+      # "testing"))]` fail-closed proof as scp-node. The workspace test lane
+      # enables `testing` on both, and the pyo3 production lane below builds
+      # without testing but never runs tests, so neither proof executed anywhere.
+      - name: scp-identity create paths fail closed
+        run: cargo test -p scp-identity --lib fails_closed_without_pre_rotation_backend -- --nocapture
+      - name: pyo3 bridge create paths fail closed
+        run: cargo test -p scp-ffi --lib fails_closed -- --nocapture
 
   # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
   # Asserts every shipped FFI bridge and the scp-node/scp-relay binaries' resolved
@@ -512,7 +524,11 @@ jobs:
           # broken optional transport fails CI. They co-compile (openssl-backed
           # udp/coap alongside ring-backed quic/http3), so a single combined
           # invocation covers all four.
-          cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
+          # `nostr` and `webrtc` join the list for the same reason: each gates a
+          # `src/` module plus a `[[test]] required-features` target, and neither
+          # feature was activated by any lint or test invocation, so 41 tests and
+          # both adapter modules went unlinted and unrun.
+          cargo clippy -p scp-transport --features quic,http3,udp,coap,nostr,webrtc --all-targets -- -D warnings
 
   # Matrix jobs must always expand so each OS variant reports a status
   # to branch protection. Step-level `if` skips the heavy work instead.
@@ -566,11 +582,32 @@ jobs:
           # --workspace (combined includes rusqlite + scp-platform; local-cache
           # enables caching logic).
           cargo test -p scp-transport --features combined,local-cache
-          # The optional network transports (quic, http3, udp, coap) are also
-          # not activated by --workspace. They co-compile, so a single combined
-          # invocation exercises every transport's test suite and guards against
-          # the silent rot that broke the quic feature for months.
-          cargo nextest run -p scp-transport --features quic,http3,udp,coap
+          # The optional network transports (quic, http3, udp, coap, nostr,
+          # webrtc) are also not activated by --workspace. They co-compile, so a
+          # single combined invocation exercises every transport's test suite and
+          # guards against the silent rot that broke the quic feature for months.
+          # `nostr` and `webrtc` each declare a `[[test]] required-features`
+          # target (nostr_roundtrip, webrtc_roundtrip) that this list must
+          # activate; without them those 10 tests plus 31 in-module tests under
+          # src/nostr/ and src/webrtc/ compiled into no test binary CI ran.
+          cargo nextest run -p scp-transport --features quic,http3,udp,coap,nostr,webrtc
+          # scp-node declares two `[[test]]` targets gated on its own `quic`
+          # feature (quic_listener, quic_cross_transport). --workspace activates
+          # neither, so their 5 tests ran nowhere.
+          cargo nextest run -p scp-node --features quic,testing --test quic_listener --test quic_cross_transport
+          # scp-node's well_known module asserts the advertised-transport list
+          # twice per transport: once for the feature-off arm and once for the
+          # feature-on arm. --workspace activates neither http3 nor udp, so only
+          # the off arms ran.
+          cargo test -p scp-node --features http3,udp,testing --lib well_known
+          # scp-platform gates its Apple SQLCipher storage adapter behind `apple`
+          # and its syncable-storage trait behind `sync`. No crate enables either,
+          # so both modules' tests — including the storage_conformance! expansion
+          # over SyncableStorage — compiled into nothing.
+          cargo nextest run -p scp-platform --features apple,sync,sqlite,filesystem,file,encrypting,testing
+          # persistence_advanced holds two tests gated on scp-testing's `sync` and
+          # `combined` features, which --workspace does not activate.
+          cargo nextest run -p scp-testing --features sync,combined --test persistence_advanced
           # The saga-journal durable crash-recovery round-trip is gated behind
           # scp-testing/sqlite (it opens a real on-disk SqliteStorage across two
           # processes). --workspace does NOT activate this optional feature, so
@@ -782,6 +819,18 @@ jobs:
           # Parity tests require Bun/Kotlin/Swift runners that are not
           # available in this job — they run in dedicated parity jobs below.
           PYTHONPATH=. pytest tests/ -v -m "not parity"
+      # `cd bindings/python` above resolves `tests/` to `bindings/python/tests/`,
+      # so the two pytest suites that live elsewhere in the tree ran in no CI job
+      # at all. Each gets its own step, because a collection error in one must not
+      # abort the other.
+      - name: Run reference-agent example tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest examples/reference-agent/test_agent.py -v
+      - name: Run phase-3 integration test
+        run: |
+          source .venv/bin/activate
+          PYTHONPATH=bindings/python python -m pytest tests/integration/ -v
 
   # ── TypeScript ──────────────────────────────────────────────────────
   typescript-check:
@@ -998,7 +1047,13 @@ jobs:
         run: |
           # Set JNA library path to find the compiled Rust cdylib
           export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          ./gradlew testDebugUnitTest
+          # Name both modules' test tasks explicitly. `:scp-kt` applies the
+          # `kotlin("jvm")` plugin, which registers `test` and never registers
+          # `testDebugUnitTest`; `:scp-kt-android` applies `com.android.library`,
+          # which registers `testDebugUnitTest`. A bare `./gradlew
+          # testDebugUnitTest` therefore resolved in the Android module alone and
+          # ran none of the 492 tests in `:scp-kt`.
+          ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest
 
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:
@@ -1068,6 +1123,11 @@ jobs:
           workspaces: "fuzz -> target"
       - name: Check fuzz crate compiles
         run: cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml
+      # `cargo check` never compiles `#[cfg(test)]`, so the fuzz crate's one
+      # library test — which asserts the Arbitrary MessageType discriminants
+      # still match the production enum — ran in no job.
+      - name: Run fuzz crate library tests
+        run: cargo +nightly-2026-05-03 test --manifest-path fuzz/Cargo.toml --lib
 
   # ── Bridge parity (ADR-046) ────────────────────────────────────────
   # Cross-bridge runtime parity harness: drives PyO3 (in-process) and
