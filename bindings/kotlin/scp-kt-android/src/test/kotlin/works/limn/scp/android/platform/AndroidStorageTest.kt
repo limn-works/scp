@@ -3,7 +3,8 @@
 // IMPORTANT: These are IN-MEMORY-ONLY tests. All StorageProvider contract tests run
 // against InMemoryStorageProvider, NOT the real AndroidStorage implementation. The
 // following production behaviors are NOT exercised by these tests:
-//   - Android Keystore TEE key derivation (Bug #2: setRandomizedEncryptionRequired)
+//   - Android Keystore HMAC-SHA-256 key generation and the TEE MAC that feeds HKDF
+//     (StorageKeyDerivationTest covers the HKDF half, which needs no Keystore)
 //   - SQLCipher SQL LIKE escaping with % and _ wildcards (Bug #4)
 //   - Non-atomic deletePrefix under concurrent access (Bug #5)
 //   - Passphrase ByteArray zeroing after database open (Bug #3)

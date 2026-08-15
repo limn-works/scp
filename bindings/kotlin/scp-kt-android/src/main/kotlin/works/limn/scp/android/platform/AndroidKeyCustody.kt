@@ -494,33 +494,12 @@ class AndroidKeyCustody internal constructor(
 
         val privateParams = keyPair.private as Ed25519PrivateKeyParameters
         val privateKeyBytes = privateParams.encoded
-        val secret = hkdfSha256(privateKeyBytes, salt, ByteArray(0), 32)
+        // Hkdf.sha256 matches the Rust `hkdf::Hkdf::<Sha256>` used in
+        // `scp-crypto/src/pseudonym.rs::derive_pseudonym_secret`. AndroidStorage
+        // calls the same object to derive the SQLCipher passphrase.
+        val secret = Hkdf.sha256(privateKeyBytes, salt, ByteArray(0), Hkdf.SHA256_OUTPUT_BYTES)
         privateKeyBytes.fill(0) // zeroize private key material
         return secret
-    }
-
-    /**
-     * HKDF-SHA256 (RFC 5869) extract-and-expand.
-     *
-     * Matches the Rust `hkdf::Hkdf::<Sha256>` used in
-     * `scp-crypto/src/pseudonym.rs::derive_pseudonym_secret`.
-     */
-    private fun hkdfSha256(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int): ByteArray {
-        // Extract: PRK = HMAC-SHA256(salt, IKM)
-        val extractMac = Mac.getInstance("HmacSHA256")
-        extractMac.init(SecretKeySpec(salt, "HmacSHA256"))
-        val prk = extractMac.doFinal(ikm)
-
-        // Expand: OKM = T(1) where T(1) = HMAC-SHA256(PRK, info || 0x01)
-        // For length <= 32 (one block), only one iteration is needed.
-        require(length <= 32) { "HKDF-SHA256 expand: length must be <= 32 for single-block output" }
-        val expandMac = Mac.getInstance("HmacSHA256")
-        expandMac.init(SecretKeySpec(prk, "HmacSHA256"))
-        prk.fill(0) // zeroize PRK
-        expandMac.update(info)
-        expandMac.update(byteArrayOf(0x01))
-        val okm = expandMac.doFinal()
-        return okm.copyOf(length)
     }
 
     /**

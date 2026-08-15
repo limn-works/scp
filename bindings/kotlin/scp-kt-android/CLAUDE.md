@@ -74,9 +74,15 @@ The dependency `net.zetetic:sqlcipher-android:4.6.x` uses package `net.zetetic.d
 
 For Android Keystore Ed25519 key generation (API 33+), use `NamedParameterSpec.ED25519` as the algorithm parameter spec. `EdDSAParameterSpec` is for specifying prehash mode and context bytes, not the curve. The constant `Ed25519` lives on `NamedParameterSpec`, not `EdDSAParameterSpec`.
 
-### Android Keystore AES-GCM requires setRandomizedEncryptionRequired(false) for deterministic IV
+### Derive the SQLCipher passphrase with HMAC + HKDF, never with a Keystore cipher
 
-Android Keystore enforces randomized encryption by default for GCM keys. If you use a fixed/caller-supplied IV (as `AndroidStorage.getOrCreateStorageKey()` does for deterministic passphrase derivation), you **must** call `.setRandomizedEncryptionRequired(false)` on the `KeyGenParameterSpec.Builder`. Without this, `Cipher.init()` throws `InvalidAlgorithmParameterException` at runtime. This is invisible to JVM unit tests since they cannot use the real Android Keystore -- it only manifests on actual devices.
+`AndroidStorage.getOrCreateStorageKey()` needs the same 32 bytes on every database open, and Android Keystore enforces randomized encryption on GCM keys. Reaching for `.setRandomizedEncryptionRequired(false)` and a fixed IV buys that determinism and destroys the secret: under a fixed IV, AES-GCM's keystream depends on the key alone, so the ciphertext is the known plaintext XOR one reusable keystream. An earlier revision of this file shipped that construction.
+
+The Keystore key is an HMAC-SHA-256 key (`KeyProperties.PURPOSE_SIGN` + `setDigests(DIGEST_SHA256)`). The TEE MACs the fixed label `"scp-storage-passphrase"`, and `Hkdf.sha256` expands that MAC output into the 32-byte passphrase under the salt and info from section 17.6 of `.docs/specs/17-persistence-and-storage.md`. HMAC is deterministic and takes no nonce, so nothing has to be persisted beside the database, and `setRandomizedEncryptionRequired` has no counterpart on a sign-purpose key.
+
+`Hkdf` is shared: `AndroidKeyCustody.derivePseudonymSecret` calls the same object, so the package holds one HKDF implementation.
+
+The Keystore half of this path is invisible to JVM unit tests, which cannot reach the real Android Keystore. `StorageKeyDerivationTest` covers the derivation by calling `AndroidStorage.derivePassphrase` directly; the Keystore key generation and MAC need an instrumented test on a device.
 
 ### StorageProvider method names match UniFFI callback interface
 
