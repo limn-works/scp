@@ -67,6 +67,12 @@ jobs:
         with:
           filters: |
             docs:
+              # Manifests count: a dependency removal or a feature-flag change
+              # readily breaks a cross-crate intra-doc link in `scp-runtime`,
+              # the crate that denies `rustdoc::broken_intra_doc_links`.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/*/Cargo.toml'
               - 'bindings/**'
               - 'crates/scp-core/src/**'
               - 'crates/scp-protocol/src/**'
