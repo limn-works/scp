@@ -702,7 +702,7 @@
         "phase": 3,
         "crate": "scp-core"
       },
-      "result": "DualLayerHealingPublisher trait + DualLayerResolver integration. When seq numbers diverge between relay and DHT, fresher document is asynchronously republished to stale layer via tokio::spawn. HealingPublisher trait enables mock injection. NoOpHealer for tests. Tests: seq_divergence_triggers_healing, healing_failure_logged_not_propagated."
+      "result": "SUPERSEDED. That work built cross-layer healing: DualLayerHealingPublisher + DualLayerResolver integration, republishing the fresher document to the stale layer on cross-layer seq divergence via tokio::spawn, with tests seq_divergence_triggers_healing and healing_failure_logged_not_propagated. \u00a73.10.7 removed cross-layer healing as unperformable under two encodings, so the behaviour recorded here is no longer the behaviour this story specifies. Nothing built from it reaches production either way: DualLayerResolver::new sets healing_publisher to None at every construction site, and with_healing is called only from the crate's own test module."
     },
     {
       "id": "SCP-246",
