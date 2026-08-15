@@ -656,14 +656,15 @@
       "gate": "gate-1",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-core/src/identity/dht.rs",
         "crates/scp-core/src/identity/cache.rs"
       ],
-      "description": "Implement DID document publishing to and resolution from the Mainline DHT, with BEP44 signed mutable items, caching with staleness detection, and automatic republishing for active identities. DHT records expire if not refreshed, so the SDK handles periodic republishing automatically.",
+      "description": "Implement DID document publishing to and resolution from the Mainline DHT, with BEP44 signed mutable items, caching with staleness detection, and automatic republishing for active identities. Mainline records expire if not refreshed, so the SDK handles periodic republishing automatically. Mainline carries the bootstrap core in the did:dht DNS-packet encoding, not the full JSON document (§18.2.2C), and the publish path rejects an over-cap encoding before signing it (§18.2.2D). This story previously published the full JSON document to Mainline, which BEP44's 1,000-byte cap rejects; the two-encoding amendment to §3.10.5 and ADR-003 removed that assumption, which is why the status returned to pending.",
       "acceptanceCriteria": [
-        "publish_did_document(identity) publishes DID document to Mainline DHT as BEP44 signed mutable item",
+        "publish_did_document(identity) publishes to both layers, each in its own encoding (§3.10.5): the full document as canonical JSON to SCP relays, and the DNS-encoded bootstrap core (§18.2.2C) to Mainline as a BEP44 signed mutable item",
+        "publish_did_document rejects an over-cap encoding before signing it, returning SCP-IDENT-1061 with the layer, the measured length and the cap (§18.2.2D)",
         "Published item is signed by the identity's Ed25519 key",
         "Includes a sequence number (monotonically increasing) for ordered updates",
         "Idempotent: re-publishing with same sequence number is a no-op on the DHT",
@@ -677,7 +678,7 @@
         "resolve_did(did_string) -> DIDDocument resolves did:dht via Mainline DHT lookup",
         "resolve_did verifies self-certification: decoded z-base-32 of DID suffix matches public key in resolved document",
         "resolve_did verifies BEP44 signature on the DHT record",
-        "resolve_did returns DID document with verification methods",
+        "resolve_did returns the Mainline bootstrap core (§18.2.2C) — #active, the pre-rotation commitment and the relay list — and reports BootstrapCore completeness so a caller treats every other entry as unresolved rather than absent (§3.10.10)",
         "resolve_did caches results: 24-hour refresh for active contacts, 7-day for inactive (Decision 9)",
         "Stale DID resolution includes staleness indicator: DIDResolutionResult { document, staleness: Staleness::Fresh | Staleness::Stale { last_verified: u64 } }",
         "Stale results trigger SDK warning log",

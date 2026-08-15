@@ -348,10 +348,11 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
    - Returns an `ScpIdentity` handle containing the DID string, all key handles (never raw private keys), pre-rotation commitment, and DID document.
 
 2. **`publish_did_document(identity) -> ()`**
-   - Publishes the DID document to the Mainline DHT as a BEP44 signed mutable item.
-   - The item is signed by the identity's Ed25519 key.
-   - Includes a sequence number (monotonically increasing) for ordered updates.
-   - Idempotent: re-publishing with the same sequence number is a no-op on the DHT.
+   - Publishes to both resolution layers, each in that layer's own encoding (§3.10.5): the full document as canonical JSON in a DID-record frame to SCP relays, and the bootstrap core (§18.2.2C) as a did:dht DNS packet to the Mainline DHT. Each layer's payload is a BEP44 signed mutable item under its own signature.
+   - The identity's Ed25519 key signs each layer's item, over that layer's own bytes.
+   - Each layer carries a sequence number (monotonically increasing within that layer) for ordered updates. A publisher advances a layer's number on that layer's own publish, and no resolver compares one layer's number against the other's (§3.10.7).
+   - Rejects an over-cap encoding before signing it, with `SCP-IDENT-1061` (§18.2.2D).
+   - Idempotent: re-publishing with the same sequence number is a no-op on the layer that receives it.
 
    **DHT republishing strategy:** DIDs published via did:dht require periodic republishing to remain resolvable — Mainline DHT records expire if not refreshed. The SDK handles this automatically for all active identities (identities loaded into memory with an active signing key):
 
@@ -365,8 +366,8 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
    - Resolves a did:dht identifier via Mainline DHT lookup.
    - Verifies self-certification: decoded z-base-32 of DID suffix matches the public key in the resolved document.
    - Verifies BEP44 signature on the DHT record.
-   - Returns the DID document with verification methods.
-   - Caches results (24-hour refresh for active contacts, 7-day for inactive — Decision 9).
+   - Returns the bootstrap core (§18.2.2C), which carries `#active`, the pre-rotation commitment and the relay list. A Mainline lookup returns nothing beyond the core, so a caller that needs any other entry resolves the full document from a relay (§3.10.4) and MUST treat an entry outside the core as unresolved rather than absent (§3.10.10).
+   - Caches results per (DID, layer) — 24-hour refresh for active contacts, 7-day for inactive (Decision 9).
 
 4. **Key Rotation — Three-Layer Architecture**
 
@@ -539,8 +540,8 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 |------|---------|
 | `mod.rs` | Module root, `Identity` struct, `DidMethod` trait, re-exports |
 | `dht.rs` | `DidDht` implementation — create, publish, resolve, rotate via Mainline DHT + BEP44 |
-| `document.rs` | DID Document construction, serialization (JSON-LD), parsing, verification method management |
-| `cache.rs` | Resolution cache — TTL-based, 24h active / 7d inactive refresh, BEP44 sequence number comparison for staleness |
+| `document.rs` | DID Document construction, relay-layer serialization (canonical JSON, RFC 8785), parsing, verification method management. The Mainline layer's DNS-packet encoding of the bootstrap core lives beside it (§18.2.2C). |
+| `cache.rs` | Resolution cache — TTL-based, 24h active / 7d inactive refresh, keyed per (DID, layer); a BEP44 sequence number is compared for staleness only against the last number observed on the same layer (§3.10.7) |
 
 **Estimated functions:** ~10-12 public functions, ~8-10 internal helpers.
 

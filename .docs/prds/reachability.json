@@ -361,29 +361,35 @@
       "gate": "gate-reachability-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-identity/src/resolution.rs",
         "crates/scp-identity/src/republish.rs"
       ],
-      "description": "Extend RepublishManager to publish DID documents to SCP relays using existing PUBLISH operation (§3.10.5). DID documents are published as standard blobs with routing_id = did_routing_id(did_string) and blob_ttl = 604800 (7 days). Identity owners SHOULD publish to their own relays plus bootstrap relays. RepublishManager schedules relay republishing on a 6-day cycle (1-day margin before TTL expiry). Publishing to both SCP relays and Mainline DHT is a MUST per the anti-segmentation invariant (§3.10.6).",
+      "description": "Extend RepublishManager to publish DID documents to SCP relays using the existing PUBLISH operation (§3.10.5). DID documents are published as standard blobs with routing_id = did_routing_id(did_string) and blob_ttl = 604800 (7 days). Identity owners SHOULD publish to their own relays plus bootstrap relays. RepublishManager schedules relay republishing on a 6-day cycle (1-day margin before TTL expiry). Publishing to both SCP relays and Mainline DHT is a MUST per the anti-segmentation invariant (§3.10.6). Each layer receives its OWN encoding under its OWN signature and its OWN sequence number (§3.10.5, §18.2.2A): the relay layer receives the full document as RFC 8785 canonical JSON, and Mainline receives the DNS-encoded bootstrap core (§18.2.2C). This story previously assumed one encoding published to both layers; the two-encoding amendment removed that assumption from §3.10.5, which is why the status returned to pending. The Mainline encoder itself is a separate story; this story consumes it.",
       "acceptanceCriteria": [
         "DID document PUBLISH uses routing_id = did_routing_id(did_string)",
         "DID document PUBLISH uses blob_ttl = 604800 (7 days)",
-        "DID document blob contains BEP44-signed DID document bytes",
+        "The relay-layer blob carries the BEP44-signed RFC 8785 canonical JSON of the full document, wrapped in a DID-record frame (§9.10.12)",
+        "The Mainline publish carries the separately-signed DNS-encoded bootstrap core, and the two layers' value bytes are not equal for any identity that has any entry outside the core",
+        "Each layer advances its own sequence number on its own publish, and no publish path reads the other layer's number (§3.10.7)",
+        "Both publish paths reject an over-cap encoding before signing it, with SCP-IDENT-1061 (§18.2.2D)",
         "RepublishManager schedules relay republishing on a 6-day cycle",
-        "RepublishManager publishes to identity's own relays AND bootstrap relays",
-        "DHT publishing continues unchanged (anti-segmentation invariant: both layers MUST be published to)",
+        "RepublishManager publishes to the identity's own relays AND bootstrap relays",
+        "Mainline republishing continues on its 2-hour cycle (anti-segmentation invariant: both layers MUST be published to)",
         "Disabling either publishing layer requires explicit opt-out with a warning log",
         "Unit test: PUBLISH operation sent with correct routing_id and blob_ttl",
-        "Unit test: republish timer fires at 6-day interval"
+        "Unit test: republish timer fires at 6-day interval",
+        "Unit test: an over-cap encoding on either layer returns SCP-IDENT-1061 and no publish is attempted"
       ],
       "actionItems": [
-        "Add relay-based DID document publishing to RepublishManager",
-        "Implement 6-day republish cycle for relay layer (separate from 2-hour DHT cycle)",
+        "Add relay-based DID document publishing to RepublishManager, carrying the canonical-JSON encoding",
+        "Publish the DNS-encoded bootstrap core to Mainline under its own signature and sequence number",
+        "Apply the per-layer publish size gate before requesting either signature",
+        "Implement 6-day republish cycle for relay layer (separate from 2-hour Mainline cycle)",
         "Publish to own relays + bootstrap relays on each cycle",
         "Add anti-segmentation guard: warn if either layer is disabled",
-        "Add tests for publish operation parameters and republish timing"
+        "Add tests for publish operation parameters, republish timing, and size-gate rejection"
       ],
       "blockedBy": [
         "SCP-238"
@@ -396,13 +402,17 @@
         {
           "file": ".docs/specs/03-identity.md",
           "section": "### 3.10.2 Layer 1: SCP Relay-Based Resolution"
+        },
+        {
+          "file": ".docs/specs/18-addressability-and-deployment.md",
+          "section": "### 18.2.2D Per-Layer Size Caps and the Publish-Side Size Gate"
         }
       ],
       "details": {
         "phase": 2,
         "crate": "scp-core"
       },
-      "result": "Extended RepublishManager with relay-based DID document publishing. 6-day cycle, own+bootstrap relays, anti-segmentation guard. Commit b5ce707."
+      "result": "Extended RepublishManager with relay-based DID document publishing. 6-day cycle, own+bootstrap relays, anti-segmentation guard. Commit b5ce707. Superseded in part: that work published one encoding to both layers, which §3.10.5 no longer permits."
     },
     {
       "id": "SCP-240",
@@ -410,21 +420,23 @@
       "gate": "gate-reachability-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-identity/src/resolution.rs"
       ],
-      "description": "Implement relay-based DID document resolution using existing QUERY operation (§3.10.4). Resolver computes did_routing_id, queries known SCP relays (identity's relays if known, else bootstrap relays), verifies BEP44 signature against the public key encoded in the DID string, and checks seq >= last_known_seq. This is the relay layer of the dual-layer resolution protocol. Cache results per §9.10.7 (24h active, 7d inactive).",
+      "description": "Implement relay-based DID document resolution using the existing QUERY operation (§3.10.4). The resolver computes did_routing_id, queries known SCP relays (the identity's relays if known, else bootstrap relays), verifies the BEP44 signature against the public key encoded in the DID string, and checks seq against the last sequence number it observed ON THE RELAY LAYER for this DID (§3.10.4 step 4c). This is the relay layer of the dual-layer resolution protocol, and it carries the full DID document as canonical JSON (§18.2.2A). Cache results per §9.10.7 (24h active, 7d inactive), keyed per (DID, layer). This story previously keyed the sequence check and the cache by DID alone and sent limit = 1; §3.10.4 now keys both per layer and §3.10.2 specifies limit = N (N = 16), which is why the status returned to pending.",
       "acceptanceCriteria": [
-        "QUERY operation sent with routing_id = did_routing_id(did_string) and limit = 1",
-        "Response blob parsed as BEP44-signed DID document",
+        "QUERY operation sent with routing_id = did_routing_id(did_string) and limit = 16, per §3.10.2",
+        "Response blob decoded as a DID-record frame (§9.10.12), and its value parsed as the relay layer's canonical-JSON DID document",
         "BEP44 signature verified against public key extracted from DID string (z-base-32 decode)",
-        "Sequence number checked: reject if seq < last_known_seq for this DID",
-        "Resolved DID document cached with 24h active / 7d inactive TTL",
+        "Sequence number checked against the last seq observed for this DID on the RELAY layer; a Mainline sequence number is never consulted (§3.10.7)",
+        "When a relay returns more than one valid record, the highest-seq valid record is selected within the relay layer (§3.10.4 step 5a)",
+        "Resolved DID document cached with 24h active / 7d inactive TTL, keyed per (DID, layer)",
         "Queries sent to identity's known relays first, then bootstrap relays",
         "Unit test: valid BEP44-signed document is accepted and cached",
         "Unit test: document with invalid signature is rejected",
-        "Unit test: document with lower sequence number than cached is rejected"
+        "Unit test: a record whose seq is lower than the cached RELAY-layer seq is rejected",
+        "Unit test: two valid records at different seq from two relays — the higher-seq record is selected"
       ],
       "actionItems": [
         "Implement relay_resolve function: compute did_routing_id, QUERY relay, verify BEP44, check seq",
@@ -459,32 +471,35 @@
       "gate": "gate-reachability-2",
       "priority": "P0",
       "severity": "critical",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-identity/src/resolver.rs"
       ],
-      "description": "Implement the DidResolver trait (§3.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel via tokio::join! with per-layer 10-second timeouts. Valid means BEP44 signature verifies AND sequence number >= last known cached sequence. When both return valid documents, highest sequence number wins. On a tie, relay is preferred (lower latency). ResolutionSource enum tracks whether the result came from an SCP relay, Mainline DHT, or cache.",
+      "description": "Implement the DidResolver trait (§3.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel via tokio::join! with per-layer 10-second timeouts. Valid means the BEP44 signature verifies AND the sequence number is >= the last sequence number this resolver observed ON THE SAME LAYER (§3.10.4 step 4c). The two layers carry different encodings under different signatures (§18.2.2A), so selection is per layer and never across layers (§3.10.4 step 5, §3.10.7): the relay layer answers for the full document, Mainline answers for the bootstrap core (§18.2.2C), and a resolver MUST NOT compare one layer's sequence number against the other's. ResolutionSource tracks which layer served the result, and DocumentCompleteness tells the caller whether it holds the full document or the bootstrap core. This story previously specified cross-layer highest-sequence-wins; the amendment that removed that rule from §3.10.7 also removed it here, which is why the status returned to pending.",
       "acceptanceCriteria": [
         "DidResolver trait defined with resolve(&self, did: &str) -> Result<Option<ResolvedDidDocument>>",
-        "ResolvedDidDocument contains document, seq, and source fields",
+        "ResolvedDidDocument contains document, seq, source, and completeness fields (§3.10.10)",
+        "DocumentCompleteness enum has Full and BootstrapCore variants; a Mainline resolution reports BootstrapCore and a relay resolution reports Full",
         "ResolutionSource enum has ScpRelay { relay_url: String }, MainlineDht, and Cache variants",
         "Parallel query: both SCP relay and DHT resolution initiated concurrently via tokio::join!",
-        "Both layers are awaited; highest sequence number wins (§3.10.7)",
-        "When both return valid documents, highest sequence number wins; on tie, relay preferred",
-        "Results with seq < cached_sequence are rejected (rollback protection)",
-        "DidMethod::resolve() continues to work for single-layer DHT resolution (no regression)",
-        "Unit test: relay responds with valid doc, DHT returns nothing — relay result used",
-        "Unit test: DHT responds with valid doc, relay returns nothing — DHT result used",
-        "Unit test: both respond, higher seq wins regardless of arrival order",
-        "Unit test: one layer fails, other layer's result is accepted"
+        "The resolver keeps one last-known sequence number per (DID, layer) pair, and rejects a record whose seq is lower than the number observed on the layer that served it (§3.10.4 step 4c)",
+        "The resolver never compares a relay-layer sequence number against a Mainline sequence number, and never discards one layer's record because the other returned a higher number (§3.10.4 step 5c)",
+        "Within the relay layer, when more than one valid record is returned, the highest-seq valid record wins (§3.10.4 step 5a)",
+        "When both layers answer and the caller asked for the full document, the relay-layer record is the answer (§3.10.4 step 5d)",
+        "DidMethod::resolve() continues to work for single-layer Mainline resolution and returns BootstrapCore completeness (no regression)",
+        "Unit test: relay responds with a valid full document, Mainline returns nothing — the relay result is used and reports Full",
+        "Unit test: Mainline responds, relay returns nothing — the Mainline result is used and reports BootstrapCore",
+        "Unit test: both layers respond with different sequence numbers — neither record is discarded, and the relay record answers a full-document request",
+        "Unit test: a relay record whose seq is below the cached RELAY seq is rejected, while a Mainline record at that same seq is accepted because its own layer's cached seq is lower",
+        "Unit test: one layer fails, the other layer's result is accepted with its own completeness"
       ],
       "actionItems": [
-        "Define DidResolver trait, ResolvedDidDocument struct, and ResolutionSource enum",
+        "Define DidResolver trait, ResolvedDidDocument struct, DocumentCompleteness enum, and ResolutionSource enum",
         "Implement DualLayerResolver composing relay resolution (SCP-240) and DhtClient::resolve()",
         "Implement parallel query with tokio::join! and per-layer timeouts",
-        "Implement highest-seq-wins logic when both layers return valid documents",
-        "Implement rollback protection: reject results with seq < cached_sequence",
-        "Preserve DidMethod::resolve() for backward compatibility",
+        "Key the last-known-sequence cache by (DID, layer) and implement per-layer selection with no cross-layer comparison",
+        "Implement highest-seq-wins within the relay layer only",
+        "Preserve DidMethod::resolve() for backward compatibility, reporting BootstrapCore completeness",
         "Add tests for all resolution scenarios"
       ],
       "blockedBy": [
@@ -498,6 +513,10 @@
         {
           "file": ".docs/specs/03-identity.md",
           "section": "### 3.10.4 Resolution Protocol"
+        },
+        {
+          "file": ".docs/specs/03-identity.md",
+          "section": "### 3.10.7 Version Resolution"
         }
       ],
       "details": {
@@ -647,25 +666,28 @@
       "gate": "gate-reachability-2",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-identity/src/resolver.rs",
         "crates/scp-identity/src/republish.rs"
       ],
-      "description": "Per §3.10.7, when both resolution layers return valid documents with different sequence numbers, the resolver SHOULD re-publish the fresher document to the layer that returned the stale one (protocol-level healing). Currently DualLayerResolver picks the highest seq but does not trigger a republish to the stale layer. This story implements the healing mechanism: when the relay returns seq=1 and DHT returns seq=5, the resolver queues a republish of the seq=5 document to the relay layer.",
+      "description": "Per §3.10.7, healing is per layer and it is a MAY. When a layer returns a record whose sequence number is lower than the number the resolver already holds for THAT layer, the resolver MAY re-publish that layer's own current encoding back to that same layer. A resolver MUST NOT copy one layer's bytes to the other layer: the full JSON document exceeds Mainline's 1,000-byte cap and the DNS-encoded bootstrap core is not what the relay layer is authoritative for (§18.2.2A, §18.2.2D). This story previously specified cross-layer healing — republishing the fresher document to whichever layer returned the stale one — which the two-encoding amendment removed from §3.10.7 as unperformable, so this story's status returned to pending. No production code performs healing today: DualLayerResolver::new sets healing_publisher to None at every construction site, and with_healing is called only from the crate's own test module, so the capability is honestly absent rather than stubbed.",
       "acceptanceCriteria": [
-        "When relay returns a lower seq than DHT, the DHT document is republished to relay layer",
-        "When DHT returns a lower seq than relay, the relay document is republished to DHT layer",
+        "When a relay returns a relay-layer record whose seq is lower than the resolver's cached relay-layer seq, the resolver MAY re-publish its cached relay-layer encoding to that relay",
+        "When Mainline returns a record whose seq is lower than the resolver's cached Mainline seq, the resolver MAY re-publish its cached bootstrap-core encoding to Mainline",
+        "The resolver never publishes a relay-layer encoding to Mainline, and never publishes a bootstrap-core encoding to a relay — a test asserts each direction is refused",
+        "The resolver never triggers healing from a cross-layer sequence comparison, because §3.10.7 forbids that comparison",
         "Healing is asynchronous (does not block the resolve call)",
         "Healing is best-effort (failure is logged, not propagated)",
-        "Unit test: seq divergence triggers healing republish to stale layer",
-        "Unit test: healing failure is logged and does not affect resolve result"
+        "Unit test: a within-layer stale record triggers a healing republish to that same layer",
+        "Unit test: healing failure is logged and does not affect the resolve result",
+        "A resolver that never heals is conformant, and a test covers the healing_publisher: None path returning results unchanged"
       ],
       "actionItems": [
-        "Add healing trigger in DualLayerResolver when seq numbers diverge",
-        "Implement async republish to the stale layer",
-        "Wire RepublishManager or a dedicated healing publisher",
-        "Add tests for both divergence directions"
+        "Add a per-layer healing trigger in DualLayerResolver keyed on that layer's own cached seq",
+        "Implement async republish of a layer's own encoding back to that layer",
+        "Wire RepublishManager or a dedicated healing publisher, and keep the no-healing path conformant",
+        "Add tests for both layers, plus tests asserting no cross-layer copy occurs"
       ],
       "blockedBy": [
         "SCP-241"
