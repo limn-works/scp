@@ -2084,7 +2084,23 @@ Reuses existing event types wherever possible. Only one genuinely new type:
 
 Broadcast contexts are discoverable through four mechanisms:
 
-1. **DID document service endpoint.** An author MAY publish one `SCPBroadcastContext` service entry in its DID document. The entry carries relay URL(s), and a verifier fetches the author's broadcast-context list from those relays; the entry carries no context ID itself. The count is one entry per DID rather than one per context, because §18.2.2B criterion 2 forbids an inline entry class whose count grows with the author's further activity, and an author creates broadcast contexts for as long as it publishes. The fetched list carries broadcast context IDs only — §5.14.11 mechanism 3 and §9.10 forbid publishing any other context's ID, and moving the list behind a relay fetch does not relax that rule.
+1. **DID document service endpoint.** An author MAY publish **one** `SCPBroadcastContext` service entry in its DID document, naming where a reader fetches the author's broadcast-context list. The count is one entry per DID rather than one per context, because §18.2.2B criterion 2 forbids an inline entry class whose count grows with the author's further activity, and an author creates broadcast contexts for as long as it publishes.
+
+   The entry and its fetch follow the `ParticipationStatements` pattern (§7.3.2.1) exactly, because that pattern already solves the same problem — a DID document pointing at a list a verifier retrieves and checks:
+
+   ```json
+   {
+     "id": "#scp-broadcast-contexts",
+     "type": "SCPBroadcastContext",
+     "serviceEndpoint": "https://relay.example.com/scp/v1/broadcast-contexts/<did>"
+   }
+   ```
+
+   The `serviceEndpoint` URL accepts an HTTP GET and requires no authentication, because every context it may list is a broadcast context and mechanism 3 below already permits publishing those IDs in a `.well-known/scp` document. The response is a single `BroadcastContextList` object carrying the author's DID, a `updated_at` timestamp, one entry per advertised context (`context_id`, its relay URLs, and `mode: broadcast`), and an Ed25519 signature by the author's `#active` key over the §9.5.1 canonical hash of those fields.
+
+   **The signature is what the pointer form must not lose.** In the inline form the BEP44 signature over the DID document covered every advertised context, so a relay could neither add nor remove one. Moving the list behind a fetch would surrender that property to the serving relay unless the list carries its own signature, and relays are untrusted (ADR-004). A reader therefore resolves the author's DID, takes `#active` from the resolved document, and verifies the fetched list against it; a list that fails verification is discarded exactly as an invalid DID record is (§3.10.4), and the reader learns nothing about the author's contexts rather than learning something a relay chose.
+
+   **The list carries broadcast context IDs only.** Mechanism 3 below and §9.10's metadata-privacy rules forbid publishing any other context's ID, and moving the list behind a fetch does not relax that rule. A reader that finds a non-broadcast context ID in a fetched list discards the whole list, because a list containing one is not a list the author's `#active` should have signed.
 2. **Contexts with discovery outlets.** Authors register broadcast contexts via `agent_register` in contexts with discovery outlets (§6.2.2B), with metadata indicating the context mode.
 3. **`.well-known/scp`.** Operators MAY list broadcast contexts in their `.well-known/scp` document (§18.3). Only broadcast context IDs may be listed — encrypted context IDs MUST NOT appear (§9.10 metadata privacy).
 4. **Out-of-band URI.** The universal context URI format (§18.4) is used for sharing context references: `scp://context/<context_id_hex>?relay=<url>&mode=broadcast`. The legacy format `scp://broadcast/<context_id_hex>?relay=<url>` is accepted as an alias and normalized to the universal format.
