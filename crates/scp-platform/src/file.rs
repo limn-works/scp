@@ -1096,6 +1096,109 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Fail-closed construction (spec §17.17.1 SCP-CAPSEL-8001, §17.8)
+    //
+    // `FileKeyCustody` is one of the shipped production key-custody backends.
+    // Its backing resource is the key file, so when that file cannot be
+    // created or cannot be parsed the constructor returns
+    // `PlatformError::CustodyError` rather than a custody handle that would
+    // later mint or lose keys against a store it never opened.
+    // -----------------------------------------------------------------------
+
+    /// `FileKeyCustody::new` at a path the operating system refuses returns
+    /// `PlatformError::CustodyError`. The parent component is a regular file,
+    /// so no key file can be written underneath it.
+    #[test]
+    fn new_at_unwritable_path_fails_closed_with_custody_error() {
+        let dir = TempDir::new().unwrap();
+        let blocker = dir.path().join("this-is-a-file");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("keys.scp");
+
+        let result = FileKeyCustody::new(&path, "correct-horse-battery-staple");
+
+        match result {
+            Err(PlatformError::CustodyError(msg)) => {
+                assert!(
+                    !msg.is_empty(),
+                    "the fail-closed custody error must carry a diagnostic message"
+                );
+            }
+            Err(other) => panic!("expected PlatformError::CustodyError, got {other:?}"),
+            Ok(_) => panic!(
+                "FileKeyCustody::new must fail closed with PlatformError::CustodyError when its \
+                 key file cannot be written; returning a custody handle here would hold key \
+                 material no restart can recover (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+    }
+
+    /// `FileKeyCustody::new` over a key file whose header declares more
+    /// entries than the file holds returns `PlatformError::CustodyError`
+    /// rather than opening a custody store that silently drops the missing
+    /// keys.
+    #[test]
+    fn new_on_truncated_key_file_fails_closed_with_custody_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        // A well-formed header that claims 4 entries, followed by no entries.
+        let mut data = Vec::with_capacity(HEADER_SIZE);
+        data.push(FORMAT_VERSION);
+        data.extend_from_slice(&[0x11u8; SALT_LEN]);
+        data.extend_from_slice(&4u32.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        let result = FileKeyCustody::new(&path, "correct-horse-battery-staple");
+
+        match result {
+            Err(PlatformError::CustodyError(msg)) => {
+                assert!(
+                    msg.contains("truncated"),
+                    "the error must name the truncation it detected: {msg}"
+                );
+            }
+            Err(other) => panic!("expected PlatformError::CustodyError, got {other:?}"),
+            Ok(_) => panic!(
+                "FileKeyCustody::new must fail closed with PlatformError::CustodyError when its \
+                 key file is truncated (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+    }
+
+    /// `FileKeyCustody::new` over a key file written by an unsupported format
+    /// version returns `PlatformError::CustodyError` rather than reading the
+    /// bytes under this build's layout.
+    #[test]
+    fn new_on_unsupported_version_fails_closed_with_custody_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let mut data = Vec::with_capacity(HEADER_SIZE);
+        data.push(FORMAT_VERSION.wrapping_add(0x7F));
+        data.extend_from_slice(&[0x11u8; SALT_LEN]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+
+        let result = FileKeyCustody::new(&path, "correct-horse-battery-staple");
+
+        match result {
+            Err(PlatformError::CustodyError(msg)) => {
+                assert!(
+                    msg.contains("unsupported key file version"),
+                    "the error must name the version it rejected: {msg}"
+                );
+            }
+            Err(other) => panic!("expected PlatformError::CustodyError, got {other:?}"),
+            Ok(_) => panic!(
+                "FileKeyCustody::new must fail closed with PlatformError::CustodyError when its \
+                 key file carries an unsupported format version \
+                 (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn key_file_does_not_contain_raw_private_key() {
         let dir = TempDir::new().unwrap();

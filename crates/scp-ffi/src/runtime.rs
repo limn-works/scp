@@ -3041,6 +3041,34 @@ mod tests {
         );
     }
 
+    /// Parity with the NAPI and `UniFFI` bridges'
+    /// `test_sqlite_open_failure_fails_closed`: a Sqlite selection whose
+    /// directory the operating system refuses must FAIL CLOSED with
+    /// `StorageInitError::SqliteOpen` (spec §17.6 "Storage Selection Fails
+    /// Closed" / §17.17.1 SCP-CAPSEL-8001) rather than degrade to in-memory
+    /// storage or to no storage.
+    ///
+    /// The path's parent component is a regular file, so the directory cannot
+    /// be created.
+    #[test]
+    fn test_with_storage_py_sqlite_open_failure_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blocker = tmp.path().join("this-is-a-file");
+        std::fs::write(&blocker, b"not a directory").expect("write the blocking regular file");
+        let bad_dir = blocker.join("scp-data");
+
+        let result = PyBridgeInstance::with_storage_py(StorageConfig::Sqlite {
+            path: bad_dir,
+            key: SqliteKeyMaterial::Raw(Zeroizing::new(vec![0x22u8; 32])),
+        });
+
+        assert!(
+            matches!(result, Err(StorageInitError::SqliteOpen { .. })),
+            "a Sqlite open at an unusable path must fail closed with SqliteOpen; \
+             an in-memory or no-storage fallback is forbidden"
+        );
+    }
+
     /// `SqliteKeyMaterial`'s custom `Debug` impl must NOT leak the key or
     /// passphrase bytes (defense in depth). Mirrors the NAPI/UniFFI redacting
     /// impls.

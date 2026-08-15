@@ -4295,8 +4295,12 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
 
 /// Verifies a device attestation token.
 ///
-/// Uses `InMemoryDeviceAttestation` to check the token format. ADR-048 §1:
-/// pure helper, no per-instance state.
+/// A shipped (non-`testing`) build declines the capability: no production
+/// device-attestation backend is wired, so this returns a typed
+/// [`codes::IDENT_1016`] error rather than a silently-valid `true` (spec
+/// §9:187, ADR-062 §Decision 3). A `testing` build checks the token format
+/// against the `InMemoryDeviceAttestation` test double. ADR-048 §1: pure
+/// helper, no per-instance state.
 ///
 /// See §9.3.
 #[uniffi::export(async_runtime = "tokio")]

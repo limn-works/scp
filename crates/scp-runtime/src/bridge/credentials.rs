@@ -1473,6 +1473,154 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Fail-closed: the durable arm reports a typed error when its backing
+    // store cannot answer (spec §17.17.1 SCP-CAPSEL-8001, §17.6).
+    //
+    // SCP-CAPSEL-8001 forbids a production arm from degrading silently when
+    // its backend cannot be satisfied. For credential storage the backend is
+    // the `EncryptedStorage` handle the bridge selected, so the two tests
+    // below drive a REAL on-disk `SqliteStorage` into the two states §17.6
+    // names — a record the backend cannot decode, and a database whose bytes
+    // are destroyed — and assert the named `CredentialError::StorageError`
+    // variant. A durable arm that answered `Ok` here would hand the caller a
+    // credential the store never held.
+    // -----------------------------------------------------------------------
+
+    /// Deterministic 32-byte `SQLCipher` key for the on-disk test databases.
+    const CRED_DB_KEY: &[u8; 32] = b"sqlcipher-cred-key-32-bytes-ok!!";
+
+    /// Allocates a unique, empty temp directory for an on-disk `SQLCipher`
+    /// database. Each test needs its own directory because `SqliteStorage`
+    /// holds an advisory lock on it for the lifetime of the handle.
+    fn unique_credential_db_dir(label: &str) -> std::path::PathBuf {
+        static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "scp-cred-failclosed-{label}-{}-{n}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `retrieve` on the durable arm returns `CredentialError::StorageError`
+    /// when the persisted record cannot be decoded: it never invents a
+    /// credential, and it never reports the slot empty.
+    ///
+    /// Answering `NotFound` would be as wrong as answering `Ok`, because the
+    /// record exists and the store cannot read it, so the caller has to see a
+    /// storage failure rather than a claim about whether the credential
+    /// exists.
+    #[tokio::test]
+    async fn durable_retrieve_fails_closed_when_the_persisted_record_is_undecodable() {
+        use scp_platform::traits::Storage;
+
+        let dir = unique_credential_db_dir("undecodable");
+        let storage = std::sync::Arc::new(
+            scp_platform::sqlite::SqliteStorage::new(&dir, CRED_DB_KEY).unwrap(),
+        );
+        let store = ProtocolRepositoryCredentialStore::new(std::sync::Arc::clone(&storage));
+
+        store
+            .provision(
+                "bridge-undecodable",
+                CredentialType::OAuthAccessToken,
+                b"oauth-access-token-xyz",
+                TEST_BRIDGE_KEY,
+            )
+            .await
+            .expect("provision the credential this test then destroys");
+
+        // Destroy the persisted record through the same real backend, leaving
+        // the key present and its bytes undecodable.
+        let keys = storage
+            .list_keys("bridge-credential/bridge-undecodable/")
+            .await
+            .expect("list the persisted credential keys");
+        assert_eq!(
+            keys.len(),
+            1,
+            "provision must have written exactly one credential record"
+        );
+        storage
+            .store(&keys[0], b"these bytes are not a stored BridgeCredential")
+            .await
+            .expect("overwrite the persisted record");
+
+        let result = store
+            .retrieve(
+                "bridge-undecodable",
+                &CredentialType::OAuthAccessToken,
+                TEST_BRIDGE_KEY,
+            )
+            .await;
+
+        match result {
+            Err(CredentialError::StorageError { reason }) => {
+                assert!(
+                    !reason.is_empty(),
+                    "the fail-closed credential-storage error must carry a diagnostic reason"
+                );
+            }
+            Err(other) => panic!("expected CredentialError::StorageError, got {other:?}"),
+            Ok(plaintext) => panic!(
+                "a durable credential store whose record is undecodable must fail closed with \
+                 CredentialError::StorageError; it returned {} plaintext byte(s) instead \
+                 (spec §17.17.1 SCP-CAPSEL-8001)",
+                plaintext.len()
+            ),
+        }
+    }
+
+    /// `get_bridge_credential_key` on the durable arm returns
+    /// `CredentialError::StorageError` when the `SQLCipher` database behind it
+    /// is destroyed while the handle is open. The root key is never
+    /// fabricated, and the slot is never reported empty.
+    #[tokio::test]
+    async fn durable_root_key_fails_closed_when_the_database_is_destroyed() {
+        let dir = unique_credential_db_dir("destroyed");
+        let storage = std::sync::Arc::new(
+            scp_platform::sqlite::SqliteStorage::new(&dir, CRED_DB_KEY).unwrap(),
+        );
+        let store = ProtocolRepositoryCredentialStore::new(std::sync::Arc::clone(&storage));
+
+        let root = generate_bridge_credential_key();
+        store
+            .store_bridge_credential_key("bridge-destroyed", root)
+            .await
+            .expect("store the root key this test then destroys");
+
+        // Overwrite every SQLCipher file in the directory with bytes SQLite
+        // cannot read, so the open handle's next page read fails.
+        for entry in std::fs::read_dir(&dir).expect("read the database directory") {
+            let path = entry.expect("read a directory entry").path();
+            if path.is_file() {
+                std::fs::write(&path, vec![0x5Au8; 65_536]).expect("destroy the database file");
+            }
+        }
+
+        let result = store.get_bridge_credential_key("bridge-destroyed").await;
+
+        match result {
+            Err(CredentialError::StorageError { reason }) => {
+                assert!(
+                    !reason.is_empty(),
+                    "the fail-closed credential-storage error must carry a diagnostic reason"
+                );
+            }
+            Err(other) => panic!("expected CredentialError::StorageError, got {other:?}"),
+            Ok(_) => panic!(
+                "a durable credential store whose database is destroyed must fail closed with \
+                 CredentialError::StorageError (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // CredentialType tests
     // -----------------------------------------------------------------------
 
