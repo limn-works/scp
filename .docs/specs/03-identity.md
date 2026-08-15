@@ -253,7 +253,7 @@ Identity link attestations are published as service entries in the issuer's DID 
 
 ```
 Service {
-  id:              "<did>#attestation-<platform>--<index>",  // e.g., "did:dht:z...#attestation-github.com--0"
+  id:              "<did>#attestation-<platform>--<index>",  // e.g., "did:dht:cyuo...#attestation-github.com--0"
   type:            "ScpIdentityLinkAttestation",
   serviceEndpoint: "<attestation_id>"                       // Hex-encoded attestation ID (§3.5.2)
 }
