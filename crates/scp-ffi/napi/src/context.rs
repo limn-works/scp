@@ -2357,7 +2357,15 @@ pub(crate) async fn context_subscribe_on(
                 sup,
                 heartbeat_context_id,
                 heartbeat_sender_did,
-                sk,
+                // ADR-039: `resolve_napi_signing_key` exports the handle's
+                // retained ACTIVE signing key, so `#active` is the method this
+                // beacon is honestly signed under. Pairing the two HERE — at the
+                // resolution that produced the key — is the only place they can
+                // be kept in agreement; from here down they travel as one value.
+                scp_ffi_common::persona::ResolvedMessageSigner::new(
+                    sk,
+                    scp_did::SigningKeyId::Active,
+                ),
                 interval,
                 heartbeat_cancel,
                 heartbeat_bridge_cancel,

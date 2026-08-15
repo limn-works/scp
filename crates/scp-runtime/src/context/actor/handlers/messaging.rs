@@ -173,10 +173,19 @@ pub(crate) async fn dispatch(
             context_id,
             sender_did,
             signing_key,
+            signing_key_id,
             reply,
         } => {
-            handle_build_local_checkpoint(cell, deps, &context_id, &sender_did, &signing_key, reply)
-                .await
+            handle_build_local_checkpoint(
+                cell,
+                deps,
+                &context_id,
+                &sender_did,
+                &signing_key,
+                signing_key_id,
+                reply,
+            )
+            .await
         }
         MessagingCommand::CompareRemoteCheckpoint {
             context_id,
@@ -195,8 +204,20 @@ pub(crate) async fn dispatch(
             context_id,
             sender_did,
             signing_key,
+            signing_key_id,
             reply,
-        } => handle_send_heartbeat(cell, deps, &context_id, &sender_did, &signing_key, reply).await,
+        } => {
+            handle_send_heartbeat(
+                cell,
+                deps,
+                &context_id,
+                &sender_did,
+                &signing_key,
+                signing_key_id,
+                reply,
+            )
+            .await
+        }
         #[cfg(feature = "testing")]
         MessagingCommand::HandleSenderKeyRequest {
             context_id,
@@ -1058,9 +1079,15 @@ async fn handle_build_local_checkpoint(
     context_id: &str,
     sender_did: &scp_did::DID,
     signing_key: &crate::context::actor::commands::SigningKeyBytes,
+    signing_key_id: scp_did::SigningKeyId,
     reply: crate::context::actor::commands::BuildLocalCheckpointReply,
 ) -> Outcome<()> {
     let sk = signing_key.to_signing_key();
+    // ADR-039: recombine the key with the persona the caller DECLARED for it
+    // into the single coupled value. `sk` signs the checkpoint struct and
+    // `signer` stamps the envelope that broadcasts it, so a peer resolving the
+    // declared method verifies both against the same key.
+    let signer = crate::context::supervisor::MessageSigner::for_key_id(&sk, signing_key_id);
     let now = deps.clock.now_secs();
     // Build + retain the checkpoint through the non-persisting Class-C view
     // (coalesced — the run loop persists on `mutated`). The `&mut view` borrow
@@ -1111,7 +1138,7 @@ async fn handle_build_local_checkpoint(
         cell,
         context_id,
         sender_did,
-        &sk,
+        signer,
         &checkpoint,
     )
     .await
@@ -1213,6 +1240,7 @@ async fn handle_send_heartbeat(
     context_id: &str,
     sender_did: &scp_did::DID,
     signing_key: &crate::context::actor::commands::SigningKeyBytes,
+    signing_key_id: scp_did::SigningKeyId,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     // Take `&mut ClassSCell` (Send) rather than `&PerContextState` (`!Sync`, so
@@ -1221,9 +1249,13 @@ async fn handle_send_heartbeat(
     // actor future. `send_heartbeat` reads the shared `&*cell` in its sync
     // prelude (ADR-049 Decision 7).
     let sk = signing_key.to_signing_key();
-    let result =
-        crate::context::messaging_helpers::send_heartbeat(deps, cell, context_id, sender_did, &sk)
-            .await;
+    // ADR-039: recombine the key with the persona the caller DECLARED for it, so
+    // the beacon's envelope stamp matches the key that signs it.
+    let signer = crate::context::supervisor::MessageSigner::for_key_id(&sk, signing_key_id);
+    let result = crate::context::messaging_helpers::send_heartbeat(
+        deps, cell, context_id, sender_did, signer,
+    )
+    .await;
     match result {
         Ok(()) => {
             let _ = reply.send(Ok(()));

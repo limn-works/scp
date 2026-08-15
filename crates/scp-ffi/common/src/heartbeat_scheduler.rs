@@ -30,12 +30,13 @@
 
 use std::sync::Arc;
 
-use ed25519_dalek::SigningKey;
 use scp_core::context::supervisor::Supervisor;
 use scp_did::DID;
 use scp_transport::HeartbeatConfig;
 use scp_transport::profile::TransportProfile;
 use tokio_util::sync::CancellationToken;
+
+use crate::persona::ResolvedMessageSigner;
 
 /// Resolves the heartbeat send interval for a transport profile, or `None`
 /// when the profile disables heartbeats (`Constrained`).
@@ -50,9 +51,18 @@ pub fn heartbeat_interval(profile: TransportProfile) -> Option<std::time::Durati
 
 /// Drives periodic heartbeat sends for one subscribed context until cancelled.
 ///
-/// Loops on a timer at `interval`, calling
-/// [`Supervisor::send_heartbeat`] each tick with the caller-held
-/// `signing_key`. The send is best-effort: a transport failure is logged but
+/// Loops on a timer at `interval`, calling [`Supervisor::send_heartbeat`] each
+/// tick with the caller-held `signer`.
+///
+/// `signer` is a [`ResolvedMessageSigner`] — the key and the `#active`/`#agent`
+/// verification method it was resolved under, as ONE value (ADR-039). Taking
+/// the pair separately would let a bridge stamp a method its key does not back,
+/// and a beacon whose stamp its signature does not match is rejected by every
+/// peer — so an honest participant would be read as suppressed (§9.9.2). Each
+/// bridge's `resolve_*` helper picks the key handle and the persona in a single
+/// match, so the two cannot drift apart between resolution and this call.
+///
+/// The send is best-effort: a transport failure is logged but
 /// never breaks the loop, because a failed or undelivered heartbeat is itself a
 /// suppression signal — surfaced by the *receiver's* gap detection, not by
 /// tearing down the sender. The loop exits cleanly when either `cancel` (the
@@ -70,32 +80,36 @@ pub async fn run_heartbeat_scheduler(
     supervisor: Arc<Supervisor>,
     context_id: String,
     sender_did: DID,
-    signing_key: SigningKey,
+    signer: ResolvedMessageSigner,
     interval: std::time::Duration,
     cancel: CancellationToken,
     bridge_cancel: CancellationToken,
 ) {
     let ctx_for_log = context_id.clone();
-    // Wrap the secret signing key in an `Arc` ONCE so each tick clones a
-    // refcount handle, never a copy of the Ed25519 secret scalar. The key
-    // material exists in exactly one heap location for the scheduler's
+    // Wrap the signer (which owns the secret key) in an `Arc` ONCE so each tick
+    // clones a refcount handle, never a copy of the Ed25519 secret scalar. The
+    // key material exists in exactly one heap location for the scheduler's
     // lifetime (matching the prior single-capture exposure window) rather than
     // being re-copied per tick.
-    let signing_key = Arc::new(signing_key);
+    let signer = Arc::new(signer);
     scheduler_loop(interval, cancel, bridge_cancel, move || {
         // The per-tick async block is `move` and outlives the `FnMut` closure
         // call, so it must OWN what it touches — it cannot borrow the closure's
         // captures. Per tick we clone only cheap handles: the `Arc<Supervisor>`
-        // and `Arc<SigningKey>` clones are refcount bumps (no secret-scalar
-        // copy), and the DID / context-id string clones are negligible against
-        // the ≥60s tick cadence.
+        // and `Arc<ResolvedMessageSigner>` clones are refcount bumps (no
+        // secret-scalar copy), and the DID / context-id string clones are
+        // negligible against the ≥60s tick cadence.
         let supervisor = Arc::clone(&supervisor);
         let context_id = context_id.clone();
         let sender_did = sender_did.clone();
-        let signing_key = Arc::clone(&signing_key);
+        let signer = Arc::clone(&signer);
         async move {
+            // ADR-039: the stamp and the signing key are one value from here
+            // down, so a peer resolving the declared method always verifies the
+            // beacon. `message_signer()` borrows from `signer`, which the
+            // surrounding `async move` block owns for the whole call.
             if let Err(e) = supervisor
-                .send_heartbeat(&context_id, &sender_did, &signing_key)
+                .send_heartbeat(&context_id, &sender_did, signer.message_signer())
                 .await
             {
                 // Best-effort (§9.9.2): a failed send does not stop the

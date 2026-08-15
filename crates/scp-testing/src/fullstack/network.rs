@@ -6,12 +6,14 @@
 //! supervisor to reserve its own MLS `KeyPackage` and publish its wrapping keypair
 //! during `add_member`).
 //!
-//! Every node in one network resolves its `#active` verifying key through a
-//! single deterministic [`KeyResolver`] the network owns: it maps each DID to
-//! `SigningKey::from_bytes(did_to_seed(did)).verifying_key()` — exactly the key
-//! each node signs with AND the key a joiner's #active custody imports, so
-//! `Supervisor::invite_member` (which seals to the resolved invitee key) and
-//! governance vote verification both work without any per-test resolver wiring.
+//! Every node in one network resolves its verifying keys through a single
+//! deterministic, **persona-aware** [`KeyResolver`] the network owns (ADR-039):
+//! `#active` maps to `SigningKey::from_bytes(did_to_seed(did))` — exactly the
+//! key each node signs with AND the key a joiner's `#active` custody imports,
+//! so `Supervisor::invite_member` (which seals to the resolved invitee key) and
+//! governance vote verification both work without any per-test resolver wiring
+//! — and `#agent` maps to a genuinely different key,
+//! `SigningKey::from_bytes(did_to_agent_seed(did))`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,7 +23,7 @@ use scp_did::DID;
 
 use super::crypto::E2eCryptoProvider;
 use super::exchange::KeyExchange;
-use super::node::{FullStackNode, NodeRegistry, NodeShared, did_to_seed};
+use super::node::{FullStackNode, NodeRegistry, NodeShared, did_to_agent_seed, did_to_seed};
 
 /// Factory for creating `FullStackNode`s that share a `KeyExchange` and a node
 /// registry.
@@ -47,15 +49,32 @@ impl FullStackNetwork {
         }
     }
 
-    /// The network's deterministic `#active` key resolver: maps every DID to
-    /// `SigningKey::from_bytes(did_to_seed(did)).verifying_key()`. This is the
-    /// same key each node signs with and the key a joiner's #active custody
-    /// imports, so `invite_member` seals to a key the joiner can open and
-    /// governance vote verification succeeds.
+    /// The network's deterministic **persona-aware** key resolver (ADR-039).
+    ///
+    /// Each DID resolves to a DIFFERENT verifying key per verification method:
+    /// - `#active` → `SigningKey::from_bytes(did_to_seed(did))` — the key each
+    ///   node signs with by default and the key a joiner's `#active` custody
+    ///   imports, so `invite_member` seals to a key the joiner can open and
+    ///   governance vote verification succeeds.
+    /// - `#agent` → `SigningKey::from_bytes(did_to_agent_seed(did))` — the
+    ///   node's autonomous-agent key.
+    ///
+    /// This resolver previously ignored the requested method (`|did, _kid|`)
+    /// and answered the `#active` key for both. That made every declared-method
+    /// assertion in this harness VACUOUS: an envelope stamped `#agent` but
+    /// signed `#active` verified, and a judge resolving the wrong method still
+    /// succeeded, so a test could not distinguish a correct implementation from
+    /// one that dropped the declaration entirely. Two distinct keys restore the
+    /// production property — the declared method must match the key that
+    /// signed, or verification fails.
     #[must_use]
     fn resolver() -> KeyResolver {
-        Arc::new(|did: &DID, _kid: scp_did::SigningKeyId| {
-            Some(ed25519_dalek::SigningKey::from_bytes(&did_to_seed(did)).verifying_key())
+        Arc::new(|did: &DID, kid: scp_did::SigningKeyId| {
+            let seed = match kid {
+                scp_did::SigningKeyId::Active => did_to_seed(did),
+                scp_did::SigningKeyId::Agent => did_to_agent_seed(did),
+            };
+            Some(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key())
         })
     }
 

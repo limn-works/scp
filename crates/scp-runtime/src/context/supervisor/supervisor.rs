@@ -1294,6 +1294,25 @@ pub enum MessageSigner<'a> {
 }
 
 impl<'a> MessageSigner<'a> {
+    /// Pairs a signing key with the verification method it signs under.
+    ///
+    /// The SINGLE construction point for turning a `(key, SigningKeyId)` pair —
+    /// the shape a command variant or an FFI boundary carries, where the two
+    /// necessarily travel as separate values — back into the coupled
+    /// [`MessageSigner`]. Every such recombination goes through here, so the
+    /// `SigningKeyId` → variant mapping exists exactly once and a new persona
+    /// cannot be added to [`SigningKeyId`] without this match failing to compile.
+    #[must_use]
+    pub const fn for_key_id(
+        key: &'a ed25519_dalek::SigningKey,
+        signing_key_id: scp_did::SigningKeyId,
+    ) -> Self {
+        match signing_key_id {
+            scp_did::SigningKeyId::Active => Self::Active(key),
+            scp_did::SigningKeyId::Agent => Self::Agent(key),
+        }
+    }
+
     /// The Ed25519 signing key, regardless of persona.
     #[must_use]
     pub const fn key(&self) -> &'a ed25519_dalek::SigningKey {
@@ -10997,8 +11016,17 @@ impl Supervisor {
     /// through the actor mailbox via [`Self::dispatch_command`].
     ///
     /// Used by the reconnection driver's Phase 3 (`event_log_sync`): the
-    /// caller supplies its locally-controlled `sender_did` + `signing_key`
+    /// caller supplies its locally-controlled `sender_did` + `signer`
     /// exactly as the application send path does.
+    ///
+    /// `signer` is the coupled key-and-persona value (ADR-039), identical in
+    /// shape to [`Self::send_message`]. The checkpoint's own Ed25519 signature
+    /// uses `signer.key()` and the envelope that broadcasts it is stamped with
+    /// `signer`'s verification method, so a peer resolving the DECLARED method
+    /// verifies both against one key. Taking a bare key here and re-asserting a
+    /// persona downstream is what previously made an `#agent` participant's
+    /// checkpoints unverifiable — and therefore exempt from §9.9.3 tier-(a)
+    /// equivocation detection.
     ///
     /// # Errors
     ///
@@ -11008,15 +11036,20 @@ impl Supervisor {
         &self,
         context_id: &str,
         sender_did: &DID,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: MessageSigner<'_>,
     ) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // Single decomposition point: the key and the declared persona both come
+        // from the one `MessageSigner`, and the handler recombines them with
+        // `MessageSigner::for_key_id`. A command cannot carry the borrow the
+        // coupled value needs, which is the only reason they travel split.
         let cmd = MessagingCommand::BuildLocalCheckpoint {
             context_id: context_id.to_owned(),
             sender_did: sender_did.clone(),
             signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
+                signer.key(),
             ),
+            signing_key_id: signer.signing_key_id(),
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -11033,10 +11066,16 @@ impl Supervisor {
     ///
     /// Driven by the bridge/SDK subscribe-path periodic scheduler (the
     /// §9.9.2 "the SDK sends heartbeats" boundary): the caller supplies its
-    /// locally-controlled `sender_did` + `signing_key` exactly as the
-    /// application send path does — the signing key is not actor-owned state.
-    /// The heartbeat carries an empty payload; its only purpose is to give
-    /// peers a liveness beacon for suppression detection.
+    /// locally-controlled `sender_did` + `signer` exactly as the application
+    /// send path does — the signing key is not actor-owned state. The heartbeat
+    /// carries an empty payload; its only purpose is to give peers a liveness
+    /// beacon for suppression detection.
+    ///
+    /// `signer` is the coupled key-and-persona value (ADR-039), identical in
+    /// shape to [`Self::send_message`]. A beacon stamped with a verification
+    /// method its signature does not match is rejected by every peer, which
+    /// reads a live participant as suppressed — so the persona must travel with
+    /// the key rather than being re-asserted downstream.
     ///
     /// # Errors
     ///
@@ -11048,15 +11087,18 @@ impl Supervisor {
         &self,
         context_id: &str,
         sender_did: &DID,
-        signing_key: &ed25519_dalek::SigningKey,
+        signer: MessageSigner<'_>,
     ) -> Result<(), ContextError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // Single decomposition point (see `build_local_checkpoint`): both halves
+        // come from the one `MessageSigner` and the handler recombines them.
         let cmd = MessagingCommand::SendHeartbeat {
             context_id: context_id.to_owned(),
             sender_did: sender_did.clone(),
             signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
-                signing_key,
+                signer.key(),
             ),
+            signing_key_id: signer.signing_key_id(),
             reply: tx,
         };
         self.dispatch_command(context_id, cmd).await?;
@@ -11075,13 +11117,41 @@ impl Supervisor {
     /// [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison)
     /// (`Consistent` / `Behind` / `Ahead` / `Divergent`). A `Divergent`
     /// result has already emitted `ContextEvent::EquivocationDetected`
-    /// inside the handler. Used by the reconnection driver's Phase 3.
+    /// inside the handler.
+    ///
+    /// This is NOT the production comparison path. A received peer checkpoint
+    /// is judged automatically inside the receive path (`deliver_commit_blob` →
+    /// `deliver_incoming` → `deliver_checkpoint_message` → the judge), which is
+    /// the ONLY place the declaration below can be sourced honestly. The
+    /// reconnection driver's Phase 3 builds and broadcasts the LOCAL checkpoint
+    /// ([`Self::build_local_checkpoint`]) and then drains the alerts that
+    /// automatic judging already raised; it never calls this method. (A prior
+    /// version of this comment claimed otherwise.) The method exists as the
+    /// mailbox-dispatch surface for
+    /// [`MessagingCommand::CompareRemoteCheckpoint`] and is exercised by the
+    /// runtime dispatch tests in `scp-testing`.
     ///
     /// `signing_key_id` is the verification method the checkpoint's sender
     /// DECLARED — the `signing_key_id` of the inner envelope that carried it
     /// (ADR-039). The judge resolves exactly that method from the sender's DID
     /// document, so §9.9.3 equivocation detection applies under `#active` and
     /// `#agent` alike without the two personas being interchangeable.
+    ///
+    /// # Callers MUST NOT synthesize `signing_key_id`
+    ///
+    /// This value is a *relayed attestation*, not a caller preference. It is
+    /// only meaningful when it is the `signing_key_id` field read off an inner
+    /// envelope whose signature has ALREADY been verified under that same field
+    /// — the production path
+    /// ([`deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
+    /// → `deliver_checkpoint_message`), where the sender's own signature covers
+    /// the declaration and so binds it. Passing a hand-chosen variant here, or
+    /// retrying with the other one after a `CryptoFailed`, reconstitutes the
+    /// try-both verifier ADR-039 forbids: it lets an equivocator whose
+    /// checkpoint was signed under one persona be judged as though it declared
+    /// the other, and turns the persona from an authenticated claim into a
+    /// receiver-side guess. There is no legitimate caller that knows the
+    /// declaration without having verified the envelope that carried it.
     ///
     /// # Errors
     ///
@@ -22112,6 +22182,7 @@ mod tests {
                 signing_key: SigningKeyBytes::from_signing_key(
                     &crate::crypto::mls::two_party_test_support::alice_signing_key(),
                 ),
+                signing_key_id: scp_did::SigningKeyId::Active,
                 reply: htx,
             };
             let outcome = crate::context::actor::handlers::messaging::dispatch(
@@ -23702,7 +23773,7 @@ mod tests {
             &sender,
             0,
             b"paid",
-            Some(&signing_key),
+            Some(MessageSigner::Active(&signing_key)),
             // Paid send: a deferred spending-nonce token whose fail-closed
             // commit drives the persist (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -23725,7 +23796,7 @@ mod tests {
             &sender,
             1,
             b"free",
-            Some(&signing_key),
+            Some(MessageSigner::Active(&signing_key)),
             // Free send: no token (previously the `false` bool) — keeps the
             // best-effort persist, un-regressed.
             None,
@@ -24386,7 +24457,7 @@ mod tests {
             &sender,
             0,
             b"paid-send",
-            Some(&signing_key),
+            Some(MessageSigner::Active(&signing_key)),
             // Paid send: deferred token whose fail-closed commit persists the
             // consumed nonce (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
@@ -24859,7 +24930,7 @@ mod tests {
             &sender,
             reserved,
             b"paid",
-            Some(&signing_key),
+            Some(MessageSigner::Active(&signing_key)),
             // Paid send: deferred token whose fail-closed commit fails here,
             // driving the sequence-rollback path (previously the `true` bool).
             Some(crate::context::actor::class_s::ClassSCommitToken::new_for_test(&ctx_key)),
