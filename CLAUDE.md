@@ -6,15 +6,15 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 
 ### Protocol tenets
 
-- **Provenance everywhere.** All non-private data carries verifiable origin metadata. The absence of provenance is itself a signal.
+- **Provenance everywhere.** All non-private data carries verifiable origin metadata. When a record carries no provenance, that absence tells a reader something, so treat it as a signal rather than as missing information.
 - **Human accountability.** Every agent traces to a human DID through attestation chains. Behavioral records are durable.
-- **Context isolation.** All interaction within bounded contexts. Cross-context data flow is explicit and governed. The security boundary.
+- **Context isolation.** Every interaction happens inside a bounded context. A participant moves data across a context boundary only through an explicit, governed path. The context boundary is the security boundary.
 - **Encryption-as-access-control.** MLS group keys enforce membership. Relays are untrusted: access control is cryptographic (never relay-enforced) and clients verify every record independently, so correctness never depends on a relay. A relay MAY validate *public, self-certifying* records it stores (e.g. verify a DID document's BEP44 signature and keep the highest-seq copy) for availability/anti-suppression — defense-in-depth, never a trust dependency, and never applies to encrypted content. 'Untrusted,' not 'does zero validation,' is the invariant.
-- **Legibility before opt-in.** Context parameters visible before joining. Informed consent is mechanical.
-- **Protocol requires no operator.** Must work if Limn disappears tomorrow.
+- **Legibility before opt-in.** A prospective member reads a context's parameters before joining it, so the protocol makes informed consent mechanical.
+- **Protocol requires no operator.** The protocol must keep working if Limn shuts down tomorrow.
 - **Transport independence.** No structural coupling to any single transport.
 - **Agents are participants, not enforcers.** Same rules as any human-bound participant.
-- **Trust is contextual.** Function of identity, capability, context, and behavior — not binary.
+- **Trust is contextual.** A trust decision reads identity, capability, context, and behavior together. No participant is simply trusted or untrusted.
 
 ### Builder tenets
 
@@ -40,7 +40,7 @@ SCP is an open, ecosystem-agnostic infrastructure protocol — open infrastructu
 - **No shortcuts.** No force unwraps, no placeholders, no "good enough."
 - **Provenance is paramount.** Every line traces to a documented decision. Chain: `.docs/` sources → `.docs/prds/` stories (or GitHub comments, feature-local artifacts). Before writing or changing code, read the full provenance chain — not summaries, not headers, the actual artifacts. Fresh agents must retrace full context quickly. Broken provenance is a bug.
 - **Always run CI locally before pushing.** Pushing lint, format, and test failures is a waste of CI minutes.
-- **Agent-first API design.** The SDK's primary author is an LLM. Optimize every public API for first-pass LLM authorability: one canonical pattern; flat named-field config objects over builders and typestate; enums over booleans for consequential choices; no silent security defaults; an identical shape across all language bindings. Typestate / phantom required-ordering a model can't track is a defect, not a safety feature — encode required choices as required fields. The measure: an agent writes correct code from the type signature plus one example, with no compile-retry loop. Enacted mechanically via `.docs/standards/construction.md` + a structural check (see ADR-052).
+- **Agent-first API design.** The SDK's primary author is an LLM. Optimize every public API for first-pass LLM authorability: one canonical pattern; flat named-field config objects over builders and typestate; enums over booleans for consequential choices; no silent security defaults; an identical shape across all language bindings. Typestate / phantom required-ordering a model can't track is a defect, not a safety feature — encode required choices as required fields. The measure: an agent writes correct code from the type signature plus one example, with no compile-retry loop. Enacted mechanically via `.docs/standards/construction.md` + a structural check (see ADR-052, the unified construction pattern).
 
 ## Tools
 
@@ -66,10 +66,26 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 
 **Operating model:**
 - Humans steer. Agents execute. No human-written code; only human-driven specs.
-- Context is scarce — give agents a map, not a manual
-- Provenance must always be maintained and traced back. Read the actual source artifacts — specs, ADRs, PRDs, standards — before making changes. Skimming is not reading.
+- An agent's context window is small, so tell an agent where to look and let it read the artifact itself. Do not paste the artifact into the prompt.
+- Maintain provenance and trace every claim back to its source. Read the source artifacts themselves — specs, ADRs, PRDs, standards — before you change anything. Skimming an artifact does not count as reading it.
 - Be autonomous: infer from context, code, artifacts. Escalate only for genuine judgment calls.
-- Go deep on references. When a spec cites a section, read that section. When code references a story, read the story. When an ADR lists alternatives, understand why they were rejected. Surface-level understanding produces surface-level code.
+- Follow every reference. When a spec cites a section, read that section. When code references a story, read the story. When an ADR lists a rejected alternative, find out why its author rejected it. An agent who skims the sources writes code that matches the sources only on the surface.
+
+**Never resolve an open question yourself (MANDATORY):**
+- When you ask the human a question, wait for the human to answer it. Do not answer it yourself, and do not proceed on the answer you expected.
+- When the human answers part of what you asked, the rest stays open. A partial answer decides nothing about the parts it did not cover, so name what is still open instead of filling it in.
+- Never act on an implicit or assumed resolution while a conversation is running. Silence is not agreement. Moving to the next topic is not agreement. An answer that implies something is not a decision about that something.
+- A question is settled when both parties have stated the same resolution: you state the resolution explicitly, and the human confirms it. Until that happens the question stays open, and you say it is open rather than choosing an answer.
+- This rule governs open questions, not assigned work. It never licenses asking permission to do work the human already assigned — the autonomy rules still hold. Execute the assigned work, and stop at the question the human has not answered.
+
+**Never reclaim the human's words as your own by reframing them (MANDATORY — in conversation first, and in every artifact):**
+- When the human says "it's a sunny day", do not answer "yes, not a cloud in the sky". Those two statements are not the same: one allows clouds and the other forbids them. Answering that way swaps your claim in for theirs and attaches their agreement to yours.
+- Agree with what they said. When you have a further claim, say it separately and say that it is yours.
+- When the human states a rule, a finding, or a decision, record it with their meaning and their scope intact.
+- Quote them verbatim when they ask for a quote, not by default.
+- Paraphrasing their statement into your own register erodes the original information and presents your content as theirs, so your invention carries their authority.
+- Keep their general clause when they give one. Do not replace it with an enumeration you invented, and do not narrow it to the instance in front of you.
+- When you must add a word to make their statement usable, say that you added it.
 
 **Artifact flow (INVARIANT):**
 - The flow is strictly one-way: **plans → specs → ADRs → stories → source code.**
@@ -79,19 +95,19 @@ Artifacts (`.docs/`) are durable and versioned — the system of record. Vestige
 - Violating this invariant creates phantom provenance: code that appears grounded in artifacts but actually diverges from them. This is worse than no provenance at all.
 
 **Workflow:**
-- Plan mode for all non-trivial tasks (3+ steps or architectural decisions)
-- Aggressively reference and update `.docs/`; add lessons after any correction
+- Enter plan mode for any task that takes three or more steps, and for any task that decides an architectural question
+- Cite `.docs/` in your work and update it as you go. After anyone corrects you, write the lesson into `.docs/lessons/`
 - Check `.docs/standards/` before writing code — read and follow them
-- Subagents: use liberally, one task each, keep main context clean
+- Give each subagent exactly one task, and dispatch as many subagents as the work needs, so the orchestrator's context stays small
 - Subagents: ALWAYS instruct them to read CLAUDE.md
-- Verify all gates, tests, and builds pass before deciding you are done
+- Run every gate, every test, and every build, and read their output, before you call the work done
 
 **Change protocol (MANDATORY for all code changes):**
 - Use subagents with worktree isolation for all changes
-- Add and update tests for every change — no untested code ships
+- Write a test for every change and update the tests the change breaks. Untested code does not ship
 - Review locally using the full review roster, in logical units
   - Validate and address every item, then re-run the full review
-  - Repeat until zero items remain
+  - Repeat the loop until a review pass returns zero items twice in a row
   - Do NOT ignore or dismiss review items as "out of scope" or "preexisting." Prefer to fix them inline. At minimum, file GitHub issues — but fixing is always preferred over filing.
 - Run CI locally before pushing. **Always.** No exceptions.
   - CI failures are never acceptable, whether you introduced them or not. Fix them properly before pushing.
@@ -105,7 +121,7 @@ Before executing any plan that adds protocol logic, verify:
 3. Each bridge export has a corresponding SDK wrapper method
 4. A pipeline assertion exists in `pipeline_wiring.rs` for the new step
 5. The SDK capability matrix is updated
-If any cell is empty, the plan is incomplete — expand scope or file dependent issues first.
+When any one of those five checks fails, the plan is incomplete: widen the plan to cover the gap, or file the dependent issue, before you execute.
 
 **NEVER modify enforcement files to bypass failures.**
 Files: pipeline_wiring.rs, ffi_conformance.rs, sdk-capability-matrix.json,
@@ -114,7 +130,7 @@ check-cross-layer.sh, check-protocol-deps.sh, check-no-shim-reexports.sh, check-
 check-no-bridge-globals.sh, check-no-fallback-registry.sh,
 check-handle-affinity.sh, check_ready_coverage.rs (per-instance handle
 affinity enforcement),
-check-saga-gating-granularity.sh (ADR-049 §3a per-participant-context-set
+check-saga-gating-granularity.sh (ADR-049 actor-per-context, §3a per-participant-context-set
 saga gating granularity), check-no-mutable-globals.sh,
 check-no-mutable-module-globals.py, check-no-ts-mutable-globals.sh,
 check-no-kotlin-mutable-globals.sh,
@@ -128,28 +144,39 @@ feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability
 features only, ZERO nullifier exceptions),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
-If a check fails, fix the code. The only legitimate modifications are:
-- Adding NEW assertions/operations (expanding coverage)
-- Removing #[ignore] when a wiring PR lands (promoting to enforced)
-Weakening, removing, or exempting existing assertions requires human approval.
+When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:
+- You are adding a new assertion or a new operation, which widens what the check covers
+- You are removing an `#[ignore]` because the wiring it waited on has landed, which promotes a dormant assertion to an enforced one
+A human must approve before you weaken an existing assertion, delete one, or exempt anything from one.
 
 **Architecture:**
-- Protocol-first design; inject through initializers; no singletons
-- APIs: self-evident, one happy path, optimized for LLM authorability (see the Agent-first API design tenet)
+- Define a protocol before you write the type that satisfies it. Inject every dependency through an initializer. Never reach for a singleton
+- Give every public API one happy path a reader can find from the type signature alone, and optimize that signature for an LLM author (see the Agent-first API design tenet)
 
 **PRD stories (MANDATORY):**
 - **Before creating, editing, or updating any story in `.docs/prds/`**, read `.docs/standards/prd.md` in full. No exceptions.
-- Every field in the standard is required. Every acceptance criterion must be machine-verifiable. Every source must trace to an actual heading in an actual file. Every dependency must be forward-only.
+- Fill every field the standard defines. Write every acceptance criterion so a machine can verify it. Point every source at a heading that exists in a file that exists. Point every dependency forward, never backward.
 - The artifact flow applies to stories: stories reference specs and ADRs, never the reverse. If a story can't cite a spec section or ADR, it needs one written first.
 - Run `python3 scripts/validate-prd.py` before committing PRD changes. CI enforces this.
-- Subagents creating stories must self-validate against the standard before returning. Two audits missed quality issues because no one checked their own output — that failure mode is why this standard exists.
+- A subagent that writes a story validates the story against the standard before it returns. Two audits shipped defective stories because neither audit checked its own output, and that failure is why this standard exists.
 
 **Stubs:**
 - Every stub must reference a PRD story ID (`// Stub — see SCP-NNN`)
-- Stories marked "done" must have zero stubs against their acceptance criteria
+- A story marked "done" carries zero stubs against its acceptance criteria
 - CI enforces: Rust (`clippy::todo/unimplemented = "deny"`), Kotlin (detekt `ForbiddenComment`), Python (ruff `FIX`), Swift (SwiftLint `todo`), TypeScript (ESLint `no-warning-comments`)
 - See `.docs/standards/sdk-common.md` §Stub and Placeholder Policy
 - **No dev/test-only stand-in may mask a missing production implementation (see the builder tenet).** A stub returns a documented, story-referenced gap on its own path; it does NOT reach for a test-only nullifier (in-memory custody/DHT/attestation, no-op verifier, placeholder value) to *appear* functional in production. Prod fails closed until the real backend lands. The prove-absence gate allowlists zero nullifiers — deferring a real backend to a tracked issue never authorizes shipping a stand-in for it.
+
+**Never write your extrapolation as the contract (MANDATORY for every spec clause, acceptance criterion, gate, standard, and agent prompt):**
+Mike Caulfield names this failure in "I finally understand why LLMs suck at writing prompts" (https://mikecaulfield.substack.com/p/i-finally-understand-why-llms-suck): a model asked to write a prompt "write[s] the intermediate prompt as the contract prompt." Two different things get written in the same authoritative register:
+- A **contract** states the criterion a reader applies to decide whether something qualifies.
+- An **intermediate extrapolation** is the operational detail a model invents so it can act on a request the contract states too vaguely: candidate indicators, search terms, surface features that often accompany the target.
+Caulfield asked a model to characterize the director Chris Columbus and got "warm, sentimental mainstream family entertainment; plucky kids and harried parents in cozy suburban or holiday settings; broad comic set-pieces softened by earnest heart and reassuring resolution." That paragraph reads as a definition, but it matched roughly one film in ten across continents and centuries, and the model itself later judged two of its three top matches indefensible. The paragraph lists things that often accompany a Columbus film. It never states what makes a film a Columbus film.
+- **Write the criterion, then label the indicators as indicators.** State what decides membership. Keep the operational detail you invented, because a reader needs it to act, but mark it as evidence that suggests the target rather than as the test that defines the target.
+- **Test every criterion you write by asking how many non-targets it admits.** When a criterion admits many things you did not mean, you wrote search candidates. Narrow the criterion, or demote the text to an indicator list under a criterion you then have to write.
+- **This failure produces a defect this repo already fights.** A denylist gate that chases one more spelling of a bypass is an indicator list presented as a criterion, which is why the "Guard against over-engineering" rule requires a positive whitelist closed by construction.
+
+**Prose (MANDATORY):** every sentence you write for a human reader follows `.docs/standards/concrete-prose.md`. Read that file before you write prose. It governs chat responses, specs, ADRs, PRD stories, commit bodies, pull-request descriptions, code comments, review findings, README text, and artifact copy.
 
 ### Toolchain
 
@@ -169,7 +196,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 - **Kotlin:** JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise. Run `eval "$(mise env)"` first.
 - **TypeScript:** `bun run check` runs `tsc --noEmit` for type checking. Biome handles both lint and format.
 - **PRD validation:** `python3.12 scripts/validate-prd.py` — run before committing PRD changes.
-- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands require `+nightly`. List targets: `cargo +nightly fuzz list --fuzz-dir fuzz`. See ADR-045 and `fuzz/README.md`.
+- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands require `+nightly`. List targets: `cargo +nightly fuzz list --fuzz-dir fuzz`. See ADR-045, the fuzzing infrastructure decision, and `fuzz/README.md`.
 
 ### Git
 
@@ -234,6 +261,7 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 - Never say "done" without showing verification output.
 
 **Agent execution rules (MANDATORY):**
+- **Write every agent prompt as a contract, never as your recipe.** State what the agent must make true, and state how you will check it. Then, separately and labelled as such, give the recipe you would have followed: the files to read, the greps to run, the symbols to trace. An agent that receives only a recipe satisfies the recipe and reports success, which is how `let _ = function_name;` came to satisfy a string-search test while calling nothing. The same rule governs the standing agent definitions in `.claude/agents/`: each one states its verdict criterion, and its review dimensions serve that criterion as evidence rather than replacing it.
 - Every agent prompt must specify which branch to start from. Include: "Verify with `git log --oneline -3` that you see [expected commits]. If not, STOP."
 - Never checkout migration/feature branches on the main worktree. All branch work happens in worktrees. Main worktree stays on main.
 - When the plan says "delete X and import Y," agents MUST delete X and import Y. No excuses. "Different serde format," "different field types," "architectural mismatch" are NOT valid reasons to keep local reimplementations when there are zero consumers. The only valid reason is a compiler-level mechanical restriction.
@@ -278,13 +306,13 @@ crates/              # Rust workspace — the protocol core
 │   ├── uniffi/      #   UniFFI (Swift, Kotlin)
 │   └── napi/        #   napi-rs (Node.js/Bun → TypeScript)
 ├── scp-identity/    # Native DID subsystem — DID-method, resolution/publication/lifecycle
-├── scp-dht/         # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 T1c-a)
+├── scp-dht/         # Native DHT transport leaf — DhtClient/DhtRecord/InMemory/Pkarr + BEP44 helpers (ADR-057 in-browser client, task T1c-a)
 ├── scp-clock/       # Clock port (wall-clock time) — wasm-safe capability leaf
 ├── scp-crypto/      # Ed25519 signature verification — wasm-safe capability leaf
 ├── scp-did/         # DID data model (DID, SigningKeyId, DidDocument, proofs, attestation) — wasm-safe
-├── scp-mls/         # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057)
-├── scp-client/      # Single-threaded in-browser participant driver over scp-mls (ADR-057)
-├── scp-client-wasm/ # wasm-bindgen browser surface over scp-client (ADR-057)
+├── scp-mls/         # Synchronous MLS state machine — wasm-safe, shared by node + browser (ADR-057 in-browser client)
+├── scp-client/      # Single-threaded in-browser participant driver over scp-mls (ADR-057 in-browser client)
+├── scp-client-wasm/ # wasm-bindgen browser surface over scp-client (ADR-057 in-browser client)
 ├── scp-transport/   # Relay, adapters, blob storage
 ├── scp-node/        # Application node binary (relay + HTTP + identity)
 ├── scp-platform/    # Platform abstractions (KeyCustody, Storage, DeviceAttestation)
@@ -295,7 +323,7 @@ crates/              # Rust workspace — the protocol core
 
 bindings/            # Language SDK wrappers — the developer-facing API
 ├── python/          # scp_sdk package (wraps PyO3 bridge)
-├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge; browser = in-browser SCP client over scp-client-wasm, keys on-device per ADR-057)
+├── typescript/      # @limn-works/scp-ts (wraps NAPI bridge; browser = in-browser SCP client over scp-client-wasm, keys on-device per ADR-057, the in-browser client)
 ├── swift/           # SCP Swift package (wraps UniFFI bridge)
 └── kotlin/          # scp-kt (wraps UniFFI bridge) — Android extensions
 ```

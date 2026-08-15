@@ -1,10 +1,16 @@
 # Documentation Standards
 
-When and how to document code.
+When to document code, how to write the documentation, and which prose rules bind it.
 
 ## Philosophy
 
-Documentation exists to accelerate human understanding. Write docs that help someone get up to speed quickly — not docs for the sake of completeness.
+Documentation exists so a reader learns something faster than they would by reading the code. Write what a reader needs in order to use the thing correctly. Do not write documentation to make a coverage count go up.
+
+## Prose rules (binding)
+
+Every sentence in every document in this repository follows `.docs/standards/concrete-prose.md`. Read that file before you write documentation. Those rules require, in short: name the agent, give every verb its object, state how each clause relates to the clause beside it, write in the active voice, report rather than appraise, delete a modifier a reader cannot check, name a thing beside every identifier you cite, and write the shortest sentence that still does all of that.
+
+Documentation adds one further requirement, from the `CLAUDE.md` rule about contracts: **state the criterion, then label the indicators.** A doc comment that lists the conditions under which a function usually works has told the reader nothing about when the function is correct to call. Write the precondition the caller must satisfy, then list the symptoms of violating it as symptoms.
 
 ## When to Document
 

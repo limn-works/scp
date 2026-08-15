@@ -2,6 +2,18 @@
 
 This project uses specialized agents for different architectural concerns. Each agent owns a vertical slice of responsibility.
 
+## Every agent definition is a contract
+
+An agent file must say, in one sentence, what the agent has to confirm before it reports a verdict. The rest of the file tells the agent where to look. An agent that has run every check in the file still has to confirm that one thing, and the file must say so.
+
+An agent handed a checklist and no criterion completes the checklist and reports success. That is how `let _ = function_name;` came to satisfy a string-search test while calling nothing.
+
+When you write or edit an agent definition, satisfy both requirements:
+1. State the criterion in the file, in one sentence the agent can quote back. "INCOMPLETE if any acceptance criterion has no code behind it" is a criterion. "Check for stubs, check for `None`, check the matrix" is a recipe.
+2. Mark the recipe as a recipe. Write "these dimensions are where gaps usually hide, not the definition of a gap," so an agent that exhausts the list still knows it has not yet met the criterion.
+
+Every agent definition also follows `.docs/standards/concrete-prose.md`, which governs all prose in this repository.
+
 ## Agents
 
 | Agent | Responsibility | File |
@@ -13,9 +25,14 @@ This project uses specialized agents for different architectural concerns. Each 
 | **AI** | Prompts, context, response parsing, model selection | `ai.md` |
 | **Backend** | Backend systems, APIs, services, server-side architecture | `backend.md` |
 | **Designer** | Product design, visual design, UX, animations, brand | `designer.md` |
-| **GFX** | Shaders, GPU rendering, visual effects, creative coding | `gfx.md` |
 | **Chronicler** | Documentation, knowledge capture, CLAUDE.md updates | `chronicler.md` |
 | **Review Agents** | | |
+| **Adversarial Expert** | Ship/no-ship judgement from a paid outside skeptic's stance | `adversarial-expert.md` |
+| **Black Hat** | Worst-case adversary modelling, abuse of legitimate features | `black-hat.md` |
+| **Red Hat** | Offensive exploitation chains, attack-surface mapping | `red-hat.md` |
+| **White Hat** | Defensive architecture, hardening, security invariants | `white-hat.md` |
+| **Cryptographer** | MLS, AEAD, key management, signatures, Merkle, HPKE, UCAN, DID | `cryptographer.md` |
+| **SDK Coverage Verifier** | Capability-matrix entries: public, callable, semantically correct | `sdk-coverage-verifier.md` |
 | **Styler** | Conventions, naming, code organization | `styler.md` |
 | **Bug Catcher** | Concurrency, crashes, logic errors, subtle defects | `bug-catcher.md` |
 | **Simplifier** | Complexity, premature abstractions, change atomicity | `simplifier.md` |
@@ -43,9 +60,12 @@ This project uses specialized agents for different architectural concerns. Each 
 | **AI** | Prompts, context management, response parsing, model selection |
 | **Backend** | Backend systems, API design, services, server-side architecture, 0-1 builds |
 | **Designer** | New features needing design specs, visual polish, UX flows, brand alignment |
-| **GFX** | Shaders, GPU rendering, visual effects, performance-critical visuals |
 | **Chronicler** | After significant changes, artifact/doc changes, permanent instructions, implementation learnings |
 | **Review — always on code:** | |
+| **Black Hat** | Protocol changes, trust assumptions, any feature an attacker could turn against a participant |
+| **Red Hat** | Security-sensitive changes where you need the exploitation chain, not the vulnerability list |
+| **White Hat** | New defensive controls, hardening work, security-invariant definitions |
+| **Cryptographer** | Any change touching a cryptographic construction, key lifecycle, or proof |
 | **Styler** | After writing code, during refactoring, convention changes |
 | **Bug Catcher** | After writing/modifying code, debugging crashes, concurrency-heavy changes |
 | **Simplifier** | After implementing features, overcomplicated code, complexity reviews |
@@ -62,6 +82,8 @@ This project uses specialized agents for different architectural concerns. Each 
 | **Test Quality Reviewer** | When test files are added or modified |
 | **Tester** | After code changes to verify tests pass |
 | **Dependency Safety Reviewer** | Package/dependency changes, model changes, migrations, public API changes |
+| **Adversarial Expert** | Before building on unreviewed foundation code, or when you need a ship/no-ship call |
+| **SDK Coverage Verifier** | Changes under `bindings/` or to `sdk-capability-matrix.json` |
 
 ## Coordination Principles
 
@@ -88,7 +110,7 @@ When initializing or adding major features:
 4. **AI** — Intelligence layer (if needed)
 5. **Designer** — Visual specs and UX flows (if needed)
 6. **Frontend** — Navigation shell and design system
-7. Feature implementation using appropriate agents (GFX for graphics-heavy work)
+7. Feature implementation using the agent that owns each domain
 
 ## Quick Reference
 
