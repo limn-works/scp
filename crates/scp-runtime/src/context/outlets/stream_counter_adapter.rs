@@ -251,7 +251,7 @@ mod tests {
             event_log,
             key_resolver,
             Some(Box::new(
-                crate::context::persistence::NoopContextPersistence,
+                crate::context::persistence::NoOpContextPersistence,
             )),
             None,
             None,

@@ -38,9 +38,9 @@ use scp_runtime::context::supervisor::{
     Supervisor, SupervisorConfig,
 };
 
-struct NoopPersistence;
+struct NoOpPersistence;
 #[async_trait::async_trait]
-impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
+impl scp_runtime::context::persistence::ContextPersistence for NoOpPersistence {
     async fn persist_context(
         &self,
         _: &str,
@@ -91,7 +91,7 @@ async fn inject(
 
 fn build_supervisor(storage: &Arc<InMemoryStorage>) -> Supervisor {
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let journal: Arc<dyn SagaJournal> =
         Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(storage)));
     Supervisor::new(persistence, journal, SupervisorConfig::default())
@@ -244,7 +244,7 @@ async fn restore_on_startup_fails_closed_when_restore_leg_errors() {
     // helper-side persistence provider, so the restore leg returns
     // `PersistenceFailed`.
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let journal: Arc<dyn SagaJournal> =
         Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let restarted = Arc::new(Supervisor::new(

@@ -43,9 +43,9 @@ use scp_runtime::context::supervisor::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-struct NoopPersistence;
+struct NoOpPersistence;
 #[async_trait::async_trait]
-impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
+impl scp_runtime::context::persistence::ContextPersistence for NoOpPersistence {
     async fn persist_context(
         &self,
         _: &str,
@@ -127,7 +127,7 @@ impl SagaJournal for RecordingJournal {
 
 fn test_supervisor() -> Supervisor {
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let (_, journal) = journal_with_shared_storage();
     let journal_dyn: Arc<dyn SagaJournal> = journal;
     Supervisor::new(persistence, journal_dyn, SupervisorConfig::default())
@@ -172,7 +172,7 @@ async fn saga_prepare_a_invalid_state_aborts_and_returns_error() {
 #[tokio::test]
 async fn saga_journal_records_every_phase_transition_on_abort() {
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let storage = Arc::new(InMemoryStorage::new());
     let prod_journal: Arc<dyn SagaJournal> =
         Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
@@ -275,7 +275,7 @@ async fn saga_concurrent_start_rejects_with_saga_busy() {
 #[tokio::test]
 async fn saga_journal_write_ordering_is_monotonic() {
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let storage = Arc::new(InMemoryStorage::new());
     let prod_journal: Arc<dyn SagaJournal> =
         Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
@@ -346,7 +346,7 @@ async fn crash_recovery_initiated_state_is_discarded() {
 
     // Build a fresh supervisor that shares the journal's storage.
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let replayed_journal = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed_journal;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
@@ -378,7 +378,7 @@ async fn crash_recovery_preparing_a_state_is_discarded() {
     inject_entry(&journal, &saga_id, SagaState::PreparingA, 1).await;
 
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
@@ -408,7 +408,7 @@ async fn crash_recovery_preparing_b_state_is_rolled_back() {
     inject_entry(&journal, &saga_id, SagaState::PreparingB, 1).await;
 
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
@@ -437,7 +437,7 @@ async fn crash_recovery_committing_state_triggers_needs_repair() {
     inject_entry(&journal, &saga_id, SagaState::Committing, 0).await;
 
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
@@ -474,7 +474,7 @@ async fn crash_recovery_needs_repair_is_carryover() {
     inject_entry(&journal, &saga_id, SagaState::NeedsRepair, 0).await;
 
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());
@@ -516,7 +516,7 @@ async fn crash_recovery_terminal_states_are_noop() {
         .unwrap();
 
     let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
-        Arc::new(NoopPersistence);
+        Arc::new(NoOpPersistence);
     let replayed = Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(&storage)));
     let j_dyn: Arc<dyn SagaJournal> = replayed;
     let supervisor = Supervisor::new(persistence, j_dyn, SupervisorConfig::default());

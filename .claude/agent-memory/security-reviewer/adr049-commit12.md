@@ -25,10 +25,10 @@ type: project
 - Fix: gate the unchecked variants behind `pub(crate)` or rename them with `_unchecked` suffix and add deny-by-default lint; remove the unchecked `Supervisor::*` passthroughs entirely.
 
 ### P1 — saga journal posture broken from FFI
-- All FFI bridges call `Supervisor::with_providers(...)` which always wires `NoopSagaJournal` (supervisor.rs:449). FFI cannot configure a real journal.
+- All FFI bridges call `Supervisor::with_providers(...)` which always wires `NoOpSagaJournal` (supervisor.rs:449). FFI cannot configure a real journal.
 - Cross-context sagas (migration, standing-pair, broadcast hosting handshake, cross-context tool invocation) lose all durable journal records. Crash recovery via `load_unresolved` is silently empty.
-- Migration sagas are secret-bearing (handover envelope). With `NoopSagaJournal`, the §9.4.3 "synchronously overwrite on-disk evidence" guarantee is moot — but if any production code path triggers `start_saga` from FFI today, in-flight sagas will not survive crash. Documented as "saga orchestration not yet active in FFI bridges (lands with watchdog migration in commit 12c.10)".
-- Fix: extend `with_providers` with a `saga_journal: Option<Arc<dyn SagaJournal>>` parameter, default to a typed `Disabled` variant that returns `ContextError::NotInitialized` on `start_saga` instead of pretending to succeed. Or refuse `start_saga` entirely when `saga_journal.is::<NoopSagaJournal>()`.
+- Migration sagas are secret-bearing (handover envelope). With `NoOpSagaJournal`, the §9.4.3 "synchronously overwrite on-disk evidence" guarantee is moot — but if any production code path triggers `start_saga` from FFI today, in-flight sagas will not survive crash. Documented as "saga orchestration not yet active in FFI bridges (lands with watchdog migration in commit 12c.10)".
+- Fix: extend `with_providers` with a `saga_journal: Option<Arc<dyn SagaJournal>>` parameter, default to a typed `Disabled` variant that returns `ContextError::NotInitialized` on `start_saga` instead of pretending to succeed. Or refuse `start_saga` entirely when `saga_journal.is::<NoOpSagaJournal>()`.
 
 ### P2 — saga FSM panic poisons concurrency guard
 - `Supervisor::start_saga` (supervisor.rs:1569) sets `saga_pending_guard` to `true`, awaits `run_saga_fsm`, then stores `false`. No RAII; if `run_saga_fsm` panics, the store-false never runs and `saga_pending_guard` is permanently `true`. All future `start_saga` calls return `ActorBusy(SagaBusy)` until process restart.

@@ -96,7 +96,7 @@ pub trait ContextPersistence: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// NoopContextPersistence — every operation is a no-op success.
+// NoOpContextPersistence — every operation is a no-op success.
 // ---------------------------------------------------------------------------
 
 /// No-op persistence — every operation is a no-op success.
@@ -104,10 +104,10 @@ pub trait ContextPersistence: Send + Sync {
 /// Used by the supervisor's `Supervisor::for_query_shim`
 /// constructor and as the default when [`crate::context::supervisor::Supervisor::with_providers`]
 /// is called with `persistence: None`.
-pub struct NoopContextPersistence;
+pub struct NoOpContextPersistence;
 
 #[async_trait]
-impl ContextPersistence for NoopContextPersistence {
+impl ContextPersistence for NoOpContextPersistence {
     async fn persist_context(
         &self,
         _context_id: &str,

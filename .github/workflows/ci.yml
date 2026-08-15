@@ -404,6 +404,23 @@ jobs:
       - name: Real check
         run: bash scripts/check-no-panic-abort.sh
 
+  noop-spelling:
+    needs: check-draft
+    name: Hygiene / canonical NoOp identifier prefix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Self-test MUST run first: it plants an upper-CamelCase and a
+      # lower-camelCase non-canonical spelling (both must be DETECTED) and
+      # confirms the canonical spelling, the bare word in prose, and a
+      # SCREAMING_SNAKE_CASE constant are NOT flagged — proving the gate is
+      # alive before we trust it on the tree. This gate is naming hygiene so
+      # name-based searches stay honest; it is NOT the nullifier check.
+      - name: Self-test gate
+        run: bash scripts/check-noop-spelling.sh --self-test
+      - name: Real check
+        run: bash scripts/check-noop-spelling.sh
+
   saga-gating-granularity:
     needs: check-draft
     name: Actor / saga gating granularity (ADR-049 §3a)
@@ -1311,6 +1328,7 @@ jobs:
       - handle-affinity
       - no-panic-abort
       - handler-no-panic
+      - noop-spelling
       - saga-gating-granularity
       - deleted-primitives
       - bridge-instance-lifecycle
@@ -1359,6 +1377,7 @@ jobs:
             "${{ needs.handle-affinity.result }}" \
             "${{ needs.no-panic-abort.result }}" \
             "${{ needs.handler-no-panic.result }}" \
+            "${{ needs.noop-spelling.result }}" \
             "${{ needs.saga-gating-granularity.result }}" \
             "${{ needs.deleted-primitives.result }}" \
             "${{ needs.bridge-instance-lifecycle.result }}" \

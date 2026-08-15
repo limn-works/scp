@@ -417,7 +417,7 @@ mod tests {
     fn build_supervisor(adapter: Option<Arc<dyn PaymentAdapterDyn>>) -> Arc<Supervisor> {
         build_supervisor_with_persistence(
             adapter,
-            Box::new(crate::context::persistence::NoopContextPersistence),
+            Box::new(crate::context::persistence::NoOpContextPersistence),
         )
     }
 

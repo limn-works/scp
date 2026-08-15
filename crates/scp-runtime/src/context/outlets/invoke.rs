@@ -7933,9 +7933,9 @@ mod tests {
 
         // ---- AC2: Ok variant is a plaintext mpsc::Receiver<OutletStreamChunk>.
 
-        struct NoopExecutor;
+        struct NoOpExecutor;
         #[async_trait::async_trait]
-        impl super::super::OutletExecutor for NoopExecutor {
+        impl super::super::OutletExecutor for NoOpExecutor {
             async fn exec_action(
                 &self,
                 _ctx: &mut super::super::MutableInvocation<'_>,
@@ -7962,7 +7962,7 @@ mod tests {
             params: crate::context::outlets::dispatch::OpenStreamParams,
         ) {
             let out: Result<mpsc::Receiver<OutletStreamChunk>, InvocationError> =
-                invoke_outlet_cross_context::<NoopExecutor>(
+                invoke_outlet_cross_context::<NoOpExecutor>(
                     supervisor,
                     a_event_log,
                     "a",
@@ -7972,7 +7972,7 @@ mod tests {
                     serde_json::json!({}),
                     invoker_did,
                     None,
-                    Arc::new(NoopExecutor),
+                    Arc::new(NoOpExecutor),
                     incoming_open,
                     None,
                     params,
@@ -8821,7 +8821,7 @@ mod tests {
             invoker_did: &DID,
         ) {
             let out: Result<mpsc::Receiver<OutletStreamChunk>, InvocationError> =
-                invoke_outlet::<NoopExecutor>(
+                invoke_outlet::<NoOpExecutor>(
                     context,
                     registry,
                     role_state,
@@ -8829,7 +8829,7 @@ mod tests {
                     serde_json::json!({}),
                     invoker_did,
                     None,
-                    Arc::new(NoopExecutor),
+                    Arc::new(NoOpExecutor),
                     None,
                     None,
                     None,

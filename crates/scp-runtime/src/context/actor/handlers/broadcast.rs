@@ -213,7 +213,7 @@ async fn handle_subscribe_broadcast(
     // the separate spending-UCAN revocation path and is inert for read grants.
     // Spec is silent on subscribe-nonce dedup; a fresh no-op tracker is the sound,
     // documented choice.
-    let mut nonce_tracker = NoopNonceTracker;
+    let mut nonce_tracker = NoOpNonceTracker;
 
     let mut validation_ctx = ValidationContext {
         did_resolver: &did_resolver,
@@ -591,8 +591,8 @@ fn handle_release_broadcast_reservation(
 // which its comment cross-references by this name).
 // ---------------------------------------------------------------------------
 
-struct NoopNonceTracker;
-impl scp_protocol::crypto::ucan::validate::NonceTracker for NoopNonceTracker {
+struct NoOpNonceTracker;
+impl scp_protocol::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
     fn check_replay(
         &self,
         _nonce: &str,

@@ -397,7 +397,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     // Route through the production startup entry (`restore_on_startup` =
     // restore THEN saga-journal replay). The bare `restore_all_contexts` leg is
     // `pub(crate)` (restore-implies-replay seal); cross-crate callers must use
-    // this combined entry. Replay over this manager's `NoopSagaJournal` (wired
+    // this combined entry. Replay over this manager's `NoOpSagaJournal` (wired
     // by `with_providers`) is a no-op — no saga is ever started here — so the
     // restore semantics this test asserts on are preserved.
     let restored = manager2

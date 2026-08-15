@@ -2575,7 +2575,7 @@ pub fn build_snapshot_for_persist(
 /// The persisted snapshot's crypto blob is a 1:1 copy of the
 /// `export_crypto_state` result, so re-reading the live export tells the
 /// entrypoint exactly what the snapshot carries WITHOUT depending on the
-/// persistence backend supporting read-back (the default `NoopContextPersistence`
+/// persistence backend supporting read-back (the default `NoOpContextPersistence`
 /// and the `for_query_shim` path do not). Returns `true` only when the export
 /// succeeded AND carries a non-empty blob.
 ///

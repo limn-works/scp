@@ -216,7 +216,7 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // Raised 49 -> 50 when the production saga-journal swap added
 // `prod_supervisor_construction_wires_durable_saga_journal` — pinning that every
 // production seam constructs the durable `ProtocolRepositorySagaJournal` rather
-// than `NoopSagaJournal` — locking that assertion into the ratchet floor.
+// than `NoOpSagaJournal` — locking that assertion into the ratchet floor.
 // Lowered 50 -> 41 when the WASM bridge was deleted (ADR-055): the 9 WASM-bridge
 // structural assertions (consequence dispatch, governance trust boundary,
 // C2 economy fail-closed gate, ucan_evaluate routing) lost their subject and
@@ -2933,13 +2933,13 @@ fn b3_webhook_dispatch_wired() {
 /// MUST route through `with_providers_and_journal` and supply a
 /// `ProtocolRepositorySagaJournal` built over the SAME chosen `Storage` backend
 /// that feeds `mls_storage` — NOT the bare `with_providers` (which hardcodes
-/// `NoopSagaJournal`). Without this, a process restart loads no journal and the
+/// `NoOpSagaJournal`). Without this, a process restart loads no journal and the
 /// §17.16.4 crash-recovery replay can never reconcile a crash-orphaned saga.
 ///
 /// This is a source-text presence gate (defense-in-depth, NOT the primary
 /// guarantee — the type system already forces a journal argument on
 /// `with_providers_and_journal`). It pins the wiring legible so a refactor that
-/// silently reverts a seam to the `NoopSagaJournal`-hardcoding `with_providers`
+/// silently reverts a seam to the `NoOpSagaJournal`-hardcoding `with_providers`
 /// is flagged. The behavioral proof that BOTH legs run over the real journal is
 /// the `saga_bridge_journal_swap` integration test.
 #[test]
@@ -2958,7 +2958,7 @@ fn prod_supervisor_construction_wires_durable_saga_journal() {
             "with_providers_and_journal"
         ),
         "PyO3 build_supervisor must route through with_providers_and_journal (durable saga \
-         journal), not the NoopSagaJournal-hardcoding with_providers"
+         journal), not the NoOpSagaJournal-hardcoding with_providers"
     );
     assert!(
         fn_body_contains(
@@ -2997,7 +2997,7 @@ fn prod_supervisor_construction_wires_durable_saga_journal() {
             "with_providers_and_journal"
         ),
         "NAPI build_supervisor_arc must route through with_providers_and_journal (durable saga \
-         journal), not the NoopSagaJournal-hardcoding with_providers"
+         journal), not the NoOpSagaJournal-hardcoding with_providers"
     );
     assert!(
         fn_body_contains(
@@ -3018,7 +3018,7 @@ fn prod_supervisor_construction_wires_durable_saga_journal() {
             "with_providers_and_journal"
         ),
         "UniFFI build_supervisor must route through with_providers_and_journal (durable saga \
-         journal), not the NoopSagaJournal-hardcoding with_providers"
+         journal), not the NoOpSagaJournal-hardcoding with_providers"
     );
     assert!(
         fn_body_contains(
@@ -3043,7 +3043,7 @@ fn prod_supervisor_construction_wires_durable_saga_journal() {
             "with_providers_and_journal"
         ),
         "Node connect_loopback_supervisor must route through with_providers_and_journal (durable \
-         saga journal), not the NoopSagaJournal-hardcoding with_providers"
+         saga journal), not the NoOpSagaJournal-hardcoding with_providers"
     );
     assert!(
         fn_body_contains(
