@@ -90,13 +90,19 @@ export {
 // Trust — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-// `BehavioralRecord` and `TrustEvaluation` are the canonical structured shapes
-// in `./types` — the ones `SCP.evaluateTrust` and `SCP.participationRecord`
-// return, and the ones the Python, Swift, and Kotlin SDKs mirror field for
-// field (ADR-059 Decision 1). `./trust` exported a second, incompatible pair of
-// interfaces under those names until this module stopped re-declaring them.
+// `BehavioralRecord` and `TrustEvaluation` moved to the `./types` export block
+// below. They are the shapes `SCP.participationRecord` and `SCP.evaluateTrust`
+// return; `./trust` declared a second, incompatible pair under the same two
+// names, and this block exported that pair. `BehavioralRecord` mirrors the
+// participation facts §7.3.2 of the trust spec defines, so its field set is
+// specified. The `TrustEvaluation` composite is NOT defined by any spec section
+// or ADR — the only artifact describing it is the `SCP.Trust.evaluate` section
+// of `.docs/sketch.md`, which self-describes as a working sketch and still
+// carries the pre-§7.3.2 field set. Read that gap as open, not as settled.
+//
+// `evaluateTrust` is no longer exported here. §7 of ADR-048 requires a stateful
+// operation to be a method on `SCP` in every SDK; call `scp.evaluateTrust(...)`.
 export type { AggregatedTrustInput, AggregationInput } from "./trust";
-export { evaluateTrust } from "./trust";
 
 // ---------------------------------------------------------------------------
 // Event Log — types only (entry points moved to SCP)
@@ -136,10 +142,11 @@ export type { McpClient, McpServer, NativeMcpClientHandle, NativeMcpServerHandle
 // ---------------------------------------------------------------------------
 //
 // Stateful entry points (`bridgeCreateShadow`, credentials) live on SCP.
-// `evaluateTrust` (exported here as `bridgeEvaluateTrust` to disambiguate
-// from the four-layer `evaluateTrust` in `./trust`, mirroring the Python
-// SDK's `bridge_evaluate_trust` re-export name) is the pure bridge-provenance
-// trust-tier classifier (spec §12).
+// `evaluateTrust` is the pure bridge-provenance trust-tier classifier of §12 of
+// the spec. It keeps the `bridgeEvaluateTrust` export name, matching the Python
+// SDK's `bridge_evaluate_trust`. The alias also disambiguated it from a free
+// `evaluateTrust` that `./trust` exported until the ADR-059 rebuild deleted
+// that one; the participant trust evaluation is now `scp.evaluateTrust(...)`.
 
 export type {
   BridgeCredential,

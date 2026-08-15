@@ -1,38 +1,26 @@
 /**
- * Trust module for the SCP TypeScript SDK.
+ * Trust-aggregation wire types for the SCP TypeScript SDK.
  *
- * Holds the trust-aggregation wire types ({@link AggregationInput},
- * {@link AggregatedTrustInput}) and the free-function {@link evaluateTrust}
- * entry point, which mirrors the Python SDK's `scp_sdk.trust.evaluate_trust`.
+ * This module holds types only. `SCP.evaluateTrust`, `SCP.aggregateTrustInput`,
+ * and `SCP.verifyParticipationRequirements` are the entry points, and §7 of
+ * ADR-048 ("SCP as First-Class Multi-Instance SDK Object") requires that: a
+ * stateful operation — one that reads or mutates the per-instance
+ * `BridgeInstance` state — is a method on `SCP` in every SDK, and the
+ * per-language free-function latitude the same section grants covers pure
+ * helpers only. Trust evaluation dispatches against a context handle, the
+ * instance's trust store, and the instance's event log, so it is stateful.
  *
- * {@link evaluateTrust} delegates to `SCP.evaluateTrust`, the canonical
- * implementation. That method composes the structured trust model of
- * §7.2.4 of `.docs/specs/07-trust-validation-and-capabilities.md`:
+ * A free `evaluateTrust` lived here and delegated to the method until the
+ * ADR-059 rebuild. It predated ADR-048, had no caller, and forced the
+ * bridge-provenance `evaluateTrust` in `./bridge` to be re-exported under the
+ * name `bridgeEvaluateTrust` to avoid the collision.
  *
- * 1. **Layer 1 — protocol enforcement.** Each capability token goes through the
- *    read-only `SCP.ucanEvaluate` diagnostic, which returns the six per-stage
- *    booleans of `CapabilityValidation` as typed data across the FFI. The SDK
- *    reads those booleans and AND-combines them across the token set. It never
- *    inspects an error message to decide which stage failed, because ADR-059
- *    ("Structured Capability/Trust Validation Across the FFI; SDKs Consume
- *    Typed Results, Not Prose", Decision 3) forbids that.
- * 2. **Layer 2 — behavioral validation.** The shared Rust core computes the
- *    participation facts of §7.3.2 in `Supervisor::participation_record` and
- *    the SDK receives them, so no binding re-aggregates the event log.
- * 3. **Layer 3 — attestation authenticity.** `SCP.evaluateTrust` reports the
- *    subject's attestation count inside the behavioral record; it does not
- *    return the attestation list, because the op takes no attestation set.
- *
- * `scp.aggregateTrustInput(...)` and `scp.verifyParticipationRequirements(...)`
- * gather the Layer-4 trust-evaluation inputs (endorsements, challenge results,
- * consequence structures) that {@link evaluateTrust} does not return.
- *
- * See ADR-059 in `.docs/adrs/phase-2.md`, ADR-017 (Trust Engine), and
- * `.docs/sketch.md` section `SCP.Trust.evaluate`.
+ * See ADR-059 ("Structured Capability/Trust Validation Across the FFI; SDKs
+ * Consume Typed Results, Not Prose") and §7 of ADR-048, both in `.docs/adrs/`,
+ * plus §7.2.4 and §7.3 of
+ * `.docs/specs/07-trust-validation-and-capabilities.md`.
  */
 
-import type { Context } from "./context";
-import type { SCP } from "./scp";
 import type {
   AttestationType,
   AttestorInfo,
@@ -41,7 +29,6 @@ import type {
   ConsequenceRule,
   EventLogEntry,
   ThresholdRequirement,
-  TrustEvaluation,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -98,55 +85,4 @@ export interface AggregatedTrustInput {
   consequence_structure: readonly Record<string, unknown>[];
   /** Threshold counts per attestation type: [met, required]. */
   threshold_counts: Readonly<Record<string, readonly [number, number]>>;
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/**
- * Evaluates the trustworthiness of a participant in a context.
- *
- * Free-function form of `SCP.evaluateTrust`, matching the Python SDK's
- * `scp_sdk.trust.evaluate_trust`. It resolves the context handle from
- * `context` and forwards every argument unchanged; `SCP.evaluateTrust` holds
- * the whole implementation, so the two entry points cannot report different
- * verdicts for the same inputs.
- *
- * Layer 1 reads the six typed `CapabilityValidation` booleans that
- * `SCP.ucanEvaluate` returns across the FFI. It classifies nothing from an
- * error message, and the diagnostic never records the token's nonce, so
- * calling this function does not consume a token.
- *
- * The Layer-1 diagnostic runs in intrinsic-validity mode: it supplies no
- * challenge capability, so the core skips the invoked-capability grant-match
- * and evaluates the token against every attenuation the token declares.
- * `evaluate_ucan` in `crates/scp-protocol/src/crypto/ucan/validate.rs` parses
- * the full `att` set (`parse_granted_caps`, fail-closed on any unparseable
- * URI), enforces the Category-A rule over every granted capability, checks the
- * context ceiling over every granted capability
- * (`verify_ceiling_compliance`), and re-checks attenuation at every edge of the
- * delegation chain. Spec §7.2.4 and ADR-059 Decision 2a state that omitting the
- * challenge never sets a `CapabilityValidation` field to `true` that another
- * check would set to `false`.
- *
- * Layer 2 receives the participation facts of §7.3.2 from the Rust core. The
- * SDK does not compute or estimate any count.
- *
- * @param scp The {@link SCP} instance to dispatch bridge calls on.
- * @param subjectDid The DID of the participant to evaluate.
- * @param context The {@link Context} to evaluate trust within.
- * @param capabilityTokens Optional UCAN token strings to evaluate for Layer 1.
- * @returns A {@link TrustEvaluation} carrying Layers 1 and 2.
- * @throws {@link "./errors".ScpError} when the bridge rejects an input (a
- *   malformed handle, token, or capability URI) or a provider fails. A
- *   capability outcome is reported through the booleans and never thrown.
- */
-export async function evaluateTrust(
-  scp: SCP,
-  subjectDid: string,
-  context: Context,
-  capabilityTokens?: readonly string[],
-): Promise<TrustEvaluation> {
-  return await scp.evaluateTrust(context._rawHandle, subjectDid, capabilityTokens);
 }

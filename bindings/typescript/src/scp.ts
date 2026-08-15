@@ -3508,6 +3508,20 @@ export class SCP {
    * FFI inputs (bad context handle / token / capability) propagate as a typed
    * {@link "./errors".ScpError}.
    *
+   * NOT AN AUTHORIZATION DECISION. Layer 1 supplies no challenge capability, so
+   * the core skips the invoked-capability grant-match and reports each token's
+   * intrinsic validity. An all-`true` {@link CapabilityValidation} therefore
+   * does NOT establish that the subject may perform any particular action — a
+   * token declaring an empty `att` set reports all six fields `true`. §7.2.4 of
+   * the trust spec names gating an action on a no-challenge diagnostic a
+   * misuse: to authorize, call {@link ucanValidate} with the concrete
+   * capability URI, which runs the grant-match and consumes the nonce.
+   *
+   * Layer 1 also passes no delegation-chain proof tokens, so a token that
+   * depends on a proof chain reports `signaturesValid: false` here. Pass the
+   * proofs to {@link ucanEvaluate} directly when a delegated token must be
+   * assessed.
+   *
    * SECURITY: the behavioral record's `attestationCount` (and any challenge
    * results, where consumed) are authentic-but-self-mintable signals — an
    * issuer/verifier is self-certifying, so a subject can mint them from DIDs it

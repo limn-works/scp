@@ -8,12 +8,13 @@
  * rather than a bare `Error`. These tests pin that contract across the async,
  * sync, `getBridge`-routed, and `nativeFreeFn`-routed shapes.
  *
- * `ucanValidate` and `eventLogQuery` are wrapped like every other method.
- * Their sole SDK consumer (`evaluateTrust` in trust.ts) classifies errors by
- * inspecting the `[SCP-...]` code prefix on the error message — and
- * `mapBridgeError` preserves the original message verbatim, so the typed
- * {@link ScpError} subclass it produces still carries the prefix and trust
- * classification is unaffected.
+ * `ucanValidate` and `eventLogQuery` are wrapped like every other method. No
+ * trust-signal code reads their message text: `scp.evaluateTrust` calls
+ * `ucanEvaluate` and `participationRecord`, reads the six typed
+ * `CapabilityValidation` booleans, and branches on the structured
+ * `SCP-CTX-2076` code, as ADR-059 Decision 3 requires. `mapBridgeError` still
+ * preserves the original message verbatim, so the typed {@link ScpError}
+ * subclass carries both the stable `.code` and the unaltered text.
  */
 
 import { describe, expect, it } from "bun:test";

@@ -1035,7 +1035,18 @@ export interface TrustEvaluation {
    * facts for the same context/subject.
    */
   readonly behavioralRecord: BehavioralRecord;
-  /** Layer 3: attestations for the subject. */
+  /**
+   * Layer 3: attestations for the subject.
+   *
+   * {@link "./scp".SCP.evaluateTrust} always leaves this empty. That op takes
+   * no attestation set and returns no attestation list, so an empty array here
+   * reports that the op carries no Layer-3 list — it does NOT report that the
+   * subject holds no attestations. Read
+   * {@link BehavioralRecord.attestationCount} for the count the Rust core
+   * computed, and call {@link "./scp".SCP.aggregateTrustInput} for the
+   * verified attestation list. Python, Swift, and Kotlin leave the field empty
+   * on the same op, so the shape matches across bindings (ADR-059 Decision 1).
+   */
   readonly attestations: readonly AttestationSummary[];
 }
 
