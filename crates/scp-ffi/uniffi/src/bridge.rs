@@ -21054,7 +21054,12 @@ mod tests {
     /// `target_did` into the returned event's `payload_json`, decoded through the
     /// shared `scp_event_log::payload::project_payload` so the value is
     /// byte-identical across the three native bridges.
-    #[tokio::test]
+    // Multi-thread flavor: `ensure_ucan_registered` rebuilds the context's
+    // durable UCAN state, and that read bridges sync to async through
+    // `block_in_place`, which a current-thread runtime cannot host. The
+    // bridge's own runtime is multi-threaded, so every production caller
+    // reaches this code on a worker that can step aside.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_query_projects_governance_target_did() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
@@ -21107,7 +21112,12 @@ mod tests {
     /// `payload_json`, decoded through the shared
     /// `scp_event_log::payload::project_payload` so the value is byte-identical
     /// across the three native bridges.
-    #[tokio::test]
+    // Multi-thread flavor: `ensure_ucan_registered` rebuilds the context's
+    // durable UCAN state, and that read bridges sync to async through
+    // `block_in_place`, which a current-thread runtime cannot host. The
+    // bridge's own runtime is multi-threaded, so every production caller
+    // reaches this code on a worker that can step aside.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn event_log_query_projects_role_assigned_subject_did() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);

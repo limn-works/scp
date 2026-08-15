@@ -7064,7 +7064,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    // Multi-thread flavor: `register_context` rebuilds the context's durable
+    // UCAN state, and that read bridges sync to async through
+    // `block_in_place`, which a current-thread runtime cannot host. Production
+    // `PyO3` callers arrive from a Python thread with no ambient runtime, so
+    // they take the `Handle::block_on` arm instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deliver_message_via_runtime() {
         let context_id = "ctx-deliver-test";
         let bi = __bi();
@@ -7098,7 +7103,12 @@ mod tests {
         crate::runtime::remove_context(&bi, context_id);
     }
 
-    #[tokio::test]
+    // Multi-thread flavor: `register_context` rebuilds the context's durable
+    // UCAN state, and that read bridges sync to async through
+    // `block_in_place`, which a current-thread runtime cannot host. Production
+    // `PyO3` callers arrive from a Python thread with no ambient runtime, so
+    // they take the `Handle::block_on` arm instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deliver_message_overflow_injects_warning() {
         let context_id = "ctx-overflow-deliver";
         let capacity = RECEIVE_BUFFER_CAPACITY;

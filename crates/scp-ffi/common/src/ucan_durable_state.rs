@@ -313,16 +313,21 @@ pub async fn hydrate_core<S: Storage>(
 /// durable UCAN state, and `Storage` is an async trait. Which bridging primitive
 /// works depends on where the caller runs:
 ///
-/// - Outside any tokio runtime (a `PyO3` call arriving from a Python thread):
-///   `Handle::block_on` drives the future directly.
 /// - Inside a multi-threaded runtime (a napi-rs or `UniFFI` async entry point,
 ///   or a `PyO3` MCP server task): `block_in_place` moves the current worker off
 ///   the scheduler first, which is the same sync-to-async bridge
-///   `ScpMlsProvider` uses for the sync `OpenMLS` storage trait.
+///   `ScpMlsProvider` uses for the sync `OpenMLS` storage trait. `fallback` is
+///   not read on this path.
+/// - Outside any tokio runtime (a `PyO3` call arriving from a Python thread):
+///   `fallback` names the bridge's own runtime and `Handle::block_on` drives the
+///   future on it.
 /// - Inside a current-thread runtime: neither primitive is legal, so this
 ///   returns [`UcanDurableStateError::NoBlockingContext`] and the caller fails
 ///   closed. The `PyO3` bridge builds a current-thread runtime only when
 ///   building a multi-threaded one fails.
+/// - Outside any tokio runtime with `fallback` set to `None`: there is nothing
+///   to drive the future on, so this returns
+///   [`UcanDurableStateError::NoBlockingContext`] as well.
 ///
 /// `crates/scp-ffi/**` is outside the scope of the `block_in_place` CI gate
 /// (`scripts/check-block-in-place.py`), which excludes the whole directory
@@ -331,23 +336,23 @@ pub async fn hydrate_core<S: Storage>(
 /// # Errors
 ///
 /// Returns [`UcanDurableStateError::NoBlockingContext`] when called from inside
-/// a current-thread tokio runtime.
+/// a current-thread tokio runtime, or when the caller is outside any runtime and
+/// passes no `fallback` handle.
 pub fn block_on_storage<F>(
-    handle: &tokio::runtime::Handle,
+    fallback: Option<&tokio::runtime::Handle>,
     fut: F,
 ) -> Result<F::Output, UcanDurableStateError>
 where
     F: std::future::Future,
 {
-    match tokio::runtime::Handle::try_current() {
-        Ok(current) => match current.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::CurrentThread => {
-                Err(UcanDurableStateError::NoBlockingContext)
-            }
-            _ => Ok(tokio::task::block_in_place(|| current.block_on(fut))),
-        },
-        Err(_) => Ok(handle.block_on(fut)), // ci-allow: block-on: sync FFI entry point outside any runtime
+    if let Ok(current) = tokio::runtime::Handle::try_current() {
+        if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+            return Err(UcanDurableStateError::NoBlockingContext);
+        }
+        return Ok(tokio::task::block_in_place(|| current.block_on(fut)));
     }
+    let handle = fallback.ok_or(UcanDurableStateError::NoBlockingContext)?;
+    Ok(handle.block_on(fut)) // ci-allow: block-on: sync FFI entry point outside any runtime
 }
 
 #[cfg(test)]

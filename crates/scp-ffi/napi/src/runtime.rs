@@ -1753,7 +1753,7 @@ fn hydrate_ucan_state_blocking(
 ) -> Result<(), ScpNapiError> {
     let repo = protocol_repository(bi);
     scp_ffi_common::ucan_durable_state::block_on_storage(
-        crate::runtime().handle(),
+        Some(crate::runtime().handle()),
         repo.hydrate_ucan_state(context_id, core),
     )
     .map_err(|e| ScpNapiError::Context {
@@ -1784,7 +1784,7 @@ pub(crate) fn persist_ucan_revocation_blocking(
     let list = with_context(bi, context_id, |rt| Ok(rt.core.revocation_list.clone()))?;
     let repo = protocol_repository(bi);
     scp_ffi_common::ucan_durable_state::block_on_storage(
-        crate::runtime().handle(),
+        Some(crate::runtime().handle()),
         repo.persist_ucan_revocation_list(context_id, &list),
     )
     .map_err(|e| ScpNapiError::Context {
@@ -1817,7 +1817,7 @@ pub(crate) fn persist_ucan_nonces_blocking(
     })?;
     let repo = protocol_repository(bi);
     scp_ffi_common::ucan_durable_state::block_on_storage(
-        crate::runtime().handle(),
+        Some(crate::runtime().handle()),
         repo.persist_ucan_nonce_entries(context_id, &entries),
     )
     .map_err(|e| ScpNapiError::Context {

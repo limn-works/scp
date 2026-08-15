@@ -1222,7 +1222,7 @@ impl UniffiBridgeInstance {
             }
         };
         scp_ffi_common::ucan_durable_state::block_on_storage(
-            crate::runtime().handle(),
+            Some(crate::runtime().handle()),
             self.protocol_repository
                 .hydrate_ucan_state(context_id, state),
         )
@@ -1256,7 +1256,7 @@ impl UniffiBridgeInstance {
                 to_error(format!("context '{context_id}' not found in UCAN registry"))
             })?;
         scp_ffi_common::ucan_durable_state::block_on_storage(
-            crate::runtime().handle(),
+            Some(crate::runtime().handle()),
             self.protocol_repository
                 .persist_ucan_revocation_list(context_id, &list),
         )
@@ -1298,7 +1298,7 @@ impl UniffiBridgeInstance {
                 to_error(format!("context '{context_id}' not found in UCAN registry"))
             })?;
         scp_ffi_common::ucan_durable_state::block_on_storage(
-            crate::runtime().handle(),
+            Some(crate::runtime().handle()),
             self.protocol_repository
                 .persist_ucan_nonce_entries(context_id, &entries),
         )

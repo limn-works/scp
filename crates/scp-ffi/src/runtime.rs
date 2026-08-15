@@ -1664,21 +1664,26 @@ fn hydrate_ucan_state_blocking(
             "failed to rebuild durable UCAN state for '{context_id}': {e}"
         ))
     };
-    let tokio_rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-    scp_ffi_common::ucan_durable_state::block_on_storage(tokio_rt.handle(), async {
-        scp_ffi_common::ucan_durable_state::hydrate_revocation_list(
-            storage,
-            context_id,
-            revocation_list,
-        )
-        .await?;
-        scp_ffi_common::ucan_durable_state::hydrate_nonce_tracker(
-            storage,
-            context_id,
-            nonce_tracker,
-        )
-        .await
-    })
+    // Only used when the caller is outside any tokio runtime (the ordinary
+    // Python-thread entry). Inside a runtime the helper uses the ambient one.
+    let tokio_rt = super::runtime().ok();
+    scp_ffi_common::ucan_durable_state::block_on_storage(
+        tokio_rt.map(tokio::runtime::Runtime::handle),
+        async {
+            scp_ffi_common::ucan_durable_state::hydrate_revocation_list(
+                storage,
+                context_id,
+                revocation_list,
+            )
+            .await?;
+            scp_ffi_common::ucan_durable_state::hydrate_nonce_tracker(
+                storage,
+                context_id,
+                nonce_tracker,
+            )
+            .await
+        },
+    )
     .map_err(to_error)?
     .map_err(to_error)
 }
@@ -1710,9 +1715,9 @@ pub(crate) fn persist_ucan_revocation_blocking(
             "failed to persist UCAN revocation for '{context_id}': {e}"
         ))
     };
-    let tokio_rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+    let tokio_rt = super::runtime().ok();
     scp_ffi_common::ucan_durable_state::block_on_storage(
-        tokio_rt.handle(),
+        tokio_rt.map(tokio::runtime::Runtime::handle),
         scp_ffi_common::ucan_durable_state::persist_revocation_list(storage, context_id, &list),
     )
     .map_err(to_error)?
@@ -1746,9 +1751,9 @@ pub(crate) fn persist_ucan_nonces_blocking(
             "failed to persist UCAN nonce state for '{context_id}': {e}"
         ))
     };
-    let tokio_rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+    let tokio_rt = super::runtime().ok();
     scp_ffi_common::ucan_durable_state::block_on_storage(
-        tokio_rt.handle(),
+        tokio_rt.map(tokio::runtime::Runtime::handle),
         scp_ffi_common::ucan_durable_state::persist_nonce_entries(storage, context_id, &entries),
     )
     .map_err(to_error)?
