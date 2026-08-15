@@ -259,6 +259,11 @@ describe("scp.evaluateTrust — Layer 1 AND-combination + Layer 2 behavioral", (
             ),
           ),
         );
+        // Layer 2 must succeed, so the outcome this test compares is decided by
+        // Layer 1 alone. Leaving `participationRecord` unstubbed would make the
+        // mock reject for BOTH spellings and hide a Layer-1 divergence behind a
+        // Layer-2 failure.
+        native.__stub("participationRecord", () => fakeParticipationRecord());
         try {
           const value = await scp.evaluateTrust(context._rawHandle, "did:dht:subject", ["token-a"]);
           return { rejected: false, capabilityValidation: value.capabilityValidation };
