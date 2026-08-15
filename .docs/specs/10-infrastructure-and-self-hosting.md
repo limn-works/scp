@@ -766,8 +766,8 @@ Tiers 1 and 2 use `ws://` with raw IP addresses — these are the zero-config, n
 **Address change handling.** Residential IP addresses change (ISP DHCP lease renewal, router reboot). UPnP port mappings may be reassigned. STUN-discovered addresses shift when NAT mappings expire and reform. The `RepublishManager` handles address changes by:
 
 1. Detecting the change (periodic STUN re-probe, UPnP lease renewal response, network interface change event).
-2. Incrementing the DID document sequence number.
-3. Republishing the DID document with the new relay URL to both the DHT and SCP relays (§3.10.5 when specified, otherwise DHT-only).
+2. Incrementing each layer's own sequence number (§3.10.7).
+3. Republishing to both layers, each in that layer's own encoding (§3.10.5): the full JSON document carrying the new relay URL to SCP relays, and the DNS-encoded bootstrap core carrying the same new relay URL to Mainline. The relay list is part of the bootstrap core (§18.2.2B), so an address change reaches both layers.
 
 Peers that fail to connect to a stale relay address re-resolve the DID document immediately. Multi-relay publishing (§18.7) provides availability during address transitions — if the self-hosted relay publishes to external relays in addition to advertising its own address, messages accumulate on external relays while the self-hosted relay's address updates propagate.
 

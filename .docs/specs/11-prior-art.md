@@ -150,7 +150,7 @@ SCP adopts the core self-certification property:
 
 SCP extends did:dht significantly. These extensions are additive — a standard did:dht resolver can still resolve SCP identities via DHT — but they represent a fundamentally different approach to identity resolution resilience and key management.
 
-**1. Dual-layer resolution (§3.10).** did:dht has one resolution path: Mainline DHT. SCP adds a second: SCP relays. DID documents are published as standard relay blobs (routing_id = `SHA-256("scp:did:" || did_string)`). Both layers are queried in parallel, first-valid-wins, BEP44 sequence numbers resolve conflicts. The anti-segmentation invariant (§3.10.6) makes dual-layer publishing a MUST, not a SHOULD.
+**1. Dual-layer resolution (§3.10).** did:dht has one resolution path: Mainline DHT. SCP adds a second: SCP relays. DID documents are published as standard relay blobs (routing_id = `SHA-256("scp:did:" || did_string)`). Both layers are queried in parallel. Each layer carries its own encoding under its own signature and its own sequence number, so a BEP44 sequence number resolves conflicts **within** a layer and never between layers (§3.10.7); the relay layer answers for the full document and Mainline for the bootstrap core. The anti-segmentation invariant (§3.10.6) makes dual-layer publishing a MUST, not a SHOULD.
 
 This means SCP identities are resolvable even if:
 - The entire Mainline DHT is unreachable (relay layer serves)
@@ -168,11 +168,11 @@ An attacker must suppress a DID document on ALL relays AND ALL reachable DHT nod
 
 This separation of concerns (identity ≠ human signing ≠ agent signing ≠ rotation) is a significant security improvement over single-key DID methods. It provides: (a) recovery from key compromise without DID change, (b) custody separation between human and agent operations, and (c) structural action provenance — verifiers can determine whether a human or agent performed any given action by inspecting the `signing_key_id`, without trusting self-reported claims.
 
-**3. Protocol-level healing (§3.10.7).** When both resolution layers return valid documents with different sequence numbers, the resolver accepts the higher one and MAY re-publish the fresher document to the stale layer. The network self-heals — converging on the freshest document without central coordination. This is unique to SCP; standard did:dht has no concept of multi-layer resolution and therefore no healing protocol.
+**3. Per-layer healing (§3.10.7).** When a layer returns a record older than the one a resolver already holds for that layer, the resolver MAY re-publish that layer's own current encoding back to that layer. Each layer converges on its own freshest record without central coordination. SCP does not copy one layer's bytes to the other, because the two layers carry different encodings under different caps. This is unique to SCP; standard did:dht has no concept of multi-layer resolution and therefore no healing protocol. No SCP implementation performs healing today, and §3.10.7 keeps it a MAY.
 
 **4. Relay-layer TTL decoupling.** did:dht's ~2 hour DHT expiry requires aggressive republishing. SCP's relay layer uses 7-day TTL with 6-day republish cycles. The two layers have complementary availability characteristics: DHT for immediate availability (millions of nodes, works from day one), relays for longer persistence (7-day TTL, lower republish overhead). The RepublishManager maintains both cycles independently.
 
-**5. JSON-LD DID document serialization.** Standard did:dht specifies DNS packet encoding (TXT/SRV records) within the 1000-byte BEP44 payload. SCP uses JSON-LD serialization for DID documents. On the relay layer, this removes the 1000-byte constraint entirely (relay blobs support 256KB), allowing richer DID documents with more attestations, service endpoints, and key material. On the DHT layer, the DNS packet encoding is still used for BEP44 compatibility — but the relay layer carries the full document.
+**5. Two DID-document encodings, one per layer.** Standard did:dht specifies DNS packet encoding (TXT/SRV records) within the 1000-byte BEP44 payload. SCP keeps that encoding on the Mainline layer, where it carries the bootstrap core, and adds a JSON-LD encoding on the relay layer, where the 262,039-byte relay bound (not the 1000-byte BEP44 bound) lets the full document carry attestations, service endpoints and key material. This subsection is where SCP's two-encoding model was first written down, in a prior-art survey. It does not govern: §18.2.2A of the addressability spec and §3.10.5 of the identity spec carry the normative statement, and this subsection records the model's origin so a reader can trace it.
 
 ### 11.2.4 SCP's DID Implementation Independence
 
@@ -197,7 +197,7 @@ Given SCP's significant departures from did:dht, a natural question is whether S
 
 1. **Interoperability.** The DID string format is identical to did:dht. A standard did:dht resolver can resolve SCP identities via Mainline DHT. They won't get the relay layer, three-key semantics, or protocol-level healing — but they get a valid DID document. Changing to `did:scp` would break this interoperability bridge.
 
-2. **SCP's extensions are additive, not contradictory.** Nothing SCP does violates the did:dht specification. SCP adds capabilities on top (dual resolution, multi-key verification methods, healing, agent signing keys). A did:dht-compliant resolver seeing an SCP identity just sees a standard did:dht identity with additional verification methods and service endpoints — all of which are valid DID document constructs that standard resolvers can parse (and ignore what they don't understand).
+2. **SCP's extensions are additive, not contradictory.** Nothing SCP does violates the did:dht specification. SCP adds capabilities on top (dual resolution, multi-key verification methods, per-layer healing, agent signing keys). What a did:dht-compliant resolver sees is the Mainline layer, and the Mainline layer carries a conformant DNS packet: the bootstrap core (§18.2.2B), holding `#active`, the pre-rotation commitment and the relay list as ordinary verification-method and service entries that a standard resolver parses. SCP's richer relay-layer document lives outside the did:dht method entirely, at an SCP routing ID a did:dht resolver never queries, so it extends SCP without changing what a conformant resolver reads.
 
 3. **Cost of premature separation.** Defining a new DID method requires registration, documentation, resolver implementation by third parties. The benefit is namespace clarity. The cost is loss of DHT interoperability with the existing did:dht ecosystem. The cost currently outweighs the benefit.
 
@@ -892,7 +892,7 @@ Cjdns and Yggdrasil are network-layer protocols — they replace IP routing with
 
 No existing protocol combines all of the following. This is SCP's novel contribution:
 
-- **Identity:** Dual-layer DID resolution with protocol-level self-healing; multi-key architecture with pre-rotation commitments and optional agent signing keys; shared-DID human-agent pairs with structural action provenance (`signing_key_id` distinguishes human vs agent signatures without trusting self-reported claims)
+- **Identity:** Dual-layer DID resolution, each layer carrying its own encoding and healing itself; multi-key architecture with pre-rotation commitments and optional agent signing keys; shared-DID human-agent pairs with structural action provenance (`signing_key_id` distinguishes human vs agent signatures without trusting self-reported claims)
 - **Capability:** UCAN-based authorization with delegation chains, time-bounding, and revocation; context-level economic governance with spending UCANs
 - **Encryption:** MLS group keys as the membership mechanism (encryption-as-access-control); sender-side key layers enabling per-sender blocking without group disruption
 - **Governance:** 30 governance action types with pluggable engines; context-bound participation rules enforced cryptographically

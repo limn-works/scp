@@ -43,7 +43,7 @@ Properties:
 - **URL format:** `wss://<host>/scp/v1` — the canonical SCP relay WebSocket endpoint (ADR-004). TLS 1.3 required (§9.13). **Exception:** Self-hosted relays without a domain MAY use `ws://` with IP literal addresses when discovered via DHT-resolved DID documents (§10.12.7). The SDK MUST reject `ws://` URLs from `.well-known/scp` or any non-DHT source.
 - **Multiple entries allowed.** An identity MAY publish multiple `SCPRelay` entries for suppression resistance (§9.9.2, ADR-012). The recommended minimum is 3 relays.
 - **Self-certified via BEP44.** For did:dht identities, relay URLs in the DID document are signed as part of the BEP44 record (§9.6.3). Substituting a relay URL requires the identity's private key.
-- **Sequence number monotonicity.** Relay list updates follow the BEP44 sequence number rules (§9.6.3). Clients MUST reject DID documents with lower sequence numbers than previously observed.
+- **Sequence number monotonicity, per layer.** Relay list updates follow the BEP44 sequence number rules (§9.6.3). A client MUST reject a DID document whose sequence number is lower than the last sequence number that client observed **on the layer that served it**. Each layer signs its own bytes and advances its own sequence number (§18.2.2A), so a client compares a relay-layer sequence number only against a relay-layer sequence number, and a Mainline sequence number only against a Mainline sequence number.
 
 When a peer resolves an identity's DID document, the `SCPRelay` entries tell them where to route encrypted envelopes destined for that identity. This is the primary relay discovery mechanism — out-of-band DID exchange leads to DHT resolution leads to relay URLs.
 
@@ -71,9 +71,20 @@ A relay operator's DID document contains `SCPRelay` entries (where to connect). 
 
 ### 18.2.2A DID Document Field-Level Schema
 
-SCP DID documents follow the W3C DID Core specification (v1.0) with SCP-specific verification methods and service endpoints. The canonical serialization is JSON (per did:dht spec). Two SDKs MUST produce byte-identical DID documents for the same identity state to ensure BEP44 signature verification.
+SCP DID documents follow the W3C DID Core specification (v1.0) with SCP-specific verification methods and service endpoints.
 
-**Canonical DID document structure:**
+**SCP publishes a DID document in two encodings, one per resolution layer (§3.10).** The SCP relay network carries the **full document** as JSON. Mainline DHT carries a **reduced bootstrap core** as a did:dht-conformant DNS packet. The two encodings carry different bytes. Each layer signs its own bytes with its own BEP44 signature and advances its own sequence number, so no clause in this specification requires the relay layer and the Mainline layer to carry identical bytes, and no resolver compares a sequence number from one layer against a sequence number from the other (§3.10.4 step 5, §3.10.7).
+
+| Layer | Encoding | Carries | Size cap |
+|-------|----------|---------|----------|
+| SCP relay network (§3.10.2) | JSON, as specified below | The full DID document | `MAX_DID_RECORD_VALUE_LEN` = 262,039 bytes |
+| Mainline DHT (§3.10.3) | did:dht-conformant DNS packet | The bootstrap core (§18.2.2B) | 1,000 bytes (BEP44 v1) |
+
+Every SDK MUST produce byte-identical bytes to every other SDK for the same identity state **within a layer**, because BEP44 signature verification reproduces the signed octets exactly. A byte comparison between the relay encoding and the Mainline encoding is not a conformance check and MUST NOT be performed.
+
+**Correction to the previous text of this clause.** This paragraph previously read "The canonical serialization is JSON (per did:dht spec)". The parenthetical was wrong about did:dht: the did:dht method specifies a DNS-packet encoding within the BEP44 payload, never JSON. Because this clause was the only place in the corpus that authorized the JSON path, the error reached the implementation, which publishes pretty-printed JSON to Mainline and is rejected server-side by the 1,000-byte BEP44 cap. Issue #2297, "DID documents do not fit their transport", records the failure chain.
+
+**Canonical DID document structure (relay-layer JSON encoding):**
 
 ```json
 {
@@ -136,7 +147,7 @@ SCP DID documents follow the W3C DID Core specification (v1.0) with SCP-specific
 }
 ```
 
-**Field constraints:**
+**Field constraints (relay-layer JSON encoding):**
 
 | Field | Required | Constraints |
 |-------|----------|-------------|
@@ -152,7 +163,49 @@ SCP DID documents follow the W3C DID Core specification (v1.0) with SCP-specific
 | `service[].id` | Yes | Fragment identifier (e.g., `#scp-relay-1`). Unique within the document. |
 | `service[].type` | Yes | One of the types in §18.2.2. |
 
-**Canonical serialization rules:** JSON keys MUST be sorted lexicographically at every nesting level (RFC 8785 JSON Canonicalization Scheme). This ensures deterministic serialization for BEP44 signature computation. Whitespace: no extra whitespace (minified JSON). Unicode: NFC normalization.
+**Canonical serialization rules — relay layer.** A publisher MUST sort JSON keys lexicographically at every nesting level (RFC 8785 JSON Canonicalization Scheme), MUST emit no whitespace between tokens (minified JSON), and MUST normalize Unicode to NFC. The relay layer's BEP44 signature covers these octets, so two SDKs that canonicalize the same identity state produce the same signed bytes.
+
+**Canonical serialization rules — Mainline layer.** The did:dht DNS-packet encoding fixes its own octet order, so a publisher canonicalizes the Mainline bytes by emitting that encoding as the did:dht method specifies it (§18.2.2B). RFC 8785 does not apply to the Mainline layer, because the Mainline layer carries no JSON.
+
+**Both rules are unimplemented, and a code slice owes them.** `DidDocument::to_json` (`crates/scp-did/src/document.rs:396`) calls `serde_json::to_string_pretty`, which emits indentation and newlines and preserves struct field order rather than sorting keys — so the shipped relay-layer bytes satisfy neither the sorting rule nor the whitespace rule. Neither `crates/scp-did`, nor `crates/scp-identity`, nor `crates/scp-dht` contains an RFC 8785 canonicalizer or calls one; the workspace's RFC 8785 implementation lives in `crates/scp-protocol/src/jcs.rs` and no DID crate references it. No DNS-packet encoder exists at all. Issue #2297, "DID documents do not fit their transport", carries both as fix items 1 and 3; the canonicalization call sites land with the encoder.
+
+### 18.2.2B The Mainline Bootstrap Core
+
+The Mainline DHT layer carries a **bootstrap core**: the subset of the DID document a resolver needs in order to reach the relay layer and verify what it finds there. The core carries exactly four things:
+
+| Element | Why the core carries it |
+|---------|-------------------------|
+| The identity key derivation | The DID string encodes the `#0` public key (§9.6.1), so a resolver derives `#0` from the DID it is resolving and the core carries no separate `#0` entry. |
+| The `#active` verification method | A resolver verifies a signature before it trusts any document it fetched from a relay. |
+| The `PreRotationCommitment` service entry | Rotation verification (§9.12) needs the commitment at the same moment it needs `#active`. |
+| The `SCPRelay` service entries | §18.5.1 level 2 makes the Mainline resolution the first place an SDK learns of any relay, so a pointer to a relay list would need a relay to fetch it and the chain would not start. Relay entries stay inline; everything outside the core may be a pointer. |
+
+Everything else a DID document carries — `SCPCapabilities`, `IdentityPrivateState`, `SCPBroadcastContext`, `ParticipationStatements`, `AttestationRevocations`, `ScpIdentityLinkAttestation`, `alsoKnownAs`, and the `#agent` verification method — lives on the relay layer only. A resolver that holds only the bootstrap core holds the relay list, so it fetches the full document from a relay rather than reading those fields out of Mainline.
+
+**Two questions about the Mainline encoding are open, and the encoder slice settles both against the did:dht method specification as the primary source** (issue #2297 fix item 3). First, which DNS resource record carries each core element. Second, which compression the method requires: issue #2297 states did:dht requires a gzipped DNS packet, while RFC 1035 §4.1.4 defines DNS message pointer compression, which is not gzip. Two different mechanisms have been named for the same field, so at most one is right, and the encoder's output bytes depend on the answer. This section states the core's membership, which does not depend on either answer; it does not state the wire mapping.
+
+### 18.2.2C Per-Layer Size Caps
+
+**Normative.** A publisher MUST reject an encoding whose byte length exceeds the cap of the layer that encoding targets, and MUST reject it at publish time with a typed error rather than emitting a publish the transport will refuse:
+
+| Layer | Cap | Source |
+|-------|-----|--------|
+| Mainline DHT | 1,000 bytes | BEP44 v1 `value` limit, enforced server-side by Mainline nodes. |
+| SCP relay network | 262,039 bytes | `MAX_DID_RECORD_VALUE_LEN` (`crates/scp-protocol/src/envelope/did_record.rs:88`) = `MAX_BLOB_SIZE` (262,144, §9.18.11) − `DID_RECORD_FIXED_PREFIX_LEN` (105). |
+
+Neither cap is enforced today. A publish that exceeds the BEP44 cap is rejected by the Mainline node as error 205, which the `mainline` crate maps to a timeout and `scp-dht` re-wraps as `DhtPublishFailed`, so the republish loop retries the same over-cap bytes every 30 minutes and the failure presents as flaky connectivity.
+
+**This publish-side cap is a different requirement from the parse-side cap that issue #1656, "add a `MAX_DID_DOCUMENT_SIZE` size gate before `serde_json::from_str`", asks for.** The publish-side cap bounds what a publisher emits, and it is the clause a publisher's size gate enforces. The parse-side cap bounds what a resolver deserializes from an untrusted source, and it guards the resolver against a memory-amplification input. Issue #1656 is open, and both caps are owed.
+
+**Measured sizes, against the relay-layer JSON encoding as the code emits it today.** Each figure is the byte length of `DidDocument::to_json` for a document built through `DidDocument::new` with three Ed25519 public keys and a SHA-256 pre-rotation commitment:
+
+| Shape | `to_json` (pretty) | Minified |
+|-------|--------------------|----------|
+| `#0` + `#active`, `PreRotationCommitment` only | 1,281 bytes | 1,103 bytes |
+| The same plus one `SCPRelay` entry (the minimum §18.2.2 permits) | 1,467 bytes | 1,255 bytes |
+| Bootstrap-core field set, still as JSON | 1,170 bytes | 1,000 bytes |
+
+The third row is why the two encodings are two encodings rather than one. Reducing the field set to the bootstrap core does not bring a JSON document under the BEP44 cap: the core is still 1,000 bytes minified with the shortest relay URL the spec's own example uses, and any real relay hostname pushes it over. The core fits Mainline only once the encoding changes — dropping `@context` takes the same core to 905 bytes, and replacing every absolute `did:dht:…#fragment` identifier with a relative fragment takes it to 478 bytes. A did:dht DNS packet does both by construction, which is why the method specifies that encoding.
 
 ### 18.2.3 Multiple Relay Entries
 
@@ -332,7 +385,7 @@ How a new identity learns its first relay. This closes the relay discovery open 
 When an identity needs to discover relays, the SDK follows this priority chain:
 
 1. **Explicit configuration.** Relay URLs provided directly in `TransportConfig` at SDK initialization. Highest trust — the operator or user explicitly chose these relays.
-2. **DID document resolution.** Resolve the identity's own DID document via Mainline DHT. Extract `SCPRelay` service entries. Self-certifying (§9.6.3).
+2. **DID document resolution.** Resolve the identity's own bootstrap core via Mainline DHT. Extract `SCPRelay` service entries. Self-certifying (§9.6.3). This level is why the relay list stays inline in the Mainline bootstrap core (§18.2.2B) rather than behind a pointer: a pointer to a relay list would need a relay to fetch it, and this level is where the SDK first learns of any relay.
 3. **`.well-known/scp` resolution.** If a bootstrap domain is configured, fetch `https://<domain>/.well-known/scp` and extract the relay URL. Verify against DID document (§18.3.2).
 4. **Peer relay discovery.** For identities that share contexts with known peers, resolve the peer's DID document and use overlapping relay sets. This enables relay discovery through the social graph.
 5. **Fallback relay list.** A hardcoded list of well-known community relays shipped with the SDK. Last resort. These relays are not privileged — they are default suggestions that can be overridden. The SDK SHOULD warn when falling back to default relays. The fallback list MUST include at least one free relay (no `economic` field in `relay_config`) — this is a protocol invariant that prevents economic gatekeeping of basic protocol operation (§19.8, §19.14).
@@ -347,7 +400,7 @@ An agent deploying via `ApplicationNode` (§18.6) follows a simplified bootstrap
 
 1. `ApplicationNode::builder().domain("example.com").build()` starts the relay server on the local machine.
 2. The relay URL is `wss://example.com/scp/v1` (derived from the configured domain).
-3. The identity's DID document is published with this relay URL as an `SCPRelay` entry.
+3. The identity publishes this relay URL as an `SCPRelay` entry to both layers, each in that layer's own encoding (§3.10.5): the full JSON document to SCP relays and the DNS-encoded bootstrap core to Mainline.
 4. `.well-known/scp` is generated and served at `https://example.com/.well-known/scp`.
 
 The agent's relay is self-hosted — no external relay discovery needed. Peers discover the agent's relay by resolving its DID document.
