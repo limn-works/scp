@@ -1,10 +1,15 @@
-// Module-level allow — `dead_code` is allowed module-wide because this
-// module is the authoritative home for query-domain free functions
-// consumed by FFI bridges (PyO3 / NAPI / UniFFI) and by external test
-// crates behind `feature = "testing"`. Those callers live outside this
-// crate, so rustc's reachability analysis cannot see them and would
-// report several helpers here as unused.
-#![allow(clippy::significant_drop_tightening, dead_code)]
+// Module-level allow — `significant_drop_tightening` only.
+//
+// `dead_code` is deliberately NOT allowed module-wide. The module is declared
+// `pub(crate) mod queries_helpers` in `context/mod.rs` and is re-exported
+// nowhere, so no out-of-crate caller can exist and rustc's reachability
+// analysis is exactly right about this module. (A prior module-wide
+// `dead_code` allow claimed otherwise — that FFI bridges and `feature =
+// "testing"` crates called in from outside — and the false claim masked seven
+// genuinely unreferenced helpers.) Items that are intentionally
+// call-site-free carry a per-item `#[allow(dead_code)]` naming the wiring that
+// will consume them; the lint stays live for the rest of the module.
+#![allow(clippy::significant_drop_tightening)]
 
 //! Queries-domain helpers — actor-shape signatures
 //! (ADR-049 Phase 2A.10, `queries` domain migration).
@@ -21,11 +26,10 @@
 //!
 //! Actor-owned state collapses the legacy lock dance: each query is
 //! serialized through the per-context actor's mailbox, so per-context
-//! reads borrow `state` directly. Mutating reads (`drain_events`,
-//! `report_degraded_mode`, access-key management, checkpoint creation,
-//! Merkle-tree sync used by `prove_event_*`) take `&mut state` without
-//! the legacy lock-drop / re-acquire dance because the actor IS the
-//! per-context generation.
+//! reads borrow `state` directly. Mutating reads (`report_degraded_mode`,
+//! access-key management, checkpoint creation, Merkle-tree sync used by
+//! `prove_event_*`) take `&mut state` without the legacy lock-drop /
+//! re-acquire dance because the actor IS the per-context generation.
 //!
 //! # Helpers
 //!
@@ -43,13 +47,10 @@
 //! Per-context mutating reads (actor-shape `(state: &mut
 //! PerContextState, deps: &ActorDeps, ...)`):
 //!
-//! - [`drain_events`] — drains the receive buffer.
 //! - [`report_degraded_mode`] — emits a `DegradedMode` event.
 //! - [`generate_context_access_key`], [`revoke_context_access_key`],
-//!   [`restore_context_access_key`], [`set_access_key`],
-//!   [`remove_access_key`] — access-key store mutations.
-//! - `inject_access_key`, `get_access_key`, `get_all_access_keys`,
-//!   `grant_budget_for_test`, `remaining_budget_for_test`,
+//!   [`restore_context_access_key`] — access-key store mutations.
+//! - `get_access_key`, `get_all_access_keys`, `remaining_budget_for_test`,
 //!   `velocity_for_test` — `#[cfg(feature = "testing")]` accessors.
 //! - [`compare_remote_checkpoint`] — equivocation detection (§9.9.3).
 //!   Reads membership and mutates `last_seen_remote_checkpoint` +
@@ -302,11 +303,6 @@ pub(super) fn payment_history(
 // Receive buffer + degraded mode (actor-shape, mutating)
 // ===========================================================================
 
-/// Drains all events from the receive buffer.
-pub fn drain_events(state: &mut PerContextState) -> Vec<ContextEvent> {
-    state.receive_buffer.drain()
-}
-
 /// Reports that a received envelope triggered degraded mode (§13.6).
 ///
 /// Emits a `DegradedMode` event into the receive buffer (and the
@@ -465,43 +461,9 @@ pub fn restore_context_access_key(
     Ok(())
 }
 
-/// Stores an access key in the access key store. Best-effort — no
-/// validation on `member_did`.
-pub fn set_access_key(
-    state: &mut PerContextState,
-    context_id: &str,
-    member_did: &str,
-    key: scp_protocol::crypto::access_keys::AccessKey,
-) {
-    state
-        .access
-        .access_key_store
-        .set(context_id, member_did, key);
-}
-
-/// Removes a member's access key. Best-effort — silently no-op if the
-/// key is absent.
-pub fn remove_access_key(state: &mut PerContextState, context_id: &str, member_did: &str) {
-    state.access.access_key_store.remove(context_id, member_did);
-}
-
 // ===========================================================================
 // Test-only accessors
 // ===========================================================================
-
-/// Injects an access key. Test-only.
-#[cfg(feature = "testing")]
-pub fn inject_access_key(
-    state: &mut PerContextState,
-    context_id: &str,
-    member_did: &str,
-    key: scp_protocol::crypto::access_keys::AccessKey,
-) {
-    state
-        .access
-        .access_key_store
-        .set(context_id, member_did, key);
-}
 
 /// Retrieves a clone of a member's access key. Test-only.
 #[cfg(feature = "testing")]
@@ -526,16 +488,6 @@ pub fn get_all_access_keys(
     context_id: &str,
 ) -> std::collections::HashMap<String, scp_protocol::crypto::access_keys::AccessKey> {
     state.access.access_key_store.get_all(context_id)
-}
-
-/// Grants budget to a member. Test-only.
-#[cfg(feature = "testing")]
-pub fn grant_budget_for_test(
-    state: &mut PerContextState,
-    member_did: &DID,
-    amount: scp_protocol::economy::types::Amount,
-) {
-    state.governance.budget_tracker.grant(member_did, amount);
 }
 
 /// Returns the remaining budget for a member. Test-only.
@@ -1303,6 +1255,17 @@ fn emit_equivocation_alert(
 // ===========================================================================
 // Merkle proof operations (ADR-011) — actor-shape
 // ===========================================================================
+//
+// The four helpers below have no call site yet, so each carries its OWN
+// `#[allow(dead_code)]` rather than a module-wide one — the lint stays live for
+// the other ~60 items in this file. They are the building blocks the §23.7
+// step-3 consistency-proof catch-up will call: the `Behind` arm of
+// `classify_remote_checkpoint` (above) is the point where a member learns it
+// is missing events, and confirming a fetched suffix genuinely EXTENDS its own
+// history (rather than the relay having rewritten held events) requires
+// proving/verifying an RFC 6962 §2.1.2 consistency proof from the last-known
+// root. The event-range fetch and proof exchange that drive them are specified
+// separately; these four are the local half and are complete as written.
 
 /// Returns a Merkle inclusion proof for the event at `leaf_index` in
 /// the per-context RFC 6962 event log.
@@ -1315,6 +1278,10 @@ fn emit_equivocation_alert(
 ///
 /// Returns [`ContextError::EventLogFailed`] if no log exists for the context,
 /// the leaf index is out of bounds, or the log is empty.
+#[allow(
+    dead_code,
+    reason = "§23.7 step-3 consistency-proof catch-up seam — see the section note above"
+)]
 pub fn prove_event_inclusion(
     deps: &ActorDeps,
     context_id: &str,
@@ -1334,6 +1301,10 @@ pub fn prove_event_inclusion(
 ///
 /// Returns [`ContextError::EventLogFailed`] if no log exists for the context,
 /// `old_size` is 0, `old_size` exceeds the current size, or the log is empty.
+#[allow(
+    dead_code,
+    reason = "§23.7 step-3 consistency-proof catch-up seam — see the section note above"
+)]
 pub fn prove_event_consistency(
     deps: &ActorDeps,
     context_id: &str,
@@ -1346,12 +1317,20 @@ pub fn prove_event_consistency(
 
 /// Verifies a Merkle inclusion proof. Pure function — no state needed.
 #[must_use]
+#[allow(
+    dead_code,
+    reason = "§23.7 step-3 consistency-proof catch-up seam — see the section note above"
+)]
 pub fn verify_event_inclusion(proof: &scp_event_log::proof::InclusionProof) -> bool {
     scp_event_log::proof::verify_inclusion(proof)
 }
 
 /// Verifies a Merkle consistency proof. Pure function — no state needed.
 #[must_use]
+#[allow(
+    dead_code,
+    reason = "§23.7 step-3 consistency-proof catch-up seam — see the section note above"
+)]
 pub fn verify_event_consistency(proof: &scp_event_log::proof::ConsistencyProof) -> bool {
     scp_event_log::proof::verify_consistency(proof)
 }
@@ -2853,6 +2832,90 @@ mod remote_checkpoint_classification_tests {
         assert!(
             view.last_seen_remote_checkpoint_mut().is_empty(),
             "an agreeing peer must record no divergence"
+        );
+    }
+
+    /// An `#agent`-signed checkpoint the local log is BEHIND is
+    /// `Behind { missing_events }` — benign catch-up lag, no alert.
+    ///
+    /// The `#active` twin is
+    /// [`local_behind_the_remote_is_behind_not_equivocation`]; this pins that
+    /// the non-equivocation arms are persona-independent too. Without it the
+    /// `#agent` coverage would stop at the two arms that touch the alert path,
+    /// leaving open the possibility that a declared `#agent` reaches the
+    /// signature gate but is mis-classified once past it — which is exactly the
+    /// class of bug that would turn genuine catch-up lag into an accusation.
+    #[tokio::test]
+    async fn an_agent_signed_behind_checkpoint_is_behind_not_equivocation() {
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&[24u8; 32]);
+        let agent_key = ed25519_dalek::SigningKey::from_bytes(&[25u8; 32]);
+        assert_ne!(active_key.verifying_key(), agent_key.verifying_key());
+
+        // Local: 7 events. Remote: a real 10-event log's count and root.
+        let remote_root = root_of_log_with(10).await;
+        let deps = deps_over_methods(
+            Box::new(readable_provider(7).await),
+            Some(active_key.verifying_key()),
+            Some(agent_key.verifying_key()),
+        )
+        .await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        let remote = signed_remote(&agent_key, 10, remote_root);
+        let comparison =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote, AGENT)
+                .expect("an #agent-signed checkpoint over a readable log yields a verdict");
+        assert_eq!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Behind { missing_events: 3 },
+            "being behind an #agent signer is catch-up lag, exactly as under #active"
+        );
+        assert!(
+            cell.class_c_view()
+                .receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .is_empty(),
+            "catch-up lag is not equivocation — no alert may be raised under #agent"
+        );
+    }
+
+    /// An `#agent`-signed checkpoint the local log is AHEAD of is
+    /// `Ahead { extra_events }` — no alert.
+    ///
+    /// The `#active` twin is [`local_ahead_of_the_remote_is_ahead_not_equivocation`].
+    #[tokio::test]
+    async fn an_agent_signed_ahead_checkpoint_is_ahead_not_equivocation() {
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&[26u8; 32]);
+        let agent_key = ed25519_dalek::SigningKey::from_bytes(&[27u8; 32]);
+        assert_ne!(active_key.verifying_key(), agent_key.verifying_key());
+
+        // Local: 10 events. Remote: a real 4-event log's count and root.
+        let remote_root = root_of_log_with(4).await;
+        let deps = deps_over_methods(
+            Box::new(readable_provider(10).await),
+            Some(active_key.verifying_key()),
+            Some(agent_key.verifying_key()),
+        )
+        .await;
+        let mut cell =
+            crate::context::actor::class_s::ClassSCell::new(state_with_sender_as_member());
+
+        let remote = signed_remote(&agent_key, 4, remote_root);
+        let comparison =
+            compare_remote_checkpoint(&mut cell.class_c_view(), &deps, CTX_HEX, &remote, AGENT)
+                .expect("an #agent-signed checkpoint over a readable log yields a verdict");
+        assert_eq!(
+            comparison,
+            scp_event_log::checkpoint::CheckpointComparison::Ahead { extra_events: 6 },
+            "being ahead of an #agent signer is not equivocation, exactly as under #active"
+        );
+        assert!(
+            cell.class_c_view()
+                .receive_buffer_mut()
+                .drain_equivocation_alerts()
+                .is_empty(),
+            "being ahead of a peer is not equivocation — no alert may be raised under #agent"
         );
     }
 

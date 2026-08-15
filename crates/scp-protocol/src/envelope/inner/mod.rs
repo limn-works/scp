@@ -212,6 +212,15 @@ pub struct InnerEnvelope {
     /// Identifies which DID verification method (`#active` or `#agent`)
     /// produced the signature. Defaults to `Active` for backward compatibility
     /// with envelopes created before agent binding (ADR-039).
+    ///
+    /// **The `serde(default)` is NOT a permissive fallback.** This field is
+    /// inside the canonical hash the signature covers, so an absent field is
+    /// only accepted where the signer genuinely omitted it — i.e. a pre-ADR-039
+    /// envelope, which was signed over the `Active` default. Stripping the
+    /// field from an `#agent` envelope to make a verifier resolve `#active`
+    /// changes the canonical hash and the signature no longer verifies. The
+    /// default therefore cannot be used to downgrade a declaration; it only
+    /// spells out what an old envelope already committed to.
     #[serde(default)]
     pub signing_key_id: SigningKeyId,
 

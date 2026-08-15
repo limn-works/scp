@@ -604,6 +604,18 @@ pub enum MessagingCommand {
         /// so the private key zeroes on drop (mirrors the
         /// [`SendMessagePayload`] pattern).
         signing_key: SigningKeyBytes,
+        /// The verification method (`#active` / `#agent`) `signing_key`
+        /// belongs to, DECLARED by the FFI caller that resolved it (ADR-039).
+        /// The handler recombines the two into one
+        /// [`MessageSigner`](crate::context::supervisor::MessageSigner) via
+        /// [`MessageSigner::for_key_id`](crate::context::supervisor::MessageSigner::for_key_id),
+        /// so the checkpoint's own Ed25519 signature and the stamp on the
+        /// envelope that broadcasts it come from a single source of truth.
+        /// A command cannot hold the borrow a `MessageSigner` needs, which is
+        /// the only reason the pair travels split; the public
+        /// [`Supervisor::build_local_checkpoint`](crate::context::supervisor::Supervisor::build_local_checkpoint)
+        /// boundary takes them already coupled.
+        signing_key_id: scp_did::SigningKeyId,
         /// Oneshot reply channel carrying the freshly-built signed
         /// checkpoint.
         reply: BuildLocalCheckpointReply,
@@ -625,8 +637,15 @@ pub enum MessagingCommand {
     /// [`CheckpointComparison`](scp_event_log::checkpoint::CheckpointComparison)
     /// (`Consistent` / `Behind` / `Ahead` / `Divergent`). The `Behind`
     /// arm is the post-offline catch-up seam — the consistency-proof
-    /// catch-up integration point, specified separately. Used by the
-    /// reconnection driver's Phase 3.
+    /// catch-up integration point, specified separately.
+    ///
+    /// Received peer checkpoints are judged automatically inside the receive
+    /// path (`deliver_incoming` → `deliver_checkpoint_message`), which is the
+    /// only place `signing_key_id` below can be sourced from an authenticated
+    /// envelope. The reconnection driver's Phase 3 builds the LOCAL checkpoint
+    /// ([`BuildLocalCheckpoint`](Self::BuildLocalCheckpoint)) and drains the
+    /// alerts automatic judging already raised; it does not dispatch this
+    /// command.
     CompareRemoteCheckpoint {
         /// Context identifier.
         context_id: String,
@@ -671,6 +690,16 @@ pub enum MessagingCommand {
         /// the private key zeroes on drop (mirrors the
         /// [`SendMessagePayload`] pattern).
         signing_key: SigningKeyBytes,
+        /// The verification method (`#active` / `#agent`) `signing_key`
+        /// belongs to, DECLARED by the FFI caller that resolved it (ADR-039).
+        /// The handler recombines the two via
+        /// [`MessageSigner::for_key_id`](crate::context::supervisor::MessageSigner::for_key_id)
+        /// so the heartbeat envelope's stamp matches the key that signs it. A
+        /// stamp the signature does not match is rejected by every peer, which
+        /// would read a live `#agent` participant as suppressed (§9.9.2). Same
+        /// split-then-recombine rationale as
+        /// [`BuildLocalCheckpoint`](Self::BuildLocalCheckpoint).
+        signing_key_id: scp_did::SigningKeyId,
         /// Oneshot reply channel. `Ok(())` on success; transport error if
         /// every fan-out send fails.
         reply: oneshot::Sender<Result<(), ContextError>>,

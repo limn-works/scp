@@ -207,11 +207,10 @@ fn build_send_blob(
 
     // Pair the chosen persona with the signing key so the stamped
     // `signing_key_id` and the key that signs come from one source — this is
-    // exactly the invariant the #agent-persona slice asserts.
-    let signer = match signing_key_id {
-        SigningKeyId::Active => MessageSigner::Active(signing_key),
-        SigningKeyId::Agent => MessageSigner::Agent(signing_key),
-    };
+    // exactly the invariant the #agent-persona slice asserts. Built through the
+    // PRODUCTION constructor rather than a local match, so this test cannot
+    // drift from the mapping the runtime actually uses.
+    let signer = MessageSigner::for_key_id(signing_key, signing_key_id);
 
     // Drive the PRODUCTION actor app-data seal `build_encrypted_envelope_actor`
     // (the exact seam `encrypt_and_send` bottoms out in) directly on Alice's
@@ -778,10 +777,7 @@ mod live_supervisor_send {
         // THE PUBLIC SEND. Persona chosen by `signing_key_id`; the signing key
         // is Alice's matching (#agent or #active) key. `MessageSigner` pairs the
         // two so the stamped persona cannot disagree with the key that signs.
-        let signer = match signing_key_id {
-            SigningKeyId::Active => MessageSigner::Active(signing_key),
-            SigningKeyId::Agent => MessageSigner::Agent(signing_key),
-        };
+        let signer = MessageSigner::for_key_id(signing_key, signing_key_id);
         sup.send_message(&handle, &DID::from(ALICE_DID), payload, signer, None, None)
             .await
             .expect("Supervisor::send_message (public API) succeeds");

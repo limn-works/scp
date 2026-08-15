@@ -85,8 +85,11 @@ pub struct RelayActorSyncDriver<'a> {
     /// Local member DID — the checkpoint author / reset requester.
     member_did: DID,
     /// Local Ed25519 signing-key seed used to sign the Phase-3 local
-    /// checkpoint. Zeroized by the caller after the driver is dropped
-    /// (the caller owns the key material lifetime).
+    /// checkpoint. This is the member's `#active` key — the same authority the
+    /// application send path uses — which is why `event_log_sync` declares
+    /// [`SigningKeyId::Active`](scp_did::SigningKeyId::Active) for it (ADR-039).
+    /// Zeroized by the caller after the driver is dropped (the caller owns the
+    /// key material lifetime).
     signing_key: SigningKeyBytes,
 }
 
@@ -379,9 +382,20 @@ impl SyncPhaseDriver for RelayActorSyncDriver<'_> {
     /// checkpoints in Phase 2.
     async fn event_log_sync(&self, context_id: &str) -> Result<(u64, Vec<SyncEvent>), SyncError> {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&self.signing_key);
+        // ADR-039: DECLARE the persona this key actually belongs to. The driver
+        // is constructed with the local member's `#active` seed (see the
+        // `signing_key` field docs), so `#active` is what the checkpoint and the
+        // envelope carrying it are both stamped with. The declaration is made
+        // HERE, next to the key it describes, rather than re-asserted deeper in
+        // the runtime where it could contradict a key resolved under a different
+        // persona.
         let checkpoint = self
             .supervisor
-            .build_local_checkpoint(context_id, &self.member_did, &signing_key)
+            .build_local_checkpoint(
+                context_id,
+                &self.member_did,
+                scp_core::context::supervisor::MessageSigner::Active(&signing_key),
+            )
             .await
             .map_err(|e| SyncError::EventLogSyncFailed {
                 context_id: context_id.to_owned(),

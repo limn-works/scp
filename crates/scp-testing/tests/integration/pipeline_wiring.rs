@@ -2679,16 +2679,26 @@ fn b3_merkle_proof_verification_wired() {
          compare_remote_checkpoint so the judge resolves the sender's DECLARED \
          verification method (§9.9.3 / ADR-039)"
     );
-    // And the judge must resolve THAT parameter, not a hardcoded variant: a
-    // literal `SigningKeyId::Active` in the authenticity gate is the exact
-    // regression this closes.
+    // And the judge must name NO variant literal. These two negatives are what
+    // a source-text gate can hold SOUNDLY: they are formatting-independent (no
+    // call-shape substring to be re-wrapped by rustfmt after a rename) and they
+    // pin a property no type check expresses — that the authenticity gate does
+    // not hardcode a method, and does not try both on failure.
+    //
+    // The POSITIVE half — that the declaration is actually threaded from the
+    // authenticated envelope down to the judge — is pinned BEHAVIORALLY by
+    // `reconnect_sync::agent_persona_checkpoint_survives_the_real_cross_member_receive_path`
+    // and `::supervisor_compare_remote_checkpoint_honors_the_declared_method`,
+    // which drive a real `#agent`-signed checkpoint through the cross-member
+    // receive path and through the Supervisor mailbox respectively, against a
+    // harness resolver that answers `#active` and `#agent` with DIFFERENT keys.
+    // Both kill the `{ let _declared = inner.signing_key_id; Default::default() }`
+    // revert. An exact-substring assertion on the resolver call shape was
+    // REPLACED by those tests rather than kept alongside them: it re-checked the
+    // same property in a weaker form that a rustfmt line-wrap could break
+    // without the invariant changing at all.
     let authenticity_body = extract_fn_body(MANAGER_SRC, "verify_remote_checkpoint_authenticity")
         .expect("verify_remote_checkpoint_authenticity must exist in manager source");
-    assert!(
-        authenticity_body.contains("deps.key_resolver)(&remote.sender_did, signing_key_id)"),
-        "verify_remote_checkpoint_authenticity must resolve the DECLARED \
-         signing_key_id (ADR-039), never a hardcoded verification method"
-    );
     assert!(
         !authenticity_body.contains("SigningKeyId::Active")
             && !authenticity_body.contains("SigningKeyId::Agent"),

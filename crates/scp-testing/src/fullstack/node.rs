@@ -81,7 +81,8 @@ pub(super) type NodeRegistry = Arc<Mutex<HashMap<String, NodeShared>>>;
 /// Derives a deterministic 32-byte seed from a DID string for test key
 /// generation. The signing key is used for inner-envelope signatures on the
 /// send path AND as the node's `#active` identity key: the network's
-/// deterministic [`KeyResolver`] resolves each DID to
+/// deterministic [`KeyResolver`] resolves each DID under
+/// [`SigningKeyId::Active`](scp_did::SigningKeyId::Active) to
 /// `SigningKey::from_bytes(did_to_seed(did)).verifying_key()`, so a joiner's
 /// `#active` custody (which imports this same seed) opens the invitation the
 /// creator's `invite_member` sealed to the resolved key.
@@ -92,6 +93,29 @@ pub(super) fn did_to_seed(did: &DID) -> [u8; 32] {
     let h = hasher.finish();
     let mut seed = [0u8; 32];
     seed[..8].copy_from_slice(&h.to_le_bytes());
+    seed
+}
+
+/// Derives the deterministic seed for a DID's **`#agent`** signing key
+/// (ADR-039): [`did_to_seed`] with the final byte flipped.
+///
+/// The network's [`KeyResolver`] answers
+/// [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent) with this key's
+/// verifying key, so `#active` and `#agent` resolve to genuinely DIFFERENT
+/// keys. That difference is the point: a resolver that ignored the requested
+/// verification method (as this harness's did until the two keys were split)
+/// makes every persona test vacuous — a message stamped `#agent` but signed
+/// with the `#active` key verifies, and a judge that resolved the wrong method
+/// still succeeds. With two distinct keys, the declared method must match the
+/// key that signed or verification fails, exactly as in production.
+///
+/// Byte 31 is flipped rather than byte 0 because [`did_to_seed`] only
+/// populates bytes 0..8; flipping a byte inside that populated prefix could
+/// collide with another DID's seed, while byte 31 is zero for every `#active`
+/// seed and so is guaranteed distinct from all of them.
+pub(super) fn did_to_agent_seed(did: &DID) -> [u8; 32] {
+    let mut seed = did_to_seed(did);
+    seed[31] ^= 0xFF;
     seed
 }
 
@@ -575,14 +599,33 @@ impl FullStackNode {
             .spawn_actor_from_welcome(self.did.clone(), &custody, &active_handle, req)
             .await?;
 
-        // 5. Joiner-side pickup: pending epoch-advance Commits and the pushed
+        // 5. Establish this joiner's own per-context event log as an EMPTY
+        //    RFC 6962 tree. `spawn_actor_from_welcome` does not create one, and
+        //    without it every log-reading path on the joiner fails closed with
+        //    "no event log for context" — including the §9.9.3 judge, which
+        //    refuses to classify a peer checkpoint against an unreachable local
+        //    log. An empty log is the correct starting state (it is exactly what
+        //    production's `restore_event_log_best_effort` falls back to when
+        //    there is nothing persisted to restore), and it leaves the joiner
+        //    genuinely BEHIND its incumbents rather than fabricating history.
+        //    Cross-member replication of the incumbents' existing leaves is the
+        //    dormant receive-side append path ADR-051 §7.3.1 tracks; this does
+        //    not stand in for it.
+        <MerkleEventLogProvider as ContextEventLogProvider>::init_event_log(
+            &self.event_log,
+            context_id,
+        )
+        .await
+        .map_err(|e| ContextError::EventLogFailed(format!("joiner event-log init failed: {e}")))?;
+
+        // 6. Joiner-side pickup: pending epoch-advance Commits and the pushed
         //    sender-key distribution messages, fed through the REAL actor
         //    receive path (ADR-049 PR-7). (§9.17 access keys are acquired via
-        //    the real pull in step 7, not a deposit/pickup side-channel.)
+        //    the real pull in step 8, not a deposit/pickup side-channel.)
         self.feed_pending_incoming(context_id_str, context_id)
             .await?;
 
-        // 6. Joiner→incumbent sender-key exchange via the spec's PULL protocol
+        // 7. Joiner→incumbent sender-key exchange via the spec's PULL protocol
         //    (§9.16.2), the canonical new-member mechanism. Neither `invite_member`
         //    nor the Welcome carries the joiner's sender key to the incumbents, so
         //    without this a B→A send fails at the receiver with `sender key lookup
@@ -594,7 +637,7 @@ impl FullStackNode {
         self.incumbents_pull_joiner_sender_key(context_id, &handle)
             .await?;
 
-        // 7. §9.17 content-access-key acquisition via the REAL pull protocol.
+        // 8. §9.17 content-access-key acquisition via the REAL pull protocol.
         //    The joiner's actor spawned with an EMPTY access_key_store, so it can
         //    neither unwrap its own inbound CEKs nor wrap CEKs for its peers on
         //    send. It acquires every current member's access key (its own + the
@@ -896,17 +939,111 @@ impl FullStackNode {
             .await
     }
 
+    /// This node's Ed25519 signing key for `persona` (ADR-039).
+    ///
+    /// `#active` returns the node's default send key; `#agent` returns the
+    /// distinct key the network's resolver answers for
+    /// [`SigningKeyId::Agent`](scp_did::SigningKeyId::Agent). Tests that drive a
+    /// persona-specific path take the key from HERE so the key and the declared
+    /// method cannot drift apart.
+    #[must_use]
+    pub fn signing_key_for(&self, persona: scp_did::SigningKeyId) -> ed25519_dalek::SigningKey {
+        match persona {
+            scp_did::SigningKeyId::Active => self.signing_key.clone(),
+            scp_did::SigningKeyId::Agent => {
+                ed25519_dalek::SigningKey::from_bytes(&did_to_agent_seed(&self.did))
+            }
+        }
+    }
+
     /// Sends a suppression-detection heartbeat (§9.9.2) through the real
-    /// `Supervisor` — an empty-payload `MessageType::Heartbeat` envelope routed
-    /// through the same encrypt-and-send pipeline as application messages. The
-    /// captured ciphertext is available via [`take_sent_ciphertexts`](Self::take_sent_ciphertexts).
+    /// `Supervisor` under `persona` — an empty-payload `MessageType::Heartbeat`
+    /// envelope routed through the same encrypt-and-send pipeline as
+    /// application messages. The captured ciphertext is available via
+    /// [`take_sent_ciphertexts`](Self::take_sent_ciphertexts).
+    ///
+    /// The key is selected from `persona` via
+    /// [`signing_key_for`](Self::signing_key_for) and the two are handed to the
+    /// supervisor already coupled, so the beacon's stamp always matches the key
+    /// that signed it.
     ///
     /// # Errors
     ///
     /// Propagates [`ContextError`] from the supervisor.
-    pub async fn send_heartbeat(&self, context_id: &str) -> Result<(), ContextError> {
+    pub async fn send_heartbeat(
+        &self,
+        context_id: &str,
+        persona: scp_did::SigningKeyId,
+    ) -> Result<(), ContextError> {
+        let key = self.signing_key_for(persona);
         self.manager
-            .send_heartbeat(context_id, &self.did, &self.signing_key)
+            .send_heartbeat(
+                context_id,
+                &self.did,
+                MessageSigner::for_key_id(&key, persona),
+            )
+            .await
+    }
+
+    /// Builds and broadcasts a signed consistency checkpoint (§9.9.3) through
+    /// the real `Supervisor`, stamped under `persona` (ADR-039).
+    ///
+    /// The checkpoint's own Ed25519 signature and the envelope that carries it
+    /// to peers are both produced from the one key
+    /// [`signing_key_for`](Self::signing_key_for) selects for `persona`. The
+    /// broadcast ciphertext is available via
+    /// [`take_sent_ciphertexts`](Self::take_sent_ciphertexts) so a peer node can
+    /// be fed the REAL envelope this node produced.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the supervisor.
+    pub async fn build_local_checkpoint(
+        &self,
+        context_id: &str,
+        persona: scp_did::SigningKeyId,
+    ) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
+        let key = self.signing_key_for(persona);
+        self.manager
+            .build_local_checkpoint(
+                context_id,
+                &self.did,
+                MessageSigner::for_key_id(&key, persona),
+            )
+            .await
+    }
+
+    /// Builds and broadcasts a consistency checkpoint whose envelope stamp and
+    /// signing key DELIBERATELY DISAGREE — a negative control for ADR-039.
+    ///
+    /// `declared` is stamped on the wire while `signed_with`'s key produces
+    /// every signature. A correct peer MUST reject the result: it resolves the
+    /// DECLARED method and the signature will not verify under it. This exists
+    /// so an acceptance assertion elsewhere is provably EARNED by correct
+    /// persona binding rather than by a permissive verification path — without
+    /// it, a receiver that ignored the declaration entirely would pass the
+    /// positive test just as happily.
+    ///
+    /// Production cannot express this: `Supervisor::build_local_checkpoint`
+    /// takes a coupled `MessageSigner`, so the mismatch is only constructible
+    /// here, by handing one variant a key that belongs to the other.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the supervisor.
+    pub async fn build_local_checkpoint_with_mismatched_persona(
+        &self,
+        context_id: &str,
+        declared: scp_did::SigningKeyId,
+        signed_with: scp_did::SigningKeyId,
+    ) -> Result<scp_event_log::checkpoint::ConsistencyCheckpoint, ContextError> {
+        let key = self.signing_key_for(signed_with);
+        self.manager
+            .build_local_checkpoint(
+                context_id,
+                &self.did,
+                MessageSigner::for_key_id(&key, declared),
+            )
             .await
     }
 
@@ -1085,6 +1222,37 @@ impl FullStackNode {
                     .to_owned(),
             )),
         }
+    }
+
+    /// Feeds one peer-produced envelope through this node's REAL actor receive
+    /// path and returns the raw [`Supervisor::deliver_commit_blob`] outcome.
+    ///
+    /// Identical prologue to [`decrypt_message`](Self::decrypt_message) — any
+    /// pending Commits and pushed sender-key distributions are ingested first so
+    /// the MLS epoch is synced and the sender's key installed — but the outcome
+    /// is returned VERBATIM instead of being narrowed to application plaintext.
+    /// That matters for envelope kinds the receive path handles internally and
+    /// reports as `Ok(None)`: a consistency checkpoint (§9.9.3) or a heartbeat
+    /// (§9.9.2). `decrypt_message` turns those into an `Err`, which would make
+    /// "the peer accepted and processed it" indistinguishable from "the peer
+    /// rejected it" — exactly the distinction a persona test turns on.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the commit/sender-key prologue or from
+    /// the receive path itself (signature failure under the declared
+    /// verification method, integrity failure, a refused checkpoint judgement).
+    pub async fn deliver_envelope(
+        &self,
+        context_id_str: &str,
+        context_id: &[u8; 32],
+        ciphertext: &[u8],
+    ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+        self.feed_pending_incoming(context_id_str, context_id)
+            .await?;
+        self.manager
+            .deliver_commit_blob(context_id_str, ciphertext.to_vec())
+            .await
     }
 
     /// Feeds every deposited epoch-advance Commit and pushed sender-key

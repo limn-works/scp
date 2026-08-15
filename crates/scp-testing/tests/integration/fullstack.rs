@@ -212,7 +212,10 @@ async fn fullstack_heartbeat_send_does_not_advance_application_sequence() {
     // 1. First application message — application sequence 0.
     alice.send_message(&handle, b"first").await.unwrap();
     // 2. Heartbeat between the two messages.
-    alice.send_heartbeat(ctx_id).await.unwrap();
+    alice
+        .send_heartbeat(ctx_id, scp_did::SigningKeyId::Active)
+        .await
+        .unwrap();
     // 3. Second application message — must be application sequence 1 (the
     //    heartbeat must NOT have consumed sequence 1).
     alice.send_message(&handle, b"second").await.unwrap();

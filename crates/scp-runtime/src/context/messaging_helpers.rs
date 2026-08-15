@@ -928,10 +928,7 @@ pub async fn send_message(
     // rollback is needed). Both encrypted and broadcast sends previously
     // re-checked `None` downstream; this single check subsumes them.
     let signer = match signing_key {
-        Some(sk) => match signing_key_id {
-            SigningKeyId::Active => MessageSigner::Active(sk),
-            SigningKeyId::Agent => MessageSigner::Agent(sk),
-        },
+        Some(sk) => MessageSigner::for_key_id(sk, signing_key_id),
         None => {
             return Err(ContextError::CryptoFailed(
                 "signing key required for send".into(),
@@ -1362,10 +1359,15 @@ pub async fn send_message(
         sender_did,
         sequence,
         payload,
-        // Periodic checkpoints broadcast from `finalize_send` are always
-        // human/device-originated `#active` signals; they need only the raw
-        // key, which we hand over from the one `MessageSigner`.
-        Some(signer.key()),
+        // ADR-039: hand over the WHOLE `MessageSigner`, not just its key. A
+        // periodic checkpoint piggy-backed on this send is stamped with the
+        // persona THIS send resolved — an `#agent` send publishes an
+        // `#agent`-stamped checkpoint. Passing the bare key here forced
+        // `send_checkpoint` to re-assert `#active`, producing an envelope
+        // stamped `#active` but signed with the agent key: unverifiable at
+        // every peer, so `#agent` participants were silently exempt from
+        // §9.9.3 tier-(a) equivocation detection.
+        Some(signer),
         spending_nonce_token.take(),
         is_broadcast,
     )
@@ -1839,7 +1841,7 @@ pub(crate) async fn send_checkpoint(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: MessageSigner<'_>,
     checkpoint: &scp_event_log::checkpoint::ConsistencyCheckpoint,
 ) -> Result<(), ContextError> {
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): this is now a plain `async fn` taking
@@ -1893,9 +1895,12 @@ pub(crate) async fn send_checkpoint(
         deps,
         Some(crypto_state),
         None,
-        // Consistency checkpoints are device/human-originated signals, not
-        // agent-autonomous messages — sign under `#active` (ADR-039).
-        MessageSigner::Active(signing_key),
+        // ADR-039: CARRY the caller's persona, never re-assert one. The
+        // checkpoint inside `payload` was signed with `signer.key()`; stamping
+        // the envelope with any other verification method would make the two
+        // disagree, and the recipient — which resolves exactly the DECLARED
+        // method — would reject a checkpoint it should have judged.
+        signer,
         context_id,
         sender_did,
         &payload,
@@ -1957,7 +1962,7 @@ pub(crate) async fn send_heartbeat(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     context_id: &str,
     sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
+    signer: MessageSigner<'_>,
 ) -> Result<(), ContextError> {
     // ADR-049 PR-7 (SCP-CRYPTOMOVE-001): plain `async fn` taking `&mut ClassSCell`
     // (Send), so the seal runs on the actor's crypto view held across the fan-out
@@ -2021,9 +2026,12 @@ pub(crate) async fn send_heartbeat(
         deps,
         Some(crypto_state),
         None,
-        // Heartbeats are device/human-originated liveness beacons, not
-        // agent-autonomous messages — sign under `#active` (ADR-039).
-        MessageSigner::Active(signing_key),
+        // ADR-039: CARRY the caller's persona. A heartbeat is a liveness beacon
+        // for whichever persona is actually transmitting; re-asserting `#active`
+        // over an `#agent` key would stamp a method the signature does not match
+        // and every peer would reject the beacon, reading the `#agent`
+        // participant as suppressed rather than alive.
+        signer,
         context_id,
         sender_did,
         // Heartbeats carry NO user content — the empty payload is the whole point:
@@ -2255,7 +2263,7 @@ pub async fn finalize_send(
     sender_did: &DID,
     sequence: u64,
     payload: &[u8],
-    signing_key: Option<&ed25519_dalek::SigningKey>,
+    signer: Option<MessageSigner<'_>>,
     token: Option<crate::context::actor::class_s::ClassSCommitToken>,
     is_broadcast: bool,
 ) -> Result<(), ContextError> {
@@ -2379,8 +2387,7 @@ pub async fn finalize_send(
         // Checkpoint tracking (§9.9.3).
         *view.checkpoint_events_since_mut() += 1;
     }
-    create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signing_key, now)
-        .await;
+    create_and_broadcast_checkpoint_if_due(cell, deps, context_id, sender_did, signer, now).await;
 
     // Reconcile the GROW-armed `downward_auth_sink` with the send's nonce `token`
     // so EXACTLY ONE fail-closed persist is owed on every branch (ADR-049 §9,
@@ -2424,19 +2431,33 @@ pub async fn finalize_send(
 /// transport failure is logged but never rolls back the just-completed
 /// application send, because the checkpoint is an independent
 /// consistency-monitoring artifact, not part of the message's delivery
-/// guarantee. A missing signing key (e.g. a context with no local custody)
+/// guarantee. A missing signer (e.g. a context with no local custody)
 /// skips checkpoint creation entirely.
+///
+/// # Persona (ADR-039)
+///
+/// `signer` is the WHOLE [`MessageSigner`] the originating send resolved, not a
+/// bare key. The checkpoint it produces is signed with `signer.key()` and the
+/// envelope that carries it is stamped with `signer`'s verification method, so
+/// the piggy-backed checkpoint inherits the persona of the send that triggered
+/// it. Re-asserting `#active` here would stamp an `#agent` send's checkpoint
+/// with a method its signing key does not match — unverifiable at every peer,
+/// which silently exempted `#agent` participants from §9.9.3 tier-(a)
+/// equivocation detection.
 async fn create_and_broadcast_checkpoint_if_due(
     cell: &mut crate::context::actor::class_s::ClassSCell,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &DID,
-    signing_key: Option<&ed25519_dalek::SigningKey>,
+    signer: Option<MessageSigner<'_>>,
     now: u64,
 ) {
-    let Some(sk) = signing_key else {
+    let Some(signer) = signer else {
         return;
     };
+    // The raw key is what SIGNS the checkpoint struct; the persona rides along
+    // in `signer` to the envelope stamp below. Both come from the one value.
+    let sk = signer.key();
     // Build + retain the checkpoint through the non-persisting Class-C view
     // (coalesced — the run loop persists on `mutated`). The `&mut view` borrow
     // ends before the shared-`&` `send_checkpoint` read below (NLL).
@@ -2479,7 +2500,8 @@ async fn create_and_broadcast_checkpoint_if_due(
     // on the actor crypto view; `cell` is free here (the `due_checkpoint` view
     // borrow above ended) and this is its last use.
     if let Some(checkpoint) = due_checkpoint
-        && let Err(e) = send_checkpoint(deps, cell, context_id, sender_did, sk, &checkpoint).await
+        && let Err(e) =
+            send_checkpoint(deps, cell, context_id, sender_did, signer, &checkpoint).await
     {
         tracing::warn!(
             context_id,
