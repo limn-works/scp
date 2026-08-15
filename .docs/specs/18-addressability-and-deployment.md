@@ -160,7 +160,7 @@ Every SDK MUST produce byte-identical bytes to every other SDK for the same iden
 | `capabilityDelegation` | Yes | MUST reference only `#0`. |
 | `capabilityInvocation` | Yes | MUST reference `#0` and `#active`. |
 | `alsoKnownAs` | No | At most one entry, and it names the DID that a Layer 2 identity migration moved this identity to (§9.12). Absent on an identity that has not migrated. |
-| `service` | Yes | At least one `SCPRelay` entry required. Other types optional. Each entry satisfies the three criteria in §18.2.2B. |
+| `service` | Yes | At least one `SCPRelay` entry required. Exactly one `PreRotationCommitment` entry required: ADR-003 acceptance criterion 1 constructs it on every identity, and §9.12 reads it on every rotation, so a document without it cannot have its rotations verified. Every other type is optional. Each entry satisfies the three criteria in §18.2.2B. |
 | `service[].id` | Yes | Fragment identifier (e.g., `#scp-relay-1`). Unique within the document. |
 | `service[].type` | Yes | One of the types in §18.2.2. |
 
@@ -211,11 +211,19 @@ Two entry classes fail this criterion as §18.2.2 and §5.14.11 write them today
 
 **Criterion 2 does not yet decide retired verification methods, and this specification does not decide them here.** §18.2.2A's `verificationMethod` row permits `#0`, `#active` and `#agent` and no other verification method, while `rotate_active_key` and `rotate_agent_key` (ADR-003 §4a and §4a′) retain `#retired-{sequence}` and `#retired-agent-{sequence}` entries capped at 2 per role. Retained keys are one per rotation, so criterion 2 applies to them, and the answer depends on a retention decision that no artifact records: whether content signatures verify against retired keys at all, and if they do, whether the retained keys sit inline under a stated cap or behind a pointer. The plan of record holds that decision open and assigns it to a human. Until it lands, §18.2.2A's row stands as written and this criterion states no retention rule. Three clauses move with the decision if it permits retained keys, and a reader settling it changes them together: §18.2.2A's `verificationMethod` row, CONF-001 in §26.3 ("exactly 3 verification methods"), and CONF-003 in §26.3 ("Old `#active` key is absent"). `.docs/specs/09-security-model.md` §9.7.1 is not among them: it binds a KeyPackage attestation to the current key, which is a separate rule about a bearer capability rather than about what the document retains.
 
-**Criterion 3 — an entry appears in the Mainline bootstrap core when a resolver needs its value before it has reached any relay.**
+**Criterion 3 — the Mainline bootstrap core carries what a resolver needs in order to reach a relay, and the verification material every identity carries. Everything else lives on the relay layer.**
 
-§18.5.1's bootstrap chain puts Mainline resolution at level 2, which is the first level where an SDK holding nothing but a DID learns of any relay. A pointer resolves only by fetching from a relay, so a pointer at level 2 names a relay the resolver does not yet know and the chain never starts. Every entry a resolver reads after level 2 completes is a candidate for a pointer, because the resolver holds the relay list by then.
+The criterion has two clauses, and an entry qualifies under either one.
 
-The test names two uses. An entry whose value a resolver reads in order to reach a relay appears in the bootstrap core, and so does an entry whose value a resolver reads in order to verify what a relay returned. Every other entry lives on the relay layer alone. §18.2.2C lists what this criterion admits.
+**Clause (a) — reaching a relay.** §18.5.1's bootstrap chain puts Mainline resolution at level 2, which is the first level where an SDK holding nothing but a DID learns of any relay. A pointer resolves only by fetching from a relay, so a pointer at level 2 names a relay the resolver does not yet know and the chain never starts. The `SCPRelay` entries are what this clause admits, and it admits nothing else: once level 2 completes the resolver holds the relay list and can fetch anything.
+
+**Clause (b) — verifying this identity's signatures when no relay answers.** §3.10.3 keeps Mainline as the path that survives when every one of an identity's relays is unreachable, and that path is worth having only if a verifier holding it can check a signature the identity made. The material that check reads is the `#active` verification method, which §18.2.2A requires of every DID document, and the `PreRotationCommitment` service entry, which §9.12 reads when it checks whether a rotation was authorized. `#0` needs no separate element: the DID string encodes those same bytes (§9.6.1), so a resolver derives the key from the identifier it is already holding.
+
+**What clause (b) excludes, and how a resolver behaves when it bites.** Verification material an identity MAY carry rather than MUST stays on the relay layer, and `#agent` is the only instance today (ADR-039 makes it optional). A resolver holding only the core, meeting an artifact whose `signing_key_id` names `#agent`, MUST report `#agent` unresolved and fetch the full document from a relay before it accepts the artifact. It MUST NOT read the core's silence as an assertion that the identity has no agent key (§3.10.10). Two consequences follow: the core's byte length does not vary with an optional feature, and every identity's fallback path carries the same material as every other identity's.
+
+Note that the relay layer's own DID record does not depend on clause (b). A resolver verifies that record's BEP44 signature against the key the DID string encodes (§3.10.4 step 4b), never against `#active`, so a resolver holding no core at all can still authenticate a relay's answer once it reaches a relay by some other route (§18.5.1 levels 1, 3, 4 and 5). Clause (b) is about verifying what the identity signs, not about verifying what a relay serves.
+
+§18.2.2C lists what this criterion admits.
 
 ### 18.2.2C The Mainline Bootstrap Core
 
@@ -223,10 +231,10 @@ The Mainline DHT layer carries a **bootstrap core**: the entries criterion 3 of 
 
 | Element | Why criterion 3 admits it |
 |---------|---------------------------|
-| The identity key derivation | The DID string encodes the `#0` public key (§9.6.1), so a resolver derives `#0` from the DID it is resolving and the core carries no separate `#0` entry. |
-| The `#active` verification method | A resolver verifies a signature before it trusts a document a relay returned, and `#active` is the key that signature names. |
-| The `PreRotationCommitment` service entry | Rotation verification (§9.12) reads the commitment at the same moment it reads `#active`. |
-| The `SCPRelay` service entries | Level 2 of §18.5.1 is where the SDK first learns of any relay, so a pointer to a relay list would name a relay the resolver cannot yet reach. |
+| The identity key `#0` | Clause (b): it is the root of the identity's key material. The core carries no key bytes for it, because the DID string encodes the same bytes (§9.6.1) and a resolver derives the key from the identifier it already holds. The DNS packet still emits a `k0` record for it, because the method's root record carries a verification-method list "always containing at least `k0`" (§ "Root Record"). |
+| The `#active` verification method | Clause (b): §18.2.2A requires `#active` of every DID document, and it is the key that verifies what this identity signs. |
+| The `PreRotationCommitment` service entry | Clause (b): §9.12 reads the commitment when it checks whether a rotation was authorized, and a verifier that reached only Mainline needs that check to accept a rotated `#active`. |
+| The `SCPRelay` service entries | Clause (a): level 2 of §18.5.1 is where the SDK first learns of any relay, so a pointer to a relay list would name a relay the resolver cannot yet reach. |
 
 Everything else a DID document carries — `SCPCapabilities`, `IdentityPrivateState`, `SCPBroadcastContext`, `ParticipationStatements`, `AttestationRevocations`, `ScpIdentityLinkAttestation`, `alsoKnownAs`, and the `#agent` verification method — lives on the relay layer only. A resolver holding the bootstrap core holds the relay list, so it fetches the full document from a relay rather than reading those entries out of Mainline.
 
