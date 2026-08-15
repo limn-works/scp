@@ -1,5 +1,7 @@
 # Backend Agent Memory (scoped)
 
+- [project-track-e-kotlin-stub-scaffold](project_track_e_kotlin_stub_scaffold.md) — Kotlin CoroutineBridge scaffold deleted (b7a7846aa); all 56 broken matrix cells ARE UniFFI-exported, so "capability does not exist" exemptions would be false — escalated
+
 - [project-adr057-transport-jssocket](project_adr057_transport_jssocket.md) — ADR-057 JsSocket relay-transport slice; Step-2 finding: MLS SignatureKeyPair ED25519 private = 32-byte seed, recover via serde (private() is test-utils-gated); send_message()→() break analysis
 
 - [project-eventlog-committer-assigned-timestamp](project_eventlog_committer_assigned_timestamp.md) — event-log convergence: committer-assigned leaf timestamps replace per-member now(); per-class sourcing rules + CommitMeta refactor + chokepoints; spec 2ecfa23fb, impl 88c856360
