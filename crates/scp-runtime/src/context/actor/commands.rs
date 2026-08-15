@@ -633,6 +633,13 @@ pub enum MessagingCommand {
         /// The remote checkpoint to compare (boxed to keep the enum
         /// variant size uniform under `clippy::large_enum_variant`).
         remote: Box<scp_event_log::checkpoint::ConsistencyCheckpoint>,
+        /// The verification method the checkpoint's sender DECLARED — the
+        /// `signing_key_id` of the [`InnerEnvelope`](scp_protocol::envelope::inner::InnerEnvelope)
+        /// that carried it (ADR-039). The judge resolves exactly this method
+        /// from the sender's DID document; §9.9.3 makes equivocation detection
+        /// apply under `#active` and `#agent` alike, so this must travel with
+        /// the checkpoint rather than being assumed at the far end.
+        signing_key_id: scp_did::SigningKeyId,
         /// Oneshot reply channel carrying the comparison result.
         reply: CompareRemoteCheckpointReply,
     },

@@ -1545,7 +1545,19 @@ pub async fn deliver_incoming(
     // here — after signature/integrity verification, before the anti-replay /
     // reorder sequence machinery — and returns `Handled`.
     if inner.message_type == MessageType::ConsistencyCheckpoint {
-        return deliver_checkpoint_message(view, deps, context_id, &sender_did, &plaintext);
+        return deliver_checkpoint_message(
+            view,
+            deps,
+            context_id,
+            &sender_did,
+            // ADR-039: the verification method the sender DECLARED for this
+            // envelope is the persona that produced the checkpoint sealed inside
+            // it (the stamp and the signing key are chosen together and cannot
+            // diverge). The judge resolves exactly this method — see
+            // `verify_remote_checkpoint_authenticity`.
+            inner.signing_key_id,
+            &plaintext,
+        );
     }
 
     // Heartbeat dispatch (§9.9.2). A heartbeat is NOT application content: it
@@ -1620,20 +1632,33 @@ pub async fn deliver_incoming(
 /// as application content and never advances the per-sender application
 /// sequence.
 ///
+/// # Signing key
+///
+/// `signing_key_id` is the verification method the sender declared on the
+/// enclosing envelope, forwarded so the judge verifies the checkpoint's own
+/// Ed25519 signature against THAT method's public key (ADR-039). Both `#active`
+/// and `#agent` are judgeable — §9.9.3 states "equivocation detection applies to
+/// both" — but the declared method is resolved, never guessed: dropping this
+/// value here (as this function previously did) forced the judge to assume
+/// `#active`, which silently exempted an `#agent`-signing equivocator from
+/// detection.
+///
 /// # Errors
 ///
 /// Returns [`ContextError::CryptoFailed`] if the payload is not a well-formed
 /// tagged checkpoint or the embedded sender does not match, and propagates the
-/// error from `compare_remote_checkpoint` (member-not-found, signature failure,
-/// or an unreachable LOCAL authoritative event log). The last of those is a
-/// REFUSAL to judge, not a verdict: it surfaces to the receive path's error
-/// handling exactly like a signature failure does — it is never downgraded to
-/// `Consistent`, and it emits no `EquivocationDetected`.
+/// error from `compare_remote_checkpoint` (member-not-found, an unresolvable
+/// declared verification method, signature failure, or an unreachable LOCAL
+/// authoritative event log). The last of those is a REFUSAL to judge, not a
+/// verdict: it surfaces to the receive path's error handling exactly like a
+/// signature failure does — it is never downgraded to `Consistent`, and it emits
+/// no `EquivocationDetected`.
 fn deliver_checkpoint_message(
     view: &mut ClassCMut,
     deps: &ActorDeps,
     context_id: &str,
     sender_did: &str,
+    signing_key_id: scp_did::SigningKeyId,
     plaintext: &[u8],
 ) -> Result<DeliverOutcome, ContextError> {
     let message: CheckpointMessage = rmp_serde::from_slice(plaintext).map_err(|e| {
@@ -1665,6 +1690,7 @@ fn deliver_checkpoint_message(
         deps,
         context_id,
         &message.checkpoint,
+        signing_key_id,
     )?;
 
     Ok(DeliverOutcome::Handled)

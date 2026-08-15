@@ -2532,6 +2532,23 @@ impl<'a> ClassCMut<'a> {
         self.last_seen_remote_checkpoint
     }
 
+    /// The two disjoint Class-C `&mut` fields the §9.9.3 equivocation
+    /// dedup+emit pair
+    /// ([`crate::context::queries_helpers::record_equivocation_if_fresh`])
+    /// mutates, bundled so that helper can name its whole write surface in its
+    /// signature instead of taking a whole `&mut ClassCMut`. Each is a distinct
+    /// field of this view, so the simultaneous `&mut` is sound by construction,
+    /// and neither reaches a Class-S sub-struct — both are supplied COALESCED
+    /// (best-effort), matching their individual accessors above.
+    pub(crate) const fn equivocation_dedup_split(
+        &mut self,
+    ) -> crate::context::queries_helpers::EquivocationDedupSplit<'_> {
+        crate::context::queries_helpers::EquivocationDedupSplit {
+            last_seen_remote_checkpoint: self.last_seen_remote_checkpoint,
+            receive_buffer: self.receive_buffer,
+        }
+    }
+
     /// `&mut` access to the send-sequence counter with RAII rollback (Class-C).
     /// Best-effort rollback acceptable.
     pub(crate) const fn send_tracker_mut(&mut self) -> &mut SendSequenceTracker {
