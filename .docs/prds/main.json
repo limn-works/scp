@@ -627,10 +627,10 @@
         "Create crates/scp-core/src/identity/mod.rs with module root, ScpIdentity struct, DidMethod trait, re-exports",
         "Define ScpIdentity struct with identity_key, active_signing_key, pre_rotation_commitment, did fields",
         "Define DidMethod trait with create, publish, resolve, rotate, verify methods",
-        "Implement DidDht struct in dht.rs with create_identity using pkarr (v5.0.3+) and z-base-32",
+        "Implement DidDht struct in dht.rs with create_identity using mainline (v6.1.1+), simple-dns and z-base-32 (ADR-003 amendment: pkarr is structurally unusable, because every SignedPacket constructor requires a Keypair holding the private key while SCP signs detached through custody)",
         "Implement verify_did in dht.rs — local z-base-32 decode and comparison",
-        "Implement DID Document construction in document.rs — W3C JSON-LD format, verification methods, PreRotationCommitment service",
-        "Add dependencies to scp-core/Cargo.toml: pkarr, z-base-32, simple-dns, serde_json",
+        "Implement DID Document construction in document.rs producing BOTH layer encodings (§18.2.2A): the relay layer's W3C JSON-LD serialized as RFC 8785 canonical JSON, and the Mainline layer's did:dht DNS packet carrying the bootstrap core (§18.2.2C), verification methods, PreRotationCommitment service",
+        "Add dependencies to scp-core/Cargo.toml: mainline, z-base-32, simple-dns, serde_json (NOT pkarr — see the ADR-003 amendment)",
         "Write unit tests for create_identity verifying three keypairs, DID string format, document structure",
         "Write unit tests for verify_did with valid and invalid keys",
         "Write unit tests for DID document serialization/deserialization"
@@ -645,9 +645,9 @@
         }
       ],
       "details": {
-        "scpIdentityStruct": "```rust\npub struct ScpIdentity {\n    /// did:dht Identity Key. Derives the DID string. Stored in highest-security\n    /// custody (Secure Enclave, HSM). Used ONLY for DID document updates and\n    /// signing pre-rotation commitments. NEVER for MLS, envelopes, or UCANs.\n    pub identity_key: KeyHandle,\n\n    /// Current Active Signing Key. A verification method in the DID document.\n    /// Used for MLS credentials, inner envelope signatures, UCAN issuance.\n    /// Rotatable via rotate_active_key (DID string stays the same).\n    pub active_signing_key: KeyHandle,\n\n    /// SHA-256 hash of the next Identity Key's public key.\n    /// Published in DID document as a PreRotationCommitment service.\n    pub pre_rotation_commitment: [u8; 32],\n\n    /// The DID string: did:dht:z<z-base-32(identity_key.public)>\n    pub did: String,\n}\n```",
+        "scpIdentityStruct": "```rust\npub struct ScpIdentity {\n    /// did:dht Identity Key. Derives the DID string. Stored in highest-security\n    /// custody (Secure Enclave, HSM). Used ONLY for DID document updates and\n    /// signing pre-rotation commitments. NEVER for MLS, envelopes, or UCANs.\n    pub identity_key: KeyHandle,\n\n    /// Current Active Signing Key. A verification method in the DID document.\n    /// Used for MLS credentials, inner envelope signatures, UCAN issuance.\n    /// Rotatable via rotate_active_key (DID string stays the same).\n    pub active_signing_key: KeyHandle,\n\n    /// SHA-256 hash of the next Identity Key's public key.\n    /// Published in DID document as a PreRotationCommitment service.\n    pub pre_rotation_commitment: [u8; 32],\n\n    /// The DID string: did:dht:<z-base-32(identity_key.public)>, 52 chars, no prepended z (§18.2.2A)\n    pub did: String,\n}\n```",
         "didDhtRationale": "did:dht over did:web: No server dependency. Self-certifying (DID = public key). Key rotation via DHT record update with BEP44 signed mutable items. No TLS pinning, TOFU, or key-change alerting infrastructure needed.\n\ndid:dht over did:key: did:key cannot rotate keys (the key IS the identity). Key loss = identity loss. Recovery (spec section 3.3) requires key rotation, which did:key cannot do.",
-        "libraries": "pkarr (v5.0.3+) as primary dependency — provides Ed25519 keypair management, BEP44 signed mutable items, DNS packet construction via simple-dns, and Mainline DHT publish/resolve via mainline crate (v6.1.1+). z-base-32 for DID string encoding. SCP implements did:dht-specific DID Document to DNS resource record encoding (~300 lines) as a thin layer on top of pkarr."
+        "libraries": "mainline (v6.1.1+) as the DHT dependency, with simple-dns for DNS packet construction and z-base-32 for DID string encoding. SCP implements the did:dht DID Document to DNS resource record encoding (~300 lines) directly over those crates. The ADR-003 amendment records that pkarr cannot be a dependency of this design and never could have been: every SignedPacket constructor requires a Keypair holding the private key, and SCP signs detached through custody"
       }
     },
     {
@@ -675,8 +675,8 @@
         "Republishing starts when identity is loaded (Identity::load or Identity::create) and stops when identity is unloaded or SDK shuts down",
         "Republish task is a background tokio task managed by identity module",
         "On SDK initialization, all persisted active identities are republished immediately (startup republish)",
-        "resolve_did(did_string) -> DIDDocument resolves did:dht via Mainline DHT lookup",
-        "resolve_did verifies self-certification: decoded z-base-32 of DID suffix matches public key in resolved document",
+        "resolve_did(did_string) resolves via Mainline lookup and returns the BootstrapCore variant of ResolvedDidDocument (§3.10.10), decoding the did:dht DNS packet rather than JSON (§18.2.2C)",
+        "resolve_did verifies self-certification: the decoded z-base-32 of the DID suffix matches the identity key. The bootstrap core carries no separate key bytes for #0 (§18.2.2C), so the check is against the key the DID string itself encodes",
         "resolve_did verifies BEP44 signature on the DHT record",
         "resolve_did returns the BootstrapCore variant of ResolvedDidDocument (§3.10.10), carrying #active, the pre-rotation commitment and the relay list (§18.2.2C). The variant's payload type has no field for any relay-layer entry, so a caller cannot read one and receive an empty answer",
         "resolve_did caches results: 24-hour refresh for active contacts, 7-day for inactive (Decision 9)",
@@ -688,12 +688,12 @@
         "No unwrap() or expect() in library code"
       ],
       "actionItems": [
-        "Implement publish_did_document in dht.rs using pkarr for BEP44 mutable item publishing",
+        "Implement publish_did_document in dht.rs using mainline for BEP44 mutable item publishing, with detached signing through custody (ADR-003 amendment)",
         "Implement automatic republishing as background tokio task with 2-hour interval",
         "Implement exponential backoff for publish failures (30s, 1m, 2m, 4m, 8m, 16m, cap 30m)",
         "Implement DhtPublishDegraded warning emission after 6 consecutive failures",
         "Implement startup republish on identity load",
-        "Implement resolve_did in dht.rs using pkarr for DHT lookup",
+        "Implement resolve_did in dht.rs using mainline for DHT lookup (NOT pkarr — see the ADR-003 amendment)",
         "Implement self-certification verification (z-base-32 decode + key comparison)",
         "Implement BEP44 signature verification on resolved records",
         "Implement resolution cache in cache.rs with TTL-based expiry (24h active, 7d inactive)",
@@ -735,13 +735,13 @@
         "rotate_active_key(identity, key_custody) -> Identity generates new Ed25519 keypair as new Active Signing Key",
         "rotate_active_key updates DID document: adds new key as verification method, moves authentication and assertionMethod references to new key, retains old key as #retired-{sequence}",
         "rotate_active_key signs DID document update with Identity Key (NOT old active key)",
-        "rotate_active_key publishes to DHT with incremented BEP44 sequence number",
+        "rotate_active_key publishes to BOTH layers in their own encodings (§3.10.5), each advancing its own sequence number — Mainline's a Unix timestamp fixed by the did:dht method (§18.2.2C), the relay layer's a publish counter",
         "rotate_active_key returns updated Identity with new active key handle",
         "After rotate_active_key, DID string does NOT change, Identity Key does NOT change",
         "migrate_identity(identity, pre_rotation_key, key_custody) -> (Identity, DidRotationEvent) creates new DID using pre-rotation key as new Identity Key",
         "migrate_identity generates new Active Signing Key and new pre-rotation commitment for new DID",
         "migrate_identity updates OLD DID document: adds alsoKnownAs pointing to new DID, includes cryptographic linkage (old Identity Key signs new Identity Key public bytes)",
-        "migrate_identity publishes both old (updated) and new DID documents to DHT",
+        "migrate_identity publishes both the old (updated) and the new DID document to BOTH layers in their own encodings (§3.10.5). alsoKnownAs is a relay-layer entry (§18.2.2C), so the forwarding record reaches relays only",
         "migrate_identity returns new Identity and DidRotationEvent for distribution to all active contexts",
         "migrate_identity starts background republish task for old DID document (forwarding record maintenance, recommended 90 days)",
         "verify_migration(old_did, new_did, migration_proof, pre_rotation_proof) -> bool verifies cryptographic linkage: old Identity Key signed new Identity Key public bytes",
@@ -4181,7 +4181,7 @@
         "DiscoveryResultEntry struct defined with fields: did (DID), capabilities (Vec<String>), participation_summary (Option<serde_json::Value>), provenance (DataProvenance), relevance_score (f64)",
         "RegistrationEntry struct defined with fields: did (DID), capabilities (Vec<String>), metadata (serde_json::Value), entry_id (String), registered_at (u64)",
         "DiscoveryBootstrap struct defined with fields: default_context_ids (Vec<ContextId>)",
-        "resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError> resolves DID via did:dht, extracts SCPCapabilities from service array, caches in local contact index",
+        "resolve_capabilities(did) -> Result<CapabilityEntry, DiscoveryError> resolves the DID and extracts SCPCapabilities from the RELAY-layer document's service array, caching in the local contact index. SCPCapabilities is relay-layer only (§18.2.2C), so a resolution that returned the BootstrapCore variant carries none and this operation reports them unresolved rather than returning an empty set (§3.10.10)",
         "Module re-exports all public types from submodules"
       ],
       "actionItems": [
