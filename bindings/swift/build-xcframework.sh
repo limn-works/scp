@@ -32,8 +32,27 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 FFI_CRATE_DIR="$REPO_ROOT/crates/scp-ffi/uniffi"
 FFI_LIB_NAME="libscp_ffi_uniffi.a"
 
-# Cargo target directory (respect CARGO_TARGET_DIR if set)
-TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+# Cargo target directory.
+#
+# Ask cargo where it writes artifacts rather than assuming `$REPO_ROOT/target`.
+# Cargo resolves the directory from the `CARGO_TARGET_DIR` environment variable,
+# from `build.target-dir` in any `config.toml` it reads, and from its default in
+# that order, and a developer who points `build.target-dir` at one shared cache
+# for every worktree gets a path this script cannot guess. Reading the resolved
+# value keeps the later dylib and static-library lookups pointing at the files
+# cargo actually wrote.
+TARGET_DIR=""
+if command -v cargo >/dev/null 2>&1; then
+    TARGET_DIR="$(
+        cargo metadata --format-version 1 --no-deps --manifest-path "$REPO_ROOT/Cargo.toml" 2>/dev/null |
+            sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' || true
+    )"
+fi
+# A missing cargo reaches the prerequisite check below, which prints the
+# install instruction; this fallback only keeps the variable defined until then.
+if [ -z "$TARGET_DIR" ]; then
+    TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+fi
 
 # Apple targets
 TARGET_IOS="aarch64-apple-ios"
