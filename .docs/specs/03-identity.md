@@ -796,11 +796,11 @@ Both layers are self-certifying: the BEP44 signature on a DID document is verifi
 | 1 | SCP relays | Low (few relays exist) | Low (relay QUERY, single hop) | Yes |
 | 2 | Mainline DHT | High (millions of nodes) | Higher (DHT traversal, 1-3s typical) | No |
 
-Resolution strategy: query both layers in parallel. "Valid" means the BEP44 signature verifies against the public key encoded in the target DID AND the sequence number is greater than or equal to the last sequence number the resolver observed **on that same layer**. A resolver that needs the full document takes the relay layer's answer, and falls back to the Mainline bootstrap core only when no relay answers. A resolver that needs only the bootstrap core takes whichever layer answers first, because both layers carry it.
+Resolution strategy: query both layers in parallel. "Valid" means the BEP44 signature verifies against the public key encoded in the target DID AND the sequence number is greater than or equal to the last sequence number the resolver observed **on that same layer**.
 
-When both layers return valid records, the resolver does **not** compare their sequence numbers and does not pick a winner between them. The two records are different payloads under different signatures, so the comparison would decide nothing. The resolver keeps each layer's record as that layer's answer (§3.10.4 step 5).
+**The relay layer's answer supersedes Mainline's whenever a relay answers, for every element including the four the bootstrap core carries.** The relay layer carries a superset of the core (§18.2.2C), so a relay record answers everything a Mainline record would have answered. A resolver falls back to the Mainline bootstrap core only when no relay answers. This is a fixed precedence between the layers, and it is **not** a comparison of their sequence numbers — the resolver never compares those (§3.10.7), because the two records are different payloads under different signatures and Mainline's number is a wall-clock timestamp rather than a publish count. Taking whichever layer answers first would let a caller that needs only `#active` accept a stale Mainline copy while a fresher relay record is in hand, which is the case this precedence closes.
 
-Parallel query means resolution latency is `min(relay_latency, dht_latency)` for the bootstrap core. Resolving the full document costs relay latency, because Mainline does not carry it.
+Parallel query still means the resolver *starts* both queries together, so a resolution that only Mainline can satisfy costs Mainline latency and no more. What the precedence costs is that a resolver holding a Mainline answer waits for the relay layer under §3.10.4's first-response rule before it settles.
 
 ### 3.10.2 Layer 1: SCP Relay-Based Resolution
 
@@ -923,10 +923,17 @@ The full resolution sequence:
       because the other layer returned a higher number. The two layers carry
       different payloads under different signatures, so the comparison
       decides nothing.
-   d. When both layers answer and the caller asked for the full document,
-      the relay-layer record is the answer. When only Mainline answers, the
-      answer is the bootstrap core, and the caller learns which fields it
-      does not hold (§3.10.3).
+   d. When both layers answer, the relay-layer record is the answer,
+      whatever the caller asked for. The relay layer carries a superset of
+      the core (§18.2.2C), so it answers everything Mainline would have
+      answered. This is a fixed precedence and not a sequence comparison
+      (§3.10.1). When only Mainline answers, the answer is the bootstrap
+      core, and the caller learns which entries it does not hold (§3.10.3).
+   e. Reject a Mainline record whose seq is more than 2 hours 30 minutes
+      behind the resolver's clock. Mainline's seq is a Unix timestamp fixed
+      by the did:dht method (§18.2.2C) and §3.10.5 republishes every 2
+      hours, so this is a within-layer freshness check against wall-clock
+      time — never a comparison against the relay layer (§3.10.7).
 6. Cache result per §9.10.7 caching policy
    (24h refresh for active contacts, 7d for inactive), keyed per layer
 ```
@@ -937,11 +944,11 @@ The relay query in step 3a targets relays in priority order: the identity's own 
 
 The parallel query model (step 3) requires clear rules for when queries are cancelled, how contradictions are resolved, and what happens on failure:
 
-- **First-response optimization.** When Mainline answers first and the caller asked for the full document, the resolver SHOULD continue waiting for a relay response for up to 2 seconds rather than cancelling, because Mainline's answer is the bootstrap core and the caller asked for more than the core carries. When a relay answers first, the resolver MAY cancel the Mainline query, because the relay layer already carries everything Mainline would have supplied.
+- **First-response optimization.** When Mainline answers first, the resolver SHOULD continue waiting for a relay response for up to 2 seconds before it settles, whatever the caller asked for. A relay answer supersedes Mainline's for every element (step 5d), so cancelling on Mainline's answer would settle on the layer that carries less and can be staler. When a relay answers first, the resolver MAY cancel the Mainline query, because the relay layer already carries everything Mainline would have supplied.
 - **Two valid records within one layer, same sequence number.** The two records MUST be byte-identical: one key signed both, over one encoding, at one sequence number. If they differ, a publishing implementation is defective. The resolver MUST log a warning and accept either record. This check applies **within a layer only**. The relay layer's bytes and the Mainline layer's bytes at the same sequence number are two different encodings of two different field sets, so comparing them is not a defect check and MUST NOT be performed.
-- **Both layers succeed, different sequence numbers.** Neither number overrules the other. Each layer's record stands as that layer's answer (step 5c). A resolver MAY re-publish a layer's own current encoding to that same layer when the layer returned a stale record (per-layer healing, §3.10.7); it MUST NOT copy one layer's bytes to the other layer, because the receiving layer's cap and encoding differ.
+- **Both layers succeed, different sequence numbers.** Neither number overrules the other, and the resolver does not compare them (step 5c). The relay record is the answer by the fixed precedence in step 5d, not because its number is higher. A resolver MAY re-publish a layer's own current encoding to that same layer when the layer returned a stale record (per-layer healing, §3.10.7); it MUST NOT copy one layer's bytes to the other layer, because the receiving layer's cap and encoding differ.
 - **One layer fails, one succeeds.** The successful response is accepted, and it carries that layer's payload: the full document when a relay answered, the bootstrap core when Mainline answered. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
-- **Both layers fail.** If a cached record for either layer exists and is less than 7 days old, the resolver returns it with a `resolution_source: "cache"` indicator and the completeness of the layer it was cached from (§3.10.10). If no cache exists or every cached record is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document, and MUST NOT present a cached bootstrap core as a full document.
+- **Both layers fail.** If a cached record for either layer exists and is less than 7 days old, the resolver returns it in the variant matching the layer it was cached from — `Full` for a cached relay record, `BootstrapCore` for a cached Mainline record (§3.10.10) — with `source: Cache`. If no cache exists or every cached record is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document, and MUST NOT present a cached bootstrap core as a full document.
 - **One layer returns invalid signature.** The response is discarded as if the layer had failed. An invalid signature is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the invalid document under any circumstances.
 - **Relay blob fails frame decoding.** A relay blob that does not decode as a valid DID-record frame (§9.10.12) — shorter than the 105-byte fixed prefix, carrying an empty `value`, exceeding the bounded `value` length, or an unrecognized `version` — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver discards the blob exactly as it discards an invalid signature. When no relay returns a decodable frame, the resolver's remaining answer is Mainline's bootstrap core, so a caller that asked for the full document gets an unresolved answer for every field outside the core rather than a substitute.
 - **Timeout.** Each layer query has a 5-second timeout. If a layer does not respond within 5 seconds, it is treated as a failure for that resolution attempt.
@@ -1009,7 +1016,12 @@ The SDK prevents this by default. RepublishManager publishes to both layers on e
 
 **The sequence number carries no authority across layers.** The relay layer and the Mainline layer sign different payloads and advance separate counters (§3.10.5), and the two counters do not even measure the same thing: the did:dht method fixes Mainline's number as a wall-clock reading — "`seq` MUST be set to the current Unix Timestamp in seconds" (§ "Operations → Create" step 5b, §18.2.2C) — while the relay layer's number counts SCP's own publishes. A relay-layer sequence number and a Mainline sequence number are therefore not comparable quantities. A resolver MUST keep one last-known sequence number per (DID, layer) pair, and MUST NOT let a number from one layer reject, supersede, or validate a record from the other.
 
-**What that costs, stated plainly.** Under the rule this section replaces, a resolver that reached both layers could reject a stale Mainline record because a relay had returned a higher number. That correction is gone, and nothing replaces it: within the Mainline layer a stale-but-genuine record is the highest number that layer holds, so the resolver has no ground to reject it. What bounds the harm is that Mainline carries the bootstrap core alone (§18.2.2C). A stale core can return a rotated-out `#active` key and a stale relay list; it cannot return stale capability entries, attestation entries or `alsoKnownAs`, because it never carries them. A verifier that needs a current `#active` therefore resolves the relay layer, and §3.10.10's `completeness` field is what tells it which layer answered.
+**What that costs, stated plainly.** Under the rule this section replaces, a resolver that reached both layers could reject a stale Mainline record because a relay had returned a higher number. That correction is gone, and nothing replaces it: within the Mainline layer a stale-but-genuine record is the highest number that layer holds, so the resolver has no ground to reject it. What bounds the harm is that Mainline carries the bootstrap core alone (§18.2.2C). A stale core can return a rotated-out `#active` key and a stale relay list; it cannot return stale capability entries, attestation entries or `alsoKnownAs`, because it never carries them. A verifier that needs a current `#active` therefore resolves the relay layer, and §3.10.10's two `ResolvedDidDocument` variants are what tell it which layer answered.
+
+**Two rules bound the Mainline staleness this leaves.** Neither compares a sequence number across layers, so both are available under the rule above.
+
+1. **The relay layer's answer supersedes Mainline's for every element, whenever a relay answers.** The relay layer carries a superset of the core (§18.2.2C), so when both layers return a valid record the resolver takes the relay record and uses the Mainline record for nothing. This is a fixed precedence between layers, not a comparison of their numbers. It closes the case §3.10.1 would otherwise leave open, where a caller that needs only a core element takes whichever layer answered first and can take a stale Mainline copy while a fresher relay record is in hand.
+2. **A Mainline record is stale by its own layer's clock.** The did:dht method fixes Mainline's `seq` as a Unix timestamp in seconds, and §3.10.5 republishes to Mainline every 2 hours, so a resolver rejects a Mainline record whose `seq` is more than **2 hours and 30 minutes** behind the resolver's own clock — the republish interval plus the 30-minute grace ADR-003 already uses for staleness. This is a within-layer check against wall-clock time rather than against the other layer, and it is available only because the method made Mainline's sequence number a timestamp. It bounds a rollback on Mainline to that window instead of leaving it unbounded. A resolver whose own clock is wrong loses this check and keeps every other one, so the check is a bound on staleness rather than a trust dependency on the clock.
 
 Stale records are detected by comparing a received sequence number against the last number the resolver observed **on the layer that served it**. A relay or a Mainline node serving a stale record is not malicious — it simply has not received the latest publish. The stale record is overwritten on that layer's next republish cycle (6 days for relays, 2 hours for Mainline).
 
@@ -1059,27 +1071,41 @@ pub trait DidResolver: Send + Sync {
         -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send;
 }
 
-/// A resolved DID document with provenance metadata.
-pub struct ResolvedDidDocument {
-    /// The verified DID document.
-    pub document: DidDocument,
-    /// BEP44 sequence number, scoped to the layer named by `source`.
-    /// Never compared against a sequence number from the other layer
-    /// (§3.10.7).
-    pub seq: u64,
-    /// Which resolution layer served this document.
-    pub source: ResolutionSource,
-    /// Whether `document` is the full document or the bootstrap core.
-    pub completeness: DocumentCompleteness,
+/// What a resolution returned. The two variants carry two different types,
+/// because the two layers carry two different payloads (§18.2.2A).
+pub enum ResolvedDidDocument {
+    /// A relay served the full document. Every entry the identity published
+    /// is present, so an entry that is absent here is absent from the
+    /// identity's document.
+    Full {
+        document: DidDocument,
+        /// Relay-layer BEP44 sequence number. Never compared against a
+        /// Mainline sequence number (§3.10.7).
+        seq: u64,
+        source: ResolutionSource,
+    },
+    /// Mainline served the bootstrap core. Only the four elements
+    /// §18.2.2C admits are present. Every other entry is UNRESOLVED — this
+    /// answer says nothing about whether the identity published it.
+    BootstrapCore {
+        core: BootstrapCore,
+        /// Mainline BEP44 sequence number, which the did:dht method fixes
+        /// as a Unix timestamp in seconds (§18.2.2C).
+        seq: u64,
+        source: ResolutionSource,
+    },
 }
 
-/// How much of the DID document a resolution returned (§18.2.2C).
-pub enum DocumentCompleteness {
-    /// Every field the identity published. Only the relay layer serves this.
-    Full,
-    /// `#active`, the pre-rotation commitment and the relay list. Mainline
-    /// serves this. A field outside the core is unresolved, not absent.
-    BootstrapCore,
+/// The four elements the Mainline layer carries (§18.2.2C). This type has
+/// no field for any relay-layer entry, so a caller holding a bootstrap-core
+/// resolution cannot read `SCPCapabilities`, `alsoKnownAs`, `#agent` or any
+/// other relay-layer entry off it and receive an empty answer.
+pub struct BootstrapCore {
+    /// Derived from the DID string (§9.6.1); the core carries no key bytes.
+    pub identity_key: VerificationMethod,
+    pub active_key: VerificationMethod,
+    pub pre_rotation_commitment: PreRotationCommitment,
+    pub relays: Vec<RelayEndpoint>,
 }
 
 /// Provenance of a resolved DID document.
@@ -1093,9 +1119,11 @@ pub enum ResolutionSource {
 }
 ```
 
-`DidResolver` composes the relay QUERY path with `DhtClient::resolve()` internally. The existing `DidMethod::resolve()` interface continues to work for single-layer Mainline resolution — `DidResolver` is an additive layer, not a replacement. Code that only needs Mainline resolution (an interoperability tool, for instance) can use `DidMethod` directly, and what it receives is the bootstrap core.
+`DidResolver` composes the relay QUERY path with `DhtClient::resolve()` internally. The existing `DidMethod::resolve()` interface continues to work for single-layer Mainline resolution — `DidResolver` is an additive layer, not a replacement. Code that only needs Mainline resolution (an interoperability tool, for instance) can use `DidMethod` directly, and what it receives is a `BootstrapCore`.
 
-**A caller MUST be able to tell a bootstrap-core resolution from a full one.** `completeness` carries that answer, and a caller that reads a field outside the core from a `BootstrapCore` result MUST treat the field as unresolved. Without this distinction a caller cannot separate "the identity published no `SCPCapabilities` entry" from "Mainline does not carry `SCPCapabilities`," and the second reading would let a Mainline-only resolution silently deny a capability the identity actually declares.
+**The type carries the distinction, and prose does not.** A caller must never confuse "the identity published no `SCPCapabilities` entry" with "Mainline does not carry `SCPCapabilities`," because the second reading lets a Mainline-only resolution silently deny a capability the identity actually declares. An earlier draft of this section expressed that as a `DidDocument` plus a sibling `completeness` flag, which left the mistake available: reading a relay-layer field off a bootstrap-core result returned an empty value and compiled. Two variants carrying two types close it — `BootstrapCore` has no field to read, so the compiler rejects the mistake and a caller that needs a relay-layer entry must match on `Full` or handle the `BootstrapCore` arm explicitly. This is the mechanism every "unresolved rather than absent" rule in this specification depends on (§3.10.3, §3.10.11, §18.2.2B criterion 3, ADR-039's `#agent` note, ADR-020's `resolve_capabilities`, §6.2.2), and it is enforced by the type system rather than asserted in each of those places.
+
+**A caller that needs the full document and holds a `BootstrapCore` fetches it from a relay** using the relay list the core carries. That fetch is the whole purpose of the core (§18.2.2C clause (a)), so the `BootstrapCore` arm is a step in the resolution rather than a failure.
 
 ### 3.10.11 Bootstrap and Network Growth
 
