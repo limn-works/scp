@@ -538,6 +538,94 @@ mod tests {
         SqliteKeyCustody::new(storage).await.unwrap()
     }
 
+    // -----------------------------------------------------------------------
+    // Fail-closed construction (spec §17.17.1 SCP-CAPSEL-8001, §17.8)
+    //
+    // `SqliteKeyCustody` is the shipped production key-custody backend the
+    // node selects. Its backing resource is the SQLCipher database, so when a
+    // persisted key record cannot be read the constructor returns
+    // `PlatformError::StorageError` rather than a custody handle that silently
+    // omits the key it could not load.
+    // -----------------------------------------------------------------------
+
+    /// `SqliteKeyCustody::new` returns `PlatformError::StorageError` when a
+    /// persisted key record is the wrong length.
+    ///
+    /// Opening anyway would give the caller a custody store missing a key the
+    /// database still holds, and the next `generate_keypair` would reuse that
+    /// key's handle identifier — a silent key substitution, which is what
+    /// SCP-CAPSEL-8001 forbids the construction boundary from doing.
+    #[tokio::test]
+    async fn new_fails_closed_when_a_persisted_key_record_has_the_wrong_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_key = [0x42u8; 32];
+
+        // Write a key record of the wrong length through the real backend,
+        // then hand that database to the production constructor.
+        {
+            let storage = SqliteStorage::new(dir.path(), &db_key).unwrap();
+            storage
+                .store(&format!("{KEY_PREFIX}1"), b"too short")
+                .await
+                .unwrap();
+        }
+
+        let storage = SqliteStorage::new(dir.path(), &db_key).unwrap();
+        let result = SqliteKeyCustody::new(storage).await;
+
+        match result {
+            Err(PlatformError::StorageError(msg)) => {
+                assert!(
+                    msg.contains("invalid length"),
+                    "the error must name the record it rejected: {msg}"
+                );
+            }
+            Err(other) => panic!("expected PlatformError::StorageError, got {other:?}"),
+            Ok(_) => panic!(
+                "SqliteKeyCustody::new must fail closed with PlatformError::StorageError when a \
+                 persisted key record is unreadable; opening anyway drops that key and lets the \
+                 next generate_keypair reuse its handle (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+    }
+
+    /// `SqliteKeyCustody::new` returns `PlatformError::StorageError` when a
+    /// persisted key record carries a key-type byte this build does not know,
+    /// rather than loading the remaining keys and pretending the unknown one
+    /// was never stored.
+    #[tokio::test]
+    async fn new_fails_closed_on_an_unknown_persisted_key_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_key = [0x42u8; 32];
+
+        {
+            let storage = SqliteStorage::new(dir.path(), &db_key).unwrap();
+            let mut record = vec![0xEEu8];
+            record.extend_from_slice(&[0x11u8; 32]);
+            storage
+                .store(&format!("{KEY_PREFIX}1"), &record)
+                .await
+                .unwrap();
+        }
+
+        let storage = SqliteStorage::new(dir.path(), &db_key).unwrap();
+        let result = SqliteKeyCustody::new(storage).await;
+
+        match result {
+            Err(PlatformError::StorageError(msg)) => {
+                assert!(
+                    msg.contains("unknown type"),
+                    "the error must name the key type it rejected: {msg}"
+                );
+            }
+            Err(other) => panic!("expected PlatformError::StorageError, got {other:?}"),
+            Ok(_) => panic!(
+                "SqliteKeyCustody::new must fail closed with PlatformError::StorageError on an \
+                 unknown persisted key type (spec §17.17.1 SCP-CAPSEL-8001)"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn generate_and_retrieve_ed25519_key() {
         let dir = tempfile::tempdir().unwrap();

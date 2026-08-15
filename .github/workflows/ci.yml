@@ -643,6 +643,15 @@ jobs:
           # Slice 1). ci.yml is not an enforcement file; this is an added
           # positive test lane.
           cargo test -p scp-ffi-common
+          # Device attestation has NO production backend (ADR-062 §Decision 3
+          # declines the capability, spec §9:187), so the shipped UniFFI verify
+          # surface must answer with the typed SCP-IDENT-1016 decline rather
+          # than a silently-valid `true`. The assertion is
+          # `#[cfg(not(feature = "testing"))]`, so the workspace nextest lane
+          # compiles it out; this bare run is where it executes. It is its own
+          # integration target because `bridge.rs`'s `mod tests` references
+          # `testing`-gated items and does not compile in a bare build.
+          cargo test -p scp-ffi-uniffi --test device_attestation_fail_closed
 
   # Builds the pyo3 bridge (`scp-ffi`) in its PRODUCTION configuration: default
   # features (`server` on) but WITHOUT `testing`. This is the
