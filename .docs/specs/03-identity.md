@@ -970,7 +970,10 @@ On DID document create or update:
    which is authoritative for this ordering; did:dht uses no salt). The two
    signatures differ, because the two values differ. Each layer carries its
    own sequence number, and a publisher advances each layer's number on that
-   layer's own publish.
+   layer's own publish. The two numbers measure different things: the
+   did:dht method fixes dht_seq as the current Unix timestamp in seconds
+   (§18.2.2C), while relay_seq counts this publisher's relay-layer
+   publishes.
 3. In parallel:
    a. Wrap (public_key, relay_seq, relay_signature, relay_value) in a
       DID-record frame (§9.10.12) and PUBLISH the frame bytes to SCP relays
@@ -1004,7 +1007,9 @@ The SDK prevents this by default. RepublishManager publishes to both layers on e
 
 **The BEP44 sequence number is the sole authority for document freshness within a layer.** Within one layer the highest valid sequence number wins. Split-brain within a layer is impossible: the sequence number is monotonically increasing, and only the identity owner (holder of the Ed25519 private key) can increment it.
 
-**The sequence number carries no authority across layers.** The relay layer and the Mainline layer sign different payloads and advance separate counters (§3.10.5), so a relay-layer sequence number and a Mainline sequence number are not comparable quantities. A resolver MUST keep one last-known sequence number per (DID, layer) pair, and MUST NOT let a number from one layer reject, supersede, or validate a record from the other.
+**The sequence number carries no authority across layers.** The relay layer and the Mainline layer sign different payloads and advance separate counters (§3.10.5), and the two counters do not even measure the same thing: the did:dht method fixes Mainline's number as a wall-clock reading — "`seq` MUST be set to the current Unix Timestamp in seconds" (§ "Operations → Create" step 5b, §18.2.2C) — while the relay layer's number counts SCP's own publishes. A relay-layer sequence number and a Mainline sequence number are therefore not comparable quantities. A resolver MUST keep one last-known sequence number per (DID, layer) pair, and MUST NOT let a number from one layer reject, supersede, or validate a record from the other.
+
+**What that costs, stated plainly.** Under the rule this section replaces, a resolver that reached both layers could reject a stale Mainline record because a relay had returned a higher number. That correction is gone, and nothing replaces it: within the Mainline layer a stale-but-genuine record is the highest number that layer holds, so the resolver has no ground to reject it. What bounds the harm is that Mainline carries the bootstrap core alone (§18.2.2C). A stale core can return a rotated-out `#active` key and a stale relay list; it cannot return stale capability entries, attestation entries or `alsoKnownAs`, because it never carries them. A verifier that needs a current `#active` therefore resolves the relay layer, and §3.10.10's `completeness` field is what tells it which layer answered.
 
 Stale records are detected by comparing a received sequence number against the last number the resolver observed **on the layer that served it**. A relay or a Mainline node serving a stale record is not malicious — it simply has not received the latest publish. The stale record is overwritten on that layer's next republish cycle (6 days for relays, 2 hours for Mainline).
 
