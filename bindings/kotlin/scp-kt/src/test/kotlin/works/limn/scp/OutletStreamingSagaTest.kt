@@ -19,7 +19,6 @@
 package works.limn.scp
 
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
@@ -364,13 +363,7 @@ class StreamingSagaRecoverTest {
                     )
                 }
             } finally {
-                val shutdownBridge =
-                    works.limn.scp.bridge.CoroutineBridge(
-                        nativeBindings = works.limn.scp.conformance.ConformanceStubBindings(),
-                        ioDispatcher = Dispatchers.IO,
-                        cpuDispatcher = Dispatchers.Default,
-                    )
-                scp.shutdown(shutdownBridge, 1.seconds)
+                scp.shutdown(1.seconds)
             }
         }
     }

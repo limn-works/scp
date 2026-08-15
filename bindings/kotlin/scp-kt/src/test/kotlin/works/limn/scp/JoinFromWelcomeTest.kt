@@ -33,7 +33,6 @@
 
 package works.limn.scp
 
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assumptions.assumeTrue
@@ -47,8 +46,6 @@ import uniffi.scp.MemoryScope
 import uniffi.scp.ScpException
 import uniffi.scp.SealedInvitation
 import uniffi.scp.StorageConfig
-import works.limn.scp.bridge.CoroutineBridge
-import works.limn.scp.conformance.ConformanceStubBindings
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlin.test.fail
@@ -94,13 +91,6 @@ class JoinFromWelcomeTest {
 
         private const val CREATOR_DID = "did:key:z6MkKotlin2jCreatorAbc"
     }
-
-    private fun shutdownBridge(): CoroutineBridge =
-        CoroutineBridge(
-            nativeBindings = ConformanceStubBindings(),
-            ioDispatcher = Dispatchers.IO,
-            cpuDispatcher = Dispatchers.Default,
-        )
 
     // Encrypted SingleAdmin params. inviteMember routes the add through the
     // actor's governance gate, which enforces ONLY the proposer's
@@ -159,7 +149,7 @@ class JoinFromWelcomeTest {
                     "public KeyPackage bytes must be non-empty",
                 )
             } finally {
-                scp.shutdown(shutdownBridge(), 1.seconds)
+                scp.shutdown(1.seconds)
             }
         }
     }
@@ -187,7 +177,7 @@ class JoinFromWelcomeTest {
                     )
                 }
             } finally {
-                scp.shutdown(shutdownBridge(), 1.seconds)
+                scp.shutdown(1.seconds)
             }
         }
     }
@@ -258,7 +248,7 @@ class JoinFromWelcomeTest {
                     )
                 }
             } finally {
-                scp.shutdown(shutdownBridge(), 1.seconds)
+                scp.shutdown(1.seconds)
             }
         }
     }
@@ -297,7 +287,7 @@ class JoinFromWelcomeTest {
                     )
                 }
             } finally {
-                scp.shutdown(shutdownBridge(), 1.seconds)
+                scp.shutdown(1.seconds)
             }
         }
     }
@@ -342,7 +332,7 @@ class JoinFromWelcomeTest {
                     )
                 }
             } finally {
-                scp.shutdown(shutdownBridge(), 1.seconds)
+                scp.shutdown(1.seconds)
             }
         }
     }

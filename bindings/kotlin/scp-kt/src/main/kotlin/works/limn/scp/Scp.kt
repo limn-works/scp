@@ -57,7 +57,8 @@ import uniffi.scp.TransportManager
 import uniffi.scp.TransportStatus
 import uniffi.scp.TrustScoreResult
 import uniffi.scp.UcanToken
-import works.limn.scp.bridge.CoroutineBridge
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.logging.Level
@@ -78,19 +79,16 @@ import uniffi.scp.Scp as NativeScp
  * val scp = SCP(StorageConfig.InMemory)
  *
  * // Graceful shutdown with a 1-second deadline for in-flight tasks.
- * val bridge = CoroutineBridge(...)
- * scp.shutdown(bridge, timeout = 1.seconds)
+ * scp.shutdown(timeout = 1.seconds)
  * ```
  *
  * Not [AutoCloseable]: shutdown is a `suspend` function that drives an
- * async FFI deadline and requires a [CoroutineBridge]. A synchronous
- * `close()` cannot honor the timeout and would silently swallow it —
- * callers must invoke [shutdown] explicitly from a coroutine scope.
+ * async FFI deadline. A synchronous `close()` cannot honor the timeout
+ * and would silently swallow it — callers must invoke [shutdown]
+ * explicitly from a coroutine scope.
  *
  * After Phase 4 PR 4 (demolition) there is no `SCP.default()` — every
  * caller must construct `SCP()` explicitly. See ADR-048.
- *
- * @see works.limn.scp.bridge.CoroutineBridge
  */
 @Suppress("TooManyFunctions", "LargeClass")
 class SCP internal constructor(
@@ -132,8 +130,13 @@ class SCP internal constructor(
      * Disconnects transport and flushes context snapshots.
      * Transport-dependent operations fail until [resume] is called.
      *
-     * Dispatched on [kotlinx.coroutines.Dispatchers.IO] via the supplied
-     * [CoroutineBridge].
+     * UniFFI generates `Scp.suspend()` as a *blocking* Kotlin `fun` (the
+     * Rust side is synchronous), so this is the one lifecycle method that
+     * dispatches onto [Dispatchers.IO] itself rather than leaving the
+     * dispatcher to the caller: returning a `suspend fun` that blocks the
+     * caller's thread would be a silent contract violation. [resume] and
+     * [shutdown] need no such wrapper — UniFFI generates those as genuine
+     * `suspend fun`s that never block a thread.
      *
      * Named [suspendInstance] (not `suspend`) because `suspend` is a soft
      * Kotlin keyword that shadows the coroutine modifier in IDE refactors,
@@ -141,8 +144,8 @@ class SCP internal constructor(
      *
      * @throws uniffi.scp.ScpException.Transport if the transport lock is poisoned.
      */
-    suspend fun suspendInstance(bridge: CoroutineBridge) {
-        bridge.ffiCall { inner.suspend() }
+    suspend fun suspendInstance() {
+        withContext(Dispatchers.IO) { inner.suspend() }
     }
 
     /**
@@ -151,15 +154,15 @@ class SCP internal constructor(
      * Clears the suspended flag, then reconnects transport against pending
      * relay URLs and restores persisted contexts via the
      * [`BridgeInstanceCore::resume`](https://docs.rs/scp-ffi-common) override.
-     * Routed through [CoroutineBridge.ffiCallSuspend] because UniFFI generates
-     * `Scp.resume()` as a Kotlin `suspend fun` — the non-suspend [ffiCall]
-     * lambda would reject the call.
+     * UniFFI generates `Scp.resume()` as a genuine Kotlin `suspend fun`
+     * (the Rust side is `async`), so it is forwarded directly — no
+     * dispatcher wrapper, matching every other forwarder on this class.
      *
      * @throws uniffi.scp.ScpException.Context if the instance has been
      *   permanently shut down.
      */
-    suspend fun resume(bridge: CoroutineBridge) {
-        bridge.ffiCallSuspend { inner.resume() }
+    suspend fun resume() {
+        inner.resume()
     }
 
     /**
@@ -183,12 +186,9 @@ class SCP internal constructor(
      * @param timeout Maximum duration to wait for in-flight tasks.
      *   Defaults to 5 seconds.
      */
-    suspend fun shutdown(
-        bridge: CoroutineBridge,
-        timeout: Duration = 5.seconds,
-    ) {
+    suspend fun shutdown(timeout: Duration = 5.seconds) {
         val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
-        bridge.ffiCallSuspend { inner.shutdown(timeoutMillis = millis) }
+        inner.shutdown(timeoutMillis = millis)
         // Record shutdown AFTER the FFI call returns so that a failed
         // shutdown does not silence the finalizer warning — a caller
         // who sees an exception here should know the instance is still
@@ -228,7 +228,7 @@ class SCP internal constructor(
                     "In-flight tasks (subscriptions, governance timeouts) were aborted " +
                     "abruptly instead of draining gracefully. Always call SCP.shutdown() " +
                     "explicitly — for example from a coroutine scope: " +
-                    "`scope.launch { scp.shutdown(bridge, 5.seconds) }`.",
+                    "`scope.launch { scp.shutdown(5.seconds) }`.",
                 arrayOf<Any>(instanceId),
             )
         }

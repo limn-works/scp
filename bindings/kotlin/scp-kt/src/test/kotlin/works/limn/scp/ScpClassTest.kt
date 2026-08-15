@@ -2,8 +2,7 @@
 //
 // Covers:
 //   - SCP.withSqlite convenience companion (PR 3 StorageConfig::Sqlite)
-//   - suspendInstance / resume / shutdown routing through CoroutineBridge
-//   - ffiCallSuspend wiring for UniFFI-generated `suspend fun` bindings
+//   - suspendInstance / resume / shutdown against the UniFFI Scp object
 //
 // Each test gets a fresh `SCP` via `@BeforeEach` and a deterministic
 // shutdown via `@AfterEach`, so tests don't leak runtime state across the
@@ -23,7 +22,6 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
@@ -32,8 +30,6 @@ import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import works.limn.scp.bridge.CoroutineBridge
-import works.limn.scp.conformance.ConformanceStubBindings
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ScpClassTest {
@@ -63,13 +59,6 @@ class ScpClassTest {
 
     private lateinit var scp: SCP
 
-    private fun bridge(): CoroutineBridge =
-        CoroutineBridge(
-            nativeBindings = ConformanceStubBindings(),
-            ioDispatcher = Dispatchers.IO,
-            cpuDispatcher = Dispatchers.Default,
-        )
-
     @BeforeEach
     fun setUp() {
         assumeTrue(nativeAvailable, skipReason)
@@ -82,7 +71,7 @@ class ScpClassTest {
         // A second shutdown is a no-op at the SDK surface (AlreadyShutDown
         // is swallowed), so this is safe even if the test already called
         // shutdown() explicitly.
-        runBlocking { scp.shutdown(bridge(), 1.seconds) }
+        runBlocking { scp.shutdown(1.seconds) }
     }
 
     // ── mandatory storage selection (spec §17.6) ──────────────────
@@ -115,7 +104,7 @@ class ScpClassTest {
             // The instance id is a monotonic counter; a fresh instance must
             // not collide with the reserved UNSET_INSTANCE_ID (0).
             assertNotEquals(0UL, instance.instanceId, "instanceId must not be UNSET")
-            instance.shutdown(bridge(), 1.seconds)
+            instance.shutdown(1.seconds)
         }
 
     @Test
@@ -135,11 +124,11 @@ class ScpClassTest {
                 b.instanceId,
                 "each SCP.withSqlite(...) must produce an independent UniffiBridgeInstance",
             )
-            a.shutdown(bridge(), 1.seconds)
-            b.shutdown(bridge(), 1.seconds)
+            a.shutdown(1.seconds)
+            b.shutdown(1.seconds)
         }
 
-    // ── Lifecycle routed through CoroutineBridge ──────────────────
+    // ── Lifecycle ─────────────────────────────────────────────────
 
     @Test
     fun `resume invokes the async FFI path without blocking`() =
@@ -148,15 +137,15 @@ class ScpClassTest {
             // ffiCall (non-suspend) this would either fail to compile or
             // blow up at runtime; reaching `assertTrue(true)` means the
             // suspend path executed end-to-end.
-            scp.resume(bridge())
+            scp.resume()
             assertTrue(true)
         }
 
     @Test
-    fun `suspendInstance-then-resume round-trips via CoroutineBridge`() =
+    fun `suspendInstance-then-resume round-trips`() =
         runTest {
-            scp.suspendInstance(bridge())
-            scp.resume(bridge())
+            scp.suspendInstance()
+            scp.resume()
             assertTrue(true)
         }
 
@@ -165,10 +154,10 @@ class ScpClassTest {
     @Test
     fun `shutdown twice is idempotent`() =
         runTest {
-            scp.shutdown(bridge(), 1.seconds)
+            scp.shutdown(1.seconds)
             // Second shutdown must not throw — the SDK swallows
             // AlreadyShutDown at the wrapper layer.
-            scp.shutdown(bridge(), 1.seconds)
+            scp.shutdown(1.seconds)
             assertTrue(true)
         }
 
@@ -181,7 +170,7 @@ class ScpClassTest {
                 second.instanceId,
                 "SCP() must allocate fresh instances, not reuse a cached handle",
             )
-            second.shutdown(bridge(), 1.seconds)
+            second.shutdown(1.seconds)
         }
 
     // ── economy verify-payment-receipts (suspend, real UniFFI bridge) ──

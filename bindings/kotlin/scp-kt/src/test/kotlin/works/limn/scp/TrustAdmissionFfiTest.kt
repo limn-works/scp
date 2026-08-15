@@ -13,7 +13,6 @@
 
 package works.limn.scp
 
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonNull
 import org.junit.jupiter.api.AfterEach
@@ -25,8 +24,6 @@ import org.junit.jupiter.api.assertDoesNotThrow
 import org.junit.jupiter.api.assertThrows
 import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig
-import works.limn.scp.bridge.CoroutineBridge
-import works.limn.scp.conformance.ConformanceStubBindings
 import kotlin.time.Duration.Companion.seconds
 
 class TrustAdmissionFfiTest {
@@ -56,13 +53,6 @@ class TrustAdmissionFfiTest {
 
     private lateinit var scp: SCP
 
-    private fun bridge(): CoroutineBridge =
-        CoroutineBridge(
-            nativeBindings = ConformanceStubBindings(),
-            ioDispatcher = Dispatchers.IO,
-            cpuDispatcher = Dispatchers.Default,
-        )
-
     @BeforeEach
     fun setUp() {
         assumeTrue(nativeAvailable, skipReason)
@@ -72,7 +62,7 @@ class TrustAdmissionFfiTest {
     @AfterEach
     fun tearDown() {
         if (!this::scp.isInitialized) return
-        runBlocking { scp.shutdown(bridge(), 1.seconds) }
+        runBlocking { scp.shutdown(1.seconds) }
     }
 
     @Test

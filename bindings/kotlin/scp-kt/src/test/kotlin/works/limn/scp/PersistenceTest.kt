@@ -37,7 +37,6 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 import uniffi.scp.ScpException
 import kotlin.time.Duration.Companion.seconds
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
@@ -46,8 +45,6 @@ import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import works.limn.scp.bridge.CoroutineBridge
-import works.limn.scp.conformance.ConformanceStubBindings
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PersistenceTest {
@@ -81,13 +78,6 @@ class PersistenceTest {
 
     private val createdInstances = mutableListOf<SCP>()
 
-    private fun bridge(): CoroutineBridge =
-        CoroutineBridge(
-            nativeBindings = ConformanceStubBindings(),
-            ioDispatcher = Dispatchers.IO,
-            cpuDispatcher = Dispatchers.Default,
-        )
-
     @BeforeEach
     fun requireNative() {
         assumeTrue(nativeAvailable, skipReason)
@@ -95,9 +85,8 @@ class PersistenceTest {
 
     @AfterEach
     fun tearDown() {
-        val b = bridge()
         for (scp in createdInstances) {
-            runBlocking { scp.shutdown(b, 1.seconds) }
+            runBlocking { scp.shutdown(1.seconds) }
         }
         createdInstances.clear()
     }
@@ -129,14 +118,14 @@ class PersistenceTest {
         }
 
     @Test
-    fun `withSqlite roundtrips suspendInstance then resume via CoroutineBridge`() =
+    fun `withSqlite roundtrips suspendInstance then resume`() =
         runTest {
             val dir = Files.createTempDirectory("scp-kotlin-persist-lifecycle-")
             dir.toFile().deleteOnExit()
             val scp = makeSqliteScp(dir.toFile())
 
-            scp.suspendInstance(bridge())
-            scp.resume(bridge())
+            scp.suspendInstance()
+            scp.resume()
             // Reaching here means both suspend and resume completed
             // without raising — the SQLite-backed path composes with
             // the async resume wiring introduced in #1549 PR 3.
@@ -156,7 +145,7 @@ class PersistenceTest {
             // must release the DB before a second open can succeed. This
             // matches the Swift `testSqliteReopenWithSamePathAndKeySucceeds`
             // shape.
-            scp1.shutdown(bridge(), 1.seconds)
+            scp1.shutdown(1.seconds)
             createdInstances.remove(scp1)
 
             val scp2 = makeSqliteScp(dir.toFile())
@@ -177,7 +166,7 @@ class PersistenceTest {
 
             // First open with the correct key — creates the encrypted DB.
             val scp1 = makeSqliteScp(dir.toFile())
-            scp1.shutdown(bridge(), 1.seconds)
+            scp1.shutdown(1.seconds)
             createdInstances.remove(scp1)
 
             // Second open with a wrong key MUST throw — `SqliteStorage::new`

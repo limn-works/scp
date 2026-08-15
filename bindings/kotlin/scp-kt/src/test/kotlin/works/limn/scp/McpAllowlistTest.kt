@@ -63,20 +63,11 @@ class McpAllowlistTest {
         shutdownInstance(scp)
     }
 
-    /// Shuts down [instance] using a fresh [CoroutineBridge] over the
-    /// stub native bindings. Centralizes the cleanup pattern so changes
-    /// to dispatcher wiring or shutdown timeout land in one place. See
-    /// [ConformanceStubBindings] for the no-op shutdown surface.
+    /// Shuts [instance] down with a bounded deadline. Centralizes the
+    /// cleanup pattern so a change to the shutdown timeout lands in one
+    /// place.
     private fun shutdownInstance(instance: SCP) {
-        runBlocking {
-            val bridge =
-                works.limn.scp.bridge.CoroutineBridge(
-                    nativeBindings = works.limn.scp.conformance.ConformanceStubBindings(),
-                    ioDispatcher = kotlinx.coroutines.Dispatchers.IO,
-                    cpuDispatcher = kotlinx.coroutines.Dispatchers.Default,
-                )
-            instance.shutdown(bridge, 1.seconds)
-        }
+        runBlocking { instance.shutdown(1.seconds) }
     }
 
     @Test

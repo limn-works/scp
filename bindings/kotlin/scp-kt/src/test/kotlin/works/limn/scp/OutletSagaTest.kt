@@ -14,23 +14,15 @@
 // This suite exercises:
 //   - the public type surface (SagaResult faithful pass-through incl. null;
 //     the three typed ScpException.Saga* cases carrying their fields),
-//   - the flat `OutletBridge.invokeCrossContextSaga` conformance symbol
-//     (argument forwarding + BridgeException propagation), and
 //   - end-to-end argument forwarding through the real UniFFI bridge.
 //
 // Provenance: PR-6c slice 4/4. §6.2.4 / ADR-049 §3a. ADR-026/ADR-028.
 
 package works.limn.scp
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.test.StandardTestDispatcher
-import kotlinx.coroutines.test.TestDispatcher
-import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
-import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import uniffi.scp.CeilingPolicy
 import uniffi.scp.ContextMode
@@ -42,17 +34,12 @@ import uniffi.scp.SagaResult
 import uniffi.scp.ScpException
 import uniffi.scp.StorageConfig
 import uniffi.scp.OutletDefinition
-import works.limn.scp.bridge.BridgeException
-import works.limn.scp.bridge.CoroutineBridge
-import works.limn.scp.conformance.ConformanceStubBindings
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
-import kotlin.test.fail
 import kotlin.time.Duration.Companion.seconds
 
-@OptIn(ExperimentalCoroutinesApi::class)
 class OutletSagaTest {
     companion object {
         private var nativeAvailable = false
@@ -78,22 +65,6 @@ class OutletSagaTest {
 
         /** 32 hex chars = 16 bytes — a well-formed §6.2.4 asserted-nonce input. */
         private const val NONCE_HEX = "abababababababababababababababab"
-    }
-
-    private lateinit var stubBindings: ConformanceStubBindings
-    private lateinit var bridge: CoroutineBridge
-    private lateinit var testDispatcher: TestDispatcher
-
-    @BeforeEach
-    fun setUp() {
-        stubBindings = ConformanceStubBindings()
-        testDispatcher = StandardTestDispatcher()
-        bridge =
-            CoroutineBridge(
-                nativeBindings = stubBindings,
-                ioDispatcher = testDispatcher,
-                cpuDispatcher = testDispatcher,
-            )
     }
 
     // ── SagaResult: faithful nullable pass-through ────────────────────────
@@ -192,113 +163,6 @@ class OutletSagaTest {
         assertEquals("ctx-shared-42", error.contendedContext)
     }
 
-    // ── Flat OutletBridge.invokeCrossContextSaga conformance ────────────────
-
-    /**
-     * The coverage symbol `OutletBridge.invokeCrossContextSaga` dispatches on IO
-     * and forwards all nine arguments to the bridge verbatim, returning the
-     * JSON result unchanged.
-     */
-    @Test
-    fun `invokeCrossContextSaga forwards all arguments and returns result`() =
-        runTest(testDispatcher) {
-            stubBindings.outletInvokeCrossContextSagaResult = """{"saga_id":"saga-xyz"}"""
-            val result =
-                bridge.outlets.invokeCrossContextSaga(
-                    sourceContextHandle = 1L,
-                    targetContextHandle = 2L,
-                    callerDid = "did:key:zCaller",
-                    outletRegistrationId = "reg-001",
-                    inputJson = """{"city":"Berlin"}""",
-                    assertedNonceHex = NONCE_HEX,
-                    timestampMs = 1_700_000_000_000L,
-                    chainDepth = 0,
-                    ucanProofId = "proof-1",
-                )
-
-            assertEquals("""{"saga_id":"saga-xyz"}""", result)
-            assertEquals(
-                listOf(
-                    "1",
-                    "2",
-                    "did:key:zCaller",
-                    "reg-001",
-                    """{"city":"Berlin"}""",
-                    NONCE_HEX,
-                    "1700000000000",
-                    "0",
-                    "proof-1",
-                ),
-                stubBindings.lastSagaArgs,
-            )
-        }
-
-    /**
-     * The optional `ucanProofId` is forwarded verbatim when absent: a `null`
-     * proof reaches the bridge as `null` (recorded by the stub as the literal
-     * `"null"` via `toString()`), never coerced to an empty or sentinel proof.
-     * The other eight arguments still forward in order.
-     */
-    @Test
-    fun `invokeCrossContextSaga forwards null ucanProofId`() =
-        runTest(testDispatcher) {
-            stubBindings.outletInvokeCrossContextSagaResult = """{"saga_id":"saga-xyz"}"""
-            val result =
-                bridge.outlets.invokeCrossContextSaga(
-                    sourceContextHandle = 1L,
-                    targetContextHandle = 2L,
-                    callerDid = "did:key:zCaller",
-                    outletRegistrationId = "reg-001",
-                    inputJson = """{"city":"Berlin"}""",
-                    assertedNonceHex = NONCE_HEX,
-                    timestampMs = 1_700_000_000_000L,
-                    chainDepth = 0,
-                    ucanProofId = null,
-                )
-
-            assertEquals("""{"saga_id":"saga-xyz"}""", result)
-            assertEquals(
-                listOf(
-                    "1",
-                    "2",
-                    "did:key:zCaller",
-                    "reg-001",
-                    """{"city":"Berlin"}""",
-                    NONCE_HEX,
-                    "1700000000000",
-                    "0",
-                    "null",
-                ),
-                stubBindings.lastSagaArgs,
-            )
-        }
-
-    /**
-     * A configured bridge error propagates out of the coverage symbol as a
-     * [BridgeException] carrying the typed `SCP-SAGA-13xxx` code.
-     */
-    @Test
-    fun `invokeCrossContextSaga propagates configured BridgeException`() =
-        runTest(testDispatcher) {
-            stubBindings.outletInvokeCrossContextSagaError =
-                BridgeException("participant set overlap", "SCP-SAGA-13066")
-            try {
-                bridge.outlets.invokeCrossContextSaga(
-                    sourceContextHandle = 1L,
-                    targetContextHandle = 2L,
-                    callerDid = "did:key:zCaller",
-                    outletRegistrationId = "reg-001",
-                    inputJson = "{}",
-                    assertedNonceHex = NONCE_HEX,
-                    timestampMs = 1_700_000_000_000L,
-                    chainDepth = 0,
-                )
-                fail("expected BridgeException for a configured saga error")
-            } catch (e: BridgeException) {
-                assertEquals("SCP-SAGA-13066", e.code)
-            }
-        }
-
     // ── End-to-end argument forwarding through the real bridge ────────────
 
     /**
@@ -361,13 +225,7 @@ class OutletSagaTest {
                     )
                 }
             } finally {
-                val shutdownBridge =
-                    CoroutineBridge(
-                        nativeBindings = ConformanceStubBindings(),
-                        ioDispatcher = Dispatchers.IO,
-                        cpuDispatcher = Dispatchers.Default,
-                    )
-                scp.shutdown(shutdownBridge, 1.seconds)
+                scp.shutdown(1.seconds)
             }
         }
     }

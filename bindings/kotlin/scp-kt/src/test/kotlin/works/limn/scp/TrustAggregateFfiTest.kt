@@ -13,7 +13,6 @@
 
 package works.limn.scp
 
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
@@ -25,8 +24,6 @@ import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import uniffi.scp.StorageConfig
-import works.limn.scp.bridge.CoroutineBridge
-import works.limn.scp.conformance.ConformanceStubBindings
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
@@ -58,13 +55,6 @@ class TrustAggregateFfiTest {
 
     private lateinit var scp: SCP
 
-    private fun bridge(): CoroutineBridge =
-        CoroutineBridge(
-            nativeBindings = ConformanceStubBindings(),
-            ioDispatcher = Dispatchers.IO,
-            cpuDispatcher = Dispatchers.Default,
-        )
-
     @BeforeEach
     fun setUp() {
         assumeTrue(nativeAvailable, skipReason)
@@ -74,7 +64,7 @@ class TrustAggregateFfiTest {
     @AfterEach
     fun tearDown() {
         if (!this::scp.isInitialized) return
-        runBlocking { scp.shutdown(bridge(), 1.seconds) }
+        runBlocking { scp.shutdown(1.seconds) }
     }
 
     /** A genesis `MemberJoined` event for the aggregated subject. */
