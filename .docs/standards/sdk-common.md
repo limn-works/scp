@@ -369,7 +369,7 @@ A stub is honest about its gap on its own path. It is a **separate, forbidden fa
 
 **Deferral boundary:** deferring the *real backend* to a tracked workstream (issue/RFC) is legitimate. Shipping a dev stand-in *for it* in the interim is not. The two are independent: sever the nullifier now (make it test-harness-only, fail closed in prod); build the real backend on its own schedule.
 
-**Mechanical enforcement:** the shipped-feature-graph prove-absence gate (per ADR-062 / spec §17.17) asserts `resolved-feature-set(artifact) ⊆ an allowlist of durability-only features` and admits **zero nullifier features — no exceptions**. There is no "documented," "tracked," or "legible" allowlisted nullifier edge; a tracked deferral of the real backend does not earn one. Durability-only in-memory arms (state-loss only, no nullified security property — e.g. in-memory storage/push) remain legitimate *explicitly-selected* runtime options and are the only in-memory constructs the allowlist admits. See spec §17.17 for the durability-only-vs-nullifier classification.
+**Mechanical enforcement:** the shipped-feature-graph prove-absence gate (per ADR-062 / spec §17.17) asserts `resolved-feature-set(artifact) ⊆ an allowlist of durability-only + real-backend features` and admits **zero nullifier features — no exceptions**. There is no "documented," "tracked," or "legible" allowlisted nullifier edge; a tracked deferral of the real backend does not earn one. Durability-only in-memory arms (state-loss only, no nullified security property — e.g. in-memory storage/push) remain legitimate *explicitly-selected* runtime options and are the only in-memory constructs the allowlist admits. See spec §17.17 for the durability-only-vs-nullifier classification.
 
 ## Async Patterns
 

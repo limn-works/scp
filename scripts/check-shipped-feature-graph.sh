@@ -5,18 +5,24 @@
 #
 # WHAT THIS PROVES
 # ----------------
-# For every SHIPPED FFI artifact, the COMPLETE resolved feature set of the SCP
-# workspace crates is a SUBSET of an explicit per-artifact allowlist that permits
-# ONLY durability-only + real-backend features. Any resolved SCP-crate feature
-# that is NOT on the allowlist — named or novel, present or future — FAILS the
-# gate. This makes shipped-graph feature-absence equivalent to nullifier-type
-# absence (the soundness invariant: every nullifier double —
-# `InMemoryKeyCustody` / `InMemoryDeviceAttestation` / `InMemoryPreRotationCustody`
-# / `InMemoryDhtClient` and the `did:key` test method — is gated behind one of the
-# `testing` features of scp-platform / scp-dht / scp-did / scp-core / scp-protocol
-# / scp-runtime / scp-mls, or behind the `scp-testing` crate; the whitelist admits
-# none of them, so if a nullifier's gating feature is absent from the graph, the
-# nullifier cannot be compiled in).
+# For every shipped artifact (the three FFI bridges plus the scp-node and
+# scp-relay binaries), the COMPLETE resolved feature set of the SCP
+# workspace crates is a SUBSET of a single explicit permitted-production allowlist
+# (one superset list covering all five artifacts) permitting durability-only +
+# real-backend features — with one disclosed confidentiality-nullifier residue
+# (the three `scp-*/allow_unencrypted_storage` entries, tracked for removal in
+# Track B / #2292; full statement in ADR-062 §Status). Any resolved SCP-crate
+# feature that is NOT on the allowlist — named or novel, present or future —
+# FAILS the gate. The gate's TARGET soundness invariant — shipped-graph
+# feature-absence ≡ nullifier-type absence — holds for every `testing`-gated
+# nullifier double (`InMemoryKeyCustody` / `InMemoryDeviceAttestation` /
+# `InMemoryPreRotationCustody` / `InMemoryDhtClient` and the `did:key` test
+# method, each gated behind a `testing` feature of scp-platform / scp-dht /
+# scp-did / scp-core / scp-protocol / scp-runtime / scp-mls or the `scp-testing`
+# crate, none of which the whitelist admits — so an absent gating feature means
+# the nullifier cannot be compiled in), but is NOT YET fully achieved while the
+# disclosed `allow_unencrypted_storage` residue remains on the allowlist
+# (see ADR-062 §Status / #2292).
 #
 # WHY A CLOSED ⊆-WHITELIST, NOT A DENYLIST
 # ----------------------------------------
@@ -45,17 +51,29 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # ---------------------------------------------------------------------------
-# Per-artifact permitted-production allowlist (EXPLICIT — the whitelist).
+# Single permitted-production allowlist (EXPLICIT — the whitelist).
 #
-# Durability-only (SCP-CAPSEL-8010/8011) + real-backend features ONLY. Contains
-# ZERO nullifier features, no exceptions (ADR-062 §Decision 6; PR #2132). The
-# `assert_allowlist_has_no_nullifier` self-test enforces that invariant so a
-# future edit cannot quietly add a nullifier exception.
+# Durability-only (SCP-CAPSEL-8010/8011) + real-backend features. ZERO nullifier
+# features is the design mandate (ADR-062 §Decision 6; PR #2132); the one
+# disclosed `allow_unencrypted_storage` residue (the three `scp-*/...` entries
+# below) is single-sourced in ADR-062 §Status / #2292 — see there for the full
+# classification. The `assert_allowlist_has_no_nullifier` self-test enforces that
+# no NULLIFIER_CONTROL_FEATURES entry is added, so a future edit cannot quietly
+# add a *new* nullifier exception.
 #
-# The three shipped bridges resolve an identical SCP-crate feature set in their
-# production (`--no-default-features --features server`) configuration, so one
-# allowlist covers all three. `cargo tree` DERIVES the resolved set (never a
-# hand-list); this allowlist is the hand-maintained set of what is PERMITTED.
+# `scp-platform/in-memory-push` is an intentionally-permitted, currently-unused
+# durability-only entry: no shipped artifact resolves it today, but a superset
+# allowlist may carry permitted-but-unresolved rows (it is durability-only, not a
+# nullifier, so its presence widens nothing that matters).
+#
+# Five artifacts are gated: the three shipped FFI bridges (built
+# `--no-default-features --features server`) plus the scp-node and scp-relay
+# binaries (built with DEFAULT features — neither binary has a `server` feature).
+# The three bridges resolve one identical SCP-crate feature set; each binary
+# resolves a SUBSET of it (scp-node ~25, scp-relay ~19 SCP-crate feature edges).
+# This single allowlist is therefore a SUPERSET covering all five — one list
+# suffices. `cargo tree` DERIVES each artifact's resolved set (never a hand-list);
+# this allowlist is the hand-maintained set of what is PERMITTED.
 # ---------------------------------------------------------------------------
 PERMITTED_ALLOWLIST="$(cat <<'EOF'
 scp-clock/default
@@ -97,14 +115,36 @@ scp-transport/startup
 EOF
 )"
 
-# Shipped artifacts and their exact PRODUCTION build invocation. Each is run in
-# its prod config AND (belt-and-suspenders, AC9 / F1 backstop) explicitly with
-# `--features server`. Default features already imply `server`, so the two
-# invocations coincide; both are listed to pin the intent.
+# Shipped artifacts and their exact PRODUCTION build invocation. Two distinct
+# shipped configurations, gated exactly as they ship:
+#   - FFI bridges (scp-ffi / -napi / -uniffi): built `--no-default-features
+#     --features server` — their production bridge configuration.
+#   - Binaries (scp-node / scp-relay): built with DEFAULT features, so the
+#     feature-arg string is EMPTY. This matches the Dockerfile
+#     `cargo build --release -p scp-relay -p scp-node` and the `cargo publish`
+#     shipping config. NEITHER binary has a `server` feature (scp-node has no
+#     `default` block wiring one; scp-relay has no `[features]` table at all),
+#     so passing `--features server` here would ERROR — they are correctly gated
+#     with an empty feature-arg string, not with `--features server`.
+#
+# DRIFT CAVEAT: each entry's build-invocation string above MUST be kept in
+# lockstep with the actual shipped build config — the Dockerfile
+# `cargo build --release -p scp-relay -p scp-node` and the
+# `.github/workflows/release.yml` `cargo publish` steps. This gate checks the
+# feature config NAMED HERE, not whatever those workflows actually build; if the
+# two drift apart, coverage silently narrows (an artifact would be gated in a
+# config it no longer ships).
+#
+# uniffi-bindgen (the third workspace `[[bin]]`, in `crates/scp-ffi/uniffi`) is
+# deliberately NOT a separate ARTIFACTS entry: it is a build-time code-generation
+# tool, not a shipped runtime artifact, and its dependencies are already covered
+# transitively by the `scp-ffi-uniffi` package entry above.
 ARTIFACTS=(
   "scp-ffi|--no-default-features --features server"
   "scp-ffi-napi|--no-default-features --features server"
   "scp-ffi-uniffi|--no-default-features --features server"
+  "scp-node|"
+  "scp-relay|"
 )
 
 # Nullifier features / crates used ONLY as positive-control fixture inputs and by
@@ -127,12 +167,31 @@ NULLIFIER_CONTROL_FEATURES=(
 # resolve_scp_features <crate> <features...>
 #   Emit the COMPLETE resolved SCP-crate feature set of the shipped artifact,
 #   one `crate/feature` per line, sorted-unique. Excludes dev-dependencies.
+#
+#   DELIBERATE SPLIT from resolve_scp_testing_crate (NOT a redundant twin): this
+#   extracts FEATURE edges (`scp-* feature "…"`) from the `-e features,no-dev`
+#   tree, whereas resolve_scp_testing_crate probes CRATE-NODE presence
+#   (`scp-testing v…`) in the `-e no-dev` tree. A `scp-testing` pulled with
+#   `default-features = false` and no features enabled contributes NO feature
+#   edge here (so this grep would miss it) yet still appears as a crate node —
+#   so the two checks catch distinct cases and are both load-bearing.
 # ---------------------------------------------------------------------------
 resolve_scp_features() {
   local crate="$1"; shift
   local features="$1"
+  local raw rc
+  # Capture stdout+stderr and the exit status. Do NOT swallow a cargo failure
+  # silently: if resolution fails (e.g. the feature args name a feature this
+  # artifact lacks), surface the cargo error and return non-zero so the caller
+  # fails loud instead of proceeding with an empty (vacuously-passing) set.
   # shellcheck disable=SC2086
-  cargo tree -e features,no-dev -p "$crate" $features 2>/dev/null \
+  raw="$(cargo tree -e features,no-dev -p "$crate" $features 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree failed for '$crate' (feature args: '$features'):"
+      printf '%s\n' "$raw"; } >&2
+    return 1
+  fi
+  printf '%s\n' "$raw" \
     | grep -oE 'scp-[a-z0-9-]+ feature "[^"]+"' \
     | sed -E 's/ feature "/\//; s/"$//' \
     | sort -u
@@ -141,12 +200,28 @@ resolve_scp_features() {
 # resolve_scp_testing_crate <crate> <features...>
 #   Emit "scp-testing" iff the full-stack test-harness crate is in the shipped
 #   (no-dev) dependency graph. Its mere presence is a nullifier and FAILS.
+#   DELIBERATE SPLIT from resolve_scp_features (NOT a redundant twin): this probes
+#   CRATE-NODE presence (`scp-testing v…`), which catches a `scp-testing` pulled
+#   with no enabled features — a case the feature-edge grep in resolve_scp_features
+#   would miss. Both checks are load-bearing; keep them separate.
+#   Fails LOUD on a cargo error, mirroring resolve_scp_features: a swallowed
+#   `2>/dev/null` failure produces no output, which the grep would read as
+#   "scp-testing absent" — a FAIL-OPEN read that lets a cargo resolution error
+#   masquerade as nullifier-crate absence. Capture stdout+stderr and the exit
+#   status; on a cargo error, surface it and return non-zero so the caller fails
+#   loud instead of silently concluding the test-harness crate is not present.
 resolve_scp_testing_crate() {
   local crate="$1"; shift
   local features="$1"
+  local raw rc
   # shellcheck disable=SC2086
-  if cargo tree -e no-dev -p "$crate" $features 2>/dev/null \
-      | grep -qE '(^|[^a-z-])scp-testing v'; then
+  raw="$(cargo tree -e no-dev -p "$crate" $features 2>&1)"; rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    { echo "cargo tree (scp-testing probe) failed for '$crate' (feature args: '$features'):"
+      printf '%s\n' "$raw"; } >&2
+    return 1
+  fi
+  if printf '%s\n' "$raw" | grep -qE '(^|[^a-z-])scp-testing v'; then
     echo "scp-testing"
   fi
 }
@@ -169,6 +244,20 @@ check_subset() {
 }
 
 # ---------------------------------------------------------------------------
+# resolution_is_nonempty <resolved-lines>
+#   Guards the VACUOUS-PASS hazard. The ⊆ check treats "empty ⊆ allowlist" as a
+#   PASS — so an empty resolved set would silently green while checking nothing.
+#   Every shipped artifact legitimately resolves a NON-EMPTY SCP-crate feature
+#   set (the three bridges, plus scp-node ~25 and scp-relay ~19 feature edges),
+#   so an empty result means cargo resolution failed or the feature args are
+#   wrong. Returns 0 if the resolved set is non-empty, 1 if empty. Factored out
+#   as a pure predicate so the fixture harness can drive it directly.
+# ---------------------------------------------------------------------------
+resolution_is_nonempty() {
+  [[ -n "$1" ]]
+}
+
+# ---------------------------------------------------------------------------
 # Real gate.
 # ---------------------------------------------------------------------------
 run_gate() {
@@ -180,21 +269,43 @@ run_gate() {
     echo ">> $crate  ($features)"
 
     local resolved offenders
-    resolved="$(resolve_scp_features "$crate" "$features")"
+    # resolve_scp_features returns non-zero (and surfaces cargo's stderr) if
+    # resolution fails; the non-empty guard additionally rejects an empty result
+    # from any cause. Either way the artifact FAILS LOUD — an empty set must
+    # NEVER be accepted as a vacuous "empty ⊆ allowlist" pass.
+    if ! resolved="$(resolve_scp_features "$crate" "$features")" \
+        || ! resolution_is_nonempty "$resolved"; then
+      echo "   FAIL — resolved SCP-crate feature set is EMPTY (cargo resolution"
+      echo "          failed or the feature args are wrong — e.g. '$features'"
+      echo "          names a feature '$crate' does not have). Every shipped"
+      echo "          artifact (3 bridges + scp-node + scp-relay) legitimately"
+      echo "          resolves a NON-EMPTY set; refusing to treat an empty"
+      echo "          resolution as 'empty ⊆ allowlist' PASS."
+      failures=$((failures + 1))
+      continue
+    fi
     # A present scp-testing crate is itself a nullifier — fold it into the set so
-    # the ⊆ check rejects it (it is never on the allowlist).
+    # the ⊆ check rejects it (it is never on the allowlist). The probe fails loud
+    # (non-zero) on a cargo error; refuse to read a probe failure as "no
+    # test-harness crate present" (that would be fail-open).
     local testing_crate
-    testing_crate="$(resolve_scp_testing_crate "$crate" "$features")"
+    if ! testing_crate="$(resolve_scp_testing_crate "$crate" "$features")"; then
+      echo "   FAIL — scp-testing presence probe failed (cargo resolution error);"
+      echo "          refusing to read a probe failure as 'no nullifier crate present'."
+      failures=$((failures + 1))
+      continue
+    fi
     [[ -n "$testing_crate" ]] && resolved="$(printf '%s\n%s' "$resolved" "$testing_crate")"
 
     if offenders="$(check_subset "$resolved" "$PERMITTED_ALLOWLIST")"; then
       echo "   OK — resolved SCP-crate feature set ⊆ permitted-production allowlist"
     else
-      echo "   FAIL — resolved features NOT on the durability-only allowlist:"
+      echo "   FAIL — resolved features NOT on the permitted-production allowlist:"
       printf '%s\n' "$offenders" | sed 's/^/       ✗ /'
       echo "   These are test-harness / nullifier features that must NOT reach a"
-      echo "   shipped artifact. A shipped build carries durability-only features"
-      echo "   only (ADR-062 §Decision 6, ZERO nullifier exceptions)."
+      echo "   shipped artifact. A shipped build carries only durability-only +"
+      echo "   real-backend features (ADR-062 §Decision 6; ZERO-nullifier mandate,"
+      echo "   modulo the disclosed \`allow_unencrypted_storage\` residue — §Status / #2292)."
       failures=$((failures + 1))
     fi
   done
@@ -217,7 +328,7 @@ expect() { # <label> <expected: PASS|FAIL> <actual-rc>
 }
 
 assert_allowlist_has_no_nullifier() {
-  echo ">> fixture: allowlist carries ZERO nullifier features (AC7)"
+  echo ">> fixture: allowlist carries ZERO enumerated control-nullifier features — no NULLIFIER_CONTROL_FEATURES entry (custody/attestation/DHT/did:key/test-harness double) appears (AC7); disclosed allow_unencrypted_storage residue tracked in §Status / #2292"
   local nf
   for nf in "${NULLIFIER_CONTROL_FEATURES[@]}"; do
     if printf '%s\n' "$PERMITTED_ALLOWLIST" | grep -qxF "$nf"; then
@@ -225,7 +336,7 @@ assert_allowlist_has_no_nullifier() {
       fixture_failures=$((fixture_failures + 1))
     fi
   done
-  echo "   ok   — no nullifier feature appears on the permitted-production allowlist"
+  echo "   ok   — no custody/attestation/DHT/did:key/test-harness nullifier control-feature appears on the allowlist"
 }
 
 run_fixtures() {
@@ -255,13 +366,25 @@ run_fixtures() {
   # (AC8 soundness) A synthetic consumer whose graph carries a `testing` nullifier
   #     feature (e.g. a mis-wired bridge, or a future consumer that fails to keep
   #     the nullifier behind dev-deps) → REJECTED, because no `testing` feature is
-  #     on the durability-only allowlist. Feature-absence ≡ nullifier-absence.
+  #     on the durability-only + real-backend allowlist. This is the gate's TARGET
+  #     feature-absence ≡ nullifier-absence invariant — fully held for the testing
+  #     nullifiers, with the disclosed `allow_unencrypted_storage` residue the one
+  #     outstanding gap (§Status / #2292).
   local nf leaked
   for nf in "scp-platform/testing" "scp-dht/testing" "scp-did/testing" "scp-testing"; do
     leaked="$(printf '%s\n%s' "$PERMITTED_ALLOWLIST" "$nf")"
     check_subset "$leaked" "$PERMITTED_ALLOWLIST" >/dev/null 2>&1; rc=$?
     expect "(soundness) leaked nullifier feature '$nf' is REJECTED" "FAIL" "$rc"
   done
+
+  # (empty-resolution guard) An EMPTY resolved set must be REJECTED, never
+  #     treated as a vacuous "empty ⊆ allowlist" PASS. This proves the non-empty
+  #     assertion wired into run_gate (which fires when cargo resolution fails or
+  #     the feature args are wrong) is load-bearing.
+  resolution_is_nonempty ""; rc=$?
+  expect "(empty-guard) empty resolved set is REJECTED" "FAIL" "$rc"
+  resolution_is_nonempty "scp-core/default"; rc=$?
+  expect "(empty-guard) non-empty resolved set is ACCEPTED" "PASS" "$rc"
 
   assert_allowlist_has_no_nullifier
 
@@ -288,7 +411,7 @@ main() {
   echo
   if run_gate; then
     echo
-    echo "G1 PASSED: every shipped artifact's SCP-crate feature set is durability-only."
+    echo "G1 PASSED: every shipped artifact's SCP-crate feature set ⊆ the permitted-production allowlist (durability-only + real-backend, plus the disclosed \`allow_unencrypted_storage\` residue — §Status / #2292)."
     exit 0
   fi
   echo
