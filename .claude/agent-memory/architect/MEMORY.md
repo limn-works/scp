@@ -1,5 +1,9 @@
 # Architect Memory
 
+## Index
+- [DID two-layer encoding — settled](did-two-layer-encoding-settled.md) — relay carries full JSON, Mainline carries a DNS bootstrap core; the did:dht facts, verified against the method spec
+- [DID-document membership criteria](did-document-membership-criteria.md) — the three criteria in §18.2.2B, plus the retired-key retention question that stays Alec's
+
 ## ADR Review Fixes (Feb 2026)
 10 HIGH-severity issues identified and fixed across Phase 1-3 ADRs:
 - ADR-001: Epoch key grace window (30s max, in-memory only)
