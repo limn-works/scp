@@ -173,7 +173,7 @@ pub struct DidRotatedEvent {
 ///
 /// 1. Calls the wrapped `scp_identity` resolver (typically `DualLayerResolver`)
 ///    which performs parallel relay + DHT resolution with BEP44 signature
-///    verification, self-certification, and healing.
+///    verification and self-certification.
 /// 2. Extracts the requested public key from the resolved DID document's
 ///    verification methods.
 /// 3. Detects DID rotation by comparing sequence numbers against previously

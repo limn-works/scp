@@ -715,12 +715,20 @@ pub trait AttestationRevocationChecker {
     fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64>;
 }
 
-/// No-op revocation checker that always returns `None` (not revoked).
+/// Revocation checker that reports every attestation as not revoked.
 ///
-/// Suitable for testing, offline verification, or contexts where external
-/// revocation checking is not available.
+/// Gated behind `#[cfg(any(test, feature = "testing"))]`, so dead-code
+/// elimination removes it from every shipped artifact and the ADR-062
+/// §Decision 6 feature-graph gate can prove its absence. A checker that
+/// answers `None` for an attestation it never looked up tells
+/// [`verify_attestation_with_revocation`] the attestation is live, which is a
+/// guarantee it did not earn — the builder tenet's first named example of a
+/// dev stand-in that must never reach a production path. Production callers
+/// pass a checker that consults a real revocation source.
+#[cfg(any(test, feature = "testing"))]
 pub struct NoOpRevocationChecker;
 
+#[cfg(any(test, feature = "testing"))]
 impl AttestationRevocationChecker for NoOpRevocationChecker {
     fn check_revocation(&self, _attestation_id: &str, _issuer: &DID) -> Option<u64> {
         None

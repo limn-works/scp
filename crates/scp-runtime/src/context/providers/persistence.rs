@@ -6,22 +6,31 @@
 //! [`ContextPersistence`] trait by `.await`-ing the async `ProtocolRepository`
 //! methods directly (ADR-049 Decision 7).
 //!
-//! This module re-exports the canonical implementation for convenience and
-//! provides an additional in-memory implementation suitable for integration
-//! tests that need persistence semantics without a storage backend.
+//! This module re-exports the canonical implementation for convenience and,
+//! under `#[cfg(any(test, feature = "testing"))]`, an in-memory implementation
+//! for integration tests that need persistence semantics without a storage
+//! backend.
 //!
 //! [`ContextPersistence`]: crate::context::persistence::ContextPersistence
 
+// Every import below serves `InMemoryPersistence` alone, so each carries the
+// same gate the type does; a shipped build of this module holds only the
+// `ProtocolRepositoryContextBridge` re-export.
+#[cfg(any(test, feature = "testing"))]
 use std::collections::HashMap;
+#[cfg(any(test, feature = "testing"))]
 #[allow(
     clippy::disallowed_types,
     reason = "`ContextPersistence` is async (ADR-049 Decision 7), but this in-memory map's critical section is a synchronous lock→mutate→drop with NO await held across the guard, so `std::sync::Mutex` is correct — a `tokio::sync::Mutex` would add a needless async lock where none is required."
 )]
 use std::sync::Mutex;
 
+#[cfg(any(test, feature = "testing"))]
 use async_trait::async_trait;
 
+#[cfg(any(test, feature = "testing"))]
 use crate::context::persistence::ContextPersistence;
+#[cfg(any(test, feature = "testing"))]
 use crate::context::state::ContextSnapshot;
 
 // Re-export the canonical implementation.
@@ -34,6 +43,11 @@ pub use crate::store::context::ProtocolRepositoryContextBridge;
 /// semantics (e.g., persist-drop-restore round-trip tests) without requiring
 /// a `ProtocolRepository` or storage backend.
 ///
+/// Gated behind `#[cfg(any(test, feature = "testing"))]`, so dead-code
+/// elimination removes it from every shipped artifact and the ADR-062
+/// §Decision 6 feature-graph gate can prove its absence. The production
+/// implementation of the trait is [`ProtocolRepositoryContextBridge`].
+///
 /// # Thread Safety
 ///
 /// All state is protected by `std::sync::Mutex`. Lock scopes are minimal.
@@ -41,15 +55,20 @@ pub use crate::store::context::ProtocolRepositoryContextBridge;
 /// # Example
 ///
 /// ```rust,ignore
-/// let persistence = InMemoryPersistence::new();
-/// let manager = ContextManager::with_persistence(
-///     Box::new(crypto),
-///     Box::new(transport),
-///     Box::new(event_log),
-///     Box::new(persistence),
+/// let persistence: Box<dyn ContextPersistence> = Box::new(InMemoryPersistence::new());
+/// let supervisor = Supervisor::with_providers(
+///     crypto,
+///     transport,
+///     event_log,
 ///     key_resolver,
+///     Some(persistence),
+///     payment_adapter,
+///     event_tx,
+///     clock,
+///     mls_storage,
 /// );
 /// ```
+#[cfg(any(test, feature = "testing"))]
 pub struct InMemoryPersistence {
     #[allow(
         clippy::disallowed_types,
@@ -58,6 +77,7 @@ pub struct InMemoryPersistence {
     contexts: Mutex<HashMap<String, ContextSnapshot>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 #[allow(
     clippy::disallowed_types,
     reason = "`ContextPersistence` is async (ADR-049 Decision 7), but this map's critical section is a synchronous lock→mutate→drop with NO await held across the guard, so `std::sync::Mutex` is correct — a `tokio::sync::Mutex` would add a needless async lock where none is required."
@@ -72,12 +92,14 @@ impl InMemoryPersistence {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl Default for InMemoryPersistence {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 #[async_trait]
 impl ContextPersistence for InMemoryPersistence {
     async fn persist_context(

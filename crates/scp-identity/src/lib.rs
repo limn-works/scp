@@ -43,17 +43,21 @@ pub mod resolver;
 
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use config::{CreatedIdentity, Identity, IdentityConfig, NoPersistence};
+#[cfg(any(test, feature = "testing"))]
+pub use dht::InMemorySequenceStore;
 pub use dht::{
-    DidDht, InMemorySequenceStore, MigrationOutcome, MigrationPartialState, MigrationResumePhase,
-    PostResolveHook, SequenceStore, did_from_ed25519_public_key, extract_public_key,
-    verify_migration, verify_self_certification,
+    DidDht, MigrationOutcome, MigrationPartialState, MigrationResumePhase, PostResolveHook,
+    SequenceStore, did_from_ed25519_public_key, extract_public_key, verify_migration,
+    verify_self_certification,
 };
 pub use relay_querier::RealMultiRelayQuerier;
 pub use republish::RepublishManager;
-pub use resolution::{InMemoryRelayQuerier, RelayQuerier, RelayQueryRecord, did_routing_id};
+#[cfg(any(test, feature = "testing"))]
+pub use resolution::InMemoryRelayQuerier;
+pub use resolution::{RelayQuerier, RelayQueryRecord, did_routing_id};
 pub use resolver::{
-    DidResolver, DualLayerHealingPublisher, DualLayerResolver, HealingPublisher, MultiRelayQuerier,
-    NoOpHealer, NoOpRelayQuerier, ResolutionSource, ResolvedDidDocument, StaleLayer,
+    DidResolver, DualLayerResolver, MultiRelayQuerier, NoOpRelayQuerier, ResolutionSource,
+    ResolvedDidDocument,
 };
 
 use serde::{Deserialize, Serialize};

@@ -21,7 +21,9 @@ pub mod persistence;
 
 pub use crate::crypto::mls::provider::NodeMlsFactory;
 pub use event_log::{EventLogPersistence, MerkleEventLogProvider};
-pub use persistence::{InMemoryPersistence, ProtocolRepositoryContextBridge};
+#[cfg(any(test, feature = "testing"))]
+pub use persistence::InMemoryPersistence;
+pub use persistence::ProtocolRepositoryContextBridge;
 
 // Re-export the ProtocolRepository bridge for event log persistence.
 pub use crate::store::context::ProtocolRepositoryEventLogBridge;

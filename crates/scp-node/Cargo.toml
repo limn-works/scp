@@ -111,8 +111,10 @@ allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
 # `ApplicationNode::dev` builds through `Node::start_for_testing`. MUST NOT
 # appear in any default/non-testing feature list (ADR-062 §Decision 1); a
 # shipped node build never enables it, so the in-memory DHT nullifier is absent
-# from shipped artifacts.
-testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage"]
+# from shipped artifacts. Carries `scp-identity/testing` for the same path:
+# `run_full_node_ephemeral` builds `DidDht` over `InMemorySequenceStore`, which
+# is gated there.
+testing = ["scp-dht/testing", "scp-identity/testing", "scp-platform/testing", "allow_unencrypted_storage"]
 quic = ["scp-transport/quic", "dep:quinn"]
 http3 = ["scp-transport/http3"]
 udp = ["scp-transport/udp"]

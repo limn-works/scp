@@ -167,10 +167,16 @@ pub mod trust {
     pub use scp_protocol::trust::admission::{
         AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,
     };
+    // `NoOpRevocationChecker` is deliberately absent from this list. It reports
+    // every attestation as live without consulting a revocation source, and the
+    // facade re-exported it beside `verify_attestation_with_revocation`, which
+    // put an always-succeeds checker one `use` statement away from any
+    // downstream caller. It is now `#[cfg(any(test, feature = "testing"))]` in
+    // `scp-protocol`; the tests that need it name that path directly.
     pub use scp_protocol::trust::attestation::{
         Attestation, AttestationEvidence, AttestationRevocationChecker, AttestorInfo,
-        DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, NoOpRevocationChecker,
-        RevocationStatus, ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
+        DidPublicKeyResolver, FreshnessStatus, IdentityDidPublicKeyResolver, RevocationStatus,
+        ThresholdRequirement, ThresholdResult, canonical_attestation_bytes,
         check_attestation_freshness, check_threshold_attestation, verify_attestation,
         verify_attestation_with_revocation,
     };

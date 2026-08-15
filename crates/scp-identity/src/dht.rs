@@ -85,15 +85,24 @@ pub trait SequenceStore: Send + Sync {
 /// In-memory [`SequenceStore`] for testing.
 ///
 /// Stores sequence numbers in a `HashMap` behind a `tokio::sync::Mutex`.
-/// Not suitable for production (no persistence across restarts).
+///
+/// Gated behind `#[cfg(any(test, feature = "testing"))]`. A sequence store
+/// that restarts at zero makes BEP44 reject the node's next publish, and
+/// `mainline` surfaces that rejection as a timeout, so the node records a
+/// publish that peers never accepted while they keep serving the older
+/// document — anti-rollback defeated. Keeping the type out of every shipped
+/// artifact is what stops that composition from reaching production, and lets
+/// the ADR-062 §Decision 6 feature-graph gate prove it is gone.
 ///
 /// Construct via [`Default`] (`InMemorySequenceStore::default()`); it carries
 /// no configuration, so a bespoke `new()` would be redundant.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct InMemorySequenceStore {
     sequences: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl SequenceStore for InMemorySequenceStore {
     fn load(
         &self,

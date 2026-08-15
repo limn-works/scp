@@ -33,10 +33,10 @@ use scp_transport::native::server::{RelayConfig, RelayServer};
 use scp_transport::native::storage::BlobStorageBackend;
 
 use crate::{
-    ApplicationNode, DEFAULT_HTTP_BIND_ADDR, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy,
-    NoOpCustody, NoOpDidMethod, NoOpStorage, NodeError, TlsProvider, build_domain_inner,
-    build_no_domain_inner, generate_bridge_secret, generate_dev_token,
-    provision_with_challenge_listener, resolve_identity_persistent, resolve_nat, resolve_tls,
+    ApplicationNode, DEFAULT_HTTP_BIND_ADDR, DEFAULT_PROJECTION_RATE_LIMIT, NatStrategy, NodeError,
+    TlsProvider, build_domain_inner, build_no_domain_inner, generate_bridge_secret,
+    generate_dev_token, provision_with_challenge_listener, resolve_identity_persistent,
+    resolve_nat, resolve_tls,
 };
 
 // ---------------------------------------------------------------------------
@@ -328,11 +328,13 @@ pub enum NatSlot {
 ///
 /// The `<K, D, S>` generics survive from the former builder, carried
 /// by the config and its selectors; the `Dom`/`Id` phantom-state markers are gone.
-pub struct NodeConfig<
-    K: KeyCustody = NoOpCustody,
-    D: DidMethod = NoOpDidMethod,
-    S: Storage = NoOpStorage,
-> {
+/// None of the three carries a default type: a defaulted type parameter on a
+/// capability slot picks a backend for a caller who never named one, which is
+/// the silent selection SCP-CAPSEL-8000 and `construction.md` M4 forbid. Every
+/// caller reaches `NodeConfig` through [`NodeConfig::defaults`], which infers
+/// `K`, `D` and `S` from the custody, DID-method and storage values passed to
+/// it, so each slot is filled by something the caller chose.
+pub struct NodeConfig<K: KeyCustody, D: DidMethod, S: Storage> {
     // --- Required (irreducible; no whole-struct Default — M4) ---
     /// How the node is reached from the outside (addressing XOR).
     pub reach: Reach,

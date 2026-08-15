@@ -25,7 +25,8 @@
 //!
 //! The [`RelayQuerier`] trait abstracts relay QUERY operations so that
 //! `scp-core` does not depend on `scp-transport`. Production implementations
-//! live in `scp-transport`; tests use [`InMemoryRelayQuerier`].
+//! live in `scp-transport`; tests use `InMemoryRelayQuerier`, which is
+//! `#[cfg(any(test, feature = "testing"))]` and so is not in scope here.
 
 use sha2::{Digest, Sha256};
 
@@ -86,7 +87,8 @@ pub struct RelayQueryRecord {
 /// Abstraction over relay QUERY operations for DID document resolution.
 ///
 /// Production implementations (in `scp-transport`) send QUERY messages to SCP
-/// relays. Tests use [`InMemoryRelayQuerier`] backed by a `HashMap`.
+/// relays. Tests use `InMemoryRelayQuerier` backed by a `HashMap`; that type
+/// is `#[cfg(any(test, feature = "testing"))]` and so is not in scope here.
 ///
 /// This trait is defined in `scp-identity` so that the resolution logic does not
 /// depend on `scp-transport` (§3.10.12 phase integration).
@@ -179,11 +181,15 @@ pub(crate) fn verify_relay_record(
 ///
 /// Multiple records may be stored at the same key (co-located candidates) via
 /// repeated `insert` calls; they are returned by `query` in insertion order.
-/// This is the ONLY in-memory relay implementation; it is NOT gated behind
-/// `#[cfg(any(test, feature = "testing"))]` in Slice 011a — that demotion is
-/// Slice 011b scope. Until 011b lands, `NoOpRelayQuerier` continues to ship as
-/// the production stand-in that fails honestly (returns `Ok(None)`, ADR-062
-/// §Decision 5).
+///
+/// Gated behind `#[cfg(any(test, feature = "testing"))]`, so dead-code
+/// elimination removes it from every shipped artifact and the ADR-062
+/// §Decision 6 feature-graph gate can prove its absence. The production relay
+/// queriers are `TransportRelayQuerier` and `RealMultiRelayQuerier`;
+/// `NoOpRelayQuerier` is the arm that ships when no relay transport is
+/// available, and it reports not-found (`Ok(None)`) rather than a document it
+/// does not have (ADR-062 §Decision 5).
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
 pub struct InMemoryRelayQuerier {
     /// Map from (`relay_url`, `routing_id`) to the ordered list of stored
@@ -193,6 +199,7 @@ pub struct InMemoryRelayQuerier {
     items: tokio::sync::Mutex<std::collections::HashMap<(String, [u8; 32]), Vec<RelayQueryRecord>>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl InMemoryRelayQuerier {
     /// Creates a new empty in-memory relay querier.
     #[must_use]
@@ -216,6 +223,7 @@ impl InMemoryRelayQuerier {
 
 // Trait uses RPITIT with explicit `+ Send` bound; async fn in trait
 // does not guarantee Send futures, so manual impl Future is required.
+#[cfg(any(test, feature = "testing"))]
 #[allow(clippy::manual_async_fn)]
 impl RelayQuerier for InMemoryRelayQuerier {
     fn query(
