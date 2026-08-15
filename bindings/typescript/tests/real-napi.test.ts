@@ -20,9 +20,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
+import type { Context } from "../src/context";
 import { ContextError } from "../src/errors";
 import { __getNativeScp, SCP } from "../src/scp";
 import type { Relay } from "../src/server";
+import { evaluateTrust as freeEvaluateTrust } from "../src/trust";
 import type { BehavioralRecord, CapabilityRequirement, ParticipationProfile } from "../src/types";
 import { allValid } from "../src/types";
 
@@ -887,6 +889,47 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(result.contextId).toBe(ctx.contextId);
       // Layer 2 behavioral record is present (event-log query succeeded).
       expect(result.behavioralRecord).toBeDefined();
+    });
+
+    // The package-level free function `evaluateTrust` and the `SCP.evaluateTrust`
+    // method are two entry points onto one implementation: the free function
+    // resolves `context._rawHandle` and forwards. This test drives BOTH against
+    // the real addon on identical inputs and asserts one result, so a future
+    // edit that reintroduces a second implementation behind the free function
+    // fails here. `trust.ts` carried such a second implementation until the
+    // ADR-059 rebuild: it classified a Rust `Display` message with `startsWith`
+    // and reported hardcoded zeros for the behavioral counts.
+    test("the free evaluateTrust returns the same result as the SCP method (real addon)", async () => {
+      const admin = await napi.identityCreate("in_memory");
+      const member = await napi.identityCreate("in_memory");
+      const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
+      const good = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+
+      const viaMethod = await scpInstance.evaluateTrust(ctx, member.did, [good.encoded]);
+      const viaFreeFunction = await freeEvaluateTrust(
+        scpInstance,
+        member.did,
+        { _rawHandle: ctx, contextId: ctx.contextId } as unknown as Context,
+        [good.encoded],
+      );
+
+      // `computedAt` is a wall-clock second stamped inside the Rust core, so the
+      // two calls can straddle a second boundary. Compare every other field
+      // exactly and bound that one.
+      const { behavioralRecord: methodRecord, ...methodRest } = viaMethod;
+      const { behavioralRecord: freeRecord, ...freeRest } = viaFreeFunction;
+      expect(freeRest).toEqual(methodRest);
+      const { computedAt: methodAt, ...methodFacts } = methodRecord;
+      const { computedAt: freeAt, ...freeFacts } = freeRecord;
+      expect(freeFacts).toEqual(methodFacts);
+      expect(Math.abs(freeAt - methodAt)).toBeLessThanOrEqual(2);
+
+      // The read-only diagnostic does not record the token's nonce, so the
+      // second evaluation of the SAME token still reports `nonceValid`. The
+      // deleted implementation called the enforcing `ucanValidate` gate, which
+      // records the nonce, so the second call would have reported it false.
+      expect(viaFreeFunction.capabilityValidation.nonceValid).toBe(true);
+      expect(allValid(viaFreeFunction.capabilityValidation)).toBe(true);
     });
 
     // C3c (Phase 2C-2): the Layer-2 behavioral record is now the TYPED
