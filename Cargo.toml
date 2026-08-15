@@ -67,7 +67,18 @@ bs58 = "0.5"
 jsonschema = { version = "0.28", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 tracing = "0.1"
-lru = "0.16"
+# The patch component is load-bearing: RUSTSEC-2026-0253 (unsoundness via
+# non-panic-safe `LruCache::pop()`) is patched only in 0.18.2. Do not relax
+# this to "0.18" — that would re-admit the affected 0.18.0 / 0.18.1.
+#
+# Scope of the exposure, so nobody re-derives it under pressure: the advisory
+# is `informational = "unsound"`, and reaching the UB needs a key type with a
+# potentially-panicking `Drop` under `catch_unwind`. Every SCP cache key is
+# `BlobId(pub [u8; 32])`, `[u8; 32]`, or `String` — none has a user-defined
+# `Drop` — so the precondition is unmet today even though `pop()` is on two
+# live paths. This pin is gate compliance plus cover for a future key type;
+# introducing an `lru` key whose `Drop` can panic is what would make it bite.
+lru = "0.18.2"
 dashmap = "6"
 hex = "0.4"
 axum = "0.8"

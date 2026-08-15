@@ -3,9 +3,14 @@
 # Generates and publishes API reference docs for all language SDKs
 # on every release tag. Also runs on PRs for validation.
 #
-# When a PR doesn't touch doc-relevant paths (bindings/, crates/scp-core/src/,
-# crates/scp-ffi/), all doc jobs skip via `if` condition. GitHub reports
-# skipped jobs as passing for required status checks.
+# When a change doesn't touch doc-relevant paths (see the `docs:` filter in the
+# `changes` job), all doc jobs skip via an `if` condition rather than failing.
+# GitHub counts a skipped job as passing for a required status check, so these
+# jobs are safe to promote to required -- that promotion is the standing plan.
+#
+# Until it happens this whole workflow is ADVISORY: `ci` is the sole required
+# status check, so nothing here can block a merge. See the note on the `push`
+# trigger below for what that cost us.
 #
 # Source: .docs/scaffold/shared.md section "SDK Documentation Requirements"
 # Story: SCP-139
@@ -21,6 +26,13 @@ name: SDK Docs
 
 on:
   push:
+    # Also run on `main` so the post-merge tip is doc-tested. NOTE: this run is
+    # ADVISORY -- `ci` is the only required status check on the Default ruleset,
+    # which is why PR #2274's failing `Rust API docs (rustdoc)` job (run
+    # 30878568409, attempt 1, never re-run) did not block its merge and three
+    # broken intra-doc links rode `main` for ten days. Making rustdoc a required
+    # check is the actual fix; this trigger only shortens time-to-detection.
+    branches: [main]
     tags:
       - "scp-core@*"
   pull_request:
@@ -34,7 +46,13 @@ permissions:
 
 concurrency:
   group: docs-${{ github.ref }}
-  cancel-in-progress: true
+  # Only cancel superseded PR runs. Every `main` push shares one group, and each
+  # run is path-filtered on its OWN diff, so cancelling on push lets a later
+  # docs-irrelevant merge kill an in-flight run that was validating a
+  # doc-breaking tip -- and then skip `rust-docs` itself. Neither run would
+  # validate the broken commit, and a cancelled run notifies nobody. The merge
+  # queue batches 2-5 entries, so that interleaving is the common case.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check-draft:
@@ -59,6 +77,12 @@ jobs:
         with:
           filters: |
             docs:
+              # Manifests count: a dependency removal or a feature-flag change
+              # readily breaks a cross-crate intra-doc link in `scp-runtime`,
+              # the crate that denies `rustdoc::broken_intra_doc_links`.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/*/Cargo.toml'
               - 'bindings/**'
               - 'crates/scp-core/src/**'
               - 'crates/scp-protocol/src/**'
