@@ -1110,11 +1110,15 @@ pub enum ResolvedDidDocument {
 /// resolution cannot read `SCPCapabilities`, `alsoKnownAs`, `#agent` or any
 /// other relay-layer entry off it and receive an empty answer.
 pub struct BootstrapCore {
-    /// Derived from the DID string (§9.6.1); the core carries no key bytes.
+    /// `#0`, derived from the DID string (§9.6.1) rather than from key
+    /// bytes the core carries.
     pub identity_key: VerificationMethod,
+    /// `#active`.
     pub active_key: VerificationMethod,
-    pub pre_rotation_commitment: PreRotationCommitment,
-    pub relays: Vec<RelayEndpoint>,
+    /// The `PreRotationCommitment` service entry.
+    pub pre_rotation_commitment: Service,
+    /// The `SCPRelay` service entries, in publication order.
+    pub relays: Vec<Service>,
 }
 
 /// Provenance of a resolved DID document.
