@@ -39,6 +39,8 @@ PROTECTED_REPO_RELATIVE_PATHS=(
     "scripts/bridge-aliases.json"
     "scripts/check-pure-helpers.sh"
     "scripts/pure-helpers-allowlist.txt"
+    "scripts/check-capability-nullifiers.sh"
+    "crates/scp-testing/tests/integration/capability_nullifiers.rs"
     "scripts/check-construction-pattern.py"
     "scripts/hooks/pretooluse-enforcement-files.sh"
 )

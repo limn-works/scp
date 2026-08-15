@@ -142,6 +142,11 @@ bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
 features only, ZERO nullifier exceptions),
+check-capability-nullifiers.sh + capability_nullifiers.rs (spec §17.17.2
+SCP-CAPSEL-8012 — the workspace-wide three-conjunct nullifier detector for the
+seven provider capabilities; it covers the UNGATED arms that G1's feature-graph
+proof cannot see, and it carries a pinned true-positive fixture and pinned
+false-positive fixtures that a weakening has to delete visibly),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

@@ -151,6 +151,24 @@ jobs:
       - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
 
+  # G1 proves the `testing`-gated nullifier arms absent from shipped artifacts.
+  # This gate covers the UNGATED remainder: a capability-trait method in any
+  # workspace crate that reads neither `self` nor any parameter and still
+  # reports success. The self-test runs first and must pass, so a caller knows
+  # the detector is alive before trusting its verdict on the tree.
+  capability-nullifiers:
+    needs: check-draft
+    name: Capability nullifiers (§17.17.2 SCP-CAPSEL-8012)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Self-test — pinned true positive and pinned false positives
+        run: bash scripts/check-capability-nullifiers.sh --self-test
+      - name: Real check — workspace-wide three-conjunct scan
+        run: bash scripts/check-capability-nullifiers.sh
+
   # ── Cross-layer ──────────────────────────────────────────────────────
   cross-layer:
     needs: check-draft

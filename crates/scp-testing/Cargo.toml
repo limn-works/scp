@@ -244,6 +244,14 @@ path = "tests/integration/conformance.rs"
 name = "ffi_conformance"
 path = "tests/integration/ffi_conformance.rs"
 
+# Spec §17.17.2 SCP-CAPSEL-8012 — the workspace-wide security-nullifier
+# detector for the seven provider capabilities. It lives in its own test target
+# rather than inside `ffi_conformance`, whose scope is the three FFI bridge
+# roots; see the module docs in the file.
+[[test]]
+name = "capability_nullifiers"
+path = "tests/integration/capability_nullifiers.rs"
+
 [[test]]
 name = "sdk_wrapper"
 path = "tests/integration/sdk_wrapper.rs"
