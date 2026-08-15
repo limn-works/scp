@@ -1,5 +1,8 @@
 # Architect Memory
 
+## Index
+- [ADR-062 classification table state](adr062-classification-table-state.md) — 24 rows; six nullifiers ungated with no slice; Slice 9/10/11 status unsettled
+
 ## ADR Review Fixes (Feb 2026)
 10 HIGH-severity issues identified and fixed across Phase 1-3 ADRs:
 - ADR-001: Epoch key grace window (30s max, in-memory only)
