@@ -5324,11 +5324,12 @@
       "gate": "gate-5",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
-        "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift"
+        "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift",
+        "bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift"
       ],
-      "description": "Implement Apple App Attest device attestation adapter in `scp-platform/apple/app_attest.rs`. Implements the `DeviceAttestation` trait for Apple platforms.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nThis is a stub ADR (ADR-025) — implementation details will be refined when the full ADR is written.",
+      "description": "Implement the Apple App Attest device attestation adapter as the Swift class `AppleDeviceAttestation` in `bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift`. ADR-025, the Apple platform adapter, decides that the Apple adapter is a set of Swift classes conforming to the UniFFI callback interfaces, so no Rust file implements this story. An earlier revision of this description named `scp-platform/apple/app_attest.rs`; that file never existed and ADR-025 rules it out.\n\nApp Attest integration: attestation flow, server-side verification, fraud metric handling. App Attest provides hardware-backed device attestation that can be verified server-side.\n\nPer §9.15 key destruction verification: hardware-attested is the strongest trust level. App Attest provides the attestation primitive for this.\n\nStatus correction on 2026-08-15: this story carried `status: \"done\"` while acceptance criteria 3, 4, and 6 had no implementation in any file, before and after the fail-closed rewrite of `AppleDeviceAttestation`. `details.criteriaStatus` names the evidence for each of the six criteria. ADR-025 states the relay-side requirement behind criterion 3 in its own acceptance criterion 3. No ADR and no spec states the fraud-metric requirement behind criterion 4, so an upstream artifact has to state that requirement before an implementer can close the criterion.",
       "acceptanceCriteria": [
         "Implements DeviceAttestation trait for Apple platforms",
         "Attestation request generates App Attest attestation object",
@@ -5356,13 +5357,45 @@
         }
       ],
       "details": {
-        "stubADR": true,
+        "stubADR": false,
         "adr": "ADR-025",
         "protocolSections": [
           "§9.15"
         ],
         "expectedDecisions": {
           "appAttest": "Attestation flow, server-side verification, fraud metric handling"
+        },
+        "criteriaStatus": {
+          "assessedOn": "2026-08-15",
+          "assessedAgainst": "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift and bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift, after the fail-closed rewrite that ADR-025's 2026-08-15 amendment requires",
+          "met": [
+            {
+              "criterion": "Implements DeviceAttestation trait for Apple platforms",
+              "evidence": "`AppleDeviceAttestation` declares conformance to `DeviceAttestationProvider`, the UniFFI callback interface for the Rust `DeviceAttestation` trait, and implements `attest(challenge:deviceId:)`, `assertRequest(requestHash:)`, and `verify(token:)`."
+            },
+            {
+              "criterion": "Attestation request generates App Attest attestation object",
+              "evidence": "`attest(challenge:deviceId:)` calls `DCAppAttestService.attestKey(_:clientDataHash:)` and returns the raw CBOR attestation-object bytes Apple signed."
+            },
+            {
+              "criterion": "Attestation bound to specific key material",
+              "evidence": "`resolveKeyId()` generates one App Attest key and persists its key ID under `dev.limn.scp.appAttest.keyId`; `attest` passes that key ID to `attestKey` and `assertRequest` passes the same key ID to `generateAssertion`, so both bind to one Secure Enclave key."
+            }
+          ],
+          "unmet": [
+            {
+              "criterion": "Server-side verification validates attestation against Apple's attestation root",
+              "evidence": "`verify(token:)` calls `AppAttestAttestationObject.isWellFormed`, which reads CBOR structure and nothing else. Its own doc comment states that it checks no signature and no certificate chain. No file under `crates/` or `bindings/` walks the `x5c` chain to Apple's App Attest root or calls Apple's attestation endpoint. ADR-025 assigns that check to the relay in its acceptance criterion 3, and no relay code performs it."
+            },
+            {
+              "criterion": "Fraud metric handling integrated (risk metric from Apple)",
+              "evidence": "The strings `fraud` and `risk metric` appear in no file under `crates/` or `bindings/` other than one unrelated comment in `crates/scp-ffi/napi/src/identity.rs`. No code extracts the App Attest receipt, exchanges it with Apple, or reads a risk metric. No ADR and no spec states this requirement, so the criterion has no upstream source to implement against."
+            },
+            {
+              "criterion": "Tests pass with App Attest sandbox environment",
+              "evidence": "`AppleDeviceAttestationTests.swift` drives the adapter with `UnsupportedAppAttestService`, a `DCAppAttestService` subclass that overrides `isSupported` to `false`, and with locally built CBOR fixtures. No test contacts Apple's App Attest sandbox and no test runs on a physical device."
+            }
+          ]
         }
       }
     },
