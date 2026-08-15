@@ -42,7 +42,13 @@ permissions:
 
 concurrency:
   group: docs-${{ github.ref }}
-  cancel-in-progress: true
+  # Only cancel superseded PR runs. Every `main` push shares one group, and each
+  # run is path-filtered on its OWN diff, so cancelling on push lets a later
+  # docs-irrelevant merge kill an in-flight run that was validating a
+  # doc-breaking tip -- and then skip `rust-docs` itself. Neither run would
+  # validate the broken commit, and a cancelled run notifies nobody. The merge
+  # queue batches 2-5 entries, so that interleaving is the common case.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check-draft:
