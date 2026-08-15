@@ -662,7 +662,7 @@
     },
     {
       "id": "SCP-245",
-      "title": "Implement protocol-level healing of stale DID documents across resolution layers",
+      "title": "Implement per-layer healing: re-publish a layer's own encoding back to that layer when it serves a stale record",
       "gate": "gate-reachability-2",
       "priority": "P1",
       "severity": "major",

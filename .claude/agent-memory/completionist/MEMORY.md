@@ -20,6 +20,10 @@ artifact diverged) so future passes trace faster.
   `CLAUDE.md`); the gap is real — fix the gap.
 
 ## Reviews
+- [#2297 DID two-encoding amendment](did_two_encoding_amendment_2297.md) — relay layer = full
+  JSON, Mainline = 4-element bootstrap core; deleted cross-layer byte-identity/highest-seq/
+  healing. Where the deleted rule survived: security classifications resting on it (ADR-062
+  E4), end-of-section tables, unnumbered lists above amended items, PRD `title`/`result`.
 - [ADR-057 transport wasm-surface parity](adr057_transport_wasm_surface_parity.md) — every
   embedder-facing `pub fn` on `scp-client::ScpClient` must be mirrored on
   `scp-client-wasm::WasmScpClient`; `resubscribe_all` was not (inter-layer gap). Also: type

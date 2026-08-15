@@ -375,7 +375,7 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 
    **4a. `rotate_active_key(identity, key_custody) -> Identity`** (Layer 1 — common case)
    - Generates a new Ed25519 keypair as the new Active Signing Key via `key_custody.generate_keypair(KeyType::Ed25519)`.
-   - Updates the DID document: adds the new key as a verification method, moves `authentication` and `assertionMethod` references to the new key. Retains the old key as `#retired-{sequence}` for historical verification. Retired key retention is bounded: the document retains at most the 2 most recent retired active keys; older ones are pruned on rotation to prevent unbounded DID document growth within DHT size constraints.
+   - Updates the DID document: adds the new key as a verification method, moves `authentication` and `assertionMethod` references to the new key. Retains the old key as `#retired-{sequence}` for historical verification. **The retention bound this criterion states is unsettled, and the reason it gave has expired.** It read: "the document retains at most the 2 most recent retired active keys; older ones are pruned on rotation to prevent unbounded DID document growth within DHT size constraints." Under the two-layer model (§3.10, §18.2.2C) every entry outside the Mainline bootstrap core lives on the relay layer under a 262,039-byte bound, and retired keys are outside the core, so DHT size constrains nothing here. This is the same expired premise ADR-039's agent-key bullet corrects further down this file. Whether a content signature verifies against a retired key at all, and what bounds retention if it does, is registered as an open question in `.docs/specs/00-open-questions.md` and belongs to a human. Until that question is answered, neither the count of 2 nor any other count is authorized, and no implementation adds the pruner this criterion describes.
    - Signs the DID document update with the **Identity Key** (NOT the old active key).
    - Publishes to DHT with incremented BEP44 sequence number.
    - Returns updated Identity with the new active key handle.
@@ -384,7 +384,7 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 
    **4a′. `rotate_agent_key(identity, key_custody) -> Identity`** (Layer 1 — agent key rotation, ADR-039)
    - Generates a new Ed25519 keypair as the new Agent Signing Key via `key_custody.generate_keypair(KeyType::Ed25519)`.
-   - Updates the DID document: replaces the `#agent` verification method with the new key. Retains the old agent key as `#retired-agent-{sequence}` for historical verification. Retired key retention is bounded: the document retains at most the 2 most recent retired agent keys; older ones are pruned on rotation (same policy as active key rotation) to prevent unbounded DID document growth within DHT size constraints.
+   - Updates the DID document: replaces the `#agent` verification method with the new key. Retains the old agent key as `#retired-agent-{sequence}` for historical verification. **The retention bound this criterion states is unsettled on the same grounds as §4a above**, which carried the identical count of 2 and the identical expired "within DHT size constraints" justification. See the open question in `.docs/specs/00-open-questions.md`.
    - Signs the DID document update with the **Identity Key** (`#0`).
    - Publishes to DHT with incremented BEP44 sequence number.
    - Returns updated Identity with the new agent key handle.
