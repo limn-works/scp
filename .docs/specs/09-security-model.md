@@ -1982,6 +1982,10 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Reconnect overlap | 5s | Overlap window during relay reconnection for gap-filling | §10.5 |
 | Relay timestamp deviation threshold | 60s | Maximum acceptable clock skew between client and relay | §10.5 |
 | Max blob size | 262,144 bytes (256 KiB) | Maximum blob payload size on relay (matches largest padding bucket) | §10.5 |
+| Max DID-record value length | 262,039 bytes | Relay-layer publish cap on a DID document's `value`, before framing: max blob size minus the DID-record frame's 105-byte fixed prefix. A publisher that exceeds it is rejected with `SCP-IDENT-1061` | §18.2.2D, §9.10.12 |
+| Max Mainline BEP44 value length | 1,000 bytes | Mainline publish cap, measured on the **bencoded** `v` value — the quantity BEP44 bounds. A publisher that exceeds it is rejected with `SCP-IDENT-1061` | §18.2.2D |
+| Mainline record TTL | 7,200s (2h) | did:dht's recommended TTL for Mainline records; matches SCP's 2-hour Mainline republish cycle | §18.2.2C, §3.10.5 |
+| Mainline staleness window | 9,000s (2h 30m) | A Mainline record whose timestamp `seq` is older than this reads `Staleness::Stale`; the 2-hour republish cycle plus a 30-minute grace | §3.10.4, §3.10.7 |
 
 #### 9.18.12 Bridge
 
