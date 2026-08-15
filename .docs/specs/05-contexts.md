@@ -2084,7 +2084,7 @@ Reuses existing event types wherever possible. Only one genuinely new type:
 
 Broadcast contexts are discoverable through four mechanisms:
 
-1. **DID document service endpoint.** Authors MAY publish an `SCPBroadcastContext` service entry in their DID document with the context ID and relay URLs.
+1. **DID document service endpoint.** An author MAY publish one `SCPBroadcastContext` service entry in its DID document. The entry carries relay URL(s), and a verifier fetches the author's broadcast-context list from those relays; the entry carries no context ID itself. The count is one entry per DID rather than one per context, because §18.2.2B criterion 2 forbids an inline entry class whose count grows with the author's further activity, and an author creates broadcast contexts for as long as it publishes. The fetched list carries broadcast context IDs only — §5.14.11 mechanism 3 and §9.10 forbid publishing any other context's ID, and moving the list behind a relay fetch does not relax that rule.
 2. **Contexts with discovery outlets.** Authors register broadcast contexts via `agent_register` in contexts with discovery outlets (§6.2.2B), with metadata indicating the context mode.
 3. **`.well-known/scp`.** Operators MAY list broadcast contexts in their `.well-known/scp` document (§18.3). Only broadcast context IDs may be listed — encrypted context IDs MUST NOT appear (§9.10 metadata privacy).
 4. **Out-of-band URI.** The universal context URI format (§18.4) is used for sharing context references: `scp://context/<context_id_hex>?relay=<url>&mode=broadcast`. The legacy format `scp://broadcast/<context_id_hex>?relay=<url>` is accepted as an alias and normalized to the universal format.

@@ -57,7 +57,7 @@ SCP uses multiple DID document service endpoint types, each serving a distinct p
 | `SCPCapabilities` | Application-layer capability endpoints (outlet schemas, agent descriptions) | Discovery Engine (§6.2.2) | ADR-020 |
 | `IdentityPrivateState` | Relay URLs storing identity private state blobs | Identity Manager | §3.7 |
 | `PreRotationCommitment` | SHA-256 commitment hash for pre-rotation key (applies to `#0` and `#active` only; `#agent` is a software key with simpler rotation — no pre-rotation needed, see ADR-039) | Identity Manager (§9.12) | ADR-003 |
-| `SCPBroadcastContext` | Broadcast context ID + relay URLs for author discovery | Discovery Engine | §5.14.11 |
+| `SCPBroadcastContext` | Relay URL(s) where a verifier fetches the author's broadcast-context list. One entry per DID, never one per context (§18.2.2B criterion 2). | Discovery Engine | §5.14.11 |
 | `ParticipationStatements` | Relay URL(s) where the agent's participation statements can be fetched by verifiers | Participation Admission (§7.3.2.1) | §7.3.2.1 |
 | `AttestationRevocations` | Endpoint(s) for checking attestation revocation status | Attestation Verification (§7.4.4) | §7.4.4 |
 | `ScpIdentityLinkAttestation` | Identity link attestation entries for platform verification | Attestation Verification (§3.5.4) | §3.5.3 |
@@ -78,7 +78,7 @@ SCP DID documents follow the W3C DID Core specification (v1.0) with SCP-specific
 | Layer | Encoding | Carries | Size cap |
 |-------|----------|---------|----------|
 | SCP relay network (§3.10.2) | JSON, as specified below | The full DID document | `MAX_DID_RECORD_VALUE_LEN` = 262,039 bytes |
-| Mainline DHT (§3.10.3) | did:dht-conformant DNS packet | The bootstrap core (§18.2.2B) | 1,000 bytes (BEP44 v1) |
+| Mainline DHT (§3.10.3) | did:dht-conformant DNS packet | The bootstrap core (§18.2.2C) | 1,000 bytes, measured on the bencoded BEP44 `v` value (§18.2.2D) |
 
 Every SDK MUST produce byte-identical bytes to every other SDK for the same identity state **within a layer**, because BEP44 signature verification reproduces the signed octets exactly. A byte comparison between the relay encoding and the Mainline encoding is not a conformance check and MUST NOT be performed.
 
@@ -151,61 +151,134 @@ Every SDK MUST produce byte-identical bytes to every other SDK for the same iden
 
 | Field | Required | Constraints |
 |-------|----------|-------------|
-| `@context` | Yes | MUST include the two URIs shown above, in order. |
-| `id` | Yes | MUST match `did:dht:<z-base-32(#0 public key)>`. |
+| `@context` | Yes | MUST include the two URIs shown above, in order. This row binds the relay-layer JSON encoding alone: the did:dht method forbids `@context`, so the Mainline bootstrap core omits it (§18.2.2C). |
+| `id` | Yes | MUST match `did:dht:<z-base-32(#0 public key)>`. The suffix is the z-base-32 encoding of the raw 32 Ed25519 public-key bytes with no character prepended, which the did:dht method fixes as `did-dht-format := did:dht:Z-BASE-32(raw-public-key-bytes)` (§ "Format"). Encoding 32 bytes yields 52 characters. |
 | `verificationMethod` | Yes | MUST include `#0` (Identity Key). MUST include `#active` (Active Signing Key). MAY include `#agent` (Agent Signing Key, optional per ADR-039). No other verification methods permitted. |
-| `verificationMethod[].publicKeyMultibase` | Yes | Multibase-encoded Ed25519 public key (prefix `z` for base58btc). |
+| `verificationMethod[].publicKeyMultibase` | Yes | Multibase base58btc (`z` prefix) over the **multicodec-prefixed** Ed25519 public key: the two-byte `ed25519-pub` varint header `0xed 0x01` followed by the 32 key bytes. The `Ed25519VerificationKey2020` suite named in `verificationMethod[].type` requires that header, so a document that encodes the bare 32 bytes does not verify under the suite it declares. |
 | `authentication` | Yes | MUST reference `#active`. MAY reference `#agent`. MUST NOT reference `#0`. |
 | `assertionMethod` | Yes | Same as `authentication`. |
 | `capabilityDelegation` | Yes | MUST reference only `#0`. |
 | `capabilityInvocation` | Yes | MUST reference `#0` and `#active`. |
-| `service` | Yes | At least one `SCPRelay` entry required. Other types optional. |
+| `alsoKnownAs` | No | At most one entry, and it names the DID that a Layer 2 identity migration moved this identity to (§9.12). Absent on an identity that has not migrated. |
+| `service` | Yes | At least one `SCPRelay` entry required. Other types optional. Each entry satisfies the three criteria in §18.2.2B. |
 | `service[].id` | Yes | Fragment identifier (e.g., `#scp-relay-1`). Unique within the document. |
 | `service[].type` | Yes | One of the types in §18.2.2. |
 
 **Canonical serialization rules — relay layer.** A publisher MUST sort JSON keys lexicographically at every nesting level (RFC 8785 JSON Canonicalization Scheme), MUST emit no whitespace between tokens (minified JSON), and MUST normalize Unicode to NFC. The relay layer's BEP44 signature covers these octets, so two SDKs that canonicalize the same identity state produce the same signed bytes.
 
-**Canonical serialization rules — Mainline layer.** The did:dht DNS-packet encoding fixes its own octet order, so a publisher canonicalizes the Mainline bytes by emitting that encoding as the did:dht method specifies it (§18.2.2B). RFC 8785 does not apply to the Mainline layer, because the Mainline layer carries no JSON.
+**Canonical serialization rules — Mainline layer.** The did:dht DNS-packet encoding fixes its own octet order, so a publisher canonicalizes the Mainline bytes by emitting that encoding as the did:dht method specifies it (§18.2.2C). RFC 8785 does not apply to the Mainline layer, because the Mainline layer carries no JSON.
 
-**Both rules are unimplemented, and a code slice owes them.** `DidDocument::to_json` (`crates/scp-did/src/document.rs:396`) calls `serde_json::to_string_pretty`, which emits indentation and newlines and preserves struct field order rather than sorting keys — so the shipped relay-layer bytes satisfy neither the sorting rule nor the whitespace rule. Neither `crates/scp-did`, nor `crates/scp-identity`, nor `crates/scp-dht` contains an RFC 8785 canonicalizer or calls one; the workspace's RFC 8785 implementation lives in `crates/scp-protocol/src/jcs.rs` and no DID crate references it. No DNS-packet encoder exists at all. Issue #2297, "DID documents do not fit their transport", carries both as fix items 1 and 3; the canonicalization call sites land with the encoder.
+**Four constraints in this section are unimplemented, and a code slice owes them.** Each entry names what the shipped code emits today and which constraint above it violates.
 
-### 18.2.2B The Mainline Bootstrap Core
+- **Canonical serialization.** `DidDocument::to_json` (`crates/scp-did/src/document.rs:396`) calls `serde_json::to_string_pretty`, which emits indentation and newlines and preserves struct field order rather than sorting keys, so the shipped relay-layer bytes satisfy neither the sorting rule nor the whitespace rule. Neither `crates/scp-did`, nor `crates/scp-identity`, nor `crates/scp-dht` contains an RFC 8785 canonicalizer or calls one; the workspace's RFC 8785 implementation lives in `crates/scp-protocol/src/jcs.rs` and no DID crate references it.
+- **The Mainline encoding.** No DNS-packet encoder exists in the workspace, and `DidDht::publish_document` (`crates/scp-identity/src/dht.rs:842`) publishes the `to_json` bytes to Mainline unchanged.
+- **The DID string.** `did_dht_from_public_key` (`crates/scp-did/src/lib.rs:173`) formats `did:dht:z{}` around the z-base-32 encoding, so it prepends a `z` the did:dht method does not define and emits a 53-character suffix where the method's transformation yields 52. The `z` reads as a multibase prefix and is not one; z-base-32's own alphabet contains `z`, so the method's character-class rule accepts the string while the extra character makes it decode to 33 bytes rather than an Ed25519 public key.
+- **`publicKeyMultibase`.** `multibase_encode` (`crates/scp-did/src/document.rs:1253`) formats `z{}` around base58btc of the bare 32 key bytes, with no `0xed 0x01` multicodec header, so the emitted value does not satisfy the `Ed25519VerificationKey2020` suite that `verificationMethod[].type` declares.
 
-The Mainline DHT layer carries a **bootstrap core**: the subset of the DID document a resolver needs in order to reach the relay layer and verify what it finds there. The core carries exactly four things:
+Issue #2297, "DID documents do not fit their transport", carries the first two as fix items 1 and 3; the canonicalization call sites land with the encoder.
 
-| Element | Why the core carries it |
-|---------|-------------------------|
+### 18.2.2B What a DID Document Carries
+
+Three criteria decide the contents of a DID document, and a publisher applies them in order. Criterion 1 decides whether an item may appear in the document at all. Criterion 2 decides whether an admitted item appears as a value or as a pointer naming where a verifier fetches the value. Criterion 3 decides whether the Mainline bootstrap core (§18.2.2C) carries the item. Each criterion states the test that decides the answer. The table under each criterion applies that test to the entries §18.2.2 defines today, so an author proposing a new entry answers the criterion and reads the table as worked examples rather than as the rule.
+
+**Criterion 1 — the document carries what the identity owner asserts about the identity, and never what other participants recorded about it.**
+
+The test: does the identity owner produce this value and sign it into the document, or do other participants produce it by recording the identity's behaviour? An owner-produced value MAY appear in the document. A participant-produced value MUST NOT appear in the document; §9.3 ("Sybil Resistance and Identity Uniqueness") assigns it to context state, where the participants who recorded it hold it. The document MAY carry an owner-asserted pointer naming where a verifier fetches a participant-produced value, because the owner asserts the location while the fetched value keeps the provenance of whoever produced it.
+
+Two indicators narrow the search for a participant-produced value. They suggest the answer and do not decide it: a verifier checks the value by recomputing it from other participants' signed records, or the owner cannot change the value by publishing a new document.
+
+| Entry | Who produces the value | Criterion 1 |
+|-------|------------------------|-------------|
+| `#0`, `#active`, `#agent` verification methods | The owner's custody generates the keypair. | Admitted. |
+| `PreRotationCommitment` service entry | The owner hashes its own pre-rotation public key. | Admitted. |
+| `SCPRelay`, `IdentityPrivateState`, `SCPCapabilities` service entries | The owner chooses the endpoints. | Admitted. |
+| `ScpIdentityLinkAttestation` service entries | A platform signs a proof the owner then publishes (§3.5.2). | Admitted. |
+| `alsoKnownAs` | The owner's migration writes the forwarding record (§9.12). | Admitted. |
+| `AttestationRevocations` service entry | The owner asserts the endpoint; the issuer produces the revocation list. | Admitted as a pointer. |
+| `ParticipationStatements` service entry | The owner asserts the endpoint; contexts produce the statements (§7.3.2.1). | Admitted as a pointer. |
+| Participation history, participation record, economic activity | Contexts and payment receipts record them. | Excluded. §9.3 puts them in context state. |
+
+**Criterion 2 — every entry class that appears as a value carries a maximum count this specification states, and that count does not grow with the owner's further protocol activity.**
+
+The reason the criterion exists: §18.2.2D caps the bytes a publisher may emit on each layer, and §18.2.2D's parse-side companion bounds what a resolver deserializes from an untrusted source. An entry class whose count the owner can raise without limit therefore makes the document unpublishable at the publishing end and a memory-amplification input at the resolving end.
+
+The test: can the owner raise this entry class's count by taking one more action of a kind the protocol invites it to repeat — creating another context, enrolling another device, publishing another outlet? An entry class that answers yes appears as **one** pointer entry naming where a verifier fetches the list. An entry class whose count the protocol fixes (one `#0`, one `#active`, at most one `#agent`, one `PreRotationCommitment`, one `alsoKnownAs` target) or whose count this specification caps with a number (at most 64 `ScpIdentityLinkAttestation` entries, §3.5.3) appears as a value.
+
+Two entry classes fail this criterion as §18.2.2 and §5.14.11 write them today, and both become pointers:
+
+- **`SCPBroadcastContext`.** §5.14.11 discovery mechanism 1 publishes one entry per broadcast context the author creates, and an author creates broadcast contexts for as long as it publishes, so the count grows with the owner's activity and no number caps it. The entry becomes one `SCPBroadcastContext` pointer naming a relay URL where a verifier fetches the author's broadcast-context list. The capability §5.14.11 provides is unchanged — a resolver still discovers an author's broadcast contexts from the DID document — and the privacy rule is unchanged with it: the fetched list carries broadcast context IDs only, because §5.14.11 and §9.10 forbid publishing any other context's ID.
+- **The device-attestation proof.** `.docs/specs/00-open-questions.md` (the resolved Sybil-resistance entry) makes "attestation proof is stored in the DID document as a service entry" a protocol responsibility, and §9.3 records device attestation as a self-asserted signal, so criterion 1 admits it. One proof exists per device the owner enrolls, and the owner enrolls devices for as long as it uses the protocol, so criterion 2 makes it one pointer entry rather than one entry per device. §18.2.2's table carries no row for it yet; the row lands as a pointer.
+
+**Criterion 2 does not yet decide retired verification methods, and this specification does not decide them here.** §18.2.2A's `verificationMethod` row permits `#0`, `#active` and `#agent` and no other verification method, while `rotate_active_key` and `rotate_agent_key` (ADR-003 §4a and §4a′) retain `#retired-{sequence}` and `#retired-agent-{sequence}` entries capped at 2 per role. Retained keys are one per rotation, so criterion 2 applies to them, and the answer depends on a retention decision that no artifact records: whether content signatures verify against retired keys at all, and if they do, whether the retained keys sit inline under a stated cap or behind a pointer. The plan of record holds that decision open and assigns it to a human. Until it lands, §18.2.2A's row stands as written and this criterion states no retention rule.
+
+**Criterion 3 — an entry appears in the Mainline bootstrap core when a resolver needs its value before it has reached any relay.**
+
+§18.5.1's bootstrap chain puts Mainline resolution at level 2, which is the first level where an SDK holding nothing but a DID learns of any relay. A pointer resolves only by fetching from a relay, so a pointer at level 2 names a relay the resolver does not yet know and the chain never starts. Every entry a resolver reads after level 2 completes is a candidate for a pointer, because the resolver holds the relay list by then.
+
+The test: does a resolver need this entry's value in order to reach a relay, or in order to verify what a relay returns? An entry that answers yes to either half appears in the bootstrap core. Every other entry lives on the relay layer alone. §18.2.2C lists what the criterion admits.
+
+### 18.2.2C The Mainline Bootstrap Core
+
+The Mainline DHT layer carries a **bootstrap core**: the entries criterion 3 of §18.2.2B admits, which are the entries a resolver needs before any relay has answered it. The core carries exactly four things:
+
+| Element | Why criterion 3 admits it |
+|---------|---------------------------|
 | The identity key derivation | The DID string encodes the `#0` public key (§9.6.1), so a resolver derives `#0` from the DID it is resolving and the core carries no separate `#0` entry. |
-| The `#active` verification method | A resolver verifies a signature before it trusts any document it fetched from a relay. |
-| The `PreRotationCommitment` service entry | Rotation verification (§9.12) needs the commitment at the same moment it needs `#active`. |
-| The `SCPRelay` service entries | §18.5.1 level 2 makes the Mainline resolution the first place an SDK learns of any relay, so a pointer to a relay list would need a relay to fetch it and the chain would not start. Relay entries stay inline; everything outside the core may be a pointer. |
+| The `#active` verification method | A resolver verifies a signature before it trusts a document a relay returned, and `#active` is the key that signature names. |
+| The `PreRotationCommitment` service entry | Rotation verification (§9.12) reads the commitment at the same moment it reads `#active`. |
+| The `SCPRelay` service entries | Level 2 of §18.5.1 is where the SDK first learns of any relay, so a pointer to a relay list would name a relay the resolver cannot yet reach. |
 
-Everything else a DID document carries — `SCPCapabilities`, `IdentityPrivateState`, `SCPBroadcastContext`, `ParticipationStatements`, `AttestationRevocations`, `ScpIdentityLinkAttestation`, `alsoKnownAs`, and the `#agent` verification method — lives on the relay layer only. A resolver that holds only the bootstrap core holds the relay list, so it fetches the full document from a relay rather than reading those fields out of Mainline.
+Everything else a DID document carries — `SCPCapabilities`, `IdentityPrivateState`, `SCPBroadcastContext`, `ParticipationStatements`, `AttestationRevocations`, `ScpIdentityLinkAttestation`, `alsoKnownAs`, and the `#agent` verification method — lives on the relay layer only. A resolver holding the bootstrap core holds the relay list, so it fetches the full document from a relay rather than reading those entries out of Mainline.
 
-**Two questions about the Mainline encoding are open, and the encoder slice settles both against the did:dht method specification as the primary source** (issue #2297 fix item 3). First, which DNS resource record carries each core element. Second, which compression the method requires: issue #2297 states did:dht requires a gzipped DNS packet, while RFC 1035 §4.1.4 defines DNS message pointer compression, which is not gzip. Two different mechanisms have been named for the same field, so at most one is right, and the encoder's output bytes depend on the answer. This section states the core's membership, which does not depend on either answer; it does not state the wire mapping.
+**The Mainline encoding is the did:dht method's DNS-packet encoding, and the method specification fixes it.** The did:dht method specification, § "Operations → Create" step 4 and § "DIDs as DNS Records", states: "Compress the DNS packet as per [RFC1035] section 4.1.4", and "`v` MUST be set to a bencoded compressed DNS packet from the prior step" (https://did-dht.com, `#create` and `#dids-as-dns-records`). RFC 1035 §4.1.4 defines DNS message name-pointer compression. **The method specifies no other compression, and the string "gzip" does not appear anywhere in it.** Issue #2297, "DID documents do not fit their transport", says did:dht "requires a gzipped DNS packet"; that sentence is wrong and the method specification governs.
 
-### 18.2.2C Per-Layer Size Caps
+The method fixes the record layout the encoder emits, and SCP adopts it unchanged rather than defining its own:
 
-**Normative.** A publisher MUST reject an encoding whose byte length exceeds the cap of the layer that encoding targets, and MUST reject it at publish time with a typed error rather than emitting a publish the transport will refuse:
+| Core element | did:dht record | Method section |
+|--------------|----------------|----------------|
+| Root record listing the aliases present | `_did.<ID>.` `TXT`, rdata `v=…;vm=…;auth=…;asm=…;inv=…;del=…;svc=…` | § "Root Record" |
+| `#active` verification method | `_kN._did.` `TXT`, rdata `id=…;t=…;k=…;a=…` | § "Verification Methods" |
+| `PreRotationCommitment` and `SCPRelay` service entries | `_sN._did.` `TXT`, rdata `id=…;t=…;se=…` | § "Services" |
+| Verification relationships (`authentication`, `assertionMethod`) | Carried in the root record's `auth=` and `asm=` fields; they get no record of their own. | § "Verification Relationships" |
 
-| Layer | Cap | Source |
-|-------|-----|--------|
-| Mainline DHT | 1,000 bytes | BEP44 v1 `value` limit, enforced server-side by Mainline nodes. |
-| SCP relay network | 262,039 bytes | `MAX_DID_RECORD_VALUE_LEN` (`crates/scp-protocol/src/envelope/did_record.rs:88`) = `MAX_BLOB_SIZE` (262,144, §9.18.11) − `DID_RECORD_FIXED_PREFIX_LEN` (105). |
+Two consequences of adopting the method's encoding, both of which the relay-layer JSON encoding does not share:
 
-Neither cap is enforced today. A publish that exceeds the BEP44 cap is rejected by the Mainline node as error 205, which the `mainline` crate maps to a timeout and `scp-dht` re-wraps as `DhtPublishFailed`, so the republish loop retries the same over-cap bytes every 30 minutes and the failure presents as flaky connectivity.
+- **The bootstrap core MUST NOT carry `@context`.** The method specification states: "This specification does not make use of JSON-LD. As such, DID DHT Documents MUST NOT include the `@context` property" (§ "Operations → Create"). §18.2.2A requires `@context` on the relay-layer JSON encoding, and that requirement binds the relay layer alone.
+- **The recommended record TTL is 7,200 seconds**, which the method names as "the default TTL for Mainline records" (§ "DIDs as DNS Records"). SCP's 2-hour Mainline republish cycle (§3.10.5) already matches it.
 
-**This publish-side cap is a different requirement from the parse-side cap that issue #1656, "add a `MAX_DID_DOCUMENT_SIZE` size gate before `serde_json::from_str`", asks for.** The publish-side cap bounds what a publisher emits, and it is the clause a publisher's size gate enforces. The parse-side cap bounds what a resolver deserializes from an untrusted source, and it guards the resolver against a memory-amplification input. Issue #1656 is open, and both caps are owed.
+One mapping question the method does not answer, and the encoder slice answers it: the method's service record writes `t=N` where "`N` is the Service's `type`", and SCP's service types (`SCPRelay`, `PreRotationCommitment`, and the rest of §18.2.2's table) are SCP-defined strings that the did:dht registry does not list. Which token each SCP service type writes into `t=` is SCP's choice, and the encoder slice records it here when it lands. Issue #2297 fix item 3 carries that work.
 
-**Measured sizes, against the relay-layer JSON encoding as the code emits it today.** Each figure is the byte length of `DidDocument::to_json` for a document built through `DidDocument::new` with three Ed25519 public keys and a SHA-256 pre-rotation commitment:
+### 18.2.2D Per-Layer Size Caps and the Publish-Side Size Gate
+
+**Normative.** A publisher MUST measure each encoding it produces against the cap of the layer that encoding targets, and MUST reject an over-cap encoding at publish time. The publisher MUST NOT truncate the encoding, MUST NOT drop entries to fit, and MUST NOT publish the encoding to the other layer instead.
+
+| Layer | Cap | What the publisher measures | Source |
+|-------|-----|------------------------------|--------|
+| Mainline DHT | 1,000 bytes | The **bencoded** form of the BEP44 `v` value, which is the length prefix plus the compressed DNS packet. | BEP44 § "Mutable Items": "Storing nodes MAY reject put requests where the bencoded form of v is longer than 1000 bytes." The did:dht method restates the bound as flat: "BEP44 payload sizes are limited to 1000 bytes" (§ "Implementation Considerations → Size Constraints"). |
+| SCP relay network | 262,039 bytes | The `value` field the publisher wraps in a DID-record frame, before framing. | `MAX_DID_RECORD_VALUE_LEN` (`crates/scp-protocol/src/envelope/did_record.rs:88`) = `MAX_BLOB_SIZE` (262,144, §9.18.11) − `DID_RECORD_FIXED_PREFIX_LEN` (105). |
+
+**Where the gate sits.** The publisher applies the gate after that layer's encoding completes and before it requests a signature over the encoded bytes, on both publish paths — the Mainline publisher and the relay publisher — so no publish path can reach a transport without passing it. The gate does not sit in the transport: a relay or a Mainline client receives bytes it did not encode and cannot distinguish an over-cap DID document from any other over-cap blob. The DID-record frame's own bound on `value` stays where it is, as a second check on the same quantity at the framing boundary.
+
+**What the caller receives.** The publisher returns a typed error carrying the layer that rejected the encoding, the measured byte length, and the cap. The error code is `SCP-IDENT-1061` on every bridge and every SDK.
+
+**Why the error must be typed and must surface.** An over-cap Mainline publish fails silently today. The Mainline node rejects the put with BEP44 error 205, the `mainline` crate surfaces that rejection as a timeout, `scp-dht` re-wraps the timeout as `DhtPublishFailed`, and the republish loop retries the same over-cap bytes on a backoff capped at 30 minutes. A caller reading that sequence sees intermittent network trouble and never learns that its document cannot fit the layer it is publishing to. `SCP-IDENT-1061` names the cause at the moment the publisher can still act on it.
+
+**The gate ships with fixtures at and above each cap** — one encoding whose measured length equals the cap and publishes, and one that exceeds it by a single byte and is rejected — so a later change that moves the measurement point fails a test rather than restoring the silent failure.
+
+**This publish-side cap is a different requirement from the parse-side cap that issue #1656, "add a `MAX_DID_DOCUMENT_SIZE` size gate before `serde_json::from_str`", asks for.** The publish-side cap bounds what a publisher emits. The parse-side cap bounds what a resolver deserializes from an untrusted source and guards the resolver against a memory-amplification input; `DidDocument::from_json` (`crates/scp-did/src/document.rs:405`) is a bare `serde_json::from_str` with no length bound and no depth bound. Issue #1656 is open, and both caps are owed.
+
+**Measured sizes, against the relay-layer JSON encoding as the code emits it today.** Each figure is the byte length of `DidDocument::to_json` for a document built through `DidDocument::new` with Ed25519 public keys, a SHA-256 pre-rotation commitment, and `wss://relay.example.com/scp/v1` as the relay URL. "Minified" is `serde_json::to_string` of the same value.
 
 | Shape | `to_json` (pretty) | Minified |
 |-------|--------------------|----------|
-| `#0` + `#active`, `PreRotationCommitment` only | 1,281 bytes | 1,103 bytes |
+| `#0` + `#active`, `PreRotationCommitment`, no relay entry | 1,281 bytes | 1,103 bytes |
 | The same plus one `SCPRelay` entry (the minimum §18.2.2 permits) | 1,467 bytes | 1,255 bytes |
-| Bootstrap-core field set, still as JSON | 1,170 bytes | 1,000 bytes |
+| The same plus the `#agent` verification method, no relay entry | 1,732 bytes | 1,502 bytes |
+| Bootstrap-core entry set, still as JSON | 1,170 bytes | 1,000 bytes |
+| The bootstrap-core entry set with `@context` removed | 1,058 bytes | 905 bytes |
+| The same with every absolute `did:dht:…#fragment` identifier replaced by its bare fragment | 753 bytes | 600 bytes |
 
-The third row is why the two encodings are two encodings rather than one. Reducing the field set to the bootstrap core does not bring a JSON document under the BEP44 cap: the core is still 1,000 bytes minified with the shortest relay URL the spec's own example uses, and any real relay hostname pushes it over. The core fits Mainline only once the encoding changes — dropping `@context` takes the same core to 905 bytes, and replacing every absolute `did:dht:…#fragment` identifier with a relative fragment takes it to 478 bytes. A did:dht DNS packet does both by construction, which is why the method specifies that encoding.
+The fourth row is why the two layers carry two encodings rather than one. Reducing the entry set to the bootstrap core does not bring a JSON encoding under the BEP44 cap: the core measures exactly 1,000 bytes minified with the shortest relay URL this specification's own example uses, and bencoding that value adds its `1000:` length prefix, so the bencoded form BEP44 measures is 1,005 bytes before any real relay hostname is substituted. The core fits Mainline only once the encoding changes, and the last two rows measure the two changes the did:dht DNS encoding makes by construction: it carries no `@context`, and it writes bare aliases rather than repeating the 61-character DID inside every identifier.
 
 ### 18.2.3 Multiple Relay Entries
 
@@ -385,7 +458,7 @@ How a new identity learns its first relay. This closes the relay discovery open 
 When an identity needs to discover relays, the SDK follows this priority chain:
 
 1. **Explicit configuration.** Relay URLs provided directly in `TransportConfig` at SDK initialization. Highest trust — the operator or user explicitly chose these relays.
-2. **DID document resolution.** Resolve the identity's own bootstrap core via Mainline DHT. Extract `SCPRelay` service entries. Self-certifying (§9.6.3). This level is why the relay list stays inline in the Mainline bootstrap core (§18.2.2B) rather than behind a pointer: a pointer to a relay list would need a relay to fetch it, and this level is where the SDK first learns of any relay.
+2. **DID document resolution.** Resolve the identity's own bootstrap core via Mainline DHT. Extract `SCPRelay` service entries. Self-certifying (§9.6.3). This level is why the relay list stays inline in the Mainline bootstrap core (§18.2.2C) rather than behind a pointer: a pointer to a relay list would need a relay to fetch it, and this level is where the SDK first learns of any relay.
 3. **`.well-known/scp` resolution.** If a bootstrap domain is configured, fetch `https://<domain>/.well-known/scp` and extract the relay URL. Verify against DID document (§18.3.2).
 4. **Peer relay discovery.** For identities that share contexts with known peers, resolve the peer's DID document and use overlapping relay sets. This enables relay discovery through the social graph.
 5. **Fallback relay list.** A hardcoded list of well-known community relays shipped with the SDK. Last resort. These relays are not privileged — they are default suggestions that can be overridden. The SDK SHOULD warn when falling back to default relays. The fallback list MUST include at least one free relay (no `economic` field in `relay_config`) — this is a protocol invariant that prevents economic gatekeeping of basic protocol operation (§19.8, §19.14).

@@ -559,7 +559,7 @@ Identity verification is the trust root for the entire protocol. If an attacker 
 
 The did:dht method (target DID method for SCP) is **self-certifying**: the DID string itself is the z-base-32 encoding of the Ed25519 public key. When resolving a did:dht identifier:
 
-1. The client queries the Mainline DHT for the BEP44 signed record associated with the DID. That record carries the bootstrap core as a did:dht DNS packet (§18.2.2B), not the full document.
+1. The client queries the Mainline DHT for the BEP44 signed record associated with the DID. That record carries the bootstrap core as a did:dht DNS packet (§18.2.2C), not the full document.
 2. The client verifies the BEP44 record signature against the public key encoded in the DID string.
 3. If the signature is valid, the bootstrap core is authentic. No trusted third party is required. The client reads the relay list from the core and queries a relay for the full document (§3.10.2), which carries its own BEP44 signature under the same key and is verified the same way.
 
@@ -594,7 +594,7 @@ A DID's relay list (service endpoints) is published in the DID document.
 
 **For transport adapters with native relay lists:** Some transport adapters (e.g., Nostr via NIP-65) publish relay lists in transport-specific formats signed by a keypair derived from the DID key. This provides relay list authentication independent of the DID method but is adapter-specific, not a protocol requirement.
 
-**Attack: relay list substitution.** A compromised DHT node or relay could serve a stale relay list, directing messages to relays the recipient no longer uses. Defense: sequence numbers in BEP44 records ensure freshness. A client MUST reject a relay list whose sequence number is lower than the last number that client observed **on the layer that served it**. Both layers carry the relay list — it is part of the Mainline bootstrap core (§18.2.2B) as well as the relay-layer document — so a client that resolves both layers holds two independently-signed copies, each checked against its own layer's counter.
+**Attack: relay list substitution.** A compromised DHT node or relay could serve a stale relay list, directing messages to relays the recipient no longer uses. Defense: sequence numbers in BEP44 records ensure freshness. A client MUST reject a relay list whose sequence number is lower than the last number that client observed **on the layer that served it**. Both layers carry the relay list — it is part of the Mainline bootstrap core (§18.2.2C) as well as the relay-layer document — so a client that resolves both layers holds two independently-signed copies, each checked against its own layer's counter.
 
 ### 9.6.4 First-Contact Trust Bootstrapping
 
@@ -1249,7 +1249,7 @@ DID-RECORD (DidRecordV1) :=
   public_key: [u8; 32]                      # Ed25519 public key — carried for the RELAY's verify; the client ignores it
   seq:        u64                           # 8 bytes big-endian — BEP44 sequence
   signature:  [u8; 64]                      # Ed25519 BEP44 signature, raw fixed-width, NO length prefix
-  value:      [u8]                          # trailing remainder = BEP44-signed payload = the RELAY-layer encoding of the DID document, canonical JSON (opaque to the frame; owned by §18.2.2A). Mainline's own encoding is the DNS-packet bootstrap core (§18.2.2B) and never travels in this frame.
+  value:      [u8]                          # trailing remainder = BEP44-signed payload = the RELAY-layer encoding of the DID document, canonical JSON (opaque to the frame; owned by §18.2.2A). Mainline's own encoding is the DNS-packet bootstrap core (§18.2.2C) and never travels in this frame.
 ```
 
 - **version** — a `u8`, starting at 1. Any change to field encoding bumps the version. There is no magic tag and no `kind` field (the routing-ID domain is the type discriminant, above).
@@ -1277,7 +1277,7 @@ The fixed prefix is `1 + 32 + 8 + 64 = 105` bytes, and the total frame length is
 **The frame does not alter the bytes it wraps, and the two layers do not carry the same bytes (§3.10.5).** Two separate claims, and only the first is about framing:
 
 1. **Framing is transparent.** The frame wraps `value` for relay transport only; it never enters, reorders, or alters the signed bytes. A `(value, signature, seq)` triple decoded from a DID-record frame is byte-identical to the triple the publisher signed and verifies identically. This is a property of the frame, and it holds unconditionally.
-2. **The two layers carry different payloads.** The relay layer's `value` is the full DID document as canonical JSON; the Mainline layer's `value` is the bootstrap core as a did:dht DNS packet (§18.2.2A, §18.2.2B). A publisher signs each separately and advances each layer's sequence number separately. A relay-layer triple and a Mainline triple for the same identity are therefore **not** byte-identical, and this specification never requires them to be.
+2. **The two layers carry different payloads.** The relay layer's `value` is the full DID document as canonical JSON; the Mainline layer's `value` is the bootstrap core as a did:dht DNS packet (§18.2.2A, §18.2.2C). A publisher signs each separately and advances each layer's sequence number separately. A relay-layer triple and a Mainline triple for the same identity are therefore **not** byte-identical, and this specification never requires them to be.
 
 The §3.10.4 rule that two valid records sharing a sequence number MUST be byte-identical is a **within-layer** rule: it detects a publisher that emitted two different encodings of one payload on one layer at one sequence number. Applying it across layers would compare a JSON document against a DNS packet and report a defect on every conformant publish, so a resolver MUST NOT apply it across layers.
 

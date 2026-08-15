@@ -36,7 +36,7 @@ Each test specifies:
 | **Spec Sections** | §3.1, §3.2, ADR-039 |
 | **Preconditions** | None. |
 | **Steps** | 1. Generate Ed25519 keypair. 2. Create did:dht DID. 3. Build DID document with verification methods `#0` (root), `#active` (signing), `#agent` (agent signing). |
-| **Expected Outcome** | The **relay-layer** DID document (§18.2.2A) contains exactly 3 verification methods with IDs `#0`, `#active`, `#agent`. All are Ed25519VerificationKey2020. The DID string is the z-base-32 encoding of the `#0` public key. The Mainline bootstrap core carries `#active` alone and derives `#0` from the DID string (§18.2.2B), so this count is not asserted against a Mainline resolution. |
+| **Expected Outcome** | The **relay-layer** DID document (§18.2.2A) contains exactly 3 verification methods with IDs `#0`, `#active`, `#agent`. All are Ed25519VerificationKey2020. The DID string is the z-base-32 encoding of the `#0` public key. The Mainline bootstrap core carries `#active` alone and derives `#0` from the DID string (§18.2.2C), so this count is not asserted against a Mainline resolution. |
 
 ### CONF-002: DID Resolution and Self-Certification
 
@@ -45,7 +45,7 @@ Each test specifies:
 | **Layer** | Identity |
 | **Tier** | Core |
 | **Spec Sections** | §3.1, §9.6.1 |
-| **Preconditions** | Bootstrap core (§18.2.2B) published to Mainline DHT (or test DHT) as a did:dht-conformant DNS packet. |
+| **Preconditions** | Bootstrap core (§18.2.2C) published to Mainline DHT (or test DHT) as a did:dht-conformant DNS packet. |
 | **Steps** | 1. Resolve DID via DHT lookup. 2. Verify BEP44 signature against the public key encoded in the DID string. 3. Decode the DNS packet into the bootstrap core. |
 | **Expected Outcome** | BEP44 signature verification succeeds. The decoded bootstrap core matches the core that was published to Mainline, byte for byte. The public key embedded in the DID string matches `#0`, which the core carries by derivation rather than as an entry. The resolution reports `BootstrapCore` completeness (§3.10.10), and the implementation MUST NOT compare these bytes against the relay layer's JSON document — the two layers carry different encodings (§18.2.2A). |
 

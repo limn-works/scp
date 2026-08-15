@@ -780,7 +780,7 @@ SCP introduces a dual-layer resolution architecture:
 - **Primary: SCP relay-based resolution.** DID documents published to SCP relays via the existing PUBLISH/QUERY operations (ADR-004), addressed by a deterministic `routing_id`. An SCP-native relay validates each DID-record blob it stores and keeps a single highest-sequence slot per `routing_id` (§3.10.2), which is what makes the relay layer suppression-resistant (§3.10.8); foreign transports that cannot validate store the record opaquely and stay correct via client-side verification. Grows with the SCP network.
 - **Fallback: Mainline DHT.** Existing did:dht resolution via BEP44. Works from day one. Transitions from "only path" to "fallback path" as the relay network matures.
 
-**The two layers carry two encodings, and each layer is authoritative for what it carries.** The relay layer carries the **full DID document** as JSON inside a DID-record frame (§9.10.12), capped at `MAX_DID_RECORD_VALUE_LEN` = 262,039 bytes. Mainline carries the **bootstrap core** (§18.2.2B) as a did:dht-conformant DNS packet, capped at the 1,000 bytes BEP44 v1 permits. The two layers therefore carry different bytes rather than copies of one payload. The measured reason is in §18.2.2C: the smallest document §18.2.2A permits is 1,255 bytes as minified JSON, already over Mainline's cap, and attestations and further service entries grow it from there (§3.10.2 size budget). No single payload satisfies both caps. Consequences that every rule below depends on:
+**The two layers carry two encodings, and each layer is authoritative for what it carries.** The relay layer carries the **full DID document** as JSON inside a DID-record frame (§9.10.12), capped at `MAX_DID_RECORD_VALUE_LEN` = 262,039 bytes. Mainline carries the **bootstrap core** (§18.2.2C) as a did:dht-conformant DNS packet, capped at the 1,000 bytes BEP44 v1 permits. The two layers therefore carry different bytes rather than copies of one payload. The measured reason is in §18.2.2D: the smallest document §18.2.2A permits is 1,255 bytes as minified JSON, already over Mainline's cap, and attestations and further service entries grow it from there (§3.10.2 size budget). No single payload satisfies both caps. Consequences that every rule below depends on:
 
 - **The relay layer is authoritative for the full document.** Every field outside the bootstrap core — `SCPCapabilities`, `IdentityPrivateState`, `SCPBroadcastContext`, `ParticipationStatements`, `AttestationRevocations`, `ScpIdentityLinkAttestation`, `alsoKnownAs`, the `#agent` verification method — exists only there.
 - **Mainline is authoritative for the bootstrap core.** A resolver that reaches only Mainline holds `#active`, the pre-rotation commitment, and the relay list, which is what it needs to reach the relay layer.
@@ -868,12 +868,12 @@ This mirrors, and extends to a stored public record, the exact check `BRIDGE_REG
 - **Why the frame carries `public_key`.** The relay holds only the one-way `routing_id` hash and cannot recover the DID or its key from it — so, exactly as `BRIDGE_REGISTER` carries `public_key` for the relay to verify against (§10.12.4), the DID-record frame carries `public_key` for the relay's binding + signature check. The client ignores this field and verifies with its own DID-derived key.
 - **Self-verifying blob payload.** The frame carries the BEP44 `(value, signature, seq)` triple, not the bare document bytes. Because the signature and sequence travel inside the blob, a resolver verifies the record from the blob alone — no DHT round-trip is required to obtain the signature.
 - **Multi-relay.** A resolver can QUERY any relay that stores the target DID document. Identity owners SHOULD publish to multiple relays — their own relays plus bootstrap relays from the fallback relay list (§18.5.1) — for availability and suppression resistance.
-- **Size budget.** The relay layer carries the full JSON document, bounded by `MAX_DID_RECORD_VALUE_LEN` = 262,039 bytes (`MAX_BLOB_SIZE` 262,144, ADR-004 / §9.18.11, minus the frame's 105-byte fixed prefix). A publisher MUST reject a relay-layer document that exceeds that bound at publish time (§18.2.2C). Measured against the current JSON encoding, a document with `#0`, `#active`, a pre-rotation commitment and one `SCPRelay` entry is 1,467 bytes; attestations and additional service entries grow it, and the 262,039-byte bound is what caps that growth.
+- **Size budget.** The relay layer carries the full JSON document, bounded by `MAX_DID_RECORD_VALUE_LEN` = 262,039 bytes (`MAX_BLOB_SIZE` 262,144, ADR-004 / §9.18.11, minus the frame's 105-byte fixed prefix). A publisher MUST reject a relay-layer document that exceeds that bound at publish time (§18.2.2D). Measured against the current JSON encoding, a document with `#0`, `#active`, a pre-rotation commitment and one `SCPRelay` entry is 1,467 bytes; attestations and additional service entries grow it, and the 262,039-byte bound is what caps that growth.
 - **TTL and republishing.** The maximum relay blob TTL is 604800 seconds (7 days). Identity owners MUST republish to relays at least every 6 days (1-day safety margin). The RepublishManager already handles periodic DHT republishing on a 2-hour cycle; relay republishing adds a separate 6-day cycle for relay-stored DID documents.
 
 ### 3.10.3 Layer 2: Mainline DHT (Fallback)
 
-did:dht resolution via BEP44 signed mutable items on Mainline DHT. The signature mechanism is unchanged from §3.8 and §9.6.1. Two things change: the layer's role moves from "only resolution path" to "fallback resolution path," and its payload is the **bootstrap core** encoded as a did:dht-conformant DNS packet (§18.2.2B), not the full JSON document. A resolver that reads Mainline gets `#active`, the pre-rotation commitment and the relay list, and fetches everything else from a relay.
+did:dht resolution via BEP44 signed mutable items on Mainline DHT. The signature mechanism is unchanged from §3.8 and §9.6.1. Two things change: the layer's role moves from "only resolution path" to "fallback resolution path," and its payload is the **bootstrap core** encoded as a did:dht-conformant DNS packet (§18.2.2C), not the full JSON document. A resolver that reads Mainline gets `#active`, the pre-rotation commitment and the relay list, and fetches everything else from a relay.
 
 The DHT layer remains essential for:
 
@@ -917,7 +917,7 @@ The full resolution sequence:
       the highest-seq valid record. This is the full document, and it is
       authoritative for every field (§3.10).
    b. Mainline layer. Take the valid record. This is the bootstrap core, and
-      it is authoritative for the core's four elements (§18.2.2B).
+      it is authoritative for the core's four elements (§18.2.2C).
    c. The resolver MUST NOT compare a relay-layer sequence number against a
       Mainline sequence number, and MUST NOT discard one layer's record
       because the other layer returned a higher number. The two layers carry
@@ -954,11 +954,16 @@ Identity owners publish to both layers on every DID document create or update:
 On DID document create or update:
 1. Serialize the document TWICE, once per layer (§18.2.2A):
    a. relay_value = canonical JSON (RFC 8785) of the full document.
-      Reject at this step if len(relay_value) > MAX_DID_RECORD_VALUE_LEN
-      (262039), with a typed error (§18.2.2C).
-   b. dht_value = did:dht-conformant DNS packet of the bootstrap core
-      (§18.2.2B). Reject at this step if len(dht_value) > 1000, with a
-      typed error (§18.2.2C).
+      Reject at this step, before requesting a signature, if
+      len(relay_value) > MAX_DID_RECORD_VALUE_LEN (262039). The publisher
+      returns SCP-IDENT-1061 carrying the layer, the measured length and
+      the cap (§18.2.2D).
+   b. dht_value = did:dht-conformant DNS packet of the bootstrap core,
+      compressed per RFC 1035 §4.1.4 (§18.2.2C). Reject at this step,
+      before requesting a signature, if the BENCODED form of dht_value
+      exceeds 1000 bytes — that is the quantity BEP44 bounds, and it is
+      the length prefix plus the packet. The publisher returns
+      SCP-IDENT-1061 (§18.2.2D).
 2. Sign each value SEPARATELY via BEP44 (Ed25519 signature over the
    BEP44-canonical bencoded buffer bencode(salt?, seq, value) — the sequence
    number precedes the value, `3:seqi<seq>e1:v<value>`, per the BEP44 spec,
@@ -981,7 +986,7 @@ On DID document create or update:
 
 **The two layers receive different bytes under different signatures.** The relay layer carries the full document as JSON; Mainline carries the bootstrap core as a DNS packet. A publisher signs each layer's bytes with the same identity key over a different payload, so a record retrieved from a relay and a record retrieved from Mainline are **not** byte-identical, and nothing in this protocol requires them to be. Self-certification still holds on both layers unchanged: each record's signature verifies against the public key encoded in the DID string (§9.6.1), which is what makes each layer's storage backend untrusted. The DID-record frame wraps the relay layer's `value` for transport and does not enter the signed bytes (§9.10.12).
 
-**Why two encodings rather than one.** As JSON, the smallest document §18.2.2A permits is 1,255 bytes minified, against BEP44's 1,000-byte cap. Reducing the field set does not close the gap either: the bootstrap core is still 1,000 bytes as minified JSON with the shortest relay URL this specification's own example uses (§18.2.2C gives the measurements). What brings the core under the cap is the did:dht DNS encoding, which carries no `@context` and uses relative fragment identifiers instead of repeating the absolute DID in every `id` and `controller`. Publishing one encoding to both layers is therefore unavailable, not merely inconvenient.
+**Why two encodings rather than one.** As JSON, the smallest document §18.2.2A permits is 1,255 bytes minified, against BEP44's 1,000-byte cap. Reducing the entry set does not close the gap either: the bootstrap core measures 1,000 bytes as minified JSON with the shortest relay URL this specification's own example uses, and bencoding that value adds its length prefix, so the bencoded form BEP44 bounds is 1,005 bytes (§18.2.2D gives every measurement). What brings the core under the cap is the did:dht DNS encoding, which carries no `@context` — the method forbids it — and writes bare record aliases instead of repeating the DID inside every `id` and `controller`. Publishing one encoding to both layers is therefore unavailable.
 
 ### 3.10.6 Anti-Segmentation Invariant
 
@@ -989,7 +994,7 @@ On DID document create or update:
 
 The risk: if the DHT layer works well enough and relay-based resolution is "just faster," developers may skip DHT publishing as unnecessary overhead. If this becomes widespread, identity resolution fragments — some DIDs resolvable only on relays, others only on DHT. A resolver that checks only one layer misses identities published only on the other. The network splits into two resolution namespaces without anyone intending it.
 
-**Two encodings are not two namespaces.** Both layers address the same identity by the same DID, both carry `#active`, the pre-rotation commitment and the relay list, and both verify against the key the DID string encodes. What differs is how much each layer carries beyond the core (§18.2.2B), so an identity present on both layers is resolvable from either. The invariant this section protects is presence on both layers, and it is unchanged.
+**Two encodings are not two namespaces.** Both layers address the same identity by the same DID, both carry `#active`, the pre-rotation commitment and the relay list, and both verify against the key the DID string encodes. What differs is how much each layer carries beyond the core (§18.2.2C), so an identity present on both layers is resolvable from either. The invariant this section protects is presence on both layers, and it is unchanged.
 
 The SDK prevents this by default. RepublishManager publishes to both layers on every cycle. Disabling either layer requires explicit opt-out (`RepublishConfig::disable_dht()` or `RepublishConfig::disable_relay()`) and the SDK MUST log a warning when either is disabled. The warning states: "DID resolution layer disabled. This identity may not be resolvable by all peers."
 
@@ -1063,7 +1068,7 @@ pub struct ResolvedDidDocument {
     pub completeness: DocumentCompleteness,
 }
 
-/// How much of the DID document a resolution returned (§18.2.2B).
+/// How much of the DID document a resolution returned (§18.2.2C).
 pub enum DocumentCompleteness {
     /// Every field the identity published. Only the relay layer serves this.
     Full,
@@ -1091,7 +1096,7 @@ pub enum ResolutionSource {
 
 The dual-layer architecture is designed to be self-reinforcing as the SCP network grows:
 
-- **Day one.** Mainline dominates. Relay-layer queries mostly fail because few relays exist and few identities have published DID documents to relays. Resolution latency is Mainline latency, and what most resolutions return is the bootstrap core (§18.2.2B). A caller that needs a field outside the core — a capability endpoint, an attestation entry, `alsoKnownAs` — gets an unresolved answer for that field until the identity's relays answer (§3.10.3). This differs from the pre-§3.10 architecture, which attempted to carry the whole document on Mainline and failed the 1,000-byte BEP44 cap while reporting a timeout.
+- **Day one.** Mainline dominates. Relay-layer queries mostly fail because few relays exist and few identities have published DID documents to relays. Resolution latency is Mainline latency, and what most resolutions return is the bootstrap core (§18.2.2C). A caller that needs a field outside the core — a capability endpoint, an attestation entry, `alsoKnownAs` — gets an unresolved answer for that field until the identity's relays answer (§3.10.3). This differs from the pre-§3.10 architecture, which attempted to carry the whole document on Mainline and failed the 1,000-byte BEP44 cap while reporting a timeout.
 - **Growth.** More relays come online. More identities publish to relays. Relay-layer resolution begins succeeding more often, and faster than DHT traversal. DHT queries still run in parallel as backup.
 - **Maturity.** Relay-layer resolution is primary for most identities. DHT latency becomes irrelevant because relay responses arrive first. DHT serves as an availability backstop and interoperability bridge for non-SCP clients.
 - **DHT is never removed.** The cost of maintaining DHT publishing is one BEP44 put every 2 hours — negligible. The benefit is permanent: a resolution path that works even if every SCP relay is unreachable. Removing it would violate the anti-segmentation invariant (§3.10.6).
@@ -1106,8 +1111,8 @@ The dual-layer architecture is designed to be self-reinforcing as the SCP networ
 | `DidResolver` trait | Phase 2 | `scp-core` | Unified interface composing relay + DHT resolution. |
 | Parallel dual-layer resolution | Phase 2 | `scp-core` | Orchestration of parallel queries with first-valid-wins semantics. |
 | DID-record relay frame (§9.10.12) | Phase 2 (#482) | `scp-protocol` | Deterministic binary encode/decode of the minimal fixed-layout DID-record frame (`DidRecordV1`). Pure sync wasm-compatible type; consumed by the relay publisher + DID resolver in `scp-identity` and by the relay-side validation path. |
-| Mainline bootstrap-core DNS encoder (§18.2.2B) | Phase 2 (#2297) | `scp-did` | did:dht-conformant DNS-packet encode/decode of the bootstrap core, the Mainline layer's payload. Pure sync wasm-compatible, so the in-browser client (ADR-057) can build and verify it. Consumed by the Mainline publisher and by `DidMethod::resolve`. |
-| Per-layer publish size gates (§18.2.2C) | Phase 2 (#2297) | `scp-did`, `scp-identity` | Rejects an over-cap encoding at publish time with a typed error: 1,000 bytes for Mainline, `MAX_DID_RECORD_VALUE_LEN` for the relay layer. Ships with fixtures at and above each cap. |
+| Mainline bootstrap-core DNS encoder (§18.2.2C) | Phase 2 (#2297) | `scp-did` | did:dht-conformant DNS-packet encode/decode of the bootstrap core, the Mainline layer's payload. Pure sync wasm-compatible, so the in-browser client (ADR-057) can build and verify it. Consumed by the Mainline publisher and by `DidMethod::resolve`. |
+| Per-layer publish size gates (§18.2.2D) | Phase 2 (#2297) | `scp-did`, `scp-identity` | Rejects an over-cap encoding at publish time with `SCP-IDENT-1061`, which carries the layer, the measured length and the cap: 1,000 bytes on the bencoded BEP44 value for Mainline, `MAX_DID_RECORD_VALUE_LEN` for the relay layer. Ships with fixtures at and above each cap. |
 | Relay-layer RFC 8785 canonicalization (§18.2.2A) | Phase 2 (#2297) | `scp-did` | Replaces `serde_json::to_string_pretty` in `DidDocument::to_json` on the publish path, so two SDKs sign the same octets. |
 
 ## 3.11 DID Authentication for External Services (SCPID)
