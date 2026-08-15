@@ -929,11 +929,16 @@ The full resolution sequence:
       answered. This is a fixed precedence and not a sequence comparison
       (§3.10.1). When only Mainline answers, the answer is the bootstrap
       core, and the caller learns which entries it does not hold (§3.10.3).
-   e. Reject a Mainline record whose seq is more than 2 hours 30 minutes
-      behind the resolver's clock. Mainline's seq is a Unix timestamp fixed
-      by the did:dht method (§18.2.2C) and §3.10.5 republishes every 2
-      hours, so this is a within-layer freshness check against wall-clock
-      time — never a comparison against the relay layer (§3.10.7).
+   e. Mark a Mainline record `Staleness::Stale` when its seq is more than
+      2 hours 30 minutes behind the resolver's clock, and `Fresh`
+      otherwise. Mainline's seq is a Unix timestamp fixed by the did:dht
+      method (§18.2.2C) and §3.10.5 republishes every 2 hours, so this is a
+      within-layer freshness reading against wall-clock time — never a
+      comparison against the relay layer (§3.10.7). The resolver MARKS and
+      does not reject: a resolver whose own clock runs fast would reject
+      every valid Mainline record, taking itself off the fallback layer,
+      and marking degrades that failure to "everything reads stale" instead
+      (§3.10.7).
 6. Cache result per §9.10.7 caching policy
    (24h refresh for active contacts, 7d for inactive), keyed per layer
 ```
@@ -1021,7 +1026,11 @@ The SDK prevents this by default. RepublishManager publishes to both layers on e
 **Two rules bound the Mainline staleness this leaves.** Neither compares a sequence number across layers, so both are available under the rule above.
 
 1. **The relay layer's answer supersedes Mainline's for every element, whenever a relay answers.** The relay layer carries a superset of the core (§18.2.2C), so when both layers return a valid record the resolver takes the relay record and uses the Mainline record for nothing. This is a fixed precedence between layers, not a comparison of their numbers. It closes the case §3.10.1 would otherwise leave open, where a caller that needs only a core element takes whichever layer answered first and can take a stale Mainline copy while a fresher relay record is in hand.
-2. **A Mainline record is stale by its own layer's clock.** The did:dht method fixes Mainline's `seq` as a Unix timestamp in seconds, and §3.10.5 republishes to Mainline every 2 hours, so a resolver rejects a Mainline record whose `seq` is more than **2 hours and 30 minutes** behind the resolver's own clock — the republish interval plus the 30-minute grace ADR-003 already uses for staleness. This is a within-layer check against wall-clock time rather than against the other layer, and it is available only because the method made Mainline's sequence number a timestamp. It bounds a rollback on Mainline to that window instead of leaving it unbounded. A resolver whose own clock is wrong loses this check and keeps every other one, so the check is a bound on staleness rather than a trust dependency on the clock.
+2. **A Mainline record reads stale against its own layer's clock.** The did:dht method fixes Mainline's `seq` as a Unix timestamp in seconds, and §3.10.5 republishes to Mainline every 2 hours, so a resolver marks a Mainline record `Staleness::Stale` when its `seq` is more than **2 hours and 30 minutes** behind the resolver's own clock — the republish interval plus the 30-minute grace ADR-003 already defines for stale resolutions. This is a within-layer reading against wall-clock time rather than a comparison against the other layer, and it is available only because the method made Mainline's sequence number a timestamp.
+
+   **The resolver marks the record and does not reject it**, and the difference matters in one direction. A resolver whose clock runs fast would compute every genuine record as far behind, and a rejecting rule would take that resolver off the Mainline layer entirely — a self-inflicted outage triggered by its own clock, not by anything an attacker did. Marking degrades the same failure to "every record reads stale," which a caller can still act on.
+
+   **What the mark obliges a caller to do.** A verifier performing a check that depends on current key material — §9.7.1's KeyPackage attestation check, §9.12's rotation verification — MUST NOT accept a `Stale` bootstrap core. It resolves the relay layer, which rule 1 makes authoritative anyway, and fails closed if no relay answers. A caller reading a non-key entry MAY accept a `Stale` core. So the bound on a Mainline rollback is: an attacker replaying a record older than the window cannot get it accepted for any key-material decision, and a resolver with a broken clock loses Mainline for those decisions rather than accepting a false one.
 
 Stale records are detected by comparing a received sequence number against the last number the resolver observed **on the layer that served it**. A relay or a Mainline node serving a stale record is not malicious — it simply has not received the latest publish. The stale record is overwritten on that layer's next republish cycle (6 days for relays, 2 hours for Mainline).
 
