@@ -187,16 +187,20 @@ The test names the producer of the value. The identity owner produces a value wh
 
 Two indicators narrow the search for a participant-produced value. They suggest the answer and do not decide it: a verifier checks the value by recomputing it from other participants' signed records, or the owner cannot change the value by publishing a new document.
 
+**An owner-produced value that asserts something outside the identity's own configuration carries a proof a verifier checks without trusting the owner.** §9.3's trust-signal table records this in its own column, marking every self-asserted signal it lists as carrying either a "cryptographic proof" or a "platform-signed proof". The line the rule draws: an entry that declares how to reach this identity or which keys it uses states the identity's configuration, and the owner's signature over the document is the whole of what a verifier needs. An entry that asserts a fact about the world — that this DID controls a named account on another platform, that a named device attested it, that another DID is the same identity — carries a proof issued by whoever can attest that fact, and a verifier checks the proof rather than the assertion. Without this half, criterion 1 would admit an entry in which an owner simply declares itself trustworthy, which the document has no way to make checkable and which §9.3 assigns to context state where the network records behaviour.
+
 | Entry | Who produces the value | Criterion 1 |
 |-------|------------------------|-------------|
-| `#0`, `#active`, `#agent` verification methods | The owner's custody generates the keypair. | Admitted. |
-| `PreRotationCommitment` service entry | The owner hashes its own pre-rotation public key. | Admitted. |
-| `SCPRelay`, `IdentityPrivateState`, `SCPCapabilities` service entries | The owner chooses the endpoints. | Admitted. |
-| `ScpIdentityLinkAttestation` service entries | A platform signs a proof the owner then publishes (§3.5.2). | Admitted. |
-| `alsoKnownAs` | The owner's migration writes the forwarding record (§9.12). | Admitted. |
+| `#0`, `#active`, `#agent` verification methods | The owner's custody generates the keypair. | Admitted — configuration. |
+| `PreRotationCommitment` service entry | The owner hashes its own pre-rotation public key. | Admitted — configuration, and the reveal at rotation proves the hash. |
+| `SCPRelay`, `IdentityPrivateState`, `SCPCapabilities` service entries | The owner chooses the endpoints. | Admitted — configuration. |
+| `ScpIdentityLinkAttestation` service entries | A platform signs a proof the owner then publishes (§3.5.2). | Admitted — a world-claim carrying its platform-signed proof. |
+| Device attestation proof | The platform's attestation service signs it (§9.3). | Admitted — a world-claim carrying its platform-signed proof. |
+| `alsoKnownAs` | The owner's migration writes the forwarding record (§9.12). | Admitted — a world-claim carrying the migration proof §9.12 defines. |
 | `AttestationRevocations` service entry | The owner asserts the endpoint; the issuer produces the revocation list. | Admitted as a pointer. |
 | `ParticipationStatements` service entry | The owner asserts the endpoint; contexts produce the statements (§7.3.2.1). | Admitted as a pointer. |
 | Participation history, participation record, economic activity | Contexts and payment receipts record them. | Excluded. §9.3 puts them in context state. |
+| A bare self-declared trust or reputation value | The owner writes the number. | Excluded — a world-claim with no proof a verifier can check. |
 
 **Criterion 2 — every entry class that appears as a value carries a maximum count this specification states, and that count does not grow with the owner's further protocol activity.**
 
