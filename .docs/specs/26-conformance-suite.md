@@ -47,7 +47,7 @@ Each test specifies:
 | **Spec Sections** | §3.1, §9.6.1 |
 | **Preconditions** | Bootstrap core (§18.2.2C) published to Mainline DHT (or test DHT) as a did:dht-conformant DNS packet. |
 | **Steps** | 1. Resolve DID via DHT lookup. 2. Verify BEP44 signature against the public key encoded in the DID string. 3. Decode the DNS packet into the bootstrap core. |
-| **Expected Outcome** | BEP44 signature verification succeeds. The decoded bootstrap core matches the core that was published to Mainline, byte for byte. The public key embedded in the DID string matches `#0`, which the core carries by derivation rather than as an entry. The resolution reports `BootstrapCore` completeness (§3.10.10), and the implementation MUST NOT compare these bytes against the relay layer's JSON document — the two layers carry different encodings (§18.2.2A). |
+| **Expected Outcome** | BEP44 signature verification succeeds. The decoded bootstrap core matches the core that was published to Mainline, byte for byte. The public key embedded in the DID string matches `#0`, which the core carries by derivation rather than as an entry. The resolution returns the `BootstrapCore` variant of `ResolvedDidDocument` (§3.10.10), whose payload type carries no relay-layer entry, and the implementation MUST NOT compare these bytes against the relay layer's JSON document — the two layers carry different encodings (§18.2.2A). |
 
 ### CONF-003: Key Rotation (Active Key Update)
 
@@ -57,8 +57,8 @@ Each test specifies:
 | **Tier** | Core |
 | **Spec Sections** | §3.3, §9.11 |
 | **Preconditions** | DID with established `#active` key. Existing messages signed with old key. |
-| **Steps** | 1. Generate new Ed25519 keypair for `#active`. 2. Update DID document with new `#active` key. 3. Publish to both layers, each in its own encoding, incrementing each layer's own sequence number (§3.10.5). 4. Resolve the DID from the relay layer again. 5. Verify old `#active` key is no longer in document. 6. Verify key continuity fingerprint changed. 7. Resolve the DID from Mainline and assert its bootstrap core carries the NEW `#active` key — a publisher that rotated on one layer only fails here, and the relay-layer assertion in step 5 cannot catch it. |
-| **Expected Outcome** | New DID document has new `#active` key. Old `#active` key is absent. Key continuity fingerprint (§9.11) reflects the change. Messages signed with old key still verify against the old key (retained by recipients). |
+| **Steps** | 1. Generate new Ed25519 keypair for `#active`. 2. Update DID document with new `#active` key. 3. Publish to both layers, each in its own encoding, incrementing each layer's own sequence number (§3.10.5). 4. Resolve the DID from the relay layer again. 5. Verify the old `#active` key is no longer referenced by `authentication` or `assertionMethod`. 6. Verify key continuity fingerprint changed. 7. Resolve the DID from Mainline and assert its bootstrap core carries the NEW `#active` key — a publisher that rotated on one layer only fails here, and the relay-layer assertion in step 5 cannot catch it. |
+| **Expected Outcome** | New DID document has the new `#active` key, and neither `authentication` nor `assertionMethod` references the old one. Key continuity fingerprint (§9.11) reflects the change. **Two assertions this test previously made are CONTINGENT on the open question "Retired verification methods" (`.docs/specs/00-open-questions.md`) and are not asserted while it is open:** whether the old `#active` key is *absent from `verificationMethod`* (ADR-003 §4a's retention clause, suspended, would retain it as `#retired-{sequence}`), and whether a message signed with the old key verifies against that key after rotation (that is sub-question 1). A conformant implementation is judged on the reference assertions above until a human answers it. |
 
 ### CONF-004: Agent Binding (Human DID Attests Agent DID)
 

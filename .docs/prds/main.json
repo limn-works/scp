@@ -618,7 +618,7 @@
         "DidMethod trait defined with methods: create, publish, resolve, rotate, verify",
         "DidDht struct implements DidMethod trait",
         "ScpIdentity struct matches the specified structure: identity_key (KeyHandle), active_signing_key (KeyHandle), pre_rotation_commitment ([u8; 32]), did (String)",
-        "DID Document construction produces both layer encodings (\u00a718.2.2A): the relay layer's W3C DID Document with Ed25519 verification methods, serialized as RFC 8785 canonical JSON, and the Mainline layer's did:dht DNS packet carrying the bootstrap core (\u00a718.2.2C)",
+        "DID Document construction produces both layer encodings (§18.2.2A): the relay layer's W3C DID Document with Ed25519 verification methods, serialized as RFC 8785 canonical JSON, and the Mainline layer's did:dht DNS packet carrying the bootstrap core (§18.2.2C)",
         "All public items have /// doc comments",
         "Unit tests for create_identity, verify_did, DID document construction",
         "No unwrap() or expect() in library code"
@@ -678,7 +678,7 @@
         "resolve_did(did_string) -> DIDDocument resolves did:dht via Mainline DHT lookup",
         "resolve_did verifies self-certification: decoded z-base-32 of DID suffix matches public key in resolved document",
         "resolve_did verifies BEP44 signature on the DHT record",
-        "resolve_did returns the Mainline bootstrap core (§18.2.2C) — #active, the pre-rotation commitment and the relay list — and reports BootstrapCore completeness so a caller treats every other entry as unresolved rather than absent (§3.10.10)",
+        "resolve_did returns the BootstrapCore variant of ResolvedDidDocument (§3.10.10), carrying #active, the pre-rotation commitment and the relay list (§18.2.2C). The variant's payload type has no field for any relay-layer entry, so a caller cannot read one and receive an empty answer",
         "resolve_did caches results: 24-hour refresh for active contacts, 7-day for inactive (Decision 9)",
         "Stale DID resolution includes staleness indicator: DIDResolutionResult { document, staleness: Staleness::Fresh | Staleness::Stale { last_verified: u64 } }",
         "Stale results trigger SDK warning log",

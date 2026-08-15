@@ -475,31 +475,31 @@
       "files": [
         "crates/scp-identity/src/resolver.rs"
       ],
-      "description": "Implement the DidResolver trait (§3.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel via tokio::join! with per-layer 10-second timeouts. Valid means the BEP44 signature verifies AND the sequence number is >= the last sequence number this resolver observed ON THE SAME LAYER (§3.10.4 step 4c). The two layers carry different encodings under different signatures (§18.2.2A), so selection is per layer and never across layers (§3.10.4 step 5, §3.10.7): the relay layer answers for the full document, Mainline answers for the bootstrap core (§18.2.2C), and a resolver MUST NOT compare one layer's sequence number against the other's. ResolutionSource tracks which layer served the result, and DocumentCompleteness tells the caller whether it holds the full document or the bootstrap core. This story previously specified cross-layer highest-sequence-wins; the amendment that removed that rule from §3.10.7 also removed it here, which is why the status returned to pending.",
+      "description": "Implement the DidResolver trait (§3.10.10) that composes relay QUERY with DhtClient::resolve() for parallel dual-layer resolution. Both layers are queried in parallel via tokio::join! with the per-layer 5-second timeout §3.10.4 states. Valid means the BEP44 signature verifies AND the sequence number is >= the last sequence number this resolver observed ON THE SAME LAYER (§3.10.4 step 4c). The two layers carry different encodings under different signatures (§18.2.2A), so selection is per layer and never across layers (§3.10.4 step 5, §3.10.7): the relay layer answers for the full document, Mainline answers for the bootstrap core (§18.2.2C), and a resolver MUST NOT compare one layer's sequence number against the other's. ResolutionSource tracks which layer served the result, and DocumentCompleteness tells the caller whether it holds the full document or the bootstrap core. This story previously specified cross-layer highest-sequence-wins; the amendment that removed that rule from §3.10.7 also removed it here, which is why the status returned to pending.",
       "acceptanceCriteria": [
         "DidResolver trait defined with resolve(&self, did: &str) -> Result<Option<ResolvedDidDocument>>",
-        "ResolvedDidDocument contains document, seq, source, and completeness fields (§3.10.10)",
-        "DocumentCompleteness enum has Full and BootstrapCore variants; a Mainline resolution reports BootstrapCore and a relay resolution reports Full",
+        "ResolvedDidDocument is an ENUM with two variants carrying two different types (§3.10.10): Full { document: DidDocument, seq, source } and BootstrapCore { core: BootstrapCore, seq, source }. It is NOT a struct with a sibling completeness flag — that shape let a caller read a relay-layer field off a bootstrap-core result and receive an empty value, which is the mistake this type exists to prevent",
+        "BootstrapCore is a distinct struct carrying identity_key, active_key, pre_rotation_commitment and relays, and NO field for any relay-layer entry, so reading SCPCapabilities off a bootstrap-core resolution fails to compile; a Mainline resolution returns the BootstrapCore variant and a relay resolution returns Full",
         "ResolutionSource enum has ScpRelay { relay_url: String }, MainlineDht, and Cache variants",
         "Parallel query: both SCP relay and DHT resolution initiated concurrently via tokio::join!",
         "The resolver keeps one last-known sequence number per (DID, layer) pair, and rejects a record whose seq is lower than the number observed on the layer that served it (§3.10.4 step 4c)",
         "The resolver never compares a relay-layer sequence number against a Mainline sequence number, and never discards one layer's record because the other returned a higher number (§3.10.4 step 5c)",
         "Within the relay layer, when more than one valid record is returned, the highest-seq valid record wins (§3.10.4 step 5a)",
-        "When both layers answer and the caller asked for the full document, the relay-layer record is the answer (§3.10.4 step 5d)",
-        "DidMethod::resolve() continues to work for single-layer Mainline resolution and returns BootstrapCore completeness (no regression)",
-        "Unit test: relay responds with a valid full document, Mainline returns nothing — the relay result is used and reports Full",
-        "Unit test: Mainline responds, relay returns nothing — the Mainline result is used and reports BootstrapCore",
+        "When both layers answer, the relay-layer record is the answer WHATEVER the caller asked for, including a caller needing only a bootstrap-core element such as #active (§3.10.4 step 5d, §3.10.1) — a fixed precedence, not a sequence comparison",
+        "DidMethod::resolve() continues to work for single-layer Mainline resolution and returns the BootstrapCore variant (no regression)",
+        "Unit test: relay responds with a valid full document, Mainline returns nothing — the relay result is used and is the Full variant",
+        "Unit test: Mainline responds, relay returns nothing — the Mainline result is used and is the BootstrapCore variant",
         "Unit test: both layers respond with different sequence numbers — neither record is discarded, and the relay record answers a full-document request",
         "Unit test: a relay record whose seq is below the cached RELAY seq is rejected, while a Mainline record at that same seq is accepted because its own layer's cached seq is lower",
-        "Unit test: one layer fails, the other layer's result is accepted with its own completeness"
+        "Unit test: one layer fails, the other layer's result is accepted in its own variant; and a test asserts a caller needing only #active still receives the relay record when both layers answered"
       ],
       "actionItems": [
-        "Define DidResolver trait, ResolvedDidDocument struct, DocumentCompleteness enum, and ResolutionSource enum",
+        "Define DidResolver trait, the ResolvedDidDocument ENUM with its Full and BootstrapCore variants, the BootstrapCore struct, and the ResolutionSource enum",
         "Implement DualLayerResolver composing relay resolution (SCP-240) and DhtClient::resolve()",
         "Implement parallel query with tokio::join! and per-layer timeouts",
         "Key the last-known-sequence cache by (DID, layer) and implement per-layer selection with no cross-layer comparison",
         "Implement highest-seq-wins within the relay layer only",
-        "Preserve DidMethod::resolve() for backward compatibility, reporting BootstrapCore completeness",
+        "Preserve DidMethod::resolve() for backward compatibility, returning the BootstrapCore variant",
         "Add tests for all resolution scenarios"
       ],
       "blockedBy": [
@@ -702,7 +702,7 @@
         "phase": 3,
         "crate": "scp-core"
       },
-      "result": "SUPERSEDED. That work built cross-layer healing: DualLayerHealingPublisher + DualLayerResolver integration, republishing the fresher document to the stale layer on cross-layer seq divergence via tokio::spawn, with tests seq_divergence_triggers_healing and healing_failure_logged_not_propagated. \u00a73.10.7 removed cross-layer healing as unperformable under two encodings, so the behaviour recorded here is no longer the behaviour this story specifies. Nothing built from it reaches production either way: DualLayerResolver::new sets healing_publisher to None at every construction site, and with_healing is called only from the crate's own test module."
+      "result": "SUPERSEDED. That work built cross-layer healing: DualLayerHealingPublisher + DualLayerResolver integration, republishing the fresher document to the stale layer on cross-layer seq divergence via tokio::spawn, with tests seq_divergence_triggers_healing and healing_failure_logged_not_propagated. §3.10.7 removed cross-layer healing as unperformable under two encodings, so the behaviour recorded here is no longer the behaviour this story specifies. Nothing built from it reaches production either way: DualLayerResolver::new sets healing_publisher to None at every construction site, and with_healing is called only from the crate's own test module."
     },
     {
       "id": "SCP-246",

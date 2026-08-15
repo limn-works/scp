@@ -1,6 +1,6 @@
 ---
 name: did-two-encoding-amendment-2297
-description: Review of the #2297 DID two-encoding amendment (commits 78c72b6e7/5bc5ad838/40f422461+) — where the deleted one-document-two-layers rule survived elsewhere in .docs/
+description: Review of the #2297 DID two-encoding amendment (78c72b6e7..7fa2d9258) — where the deleted one-document-two-layers rule survived, and the verification pass at 7fa2d9258
 metadata:
   type: project
 ---
@@ -20,26 +20,49 @@ empty for every SCP identity. Issue #2297 is the root-cause filing.
 
 **How to apply:** when a downstream artifact says "the other layer serves it," "highest
 seq regardless of layer," or "publish the document to both layers," it is asserting a
-deleted rule — the amendment's own §3.10.7/§18.2.2A wording is what governs. The places
-the amendment did NOT reach on first pass, and the class each represents:
+deleted rule — the amendment's own §3.10.7/§18.2.2A wording is what governs.
 
-- `.docs/adrs/ADR-062-...md:41,96` — the E4 `NoOpRelayQuerier` "not a nullifier" verdict
-  rests on "resolution runs DHT-only, authenticity/reachability/freshness preserved."
-  Under two encodings a DHT-only resolution returns the bootstrap core only, so every
-  relay-layer-only field is permanently unresolvable. **A security classification resting
-  on a deleted premise is the highest-value class to hunt after any resolution-model
-  amendment.**
-- `.docs/specs/11-prior-art.md:155-160` and `03-identity.md:1025,1026,1107` — "the other
-  layer serves" survivals in prose *near* amended paragraphs. Amending a numbered item in
-  a list does not amend the unnumbered list above it.
-- `.docs/specs/03-identity.md:1117` — the §3.10.12 implementation-artifacts table still
-  said "first-valid-wins" after §3.10.4 replaced it. **Tables at the end of an amended
-  section are a reliable blind spot.**
-- `.docs/prds/reachability.json:665,705` and `relay-did-resolution.json:218,227,270` —
-  story `title` and `result` fields carry the deleted rule after `description` and
-  `acceptanceCriteria` were rewritten. **Amend all four fields, not two.**
-- `.docs/specs/22-human-readable-addressing.md:1131` — a `DhtDidDocument` enum variant
-  named after the layer that no longer carries the entry it names.
+## Verification pass at 7fa2d9258 — all 15 prior findings LANDED; 3 new classes found
+
+The dominant survival pattern shifted. On the first pass the deleted rule survived in
+files the amendment did not touch. On the second pass it survived **inside paragraphs the
+amendment edited**:
+
+- `03-identity.md` §3.10.8 suppression bullet: the amendment rewrote the *integrity*
+  clause of that bullet to be per-layer and left the *leading claim sentence*
+  byte-identical ("suppress the DID document on ALL of an identity's validating relays
+  AND all reachable DHT nodes"). **Diff the paragraph, not the section — an edited
+  paragraph is not a checked paragraph.**
+- `17-persistence-and-storage.md` §17.17.3: a whole new paragraph
+  ("The two-encoding model sharpens this harm") was appended while the bullet three lines
+  above kept the un-split conjunction.
+
+**A security classification amended in one place and asserted unconditionally in three
+others is the highest-value class.** ADR-062 §Decision 5 + its line-41 table row were
+re-argued to say `NoOpRelayQuerier` is a nullifier-by-effect until §3.10.10's two-variant
+`ResolvedDidDocument` ships (it has not — `resolver.rs:69` is still a single struct). But
+ADR-062 lines 16/140/172 still assert "not a nullifier, ships honestly" unconditionally,
+two of them *citing §Decision 5* as authority, and the downstream PRD
+`adr062-capability-injection.json` repeats the retired argument in six places — including
+an **acceptance criterion** (`grep ... NO #[cfg(...)] gate precedes it`) that would
+mechanically lock in the retired classification. When an amendment qualifies a
+classification, grep the ADR for every other mention of the classified symbol AND every
+downstream story field.
+
+**Phantom provenance to hunt after any amendment:** `phase-1.md:779` says "the highest
+valid `seq` is authoritative across the relay *and* the DHT — §3.10.7" and attributes to
+§9.6.1 a quote §9.6.1 does not contain. Both cited sections now say the opposite.
+
+**PRD fields, again:** `acceptanceCriteria` gets fixed; `description`, `actionItems` and
+`details` do not (SCP-RELAYRES-005 description, SCP-006 actionItems/details). `result` was
+correctly rewritten this time. Check all six fields.
+
+**Spec rename with no code counterpart:** §22's `ContextDiscoverySource` variant
+`DhtDidDocument` → `DidDocumentBroadcastList` (and wire string `dht_did_document` →
+`did_document_broadcast_list`) landed in the spec with zero code changes and no story.
+`resolve_contexts_from_did` (`scp-runtime/src/discovery/dht_context.rs`) still reads
+`SCPBroadcastContext` off a Mainline resolution — a relay-layer-only entry — so the path
+returns empty by construction.
 
 See [[adr057_transport_wasm_surface_parity]] for the same shape at the code layer:
 an amendment lands on the primary artifact and its structural twins keep the old rule.
