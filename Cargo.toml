@@ -67,7 +67,10 @@ bs58 = "0.5"
 jsonschema = { version = "0.28", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 tracing = "0.1"
-lru = "0.16"
+# The patch component is load-bearing: RUSTSEC-2026-0253 (use-after-free via
+# non-panic-safe `LruCache::pop()`) is patched only in 0.18.2. Do not relax
+# this to "0.18" — that would re-admit the affected 0.18.0 / 0.18.1.
+lru = "0.18.2"
 dashmap = "6"
 hex = "0.4"
 axum = "0.8"
