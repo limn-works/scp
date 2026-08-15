@@ -4,9 +4,13 @@
 # on every release tag. Also runs on PRs for validation.
 #
 # When a change doesn't touch doc-relevant paths (see the `docs:` filter in the
-# `changes` job), all doc jobs skip via an `if` condition. This whole workflow
-# is ADVISORY: `ci` is the sole required status check, so nothing here can block
-# a merge -- see the note on the `push` trigger below.
+# `changes` job), all doc jobs skip via an `if` condition rather than failing.
+# GitHub counts a skipped job as passing for a required status check, so these
+# jobs are safe to promote to required -- that promotion is the standing plan.
+#
+# Until it happens this whole workflow is ADVISORY: `ci` is the sole required
+# status check, so nothing here can block a merge. See the note on the `push`
+# trigger below for what that cost us.
 #
 # Source: .docs/scaffold/shared.md section "SDK Documentation Requirements"
 # Story: SCP-139
