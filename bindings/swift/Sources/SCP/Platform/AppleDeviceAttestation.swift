@@ -18,7 +18,15 @@
     public nonisolated enum AttestationError: Error, Sendable {
         /// The platform App Attest service returned an error.
         case serviceError(String)
-        /// App Attest is not supported and no fallback was possible.
+        /// `DCAppAttestService` reports `isSupported == false`, so this device
+        /// cannot produce an App Attest attestation or assertion.
+        ///
+        /// A caller catches this case to learn that the device holds no
+        /// hardware attestation signal. §9.3 of the security model spec,
+        /// "Sybil resistance and identity uniqueness", states that a missing
+        /// device attestation is an expected condition that costs the DID
+        /// nothing, so the caller presents no attestation rather than
+        /// presenting a weaker one.
         case unsupported(String)
         /// The stored App Attest key ID is missing; call `attest` first.
         case keyNotFound
@@ -33,10 +41,6 @@
     private enum StorageKey {
         /// `UserDefaults` key under which the App Attest key ID is persisted.
         static let appAttestKeyId = "dev.limn.scp.appAttest.keyId"
-        /// Prefix for synthetic software-only attestation tokens.
-        static let softwareTokenPrefix = "software-attestation-"
-        /// Prefix for synthetic software-only assertion tokens.
-        static let softwareAssertionPrefix = "software-assertion-"
     }
 
     // ---------------------------------------------------------------------------
@@ -57,12 +61,17 @@
     ///    where `clientDataHash = SHA-256(clientDataJSON)`.
     /// 3. `generateAssertion(_:clientData:)` — per-request proof of possession.
     ///
-    /// ## Software fallback (simulator / unavailable)
+    /// ## Unavailable service (simulator, or a device without App Attest)
     ///
-    /// When `DCAppAttestService.shared.isSupported` is `false`, the adapter
-    /// returns a deterministic synthetic token and never throws. The caller
-    /// receives a valid-shaped but software-only token, allowing the protocol to
-    /// proceed in development and simulator environments.
+    /// When `DCAppAttestService.isSupported` is `false`, `attest` and
+    /// `assertRequest` throw `AttestationError.unsupported`. The adapter mints
+    /// no substitute token, because a locally fabricated token would assert a
+    /// hardware guarantee that no hardware produced. §9.3 of the security model
+    /// spec, "Sybil resistance and identity uniqueness", records that a DID
+    /// carrying no device attestation loses nothing for the absence, so the
+    /// honest result is the typed error rather than a token.
+    ///
+    /// A caller that wants to branch before it calls reads `isHardwareBacked`.
     ///
     /// ## Thread safety
     ///
@@ -126,19 +135,23 @@
         /// 3. Calls `DCAppAttestService.attestKey(_:clientDataHash:)`.
         /// 4. Returns the raw CBOR attestation bytes.
         ///
-        /// On simulator or when App Attest is unavailable:
-        /// Returns a synthetic token of the form
-        /// `"software-attestation-<UUID>"` (UTF-8 encoded).
+        /// On simulator or on a device where App Attest is unavailable, this
+        /// method throws `AttestationError.unsupported` and returns no bytes.
         ///
         /// - Parameters:
         ///   - challenge: Server-issued random challenge bytes.
         ///   - deviceId: Stable device/identity identifier bytes.
-        /// - Returns: Attestation token bytes.
-        /// - Throws: `AttestationError.serviceError` if the App Attest service
+        /// - Returns: Raw CBOR attestation-object bytes that Apple signed.
+        /// - Throws: `AttestationError.unsupported` when
+        ///   `DCAppAttestService.isSupported` is `false`.
+        ///   `AttestationError.serviceError` when the App Attest service
         ///   returns an error on a real device.
         public func attest(challenge: Data, deviceId: Data) async throws -> Data {
             guard service.isSupported else {
-                return softwareAttestationToken()
+                throw AttestationError.unsupported(
+                    "DCAppAttestService.isSupported is false on this device, so App Attest cannot "
+                        + "produce an attestation. This adapter mints no substitute token."
+                )
             }
 
             let keyId = try await resolveKeyId()
@@ -165,17 +178,22 @@
         /// `DCAppAttestService.generateAssertion(_:clientData:)`. The assertion
         /// binds the request hash to the stored App Attest key.
         ///
-        /// On simulator or when App Attest is unavailable, returns a synthetic
-        /// assertion of the form `"software-assertion-<UUID>"` (UTF-8 encoded).
+        /// On simulator or on a device where App Attest is unavailable, this
+        /// method throws `AttestationError.unsupported` and returns no bytes.
         ///
         /// - Parameter requestHash: SHA-256 digest of the request payload.
         /// - Returns: Assertion bytes to include in the relay request.
-        /// - Throws: `AttestationError.keyNotFound` if no key ID is stored
-        ///   (i.e., `attest` was never called).
-        ///   `AttestationError.serviceError` if the App Attest service fails.
+        /// - Throws: `AttestationError.unsupported` when
+        ///   `DCAppAttestService.isSupported` is `false`.
+        ///   `AttestationError.keyNotFound` when no key ID is stored, which
+        ///   happens when no caller has called `attest` yet.
+        ///   `AttestationError.serviceError` when the App Attest service fails.
         public func assertRequest(requestHash: Data) async throws -> Data {
             guard service.isSupported else {
-                return softwareAssertionToken()
+                throw AttestationError.unsupported(
+                    "DCAppAttestService.isSupported is false on this device, so App Attest cannot "
+                        + "produce an assertion. This adapter mints no substitute token."
+                )
             }
 
             guard let keyId = loadKeyId() else {
@@ -199,29 +217,28 @@
 
         // MARK: - Token verification (client-side)
 
-        /// Perform client-side format validation of an attestation token.
+        /// Decide whether `token` is a structurally well-formed Apple App Attest
+        /// attestation object.
         ///
-        /// Full server-side verification is performed by the SCP relay, which
-        /// calls Apple's App Attest attestation endpoint. This method is a
-        /// lightweight sanity check only:
-        /// - Hardware tokens: non-empty bytes.
-        /// - Software tokens: UTF-8 string with `"software-attestation-"` prefix.
+        /// **The criterion this method applies:** the bytes decode as one
+        /// complete CBOR map that carries exactly the three entries
+        /// `fmt`, `attStmt`, and `authData`, where `fmt` holds the text
+        /// `"apple-appattest"`, `attStmt` holds a map, and `authData` holds a
+        /// byte string of at least 37 bytes. `AppAttestAttestationObject`
+        /// states the criterion in code and rejects everything else, so a
+        /// caller can rely on this method to return `false`.
+        ///
+        /// **What this method does not decide:** it checks no signature and no
+        /// certificate chain. The SCP relay performs that check by calling
+        /// Apple's App Attest attestation endpoint. A `true` result here means
+        /// the relay received something worth checking, never that the relay
+        /// will accept it.
         ///
         /// - Parameter token: Raw attestation bytes to validate.
-        /// - Returns: `true` if the token passes format validation.
+        /// - Returns: `true` when the token satisfies the structural criterion
+        ///   above, `false` for every other input.
         public func verify(token: Data) -> Bool {
-            if token.isEmpty {
-                return false
-            }
-            // Software-only tokens carry the known prefix; hardware tokens are
-            // CBOR-encoded and will not start with this prefix.
-            if let string = String(data: token, encoding: .utf8),
-               string.hasPrefix(StorageKey.softwareTokenPrefix) {
-                return true
-            }
-            // Non-empty non-software bytes are assumed valid for client-side
-            // purposes; full verification is server-side.
-            return true
+            AppAttestAttestationObject.isWellFormed(token)
         }
 
         // MARK: - Private helpers
@@ -335,33 +352,236 @@
             defer { lock.unlock() }
             defaults.set(keyId, forKey: StorageKey.appAttestKeyId)
         }
+    }
 
-        // MARK: Software fallback tokens
+    // ---------------------------------------------------------------------------
+    // App Attest attestation-object structure
+    // ---------------------------------------------------------------------------
 
-        /// Returns a synthetic software-only attestation token.
-        ///
-        /// Used when `DCAppAttestService.shared.isSupported == false` (simulator
-        /// or devices without App Attest). The token is a UUID-suffixed string
-        /// encoded as UTF-8 bytes. It is valid for client-side format checks but
-        /// will be treated as `method: .softwareOnly` by the relay.
-        ///
-        /// - Returns: UTF-8-encoded synthetic attestation token.
-        private func softwareAttestationToken() -> Data {
-            let token = "\(StorageKey.softwareTokenPrefix)\(UUID().uuidString)"
-            // Encoding cannot fail for a pure ASCII string.
-            return token.data(using: .utf8) ?? Data(token.utf8)
+    /// Decides whether a byte string is an Apple App Attest attestation object.
+    ///
+    /// Apple's `DCAppAttestService.attestKey(_:clientDataHash:)` returns the
+    /// attestation in the WebAuthn attestation-object shape, documented in
+    /// Apple's article "Validating Apps That Connect to Your Server": a CBOR map
+    /// holding `fmt`, `attStmt`, and `authData`, where `fmt` is the text
+    /// `"apple-appattest"`.
+    ///
+    /// `isWellFormed` names the three permitted keys and rejects every other
+    /// key, so the accepted set is closed by construction. A token that Apple
+    /// did not produce fails the check unless someone rebuilt the whole
+    /// attestation-object structure, and even then the SCP relay rejects it
+    /// because it carries no Apple signature.
+    enum AppAttestAttestationObject {
+        /// The three keys an App Attest attestation object carries, and the only
+        /// three `isWellFormed` accepts.
+        private enum Key: String, CaseIterable {
+            case format = "fmt"
+            case attestationStatement = "attStmt"
+            case authenticatorData = "authData"
         }
 
-        /// Returns a synthetic software-only assertion token.
+        /// The `fmt` value Apple writes into every App Attest attestation object.
+        private static let appleAttestationFormat = "apple-appattest"
+
+        /// The shortest authenticator data WebAuthn Level 2 §6.1 permits:
+        /// a 32-byte RP ID hash, one flags byte, and a 4-byte signature counter.
+        private static let minimumAuthenticatorDataLength = 37
+
+        /// Report whether `token` satisfies the attestation-object criterion.
         ///
-        /// Used when `DCAppAttestService.shared.isSupported == false` (simulator
-        /// or devices without App Attest). The token is a UUID-suffixed string
-        /// encoded as UTF-8 bytes.
+        /// - Parameter token: Raw bytes a caller received as an attestation.
+        /// - Returns: `true` only for a complete, correctly keyed, definite-length
+        ///   CBOR attestation object; `false` for empty input, truncated input,
+        ///   trailing bytes, a wrong `fmt` value, a duplicated key, an unknown
+        ///   key, a missing key, and authenticator data shorter than 37 bytes.
+        static func isWellFormed(_ token: Data) -> Bool {
+            var reader = CBORReader(token)
+            guard let entryCount = reader.readMapHeader(),
+                  entryCount == Key.allCases.count else { return false }
+
+            // A map carrying `Key.allCases.count` entries, no key twice and no
+            // key outside `Key`, carries each of the three keys exactly once.
+            var seenKeys = Set<Key>()
+            for _ in 0 ..< entryCount {
+                guard let name = reader.readTextString(),
+                      let key = Key(rawValue: name),
+                      seenKeys.insert(key).inserted,
+                      readValue(for: key, from: &reader) else { return false }
+            }
+
+            return reader.isAtEnd
+        }
+
+        /// Consume the value that follows `key` and report whether it satisfies
+        /// the constraint that key imposes.
+        private static func readValue(for key: Key, from reader: inout CBORReader) -> Bool {
+            switch key {
+            case .format:
+                return reader.readTextString() == appleAttestationFormat
+            case .attestationStatement:
+                return reader.skipMap()
+            case .authenticatorData:
+                guard let length = reader.readByteStringLength() else { return false }
+                return length >= minimumAuthenticatorDataLength
+            }
+        }
+    }
+
+    /// Reads the subset of CBOR (RFC 8949) that an App Attest attestation object
+    /// uses: definite-length integers, byte strings, text strings, arrays, and
+    /// maps.
+    ///
+    /// The reader rejects indefinite-length items, reserved additional-information
+    /// values, tags, and floating-point items, because Apple emits none of them.
+    /// Every read returns `nil` or `false` on malformed input; the reader never
+    /// traps and never reads past the end of its buffer.
+    private struct CBORReader {
+        /// The deepest array or map nesting the reader will walk before it
+        /// rejects the item. Apple's attestation object nests three levels
+        /// (object → `attStmt` → `x5c` array), so this bound leaves headroom
+        /// while it stops a crafted token from exhausting the stack.
+        private static let maxNestingDepth = 16
+
+        private let bytes: [UInt8]
+        private var index: Int
+
+        init(_ data: Data) {
+            bytes = [UInt8](data)
+            index = 0
+        }
+
+        /// Whether the reader consumed every byte it was given.
+        var isAtEnd: Bool {
+            index == bytes.count
+        }
+
+        /// How many bytes the reader has not consumed.
+        private var remainingCount: Int {
+            bytes.count - index
+        }
+
+        /// Read one byte, or return `nil` when the buffer holds none.
+        private mutating func readByte() -> UInt8? {
+            guard index < bytes.count else { return nil }
+            defer { index += 1 }
+            return bytes[index]
+        }
+
+        /// Read the major type and the argument of one CBOR item head.
         ///
-        /// - Returns: UTF-8-encoded synthetic assertion token.
-        private func softwareAssertionToken() -> Data {
-            let token = "\(StorageKey.softwareAssertionPrefix)\(UUID().uuidString)"
-            return token.data(using: .utf8) ?? Data(token.utf8)
+        /// - Returns: `nil` when the input truncates mid-head, when the
+        ///   additional-information value is reserved (28 through 30), or when
+        ///   the item declares an indefinite length (31).
+        private mutating func readHead() -> (major: UInt8, argument: UInt64)? {
+            guard let initialByte = readByte() else { return nil }
+            let major = initialByte >> 5
+            let additional = initialByte & 0x1F
+            switch additional {
+            case 0 ... 23:
+                return (major, UInt64(additional))
+            case 24 ... 27:
+                let width = 1 << Int(additional - 24)
+                var argument: UInt64 = 0
+                for _ in 0 ..< width {
+                    guard let next = readByte() else { return nil }
+                    argument = (argument << 8) | UInt64(next)
+                }
+                return (major, argument)
+            default:
+                return nil
+            }
+        }
+
+        /// Consume `count` payload bytes, or return `nil` when the buffer holds
+        /// fewer than `count` bytes.
+        private mutating func consumePayload(count: UInt64) -> Int? {
+            guard count <= UInt64(remainingCount) else { return nil }
+            let length = Int(count)
+            index += length
+            return length
+        }
+
+        /// Read a definite-length text string and decode it as UTF-8.
+        mutating func readTextString() -> String? {
+            guard let head = readHead(), head.major == 3 else { return nil }
+            let start = index
+            guard consumePayload(count: head.argument) != nil else { return nil }
+            return String(bytes: bytes[start ..< index], encoding: .utf8)
+        }
+
+        /// Read a definite-length byte string and report its length.
+        mutating func readByteStringLength() -> Int? {
+            guard let head = readHead(), head.major == 2 else { return nil }
+            return consumePayload(count: head.argument)
+        }
+
+        /// Read a definite-length map head and report its entry count.
+        ///
+        /// Each entry costs at least two bytes, so a declared count larger than
+        /// the remaining byte count cannot be satisfied and the reader rejects it
+        /// without looping.
+        mutating func readMapHeader() -> Int? {
+            guard let head = readHead(), head.major == 5,
+                  head.argument <= UInt64(remainingCount) else { return nil }
+            return Int(head.argument)
+        }
+
+        /// Advance past one complete map, keys and values alike.
+        mutating func skipMap() -> Bool {
+            guard let entryCount = readMapHeader() else { return false }
+            for _ in 0 ..< entryCount {
+                guard skipValue(depth: 1) else { return false }
+                guard skipValue(depth: 1) else { return false }
+            }
+            return true
+        }
+
+        /// Advance past one complete CBOR item.
+        ///
+        /// - Parameter depth: How many arrays or maps enclose this item.
+        /// - Returns: `false` when the item truncates, uses a major type Apple
+        ///   never emits, or nests deeper than `maxNestingDepth`.
+        private mutating func skipValue(depth: Int) -> Bool {
+            guard depth <= Self.maxNestingDepth else { return false }
+            guard let head = readHead() else { return false }
+            switch head.major {
+            case 0, 1:
+                // Unsigned and negative integers carry their whole value in the
+                // head, so the reader already consumed them.
+                return true
+            case 2, 3:
+                return consumePayload(count: head.argument) != nil
+            case 4:
+                return skipContainer(entryCount: head.argument, itemsPerEntry: 1, depth: depth)
+            case 5:
+                return skipContainer(entryCount: head.argument, itemsPerEntry: 2, depth: depth)
+            default:
+                // Major type 6 is a tag and major type 7 holds simple values and
+                // floats. Apple emits neither inside an attestation object.
+                return false
+            }
+        }
+
+        /// Advance past the entries of one array or map.
+        ///
+        /// - Parameters:
+        ///   - entryCount: The entry count the container's head declared.
+        ///   - itemsPerEntry: 1 for an array element, 2 for a map key and value.
+        ///   - depth: How many containers enclose this container.
+        /// - Returns: `false` when the declared count exceeds the bytes that
+        ///   remain, or when any enclosed item fails to parse.
+        private mutating func skipContainer(
+            entryCount: UInt64,
+            itemsPerEntry: Int,
+            depth: Int
+        ) -> Bool {
+            guard entryCount <= UInt64(remainingCount) else { return false }
+            for _ in 0 ..< entryCount {
+                for _ in 0 ..< itemsPerEntry {
+                    guard skipValue(depth: depth + 1) else { return false }
+                }
+            }
+            return true
         }
     }
 
