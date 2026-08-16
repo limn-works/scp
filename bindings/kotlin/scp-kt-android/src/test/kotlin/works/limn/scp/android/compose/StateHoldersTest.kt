@@ -7,7 +7,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.test.junit4.createComposeRule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.runTest
@@ -165,12 +168,14 @@ class StateHoldersTest {
         val stopped = CountDownLatch(1)
         val eventFlow = MutableSharedFlow<String>()
         val showComposable = MutableStateFlow(true)
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
 
         composeRule.setContent {
             val show by showComposable.collectAsStateCompat()
             if (show) {
                 rememberScpHotStream(
                     key = "test-key",
+                    coordinator = coordinator,
                     start = { eventFlow },
                     onStop = { stopped.countDown() },
                 )
@@ -200,12 +205,14 @@ class StateHoldersTest {
         val onStopReturned = CountDownLatch(1)
         val eventFlow = MutableSharedFlow<String>()
         val showComposable = MutableStateFlow(true)
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
 
         composeRule.setContent {
             val show by showComposable.collectAsStateCompat()
             if (show) {
                 rememberScpHotStream(
                     key = "blocking-key",
+                    coordinator = coordinator,
                     start = { eventFlow },
                     onStop = {
                         onStopEntered.countDown()
@@ -242,10 +249,12 @@ class StateHoldersTest {
     fun `rememberScpHotStream returns the started flow`() {
         val eventFlow = MutableSharedFlow<String>()
         var capturedFlow: kotlinx.coroutines.flow.SharedFlow<String>? = null
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
 
         composeRule.setContent {
             val flowState by rememberScpHotStream(
                 key = "key",
+                coordinator = coordinator,
                 start = { eventFlow },
                 onStop = {},
             )
@@ -353,6 +362,143 @@ class StateHoldersTest {
 }
 
 /**
+ * Drives one composable out of composition and back in under one same key, and checks which
+ * subscription survives.
+ *
+ * A stale `onStop` that lands after a second mount started removes whatever subscription a
+ * registry holds at that moment. When nothing orders that stop against that start, a collector
+ * holds a [kotlinx.coroutines.flow.SharedFlow] that receives nothing further and reports no
+ * error, which is what navigating away from a screen and back produced before
+ * [ScpHotStreamCoordinator] existed.
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+@RunWith(RobolectricTestRunner::class)
+@Config(manifest = Config.NONE, sdk = [33])
+class ScpHotStreamRemountTest {
+
+    @get:Rule
+    val composeRule = createComposeRule()
+
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a re-mount under one same key keeps whichever subscription that re-mount opened`() {
+        val subscriptions = FakeSubscriptionRegistry()
+        val showComposable = MutableStateFlow(true)
+        val coordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val eventFlow = MutableSharedFlow<String>()
+        val releaseStop = CountDownLatch(1)
+
+        composeRule.setContent {
+            val show by showComposable.collectAsStateCompat()
+            if (show) {
+                rememberScpHotStream(
+                    key = "shared-key",
+                    coordinator = coordinator,
+                    start = {
+                        subscriptions.subscribe()
+                        eventFlow
+                    },
+                    onStop = {
+                        releaseStop.await()
+                        subscriptions.unsubscribeLive()
+                    },
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        awaitCondition("first mount opened no subscription") {
+            subscriptions.subscribeIds() == listOf(1)
+        }
+
+        showComposable.value = false
+        composeRule.waitForIdle()
+
+        showComposable.value = true
+        composeRule.waitForIdle()
+
+        // A second mount has entered composition, and its start lambda has had this long to
+        // run. An unsequenced start reuses subscription 1 within that window, which is what
+        // makes a stop below remove a subscription that this second mount depends on.
+        Thread.sleep(SETTLE_DELAY_MS)
+        releaseStop.countDown()
+
+        awaitCondition("a first mount's onStop unsubscribed nothing") {
+            subscriptions.unsubscribeIds().size == 1
+        }
+        awaitCondition("a second mount opened no subscription") {
+            subscriptions.subscribeIds().size == 2
+        }
+
+        assertEquals(listOf(1, 2), subscriptions.subscribeIds())
+        assertEquals(listOf(1), subscriptions.unsubscribeIds())
+        assertEquals(listOf(2), subscriptions.liveIds())
+    }
+}
+
+/**
+ * Records subscribe and unsubscribe calls for one key, as
+ * [works.limn.scp.stream.HotStreamFactory] records them for one context handle.
+ *
+ * [subscribe] hands back a live subscription when one exists, and [unsubscribeLive] releases
+ * whichever subscription is live, so this double reproduces what a stale `onStop` does to a
+ * subscription that a later mount is using.
+ */
+private class FakeSubscriptionRegistry {
+    private val lock = Any()
+    private var nextId = 0
+    private var live: Int? = null
+    private val subscribed = mutableListOf<Int>()
+    private val unsubscribed = mutableListOf<Int>()
+
+    fun subscribe(): Int =
+        synchronized(lock) {
+            val existing = live
+            if (existing != null) return existing
+            nextId++
+            live = nextId
+            subscribed += nextId
+            nextId
+        }
+
+    fun unsubscribeLive() {
+        synchronized(lock) {
+            val current = live ?: return
+            unsubscribed += current
+            live = null
+        }
+    }
+
+    fun subscribeIds(): List<Int> = synchronized(lock) { subscribed.toList() }
+
+    fun unsubscribeIds(): List<Int> = synchronized(lock) { unsubscribed.toList() }
+
+    fun liveIds(): List<Int> = synchronized(lock) { listOfNotNull(live) }
+}
+
+/**
+ * Poll [condition] until it holds, and throw an [AssertionError] carrying [message] when
+ * [AWAIT_TIMEOUT_SECONDS] pass without it holding.
+ */
+private fun awaitCondition(
+    message: String,
+    condition: () -> Boolean,
+) {
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(AWAIT_TIMEOUT_SECONDS)
+    while (System.nanoTime() < deadline) {
+        if (condition()) return
+        Thread.sleep(POLL_INTERVAL_MS)
+    }
+    throw AssertionError(message)
+}
+
+/**
+ * Build a scope for one [ScpHotStreamCoordinator]. A production caller owns this scope — a
+ * ViewModel, an Application, or a dependency graph holds it — and composable disposal never
+ * cancels it.
+ */
+private fun newCoordinatorScope(): CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+/**
  * Convenience extension mirroring collectAsState for MutableStateFlow
  * within test composables. Uses the Compose runtime's collectAsState.
  */
@@ -370,6 +516,9 @@ private const val SETTLE_DELAY_MS = 100L
 
 /** Upper bound on how long a test waits for a latch that another thread opens. */
 private const val AWAIT_TIMEOUT_SECONDS = 10L
+
+/** Gap between two reads of a condition that another thread makes true. */
+private const val POLL_INTERVAL_MS = 10L
 
 /**
  * Wall-clock limit for a method that would hang, rather than fail, if disposal blocked on

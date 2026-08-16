@@ -114,6 +114,18 @@ Rust callbacks (`onMessage`, `onEvent`) run on non-coroutine threads. You cannot
 
 `HotStreamFactory.contextEvents()` and `incomingMessages()` are `suspend` functions that use `withContext(ioDispatcher)` for FFI calls and a `Mutex` to prevent duplicate subscriptions. They must be called from a coroutine scope (e.g., `lifecycleScope.launch { }`, `viewModelScope.launch { }`). See the Breaking Changes section above for migration details.
 
+### Streaming: a subscribe call and its registry write form one non-cancellable step
+
+`contextEvents` and `incomingMessages` run their FFI subscribe call and their registry write together inside `withContext(NonCancellable + ioDispatcher)`. An earlier revision called `contextSubscribeEvents` inside `withContext(ioDispatcher)` and wrote `activeEventSubscriptions` on a following line. Cancellation arriving during that FFI call surfaces on that `withContext`'s resumption, which skipped that write and left a live Rust subscription that no registry entry named, so neither `stopContextEvents` nor `stopAll` could release it.
+
+`NonCancellable` covers those two statements and no others, so a cancelled caller still observes cancellation — it just leaves a subscription that `stopContextEvents` can still name. Removal paths pair a registry removal with an unsubscribe call in that same shape.
+
+### Streaming: every path that writes a subscription registry takes that registry's mutex
+
+`stopContextEvents` takes `eventMutex` and `stopMessageStream` takes `messageMutex`. `stopAll` takes each mutex once and then calls private removal helpers under it, rather than delegating to those two public methods, because taking one non-reentrant `Mutex` twice on one coroutine deadlocks that coroutine. Removal paths that took no lock let a stop read an empty registry while a subscribe held that mutex, return, and leave a subscription that same subscribe registered a moment later.
+
+A Rust callback thread runs `onComplete` outside any coroutine, so that path cannot take either mutex. `SubscriptionSlot` calls `ConcurrentHashMap.remove(key, value)` instead: a completion callback removes its own `HotStreamState` and never a later subscription that carries one same context handle. `StreamsTest.SubscriptionOwnershipTests` covers cancellation, stop-versus-subscribe interleaving, and that stale-completion case. See `.docs/lessons/kotlin/hot-stream-subscription-ownership.md`, which also records why `rememberScpHotStream` in `scp-kt-android` now requires an injected `ScpHotStreamCoordinator`.
+
 ### UniFFI NativeLib.kt generation configured but requires compiled Rust binary
 
 UniFFI binding generation requires the compiled Rust `cdylib` because metadata is embedded at compile time via `uniffi::include_scaffolding!`. Generation is configured via:

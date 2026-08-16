@@ -5,6 +5,7 @@ package works.limn.scp.stream
 
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -26,6 +27,7 @@ import works.limn.scp.bridge.InfraBindings
 import works.limn.scp.bridge.MessageCallback
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Callback interface for real-time context events from the Rust engine.
@@ -247,6 +249,7 @@ class HotStreamFactory(
                     onBufferOverflow = BufferOverflow.DROP_OLDEST,
                 )
             val readOnly = sharedFlow.asSharedFlow()
+            val slot = SubscriptionSlot(activeEventSubscriptions, contextHandle)
 
             val callback =
                 object : EventCallback {
@@ -270,16 +273,21 @@ class HotStreamFactory(
                     }
 
                     override fun onComplete() {
-                        activeEventSubscriptions.remove(contextHandle)
+                        slot.markComplete()
                     }
                 }
 
-            val subscriptionHandle =
-                withContext(ioDispatcher) {
-                    contextBindings.contextSubscribeEvents(contextHandle, callback)
-                }
-
-            activeEventSubscriptions[contextHandle] = HotStreamState(sharedFlow, readOnly, subscriptionHandle)
+            // NonCancellable covers exactly two statements: one subscribe call into a Rust
+            // engine, and one registry write naming what that call returned. A cancellation
+            // arriving between those two statements leaves a live Rust subscription that no
+            // registry entry names, so neither stopContextEvents nor stopAll can release it.
+            // Every other statement in this function stays cancellable: a caller cancelling
+            // before this block opens no subscription, and a caller cancelling after it can
+            // still pass contextHandle to stopContextEvents.
+            withContext(NonCancellable + ioDispatcher) {
+                val subscriptionHandle = contextBindings.contextSubscribeEvents(contextHandle, callback)
+                slot.register(HotStreamState(readOnly, subscriptionHandle))
+            }
             readOnly
         }
 
@@ -312,6 +320,7 @@ class HotStreamFactory(
                     onBufferOverflow = BufferOverflow.DROP_OLDEST,
                 )
             val readOnly = sharedFlow.asSharedFlow()
+            val slot = SubscriptionSlot(activeMessageSubscriptions, contextHandle)
 
             val callback =
                 object : MessageCallback {
@@ -335,16 +344,17 @@ class HotStreamFactory(
                     }
 
                     override fun onComplete() {
-                        activeMessageSubscriptions.remove(contextHandle)
+                        slot.markComplete()
                     }
                 }
 
-            val subscriptionHandle =
-                withContext(ioDispatcher) {
-                    contextBindings.contextSubscribe(contextHandle, callback)
-                }
-
-            activeMessageSubscriptions[contextHandle] = HotStreamState(sharedFlow, readOnly, subscriptionHandle)
+            // NonCancellable covers exactly two statements, for a reason contextEvents states
+            // above its own subscribe call: a cancellation landing between a subscribe call and
+            // a registry write orphans a live Rust subscription.
+            withContext(NonCancellable + ioDispatcher) {
+                val subscriptionHandle = contextBindings.contextSubscribe(contextHandle, callback)
+                slot.register(HotStreamState(readOnly, subscriptionHandle))
+            }
             readOnly
         }
 
@@ -355,48 +365,124 @@ class HotStreamFactory(
      * After this call, the [SharedFlow] returned by [contextEvents] will
      * no longer receive new events.
      *
+     * Takes [eventMutex], so a stop that races an in-flight [contextEvents] call for one same
+     * handle waits for that call to record its subscription and then releases it. Without that
+     * mutex a stop reads an empty registry, returns, and leaves a subscription that that same
+     * in-flight call registers a moment later.
+     *
      * @param contextHandle The context to stop receiving events for.
      */
     suspend fun stopContextEvents(contextHandle: Long) {
-        val state = activeEventSubscriptions.remove(contextHandle) ?: return
-        withContext(ioDispatcher) {
-            contextBindings.contextUnsubscribeEvents(state.subscriptionHandle)
-        }
+        eventMutex.withLock { removeEventSubscription(contextHandle) }
     }
 
     /**
      * Stop receiving messages for the given context handle.
      *
+     * Takes [messageMutex] for a reason [stopContextEvents] states about [eventMutex].
+     *
      * @param contextHandle The context to stop receiving messages for.
      */
     suspend fun stopMessageStream(contextHandle: Long) {
-        val state = activeMessageSubscriptions.remove(contextHandle) ?: return
-        withContext(ioDispatcher) {
-            contextBindings.contextUnsubscribe(state.subscriptionHandle)
-        }
+        messageMutex.withLock { removeMessageSubscription(contextHandle) }
     }
 
     /**
      * Stop all active subscriptions. Call during teardown.
+     *
+     * Takes each mutex once and then removes every handle under it, rather than delegating to
+     * [stopContextEvents] and [stopMessageStream], because taking one non-reentrant [Mutex]
+     * twice on one coroutine deadlocks that coroutine.
      */
     suspend fun stopAll() {
-        activeEventSubscriptions.keys.toList().forEach { stopContextEvents(it) }
-        activeMessageSubscriptions.keys.toList().forEach { stopMessageStream(it) }
+        eventMutex.withLock {
+            activeEventSubscriptions.keys.toList().forEach { removeEventSubscription(it) }
+        }
+        messageMutex.withLock {
+            activeMessageSubscriptions.keys.toList().forEach { removeMessageSubscription(it) }
+        }
+    }
+
+    /**
+     * Remove one event subscription from [activeEventSubscriptions] and unsubscribe it.
+     *
+     * A caller holds [eventMutex] across this call. [NonCancellable] pairs a registry removal
+     * with an unsubscribe call for a reason [contextEvents] states about its own subscribe
+     * call: a cancellation landing between those two statements drops a caller's only route to
+     * a live Rust subscription.
+     */
+    private suspend fun removeEventSubscription(contextHandle: Long) {
+        withContext(NonCancellable + ioDispatcher) {
+            val state = activeEventSubscriptions.remove(contextHandle) ?: return@withContext
+            contextBindings.contextUnsubscribeEvents(state.subscriptionHandle)
+        }
+    }
+
+    /**
+     * Remove one message subscription from [activeMessageSubscriptions] and unsubscribe it.
+     *
+     * A caller holds [messageMutex] across this call, and [NonCancellable] pairs those two
+     * statements for a reason [removeEventSubscription] states.
+     */
+    private suspend fun removeMessageSubscription(contextHandle: Long) {
+        withContext(NonCancellable + ioDispatcher) {
+            val state = activeMessageSubscriptions.remove(contextHandle) ?: return@withContext
+            contextBindings.contextUnsubscribe(state.subscriptionHandle)
+        }
     }
 }
 
 /**
  * Internal state for an active hot stream subscription.
  *
- * Pairs the [MutableSharedFlow] with the Rust subscription handle so that
- * [HotStreamFactory.stopContextEvents] / [HotStreamFactory.stopMessageStream]
- * can unsubscribe from the Rust engine.
+ * Pairs a read-only [SharedFlow] that a caller collects with a Rust subscription handle, so that
+ * [HotStreamFactory.stopContextEvents] and [HotStreamFactory.stopMessageStream] can unsubscribe
+ * from a Rust engine.
+ *
+ * Carries no `equals` override, so two instances compare by identity. [SubscriptionSlot] relies
+ * on that: it removes a registry entry only when that entry is its own instance.
  */
-private data class HotStreamState(
-    val flow: MutableSharedFlow<String>,
+private class HotStreamState(
     val readOnly: SharedFlow<String>,
     val subscriptionHandle: Long,
 )
+
+/**
+ * Registry entry for one subscription, written by [HotStreamFactory] and cleared by whichever
+ * Rust callback reports that same subscription complete.
+ *
+ * A Rust callback thread runs [markComplete] outside any coroutine, so that thread cannot take
+ * [HotStreamFactory]'s mutex. [ConcurrentHashMap.remove] with a value argument removes an entry
+ * only when that entry is this slot's own [HotStreamState], so a completion callback belonging
+ * to an earlier subscription never removes a later subscription that carries one same context
+ * handle.
+ */
+private class SubscriptionSlot(
+    private val registry: ConcurrentHashMap<Long, HotStreamState>,
+    private val contextHandle: Long,
+) {
+    private val state = AtomicReference<HotStreamState?>(null)
+    private val completed = AtomicBoolean(false)
+
+    /** Publish [newState] to this slot and to [registry]. */
+    fun register(newState: HotStreamState) {
+        state.set(newState)
+        registry[contextHandle] = newState
+        // A Rust callback thread can report completion before this method publishes newState,
+        // in which case markComplete found no state to remove. Re-reading that flag here makes
+        // whichever of these two threads runs second remove an entry naming a subscription that
+        // a Rust engine has already ended.
+        if (completed.get()) {
+            registry.remove(contextHandle, newState)
+        }
+    }
+
+    /** Record that a Rust engine ended this subscription, and drop its registry entry. */
+    fun markComplete() {
+        completed.set(true)
+        state.get()?.let { registry.remove(contextHandle, it) }
+    }
+}
 
 /**
  * Improved cold message flow that fixes SCP-115 review issues.
