@@ -1,7 +1,7 @@
-# A Green Check That Asserted Nothing: Seven Ways CI Reported Success Over Zero Work
+# A Green Check That Asserted Nothing: Six Ways CI Reported Success Over Zero Work
 
 **Date:** 2026-08-16
-**Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `scripts/check-cross-layer.sh`, `CLAUDE.md` §PRD stories
+**Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `scripts/check-cross-layer.sh`
 
 ## Rule
 
@@ -10,7 +10,7 @@ fail on whichever defect it exists to catch, and keep that failure as a test. Ev
 defect below produced a green check while work behind it never ran, and every one passed
 review because a check *looked* like it was doing its job.
 
-## Seven failure shapes
+## Six failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when a filter selects no test. Two tests it named
@@ -64,17 +64,6 @@ selected per option through `X == 'v' && minutes || …`; and GitHub validates a
 input against a definition on a default branch, so a new option list cannot be exercised
 from a feature branch.
 
-**7. A document asserting that CI enforces something no workflow runs.** `CLAUDE.md`
-stated "CI enforces this" about `scripts/validate-prd.py`. One workflow referencing
-that script was `.github/workflows/prd-validate.yml.disabled`, and GitHub never loads a
-file with that suffix. Two rules follow. First, a sentence claiming mechanical enforcement
-must name whichever job performs it, so a reader checks that claim in one grep instead of
-trusting it. Second, when a bulk change disables a category of workflows — that rename
-disabled seven at once, all described as Claude-powered — check each file for steps
-outside that category: this one held a plain Python validation step alongside a Claude
-review step, and a step needing no API key went dark with a step that did. Restore
-whatever never belonged to that category, and leave a deliberate decision alone.
-
 ## Tests holding these closed
 
 - `scripts/tests/ci-gate/run-tests.sh` — asserts every job sets a `timeout-minutes`, that
@@ -86,9 +75,6 @@ whatever never belonged to that category, and leave a deliberate decision alone.
 - `scripts/tests/cross-layer/run-tests.sh` — plants an FFI export at a first line and at
   a last line of a 155 KB diff, proves that gate finds both, then plants a missing export
   and proves it still rejects that.
-- `scripts/tests/prd-validate/run-tests.sh` — plants six violation classes and proves that
-  PRD validator rejects each, and asserts a clean run reports a non-zero story count,
-  because a validator that walked zero stories would exit 0 as well.
 
-All three harnesses were run against unfixed code first and failed on exactly a defect
-each describes. A harness that has never failed has not been tested.
+Both harnesses were run against unfixed code first and failed on exactly a defect each
+describes. A harness that has never failed has not been tested.
