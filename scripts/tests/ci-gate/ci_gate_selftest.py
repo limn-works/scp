@@ -294,6 +294,18 @@ def main() -> int:
     code, out = run_aggregate(needs, "push")
     check("push event, the pull-request-only job skipped -> exit 0", code == 0, out)
 
+    # merge_group is the event the merge queue runs, so it is the event that
+    # actually gates a merge. cross-layer skips there because it diffs against a
+    # pull request's base branch, and no other job may.
+    needs = build_needs(jobs, rust_only, "merge_group", aggregate)
+    code, out = run_aggregate(needs, "merge_group")
+    check("merge_group event, a Rust change -> exit 0", code == 0, out)
+
+    needs = build_needs(jobs, rust_only, "merge_group", aggregate)
+    needs["rust-test"]["result"] = "skipped"
+    code, out = run_aggregate(needs, "merge_group")
+    check("merge_group event, the workspace test job skipped -> exit 1", code == 1, out)
+
     needs = build_needs(jobs, docs_only, "pull_request", aggregate)
     needs["cross-layer"]["result"] = "skipped"
     code, out = run_aggregate(needs, "pull_request")
