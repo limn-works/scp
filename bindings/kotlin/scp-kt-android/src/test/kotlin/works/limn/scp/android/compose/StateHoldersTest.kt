@@ -18,6 +18,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -160,7 +162,7 @@ class StateHoldersTest {
 
     @Test
     fun `rememberScpHotStream invokes onStop when leaving composition`() {
-        val stopped = AtomicBoolean(false)
+        val stopped = CountDownLatch(1)
         val eventFlow = MutableSharedFlow<String>()
         val showComposable = MutableStateFlow(true)
 
@@ -170,19 +172,70 @@ class StateHoldersTest {
                 rememberScpHotStream(
                     key = "test-key",
                     start = { eventFlow },
-                    onStop = { stopped.set(true) },
+                    onStop = { stopped.countDown() },
                 )
             }
         }
 
         composeRule.waitForIdle()
-        assertEquals(false, stopped.get())
+        assertEquals(1L, stopped.count)
 
         showComposable.value = false
         composeRule.waitForIdle()
-        Thread.sleep(SETTLE_DELAY_MS)
 
-        assertEquals(true, stopped.get())
+        assertTrue(
+            "onStop did not run within $AWAIT_TIMEOUT_SECONDS seconds of disposal",
+            stopped.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
+    }
+
+    // Guards a shape rememberScpHotStream's onDispose must keep: it launches onStop and
+    // returns. A `runBlocking { onStop() }` parks a composition thread until onStop returns,
+    // so `waitForIdle` below would never return and this method would hit its own timeout
+    // rather than reach an assertion.
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `rememberScpHotStream disposal returns while onStop is still suspended`() {
+        val onStopEntered = CountDownLatch(1)
+        val releaseOnStop = CountDownLatch(1)
+        val onStopReturned = CountDownLatch(1)
+        val eventFlow = MutableSharedFlow<String>()
+        val showComposable = MutableStateFlow(true)
+
+        composeRule.setContent {
+            val show by showComposable.collectAsStateCompat()
+            if (show) {
+                rememberScpHotStream(
+                    key = "blocking-key",
+                    start = { eventFlow },
+                    onStop = {
+                        onStopEntered.countDown()
+                        releaseOnStop.await()
+                        onStopReturned.countDown()
+                    },
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+
+        showComposable.value = false
+        composeRule.waitForIdle()
+
+        assertTrue(
+            "onStop did not start within $AWAIT_TIMEOUT_SECONDS seconds of disposal",
+            onStopEntered.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
+        assertEquals(
+            "disposal returned before onStop returned",
+            1L,
+            onStopReturned.count,
+        )
+
+        releaseOnStop.countDown()
+        assertTrue(
+            "onStop did not return after its latch opened",
+            onStopReturned.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
     }
 
     @Test
@@ -314,3 +367,12 @@ private val kotlinx.coroutines.CoroutineScope.isActive: Boolean
     get() = coroutineContext[kotlinx.coroutines.Job]?.isActive == true
 
 private const val SETTLE_DELAY_MS = 100L
+
+/** Upper bound on how long a test waits for a latch that another thread opens. */
+private const val AWAIT_TIMEOUT_SECONDS = 10L
+
+/**
+ * Wall-clock limit for a method that would hang, rather than fail, if disposal blocked on
+ * onStop again.
+ */
+private const val DISPOSAL_TIMEOUT_MS = 60_000L

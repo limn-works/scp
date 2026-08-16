@@ -68,8 +68,11 @@ class ScpContextHolder(
  * ```kotlin
  * @Composable
  * fun ChatScreen(contextHandle: Long, identityHandle: Long, bridge: CoroutineBridge) {
+ *     // A scope that outlives disposal, because rememberScpContext cancels a
+ *     // holder's own scope before it calls onDispose.
+ *     val cleanupScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
  *     val holder = rememberScpContext(contextHandle, identityHandle) { ctxH, idH ->
- *         runBlocking(Dispatchers.IO) { bridge.context.leave(ctxH, idH) }
+ *         cleanupScope.launch { bridge.context.leave(ctxH, idH) }
  *     }
  *     // Use holder to collect SCP streams
  * }
@@ -78,8 +81,12 @@ class ScpContextHolder(
  * @param contextHandle Opaque context handle from create/join.
  * @param identityHandle Opaque identity handle for the member in this context.
  * @param onDispose Callback invoked when the Composable leaves composition.
- *   Receives the context handle and identity handle for cleanup. Runs on the
- *   composition thread; launch a coroutine for suspending cleanup operations.
+ *   Receives a context handle and an identity handle for cleanup. Runs on a composition
+ *   thread, which on Android is a main thread, so it MUST NOT block on a coroutine:
+ *   `runBlocking` around a suspending SCP call risks an ANR, and deadlocks outright when
+ *   a dispatcher underneath that call schedules its work onto a blocked thread. Launch
+ *   that work on a scope which outlives disposal instead, as shown above. See
+ *   `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
  * @return A [ScpContextHolder] scoped to this Composable.
  */
 @Composable
@@ -231,8 +238,9 @@ fun <T> rememberScpStateIn(
  * @param start Suspend factory lambda that creates the [SharedFlow]. Called
  *   once per [key] value. Runs in a coroutine scoped to the Composable.
  * @param onStop Suspend cleanup lambda invoked when the Composable leaves
- *   composition. Called inside `runBlocking` on the Main thread, so it
- *   must not dispatch to `Dispatchers.Main` — doing so will deadlock.
+ *   composition. Runs on [Dispatchers.IO], on a scope that disposal does not cancel, so
+ *   it may suspend for as long as it needs. Disposal returns without waiting for it, so
+ *   `onStop` finishes only if a process outlives it.
  * @return Compose [State] holding the [SharedFlow], or `null` until
  *   the subscription is established.
  */
@@ -244,18 +252,23 @@ fun <T> rememberScpHotStream(
 ): State<SharedFlow<T>?> {
     val flowState = remember(key) { mutableStateOf<SharedFlow<T>?>(null) }
     val scope = remember(key) { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
+    // A second scope exists so that cancelling `scope` — which stops a subscription that
+    // `start` opened — cannot cancel `onStop` before it has run. Disposal never cancels
+    // this one.
+    val stopScope = remember(key) { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
 
     DisposableEffect(key) {
         scope.launch {
             flowState.value = start()
         }
         onDispose {
-            // Run onStop before cancelling the scope. Using runBlocking here
-            // is safe because onDispose runs on the composition thread (Main),
-            // and the scope uses Dispatchers.IO, so there is no deadlock risk.
-            // We must NOT launch { onStop() } then cancel — that races the
-            // coroutine against scope cancellation and onStop may never execute.
-            kotlinx.coroutines.runBlocking { onStop() }
+            // onDispose runs on a composition thread, which on Android is a main thread.
+            // A `runBlocking { onStop() }` here parks that thread until onStop returns,
+            // which risks an ANR and deadlocks whenever a dispatcher underneath onStop
+            // schedules work back onto a parked thread — SCP-117's failure, in a
+            // second spelling. See
+            // `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
+            stopScope.launch { onStop() }
             scope.cancel()
         }
     }

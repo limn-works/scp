@@ -44,6 +44,30 @@ Jetpack Compose integration via standard Compose patterns (`collectAsState()`, `
 
 ## Gotchas
 
+### This module's unit-test task needs `useJUnitPlatform()`, and CI must name both modules' tasks
+
+`build.gradle.kts` calls `tasks.withType<Test>().configureEach { useJUnitPlatform() }`. Without that call Gradle runs a JUnit 4 runner, which discovers only classes annotated `@RunWith(RobolectricTestRunner::class)` and ignores every `org.junit.jupiter.api.Test` in this module. Six JUnit 5 classes — `AndroidStorageTest`, `AndroidKeyCustodyTest`, `StorageConformanceTest`, `AndroidPushProviderTest`, `ContextLifecycleTest`, `ScpViewModelTest` — compiled and executed nothing under that configuration, and Gradle reported that task green. `junit-vintage-engine` keeps both Robolectric JUnit 4 classes running on JUnit Platform.
+
+`.github/workflows/ci.yml` names `:scp-kt:test :scp-kt-android:testDebugUnitTest`, not a bare `testDebugUnitTest`. `:scp-kt` applies `kotlin("jvm")`, which registers `test` and never registers `testDebugUnitTest`, so a bare task name resolved in `:scp-kt-android` alone and ran none of `:scp-kt`'s tests.
+
+### Compose disposal must not block, for that same reason `onCleared()` must not
+
+`rememberScpHotStream`'s `onDispose` launches `onStop` on a scope that disposal does not cancel, then cancels its subscription scope. An earlier revision called `runBlocking { onStop() }` there. `onDispose` runs on a composition thread, which on Android is a main thread, so blocking it risks an ANR and deadlocks whenever a dispatcher underneath `onStop` schedules work back onto a parked thread — `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`, in a second spelling. `rememberScpContext`'s KDoc example teaches that same non-blocking shape for its `onDispose` callback.
+
+`StateHoldersTest.rememberScpHotStream disposal returns while onStop is still suspended` holds `onStop` open on a latch and asserts that disposal already returned. It carries `@Test(timeout = 60_000)`, because a reintroduced `runBlocking` makes `composeRule.waitForIdle()` never return.
+
+### `flowWithLifecycle` needs `Dispatchers.Main` in a JVM unit test
+
+`asLifecycleFlow` delegates to `Flow.flowWithLifecycle`, which calls `Lifecycle.repeatOnLifecycle` and switches to `Dispatchers.Main.immediate`. A plain JVM unit test carries no Android main looper, so every method throws inside `MissingMainCoroutineDispatcher` before collecting anything. `ContextLifecycleTest` installs `UnconfinedTestDispatcher()` as Main in `@BeforeEach` and calls `Dispatchers.resetMain()` in `@AfterEach`. Installing a `TestDispatcher` as Main also hands `runTest` that dispatcher's scheduler, so one `advanceUntilIdle()` drives lifecycle dispatch and flow collection together.
+
+### Kotlin mangles an `internal` function's JVM name
+
+`AndroidStorage.getOrCreateStorageKey()` is `internal`, so its JVM name carries a module suffix: `getOrCreateStorageKey$scp_kt_android_debug`. `Class.getDeclaredMethod("getOrCreateStorageKey")` throws `NoSuchMethodException` against it. A reflection test must match on whatever precedes `$`.
+
+### A test double that a conformance suite drives concurrently needs a lock
+
+`InMemoryStorageProvider` in `AndroidStorageTest.kt` holds a monitor around every method. Conformance case 12 (`concurrent_access`) stores from eight threads at once, and `TreeMap` is not thread-safe: concurrent `put` calls on a red-black tree drop entries and can leave a node graph a later read walks incorrectly. Production `AndroidStorage` serializes that same way, through a single SQLCipher `SQLiteDatabase` connection.
+
 ### UniFFI method naming: snake_case -> camelCase
 
 The Rust `DeviceAttestationProvider` trait has `assert_request(request_hash)`. UniFFI generates Kotlin with camelCase: `assertRequest(requestHash)`. The ADR-027 code sample uses `assert()` which is **incorrect** — always check the UniFFI Rust trait definition in `crates/scp-ffi/uniffi/src/lib.rs` for authoritative method signatures.
@@ -60,7 +84,9 @@ All shared types (`ScpException`, `WakeSignal`, `KeyType`, `CustodyType`, `KeyHa
 
 ### Context in unit tests
 
-`AndroidDeviceAttestationTest` uses `ApplicationProvider.getApplicationContext()` from `androidx.test:core` (provided by Robolectric) for a real application context. `AndroidPushProviderTest` uses a null cast (`(null as Any?) as Context`) because it only needs the type, not a real context — this works with `isReturnDefaultValues = true` in testOptions. Integration tests on real devices should use `ApplicationProvider.getApplicationContext()`.
+`AndroidDeviceAttestationTest` and `AndroidPushProviderTest` both call `ApplicationProvider.getApplicationContext()` from `androidx.test:core` (provided by Robolectric) for a real application context.
+
+Do not fabricate a context with `(null as Any?) as Context`. Kotlin compiles that cast into an `Intrinsics.checkNotNull` call that throws `NullPointerException` at construction, whatever a constructor then does with its argument. `AndroidPushProviderTest` carried that cast and, once `useJUnitPlatform()` let its class run at all, failed all 14 of its methods on it. `isReturnDefaultValues = true` does not rescue it: that option stubs android.jar methods and leaves Kotlin's own null check standing.
 
 ### Play Integrity requires real device
 
@@ -98,7 +124,7 @@ The Kotlin `StorageProvider` interface in `Types.kt` uses `set()`/`get()` matchi
 
 The shipped implementation snapshots and clears the tracked-context list under a monitor lock, launches the `leave` calls, and returns:
 ```kotlin
-abstract class ScpViewModel(
+abstract class ScpViewModel @JvmOverloads constructor(
     cleanupDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ViewModel() {
     private val contextsLock = Any()
@@ -111,18 +137,21 @@ abstract class ScpViewModel(
             activeContexts.clear()
             snapshot
         }
-        val cleanupJob = cleanupScope.launch {
+        cleanupScope.launch {
             for (ctx in contexts) {
                 runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
                     .onFailure { failure -> if (failure is CancellationException) throw failure }
             }
         }
-        cleanupJob.invokeOnCompletion { cleanupScope.cancel() }
     }
 }
 ```
 
-`onCleared()` guarantees that the tracked list is empty when it returns and that a coroutine calling `leave` on every snapshotted context has started. It does not guarantee those calls have finished — cleanup is best-effort, and completes only if the process outlives it.
+`onCleared()` guarantees that its tracked list is empty when it returns and that a coroutine calling `leave` on every snapshotted context has been **submitted** to `cleanupScope`. It does not guarantee that coroutine has started, and it does not guarantee those `leave` calls have finished. Under a `StandardTestDispatcher` that coroutine sits queued and has not started, which is what `ScpViewModelTest.onCleared returns before the leave calls run` asserts. Cleanup is best-effort, and completes only if a process outlives it.
+
+Do not cancel `cleanupScope` after that launch. An earlier revision called `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }`. A `SupervisorJob` whose children have all completed holds no thread, no handle, and no memory to release, and `cleanupDispatcher` belongs to whoever constructed that ViewModel, so that cancellation frees nothing. It does turn every later `cleanupScope.launch` into a silent no-op, which drops `leave` for any context that `trackContext` registers after a first `onCleared` call. `ScpViewModelTest.a context tracked after onCleared is still left by a later onCleared` fails if that cancellation returns.
+
+A Java subclass calls `super()`, so this class keeps a zero-argument JVM constructor. Kotlin emits one because every primary-constructor parameter carries a default; `@JvmOverloads` emits one overload per defaulted parameter. At one parameter `javap` reports an identical constructor set under either rule, so `@JvmOverloads` earns its place only from a second defaulted parameter onward. Adding a parameter without a default removes that zero-argument constructor under both rules, which is why `ScpViewModelTest.ScpViewModel exposes a zero-argument constructor to Java callers` asserts it by reflection.
 
 Tests pass their own `TestDispatcher` as `cleanupDispatcher`, so `advanceUntilIdle()` runs the cleanup coroutine and every `leave` it makes. `ScpViewModelTest` carries a class-level `@Timeout(30s, SEPARATE_THREAD)` so a reintroduced block fails the build rather than hanging the runner.
 

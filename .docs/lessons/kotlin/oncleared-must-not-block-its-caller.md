@@ -61,7 +61,51 @@ continuation yet when `advanceUntilIdle()` returns.
 block fails the build in 31 seconds. `.github/workflows/ci.yml` sets no `timeout-minutes`, so
 without that annotation one deadlocked test consumes a 360-minute runner per pull request.
 
+## Do not cancel a cleanup scope after dispatching to it
+
+`onCleared()` first shipped its non-blocking form with `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }`
+appended. That cancellation frees nothing: a `SupervisorJob` whose children have all completed
+holds no thread, no handle, and no memory, and `cleanupDispatcher` belongs to whoever constructed
+that ViewModel, so cancelling a job never shuts a dispatcher down. It does turn every later
+`cleanupScope.launch` into a silent no-op, so a context that `trackContext` registers after a first
+`onCleared` call never gets its `leave`. `ScpViewModelTest.a context tracked after onCleared is
+still left by a later onCleared` fails if that cancellation returns.
+
+That same reasoning applies to any scope a class creates to outlive one dispatch: cancel it when it
+owns something worth releasing, not as a reflex once whatever work it carried has finished.
+
+## That same failure, in a second spelling: Compose disposal
+
+`rememberScpHotStream` in
+`bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/compose/StateHolders.kt`
+ran `runBlocking { onStop() }` inside `DisposableEffect`'s `onDispose`. A comment there argued that
+blocking was safe because `onDispose` runs on a composition thread while its subscription scope uses
+`Dispatchers.IO`. That argument fails for a reason stated above: `onStop` is a caller-supplied suspend
+lambda, so whichever dispatcher it reaches is not one `rememberScpHotStream` controls, and a
+composition thread on Android is a main thread, where blocking risks an ANR regardless.
+
+That comment also named a real constraint: launching `onStop` on whichever scope disposal then
+cancels races cancellation against `onStop`, and `onStop` may never run. A second scope settles
+both — disposal launches `onStop` on a scope it never cancels, then cancels its subscription scope
+and returns. `rememberScpContext`'s KDoc example teaches callers that same shape, because that
+example previously showed `runBlocking(Dispatchers.IO) { bridge.context.leave(...) }` inside a
+disposal callback.
+
+## Where a blocking wait is still a contract
+
+`Relay.close()` and `Node.close()` in `bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Server.kt`
+call `runBlocking(Dispatchers.Default) { shutdown() }`, and `shutdown()` routes through
+`CoroutineBridge.ffiCall`, which suspends on an injected `ioDispatcher`. That structure matches
+`onCleared()`'s deadlock, and it stays, because `AutoCloseable.close()` is a synchronous contract a
+caller opts into for `use {}`. What changed is a claim beside it: naming `Dispatchers.Default` keeps
+`runBlocking` from re-entering a caller's own event loop, and it does not rescue a caller whose
+`ioDispatcher` is a `StandardTestDispatcher` that only a parked thread advances. Call `shutdown()`
+from a coroutine when a test injects a `TestDispatcher`.
+
 ## Affected files
 
 - `bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/ScpViewModel.kt`
 - `bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/ScpViewModelTest.kt`
+- `bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/compose/StateHolders.kt`
+- `bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/compose/StateHoldersTest.kt`
+- `bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Server.kt`

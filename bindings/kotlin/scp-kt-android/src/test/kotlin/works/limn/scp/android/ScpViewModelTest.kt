@@ -123,6 +123,10 @@ class ScpViewModelTest {
         assertEquals(ctx, returned)
     }
 
+    // A cancelled cleanup scope would satisfy an "is empty" assertion whether or not
+    // onCleared() cleared its tracked list, so this method asserts on recorded contents at
+    // each step. Delete `activeContexts.clear()` from onCleared() and a second
+    // assertEquals reports [1] against an expected empty list.
     @Test
     fun `onCleared clears the active contexts list`() = runTest(testDispatcher) {
         val viewModel = TestScpViewModel(testDispatcher)
@@ -132,12 +136,57 @@ class ScpViewModelTest {
         viewModel.callOnCleared()
         advanceUntilIdle()
 
+        assertEquals(listOf(1L), stubBindings.leaveCalledHandles)
         stubBindings.leaveCalledHandles.clear()
 
         viewModel.callOnCleared()
         advanceUntilIdle()
 
-        assertTrue(stubBindings.leaveCalledHandles.isEmpty(), "Second onCleared should have no contexts")
+        assertEquals(
+            emptyList<Long>(),
+            stubBindings.leaveCalledHandles,
+            "a second onCleared finds an empty tracked list, so it leaves nothing",
+        )
+    }
+
+    // Guards against reintroducing `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }`.
+    // A cancelled cleanup scope drops every later launch without running it, so this
+    // leave would never reach TestNativeBindings.
+    @Test
+    fun `a context tracked after onCleared is still left by a later onCleared`() =
+        runTest(testDispatcher) {
+            val viewModel = TestScpViewModel(testDispatcher)
+            viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
+            advanceUntilIdle()
+
+            viewModel.callOnCleared()
+            advanceUntilIdle()
+            assertEquals(listOf(1L), stubBindings.leaveCalledHandles)
+
+            viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
+            viewModel.callOnCleared()
+            advanceUntilIdle()
+
+            assertEquals(listOf(1L, 2L), stubBindings.leaveCalledHandles)
+        }
+
+    // A Java subclass of ScpViewModel calls `super()`, so a zero-argument JVM constructor is
+    // part of this artifact's published surface. Kotlin emits one because every
+    // primary-constructor parameter carries a default; adding a parameter without a default
+    // removes it and fails this method.
+    @Test
+    fun `ScpViewModel exposes a zero-argument constructor to Java callers`() {
+        val parameterCounts = ScpViewModel::class.java.declaredConstructors
+            .map { it.parameterCount }
+            .toSet()
+        assertTrue(
+            parameterCounts.contains(0),
+            "expected a zero-argument constructor, found arities $parameterCounts",
+        )
+        assertTrue(
+            parameterCounts.contains(1),
+            "expected a one-argument constructor, found arities $parameterCounts",
+        )
     }
 
     @Test

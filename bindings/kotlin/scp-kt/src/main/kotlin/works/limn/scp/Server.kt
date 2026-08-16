@@ -247,8 +247,13 @@ class Relay internal constructor(
      * Blocks the calling thread until shutdown completes. Prefer [shutdown]
      * from a coroutine scope; this exists for `use {}` block support.
      *
-     * Uses [kotlinx.coroutines.Dispatchers.Default] to avoid deadlocking
-     * when called from a thread that already holds the event loop.
+     * Names [kotlinx.coroutines.Dispatchers.Default] so that `runBlocking` does not re-enter
+     * an event loop a caller already holds. That choice does not make every caller safe:
+     * [shutdown] routes through `CoroutineBridge.ffiCall`, which suspends on a bridge's
+     * injected `ioDispatcher`, so a caller whose `ioDispatcher` is a `StandardTestDispatcher`
+     * parks one thread that advances that dispatcher's scheduler and never returns. Such a
+     * caller must call [shutdown] from a coroutine instead. See
+     * `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
      */
     override fun close() {
         runBlocking(kotlinx.coroutines.Dispatchers.Default) { shutdown() }
@@ -328,8 +333,13 @@ class Node internal constructor(
      * Blocks the calling thread until shutdown completes. Prefer [shutdown]
      * from a coroutine scope; this exists for `use {}` block support.
      *
-     * Uses [kotlinx.coroutines.Dispatchers.Default] to avoid deadlocking
-     * when called from a thread that already holds the event loop.
+     * Names [kotlinx.coroutines.Dispatchers.Default] so that `runBlocking` does not re-enter
+     * an event loop a caller already holds. That choice does not make every caller safe:
+     * [shutdown] routes through `CoroutineBridge.ffiCall`, which suspends on a bridge's
+     * injected `ioDispatcher`, so a caller whose `ioDispatcher` is a `StandardTestDispatcher`
+     * parks one thread that advances that dispatcher's scheduler and never returns. Such a
+     * caller must call [shutdown] from a coroutine instead. See
+     * `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
      */
     override fun close() {
         runBlocking(kotlinx.coroutines.Dispatchers.Default) { shutdown() }

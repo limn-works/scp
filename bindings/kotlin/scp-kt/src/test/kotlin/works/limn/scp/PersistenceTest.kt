@@ -229,12 +229,15 @@ class PersistenceTest {
                 "passphrase construction must create scp.db at ${dbPath.pathString}",
             )
 
-            // `SqliteStorage` takes an advisory lock on `scp.db.lock` and holds
-            // it for the instance's lifetime, so the first instance must
-            // release the database before a second instance opens the same
-            // directory. The sibling test `withSqlite reopens the same dir plus
-            // key across two constructions` shuts down for the same reason.
+            // Release a first handle before reopening. `SqliteStorage::new`
+            // takes an advisory lock on `{dir}/scp.db.lock`, so a second
+            // concurrent open fails with SCP-CTX-2000 whatever passphrase it
+            // carries — which would let this method pass without re-deriving
+            // anything from a salt sidecar. Its sibling
+            // `withSqlite reopens the same dir plus key across two constructions`
+            // shuts down for that same reason.
             scp1.shutdown(bridge(), 1.seconds)
+            createdInstances.remove(scp1)
 
             // Reopen with the SAME passphrase — must succeed (salt sidecar
             // re-derives the same key).
@@ -249,10 +252,13 @@ class PersistenceTest {
             dir.toFile().deleteOnExit()
 
             val scp1 = SCP.withSqlite(dir.toFile(), passphrase = "the-right-one")
-            // Release the advisory lock on `scp.db.lock` first, so the reopen
-            // below fails on the WRONG PASSPHRASE and not on a still-held lock.
-            // Without this shutdown the assertion passes for the wrong reason.
+            // Release the advisory lock on `scp.db.lock` first, so what follows
+            // fails on a rejected passphrase rather than on a second concurrent
+            // open. A held lock produces SCP-CTX-2000 for a correct passphrase
+            // too, so without this shutdown an assertion below cannot
+            // distinguish a wrong passphrase from a right one.
             scp1.shutdown(bridge(), 1.seconds)
+            createdInstances.remove(scp1)
 
             // Reopen with the WRONG passphrase must fail closed — never
             // silently open a fresh DB (spec §17.6).
@@ -265,5 +271,10 @@ class PersistenceTest {
                 rejected.code,
                 "a rejected passphrase must surface as SCP-CTX-2000, not a downgrade to a fresh DB",
             )
+
+            // Reopening with a RIGHT passphrase must still succeed, which proves
+            // that a rejected attempt above failed on passphrase derivation and
+            // not on a lock this method forgot to release.
+            createdInstances += SCP.withSqlite(dir.toFile(), passphrase = "the-right-one")
         }
 }

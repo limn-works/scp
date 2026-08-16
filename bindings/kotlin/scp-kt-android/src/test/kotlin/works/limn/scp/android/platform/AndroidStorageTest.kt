@@ -45,37 +45,48 @@ import java.util.TreeMap
  * lexicographic ordering on listKeys, prefix-based matching, and cursor-style
  * retrieval. This implementation validates the StorageProvider contract without
  * requiring Android runtime dependencies.
+ *
+ * Every method holds [lock] for its whole body, because conformance case 12
+ * (`concurrent_access`) stores from eight threads at once and `TreeMap` is not
+ * thread-safe: concurrent `put` calls on a red-black tree drop entries and can leave
+ * a node graph that a later read walks incorrectly. Production [AndroidStorage]
+ * serializes that same way, through a single SQLCipher `SQLiteDatabase` connection.
  */
 class InMemoryStorageProvider : StorageProvider {
+
+    /** Monitor guarding [data]. Mirrors single-connection serialization AndroidStorage gets from SQLCipher. */
+    private val lock = Any()
 
     // TreeMap provides natural lexicographic ordering, matching SQLCipher's
     // ORDER BY key ASC behavior.
     private val data = TreeMap<String, ByteArray>()
 
     override fun set(key: String, data: ByteArray) {
-        this.data[key] = data.copyOf()
+        synchronized(lock) { this.data[key] = data.copyOf() }
     }
 
     override fun get(key: String): ByteArray? {
-        return data[key]?.copyOf()
+        return synchronized(lock) { data[key]?.copyOf() }
     }
 
     override fun delete(key: String) {
-        data.remove(key)
+        synchronized(lock) { data.remove(key) }
     }
 
     override fun listKeys(prefix: String): List<String> {
-        return data.keys.filter { it.startsWith(prefix) }
+        return synchronized(lock) { data.keys.filter { it.startsWith(prefix) } }
     }
 
     override fun deletePrefix(prefix: String): Long {
-        val keysToDelete = data.keys.filter { it.startsWith(prefix) }
-        keysToDelete.forEach { data.remove(it) }
-        return keysToDelete.size.toLong()
+        return synchronized(lock) {
+            val keysToDelete = data.keys.filter { it.startsWith(prefix) }
+            keysToDelete.forEach { data.remove(it) }
+            keysToDelete.size.toLong()
+        }
     }
 
     override fun exists(key: String): Boolean {
-        return data.containsKey(key)
+        return synchronized(lock) { data.containsKey(key) }
     }
 }
 
@@ -457,11 +468,16 @@ class AndroidStorageTest {
         }
 
         @Test
-        fun `getOrCreateStorageKey is accessible for integration testing`() {
-            // Verify the method exists on the production class (will throw at runtime
-            // without Android Keystore, but the method signature is correct)
-            val method = AndroidStorage::class.java.getDeclaredMethod("getOrCreateStorageKey")
+        fun `getOrCreateStorageKey takes no parameters and returns a ByteArray`() {
+            // Kotlin appends a module suffix to an `internal` function's JVM name
+            // (getOrCreateStorageKey$scp_kt_android_debug), so getDeclaredMethod given a
+            // Kotlin name never resolves it and throws NoSuchMethodException. Match on
+            // whatever precedes that suffix, then assert a signature ADR-027 names.
+            val method = AndroidStorage::class.java.declaredMethods
+                .single { it.name.substringBefore('$') == "getOrCreateStorageKey" }
             assertNotNull(method)
+            assertEquals(0, method.parameterCount)
+            assertEquals(ByteArray::class.java, method.returnType)
         }
 
         @Test
