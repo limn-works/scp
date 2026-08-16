@@ -14,7 +14,7 @@
 //! - **WASM**: `web_sys::RtcDataChannel`
 //! - **Testing**: in-memory mock provider
 //!
-//! The adapter orchestrates SCP message framing (MessagePack serialization)
+//! That adapter orchestrates SCP message framing (`MessagePack` serialization)
 //! over whatever data channel implementation the provider gives.
 //!
 //! # Operation Mapping (section 10.5.2)
