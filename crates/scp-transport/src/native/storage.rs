@@ -69,6 +69,17 @@ pub enum StorageError {
     /// An internal storage error occurred.
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A caller reached a backend-selection boundary without naming a backend,
+    /// named a backend this build does not carry, or omitted a value that a
+    /// named backend requires.
+    ///
+    /// §17.17.1 of `.docs/specs/17-persistence-and-storage.md`
+    /// (`SCP-CAPSEL-8000`) requires a caller to name a backend and forbids any
+    /// shape that picks one for that caller, so a selection boundary returns
+    /// this variant instead of picking a backend itself.
+    #[error("storage configuration error: {0}")]
+    Configuration(String),
 }
 
 /// Blob metadata without the body. Returned by streaming operations

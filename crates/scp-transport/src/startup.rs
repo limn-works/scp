@@ -11,13 +11,37 @@
 
 use std::env;
 use std::net::SocketAddr;
+// Only a sqlite arm and a redb arm name a path, so this import carries their
+// features; a `startup` build without either one would otherwise warn.
+#[cfg(any(feature = "sqlite-blob", feature = "redb-blob"))]
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 
-use crate::native::server::RelayConfig;
-use crate::native::storage::BlobStorageBackend;
+use crate::native::server::{RelayConfig, RelayError};
+use crate::native::storage::{BlobStorageBackend, StorageError};
+
+// ---------------------------------------------------------------------------
+// StartupError
+// ---------------------------------------------------------------------------
+
+/// Why a relay failed to start.
+///
+/// [`start_relay_from_env`] returns this to a binary rather than ending a
+/// process itself, so a caller that embeds a relay (a test harness, a node
+/// binary that also serves HTTP) chooses its own response.
+#[derive(Debug, thiserror::Error)]
+pub enum StartupError {
+    /// An operator named no blob storage backend, named one this build does
+    /// not carry, or named one whose resource a relay could not open.
+    #[error("blob storage selection failed: {0}")]
+    Storage(#[from] StorageError),
+
+    /// A relay bound its listener or started its accept loop and failed.
+    #[error("relay failed to start: {0}")]
+    Relay(#[from] RelayError),
+}
 
 // ---------------------------------------------------------------------------
 // env_or — typed environment variable with fallback
@@ -75,35 +99,83 @@ pub fn relay_config_from_env() -> RelayConfig {
 // Blob storage backend from environment
 // ---------------------------------------------------------------------------
 
-/// Valid backend names for error messages.
-pub const VALID_BACKENDS: &str = "sqlite, redb, postgres, s3, memory";
+/// Every backend name [`storage_from_env`] recognizes, across all builds. A
+/// build compiles an arm for each of these names only when that backend's cargo
+/// feature is on, so this list names more backends than a given build carries;
+/// [`compiled_backends`] names whichever ones this build carries.
+const KNOWN_BACKENDS: [&str; 5] = ["sqlite", "redb", "postgres", "s3", "memory"];
 
-/// Constructs the blob storage backend from environment configuration.
+/// Backend names this build carries an arm for, drawn from those same
+/// `#[cfg]`s that gate match arms in [`storage_from_env`].
 ///
-/// Reads `SCP_RELAY_STORAGE_BACKEND` (default: `sqlite`) and delegates to the
-/// appropriate backend constructor. Calls [`std::process::exit`] on
-/// misconfiguration with a descriptive error naming the valid options.
+/// Every operator-facing message lists these rather than [`KNOWN_BACKENDS`],
+/// because a message that offers a name this build compiled out sends an
+/// operator into a second error.
+fn compiled_backends() -> Vec<&'static str> {
+    let mut names = Vec::with_capacity(KNOWN_BACKENDS.len());
+    #[cfg(feature = "sqlite-blob")]
+    names.push("sqlite");
+    #[cfg(feature = "redb-blob")]
+    names.push("redb");
+    #[cfg(feature = "postgres-blob")]
+    names.push("postgres");
+    #[cfg(feature = "s3-blob")]
+    names.push("s3");
+    names.push("memory");
+    names
+}
+
+/// Names [`compiled_backends`] returns, joined for a message.
+fn compiled_backends_list() -> String {
+    compiled_backends().join(", ")
+}
+
+/// Constructs whichever blob storage backend an operator names in
+/// `SCP_RELAY_STORAGE_BACKEND`.
+///
+/// An operator names one backend; this function never picks one. §17.17.1 of
+/// `.docs/specs/17-persistence-and-storage.md` (`SCP-CAPSEL-8000`) makes that
+/// selection mandatory and forbids a default, and §17.17.1
+/// (`SCP-CAPSEL-8001`) makes a failed selection terminal, so every failure
+/// returns [`StorageError`] to a caller instead of ending a process. Each
+/// binary decides what to do with that error.
 ///
 /// # Storage backend selection
 ///
-/// | Value | Backend | Config env vars | Default |
-/// |---|---|---|---|
-/// | `sqlite` | `SQLite` | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | **yes** |
-/// | `redb` | redb | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | |
-/// | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required) | |
-/// | `s3` | S3-compat | `SCP_RELAY_S3_BUCKET` (required) + AWS env | |
-/// | `memory` | In-memory | — | |
+/// | Value | Backend | Config env vars |
+/// |---|---|---|
+/// | `sqlite` | `SQLite` | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) |
+/// | `redb` | redb | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) |
+/// | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required) |
+/// | `s3` | S3-compat | `SCP_RELAY_S3_BUCKET` (required) + AWS env |
+/// | `memory` | In-memory | — |
 ///
-/// # Panics
+/// # Errors
 ///
-/// Backend arms are compiled only when the corresponding feature is enabled
-/// (`sqlite-blob`, `redb-blob`, `postgres-blob`, `s3-blob`). If a backend
-/// is requested but the feature is not compiled in, the function prints an
-/// error and exits.
-pub async fn storage_from_env() -> BlobStorageBackend {
-    let backend = env::var("SCP_RELAY_STORAGE_BACKEND")
-        .unwrap_or_else(|_| "sqlite".to_owned())
-        .to_lowercase();
+/// Returns [`StorageError::Configuration`] when `SCP_RELAY_STORAGE_BACKEND` is
+/// unset or empty, when its value names no backend in that table, when this
+/// build carries no arm for a named backend (each arm compiles only under its
+/// own feature: `sqlite-blob`, `redb-blob`, `postgres-blob`, `s3-blob`), or
+/// when a named backend requires an env var that an operator left unset.
+/// Returns whatever [`StorageError`] a backend constructor reports when that
+/// constructor cannot open its resource.
+// Only a postgres arm and an s3 arm await, and each compiles under its own
+// feature, so a build carrying neither sees an await-free async fn.
+#[cfg_attr(
+    not(any(feature = "postgres-blob", feature = "s3-blob")),
+    allow(clippy::unused_async)
+)]
+pub async fn storage_from_env() -> Result<BlobStorageBackend, StorageError> {
+    let raw = env::var("SCP_RELAY_STORAGE_BACKEND").unwrap_or_default();
+    let backend = raw.trim().to_lowercase();
+
+    if backend.is_empty() {
+        return Err(StorageError::Configuration(format!(
+            "SCP_RELAY_STORAGE_BACKEND is not set. Name one backend this build carries: {}. \
+             There is no default backend.",
+            compiled_backends_list()
+        )));
+    }
 
     match backend.as_str() {
         #[cfg(feature = "sqlite-blob")]
@@ -112,10 +184,7 @@ pub async fn storage_from_env() -> BlobStorageBackend {
                 env::var("SCP_RELAY_STORAGE_PATH").unwrap_or_else(|_| "./scp-relay.db".to_owned());
             let path = PathBuf::from(path);
             tracing::info!(path = %path.display(), "using sqlite blob storage");
-            BlobStorageBackend::sqlite(&path).unwrap_or_else(|e| {
-                tracing::error!(error = %e, path = %path.display(), "failed to open sqlite storage");
-                std::process::exit(1);
-            })
+            BlobStorageBackend::sqlite(&path)
         }
         #[cfg(feature = "redb-blob")]
         "redb" => {
@@ -123,54 +192,51 @@ pub async fn storage_from_env() -> BlobStorageBackend {
                 .unwrap_or_else(|_| "./scp-relay.redb".to_owned());
             let path = PathBuf::from(path);
             tracing::info!(path = %path.display(), "using redb blob storage");
-            BlobStorageBackend::redb(&path).unwrap_or_else(|e| {
-                tracing::error!(error = %e, path = %path.display(), "failed to open redb storage");
-                std::process::exit(1);
-            })
+            BlobStorageBackend::redb(&path)
         }
         #[cfg(feature = "postgres-blob")]
         "postgres" => {
             let Ok(url) = env::var("SCP_RELAY_DATABASE_URL") else {
-                eprintln!(
-                    "error: SCP_RELAY_STORAGE_BACKEND=postgres requires SCP_RELAY_DATABASE_URL to be set"
-                );
-                std::process::exit(1);
+                return Err(StorageError::Configuration(
+                    "SCP_RELAY_STORAGE_BACKEND=postgres requires SCP_RELAY_DATABASE_URL to be set"
+                        .to_owned(),
+                ));
             };
             tracing::info!("using postgres blob storage");
-            let store = crate::native::postgres_blob::PostgresBlobStore::open(&url)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "failed to connect to postgres");
-                    std::process::exit(1);
-                });
-            BlobStorageBackend::Postgres(store)
+            let store = crate::native::postgres_blob::PostgresBlobStore::open(&url).await?;
+            Ok(BlobStorageBackend::Postgres(store))
         }
         #[cfg(feature = "s3-blob")]
         "s3" => {
             let Ok(bucket) = env::var("SCP_RELAY_S3_BUCKET") else {
-                eprintln!(
-                    "error: SCP_RELAY_STORAGE_BACKEND=s3 requires SCP_RELAY_S3_BUCKET to be set"
-                );
-                std::process::exit(1);
+                return Err(StorageError::Configuration(
+                    "SCP_RELAY_STORAGE_BACKEND=s3 requires SCP_RELAY_S3_BUCKET to be set"
+                        .to_owned(),
+                ));
             };
             let prefix = env::var("SCP_RELAY_S3_PREFIX").unwrap_or_else(|_| "blobs/".to_owned());
             tracing::info!(bucket = %bucket, prefix = %prefix, "using s3 blob storage");
-            let store = crate::native::s3_blob::S3BlobStore::open(&bucket, &prefix)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::error!(error = %e, "failed to initialize s3 storage");
-                    std::process::exit(1);
-                });
-            BlobStorageBackend::S3(store)
+            let store = crate::native::s3_blob::S3BlobStore::open(&bucket, &prefix).await?;
+            Ok(BlobStorageBackend::S3(store))
         }
         "memory" => {
             tracing::warn!("using in-memory blob storage — all data will be lost on restart");
-            BlobStorageBackend::in_memory()
+            Ok(BlobStorageBackend::in_memory())
         }
-        other => {
-            eprintln!("error: unknown storage backend '{other}'. Valid options: {VALID_BACKENDS}");
-            std::process::exit(1);
-        }
+        // A name this build carries an arm for matched above, so a name that
+        // reaches here either names no backend at all or names one whose arm
+        // this build compiled out. `KNOWN_BACKENDS` separates those two cases,
+        // because an operator fixes them differently: one by correcting a
+        // value, one by rebuilding with that backend's feature.
+        other if KNOWN_BACKENDS.contains(&other) => Err(StorageError::Configuration(format!(
+            "storage backend '{other}' is not compiled into this build. Rebuild with its \
+             cargo feature, or name one of: {}",
+            compiled_backends_list()
+        ))),
+        other => Err(StorageError::Configuration(format!(
+            "unknown storage backend '{other}'. This build carries: {}",
+            compiled_backends_list()
+        ))),
     }
 }
 
@@ -210,15 +276,15 @@ pub fn init_tracing() {
 // Health check
 // ---------------------------------------------------------------------------
 
-/// Runs a TCP health probe: attempts a connection to `addr` and exits with
-/// code 0 on success, 1 on failure.
+/// Runs a TCP health probe against `addr` and reports whether a connection
+/// succeeded.
 ///
-/// Designed for container health checks (`--health` CLI flag).
-pub async fn health_check(addr: SocketAddr) {
-    match tokio::net::TcpStream::connect(addr).await {
-        Ok(_) => std::process::exit(0),
-        Err(_) => std::process::exit(1),
-    }
+/// Designed for container health checks (`--health` CLI flag). This returns a
+/// verdict rather than ending a process, because a library that exits denies
+/// every caller — an embedding test harness included — a choice. Each binary
+/// turns `false` into its own non-zero exit.
+pub async fn health_check(addr: SocketAddr) -> bool {
+    tokio::net::TcpStream::connect(addr).await.is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -233,17 +299,24 @@ pub async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .unwrap_or_else(|_| {
-                // If we cannot register SIGTERM, fall back to ctrl_c only.
-                // This is unreachable on any standard Unix system but
-                // satisfies the no-panic lint without process::exit.
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    .unwrap_or_else(|_| std::process::exit(1))
-            });
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = sigterm.recv() => {}
+        // A kernel that refuses a SIGTERM handler leaves ctrl_c as a sole
+        // shutdown path, which is what this arm waits on. This arm ends no
+        // process: a library that exits takes that decision away from a caller
+        // that may run a relay beside other work.
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cannot register a SIGTERM handler; waiting on ctrl_c alone"
+                );
+                let _ = ctrl_c.await;
+            }
         }
     }
 
@@ -262,11 +335,20 @@ pub async fn shutdown_signal() {
 ///
 /// This encapsulates the common pattern of reading config + storage from env,
 /// building the relay, starting it, and logging the result.
-pub async fn start_relay_from_env() -> (
-    crate::native::server::ShutdownHandle,
-    SocketAddr,
-    Arc<BlobStorageBackend>,
-) {
+///
+/// # Errors
+///
+/// Returns [`StartupError::Storage`] when [`storage_from_env`] rejects an
+/// operator's blob storage configuration, and [`StartupError::Relay`] when a
+/// relay cannot bind its address.
+pub async fn start_relay_from_env() -> Result<
+    (
+        crate::native::server::ShutdownHandle,
+        SocketAddr,
+        Arc<BlobStorageBackend>,
+    ),
+    StartupError,
+> {
     let config = relay_config_from_env();
     tracing::info!(
         bind_addr = %config.bind_addr,
@@ -275,18 +357,12 @@ pub async fn start_relay_from_env() -> (
         "starting relay"
     );
 
-    let storage = Arc::new(storage_from_env().await);
+    let storage = Arc::new(storage_from_env().await?);
     let server = crate::native::server::RelayServer::new(config, Arc::clone(&storage));
 
-    let (handle, local_addr) = match server.start().await {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::error!(error = %e, "relay failed to start");
-            std::process::exit(1);
-        }
-    };
+    let (handle, local_addr) = server.start().await?;
 
     tracing::info!(addr = %local_addr, "relay listening");
 
-    (handle, local_addr, storage)
+    Ok((handle, local_addr, storage))
 }

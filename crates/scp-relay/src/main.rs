@@ -10,16 +10,19 @@
 //!
 //! ## Storage backend selection
 //!
-//! The relay selects a blob storage backend via the `SCP_RELAY_STORAGE_BACKEND`
-//! environment variable. Valid values:
+//! An operator names a blob storage backend in an `SCP_RELAY_STORAGE_BACKEND`
+//! environment variable. That variable has no default: a relay that reads it
+//! unset prints an error naming these values and exits non-zero, which §17.17.1
+//! of `.docs/specs/17-persistence-and-storage.md` (`SCP-CAPSEL-8000`) requires.
+//! Valid values:
 //!
-//! | Value      | Backend    | Config env vars                              | Default |
-//! |------------|------------|----------------------------------------------|---------|
-//! | `sqlite`   | `SQLite`     | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) | **yes** |
-//! | `redb`     | redb       | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) | |
-//! | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required)           | |
-//! | `s3`       | S3-compat  | `SCP_RELAY_S3_BUCKET` (required) + AWS env    | |
-//! | `memory`   | In-memory  | —                                             | |
+//! | Value      | Backend    | Config env vars                              |
+//! |------------|------------|----------------------------------------------|
+//! | `sqlite`   | `SQLite`     | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.db`) |
+//! | `redb`     | redb       | `SCP_RELAY_STORAGE_PATH` (default `./scp-relay.redb`) |
+//! | `postgres` | `PostgreSQL` | `SCP_RELAY_DATABASE_URL` (required)           |
+//! | `s3`       | S3-compat  | `SCP_RELAY_S3_BUCKET` (required) + AWS env    |
+//! | `memory`   | In-memory  | —                                             |
 //!
 //! See §10.5 of the SCP infrastructure spec.
 
@@ -36,14 +39,27 @@ async fn main() {
             "SCP_RELAY_BIND_ADDR",
             SocketAddr::from(([127, 0, 0, 1], 9000)),
         );
-        startup::health_check(addr).await;
-        // health_check always calls process::exit, but satisfy the compiler.
-        return;
+        // `health_check` reports a verdict; this binary turns it into an exit
+        // code, which is what a container health probe reads.
+        if startup::health_check(addr).await {
+            return;
+        }
+        std::process::exit(1);
     }
 
     startup::init_tracing();
 
-    let (handle, _local_addr, _storage) = startup::start_relay_from_env().await;
+    let (handle, _local_addr, _storage) = match startup::start_relay_from_env().await {
+        Ok(started) => started,
+        Err(e) => {
+            // A relay never starts without a backend an operator named, so
+            // report what failed on stderr (which an operator reads even when
+            // tracing writes elsewhere) and exit non-zero.
+            eprintln!("error: {e}");
+            tracing::error!(error = %e, "relay failed to start");
+            std::process::exit(1);
+        }
+    };
 
     // Start Prometheus metrics HTTP server on a separate port (#1467).
     let metrics_port = startup::env_or("SCP_RELAY_METRICS_PORT", 9001u16);

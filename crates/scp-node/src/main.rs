@@ -180,8 +180,10 @@ ENVIRONMENT VARIABLES:
     SCP_STORAGE_KEY             Hex-encoded 32-byte SQLCipher encryption key
                                 (auto-generated and stored if not set)
     SCP_RELAY_BIND_ADDR         Relay bind address (default: 0.0.0.0:9000)
-    SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay: sqlite (default), redb,
-                                postgres, s3, memory
+    SCP_RELAY_STORAGE_BACKEND   Blob storage backend for relay: sqlite, redb, postgres,
+                                s3, memory. Required whenever this node serves a relay —
+                                it has no default, and a node that reads it unset exits
+                                non-zero
     SCP_RELAY_STORAGE_PATH      Path for sqlite/redb blob storage (default: ./scp-relay.db)
     SCP_RELAY_DATABASE_URL      PostgreSQL connection URL (required when backend=postgres)
     SCP_RELAY_S3_BUCKET         S3 bucket name (required when backend=s3)
@@ -261,7 +263,28 @@ fn resolve_storage_key_or_exit(storage_dir: &std::path::Path) -> Zeroizing<[u8; 
 // Relay blob storage from env
 // ---------------------------------------------------------------------------
 
-// `storage_from_env` is provided by `scp_transport::startup::storage_from_env`.
+// `storage_from_env` is provided by `scp_transport::startup::storage_from_env`,
+// which returns a typed `StorageError` rather than ending this process. This
+// binary is where that error becomes an exit code.
+
+/// Selects a relay's blob backend from environment variables, or prints a
+/// selection error and exits non-zero.
+///
+/// `scp_transport::startup::storage_from_env` returns an error when an operator
+/// named no backend in `SCP_RELAY_STORAGE_BACKEND`, named one this build does
+/// not carry, or named one whose resource it could not open. A node cannot
+/// serve a relay without a blob backend, so each of those errors ends this
+/// process here — at a binary's boundary, never inside a library.
+async fn storage_from_env_or_exit() -> BlobStorageBackend {
+    match startup::storage_from_env().await {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("error: {e}");
+            tracing::error!(error = %e, "blob storage selection failed");
+            std::process::exit(1);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Relay-only mode
@@ -277,7 +300,7 @@ async fn run_relay_only() {
         "starting scp-node in relay-only mode"
     );
 
-    let storage = Arc::new(startup::storage_from_env().await);
+    let storage = Arc::new(storage_from_env_or_exit().await);
     let server = RelayServer::new(config, storage);
 
     let (handle, local_addr) = match server.start().await {
@@ -533,10 +556,11 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 did_method,
                 Arc::clone(&node_storage_arc),
                 // Persistent mode: operator-configured durable blob backend
-                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
-                // `SCP_RELAY_STORAGE_PATH` — the same explicit selection
-                // relay-only mode makes (SCP-CAPINJECT-010).
-                startup::storage_from_env().await,
+                // named by `SCP_RELAY_STORAGE_BACKEND` (no default) and
+                // configured by `SCP_RELAY_STORAGE_PATH` — an explicit
+                // selection identical to what relay-only mode makes
+                // (SCP-CAPINJECT-010).
+                storage_from_env_or_exit().await,
             )
             .await;
         }
@@ -566,9 +590,9 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
                 did_method,
                 Arc::clone(&node_storage_arc),
                 // Persistent mode: operator-configured durable blob backend
-                // (default SQLite), honoring `SCP_RELAY_STORAGE_BACKEND` /
-                // `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
-                startup::storage_from_env().await,
+                // named by `SCP_RELAY_STORAGE_BACKEND` (no default) and
+                // configured by `SCP_RELAY_STORAGE_PATH` (SCP-CAPINJECT-010).
+                storage_from_env_or_exit().await,
             )
             .await;
         }
@@ -917,8 +941,9 @@ async fn run_node_with<
     // (that would re-introduce the SCP-CAPSEL-8002 anti-pattern the story kills,
     // and would break ephemeral mode's all-in-memory contract). Ephemeral mode
     // passes `ephemeral_blob_backend()` (in-memory, no persistence, env-ignoring);
-    // persistent mode passes `startup::storage_from_env()` (durable, default
-    // SQLite, honors env).
+    // persistent mode passes `storage_from_env_or_exit()`, which wraps
+    // `startup::storage_from_env()` (durable, operator-named backend, no
+    // default) and turns a selection error into a non-zero exit.
     blob_storage: BlobStorageBackend,
 ) {
     let use_self_signed = env_flag_is_truthy(env::var("SCP_NODE_TLS_SELF_SIGNED").ok().as_deref());
@@ -1105,8 +1130,12 @@ async fn main() {
                 SocketAddr::from(([127, 0, 0, 1], 9000)),
             )
         };
-        startup::health_check(addr).await;
-        return;
+        // `health_check` reports a verdict; this binary turns it into an exit
+        // code, which is what a container health probe reads.
+        if startup::health_check(addr).await {
+            return;
+        }
+        std::process::exit(1);
     }
 
     startup::init_tracing();
@@ -1147,8 +1176,9 @@ mod tests {
     /// Regression guard (SCP-CAPINJECT-010): ephemeral mode MUST select the
     /// in-memory blob backend — no persistence, env overrides ignored. This pins
     /// the ephemeral caller's boundary selection so it cannot silently regress to
-    /// a durable / env-driven backend (`startup::storage_from_env`, which defaults
-    /// to `Sqlite`), which would break the all-in-memory contract documented on
+    /// a durable / env-driven backend (`startup::storage_from_env`, which
+    /// requires an operator to name a backend), which would break an
+    /// all-in-memory contract documented on
     /// `run_full_node_ephemeral` and re-persist blobs to disk. If someone swaps
     /// `ephemeral_blob_backend()` to any non-in-memory backend, this fails.
     #[test]
