@@ -55,7 +55,14 @@ To test that cleanup actually runs on ViewModel destruction, use one of:
    triggers the full `clear()` → cancel → `onCleared()` sequence on the real framework code.
 2. **Dedicated scope** — if using the dedicated `cleanupScope` pattern above, tests can
    directly `advanceUntilIdle()` after `callOnCleared()` because `cleanupScope` is not
-   pre-cancelled by the test helper.
+   pre-cancelled by the test helper. `advanceUntilIdle()` drains the cleanup coroutine
+   deterministically only when `cleanupScope` runs on the test's own `TestDispatcher`, so
+   `ScpViewModel` takes that dispatcher as a constructor parameter defaulting to
+   `Dispatchers.IO`.
+
+Never wrap the cleanup loop in `runBlocking` to make it finish before `onCleared()` returns.
+That parks the calling thread on work the test dispatcher can only run from that same thread.
+See `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
 
 ## Anti-Pattern
 

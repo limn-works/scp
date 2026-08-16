@@ -90,31 +90,41 @@ The Kotlin `StorageProvider` interface in `Types.kt` uses `set()`/`get()` matchi
 
 `TestLifecycleOwner` from `lifecycle-runtime-testing` dispatches lifecycle events via a coroutine dispatcher. In tests, pass `UnconfinedTestDispatcher(testScheduler)` to `TestLifecycleOwner`'s constructor so lifecycle state changes take effect immediately. Using `StandardTestDispatcher` requires explicit `advanceUntilIdle()` calls between lifecycle transitions which can cause subtle ordering issues in flow collection tests.
 
-### ScpViewModel.onCleared() must NOT use viewModelScope
+### ScpViewModel.onCleared() must NOT use viewModelScope, and must NOT block its caller
 
-DEFECT FOUND IN SCP-117 REVIEW: `ViewModel.clear()` cancels `viewModelScope` (via its `CloseableCoroutineScope` tag) **before** calling `onCleared()`. Any `viewModelScope.launch` inside `onCleared()` launches into a cancelled scope and silently does nothing — the coroutine is dropped. This means `ScpViewModel.onCleared()` as currently written does NOT call `leave()` on tracked contexts in production Android.
+`ViewModel.clear()` cancels `viewModelScope` (via its `CloseableCoroutineScope` tag) **before** calling `onCleared()`. Any `viewModelScope.launch` inside `onCleared()` launches into a cancelled scope and silently does nothing — the coroutine is dropped. `ScpViewModel` therefore holds a dedicated `cleanupScope`.
 
-The fix is to use a dedicated cleanup scope held by the ViewModel:
+`onCleared()` must also not wait for that scope's work. A `runBlocking` around the `leave` loop parked the test thread forever, because `CoroutineBridge.ffiCall` schedules `leave` onto the injected `ioDispatcher` and a `StandardTestDispatcher` only runs queued work when the test thread advances its scheduler. See `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
+
+The shipped implementation snapshots and clears the tracked-context list under a monitor lock, launches the `leave` calls, and returns:
 ```kotlin
-private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+abstract class ScpViewModel(
+    cleanupDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) : ViewModel() {
+    private val contextsLock = Any()
+    private val cleanupScope = CoroutineScope(SupervisorJob() + cleanupDispatcher)
 
-override fun onCleared() {
-    cleanupScope.launch {
-        val contexts = mutex.withLock {
+    override fun onCleared() {
+        super.onCleared()
+        val contexts = synchronized(contextsLock) {
             val snapshot = activeContexts.toList()
             activeContexts.clear()
             snapshot
         }
-        for (ctx in contexts) {
-            runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
+        val cleanupJob = cleanupScope.launch {
+            for (ctx in contexts) {
+                runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
+                    .onFailure { failure -> if (failure is CancellationException) throw failure }
+            }
         }
-        cleanupScope.cancel()
+        cleanupJob.invokeOnCompletion { cleanupScope.cancel() }
     }
-    super.onCleared()
 }
 ```
 
-Tests for `onCleared()` are also broken: `TestScpViewModel.callOnCleared()` calls `onCleared()` directly without pre-cancelling `viewModelScope`, so the tests pass but mask the production bug. Correct test strategy: use Robolectric with the real `ViewModelProvider` lifecycle, or restructure cleanup to use the dedicated scope above so its cancellation is controllable in tests.
+`onCleared()` guarantees that the tracked list is empty when it returns and that a coroutine calling `leave` on every snapshotted context has started. It does not guarantee those calls have finished — cleanup is best-effort, and completes only if the process outlives it.
+
+Tests pass their own `TestDispatcher` as `cleanupDispatcher`, so `advanceUntilIdle()` runs the cleanup coroutine and every `leave` it makes. `ScpViewModelTest` carries a class-level `@Timeout(30s, SEPARATE_THREAD)` so a reintroduced block fails the build rather than hanging the runner.
 
 In tests, set `Dispatchers.setMain(testDispatcher)` before constructing the ViewModel and call `Dispatchers.resetMain()` in teardown.
 

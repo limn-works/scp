@@ -10,13 +10,13 @@ package works.limn.scp.android
 
 import androidx.lifecycle.ViewModel
 import works.limn.scp.bridge.CoroutineBridge
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.launch
 
 /**
  * Resource handle for an active SCP context tracked by [ScpViewModel].
@@ -66,13 +66,23 @@ data class TrackedContext(
  * ```
  *
  * Thread safety: [trackContext] and [untrackContext] are safe to call from any coroutine
- * or thread. The internal context list is protected by a [Mutex].
+ * or thread. A monitor lock guards the internal context list. Neither method suspends and
+ * neither blocks on coroutine machinery, so a caller running on a single-threaded
+ * dispatcher cannot deadlock on them.
+ *
+ * @param cleanupDispatcher Dispatcher that runs the cleanup coroutine [onCleared] launches.
+ *   That coroutine calls [CoroutineBridge.ContextBridge.leave], which dispatches its own FFI
+ *   call onto the bridge's IO dispatcher. Defaults to [Dispatchers.IO]. A test injects the
+ *   same `TestDispatcher` it gave [CoroutineBridge], so `advanceUntilIdle()` runs the cleanup
+ *   coroutine and every `leave` call the coroutine makes.
  */
-abstract class ScpViewModel : ViewModel() {
+abstract class ScpViewModel(
+    cleanupDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) : ViewModel() {
 
-    private val mutex = Mutex()
+    private val contextsLock = Any()
     private val activeContexts = mutableListOf<TrackedContext>()
-    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cleanupScope = CoroutineScope(SupervisorJob() + cleanupDispatcher)
 
     /**
      * Register a context for automatic cleanup on ViewModel clear.
@@ -85,7 +95,7 @@ abstract class ScpViewModel : ViewModel() {
      * @return The same [context] passed in, for chaining.
      */
     fun trackContext(context: TrackedContext): TrackedContext {
-        runBlocking { mutex.withLock { activeContexts.add(context) } }
+        synchronized(contextsLock) { activeContexts.add(context) }
         return context
     }
 
@@ -98,29 +108,45 @@ abstract class ScpViewModel : ViewModel() {
      * @param context The [TrackedContext] to stop tracking.
      */
     fun untrackContext(context: TrackedContext) {
-        runBlocking { mutex.withLock { activeContexts.remove(context) } }
+        synchronized(contextsLock) { activeContexts.remove(context) }
     }
 
     /**
      * Called when the ViewModel is cleared (Activity/Fragment destroyed permanently).
      *
-     * Uses a dedicated [cleanupScope] because [viewModelScope] is already cancelled
-     * before [onCleared] is called. Leaves all tracked contexts gracefully via
-     * [runBlocking] to ensure cleanup completes before the method returns. Errors
-     * during individual leave operations are caught to ensure all contexts are attempted.
+     * What this method guarantees when it returns:
+     * - The tracked-context list is empty, and the snapshot it took holds every context
+     *   that [trackContext] registered and [untrackContext] did not remove. A second
+     *   [onCleared] call therefore finds nothing to leave.
+     * - A coroutine is submitted to [cleanupScope], and that coroutine calls
+     *   [CoroutineBridge.ContextBridge.leave] once for every context in the snapshot.
+     * - A `leave` call that throws does not stop the remaining `leave` calls.
+     *
+     * What this method does not guarantee: that the `leave` calls have finished. Cleanup
+     * is best-effort — the calls run to completion only if the process outlives them.
+     * Blocking until they finish is not an option: [onCleared] runs on the Android main
+     * thread, and blocking that thread on FFI calls both risks an ANR and deadlocks
+     * whenever the injected dispatcher schedules its work onto the blocked thread.
+     *
+     * Uses a dedicated [cleanupScope] because `viewModelScope` is already cancelled before
+     * [onCleared] is called, so a coroutine launched there would be dropped without running.
+     * The scope is cancelled once the cleanup coroutine completes.
      */
     override fun onCleared() {
         super.onCleared()
-        runBlocking(cleanupScope.coroutineContext) {
-            val contexts = mutex.withLock {
+        val contexts =
+            synchronized(contextsLock) {
                 val snapshot = activeContexts.toList()
                 activeContexts.clear()
                 snapshot
             }
-            for (ctx in contexts) {
-                runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
+        val cleanupJob =
+            cleanupScope.launch {
+                for (ctx in contexts) {
+                    runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
+                        .onFailure { failure -> if (failure is CancellationException) throw failure }
+                }
             }
-        }
-        cleanupScope.cancel()
+        cleanupJob.invokeOnCompletion { cleanupScope.cancel() }
     }
 }
