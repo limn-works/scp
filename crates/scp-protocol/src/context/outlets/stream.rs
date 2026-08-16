@@ -1839,9 +1839,21 @@ mod tests {
 
     #[test]
     fn stream_terminal_status_three_variants() {
-        let _ = StreamTerminalStatus::Ok;
-        let _ = StreamTerminalStatus::Error(CODE_EXECUTION_FAULT.into());
-        let _ = StreamTerminalStatus::Cancelled;
+        // A wildcard-free match over every constructed variant stops
+        // compiling when a fourth variant appears, which is what this test's
+        // name claims. Binding each variant to `_`, as an earlier version
+        // did, admitted any number of variants.
+        for status in [
+            StreamTerminalStatus::Ok,
+            StreamTerminalStatus::Error(CODE_EXECUTION_FAULT.into()),
+            StreamTerminalStatus::Cancelled,
+        ] {
+            match status {
+                StreamTerminalStatus::Ok
+                | StreamTerminalStatus::Error(_)
+                | StreamTerminalStatus::Cancelled => {}
+            }
+        }
     }
 
     #[test]

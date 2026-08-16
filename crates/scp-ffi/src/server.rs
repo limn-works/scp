@@ -1043,12 +1043,19 @@ mod tests {
             "RunningNode enable should succeed: {result:?}"
         );
 
-        // commit_deploy — will fail because no blobs exist but should return
-        // a proper error, not panic.
         let cd_result = rt().block_on(inner.commit_deploy("dispatch-ctx", "deploy-abc"));
-        // This will return an error about no assets or similar — the important
-        // thing is that dispatch works and doesn't panic.
-        assert!(cd_result.is_ok() || cd_result.is_err());
+        // `RunningNode::commit_deploy` returns how many assets it committed.
+        // Code above projected this context, which holds no staged blob, so
+        // dispatch must reach this node and report zero assets — never that
+        // "not projected" error `commit_deploy_on_unprojected_context_returns_error`
+        // pins. An earlier assertion read `is_ok() || is_err()`, which every
+        // value satisfies.
+        let committed =
+            cd_result.expect("commit_deploy must reach a projected context rather than erroring");
+        assert_eq!(
+            committed, 0,
+            "no asset was staged under deploy-abc, so no asset may be committed"
+        );
 
         // disable
         rt().block_on(inner.disable_broadcast_projection("dispatch-ctx"));

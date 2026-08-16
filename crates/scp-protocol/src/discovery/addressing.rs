@@ -169,6 +169,36 @@ impl AddressResolution {
     }
 }
 
+/// A resolution layer that a [`crate::discovery::AddressResolution`] producer
+/// cannot query at all.
+///
+/// A querier returns this value instead of an empty result vector when that
+/// querier implements no path to a layer. An empty vector and this error carry
+/// different information: an empty vector says no participant registered that
+/// handle, and this error says nobody asked. §22.11.7 of
+/// `.docs/specs/22-human-readable-addressing.md` makes `attestation_lookup` a
+/// normative outlet name, so a bridge that never invokes `attestation_lookup`
+/// reports [`ResolutionLayer::Attestation`] as unavailable rather than
+/// reporting zero results.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{layer:?} resolution layer is unavailable: {reason}")]
+pub struct LayerUnavailable {
+    /// Layer that this querier cannot reach.
+    pub layer: ResolutionLayer,
+    /// Why this querier cannot reach `layer`.
+    pub reason: String,
+}
+
+/// Renders every unavailable layer into one comma-separated sentence for
+/// [`AddressingError::LayersUnavailable`].
+fn describe_layers(layers: &[LayerUnavailable]) -> String {
+    layers
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Errors produced by address parsing and resolution.
 #[derive(Debug, thiserror::Error)]
 pub enum AddressingError {
@@ -193,8 +223,24 @@ pub enum AddressingError {
     ConsecutivePeriods,
 
     /// No resolution results found for the given address.
+    ///
+    /// Every layer that resolution consulted answered, and no layer held a
+    /// binding for this address.
     #[error("address not found: {0}")]
     NotFound(String),
+
+    /// Resolution produced no results, and at least one layer never answered
+    /// because this deployment cannot query that layer.
+    ///
+    /// A caller reads this variant as "capability absent", and reads
+    /// [`AddressingError::NotFound`] as "capability present, binding absent".
+    #[error("address {address} did not resolve, and these layers could not be queried: {}", describe_layers(.layers))]
+    LayersUnavailable {
+        /// Address that resolution failed to resolve.
+        address: String,
+        /// Every layer that resolution skipped, with a reason for each.
+        layers: Vec<LayerUnavailable>,
+    },
 
     /// A resolution layer returned an error.
     #[error("resolution error in {layer} layer: {message}")]

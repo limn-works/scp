@@ -1009,6 +1009,16 @@ pub const VALID_7133: &str = "SCP-VALID-7133";
 pub const VALID_7134: &str = "SCP-VALID-7134";
 /// Address resolution ambiguous error.
 pub const VALID_7135: &str = "SCP-VALID-7135";
+/// Address resolution reached no binding, and could not query at least one
+/// layer.
+///
+/// Which layer went unqueried: attestation reverse-lookup (§22.5.1),
+/// `.well-known/scp` domain handles (§22.6.1), or a context handle registry
+/// this bridge instance does not hold. `VALID_7091` reports one other case,
+/// where every consulted layer answered and none held a binding, so a caller
+/// reads `VALID_7136` as "capability absent" and `VALID_7091` as "binding
+/// absent".
+pub const VALID_7136: &str = "SCP-VALID-7136";
 /// Recovery or custody-migration concurrency cap reached.
 ///
 /// The NAPI bridge bounds concurrent `block_on` invocations to prevent libuv

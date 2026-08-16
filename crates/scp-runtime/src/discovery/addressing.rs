@@ -23,8 +23,8 @@ use scp_clock::Clock;
 use scp_protocol::discovery::ContextId;
 
 pub use scp_protocol::discovery::addressing::{
-    AddressResolution, AddressingError, HandleTarget, MAX_LOCAL_PART_LENGTH, PetnameStore,
-    ResolutionLayer, ResolutionPath, TrustLevel,
+    AddressResolution, AddressingError, HandleTarget, LayerUnavailable, MAX_LOCAL_PART_LENGTH,
+    PetnameStore, ResolutionLayer, ResolutionPath, TrustLevel,
 };
 
 // ---------------------------------------------------------------------------
@@ -376,8 +376,13 @@ impl AddressResolver {
     ///
     /// # Errors
     ///
-    /// Returns [`AddressingError`] if the address is malformed or resolution
-    /// fails entirely.
+    /// Returns [`AddressingError::EmptyAddress`] and its sibling parse
+    /// variants when `address` is malformed. Returns
+    /// [`AddressingError::NotFound`] when every consulted layer answered and
+    /// none held a binding. Returns [`AddressingError::LayersUnavailable`]
+    /// when no layer held a binding and `handle_querier` could not query at
+    /// least one layer, which tells a caller that a capability is missing
+    /// rather than a binding.
     #[allow(clippy::future_not_send)] // async trait methods don't support Send bounds
     pub async fn resolve<P, H>(
         &mut self,
@@ -401,34 +406,51 @@ impl AddressResolver {
 
         let parsed = parse_address(address)?;
         let mut results = Vec::new();
+        // Every layer that answered with LayerUnavailable rather than with a
+        // result vector. Resolution reports these to a caller when no layer
+        // produced a binding, so that caller separates "capability absent"
+        // from "binding absent".
+        let mut unavailable: Vec<LayerUnavailable> = Vec::new();
 
         match parsed {
             ParsedAddress::DiscoveryHandle { local_part, scope } => {
                 if let Some(context_id) = known_contexts.get(&scope) {
-                    let handle_results = handle_querier
-                        .lookup_handle(context_id, &local_part, None)
-                        .await;
-                    results.extend(handle_results);
+                    record_layer_answer(
+                        handle_querier
+                            .lookup_handle(context_id, &local_part, None)
+                            .await,
+                        &mut results,
+                        &mut unavailable,
+                    );
                 }
             }
             ParsedAddress::DomainHandle { local_part, domain } => {
-                let domain_results = handle_querier
-                    .lookup_domain_handle(&domain, &local_part)
-                    .await;
-                results.extend(domain_results);
+                record_layer_answer(
+                    handle_querier
+                        .lookup_domain_handle(&domain, &local_part)
+                        .await,
+                    &mut results,
+                    &mut unavailable,
+                );
 
                 if results.is_empty() {
-                    let attestation_results = handle_querier
-                        .lookup_attestation_handle(&local_part, Some(&domain))
-                        .await;
-                    results.extend(attestation_results);
+                    record_layer_answer(
+                        handle_querier
+                            .lookup_attestation_handle(&local_part, Some(&domain))
+                            .await,
+                        &mut results,
+                        &mut unavailable,
+                    );
                 }
             }
             ParsedAddress::AttestationHandle { handle, platform } => {
-                let attestation_results = handle_querier
-                    .lookup_attestation_handle(&handle, platform.as_deref())
-                    .await;
-                results.extend(attestation_results);
+                record_layer_answer(
+                    handle_querier
+                        .lookup_attestation_handle(&handle, platform.as_deref())
+                        .await,
+                    &mut results,
+                    &mut unavailable,
+                );
             }
             ParsedAddress::Unscoped { name } => {
                 // §22.8.2: Check petnames first (instant, no network).
@@ -442,27 +464,40 @@ impl AddressResolver {
 
                 // Then check all contexts with discovery outlets.
                 for (scope, context_id) in known_contexts {
-                    let handle_results =
-                        handle_querier.lookup_handle(context_id, &name, None).await;
-                    results.extend(handle_results);
+                    record_layer_answer(
+                        handle_querier.lookup_handle(context_id, &name, None).await,
+                        &mut results,
+                        &mut unavailable,
+                    );
                     let _ = scope;
                 }
 
                 // Then check domain handles for each configured domain (§22.8.2 step 2a).
                 for domain in known_domains {
-                    let domain_results = handle_querier.lookup_domain_handle(domain, &name).await;
-                    results.extend(domain_results);
+                    record_layer_answer(
+                        handle_querier.lookup_domain_handle(domain, &name).await,
+                        &mut results,
+                        &mut unavailable,
+                    );
                 }
 
                 // Then check attestation.
-                let attestation_results =
-                    handle_querier.lookup_attestation_handle(&name, None).await;
-                results.extend(attestation_results);
+                record_layer_answer(
+                    handle_querier.lookup_attestation_handle(&name, None).await,
+                    &mut results,
+                    &mut unavailable,
+                );
             }
         }
 
         if results.is_empty() {
-            return Err(AddressingError::NotFound(address.to_owned()));
+            if unavailable.is_empty() {
+                return Err(AddressingError::NotFound(address.to_owned()));
+            }
+            return Err(AddressingError::LayersUnavailable {
+                address: address.to_owned(),
+                layers: unavailable,
+            });
         }
 
         // Sort by trust level rank (descending).
@@ -499,36 +534,81 @@ impl Default for AddressResolver {
 /// Abstracts context handle lookup, attestation reverse-lookup,
 /// and domain handle resolution.
 #[allow(async_fn_in_trait)]
+/// Every method answers with a result vector, which may be empty when no
+/// participant registered that handle, or with [`LayerUnavailable`], which
+/// says this implementation reaches no such layer. An implementation that
+/// cannot query a layer MUST return [`LayerUnavailable`] and MUST NOT return
+/// an empty vector, because an empty vector claims that somebody looked.
 pub trait HandleQuerier {
     /// Looks up a handle in a context with discovery outlets.
     ///
     /// Returns resolution results from the specified context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerUnavailable`] when this implementation reaches no
+    /// context handle registry.
     async fn lookup_handle(
         &self,
         context_id: &ContextId,
         handle: &str,
         type_filter: Option<AddressType>,
-    ) -> Vec<AddressResolution>;
+    ) -> Result<Vec<AddressResolution>, LayerUnavailable>;
 
     /// Looks up a domain handle via `.well-known/scp`.
     ///
     /// Returns resolution results from the domain's handles map.
-    async fn lookup_domain_handle(&self, domain: &str, handle: &str) -> Vec<AddressResolution>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerUnavailable`] when this implementation performs no
+    /// `.well-known/scp` fetch.
+    async fn lookup_domain_handle(
+        &self,
+        domain: &str,
+        handle: &str,
+    ) -> Result<Vec<AddressResolution>, LayerUnavailable>;
 
     /// Looks up an attestation-backed handle via reverse-lookup.
     ///
     /// Returns resolution results from attestation indexes in known
     /// contexts with discovery outlets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerUnavailable`] when this implementation invokes no
+    /// `attestation_lookup` outlet (§22.5.1).
     async fn lookup_attestation_handle(
         &self,
         handle: &str,
         platform: Option<&str>,
-    ) -> Vec<AddressResolution>;
+    ) -> Result<Vec<AddressResolution>, LayerUnavailable>;
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Pushes one layer's answer onto `results`, or that layer's unavailability
+/// onto `unavailable`.
+///
+/// A caller that queries one layer once per domain or once per context still
+/// learns of one absent capability, so this records each distinct
+/// [`LayerUnavailable`] once.
+fn record_layer_answer(
+    answer: Result<Vec<AddressResolution>, LayerUnavailable>,
+    results: &mut Vec<AddressResolution>,
+    unavailable: &mut Vec<LayerUnavailable>,
+) {
+    match answer {
+        Ok(found) => results.extend(found),
+        Err(missing) => {
+            if !unavailable.contains(&missing) {
+                unavailable.push(missing);
+            }
+        }
+    }
+}
 
 /// Detects when multiple resolution paths found the same DID and promotes
 /// those results to `MultiLayerCorroborated` per §22.8.2 step 4c.
@@ -986,6 +1066,10 @@ mod tests {
         discovery_handles: HashMap<(String, String), Vec<AddressResolution>>,
         domain_handles: HashMap<(String, String), Vec<AddressResolution>>,
         attestation_handles: HashMap<String, Vec<AddressResolution>>,
+        /// Layers this querier reports as unreachable, modelling a bridge that
+        /// invokes no `attestation_lookup` outlet and fetches no
+        /// `.well-known/scp` document.
+        unavailable_layers: Vec<ResolutionLayer>,
     }
 
     impl TestHandleQuerier {
@@ -994,7 +1078,26 @@ mod tests {
                 discovery_handles: HashMap::new(),
                 domain_handles: HashMap::new(),
                 attestation_handles: HashMap::new(),
+                unavailable_layers: Vec::new(),
             }
+        }
+
+        /// Marks `layer` unreachable, so every lookup against it answers with
+        /// [`LayerUnavailable`].
+        fn mark_unavailable(&mut self, layer: ResolutionLayer) {
+            self.unavailable_layers.push(layer);
+        }
+
+        /// Answers with [`LayerUnavailable`] when a caller marked `layer`
+        /// unreachable.
+        fn availability(&self, layer: &ResolutionLayer) -> Result<(), LayerUnavailable> {
+            if self.unavailable_layers.contains(layer) {
+                return Err(LayerUnavailable {
+                    layer: layer.clone(),
+                    reason: "test double reaches no such layer".to_owned(),
+                });
+            }
+            Ok(())
         }
 
         fn add_discovery_handle(
@@ -1058,29 +1161,39 @@ mod tests {
             context_id: &ContextId,
             handle: &str,
             _type_filter: Option<AddressType>,
-        ) -> Vec<AddressResolution> {
-            self.discovery_handles
+        ) -> Result<Vec<AddressResolution>, LayerUnavailable> {
+            self.availability(&ResolutionLayer::HandleRegistry)?;
+            Ok(self
+                .discovery_handles
                 .get(&(context_id.clone(), handle.to_owned()))
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default())
         }
 
-        async fn lookup_domain_handle(&self, domain: &str, handle: &str) -> Vec<AddressResolution> {
-            self.domain_handles
+        async fn lookup_domain_handle(
+            &self,
+            domain: &str,
+            handle: &str,
+        ) -> Result<Vec<AddressResolution>, LayerUnavailable> {
+            self.availability(&ResolutionLayer::Domain)?;
+            Ok(self
+                .domain_handles
                 .get(&(domain.to_owned(), handle.to_owned()))
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default())
         }
 
         async fn lookup_attestation_handle(
             &self,
             handle: &str,
             _platform: Option<&str>,
-        ) -> Vec<AddressResolution> {
-            self.attestation_handles
+        ) -> Result<Vec<AddressResolution>, LayerUnavailable> {
+            self.availability(&ResolutionLayer::Attestation)?;
+            Ok(self
+                .attestation_handles
                 .get(handle)
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default())
         }
     }
 
@@ -1323,6 +1436,93 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(AddressingError::NotFound(_))));
+    }
+
+    /// A querier that reaches no attestation index reports
+    /// [`AddressingError::LayersUnavailable`], never
+    /// [`AddressingError::NotFound`], so a caller learns that this deployment
+    /// invokes no `attestation_lookup` outlet (§22.5.1).
+    #[tokio::test]
+    async fn resolve_attestation_handle_reports_unavailable_layer() {
+        let petnames = TestPetnameStore::new();
+        let mut querier = TestHandleQuerier::new();
+        querier.mark_unavailable(ResolutionLayer::Attestation);
+        let known = HashMap::new();
+
+        let mut resolver = AddressResolver::new();
+        let result = resolver
+            .resolve(
+                "@alice_cooks",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_clock::SystemClock,
+            )
+            .await;
+
+        let Err(AddressingError::LayersUnavailable { address, layers }) = result else {
+            panic!("expected LayersUnavailable, got {result:?}");
+        };
+        assert_eq!(address, "@alice_cooks");
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].layer, ResolutionLayer::Attestation);
+    }
+
+    /// A querier that reaches an attestation index holding no entry for this
+    /// handle reports [`AddressingError::NotFound`]. Paired with
+    /// `resolve_attestation_handle_reports_unavailable_layer`, this test pins
+    /// one distinction a caller depends on: a missing binding and a missing
+    /// capability produce different errors.
+    #[tokio::test]
+    async fn resolve_attestation_handle_absent_entry_returns_not_found() {
+        let petnames = TestPetnameStore::new();
+        let querier = TestHandleQuerier::new();
+        let known = HashMap::new();
+
+        let mut resolver = AddressResolver::new();
+        let result = resolver
+            .resolve(
+                "@alice_cooks",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_clock::SystemClock,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AddressingError::NotFound(ref a)) if a == "@alice_cooks"),
+            "expected NotFound, got {result:?}"
+        );
+    }
+
+    /// An unavailable layer never suppresses a binding another layer found.
+    #[tokio::test]
+    async fn resolve_unscoped_returns_handle_result_despite_unavailable_attestation() {
+        let petnames = TestPetnameStore::new();
+        let mut querier = TestHandleQuerier::new();
+        querier.add_discovery_handle("ctx-cooking", "alice", "did:dht:zAlice", "cooking");
+        querier.mark_unavailable(ResolutionLayer::Attestation);
+
+        let mut known = HashMap::new();
+        known.insert("cooking".to_owned(), "ctx-cooking".to_owned());
+
+        let mut resolver = AddressResolver::new();
+        let results = resolver
+            .resolve(
+                "alice",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("handle registry holds a binding for alice");
+
+        assert_eq!(results.len(), 1);
     }
 
     #[tokio::test]

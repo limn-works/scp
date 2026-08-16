@@ -22,8 +22,8 @@ use std::sync::Mutex;
 
 use scp_clock::Clock;
 use scp_core::discovery::addressing::{
-    AddressResolution, AddressType, HandleQuerier, HandleTarget, ResolutionLayer, ResolutionPath,
-    TrustLevel,
+    AddressResolution, AddressType, AddressingError, HandleQuerier, HandleTarget, LayerUnavailable,
+    ResolutionLayer, ResolutionPath, TrustLevel,
 };
 use scp_core::discovery::handles::{
     HandleEntry, HandleLookupParams, HandleRegistry, HandleTypeFilter,
@@ -277,6 +277,24 @@ pub fn handle_entry_to_resolution(
 }
 
 // ---------------------------------------------------------------------------
+// Address-resolution error mapping
+// ---------------------------------------------------------------------------
+
+/// Maps an address-resolution failure onto one FFI error code, shared by all
+/// three bridges so that no bridge reports a different code for one failure.
+///
+/// [`AddressingError::LayersUnavailable`] carries its own code, because a
+/// caller acts differently on "this build queries no attestation index" than
+/// on "no DID registered that handle".
+#[must_use]
+pub const fn address_resolution_error_code(error: &AddressingError) -> &'static str {
+    match error {
+        AddressingError::LayersUnavailable { .. } => crate::error_codes::VALID_7136,
+        _ => crate::error_codes::VALID_7091,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HandleQuerier implementation
 // ---------------------------------------------------------------------------
 
@@ -306,12 +324,24 @@ impl HandleQuerier for LocalHandleQuerier<'_> {
         context_id: &String,
         handle: &str,
         type_filter: Option<AddressType>,
-    ) -> Vec<AddressResolution> {
+    ) -> Result<Vec<AddressResolution>, LayerUnavailable> {
         let Ok(guard) = self.registries.lock() else {
-            return Vec::new();
+            return Err(LayerUnavailable {
+                layer: ResolutionLayer::HandleRegistry,
+                reason: "handle registry mutex is poisoned on this bridge instance".to_owned(),
+            });
         };
         let Some(registry) = guard.get(context_id.as_str()) else {
-            return Vec::new();
+            // This bridge holds no registry for that context, and it invokes
+            // no remote `handle_lookup` outlet, so nobody looked. An empty
+            // result vector would instead claim that somebody looked and
+            // found no registration.
+            return Err(LayerUnavailable {
+                layer: ResolutionLayer::HandleRegistry,
+                reason: format!(
+                    "no local handle registry for context {context_id}, and this bridge invokes no remote handle_lookup outlet"
+                ),
+            });
         };
 
         let filter = type_filter.map(|tf| match tf {
@@ -326,28 +356,45 @@ impl HandleQuerier for LocalHandleQuerier<'_> {
 
         let now = scp_clock::SystemClock.now_secs();
 
-        result
+        Ok(result
             .results
             .into_iter()
             .map(|entry| handle_entry_to_resolution(&entry, context_id, now))
-            .collect()
+            .collect())
     }
 
-    async fn lookup_domain_handle(&self, _domain: &str, _handle: &str) -> Vec<AddressResolution> {
-        // Domain handle resolution requires HTTP I/O to fetch .well-known/scp.
-        // Not available in FFI bridge — requires transport layer infrastructure.
-        Vec::new()
+    async fn lookup_domain_handle(
+        &self,
+        _domain: &str,
+        _handle: &str,
+    ) -> Result<Vec<AddressResolution>, LayerUnavailable> {
+        // Domain handle resolution fetches `.well-known/scp` over HTTP, and
+        // this bridge performs no HTTP I/O. Reporting an empty result vector
+        // would tell a caller that a domain published no such handle.
+        Err(LayerUnavailable {
+            layer: ResolutionLayer::Domain,
+            reason:
+                "this bridge performs no .well-known/scp fetch, so no domain handle map was read"
+                    .to_owned(),
+        })
     }
 
     async fn lookup_attestation_handle(
         &self,
         _handle: &str,
         _platform: Option<&str>,
-    ) -> Vec<AddressResolution> {
-        // Attestation handle resolution requires querying attestation indexes
-        // in contexts with discovery outlets. Not available in FFI bridge — requires
-        // context query infrastructure.
-        Vec::new()
+    ) -> Result<Vec<AddressResolution>, LayerUnavailable> {
+        // §22.5.1 places attestation reverse-lookup behind an
+        // `attestation_lookup` outlet in a context with discovery outlets.
+        // This bridge invokes no outlet against a remote context, so it
+        // queries no attestation index. Reporting an empty result vector
+        // would tell a caller that no DID claims that platform handle.
+        Err(LayerUnavailable {
+            layer: ResolutionLayer::Attestation,
+            reason:
+                "this bridge invokes no attestation_lookup outlet, so no attestation index was queried"
+                    .to_owned(),
+        })
     }
 }
 
@@ -778,7 +825,10 @@ mod tests {
         }
 
         let querier = LocalHandleQuerier::new(&core);
-        let results = querier.lookup_handle(&ctx.to_owned(), "dave", None).await;
+        let results = querier
+            .lookup_handle(&ctx.to_owned(), "dave", None)
+            .await
+            .expect("registry exists for this context");
         assert_eq!(results.len(), 1);
         match &results[0] {
             AddressResolution::Identity { did, .. } => {
@@ -788,14 +838,24 @@ mod tests {
         }
     }
 
+    /// A context this bridge holds no registry for produces
+    /// [`LayerUnavailable`], because this bridge queries no remote
+    /// `handle_lookup` outlet. An empty result vector would instead assert
+    /// that a registry answered and held no entry.
     #[tokio::test]
-    async fn local_handle_querier_lookup_empty_when_context_not_found() {
+    async fn local_handle_querier_reports_unavailable_when_context_not_found() {
         let core = CoreFields::new();
         let querier = LocalHandleQuerier::new(&core);
-        let results = querier
+        let error = querier
             .lookup_handle(&"nonexistent-ctx-xyz".to_owned(), "anyone", None)
-            .await;
-        assert!(results.is_empty());
+            .await
+            .expect_err("no registry exists for that context");
+        assert_eq!(error.layer, ResolutionLayer::HandleRegistry);
+        assert!(
+            error.reason.contains("nonexistent-ctx-xyz"),
+            "reason names that context: {}",
+            error.reason
+        );
     }
 
     #[tokio::test]
@@ -823,31 +883,48 @@ mod tests {
         // Filter for Identity — should find the entry.
         let identity_results = querier
             .lookup_handle(&ctx.to_owned(), "eve", Some(AddressType::Identity))
-            .await;
+            .await
+            .expect("registry exists for this context");
         assert_eq!(identity_results.len(), 1);
 
-        // Filter for Context — should find nothing (entry is Identity).
+        // Filter for Context — a registry answered and held no context entry,
+        // so an empty result vector answers honestly here.
         let context_results = querier
             .lookup_handle(&ctx.to_owned(), "eve", Some(AddressType::Context))
-            .await;
+            .await
+            .expect("registry exists for this context");
         assert!(context_results.is_empty());
     }
 
+    /// §22.11.7 names `attestation_lookup` as a normative outlet, and this
+    /// bridge invokes no outlet against a remote context. Both layers
+    /// therefore report [`LayerUnavailable`], which a caller distinguishes
+    /// from an empty result vector meaning "nobody registered that handle".
     #[tokio::test]
-    async fn local_handle_querier_domain_and_attestation_return_empty() {
+    async fn local_handle_querier_domain_and_attestation_report_unavailable() {
         let core = CoreFields::new();
         let querier = LocalHandleQuerier::new(&core);
+
+        let domain_error = querier
+            .lookup_domain_handle("example.com", "alice")
+            .await
+            .expect_err("this bridge fetches no .well-known/scp document");
+        assert_eq!(domain_error.layer, ResolutionLayer::Domain);
         assert!(
-            querier
-                .lookup_domain_handle("example.com", "alice")
-                .await
-                .is_empty()
+            domain_error.reason.contains(".well-known/scp"),
+            "reason names what is missing: {}",
+            domain_error.reason
         );
+
+        let attestation_error = querier
+            .lookup_attestation_handle("alice", Some("github"))
+            .await
+            .expect_err("this bridge invokes no attestation_lookup outlet");
+        assert_eq!(attestation_error.layer, ResolutionLayer::Attestation);
         assert!(
-            querier
-                .lookup_attestation_handle("alice", Some("github"))
-                .await
-                .is_empty()
+            attestation_error.reason.contains("attestation_lookup"),
+            "reason names what is missing: {}",
+            attestation_error.reason
         );
     }
 }

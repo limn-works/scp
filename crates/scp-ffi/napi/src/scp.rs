@@ -1982,7 +1982,8 @@ impl Scp {
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Validation {
                     message: format!("address resolution failed: {e}"),
-                    code: codes::VALID_7091.to_owned(),
+                    code: scp_ffi_common::petname_helpers::address_resolution_error_code(&e)
+                        .to_owned(),
                 })
             })?;
         let json_results: Vec<serde_json::Value> =

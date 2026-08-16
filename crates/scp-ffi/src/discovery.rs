@@ -1241,7 +1241,7 @@ impl crate::scp::PyScp {
                 .await
                 .map_err(|e| ScpPyError::ValidationError {
                     message: format!("address resolution failed: {e}"),
-                    code: codes::VALID_7091.to_owned(),
+                    code: petname_helpers::address_resolution_error_code(&e).to_owned(),
                 })
         })?;
 
