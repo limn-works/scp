@@ -1,6 +1,6 @@
 # FFI global registries made PyO3 single-tenant (RED-017)
 
-**Status: resolved.** PyO3 now holds per-instance `BridgeInstance` state instead of process-global registries. ADR-055 removed a fourth wasm-bindgen bridge on 2026-06-29, so PyO3, NAPI and UniFFI remain, and a browser runs as a remote thin client. Everything under "What went wrong" describes an implementation that no longer ships.
+**Status: resolved.** PyO3 now holds per-instance bridge-instance state instead of process-global registries. Three bridges remain — PyO3, NAPI, UniFFI — after removal of a fourth wasm-bindgen bridge, which ADR-057, in-browser client over shared MLS, records at its line 9 as correct and standing. That same ADR revised one further conclusion: a browser no longer runs as a remote thin client, and instead executes protocol code through `scp-client-wasm` over shared `scp-mls`. Everything under "What went wrong" describes an implementation that no longer ships.
 
 ## Rule
 
@@ -23,4 +23,4 @@ NAPI and UniFFI never carried that defect, because each hands a caller a per-ins
 
 ## What holds now
 
-SCP-228 replaced those globals with per-instance runtime objects. Each tenant constructs its own instance, which owns its context, identity, and relay state, and a Python SDK class wraps that instance as one entry point. PyO3 now matches NAPI and UniFFI.
+Per-instance state replaced those globals. `crates/scp-ffi/src/runtime.rs:404` declares `pub struct PyBridgeInstance`, and none of `CONTEXT_REGISTRY`, `KNOWN_CONTEXTS`, `RELAY_CONNECTION`, or `IDENTITY_ROUTING_SECRETS` appears anywhere in that file. Each tenant constructs its own instance, which owns its context, identity, and relay state, so PyO3 now matches NAPI and UniFFI. Lifecycle documentation for all three lives at `crates/scp-ffi/common/src/bridge_instance.rs`.

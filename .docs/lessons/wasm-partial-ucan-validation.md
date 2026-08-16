@@ -1,6 +1,10 @@
 # Document a partial validation pipeline by what it checks, never by what it claims
 
-**Status: resolved since #1877 slice 1.** That bridge's `ucan_validate` now delegates to one shared pipeline, `scp_protocol::crypto::ucan::validate::validate_ucan`, through an extract-validate-writeback pattern, so it runs identical logic to native bridges rather than a local reimplementation. A flat `ceiling_strings: HashSet<String>` representation described below is gone: a ceiling now lives inside shared `scp_protocol::context::roles::ContextRoleState`, and shared `CapabilityCeiling::validate_entries` enforces it. Everything under "What went wrong" describes a pre-convergence implementation.
+**Status: that divergence cannot recur, because that bridge no longer exists.** `crates/scp-ffi/` holds four members — `src` (PyO3), `napi`, `uniffi`, and `common` — and no `wasm` directory, so no WASM-local reimplementation of UCAN validation remains to drift. Three native bridges call one shared pipeline instead: `validate_ucan`, declared at `crates/scp-protocol/src/crypto/ucan/validate.rs:729`.
+
+Two details this lesson previously got wrong, corrected here against source. A flat `ceiling_strings: HashSet<String>` is **not** gone: `crates/scp-ffi/common/src/bridge_runtime.rs:376` still declares it, NAPI and UniFFI populate it (`napi/src/runtime.rs:1647` and `:1906`, `uniffi/src/runtime.rs:1125`), and both pass it as that pipeline's step-8 ceiling argument (`napi/src/outlets.rs:61`, `uniffi/src/bridge.rs:4404`), which `validate.rs:659` types as `ceiling: &'a HashSet<String, S>`. A second representation coexists rather than replacing it: `ContextRoleState::ceiling()` at `crates/scp-protocol/src/context/roles.rs:1901` returns `&CapabilityCeiling`.
+
+Everything under "What went wrong" describes that removed bridge.
 
 ## Rule
 
@@ -15,7 +19,7 @@ That bridge could not reach scp-core validation, because scp-core depended on `t
 Two narrower defects rode along:
 
 - Wildcard matching compared `can_str == "*"` without first pinning resource scope, so a token granting `scp:ctx:A/*` passed validation for `scp:ctx:B/messages:write`. Correct order checks `with_str` first, then allows a wildcard on `can`.
-- A missing `exp` raised an error, though UCAN and scp-core both treat an absent `exp` as a non-expiring token.
+- A missing `exp` raised an error, which that era's reading of UCAN treated as wrong, because UCAN permits a non-expiring token. This codebase settled that question in a different direction, and a reader should not carry that bullet forward as guidance: `UcanPayload::exp` at `crates/scp-protocol/src/crypto/ucan/mod.rs:399` is a required `u64` with no `Option` and no serde default, so a token omitting `exp` now fails to deserialize.
 
 ## How to apply
 
