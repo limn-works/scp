@@ -244,8 +244,12 @@ const DID_CONTEXT: &str = "https://www.w3.org/ns/did/v1";
 /// The Ed25519 verification key suite context URI.
 const ED25519_CONTEXT: &str = "https://w3id.org/security/suites/ed25519-2020/v1";
 
-/// The verification method type string for Ed25519 keys.
-const ED25519_VERIFICATION_KEY_TYPE: &str = "Ed25519VerificationKey2020";
+/// Type string every Ed25519 verification method in a DID document carries.
+///
+/// A verifier that resolves a signing key compares this value against
+/// [`VerificationMethod::method_type`], so a method declaring some other
+/// suite never supplies an Ed25519 signature key.
+pub const ED25519_VERIFICATION_KEY_TYPE: &str = "Ed25519VerificationKey2020";
 
 /// The service type string for `SCPRelay` entries (§18.2.1).
 const SCP_RELAY_SERVICE_TYPE: &str = "SCPRelay";
@@ -406,13 +410,41 @@ impl DidDocument {
         serde_json::from_str(json)
     }
 
-    /// Returns the verification method with the given fragment (e.g., `"#0"` or `"#active"`).
+    /// Returns a verification method this document identifies as
+    /// `{self.id}#{fragment}` — for example `"0"`, `"active"`, or `"agent"`.
+    ///
+    /// A verification method qualifies when its `id` equals this document's own
+    /// DID followed by `#` and `fragment`. A method some other DID identifies —
+    /// `did:dht:zSOMEONEELSE#active` inside this document — never qualifies, and
+    /// neither does a longer fragment that merely ends in a requested one,
+    /// such as `#retired-1#active`.
+    ///
+    /// Returns `None` when no method carries that identifier, and also when two
+    /// or more do: W3C DID Core §5.3.1 requires a verification method
+    /// identifier to be unique within a document, so a repeated identifier
+    /// leaves a reader no way to say which key a document meant. Every caller
+    /// of this method resolves a key for signature verification, and picking
+    /// one of two candidates by array position would let document order decide
+    /// which signature verifies.
     #[must_use]
     pub fn verification_method_by_fragment(&self, fragment: &str) -> Option<&VerificationMethod> {
-        let suffix = format!("#{fragment}");
-        self.verification_method
+        let method_id = self.verification_method_id(fragment);
+        let mut matches = self
+            .verification_method
             .iter()
-            .find(|vm| vm.id.ends_with(&suffix))
+            .filter(|vm| vm.id == method_id);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
+    /// Returns an identifier this document assigns a verification method with
+    /// a given fragment: `{self.id}#{fragment}`.
+    #[must_use]
+    pub fn verification_method_id(&self, fragment: &str) -> String {
+        format!("{}#{}", self.id, fragment)
     }
 
     /// Returns the `PreRotationCommitment` service, if present.
@@ -881,12 +913,14 @@ impl DidDocument {
     ///   fragment (e.g., `#retired-1`).
     pub fn retire_active_key(&mut self, new_active_public_key: &[u8], sequence: u64) {
         let did = &self.id;
+        let active_id = format!("{did}#active");
+        let retired_id = format!("{did}#retired-{sequence}");
 
-        // Find the current #active verification method and rename it to #retired-{sequence}.
+        // Find this document's own #active verification method and rename it to
+        // #retired-{sequence}. A method some other DID identifies is left alone.
         for vm in &mut self.verification_method {
-            if vm.id.ends_with("#active") {
-                let retired_fragment = format!("retired-{sequence}");
-                vm.id = format!("{did}#{retired_fragment}");
+            if vm.id == active_id {
+                vm.id.clone_from(&retired_id);
             }
         }
 
@@ -966,9 +1000,8 @@ impl DidDocument {
     /// Returns `true` if this document contains an `#agent` verification method.
     #[must_use]
     pub fn has_agent_key(&self) -> bool {
-        self.verification_method
-            .iter()
-            .any(|vm| vm.id.ends_with("#agent"))
+        let agent_id = self.verification_method_id("agent");
+        self.verification_method.iter().any(|vm| vm.id == agent_id)
     }
 
     /// Returns the `#agent` verification method, if present.
@@ -1030,12 +1063,10 @@ impl DidDocument {
             return Err(DidError::AgentKeyNotFound);
         }
 
-        self.verification_method
-            .retain(|vm| !vm.id.ends_with("#agent"));
-        self.authentication
-            .retain(|ref_id| !ref_id.ends_with("#agent"));
-        self.assertion_method
-            .retain(|ref_id| !ref_id.ends_with("#agent"));
+        let agent_id = self.verification_method_id("agent");
+        self.verification_method.retain(|vm| vm.id != agent_id);
+        self.authentication.retain(|ref_id| *ref_id != agent_id);
+        self.assertion_method.retain(|ref_id| *ref_id != agent_id);
 
         Ok(())
     }
@@ -1073,10 +1104,14 @@ impl DidDocument {
 
         let did = &self.id;
 
-        // Rename current #agent to #retired-agent-{sequence}.
+        // Rename this document's own #agent method to
+        // #retired-agent-{sequence}. A method some other DID identifies is
+        // left alone.
+        let agent_id = format!("{did}#agent");
+        let retired_id = format!("{did}#retired-agent-{sequence}");
         for vm in &mut self.verification_method {
-            if vm.id.ends_with("#agent") {
-                vm.id = format!("{did}#retired-agent-{sequence}");
+            if vm.id == agent_id {
+                vm.id.clone_from(&retired_id);
             }
         }
 
@@ -1108,10 +1143,11 @@ impl DidDocument {
     /// Returns [`DidError::MultipleAgentKeys`] if more than one `#agent`
     /// VM is found.
     pub fn validate_agent_keys(&self) -> Result<(), DidError> {
+        let agent_id = self.verification_method_id("agent");
         let agent_count = self
             .verification_method
             .iter()
-            .filter(|vm| vm.id.ends_with("#agent"))
+            .filter(|vm| vm.id == agent_id)
             .count();
 
         if agent_count > 1 {

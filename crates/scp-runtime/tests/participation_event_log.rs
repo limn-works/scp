@@ -20,6 +20,9 @@
 //! Covers SCP-125 AC6: participation validation continues to work with
 //! checkpointed and pruned event logs.
 
+use std::collections::BTreeMap;
+
+use scp_did::{DID, DidDocument};
 use sha2::{Digest, Sha256};
 
 use scp_event_log::checkpoint::ConsistencyCheckpoint;
@@ -27,7 +30,9 @@ use scp_event_log::payload::{
     GovernanceActionExecutedPayload, MembershipChangePayload, RoleAssignedPayload, encode_payload,
 };
 use scp_event_log::pruning::{PruningConfig, prune_before_checkpoint};
-use scp_event_log::test_helpers::{TestSigner, did_from_pubkey, sign_event, test_keypair};
+use scp_event_log::test_helpers::{
+    TestSigner, did_from_pubkey, sign_event, test_did_document, test_keypair,
+};
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventType};
 use scp_protocol::trust::compute_participation_record;
@@ -111,6 +116,7 @@ fn merkle_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
 fn build_log_with_events(n: u64, start_timestamp: u64) -> (EventLog, Vec<Event>, Vec<[u8; 32]>) {
     let (verifying_key, signing_key) = test_keypair();
     let did = did_from_pubkey(&verifying_key);
+    let actor_document = test_did_document(&did, &verifying_key);
     let mut log = EventLog::new("ctx-prune-test".to_owned());
     let mut prev_hash = GENESIS_PREV_HASH;
     let mut events = Vec::new();
@@ -134,7 +140,7 @@ fn build_log_with_events(n: u64, start_timestamp: u64) -> (EventLog, Vec<Event>,
             prev_hash,
             &signing_key,
         );
-        tree::append(&mut log, &event).expect("append should succeed");
+        tree::append(&mut log, &event, &actor_document).expect("append should succeed");
 
         let serialized = rmp_serde::to_vec(&event).expect("serialization should succeed");
         let mut hasher = Sha256::new();
@@ -189,6 +195,13 @@ async fn participation_validation_works_with_checkpointed_log() {
     let (vk_bob, sk_bob) = test_keypair();
     let did_bob = did_from_pubkey(&vk_bob);
 
+    // One DID document per actor, as a resolver returns it. `tree::append`
+    // verifies every event against an `#active` key its actor's document
+    // names (§23.13 paragraph 1).
+    let mut actor_documents: BTreeMap<DID, DidDocument> = BTreeMap::new();
+    actor_documents.insert(did_alice.clone(), test_did_document(&did_alice, &vk_alice));
+    actor_documents.insert(did_bob.clone(), test_did_document(&did_bob, &vk_bob));
+
     let mut log = EventLog::new("ctx-participation-checkpoint".to_owned());
     let mut prev_hash = GENESIS_PREV_HASH;
     let mut all_events = Vec::new();
@@ -213,7 +226,10 @@ async fn participation_validation_works_with_checkpointed_log() {
             prev,
             signing_key,
         );
-        tree::append(log, &event).expect("append should succeed");
+        let actor_document = actor_documents
+            .get(&event.actor_did)
+            .expect("this scenario resolves a DID document per event actor");
+        tree::append(log, &event, actor_document).expect("append should succeed");
         let leaf_hash: [u8; 32] = {
             let mut h = Sha256::new();
             h.update([0x00]);
@@ -476,6 +492,10 @@ fn participation_validation_works_after_pruning() {
     let (verifying_key2, signing_key2) = test_keypair();
     let did2 = did_from_pubkey(&verifying_key2);
 
+    let mut actor_documents: BTreeMap<DID, DidDocument> = BTreeMap::new();
+    actor_documents.insert(did.clone(), test_did_document(&did, &verifying_key));
+    actor_documents.insert(did2.clone(), test_did_document(&did2, &verifying_key2));
+
     let mut log = EventLog::new("ctx-behavior-test".to_owned());
     let mut prev_hash = GENESIS_PREV_HASH;
     let mut all_events = Vec::new();
@@ -497,7 +517,10 @@ fn participation_validation_works_after_pruning() {
             prev_hash,
             skey,
         );
-        tree::append(&mut log, &event).expect("append should succeed");
+        let actor_document = actor_documents
+            .get(&event.actor_did)
+            .expect("this scenario resolves a DID document per event actor");
+        tree::append(&mut log, &event, actor_document).expect("append should succeed");
         let serialized = rmp_serde::to_vec(&event).expect("event serialization should succeed");
         let mut h = Sha256::new();
         h.update([0x00]);
@@ -535,7 +558,10 @@ fn participation_validation_works_after_pruning() {
             prev_hash,
             skey,
         );
-        tree::append(&mut log, &event).expect("append should succeed");
+        let actor_document = actor_documents
+            .get(&event.actor_did)
+            .expect("this scenario resolves a DID document per event actor");
+        tree::append(&mut log, &event, actor_document).expect("append should succeed");
         let serialized = rmp_serde::to_vec(&event).expect("event serialization should succeed");
         let mut h = Sha256::new();
         h.update([0x00]);

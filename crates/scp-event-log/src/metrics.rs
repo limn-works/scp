@@ -526,7 +526,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::test_helpers::{did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair};
+    use crate::test_helpers::{
+        did_from_pubkey, leaf_hash_from_event, sign_event, test_did_document, test_keypair,
+    };
     use crate::tree::{self, GENESIS_PREV_HASH};
     use crate::{EventLog, EventType};
 
@@ -538,6 +540,7 @@ mod tests {
     fn build_log(n: u64) -> (EventLog, Vec<u64>) {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document(&did, &verifying_key);
         let mut log = EventLog::new("ctx-metrics-test".to_owned());
         let mut prev_hash = GENESIS_PREV_HASH;
         let mut sizes = Vec::new();
@@ -554,7 +557,7 @@ mod tests {
             );
             let serialized = rmp_serde::to_vec(&event).unwrap();
             sizes.push(serialized.len() as u64);
-            tree::append(&mut log, &event).unwrap();
+            tree::append(&mut log, &event, &actor_document).unwrap();
             let leaf_hash = leaf_hash_from_event(&event);
             prev_hash = leaf_hash;
         }

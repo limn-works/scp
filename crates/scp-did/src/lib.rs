@@ -20,8 +20,8 @@ pub mod attestation;
 pub mod document;
 
 pub use document::{
-    DidDocument, DidError, DidRotationEvent, MigrationProof, PreRotationProof, Service,
-    VerificationMethod, decode_multibase_key,
+    DidDocument, DidError, DidRotationEvent, ED25519_VERIFICATION_KEY_TYPE, MigrationProof,
+    PreRotationProof, Service, VerificationMethod, decode_multibase_key,
 };
 
 use serde::{Deserialize, Serialize};

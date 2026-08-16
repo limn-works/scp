@@ -305,6 +305,29 @@ fn kat_did() -> String {
     format!("did:dht:z{}", zbase32::encode(vk.as_bytes()))
 }
 
+/// Identity Key (`#0`) a KAT DID document publishes.
+///
+/// `tree::verify_event_signature` reads `#active` and `#agent` and never `#0`,
+/// so this document names an Identity Key that signs nothing in this test: a
+/// verifier that reached for `#0` would reject every KAT event.
+const KAT_UNUSED_IDENTITY_KEY: [u8; 32] = [0xA5; 32];
+
+/// Pre-rotation commitment a KAT DID document publishes. Event
+/// verification reads no service entry, so this value only has to exist.
+const KAT_UNUSED_PRE_ROTATION_COMMITMENT: [u8; 32] = [0x5A; 32];
+
+/// Builds a DID document a resolver returns for one KAT identity: its
+/// `#active` verification method carries a fixed KAT signing key.
+fn kat_did_document() -> scp_did::DidDocument {
+    let vk = kat_signing_key().verifying_key();
+    scp_did::DidDocument::new(
+        &kat_did(),
+        &KAT_UNUSED_IDENTITY_KEY,
+        vk.as_bytes(),
+        &KAT_UNUSED_PRE_ROTATION_COMMITMENT,
+    )
+}
+
 /// A deterministic, fixed-key [`EventLogSigner`] for checkpoint KAT signing.
 struct KatSigner(SigningKey);
 
@@ -465,12 +488,13 @@ fn vector_32_typed_leaf_and_checkpoint_kat() {
     let events = kat_events();
     assert_eq!(events.len(), 9, "KAT spread must be 9 events");
 
-    // Build the log via the production append path (verifies signatures, builds
-    // the RFC 6962 tree incrementally).
+    // Build a log through `tree::append`, which verifies each signature against
+    // a resolved DID document and extends an RFC 6962 tree incrementally.
     let mut log = EventLog::new("ctx-kat".to_owned());
+    let actor_document = kat_did_document();
     let mut leaves = Vec::new();
     for ev in &events {
-        tree::append(&mut log, ev).expect("append KAT event");
+        tree::append(&mut log, ev, &actor_document).expect("append KAT event");
         leaves.push(typed_leaf_hash(ev));
     }
 
@@ -518,8 +542,9 @@ async fn vector_33_checkpoint_root_equals_tree_root_kat() {
 
     let events = kat_events();
     let mut log = EventLog::new("ctx-kat".to_owned());
+    let actor_document = kat_did_document();
     for ev in &events {
-        tree::append(&mut log, ev).expect("append KAT event");
+        tree::append(&mut log, ev, &actor_document).expect("append KAT event");
     }
 
     let tree_root = tree::root(&log);

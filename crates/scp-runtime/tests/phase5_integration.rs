@@ -27,7 +27,8 @@ use std::time::Duration;
 use ed25519_dalek::Signer;
 use sha2::{Digest, Sha256};
 
-use scp_did::DID;
+use scp_did::{DID, DidDocument};
+use scp_event_log::test_helpers::test_did_document;
 use scp_event_log::tree::{self, GENESIS_PREV_HASH};
 use scp_event_log::{Event, EventLog, EventPayload, EventType};
 use scp_protocol::bridge::claiming::{ClaimRequest, claim_shadow};
@@ -114,8 +115,12 @@ fn sign_event(
 }
 
 /// Appends an event to a log and returns the resulting leaf hash.
-fn append_and_hash(log: &mut EventLog, event: &Event) -> [u8; 32] {
-    tree::append(log, event).expect("append should succeed");
+///
+/// `actor_document` is a DID document a resolver returns for an event's
+/// actor; `tree::append` verifies each signature against an `#active` key
+/// that document names.
+fn append_and_hash(log: &mut EventLog, event: &Event, actor_document: &DidDocument) -> [u8; 32] {
+    tree::append(log, event, actor_document).expect("append should succeed");
     let serialized = rmp_serde::to_vec(event).expect("serialize");
     let mut hasher = Sha256::new();
     hasher.update([0x00]);
@@ -858,6 +863,7 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
 
     let (alice_vk, alice_sk) = test_keypair();
     let alice_did = did_from_pubkey(&alice_vk);
+    let alice_document = test_did_document(&alice_did, &alice_vk);
 
     let mut event_log = EventLog::new(context_id.to_owned());
     let mut prev_hash = GENESIS_PREV_HASH;
@@ -873,7 +879,7 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
         prev_hash,
         &alice_sk,
     );
-    prev_hash = append_and_hash(&mut event_log, &ctx_created);
+    prev_hash = append_and_hash(&mut event_log, &ctx_created, &alice_document);
     seq += 1;
 
     // Event 2: Bridge registration (GovernanceAction event type).
@@ -894,7 +900,7 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
         prev_hash,
         &alice_sk,
     );
-    prev_hash = append_and_hash(&mut event_log, &bridge_reg_event);
+    prev_hash = append_and_hash(&mut event_log, &bridge_reg_event, &alice_document);
     seq += 1;
 
     // Event 3: Shadow identity created (member joined as shadow).
@@ -915,7 +921,7 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
         prev_hash,
         &alice_sk,
     );
-    prev_hash = append_and_hash(&mut event_log, &shadow_event);
+    prev_hash = append_and_hash(&mut event_log, &shadow_event, &alice_document);
     seq += 1;
 
     // Event 4: Media session started.
@@ -935,7 +941,7 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
         prev_hash,
         &alice_sk,
     );
-    prev_hash = append_and_hash(&mut event_log, &media_start_event);
+    prev_hash = append_and_hash(&mut event_log, &media_start_event, &alice_document);
     seq += 1;
 
     // Event 5: Media session ended.
@@ -954,7 +960,7 @@ fn cross_adr_event_log_records_bridge_and_media_events() {
         prev_hash,
         &alice_sk,
     );
-    let _prev_hash_final = append_and_hash(&mut event_log, &media_end_event);
+    let _prev_hash_final = append_and_hash(&mut event_log, &media_end_event, &alice_document);
 
     // Verify the event log contains all 5 events.
     assert_eq!(tree::event_count(&event_log), 5);
