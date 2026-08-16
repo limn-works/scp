@@ -14,29 +14,39 @@ pip install scp-python
 
 ```python
 import asyncio
-from scp_sdk import Identity, Context
+
+from scp_sdk import SCP, Capability, CustodyType, MemoryScope
 
 
 async def main():
-    # Create a cryptographic identity (DID)
-    identity = await Identity.create(custody="platform")
+    # Every call routes through an SCP instance (ADR-048). Name a storage
+    # backend: this constructor has no default.
+    scp = SCP(storage={"type": "in_memory"})
+
+    # Create a cryptographic identity (DID). Name a custody backend too —
+    # `identity_create` has no default either (spec §17.17.1,
+    # SCP-CAPSEL-8000). `CustodyType.FILE` stores keys encrypted at rest.
+    identity = await scp.identity_create(CustodyType.FILE)
     print(f"DID: {identity.did}")
 
-    # Create an encrypted context
-    ctx = await Context.create(
-        identity=identity,
-        params={"ceiling": ["msg:send", "msg:receive"], "ttl": 3600},
+    # Create an encrypted context.
+    ctx = await scp.context_create(
+        identity.did,
+        {
+            "ceiling": [
+                Capability.MESSAGES_READ.value,
+                Capability.MESSAGES_WRITE.value,
+            ],
+            "memory_scope": MemoryScope.EPHEMERAL.value,
+            "ttl": 3600,
+        },
     )
 
-    # Send a message (MLS-encrypted, signed, provenance-tagged)
-    await ctx.send(b"Hello from SCP")
+    # Send a message (MLS-encrypted, signed, provenance-tagged).
+    await scp.context_send(ctx._raw_handle, identity.did, b"Hello from SCP")
 
-    # Receive messages
-    async for msg in ctx.receive():
-        print(f"{msg.sender_did}: {msg.content}")
-        break
-
-    await ctx.close()
+    await scp.context_close(ctx._raw_handle, identity.did)
+    await scp.shutdown(5.0)
 
 
 asyncio.run(main())

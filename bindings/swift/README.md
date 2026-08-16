@@ -19,29 +19,46 @@ dependencies: [
 ```swift
 import SCP
 
-// Create a cryptographic identity (DID)
-let identity = try await Identity.create(custody: "platform")
+// Every call routes through an SCP instance (ADR-048). Name a storage
+// backend: this initializer has no default.
+let scp = try SCP(storage: .inMemory)
+
+// Create a cryptographic identity (DID). Name a custody backend too —
+// `identityCreate` has no default either (spec §17.17.1, SCP-CAPSEL-8000).
+let identity = try await scp.identityCreate(custody: "platform")
 print("DID: \(identity.did)")
 
-// Create an encrypted context
-let ctx = try await Context.create(
+// Create an encrypted context. `ContextParams` names every parameter a
+// prospective member reads before joining, so it carries no defaults.
+let ctx = try await scp.contextCreate(
     identity: identity,
     params: ContextParams(
-        ceiling: ["msg:send", "msg:receive"],
-        ttl: 3600
+        mode: .encrypted,
+        ceiling: ["messages:read", "messages:write"],
+        ceilingPolicy: .immutable,
+        governance: .singleAdmin,
+        memoryScope: .ephemeral,
+        ttlSeconds: 3600,
+        promotable: false,
+        minProtocolVersion: 0,
+        maxChainDepth: nil,
+        maxNestingDepth: nil,
+        sessionCap: nil,
+        economicPolicy: nil,
+        consequenceRulesJson: nil,
+        consequenceConfigJson: nil
     )
 )
 
-// Send a message (MLS-encrypted, signed, provenance-tagged)
-try await ctx.send(Data("Hello from SCP".utf8))
+// Send a message (MLS-encrypted, signed, provenance-tagged).
+try await scp.contextSend(
+    handle: ctx,
+    identity: identity,
+    payload: Data("Hello from SCP".utf8),
+    spendingUcanJwt: nil
+)
 
-// Receive messages
-for await msg in ctx.messages {
-    print("\(msg.senderDid): \(String(data: msg.content, encoding: .utf8)!)")
-    break
-}
-
-try await ctx.close()
+try await scp.contextClose(handle: ctx, identity: identity)
 ```
 
 ## Platform Support

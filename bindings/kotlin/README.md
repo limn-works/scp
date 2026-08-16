@@ -16,32 +16,56 @@ dependencies {
 ## Quick Start
 
 ```kotlin
-import works.limn.scp.Identity
-import works.limn.scp.Context
-import kotlinx.coroutines.flow.first
+import works.limn.scp.CeilingPolicy
+import works.limn.scp.ContextMode
+import works.limn.scp.ContextParams
+import works.limn.scp.GovernanceModel
+import works.limn.scp.MemoryScope
+import works.limn.scp.SCP
+import works.limn.scp.StorageConfig
 
 suspend fun main() {
-    // Create a cryptographic identity (DID)
-    val identity = Identity.create(custody = "platform")
+    // Every call routes through an SCP instance (ADR-048). Name a storage
+    // backend: this factory has no default.
+    val scp = SCP(StorageConfig.InMemory)
+
+    // Create a cryptographic identity (DID). Name a custody backend too —
+    // `identityCreate` has no default either (spec §17.17.1,
+    // SCP-CAPSEL-8000).
+    val identity = scp.identityCreate(custody = "platform")
     println("DID: ${identity.did}")
 
-    // Create an encrypted context
-    val ctx = Context.create(
+    // Create an encrypted context. `ContextParams` names every parameter a
+    // prospective member reads before joining, so it carries no defaults.
+    val ctx = scp.contextCreate(
         identity = identity,
-        params = mapOf(
-            "ceiling" to listOf("msg:send", "msg:receive"),
-            "ttl" to 3600,
+        params = ContextParams(
+            mode = ContextMode.ENCRYPTED,
+            ceiling = listOf("messages:read", "messages:write"),
+            ceilingPolicy = CeilingPolicy.IMMUTABLE,
+            governance = GovernanceModel.SINGLE_ADMIN,
+            memoryScope = MemoryScope.EPHEMERAL,
+            ttlSeconds = 3600uL,
+            promotable = false,
+            minProtocolVersion = 0.toUShort(),
+            maxChainDepth = null,
+            maxNestingDepth = null,
+            sessionCap = null,
+            economicPolicy = null,
+            consequenceRulesJson = null,
+            consequenceConfigJson = null,
         ),
     )
 
-    // Send a message (MLS-encrypted, signed, provenance-tagged)
-    ctx.send("Hello from SCP".toByteArray())
+    // Send a message (MLS-encrypted, signed, provenance-tagged).
+    scp.contextSend(
+        handle = ctx,
+        identity = identity,
+        payload = "Hello from SCP".toByteArray(),
+        spendingUcanJwt = null,
+    )
 
-    // Receive messages
-    val msg = ctx.receiveFlow().first()
-    println("${msg.senderDid}: ${String(msg.content)}")
-
-    ctx.close()
+    scp.contextClose(handle = ctx, identity = identity)
 }
 ```
 

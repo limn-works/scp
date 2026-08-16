@@ -4,8 +4,8 @@ import Foundation
 
 /// Result of executing a governance action (ADR-031).
 ///
-/// Each case corresponds to one of the 28 governance action outcomes from
-/// `scp_core::context::manager::GovernanceActionResult`.
+/// Each case corresponds to one of 29 governance action outcomes from
+/// `scp_core::context::state::GovernanceActionResult`.
 ///
 /// See `.docs/specs/05-contexts.md` section 5.9 and ADR-031.
 public enum GovernanceActionResult: String, Sendable {
@@ -35,6 +35,9 @@ public enum GovernanceActionResult: String, Sendable {
     case subscriberBanned = "SubscriberBanned"
     case subscriberUnbanned = "SubscriberUnbanned"
     case executed = "Executed"
+    case migrationProposed = "MigrationProposed"
+    case migrationCancelled = "MigrationCancelled"
+    case contextTombstoned = "ContextTombstoned"
 }
 
 // MARK: - MemberRole
@@ -54,9 +57,13 @@ public enum MemberRole: String, Sendable {
     /// Custom role defined by context governance.
     case custom = "Custom"
 
-    /// Parse a bridge-layer role string into a ``MemberRole``.
+    /// Parse a bridge-layer role name into a ``MemberRole``.
     ///
-    /// Falls back to ``custom`` for unrecognised strings.
+    /// Every bridge reports an assigned role's name
+    /// (`RoleAssignment.role_name`). A name no case carries is a role a
+    /// context's governance defined, which ``custom`` is exactly what this
+    /// protocol calls — so that answer states what a governance engine
+    /// reported rather than substituting a protocol-defined role for it.
     public static func fromBridge(_ raw: String) -> MemberRole {
         let normalised = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
@@ -292,9 +299,11 @@ public extension Context {
     ///
     /// - Parameters:
     ///   - proposalIdHex: Hex-encoded id of the approved, tracked proposal.
-    /// - Returns: A ``GovernanceActionResult`` describing the outcome.
-    /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
-    ///   active or governance execution fails.
+    /// - Returns: A ``GovernanceActionResult`` naming which action ran.
+    /// - Throws: ``ScpError/Context(msg:code:)`` when this context is not
+    ///   active (`SCP-CTX-2001`), when governance execution fails, or when a
+    ///   bridge reports an outcome this SDK version cannot name
+    ///   (`SCP-GOV-11040`).
     func executeGovernanceAction(
         proposalIdHex: String
     ) async throws -> GovernanceActionResult {
@@ -309,7 +318,20 @@ public extension Context {
             handle: handle,
             proposalIdHex: proposalIdHex
         )
-        return GovernanceActionResult(rawValue: raw) ?? .executed
+        // Fail closed on an outcome this SDK version cannot name. Resolving it
+        // to `.executed` would tell a caller that a governance action succeeded
+        // while this SDK cannot say which action ran, and governance decides
+        // authorization. A message states both facts a caller acts on: an
+        // action DID execute, and this SDK is older than its bridge.
+        guard let result = GovernanceActionResult(rawValue: raw) else {
+            throw ScpError.Context(
+                msg: "governance action executed, and its outcome '\(raw)' has no name in "
+                    + "this SDK version. Upgrade an SCP Swift package to match whichever "
+                    + "bridge it calls.",
+                code: "SCP-GOV-11040"
+            )
+        }
+        return result
     }
 }
 

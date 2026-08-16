@@ -443,3 +443,23 @@ def test_wrapper_with_storage_sqlite_passes_config_through() -> None:
         wrapper = WrapperSCP(storage=sqlite_cfg)
     mock_cls.with_storage.assert_called_once_with(sqlite_cfg)
     assert wrapper.instance_id == 42
+
+
+def test_identity_create_requires_a_custody_selection() -> None:
+    """`identity_create` names no default custody backend.
+
+    Persistence spec §17.17.1 (``SCP-CAPSEL-8000``) forbids a form that selects
+    a backend for a caller, whichever backend that form would pick.
+    Restoring ``custody: CustodyType | str = CustodyType.FILE`` makes this call
+    succeed, so this assertion fails.
+    """
+    import inspect
+
+    from scp_sdk.scp import SCP as WrapperScp
+
+    for method_name in ("identity_create", "identity_create_with_agent_key"):
+        signature = inspect.signature(getattr(WrapperScp, method_name))
+        custody = signature.parameters["custody"]
+        assert custody.default is inspect.Parameter.empty, (
+            f"{method_name} must require a custody selection; found default {custody.default!r}"
+        )

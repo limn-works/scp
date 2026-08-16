@@ -201,11 +201,13 @@ class MemberRole(enum.Enum):
 
     @classmethod
     def from_bridge(cls, raw: str) -> MemberRole:
-        """Parse a bridge-layer role string into a :class:`MemberRole`.
+        """Parse a bridge-layer role name into a :class:`MemberRole`.
 
-        The bridge returns a Rust debug representation. This method
-        normalises known variants and falls back to :attr:`CUSTOM` for
-        unrecognised strings.
+        Every bridge reports an assigned role's name (``RoleAssignment.role_name``),
+        matched here without regard to case. A name no member carries is a
+        role a context's governance defined, which :attr:`CUSTOM` is exactly
+        what this protocol calls — so that answer states what a governance
+        engine reported rather than substituting a protocol-defined role for it.
         """
         normalised = raw.strip().strip('"')
         for member in cls:

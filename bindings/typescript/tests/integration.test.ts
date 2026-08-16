@@ -356,15 +356,20 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
     expect(call?.args).toEqual(["in_memory"]);
   });
 
-  it("identityCreate defaults custody to 'in_memory' when omitted", async () => {
+  it("identityCreate rejects an omitted custody selection", async () => {
+    // Persistence spec §17.17.1 (`SCP-CAPSEL-8000`) forbids a form that
+    // selects a custody backend for a caller, so this method has no default.
+    // `tests/identity-custody-selection.test.ts` carries compile-time and
+    // runtime assertions; this one pins that a bridge sees no call.
     const { scp, native } = mountMockScp();
     native.__stub("identityCreate", () =>
       Promise.resolve({ did: "did:dht:z6MkDefault", custodyType: "in_memory" }),
     );
+    const untyped = scp as unknown as { identityCreate(custody?: unknown): Promise<unknown> };
 
-    await scp.identityCreate();
+    await expect(untyped.identityCreate()).rejects.toBeInstanceOf(IdentityError);
 
-    expect(native.__lastCall("identityCreate")?.args).toEqual(["in_memory"]);
+    expect(native.__lastCall("identityCreate")).toBeUndefined();
   });
 
   it("contextSend forwards handle, did, payload array, and null spending ucan by default", async () => {

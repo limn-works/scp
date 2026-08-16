@@ -35,7 +35,7 @@ except (ImportError, AttributeError):
 
 from scp_sdk import SCP
 from scp_sdk.errors import ValidationError
-from scp_sdk.types import CustodyType
+from scp_sdk.types import CustodyType, MemberRole
 
 # ---------------------------------------------------------------------------
 # Session-scoped relay fixture (started once, shut down after all tests)
@@ -508,6 +508,11 @@ class TestContext:
         role = scp._native.context_member_role(handle, alice.did)
         assert role is not None
         assert "admin" in str(role).lower()
+        # A bridge reports a role by name, so an SDK enum parses it. Reverting
+        # that bridge to `format!("{r:?}")` renders a whole `RoleAssignment`
+        # struct, which matches no member and reads as CUSTOM — so this
+        # assertion fails.
+        assert MemberRole.from_bridge(str(role)) is MemberRole.ADMIN
 
 
 # ---------------------------------------------------------------------------

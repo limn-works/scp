@@ -15,28 +15,43 @@ bun add @limn-works/scp-ts
 ## Quick Start
 
 ```typescript
-import { Identity, Context } from "@limn-works/scp-ts";
+import { SCP } from "@limn-works/scp-ts";
 
-// Create a cryptographic identity (DID)
-const identity = await Identity.create({ custody: "platform" });
+// Every call routes through an SCP instance (ADR-048). Name a storage
+// backend: this constructor has no default.
+const scp = new SCP({ storage: { type: "in_memory" } });
+
+// Create a cryptographic identity (DID). Name a custody backend too —
+// `identityCreate` has no default either (spec §17.17.1, SCP-CAPSEL-8000).
+const identity = await scp.identityCreate("platform");
 console.log(`DID: ${identity.did}`);
 
-// Create an encrypted context
-const ctx = await Context.create(identity, {
-  ceiling: ["msg:send", "msg:receive"],
-  ttl: 3600,
+// Create an encrypted context.
+const ctx = await scp.contextCreate(
+  identity,
+  JSON.stringify({
+    ceiling: ["messages:read", "messages:write"],
+    memoryScope: "ephemeral",
+    governance: "single_admin",
+    ttl: 3600,
+  }),
+);
+
+// Send a message (MLS-encrypted, signed, provenance-tagged).
+await scp.contextSend(
+  ctx._rawHandle,
+  identity.did,
+  new TextEncoder().encode("Hello from SCP"),
+  null,
+);
+
+// Receive messages on a subscription callback.
+await scp.contextSubscribe(ctx._rawHandle, identity.did, (msg) => {
+  console.log(msg);
 });
 
-// Send a message (MLS-encrypted, signed, provenance-tagged)
-await ctx.send(new TextEncoder().encode("Hello from SCP"));
-
-// Receive messages
-for await (const msg of ctx.receive()) {
-  console.log(`${msg.senderDid}: ${msg.content}`);
-  break;
-}
-
-await ctx.close();
+await scp.contextClose(ctx._rawHandle, identity.did);
+await scp.shutdown(5);
 ```
 
 ## Runtime Support
@@ -97,7 +112,7 @@ All errors extend `ScpError` with a machine-readable `code` field:
 import { ScpError, ContextError } from "@limn-works/scp-ts";
 
 try {
-  await ctx.send(payload);
+  await scp.contextSend(ctx._rawHandle, identity.did, payload, null);
 } catch (e) {
   if (e instanceof ContextError) {
     console.error(`[${e.code}] ${e.message}`);

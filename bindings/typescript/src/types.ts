@@ -509,37 +509,52 @@ export interface BatchPublishResult {
 // ---------------------------------------------------------------------------
 
 /**
+ * Every governance outcome a bridge reports, one entry per variant of
+ * `scp_core::context::state::GovernanceActionResult` (ADR-031). All three
+ * bridges name a variant through one shared mapping
+ * (`scp_ffi_common::governance_result`), so these 29 strings are what a caller
+ * reads.
+ */
+export const GOVERNANCE_ACTION_RESULTS = [
+  "MemberAdded",
+  "MemberRemoved",
+  "RoleChanged",
+  "OutletRegistered",
+  "OutletRemoved",
+  "CeilingModified",
+  "ContextClosed",
+  "TtlExtended",
+  "PruningPolicyModified",
+  "AdminTransferred",
+  "SignerAdded",
+  "SignerRemoved",
+  "ThresholdModified",
+  "ChildContextCreated",
+  "OutletInterfaceEstablished",
+  "MemberReset",
+  "ConflictResolved",
+  "ContextPromoted",
+  "MemberSuspended",
+  "AccessRevoked",
+  "AccessRestored",
+  "ContentKeysRotated",
+  "GovernanceReconfigured",
+  "SubscriberBanned",
+  "SubscriberUnbanned",
+  "Executed",
+  "MigrationProposed",
+  "MigrationCancelled",
+  "ContextTombstoned",
+] as const;
+
+/**
  * Result of executing a governance action (ADR-031).
  *
- * Each variant corresponds to one of the 28 governance action outcomes.
+ * Derived from {@link GOVERNANCE_ACTION_RESULTS}, so one list feeds both this
+ * type and a runtime membership check `SCP.contextExecuteGovernanceAction`
+ * applies to what a bridge returns.
  */
-export type GovernanceActionResult =
-  | "MemberAdded"
-  | "MemberRemoved"
-  | "RoleChanged"
-  | "OutletRegistered"
-  | "OutletRemoved"
-  | "CeilingModified"
-  | "ContextClosed"
-  | "TtlExtended"
-  | "PruningPolicyModified"
-  | "AdminTransferred"
-  | "SignerAdded"
-  | "SignerRemoved"
-  | "ThresholdModified"
-  | "ChildContextCreated"
-  | "OutletInterfaceEstablished"
-  | "MemberReset"
-  | "ConflictResolved"
-  | "ContextPromoted"
-  | "MemberSuspended"
-  | "AccessRevoked"
-  | "AccessRestored"
-  | "ContentKeysRotated"
-  | "GovernanceReconfigured"
-  | "SubscriberBanned"
-  | "SubscriberUnbanned"
-  | "Executed";
+export type GovernanceActionResult = (typeof GOVERNANCE_ACTION_RESULTS)[number];
 
 // ---------------------------------------------------------------------------
 // Invitations (ADR-049 Phase 2J / FFI-02 Option A)

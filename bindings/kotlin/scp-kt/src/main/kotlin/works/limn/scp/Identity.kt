@@ -247,9 +247,13 @@ class IdentityAdvancedBridge internal constructor(
      * Overload accepting a raw string for backward compatibility.
      *
      * @param custody Key custody method: "in_memory", "platform", or "software".
+     *   Naming one is required and this parameter carries no default:
+     *   persistence spec §17.17.1 (`SCP-CAPSEL-8000`) forbids a form
+     *   that selects a backend for a caller, and §17:658 classifies
+     *   `InMemoryKeyCustody` as a security nullifier.
      * @return Opaque identity handle with agent key.
      */
-    suspend fun createWithAgentKey(custody: String = "in_memory"): Long =
+    suspend fun createWithAgentKey(custody: String): Long =
         bridge.ffiCall { bindings.identityCreateWithAgentKey(custody) }
 
     /**

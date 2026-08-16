@@ -977,3 +977,72 @@ class TestBroadcastKeyHexValidation:
 
         with pytest.raises(ValueError, match="broadcast_key_hex must be exactly 64 hex characters"):
             validate_broadcast_key_hex("")
+
+
+class TestGovernanceActionResultFromBridge:
+    """``GovernanceActionResult.from_bridge`` parses an outcome or fails closed.
+
+    Governance decides authorization, so an outcome string this SDK cannot name
+    raises rather than resolving to ``EXECUTED``. Restoring an earlier
+    ``return cls.EXECUTED`` fallback makes ``test_unknown_outcome_raises`` fail.
+    """
+
+    def test_known_outcome_parses(self) -> None:
+        from scp_sdk.governance import GovernanceActionResult
+
+        assert (
+            GovernanceActionResult.from_bridge("MemberRemoved")
+            is GovernanceActionResult.MEMBER_REMOVED
+        )
+
+    def test_surrounding_whitespace_is_stripped(self) -> None:
+        from scp_sdk.governance import GovernanceActionResult
+
+        assert (
+            GovernanceActionResult.from_bridge("  RoleChanged  ")
+            is GovernanceActionResult.ROLE_CHANGED
+        )
+
+    def test_migration_outcomes_parse(self) -> None:
+        """A PyO3 bridge emits these three strings (``context.rs``), so this
+        enum names them instead of collapsing them onto ``EXECUTED``."""
+        from scp_sdk.governance import GovernanceActionResult
+
+        assert (
+            GovernanceActionResult.from_bridge("MigrationProposed")
+            is GovernanceActionResult.MIGRATION_PROPOSED
+        )
+        assert (
+            GovernanceActionResult.from_bridge("MigrationCancelled")
+            is GovernanceActionResult.MIGRATION_CANCELLED
+        )
+        assert (
+            GovernanceActionResult.from_bridge("ContextTombstoned")
+            is GovernanceActionResult.CONTEXT_TOMBSTONED
+        )
+
+    def test_unknown_outcome_raises(self) -> None:
+        import pytest
+
+        from scp_sdk.errors import GovernanceError, UnknownGovernanceOutcomeError
+        from scp_sdk.governance import GovernanceActionResult
+
+        with pytest.raises(UnknownGovernanceOutcomeError) as excinfo:
+            GovernanceActionResult.from_bridge("SomethingThisSdkDoesNotKnow")
+
+        # `SCP-GOV-11040` says an action ran under a name this SDK version does
+        # not carry, which `SCP-GOV-11000` (a governance failure) does not say.
+        assert excinfo.value.code == "SCP-GOV-11040"
+        assert excinfo.value.raw_outcome == "SomethingThisSdkDoesNotKnow"
+        assert "SomethingThisSdkDoesNotKnow" in excinfo.value.message
+        # A caller catching a governance failure catches this one too.
+        assert isinstance(excinfo.value, GovernanceError)
+
+    def test_empty_string_raises(self) -> None:
+        import pytest
+
+        from scp_sdk.errors import UnknownGovernanceOutcomeError
+        from scp_sdk.governance import GovernanceActionResult
+
+        with pytest.raises(UnknownGovernanceOutcomeError):
+            GovernanceActionResult.from_bridge("")
