@@ -1608,6 +1608,22 @@ jobs:
       # the only required status check, matching the pytest pin in sdk-coverage.
       - run: pip install 'pyyaml>=6,<7'
       - run: bash scripts/tests/ci-gate/run-tests.sh
+      # Two fuzz.yml jobs size `timeout-minutes` by selecting a whole-minute
+      # budget per `fuzz_time` option, because GitHub expressions carry no
+      # arithmetic. scripts/tests/ci-gate reads those chains and assumes an
+      # evaluator picks a matching arm, and falls through to a trailing value
+      # when no input arrives. Reading a chain cannot prove that assumption, so
+      # these two assertions hand identical shapes to a real evaluator.
+      - name: Selection-chain evaluation matches what ci-gate assumes
+        env:
+          MATCHED_ARM: ${{ '7200' == '7200' && 150 || 45 }}
+          ABSENT_INPUT: ${{ github.event.inputs.fuzz_time == '7200' && 150 || 45 }}
+        run: |
+          test "$MATCHED_ARM" = "150" || {
+            echo "a matching arm evaluated to $MATCHED_ARM, expected 150" >&2; exit 1; }
+          test "$ABSENT_INPUT" = "45" || {
+            echo "an absent input evaluated to $ABSENT_INPUT, expected 45" >&2; exit 1; }
+          echo "matching arm -> $MATCHED_ARM, absent input -> $ABSENT_INPUT"
 
   # ── CI Gate ─────────────────────────────────────────────────────────
   # The single status check the repository ruleset requires, so this job decides

@@ -7,9 +7,21 @@ on:
   workflow_dispatch:
     inputs:
       fuzz_time:
+        # A closed option list, not a free-text field. Two jobs below size their
+        # `timeout-minutes` from whatever an operator picks here, so an
+        # unbounded value would hand an operator an unbounded job budget and
+        # undo a per-job ceiling entirely. Every option divides evenly by 60, so
+        # each computed budget stays a whole number of minutes.
         description: "Seconds per target"
+        type: choice
         default: "900"
         required: false
+        options:
+          - "300"
+          - "900"
+          - "1800"
+          - "3600"
+          - "7200"
 
 permissions:
   contents: read
@@ -57,7 +69,30 @@ jobs:
     name: Fuzz / ${{ matrix.target }}
     needs: toolchain
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Selected from `fuzz_time`, because step "Run fuzzer" hands that same input
+    # to libFuzzer as `-max_total_time`. A budget fixed above a scheduled run
+    # would cancel any dispatch asking for longer, so an operator picking 7200
+    # would lose a run that finished before per-job budgets existed.
+    #
+    # Selection, not arithmetic: GitHub expressions carry no `+`, `-`, `*` or
+    # `/` operator, so `seconds / 60 + overhead` cannot be written here.
+    # actionlint rejects it — "got unexpected character '/' while lexing
+    # expression". Each arm below therefore states a whole-minute budget equal
+    # to its option divided by 60, plus 30 minutes covering checkout, a nightly
+    # toolchain, `cargo install cargo-fuzz`, and a sanitizer build. A closed
+    # option list on `fuzz_time` is what keeps this chain total.
+    #
+    # A schedule supplies no input, so a final arm yields 45 — same budget a
+    # scheduled nightly ran under before, and what option "900" selects, that
+    # option being longest `matrix.time` below.
+    #
+    # scripts/tests/ci-gate asserts every option maps to an arm here.
+    timeout-minutes: >-
+      ${{ github.event.inputs.fuzz_time == '7200' && 150 ||
+      github.event.inputs.fuzz_time == '3600' && 90 ||
+      github.event.inputs.fuzz_time == '1800' && 60 ||
+      github.event.inputs.fuzz_time == '300' && 35 ||
+      45 }}
     if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
@@ -192,7 +227,18 @@ jobs:
     name: Fuzz / fuzz_mls_decrypt (release, debug-assertions off)
     needs: toolchain
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Selected from `fuzz_time` for a reason spelled out above fuzz-nightly.
+    # Each arm states its option divided by 60, plus 25 minutes covering
+    # checkout, a nightly toolchain, `cargo install cargo-fuzz`, and a release
+    # build. A final arm yields 30, matching both option "300" and a scheduled
+    # run, since step "Run fuzzer (release, debug-assertions off)" falls back to
+    # 300 seconds when no input arrives.
+    timeout-minutes: >-
+      ${{ github.event.inputs.fuzz_time == '7200' && 145 ||
+      github.event.inputs.fuzz_time == '3600' && 85 ||
+      github.event.inputs.fuzz_time == '1800' && 55 ||
+      github.event.inputs.fuzz_time == '900' && 40 ||
+      30 }}
     if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Free disk space
@@ -282,6 +328,10 @@ jobs:
     name: Deep Fuzz / ${{ matrix.target }}
     needs: toolchain
     runs-on: ubuntu-latest
+    # Fixed, unlike two jobs above, because step "Run deep fuzzer" hardcodes
+    # `-max_total_time=7200` and never reads `fuzz_time`. 120 minutes of fuzzing
+    # plus 60 for checkout, a nightly toolchain, `cargo install cargo-fuzz`, and
+    # a combined ASan plus UBSan build.
     timeout-minutes: 180
     if: github.event.schedule == '0 0 * * 6' || github.event_name == 'workflow_dispatch'
     strategy:

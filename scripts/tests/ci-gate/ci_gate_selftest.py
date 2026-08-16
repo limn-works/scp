@@ -17,6 +17,10 @@ nothing:
                touched crates/scp-runtime/ alone skipped all four test jobs.
   zero-test    `cargo test <filter>` exits 0 when the filter selects no test, so
                a fail-closed lane reported success over zero assertions.
+  scaled-input Two fuzz jobs pass a workflow_dispatch input to libFuzzer as
+               `-max_total_time`, so an operator sets how long they run. A
+               budget fixed above a scheduled run cancelled every dispatch
+               asking for longer, killing a run that previously completed.
 
 Run: python3 scripts/tests/ci-gate/ci_gate_selftest.py
 """
@@ -26,6 +30,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -42,9 +47,32 @@ AGGREGATE = REPO / "scripts/ci-aggregate-result.py"
 # a hang costs minutes rather than the six hours GitHub allows by default.
 MAX_TIMEOUT_MINUTES = 90
 
-# The scheduled fuzz and release workflows run longer by design: fuzz-weekly
-# passes `-max_total_time=7200` to libFuzzer, and a release builds every target.
+# Scheduled fuzz and release workflows run longer by design: fuzz-weekly passes
+# `-max_total_time=7200` to libFuzzer, and a release builds every target.
 MAX_TIMEOUT_MINUTES_OTHER_WORKFLOWS = 240
+
+# CRITERION: a workflow_dispatch input is runtime-scaling when a step hands it to
+# something that decides how long that step runs. Such an input turns an
+# operator's choice into a job's duration, so a budget fixed above one value
+# cancels every larger one — which is why each entry below records both a
+# runtime-scaling input and a floor on spare minutes its budget must leave for
+# setup around whatever work that input sizes.
+#
+# `fuzz_time` qualifies: two jobs pass it to libFuzzer as `-max_total_time`.
+# `version` and `scp-core-version` do not — a SemVer string lands in env vars,
+# artifact names, and a PyPI URL, none of which decide duration. `dry-run` does
+# not — a boolean guards `if:` conditions that skip jobs, which can only shorten
+# a run. Add an entry here whenever a new input meets that criterion; a check
+# below then requires every job reading it to size its budget from it.
+RUNTIME_SCALING_INPUTS = {"fuzz_time": 10}
+
+# GitHub expressions carry no arithmetic — actionlint rejects `900 / 60` with
+# "got unexpected character '/' while lexing expression". A budget that must
+# track a runtime-scaling input therefore SELECTS a whole-minute value per
+# option through an `X == 'v' && minutes || …` chain, and a closed option list
+# on that input is what makes such a chain total.
+ARM_PATTERN = re.compile(r"github\.event\.inputs\.(\w+)\s*==\s*'([^']*)'\s*&&\s*(\d+)")
+FALLBACK_PATTERN = re.compile(r"\|\|\s*(\d+)\s*\}\}\s*$")
 
 # Cargo flags that consume the token after them. Any other bare token following
 # `cargo test` is a test-name filter, and `cargo test` exits 0 when a filter
@@ -115,6 +143,93 @@ def positional_filters(command: str) -> list[str]:
     return filters
 
 
+def dispatch_input_specs(doc: dict) -> dict:
+    """Return workflow_dispatch input specs, keyed by input name."""
+    # PyYAML parses a bare `on:` key as boolean True.
+    triggers = doc.get(True) or doc.get("on") or {}
+    if not isinstance(triggers, dict):
+        return {}
+    dispatch = triggers.get("workflow_dispatch")
+    if not isinstance(dispatch, dict):
+        return {}
+    return dispatch.get("inputs") or {}
+
+
+def check_selected_budget(label, expression, dispatch_inputs, ceiling) -> None:
+    """A budget written as a selection chain must cover every permitted option.
+
+    Each arm reads `<input> == '<seconds>' && <minutes>`, and a trailing
+    `|| <minutes>` catches whatever no arm named — including a scheduled run,
+    which supplies no input at all. Two properties decide correctness: every
+    option resolves to some budget, and every budget leaves spare minutes above
+    however long that option asks a fuzzer to run.
+    """
+    arms = {
+        seconds: int(minutes) for _, seconds, minutes in ARM_PATTERN.findall(expression)
+    }
+    referenced = {name for name, _, _ in ARM_PATTERN.findall(expression)}
+    fallback = FALLBACK_PATTERN.search(" ".join(expression.split()))
+
+    check(
+        f"{label} names one dispatch input in its budget",
+        len(referenced) == 1,
+        str(referenced),
+    )
+    check(
+        f"{label} ends its budget chain with a fallback",
+        fallback is not None,
+        expression,
+    )
+    if len(referenced) != 1 or fallback is None:
+        return
+
+    name = referenced.pop()
+    fallback_minutes = int(fallback.group(1))
+    spec = dispatch_inputs.get(name) or {}
+    options = [str(option) for option in (spec.get("options") or [])]
+    floor = RUNTIME_SCALING_INPUTS.get(name, 0)
+
+    check(
+        f"{label} sizes its budget from a bounded input",
+        bool(options),
+        f"input {name!r} offers no closed option list, so no chain over it can be total",
+    )
+
+    for option in options:
+        minutes = arms.get(option, fallback_minutes)
+        asked = int(option) / 60
+        check(
+            f"{label} covers fuzz_time={option} with {minutes} minutes",
+            asked + floor <= minutes <= ceiling,
+            f"{option}s asks {asked:g} minutes and this leaves {minutes - asked:g} spare, "
+            f"want at least {floor} and a budget at most {ceiling}",
+        )
+
+    for option in arms:
+        check(
+            f"{label} arm for {option} names a permitted option",
+            option in options,
+            f"no option {option!r} exists, so this arm can never be selected",
+        )
+
+
+def check_scaling_input_sizes_budget(label, job, budget) -> None:
+    """A job reading a runtime-scaling input must size its budget from it."""
+    script = " ".join(
+        step.get("run") or "" for step in job.get("steps", []) if isinstance(step, dict)
+    )
+    for name in RUNTIME_SCALING_INPUTS:
+        token = f"inputs.{name}"
+        if token not in script:
+            continue
+        check(
+            f"{label} reads {name} and sizes its budget from it",
+            isinstance(budget, str) and token in budget,
+            f"steps pass {name} to something that decides how long they run, "
+            f"so a budget of {budget!r} cancels every value above it",
+        )
+
+
 def load_aggregate():
     spec = importlib.util.spec_from_file_location("ci_aggregate_result", AGGREGATE)
     module = importlib.util.module_from_spec(spec)
@@ -169,17 +284,24 @@ def main() -> int:
             if path == WORKFLOW
             else MAX_TIMEOUT_MINUTES_OTHER_WORKFLOWS
         )
-        for job_id, job in sorted(yaml.safe_load(path.read_text())["jobs"].items()):
+        doc = yaml.safe_load(path.read_text())
+        dispatch_inputs = dispatch_input_specs(doc)
+        for job_id, job in sorted(doc["jobs"].items()):
             if "uses" in job:
-                # A reusable-workflow call takes no timeout-minutes; the called
-                # workflow's own jobs carry the budget.
+                # A reusable-workflow call takes no timeout-minutes; a called
+                # workflow's own jobs carry that budget.
                 continue
             budget = job.get("timeout-minutes")
-            check(
-                f"{path.name}:{job_id} sets timeout-minutes",
-                isinstance(budget, int) and 0 < budget <= ceiling,
-                f"got {budget!r}, want an integer in 1..{ceiling}",
-            )
+            label = f"{path.name}:{job_id}"
+            if isinstance(budget, str) and "${{" in budget:
+                check_selected_budget(label, budget, dispatch_inputs, ceiling)
+            else:
+                check(
+                    f"{label} sets timeout-minutes",
+                    isinstance(budget, int) and 0 < budget <= ceiling,
+                    f"got {budget!r}, want an integer in 1..{ceiling}",
+                )
+            check_scaling_input_sizes_budget(label, job, budget)
 
     print("coverage — every job reaches the required status check")
     defined = set(jobs) - {"ci"}
