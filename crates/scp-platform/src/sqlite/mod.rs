@@ -28,6 +28,7 @@ use rusqlite::Connection;
 
 use zeroize::Zeroize;
 
+use crate::encrypted::SQLCIPHER_KEY_LEN;
 use crate::error::PlatformError;
 use crate::kdf;
 use crate::traits::Storage;
@@ -94,23 +95,48 @@ impl SqliteStorage {
     /// configuration that can produce WAL corruption, split-brain writes,
     /// or silent data loss (red-hat RED-1002).
     ///
-    /// The `key` parameter is the raw encryption key material. It is
-    /// hex-encoded and passed to `SQLCipher` via `PRAGMA key`. The
-    /// hex-encoded key string is zeroized after the PRAGMA is executed,
-    /// but `SQLCipher` retains the derived key internally for the lifetime
-    /// of the connection — this is inherent to how `SQLCipher` works and
-    /// cannot be avoided without closing the connection.
+    /// The `key` parameter is the raw encryption key material and MUST be
+    /// exactly [`SQLCIPHER_KEY_LEN`] bytes (spec §17.6). It is hex-encoded
+    /// and passed to `SQLCipher` via `PRAGMA key`. The hex-encoded key
+    /// string is zeroized after the PRAGMA is executed, but `SQLCipher`
+    /// retains the derived key internally for the lifetime of the
+    /// connection — this is inherent to how `SQLCipher` works and cannot be
+    /// avoided without closing the connection.
     ///
     /// Callers that hold the raw key in a `Vec<u8>` or similar should
     /// zeroize it after passing it to this constructor.
     ///
+    /// # Key length is checked before anything is created
+    ///
+    /// A key of any length other than [`SQLCIPHER_KEY_LEN`] returns
+    /// [`PlatformError::InvalidKeyLength`] before this constructor creates
+    /// the directory, the lock file, or the database. An empty key would
+    /// otherwise render `PRAGMA key = "x''"`, which selects `SQLCipher`'s
+    /// no-encryption mode: the database opens successfully and stores every
+    /// value in plaintext, while `SqliteStorage` still satisfies the sealed
+    /// [`EncryptedStorage`](crate::encrypted::EncryptedStorage) marker that
+    /// `ProtocolRepository::new` requires. Rejecting the key at the
+    /// construction boundary is what SCP-CAPSEL-8001 (spec §17.17.1,
+    /// selection fails closed) requires of a durable-backend open.
+    ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::StorageError`] if the database cannot be
-    /// opened, the encryption key is rejected, the schema cannot be
-    /// created, or the advisory file lock is already held by another
-    /// `SqliteStorage` instance (same process or other).
+    /// Returns [`PlatformError::InvalidKeyLength`] if `key` is not exactly
+    /// [`SQLCIPHER_KEY_LEN`] bytes. Returns [`PlatformError::StorageError`]
+    /// if the database cannot be opened, the encryption key is rejected, the
+    /// schema cannot be created, or the advisory file lock is already held
+    /// by another `SqliteStorage` instance (same process or other).
     pub fn new(dir: &Path, key: &[u8]) -> Result<Self, PlatformError> {
+        // Reject a wrong-length key BEFORE creating the directory, the lock
+        // file, or the database, so a rejected open leaves no artifact behind
+        // and no plaintext database can exist even transiently.
+        if key.len() != SQLCIPHER_KEY_LEN {
+            return Err(PlatformError::InvalidKeyLength {
+                expected: SQLCIPHER_KEY_LEN,
+                actual: key.len(),
+            });
+        }
+
         std::fs::create_dir_all(dir)
             .map_err(|e| PlatformError::StorageError(format!("failed to create directory: {e}")))?;
 
@@ -694,6 +720,109 @@ impl<T> OptionalResult<T> for Result<T, rusqlite::Error> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The first 16 bytes of an unencrypted `SQLite` database file. `SQLCipher`
+    /// overwrites this header with ciphertext, so its presence is the direct
+    /// on-disk test for "this database is stored in plaintext".
+    const SQLITE_PLAINTEXT_HEADER: &[u8] = b"SQLite format 3\0";
+
+    /// A key of any length other than 32 bytes MUST be refused with the typed
+    /// [`PlatformError::InvalidKeyLength`], not opened.
+    ///
+    /// The zero-length case is the one that costs confidentiality: `PRAGMA key
+    /// = "x''"` selects `SQLCipher`'s no-encryption mode, so before this check
+    /// existed an empty key produced a plaintext database that still satisfied
+    /// the sealed `EncryptedStorage` marker `ProtocolRepository::new` requires.
+    #[test]
+    fn new_rejects_key_of_any_length_but_thirty_two() {
+        for wrong_len in [0usize, 1, 16, 31, 33, 64] {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path().join("db");
+            let key = vec![0x11u8; wrong_len];
+
+            let result = SqliteStorage::new(&dir, &key);
+            match result {
+                Err(PlatformError::InvalidKeyLength { expected, actual }) => {
+                    assert_eq!(expected, SQLCIPHER_KEY_LEN);
+                    assert_eq!(actual, wrong_len);
+                }
+                Err(other) => panic!("expected InvalidKeyLength for {wrong_len}, got {other:?}"),
+                Ok(_) => panic!("a {wrong_len}-byte key must be refused"),
+            }
+
+            // The rejection happens before any filesystem work, so a refused
+            // open leaves neither a directory, a database, nor a lock file.
+            assert!(
+                !dir.exists(),
+                "a refused open must not create the storage directory"
+            );
+        }
+    }
+
+    /// A 32-byte key opens the database, and the resulting file is `SQLCipher`
+    /// ciphertext rather than a plaintext `SQLite` file.
+    ///
+    /// Construction returning `Ok` proves nothing on its own — the empty-key
+    /// path returned `Ok` too. This test reads the bytes `SQLCipher` wrote.
+    #[tokio::test]
+    async fn thirty_two_byte_key_produces_an_encrypted_file() {
+        let tmp = TempDir::new().unwrap();
+        let key = [0x37u8; SQLCIPHER_KEY_LEN];
+
+        let storage = SqliteStorage::new(tmp.path(), &key).unwrap();
+        storage
+            .store("probe/key", b"plaintext-canary-value")
+            .await
+            .unwrap();
+        storage.close();
+        drop(storage);
+
+        let bytes = std::fs::read(tmp.path().join(DB_FILE_NAME)).unwrap();
+        assert!(
+            bytes.len() >= SQLITE_PLAINTEXT_HEADER.len(),
+            "database file must not be empty"
+        );
+        assert_ne!(
+            &bytes[..SQLITE_PLAINTEXT_HEADER.len()],
+            SQLITE_PLAINTEXT_HEADER,
+            "an encrypted database must not carry the plaintext SQLite header"
+        );
+
+        // The stored value must not appear verbatim anywhere in the file.
+        let canary = b"plaintext-canary-value";
+        assert!(
+            !bytes.windows(canary.len()).any(|w| w == canary),
+            "the stored value must not appear in plaintext on disk"
+        );
+
+        // And a reader without the key must not be able to read the table.
+        let plain = Connection::open(tmp.path().join(DB_FILE_NAME)).unwrap();
+        assert!(
+            plain.prepare("SELECT key FROM kv").is_err(),
+            "a connection with no SQLCipher key must not read the kv table"
+        );
+    }
+
+    /// `with_passphrase` derives its 32-byte key through Argon2id, so it always
+    /// satisfies the length check and never reaches the no-encryption mode —
+    /// including for an empty passphrase, which is a caller choice about key
+    /// strength rather than a request for a plaintext database.
+    #[tokio::test]
+    async fn with_passphrase_never_produces_a_plaintext_database() {
+        let tmp = TempDir::new().unwrap();
+
+        let storage = SqliteStorage::with_passphrase(tmp.path(), b"").unwrap();
+        storage.store("k", b"v").await.unwrap();
+        storage.close();
+        drop(storage);
+
+        let bytes = std::fs::read(tmp.path().join(DB_FILE_NAME)).unwrap();
+        assert_ne!(
+            &bytes[..SQLITE_PLAINTEXT_HEADER.len()],
+            SQLITE_PLAINTEXT_HEADER,
+            "an empty passphrase must still derive a 32-byte key and encrypt"
+        );
+    }
 
     #[test]
     fn prefix_successor_normal() {

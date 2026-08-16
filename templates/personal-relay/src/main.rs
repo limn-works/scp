@@ -378,7 +378,18 @@ async fn main() {
     let custody_storage =
         open_sqlite_or_exit(&config.storage_path.join("custody"), &storage_key);
 
-    let custody = match SqliteKeyCustody::new(custody_storage).await {
+    // The per-entry wrapping key is HKDF-separated from the storage key, so the
+    // SQLCipher PRAGMA key and the key sealing each custody entry are
+    // independent secrets rather than one secret used twice.
+    let custody_entry_key = match scp_platform::kdf::derive_custody_entry_key(&storage_key) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to derive the custody entry key");
+            std::process::exit(1);
+        }
+    };
+
+    let custody = match SqliteKeyCustody::new(custody_storage, custody_entry_key).await {
         Ok(c) => Arc::new(c),
         Err(e) => {
             tracing::error!(error = %e, "failed to initialize key custody");

@@ -39,6 +39,15 @@
 pub mod android;
 #[cfg(feature = "apple")]
 pub mod apple;
+// Shared AES-256-GCM sealing for one private-key entry, with the `key_type`
+// discriminant bound as AAD (GitHub issue #2299). `FileKeyCustody` (`file`) and
+// `SqliteKeyCustody` (`sqlite` + `software_platform`) both seal through it, so
+// one implementation decides how the discriminant is bound to the key bytes.
+#[cfg(any(
+    feature = "file",
+    all(feature = "sqlite", feature = "software_platform")
+))]
+pub(crate) mod custody_aead;
 pub mod encrypted;
 #[cfg(feature = "encrypting")]
 pub mod encrypting_adapter;

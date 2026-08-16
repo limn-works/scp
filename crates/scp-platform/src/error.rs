@@ -29,6 +29,28 @@ pub enum PlatformError {
         actual: KeyType,
     },
 
+    /// A caller supplied key material whose length the backend rejects.
+    ///
+    /// Raised at the construction boundary, before the backend opens any
+    /// file, so a wrong-length key creates nothing on disk. `SqliteStorage`
+    /// and `AppleStorage` both require exactly 32 bytes for the `SQLCipher`
+    /// PRAGMA key (spec §17.6); an empty key would select `SQLCipher`'s
+    /// no-encryption mode and store the database in plaintext, so the length
+    /// check is the difference between an encrypted database and a plaintext
+    /// one. `SqliteKeyCustody` requires exactly 32 bytes for its per-entry
+    /// AES-256-GCM key.
+    ///
+    /// Callers match on this variant to distinguish a caller-supplied key of
+    /// the wrong size from an I/O failure, which `StorageError` carries as a
+    /// string.
+    #[error("invalid key length: expected {expected} bytes, got {actual}")]
+    InvalidKeyLength {
+        /// The exact length in bytes the backend requires.
+        expected: usize,
+        /// The length in bytes the caller supplied.
+        actual: usize,
+    },
+
     /// A storage operation failed.
     #[error("storage error: {0}")]
     StorageError(String),

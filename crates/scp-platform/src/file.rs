@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────┐
-//! │ version: u8          (1 byte, currently 0x01)  │
+//! │ version: u8          (1 byte, currently 0x02)  │
 //! │ argon2id_salt: [u8]  (16 bytes)                │
 //! ├────────────────────────────────────────────────┤
 //! │ entry_count: u32 LE  (4 bytes)                 │
@@ -33,6 +33,36 @@
 //! ciphertext is the 32-byte private key encrypted under AES-256-GCM;
 //! the tag (16 bytes) is appended by the AEAD.
 //!
+//! # The `key_type` byte is Additional Authenticated Data
+//!
+//! `key_type` is stored in the clear so the loader knows which algorithm
+//! consumes the entry, and it is also passed to AES-256-GCM as Additional
+//! Authenticated Data. Both `SigningKey::from_bytes` and `StaticSecret::from`
+//! accept any 32 bytes, so before this binding existed a writer who flipped
+//! `0x01` to `0x02` kept a valid GCM tag and made the same seed serve as both
+//! an Ed25519 signing key and an X25519 Diffie-Hellman secret — the
+//! domain-separation break GitHub issue #2299 records. With the byte bound as
+//! AAD, a flip makes the shared `custody_aead::open` helper fail its
+//! tag check instead of returning key bytes.
+//!
+//! **Format version 0x02 carries the binding, and a 0x01 file no longer
+//! opens.** Entry bytes did not change length, so nothing except the version
+//! byte distinguishes a file whose entries were sealed with empty AAD; without
+//! the bump, an existing key file would report "decryption failed (wrong
+//! passphrase?)" on every operation. `open_existing` rejects version `0x01`
+//! by name instead. SCP is pre-release and `CLAUDE.md` forbids migration code,
+//! so this is a **stated breaking change**: a key file written before this
+//! change is unreadable and its keys must be regenerated. No shipped release
+//! wrote a 0x01 file that a supported upgrade path must carry forward.
+//!
+//! The entry index is deliberately NOT bound. `destroy_key` compacts the file
+//! by copying every following entry's ciphertext down one slot; binding the
+//! index would force `destroy_key` to decrypt and re-encrypt private keys it
+//! otherwise never touches, materializing unrelated key material in process
+//! memory on every destroy. A writer who can permute entries can already
+//! truncate or replace the whole file, so the slot binding would buy less than
+//! the plaintext exposure it costs.
+//!
 //! # Security Properties
 //!
 //! - Private keys are **never** stored in plaintext on disk.
@@ -44,14 +74,13 @@
 //! - Each `sign` / `public_key` / `dh_agree` call decrypts the key,
 //!   performs the operation, and zeroizes the plaintext immediately.
 //!
-//! See GitHub issue #391 and ADR-006.
+//! See GitHub issue #391 (encrypted file key custody), GitHub issue #2299
+//! (the unauthenticated `key_type` byte), and ADR-006 (platform adapters).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::RngCore;
 use std::sync::Mutex as StdMutex;
@@ -59,6 +88,7 @@ use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
+use crate::custody_aead;
 use crate::error::PlatformError;
 use crate::traits::{
     CustodyType, KeyCustody, KeyHandle, KeyType, PseudonymKeypair, PublicKey, SharedSecret,
@@ -70,22 +100,30 @@ use crate::traits::{
 // ---------------------------------------------------------------------------
 
 /// Current file format version.
-const FORMAT_VERSION: u8 = 0x01;
+///
+/// `0x02` seals every entry with the `key_type` byte bound as Additional
+/// Authenticated Data, which closes GitHub issue #2299, the unauthenticated
+/// `key_type` byte. `0x01` sealed entries with empty
+/// AAD and is rejected by [`FileKeyCustody::open_existing`] — see the "format
+/// version 0x02" paragraph in the module documentation for why no migration
+/// path reads it.
+const FORMAT_VERSION: u8 = 0x02;
+
+/// The superseded format version, whose entries were sealed with empty AAD.
+///
+/// Named so [`FileKeyCustody::open_existing`] can tell a caller that their key
+/// file predates the `key_type` AAD binding, instead of reporting a tag failure
+/// as a wrong passphrase.
+const UNBOUND_AAD_FORMAT_VERSION: u8 = 0x01;
 
 /// Argon2id salt length in bytes.
 const SALT_LEN: usize = 16;
 
-/// AES-256-GCM nonce length in bytes.
-const NONCE_LEN: usize = 12;
-
 /// Private key length in bytes (Ed25519 or X25519).
-const KEY_LEN: usize = 32;
-
-/// AES-256-GCM authentication tag length in bytes.
-const TAG_LEN: usize = 16;
+const KEY_LEN: usize = custody_aead::KEY_LEN;
 
 /// Size of one encrypted entry on disk: `key_type` (1) + nonce (12) + ciphertext (32) + tag (16).
-const ENTRY_SIZE: usize = 1 + NONCE_LEN + KEY_LEN + TAG_LEN;
+const ENTRY_SIZE: usize = 1 + custody_aead::SEALED_LEN;
 
 /// Header size: version (1) + salt (16) + `entry_count` (4).
 const HEADER_SIZE: usize = 1 + SALT_LEN + 4;
@@ -348,6 +386,24 @@ impl FileKeyCustody {
             ));
         }
 
+        if data[0] == UNBOUND_AAD_FORMAT_VERSION {
+            // Entry bytes are the same length in both versions, so nothing but
+            // this byte tells a 0x01 file apart. Naming it here keeps the
+            // caller from reading a tag failure on every entry as a wrong
+            // passphrase. SCP is pre-release and CLAUDE.md forbids migration
+            // code, so there is no path that reads a 0x01 file: its keys must
+            // be regenerated.
+            return Err(PlatformError::CustodyError(format!(
+                "key file at {} uses format version {UNBOUND_AAD_FORMAT_VERSION:#04x}, \
+                 which sealed entries without binding the key_type byte as AAD \
+                 (GitHub issue #2299, the unauthenticated key_type byte). \
+                 This build writes and reads version \
+                 {FORMAT_VERSION:#04x} only, and no migration path exists — \
+                 regenerate the keys.",
+                path.display()
+            )));
+        }
+
         if data[0] != FORMAT_VERSION {
             return Err(PlatformError::CustodyError(format!(
                 "unsupported key file version: {:#04x}",
@@ -410,57 +466,42 @@ impl FileKeyCustody {
         crate::kdf::derive_argon2id_key(passphrase.as_bytes(), salt)
     }
 
-    /// Encrypts a 32-byte private key using AES-256-GCM with a fresh nonce.
+    /// Builds the Additional Authenticated Data for one entry.
+    ///
+    /// The AAD is the single `key_type` byte, so an entry sealed as Ed25519
+    /// cannot be opened as X25519 and the reverse. See the module
+    /// documentation for why the entry index is left out.
+    const fn entry_aad(key_type: StoredKeyType) -> [u8; 1] {
+        [key_type.to_byte()]
+    }
+
+    /// Encrypts a 32-byte private key using AES-256-GCM with a fresh nonce,
+    /// binding `key_type` as Additional Authenticated Data.
+    ///
+    /// Returns `nonce || ciphertext || tag`.
     fn encrypt_key(
         &self,
         plaintext: &[u8; KEY_LEN],
-    ) -> Result<([u8; NONCE_LEN], Vec<u8>), PlatformError> {
-        let cipher = Aes256Gcm::new_from_slice(self.derived_key.as_ref())
-            .map_err(|e| PlatformError::CustodyError(format!("cipher init failed: {e}")))?;
-
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
-            .map_err(|e| PlatformError::CustodyError(format!("encryption failed: {e}")))?;
-
-        Ok((nonce_bytes, ciphertext))
+        key_type: StoredKeyType,
+    ) -> Result<[u8; custody_aead::SEALED_LEN], PlatformError> {
+        custody_aead::seal(&self.derived_key, plaintext, &Self::entry_aad(key_type))
     }
 
-    /// Decrypts a key entry from the file at the given entry index.
+    /// Decrypts a key entry from the file at the given entry index, requiring
+    /// the stored `key_type` byte to match the one the entry was sealed with.
+    ///
+    /// A caller that flips the on-disk `key_type` byte gets a tag failure here,
+    /// not the same 32 bytes reinterpreted under the other algorithm.
     fn decrypt_entry(
         &self,
         data: &[u8],
         entry_index: usize,
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, PlatformError> {
         let offset = HEADER_SIZE + entry_index * ENTRY_SIZE;
-        // Skip key_type byte (1 byte).
-        let nonce_start = offset + 1;
-        let ct_start = nonce_start + NONCE_LEN;
-        let ct_end = ct_start + KEY_LEN + TAG_LEN;
+        let key_type = StoredKeyType::from_byte(data[offset])?;
+        let sealed = &data[offset + 1..offset + ENTRY_SIZE];
 
-        let nonce = Nonce::from_slice(&data[nonce_start..ct_start]);
-        let ciphertext_and_tag = &data[ct_start..ct_end];
-
-        let cipher = Aes256Gcm::new_from_slice(self.derived_key.as_ref())
-            .map_err(|e| PlatformError::CustodyError(format!("cipher init failed: {e}")))?;
-
-        let plaintext =
-            Zeroizing::new(cipher.decrypt(nonce, ciphertext_and_tag).map_err(|_| {
-                PlatformError::CustodyError("decryption failed (wrong passphrase?)".into())
-            })?);
-
-        let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
-        if plaintext.len() != KEY_LEN {
-            return Err(PlatformError::CustodyError(format!(
-                "decrypted key has wrong length: expected {KEY_LEN}, got {}",
-                plaintext.len()
-            )));
-        }
-        key_bytes.copy_from_slice(&plaintext);
-        Ok(key_bytes)
+        custody_aead::open(&self.derived_key, sealed, &Self::entry_aad(key_type))
     }
 
     /// Reads the key file from disk.
@@ -493,13 +534,12 @@ impl FileKeyCustody {
 
         let new_index = current_count as usize;
 
-        // Encrypt the key.
-        let (nonce, ciphertext) = self.encrypt_key(private_key)?;
+        // Encrypt the key, binding `key_type` as AAD.
+        let sealed = self.encrypt_key(private_key, key_type)?;
 
         // Build the entry: key_type + nonce + ciphertext+tag.
         data.push(key_type.to_byte());
-        data.extend_from_slice(&nonce);
-        data.extend_from_slice(&ciphertext);
+        data.extend_from_slice(&sealed);
 
         // Update entry count.
         let new_count = current_count + 1;
@@ -1242,6 +1282,149 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    /// GitHub issue #2299, the unauthenticated `key_type` byte: an Ed25519
+    /// seed MUST NOT be retrievable as an
+    /// X25519 static secret.
+    ///
+    /// The `key_type` byte at the head of each entry decides which algorithm
+    /// consumes the 32 bytes, and it is bound as AES-256-GCM Additional
+    /// Authenticated Data. A writer who flips `0x01` to `0x02` keeps every
+    /// other byte valid, so before the binding the seed loaded as an X25519
+    /// `StaticSecret` and `dh_agree` returned a shared secret derived from an
+    /// Ed25519 signing seed. The flip must now fail the tag check.
+    ///
+    /// The unflipped control reopens first, so the only difference between the
+    /// passing case and the failing case is the one byte.
+    #[tokio::test]
+    async fn flipped_key_type_byte_fails_the_tag_check() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let passphrase = "aad-binding-passphrase";
+
+        let custody = FileKeyCustody::new(&path, passphrase).unwrap();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        drop(custody);
+
+        // Control: the untouched file reopens and the key is usable.
+        let control = FileKeyCustody::new(&path, passphrase).unwrap();
+        control
+            .public_key(&KeyHandle::new(1))
+            .await
+            .expect("the untouched entry must open");
+        drop(control);
+        let _ = handle;
+
+        // Flip the plaintext key_type byte of entry 0 to the X25519 value.
+        let mut data = std::fs::read(&path).unwrap();
+        assert_eq!(
+            data[HEADER_SIZE], KEY_TYPE_ED25519,
+            "entry 0 must start as Ed25519"
+        );
+        data[HEADER_SIZE] = KEY_TYPE_X25519;
+        std::fs::write(&path, &data).unwrap();
+
+        let flipped = FileKeyCustody::new(&path, passphrase).unwrap();
+        let reused = KeyHandle::new(1);
+
+        // Reading the key as an X25519 public key must fail.
+        match flipped.public_key(&reused).await {
+            Err(PlatformError::CustodyError(msg)) => {
+                assert!(
+                    msg.contains("decryption failed"),
+                    "a flipped key_type byte must fail the tag check: {msg}"
+                );
+            }
+            Err(other) => panic!("expected a decryption failure, got {other:?}"),
+            Ok(_) => panic!("an Ed25519 seed must not be readable as an X25519 public key"),
+        }
+
+        // And Diffie-Hellman under the reinterpreted seed must fail too — this
+        // is the cross-algorithm reuse the AAD binding exists to stop.
+        assert!(
+            flipped.dh_agree(&reused, &[0x11u8; 32]).await.is_err(),
+            "an Ed25519 seed must not serve as an X25519 Diffie-Hellman secret"
+        );
+    }
+
+    /// The reverse direction: an X25519 static secret MUST NOT be retrievable
+    /// as an Ed25519 signing key.
+    #[tokio::test]
+    async fn flipped_key_type_byte_fails_in_the_other_direction() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let passphrase = "aad-binding-reverse";
+
+        let custody = FileKeyCustody::new(&path, passphrase).unwrap();
+        custody.generate_keypair(KeyType::X25519).await.unwrap();
+        drop(custody);
+
+        let mut data = std::fs::read(&path).unwrap();
+        assert_eq!(
+            data[HEADER_SIZE], KEY_TYPE_X25519,
+            "entry 0 must start as X25519"
+        );
+        data[HEADER_SIZE] = KEY_TYPE_ED25519;
+        std::fs::write(&path, &data).unwrap();
+
+        let flipped = FileKeyCustody::new(&path, passphrase).unwrap();
+        let reused = KeyHandle::new(1);
+        assert!(
+            flipped.sign(&reused, b"message").await.is_err(),
+            "an X25519 secret must not serve as an Ed25519 signing key"
+        );
+        assert!(
+            flipped.public_key(&reused).await.is_err(),
+            "an X25519 secret must not yield an Ed25519 public key"
+        );
+    }
+
+    /// A key file written before the AAD binding carries format version 0x01.
+    /// Its entries are the same length as 0x02 entries, so `open_existing` must
+    /// name the version rather than let every operation report a tag failure as
+    /// a wrong passphrase.
+    #[tokio::test]
+    async fn format_version_one_is_rejected_by_name() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "version-check").unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        drop(custody);
+
+        // Rewind the version byte to the superseded value.
+        let mut data = std::fs::read(&path).unwrap();
+        assert_eq!(data[0], FORMAT_VERSION, "a fresh file must be 0x02");
+        data[0] = UNBOUND_AAD_FORMAT_VERSION;
+        std::fs::write(&path, &data).unwrap();
+
+        match FileKeyCustody::new(&path, "version-check") {
+            Err(PlatformError::CustodyError(msg)) => {
+                assert!(
+                    msg.contains("regenerate the keys"),
+                    "the error must tell the operator what to do: {msg}"
+                );
+                assert!(
+                    msg.contains("2299"),
+                    "the error must cite the issue that changed the format: {msg}"
+                );
+            }
+            Err(other) => panic!("expected a named version error, got {other:?}"),
+            Ok(_) => panic!("a 0x01 key file must not open"),
+        }
+    }
+
+    /// A fresh key file records format version 0x02, so a reader can tell an
+    /// AAD-bound file from an unbound one by its first byte.
+    #[tokio::test]
+    async fn fresh_key_file_records_format_version_two() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let _custody = FileKeyCustody::new(&path, "version-write").unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data[0], 0x02, "a fresh key file must record version 0x02");
     }
 
     #[tokio::test]

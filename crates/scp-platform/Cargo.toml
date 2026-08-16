@@ -49,7 +49,20 @@ apple = ["dep:rusqlite", "dep:hex", "dep:fs2"]
 # per-database salt generation; the shared `kdf` module is the single source
 # of the Argon2id parameterization. `fs2` provides advisory file locking for
 # the per-database salt sidecar (fail-closed on lock contention).
-sqlite = ["dep:rusqlite", "dep:hex", "dep:argon2", "dep:rand", "dep:fs2"]
+# `aes-gcm` backs `SqliteKeyCustody`'s per-entry sealing, which binds the
+# `key_type` discriminant as AAD (GitHub issue #2299, the unauthenticated
+# `key_type` byte). `hkdf` + `sha2` back `kdf::derive_custody_entry_key`, which
+# domain-separates that per-entry wrapping key from the SQLCipher database key.
+sqlite = [
+    "dep:rusqlite",
+    "dep:hex",
+    "dep:argon2",
+    "dep:rand",
+    "dep:fs2",
+    "dep:aes-gcm",
+    "dep:hkdf",
+    "dep:sha2",
+]
 # Encrypted file-backed key custody (Argon2id + AES-256-GCM).
 # Universal fallback for non-HSM platforms. See GitHub issue #391.
 file = ["software_platform", "dep:aes-gcm", "dep:argon2"]
@@ -75,9 +88,15 @@ zeroize = { workspace = true }
 # and the `SyncableStorage` changelog (`sync` feature) also serializes with it.
 rmp-serde = { workspace = true }
 
-# file dependencies, gated behind the `file` feature flag.
+# AEAD + KDF dependencies, gated behind the `file`, `sqlite`, and `encrypting`
+# feature flags.
 aes-gcm = { workspace = true, optional = true }
 argon2 = { workspace = true, optional = true }
+# HKDF-SHA-256 backs `kdf::derive_custody_entry_key`, which derives the
+# `SqliteKeyCustody` per-entry wrapping key from a caller's root key material
+# under a distinct label (spec §17.6 uses the same construction for the
+# SQLCipher PRAGMA key).
+hkdf = { workspace = true, optional = true }
 
 # software_platform dependencies, gated behind the `software_platform` feature flag.
 ed25519-dalek = { workspace = true, optional = true }
@@ -88,8 +107,9 @@ sha2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 # Per-context pseudonym derivation (§9.10.4.A) lives in the wasm-safe `scp-crypto`
 # leaf (ADR-057 Option A); every software-custody backend delegates to it. Its
-# HKDF/HMAC/SHA-256 primitives are pulled transitively, so `scp-platform` no
-# longer needs a direct `hkdf` dependency.
+# HKDF/HMAC/SHA-256 primitives are pulled transitively; the direct `hkdf`
+# dependency above exists only for `kdf::derive_custody_entry_key`, which
+# `scp-platform` owns rather than delegating.
 scp-crypto = { path = "../scp-crypto", version = "=0.1.0-beta.2", optional = true }
 
 # sqlite dependencies, gated behind the `sqlite` feature flag.

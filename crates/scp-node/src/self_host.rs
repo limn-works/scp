@@ -1263,8 +1263,14 @@ where
     //    exactly one lock holder (a second open would fail with os error 35). --
     let node_storage_arc = Arc::new(open_sqlite(&storage_dir, &storage_key)?);
     let custody_storage = open_sqlite(&storage_dir.join("custody"), &storage_key)?;
+    // The per-entry wrapping key is derived from the storage key under a
+    // distinct HKDF label, so the `SQLCipher` PRAGMA key and the key that seals
+    // each custody entry are independent secrets rather than one secret used
+    // twice (GitHub issue #2299, the unauthenticated key_type byte in custody).
+    let custody_entry_key = scp_platform::kdf::derive_custody_entry_key(&storage_key)
+        .map_err(|e| HostSiteError::Custody(e.to_string()))?;
     let custody = Arc::new(
-        SqliteKeyCustody::new(custody_storage)
+        SqliteKeyCustody::new(custody_storage, custody_entry_key)
             .await
             .map_err(|e| HostSiteError::Custody(e.to_string()))?,
     );

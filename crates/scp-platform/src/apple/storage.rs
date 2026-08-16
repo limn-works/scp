@@ -37,6 +37,7 @@ use tokio::sync::Mutex;
 
 use zeroize::Zeroize;
 
+use crate::encrypted::SQLCIPHER_KEY_LEN;
 use crate::error::PlatformError;
 use crate::traits::Storage;
 
@@ -74,16 +75,23 @@ impl AppleStorage {
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::StorageError`] if:
-    /// - The encryption key is not exactly 32 bytes.
+    /// Returns [`PlatformError::InvalidKeyLength`] if the encryption key is
+    /// not exactly [`SQLCIPHER_KEY_LEN`](crate::encrypted::SQLCIPHER_KEY_LEN)
+    /// bytes. Returns [`PlatformError::StorageError`] if:
     /// - The database file cannot be opened or created.
     /// - Any `SQLCipher` pragma fails to apply.
     pub fn open(dir: &Path, encryption_key: &[u8]) -> Result<Self, PlatformError> {
-        if encryption_key.len() != 32 {
-            return Err(PlatformError::StorageError(format!(
-                "encryption key must be exactly 32 bytes, got {}",
-                encryption_key.len()
-            )));
+        // Same check, same typed error, and for the same reason as
+        // `SqliteStorage::new`: an empty key renders `PRAGMA key = "x''"`,
+        // which selects `SQLCipher`'s no-encryption mode and stores the
+        // database in plaintext while `AppleStorage` still satisfies the
+        // sealed `EncryptedStorage` marker. Both adapters drive the same
+        // `SQLCipher` engine, so they enforce the same 32-byte key length.
+        if encryption_key.len() != SQLCIPHER_KEY_LEN {
+            return Err(PlatformError::InvalidKeyLength {
+                expected: SQLCIPHER_KEY_LEN,
+                actual: encryption_key.len(),
+            });
         }
 
         let db_path = dir.join("scp.db");

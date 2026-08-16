@@ -442,7 +442,19 @@ async fn init_persistent_storage(
     let node_storage = Arc::new(open_sqlite_or_exit(&storage_dir, &storage_key));
     let custody_storage = open_sqlite_or_exit(&storage_dir.join("custody"), &storage_key);
 
-    let custody = match SqliteKeyCustody::new(custody_storage).await {
+    // The per-entry wrapping key is derived from the storage key under a
+    // distinct HKDF label, so the `SQLCipher` PRAGMA key and the key that seals
+    // each custody entry are independent secrets rather than one secret used
+    // twice (GitHub issue #2299, the unauthenticated key_type byte in custody).
+    let custody_entry_key = match scp_platform::kdf::derive_custody_entry_key(&storage_key) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to derive the custody entry key");
+            std::process::exit(1);
+        }
+    };
+
+    let custody = match SqliteKeyCustody::new(custody_storage, custody_entry_key).await {
         Ok(c) => Arc::new(c),
         Err(e) => {
             tracing::error!(error = %e, "failed to initialize persistent key custody");

@@ -88,8 +88,12 @@ fn self_host_context_id(node_did: &str) -> String {
 async fn build_custody(dir: &std::path::Path, key: &[u8; 32]) -> Arc<SqliteKeyCustody> {
     let custody_storage =
         SqliteStorage::new(&dir.join("custody"), key).expect("custody SQLite should open");
+    // Same derivation the binary and `host_site` use: the per-entry wrapping
+    // key is HKDF-separated from the SQLCipher database key.
+    let entry_key = scp_platform::kdf::derive_custody_entry_key(key)
+        .expect("custody entry key derivation should succeed");
     Arc::new(
-        SqliteKeyCustody::new(custody_storage)
+        SqliteKeyCustody::new(custody_storage, entry_key)
             .await
             .expect("custody should initialize"),
     )

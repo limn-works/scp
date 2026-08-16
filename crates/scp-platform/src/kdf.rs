@@ -77,6 +77,61 @@ pub fn derive_argon2id_key(
     Ok(key)
 }
 
+/// Domain-separation label for the `SqliteKeyCustody` per-entry wrapping key.
+///
+/// Hashed to produce the HKDF salt, so the derived key is unrelated to any
+/// other key derived from the same root material under a different label.
+#[cfg(feature = "sqlite")]
+const CUSTODY_ENTRY_KEY_LABEL: &[u8] = b"SCP-CUSTODY-ENTRY-KEY-V1";
+
+/// HKDF `info` parameter for the `SqliteKeyCustody` per-entry wrapping key.
+#[cfg(feature = "sqlite")]
+const CUSTODY_ENTRY_KEY_INFO: &[u8] = b"scp-custody-entry";
+
+/// Derives the [`SqliteKeyCustody`] per-entry AES-256-GCM wrapping key from a
+/// caller's 32-byte root key material using HKDF-SHA-256 (RFC 5869).
+///
+/// ```text
+/// ikm  = root_key                                   // 32 bytes
+/// salt = SHA-256("SCP-CUSTODY-ENTRY-KEY-V1")        // 32 bytes
+/// info = "scp-custody-entry"
+/// okm  = HKDF-Expand(HKDF-Extract(salt, ikm), info, 32)
+/// ```
+///
+/// A caller that already holds one root secret — the `scp-node` storage key
+/// file, for example — uses this to obtain a wrapping key that is independent
+/// of the `SQLCipher` PRAGMA key it derives from the same root. Without that
+/// separation the custody entries and the database that holds them would be
+/// sealed under one key, so a leak of the database key would also forge custody
+/// entries. This mirrors the HKDF construction spec §17.6 specifies for the
+/// `SQLCipher` key itself, with a different label.
+///
+/// A caller holding two independent secrets should pass the dedicated one
+/// directly to `SqliteKeyCustody::new` instead of deriving here.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::CustodyError`] if HKDF-Expand rejects the output
+/// length. `expand` rejects only lengths above `255 * 32` bytes and this
+/// function requests 32, so no input reaches that branch; it returns an error
+/// rather than falling back to a fixed key, because a fallback key would be a
+/// wrapping key an attacker knows.
+///
+/// [`SqliteKeyCustody`]: crate::sqlite::SqliteKeyCustody
+#[cfg(feature = "sqlite")]
+pub fn derive_custody_entry_key(
+    root_key: &[u8; DERIVED_KEY_LEN],
+) -> Result<Zeroizing<[u8; DERIVED_KEY_LEN]>, PlatformError> {
+    use sha2::Digest as _;
+
+    let salt = sha2::Sha256::digest(CUSTODY_ENTRY_KEY_LABEL);
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt.as_slice()), root_key);
+    let mut okm = Zeroizing::new([0u8; DERIVED_KEY_LEN]);
+    hk.expand(CUSTODY_ENTRY_KEY_INFO, okm.as_mut())
+        .map_err(|e| PlatformError::CustodyError(format!("hkdf expand failed: {e}")))?;
+    Ok(okm)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -126,5 +181,42 @@ mod tests {
         let salt = [0u8; ARGON2_SALT_LEN];
         let key = derive_argon2id_key(b"pw", &salt).unwrap();
         assert_eq!(key.len(), 32);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn custody_entry_key_is_deterministic() {
+        let root = [0x31u8; DERIVED_KEY_LEN];
+        let first = derive_custody_entry_key(&root).unwrap();
+        let second = derive_custody_entry_key(&root).unwrap();
+        assert_eq!(
+            *first, *second,
+            "the same root must re-derive the same wrapping key across restarts"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn custody_entry_key_differs_from_its_root() {
+        // The caller passes the same root to `SqliteStorage::new` as the
+        // SQLCipher PRAGMA key, so the wrapping key must not equal it —
+        // otherwise the per-entry seal and the database rest on one secret.
+        let root = [0x31u8; DERIVED_KEY_LEN];
+        let derived = derive_custody_entry_key(&root).unwrap();
+        assert_ne!(
+            *derived, root,
+            "the wrapping key must be separated from the root it derives from"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn different_roots_derive_different_custody_entry_keys() {
+        let a = derive_custody_entry_key(&[0x01u8; DERIVED_KEY_LEN]).unwrap();
+        let b = derive_custody_entry_key(&[0x02u8; DERIVED_KEY_LEN]).unwrap();
+        assert_ne!(
+            *a, *b,
+            "different roots must produce different wrapping keys"
+        );
     }
 }
