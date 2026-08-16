@@ -726,7 +726,7 @@ impl ContextProvider for FfiBridgeProvider {
                 crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
                     .map_err(|e| format!("failed to build proof resolver: {e}"))?;
 
-            let validated = crate::runtime::with_context(&bi, context_id, |rt| {
+            let (validated, nonce_outcome) = crate::runtime::with_context(&bi, context_id, |rt| {
                 // SCP-OUT-014: select the split capability stem from the
                 // outlet's registered kind — `outlet_query:{id}` for Query
                 // outlets, `outlet_call:{id}` for Action outlets.
@@ -747,55 +747,61 @@ impl ContextProvider for FfiBridgeProvider {
                 let revocation_checker = crate::bridge_adapters::BridgeRevocationChecker {
                     revocation_list: &rt.revocation_list,
                 };
-                let mut nonce_adapter = crate::bridge_adapters::BridgeNonceTracker {
-                    inner: &mut rt.nonce_tracker,
+                let mut nonce_adapter =
+                    crate::bridge_adapters::BridgeNonceTracker::new(&mut rt.nonce_tracker);
+
+                let result = {
+                    let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                        did_resolver: &did_resolver,
+                        nonce_tracker: &mut nonce_adapter,
+                        revocation_checker: &revocation_checker,
+                        proof_resolver: &proof_resolver,
+                        ceiling: &rt.ceiling_strings,
+                        context_creator_did: &rt.creator_did,
+                        presenting_agent_did: &self.agent_did,
+                        clock_skew_tolerance_secs:
+                            scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                        clock: &scp_clock::SystemClock,
+                        // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
+                        // caveats from each token's `nb` field so §7.3.8 Step 7b
+                        // (per-edge narrow) and Step 11b (time-box) run over the
+                        // proof chain's VALIDATED-NARROWED caveat set. Generic
+                        // validate/evaluate sites (ucan.rs) stay on `NoCaveatResolver`.
+                        caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+                    };
+
+                    scp_core::context::outlets::validate_outlet_invocation_ucan(
+                        token,
+                        context_id,
+                        outlet_name,
+                        outlet_kind_for_ucan,
+                        &mut ctx,
+                    )
+                    .map_err(|e| {
+                        tracing::warn!(
+                            agent = %self.agent_did,
+                            outlet = %outlet_name,
+                            context = %context_id,
+                            error = %e,
+                            "UCAN validation failed for outlet invocation"
+                        );
+                        ScpPyError::ucan(format!(
+                            "UCAN authorization failed for outlet '{outlet_name}': {e}"
+                        ))
+                    })
                 };
+                Ok((result, nonce_adapter.into_outcome()))
+            })
+            .map_err(|e| format!("{e}"))?;
 
-                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                    did_resolver: &did_resolver,
-                    nonce_tracker: &mut nonce_adapter,
-                    revocation_checker: &revocation_checker,
-                    proof_resolver: &proof_resolver,
-                    ceiling: &rt.ceiling_strings,
-                    context_creator_did: &rt.creator_did,
-                    presenting_agent_did: &self.agent_did,
-                    clock_skew_tolerance_secs:
-                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                    clock: &scp_clock::SystemClock,
-                    // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
-                    // caveats from each token's `nb` field so §7.3.8 Step 7b
-                    // (per-edge narrow) and Step 11b (time-box) run over the
-                    // proof chain's VALIDATED-NARROWED caveat set. Generic
-                    // validate/evaluate sites (ucan.rs) stay on `NoCaveatResolver`.
-                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
-                };
-
-                scp_core::context::outlets::validate_outlet_invocation_ucan(
-                    token,
-                    context_id,
-                    outlet_name,
-                    outlet_kind_for_ucan,
-                    &mut ctx,
-                )
-                .map_err(|e| {
-                    tracing::warn!(
-                        agent = %self.agent_did,
-                        outlet = %outlet_name,
-                        context = %context_id,
-                        error = %e,
-                        "UCAN validation failed for outlet invocation"
-                    );
-                    ScpPyError::ucan(format!(
-                        "UCAN authorization failed for outlet '{outlet_name}': {e}"
-                    ))
-                })
-            });
-
-            // Step 9 of the pipeline records the token's nonce, so write the
-            // context's nonce entries to durable storage before returning. A
-            // rejected token keeps its own error: the caller is already denied,
-            // so a durability failure on that path grants nothing.
-            let persisted = crate::runtime::persist_ucan_nonces_blocking(&bi, context_id);
+            // Step 9 of the pipeline records the token's nonce, so write that
+            // one nonce to durable storage before returning. A token refused
+            // before step 9 recorded nothing, so this reaches no storage call
+            // for it. A rejected token keeps its own error: the caller is
+            // already denied, so a durability failure on that path grants
+            // nothing.
+            let persisted =
+                crate::runtime::persist_ucan_nonces_blocking(&bi, context_id, &nonce_outcome);
             validated.map_err(|e| format!("{e}"))?;
             persisted.map_err(|e| format!("{e}"))?;
         } else {

@@ -1714,14 +1714,15 @@ fn build_ucan_context_state(
         code: codes::CTX_2023.to_owned(),
     })?;
 
-    let mut core = scp_ffi_common::bridge_runtime::UcanContextStateCore {
-        revocation_list: RevocationList::new(context_id.to_owned()),
+    let mut revocation_list = RevocationList::new(context_id.to_owned());
+    hydrate_ucan_state_blocking(bi, context_id, &mut revocation_list)?;
+    let core = scp_ffi_common::bridge_runtime::UcanContextStateCore {
+        revocation_list,
         nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
         ceiling_strings,
         creator_did: creator_did.to_owned(),
         event_log: EventLog::new(context_id.to_owned()),
     };
-    hydrate_ucan_state_blocking(bi, context_id, &mut core)?;
 
     Ok(UcanContextState {
         core,
@@ -1732,8 +1733,13 @@ fn build_ucan_context_state(
     })
 }
 
-/// Rebuilds a freshly constructed [`UcanContextStateCore`] from this instance's
-/// durable revocation and nonce records.
+/// Rebuilds a freshly constructed revocation list from this instance's durable
+/// record.
+///
+/// The context's nonce tracker starts empty on every instance: the durable
+/// nonce key is a hash of the nonce and no read recovers the nonce string, so
+/// replay protection crosses a restart through
+/// [`persist_ucan_nonces_blocking`] instead (spec §17.3).
 ///
 /// `build_ucan_context_state` is synchronous and both of its callers are
 /// synchronous, while `Storage` is async, so this bridges the two through
@@ -1741,20 +1747,18 @@ fn build_ucan_context_state(
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Context` if the durable record cannot be read or
-/// decoded, or if the call arrives from inside a current-thread tokio runtime
-/// where the sync-to-async bridge cannot run. Either way the bridge fails
-/// closed: an unreadable revocation record must not present as "nothing was
-/// revoked".
+/// Returns `ScpNapiError::Context` if the durable record cannot be read. The
+/// bridge fails closed: an unreadable revocation record must not present as
+/// "nothing was revoked".
 fn hydrate_ucan_state_blocking(
     bi: &NapiBridgeInstance,
     context_id: &str,
-    core: &mut scp_ffi_common::bridge_runtime::UcanContextStateCore,
+    revocation_list: &mut RevocationList,
 ) -> Result<(), ScpNapiError> {
     let repo = protocol_repository(bi);
     scp_ffi_common::ucan_durable_state::block_on_storage(
         Some(crate::runtime().handle()),
-        repo.hydrate_ucan_state(context_id, core),
+        repo.hydrate_ucan_revocation_list(context_id, revocation_list),
     )
     .map_err(|e| ScpNapiError::Context {
         message: format!("failed to rebuild durable UCAN state for '{context_id}': {e}"),
@@ -1766,11 +1770,13 @@ fn hydrate_ucan_state_blocking(
     })
 }
 
-/// Writes the context's UCAN revocation list to this instance's durable store.
+/// Writes one revoked token id to this instance's durable store.
 ///
-/// Called by `ucan_revoke` once the core revocation pipeline has succeeded, so
-/// the durable record agrees with the in-memory list before `ucan_revoke`
-/// returns.
+/// Called by `ucan_revoke` once the core revocation pipeline has succeeded,
+/// with the token id `revoke_ucan` returned, so the durable record agrees with
+/// the in-memory list before `ucan_revoke` returns. The write reads no prior
+/// record, so a revocation running at the same time as another revocation
+/// cannot drop the other token id.
 ///
 /// # Errors
 ///
@@ -1780,12 +1786,12 @@ fn hydrate_ucan_state_blocking(
 pub(crate) fn persist_ucan_revocation_blocking(
     bi: &NapiBridgeInstance,
     context_id: &str,
+    token_cid: &str,
 ) -> Result<(), ScpNapiError> {
-    let list = with_context(bi, context_id, |rt| Ok(rt.core.revocation_list.clone()))?;
     let repo = protocol_repository(bi);
     scp_ffi_common::ucan_durable_state::block_on_storage(
         Some(crate::runtime().handle()),
-        repo.persist_ucan_revocation_list(context_id, &list),
+        repo.store_ucan_revocation(context_id, token_cid),
     )
     .map_err(|e| ScpNapiError::Context {
         message: format!("failed to persist UCAN revocation for '{context_id}': {e}"),
@@ -1797,37 +1803,52 @@ pub(crate) fn persist_ucan_revocation_blocking(
     })
 }
 
-/// Writes the context's UCAN nonce tracker to this instance's durable store.
+/// Records the nonce one run of the ADR-016 validation pipeline consumed, and
+/// refuses the token when the durable record had already seen it.
 ///
-/// Called after every UCAN-validation pipeline run, because that pipeline is
-/// the only writer of nonce state. A nonce accepted now is therefore still
-/// refused after the bridge instance is rebuilt.
+/// Called after every pipeline run, because step 9 of that pipeline is the only
+/// thing that consumes a nonce. A run that consumed no nonce — every run the
+/// pipeline refuses before step 9 — reaches no storage call at all.
+///
+/// `Ok(())` means the nonce was new. A nonce the durable record already held is
+/// a replay across a bridge-instance rebuild: the in-memory tracker was rebuilt
+/// empty and accepted it, and this durable record is what refuses it.
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Context` if the write fails. The caller propagates
-/// the failure rather than reporting a validation whose replay record did not
-/// become durable.
+/// Returns `ScpNapiError::Permission` when the nonce was already recorded, and
+/// `ScpNapiError::Context` when a storage call fails.
 pub(crate) fn persist_ucan_nonces_blocking(
     bi: &NapiBridgeInstance,
     context_id: &str,
+    outcome: &scp_ffi_common::ucan_durable_state::NonceRecordOutcome,
 ) -> Result<(), ScpNapiError> {
-    let entries = with_context(bi, context_id, |rt| {
-        Ok(rt.core.nonce_tracker.snapshot_entries())
-    })?;
+    let Some((nonce, (first_seen, token_expiry))) = outcome.recorded.as_ref() else {
+        return Ok(());
+    };
     let repo = protocol_repository(bi);
-    scp_ffi_common::ucan_durable_state::block_on_storage(
+    let fresh = scp_ffi_common::ucan_durable_state::block_on_storage(
         Some(crate::runtime().handle()),
-        repo.persist_ucan_nonce_entries(context_id, &entries),
+        repo.check_and_record_ucan_nonce(context_id, nonce, *first_seen, *token_expiry),
     )
     .map_err(|e| ScpNapiError::Context {
-        message: format!("failed to persist UCAN nonce state for '{context_id}': {e}"),
+        message: format!("failed to record UCAN nonce state for '{context_id}': {e}"),
         code: codes::CTX_2023.to_owned(),
     })?
     .map_err(|e| ScpNapiError::Context {
-        message: format!("failed to persist UCAN nonce state for '{context_id}': {e}"),
+        message: format!("failed to record UCAN nonce state for '{context_id}': {e}"),
         code: codes::CTX_2023.to_owned(),
-    })
+    })?;
+    if fresh {
+        Ok(())
+    } else {
+        // The same error the in-memory tracker raises for a nonce it already
+        // holds, so a replay refused by the durable record and a replay refused
+        // in memory reach the caller as one error with one code.
+        Err(ScpNapiError::from(
+            scp_core::crypto::ucan::UcanError::NonceReused(nonce.clone()),
+        ))
+    }
 }
 
 /// Eagerly registers per-context FFI (UCAN validation) state for a
@@ -1836,7 +1857,7 @@ pub(crate) fn persist_ucan_nonces_blocking(
 /// The join-side analog of the `PyO3` reference bridge's `register_ffi_state`:
 /// [`crate::context::context_join_from_welcome_on`] calls this as a REVERSIBLE
 /// precheck BEFORE the irreversible `Supervisor::spawn_actor_from_welcome`.
-/// Unlike [`ensure_registered`] (idempotent `or_insert` for the lazy UCAN-op
+/// Unlike [`ensure_registered`] (idempotent for the lazy UCAN-op
 /// path), an already-registered context is a HARD error here: the collision
 /// fails the join at this precheck — BEFORE the single-use `KeyPackage` is
 /// consumed — and leaves the pre-existing entry untouched (the bridge must
@@ -1858,13 +1879,21 @@ pub fn register_ffi_state(
 ) -> Result<(), ScpNapiError> {
     use dashmap::mapref::entry::Entry;
 
+    // Build the state BEFORE taking the shard's `Entry` write guard.
+    // `build_ucan_context_state` reads the context's durable revocation and
+    // nonce records, and a `DashMap` shard write guard held across a blocking
+    // SQLCipher read stalls every other key that hashes to the same shard. A
+    // collision discards the work, which costs one wasted read on the error
+    // path; the `Entry::Occupied`/`Vacant` decision that makes the gate atomic
+    // is unchanged. The `PyO3` and `UniFFI` twins are ordered the same way.
+    let state = build_ucan_context_state(bi, context_id, creator_did, user_ceiling)?;
+
     match ucan_registry(bi).entry(context_id.to_owned()) {
         Entry::Occupied(_) => Err(ScpNapiError::Context {
             message: format!("context '{context_id}' FFI state is already registered"),
             code: codes::CTX_2023.to_owned(),
         }),
         Entry::Vacant(vacant) => {
-            let state = build_ucan_context_state(bi, context_id, creator_did, user_ceiling)?;
             vacant.insert(state);
             Ok(())
         }
@@ -1874,9 +1903,19 @@ pub fn register_ffi_state(
 /// Ensures UCAN validation state is registered for a context on the given
 /// bridge instance.
 ///
-/// If the context is already registered, this is a no-op. Otherwise, creates
-/// UCAN state from the `NapiContextHandle` metadata via
-/// [`build_ucan_context_state`].
+/// If the context is already registered, this leaves the registered state
+/// exactly as it is and returns `Ok`. Otherwise it creates UCAN state from the
+/// `NapiContextHandle` metadata via [`build_ucan_context_state`].
+///
+/// A caller that loses the race to register a context must not replace the
+/// winner's state: the winner may already have recorded a revocation or a
+/// nonce that the loser's freshly hydrated state does not carry, and replacing
+/// it would drop that record. `DashMap::entry` decides occupancy and inserts as
+/// one indivisible step, so the loser cannot overwrite between the two. The
+/// `PyO3` `register_ffi_state` and the `UniFFI`
+/// `UniffiBridgeInstance::ensure_ucan_registered` reach the same decision the
+/// same way; the registration paths differ from this lazy path only in that
+/// they report an occupied entry as an error rather than as success.
 ///
 /// # Errors
 ///
@@ -1885,17 +1924,47 @@ pub fn ensure_registered(
     bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
 ) -> Result<(), ScpNapiError> {
-    let context_id = handle.context_id();
-    let map = ucan_registry(bi);
+    ensure_registered_for(
+        bi,
+        &handle.context_id(),
+        &handle.creator_did(),
+        &handle.ceiling(),
+    )
+}
 
-    if map.contains_key(&context_id) {
+/// The body of [`ensure_registered`], over the three values it reads off the
+/// context handle.
+///
+/// Split out so a caller that already holds those values — and the test that
+/// races this exact decision — reaches the same code the handle path reaches,
+/// rather than a copy of it.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` if the context state cannot be determined.
+pub(crate) fn ensure_registered_for(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+    creator_did: &str,
+    user_ceiling: &[String],
+) -> Result<(), ScpNapiError> {
+    use dashmap::mapref::entry::Entry;
+
+    if ucan_registry(bi).contains_key(context_id) {
         return Ok(());
     }
 
-    let state =
-        build_ucan_context_state(bi, &context_id, &handle.creator_did(), &handle.ceiling())?;
-    map.entry(context_id).or_insert(state);
-    Ok(())
+    // Build outside the shard write guard, for the reason `register_ffi_state`
+    // states.
+    let state = build_ucan_context_state(bi, context_id, creator_did, user_ceiling)?;
+
+    match ucan_registry(bi).entry(context_id.to_owned()) {
+        Entry::Occupied(_) => Ok(()),
+        Entry::Vacant(vacant) => {
+            vacant.insert(state);
+            Ok(())
+        }
+    }
 }
 
 /// Executes a closure with mutable access to a context's UCAN state on the
@@ -2293,6 +2362,95 @@ mod tests {
             Arc::ptr_eq(sup, bi.core.try_supervisor().unwrap()),
             "supervisor(&bi) must match bi.core.try_supervisor()"
         );
+    }
+
+    /// D2 — a second registration of a registered context must be refused and
+    /// must leave the registered state exactly as it is.
+    ///
+    /// The registered state already refuses a revoked token. A registration
+    /// path that replaced the entry with state built before that revocation
+    /// landed would drop it, which reinstates the restart bypass inside one
+    /// process run. The `PyO3` `register_ffi_state` and the `UniFFI`
+    /// `register_ucan_occupied` answer the same way.
+    #[test]
+    fn register_ffi_state_never_replaces_a_live_revocation() {
+        let bi = NapiBridgeInstance::new_napi();
+        let context_id = format!("ctx-reregister-{}", uuid::Uuid::new_v4());
+
+        register_ffi_state(&bi, &context_id, "did:dht:creator", &[])
+            .expect("the first registration must succeed");
+        with_context(&bi, &context_id, |rt| {
+            rt.core.revocation_list.revoke("cid-live".to_owned());
+            Ok(())
+        })
+        .expect("the context is registered");
+
+        let second = register_ffi_state(&bi, &context_id, "did:dht:creator", &[]);
+        assert!(
+            second.is_err(),
+            "a second registration of a registered context must be refused"
+        );
+        assert!(
+            with_context(&bi, &context_id, |rt| Ok(rt
+                .core
+                .revocation_list
+                .is_revoked("cid-live")))
+            .expect("the context is still registered"),
+            "the refused registration must leave the live revocation in place"
+        );
+    }
+
+    /// D2 — `ensure_registered` must never replace state another caller already
+    /// registered, for the same reason `register_ffi_state` must not.
+    ///
+    /// Eight threads race the same fresh context through `ensure_registered_for`,
+    /// the body `ensure_registered` runs once it has read the creator DID and
+    /// the ceiling off the context handle. Each one records its own revocation
+    /// as soon as its call returns, so a caller that replaced the entry would
+    /// drop every revocation recorded before it.
+    #[test]
+    fn racing_registrations_never_replace_a_registered_entry() {
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 12;
+        let bi = Arc::new(NapiBridgeInstance::new_napi());
+
+        for round in 0..ROUNDS {
+            let context_id = format!("ctx-ensure-race-{round}");
+            let barrier = Arc::new(Barrier::new(THREADS));
+            let mut handles = Vec::new();
+            for index in 0..THREADS {
+                let bi = Arc::clone(&bi);
+                let barrier = Arc::clone(&barrier);
+                let context_id = context_id.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_registered_for(&bi, &context_id, "did:dht:creator", &[])
+                        .expect("registration must succeed");
+                    with_context(&bi, &context_id, |rt| {
+                        rt.core.revocation_list.revoke(format!("cid-{index}"));
+                        Ok(())
+                    })
+                    .expect("the context is registered by now");
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("no thread may panic");
+            }
+
+            for index in 0..THREADS {
+                assert!(
+                    with_context(&bi, &context_id, |rt| Ok(rt
+                        .core
+                        .revocation_list
+                        .is_revoked(&format!("cid-{index}"))))
+                    .expect("the context is registered"),
+                    "round {round}: revocation {index} must survive every later \
+                     registration attempt"
+                );
+            }
+        }
     }
 
     #[test]

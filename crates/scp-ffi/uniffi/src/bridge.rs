@@ -47,13 +47,14 @@ use scp_dht::DhtClient;
 #[cfg(test)]
 use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::dht::FfiDhtClient;
-// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` are named only by the
-// testing-gated DID-resolver-init and DHT-signer helpers (production create
-// fails closed before resolver init — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
+// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` build the production
+// DID resolver. They are NOT testing-gated: a shipped Swift or Kotlin artifact
+// installs the same `DualLayerResolver` over the real Mainline Pkarr client
+// that the `PyO3` and napi bridges install, so UCAN validation, outlet
+// invocation, and the MCP capability check verify signatures against a resolved
+// DID document instead of falling back to the string-only `BridgeDidResolver`.
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
-#[cfg(feature = "testing")]
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 
 use scp_did::DidDocument as CoreDidDocument;
@@ -4394,51 +4395,55 @@ pub(crate) fn validate_outlet_ucan_uniffi(
             let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                 revocation_list: &ucan_state.revocation_list,
             };
-            let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                inner: &mut ucan_state.nonce_tracker,
-            };
+            let mut nonce_adapter =
+                scp_ffi_common::BridgeNonceTracker::new(&mut ucan_state.nonce_tracker);
 
-            let mut ctx = ValidationContext {
-                did_resolver: &did_resolver,
-                nonce_tracker: &mut nonce_adapter,
-                revocation_checker: &revocation_checker,
-                proof_resolver: &proof_resolver,
-                ceiling: &ucan_state.ceiling_strings,
-                context_creator_did: &ucan_state.creator_did,
-                presenting_agent_did: identity_did,
-                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                clock: &scp_clock::SystemClock,
-                // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
-                // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
-                // and Step 11b (time-box) run over the proof chain's VALIDATED-
-                // NARROWED caveat set. Generic validate/evaluate sites stay on
-                // `NoCaveatResolver`.
-                caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
-            };
+            let result = {
+                let mut ctx = ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &ucan_state.ceiling_strings,
+                    context_creator_did: &ucan_state.creator_did,
+                    presenting_agent_did: identity_did,
+                    clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                    clock: &scp_clock::SystemClock,
+                    // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
+                    // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
+                    // and Step 11b (time-box) run over the proof chain's VALIDATED-
+                    // NARROWED caveat set. Generic validate/evaluate sites stay on
+                    // `NoCaveatResolver`.
+                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+                };
 
-            validate_outlet_invocation_ucan(
-                ucan_token,
-                &handle.context_id,
-                outlet_id,
-                kind,
-                &mut ctx,
-            )
-            .map_err(|e| ScpError::Permission {
-                msg: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
-                code: codes::PERM_3002.to_owned(),
-            })
+                validate_outlet_invocation_ucan(
+                    ucan_token,
+                    &handle.context_id,
+                    outlet_id,
+                    kind,
+                    &mut ctx,
+                )
+                .map_err(|e| ScpError::Permission {
+                    msg: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
+                    code: codes::PERM_3002.to_owned(),
+                })
+            };
+            (result, nonce_adapter.into_outcome())
         })
         .ok_or_else(|| ScpError::Permission {
             msg: format!("context '{}' not found in UCAN registry", handle.context_id),
             code: codes::PERM_3002.to_owned(),
-        });
+        })?;
+    let (validated, nonce_outcome) = validated;
 
-    // Step 9 of the pipeline records the token's nonce, so write the context's
-    // nonce entries to durable storage before returning. A rejected token keeps
-    // its own error: the caller is already denied, so a durability failure on
-    // that path grants nothing.
-    let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id);
-    validated??;
+    // Step 9 of the pipeline records the token's nonce, so write that one nonce
+    // to durable storage before returning. A token refused before step 9
+    // recorded nothing, so this reaches no storage call for it. A rejected token
+    // keeps its own error: the caller is already denied, so a durability failure
+    // on that path grants nothing.
+    let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id, &nonce_outcome);
+    validated?;
     persisted
 }
 
@@ -5010,57 +5015,63 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                         revocation_list: &ucan_state.revocation_list,
                     };
-                    let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                        inner: &mut ucan_state.nonce_tracker,
-                    };
+                    let mut nonce_adapter =
+                        scp_ffi_common::BridgeNonceTracker::new(&mut ucan_state.nonce_tracker);
 
-                    let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                        did_resolver: &did_resolver,
-                        nonce_tracker: &mut nonce_adapter,
-                        revocation_checker: &revocation_checker,
-                        proof_resolver: &proof_resolver,
-                        ceiling: &ucan_state.ceiling_strings,
-                        context_creator_did: &ucan_state.creator_did,
-                        presenting_agent_did: &agent_did,
-                        clock_skew_tolerance_secs:
-                            scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                        clock: &scp_clock::SystemClock,
-                        // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
-                        // caveats from each token's `nb` field so §7.3.8 Step 7b
-                        // (per-edge narrow) and Step 11b (time-box) run over the
-                        // proof chain's VALIDATED-NARROWED caveat set. Generic
-                        // validate/evaluate sites stay on `NoCaveatResolver`.
-                        caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
-                    };
+                    let result = {
+                        let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                            did_resolver: &did_resolver,
+                            nonce_tracker: &mut nonce_adapter,
+                            revocation_checker: &revocation_checker,
+                            proof_resolver: &proof_resolver,
+                            ceiling: &ucan_state.ceiling_strings,
+                            context_creator_did: &ucan_state.creator_did,
+                            presenting_agent_did: &agent_did,
+                            clock_skew_tolerance_secs:
+                                scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                            clock: &scp_clock::SystemClock,
+                            // §5.4.5 HIGH-3 — outlet-invocation site resolves effective
+                            // caveats from each token's `nb` field so §7.3.8 Step 7b
+                            // (per-edge narrow) and Step 11b (time-box) run over the
+                            // proof chain's VALIDATED-NARROWED caveat set. Generic
+                            // validate/evaluate sites stay on `NoCaveatResolver`.
+                            caveat_resolver:
+                                &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+                        };
 
-                    scp_core::context::outlets::validate_outlet_invocation_ucan(
-                        token,
-                        context_id,
-                        outlet_name,
-                        outlet_kind_for_ucan,
-                        &mut ctx,
-                    )
-                    .map_err(|e| {
-                        tracing::warn!(
-                            agent = %agent_did,
-                            outlet = %outlet_name,
-                            context = %context_id,
-                            error = %e,
-                            "UCAN validation failed for outlet invocation"
-                        );
-                        format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
-                    })
+                        scp_core::context::outlets::validate_outlet_invocation_ucan(
+                            token,
+                            context_id,
+                            outlet_name,
+                            outlet_kind_for_ucan,
+                            &mut ctx,
+                        )
+                        .map_err(|e| {
+                            tracing::warn!(
+                                agent = %agent_did,
+                                outlet = %outlet_name,
+                                context = %context_id,
+                                error = %e,
+                                "UCAN validation failed for outlet invocation"
+                            );
+                            format!("UCAN authorization failed for outlet '{outlet_name}': {e}")
+                        })
+                    };
+                    (result, nonce_adapter.into_outcome())
                 })
-                .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"));
+                .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))?;
+            let (validated, nonce_outcome) = validated;
 
-            // Step 9 of the pipeline records the token's nonce, so write the
-            // context's nonce entries to durable storage before returning. A
-            // rejected token keeps its own error: the caller is already denied,
-            // so a durability failure on that path grants nothing.
+            // Step 9 of the pipeline records the token's nonce, so write that
+            // one nonce to durable storage before returning. A token refused
+            // before step 9 recorded nothing, so this reaches no storage call
+            // for it. A rejected token keeps its own error: the caller is
+            // already denied, so a durability failure on that path grants
+            // nothing.
             let persisted = bi
-                .persist_ucan_nonces_blocking(context_id)
+                .persist_ucan_nonces_blocking(context_id, &nonce_outcome)
                 .map_err(|e| e.to_string());
-            validated??;
+            validated?;
             persisted?;
         } else {
             tracing::warn!(
@@ -9466,9 +9477,16 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
 /// [`crate::scp::Scp`] identity methods to keep "init on first use"
 /// semantics scoped to the owning instance.
 ///
-/// Only reached from the testing-gated identity-create paths (production create
-/// fails closed before resolver init — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
+/// Reached from every identity-create entry point before that entry point
+/// decides which custody backend it can serve, so a shipped (no-`testing`)
+/// build installs the resolver even though it then declines to mint an identity
+/// (ADR-062 §Decision 6). Without that ordering no shipped `UniFFI` artifact
+/// ever held a production resolver, and every UCAN validation on Swift or
+/// Kotlin fell back to `BridgeDidResolver`, which extracts a key from the DID
+/// string and validates no DID document — no BEP44 signature check, no
+/// self-certification, no sequence comparison. The `PyO3` and napi bridges
+/// already call their own copy of this helper ahead of the custody decision;
+/// this is the same ordering.
 fn ensure_did_resolver_initialized_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: tokio::runtime::Handle,
@@ -9603,6 +9621,13 @@ impl Scp {
 
         runtime()
             .spawn(async move {
+                // Install the production DID resolver + shared DHT client on
+                // this instance BEFORE the custody decision, so a shipped build
+                // — which declines every custody type below — still leaves the
+                // instance holding a resolver that later UCAN validations read.
+                // Matches where the `PyO3` and napi bridges call their own copy.
+                ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
+
                 match custody_method {
                     CustodyMethod::InMemory => {
                         // Gate: `"in_memory"` custody is only available when the
@@ -9659,15 +9684,11 @@ impl Scp {
                                 |seed| InMemoryKeyCustody::from_seed_bytes(**seed),
                             );
                             let key_custody = Arc::new(OpaqueInMemoryKeyCustody(in_memory));
-                            // Initialize the production DID resolver + shared DHT
-                            // client on this instance BEFORE minting so `create`
-                            // and the freshly-minted-document publish below run
-                            // against the SAME client the resolver reads from
-                            // (H4 — matching PyO3/NAPI behavior).
-                            ensure_did_resolver_initialized_on(
-                                &bi,
-                                tokio::runtime::Handle::current(),
-                            )?;
+                            // The resolver and its shared DHT client were
+                            // installed above, before the custody decision, so
+                            // `create` and the freshly-minted-document publish
+                            // below run against the SAME client the resolver
+                            // reads from (H4 — matching PyO3/NAPI behavior).
                             let dht = DidDht::with_client(rotation_publish_client(&bi)?);
                             // Mint a fresh per-identity pre-rotation custody.
                             // ADR-003 §4b: the pre-rotation key lives in a
@@ -9796,6 +9817,13 @@ impl Scp {
                 // custody before the pre-rotation fail-closed check).
                 let callback_custody = Arc::new(CallbackKeyCustody::new(provider));
 
+                // Install the production DID resolver + shared DHT client on
+                // this instance BEFORE the fail-closed check below, so a
+                // shipped build — which declines to mint — still leaves the
+                // instance holding a resolver that later UCAN validations read.
+                // Matches where the `PyO3` and napi bridges call their own copy.
+                ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
+
                 // FAIL CLOSED on a shipped build (ADR-062 §Decision 6,
                 // IDENT_1059): every create commits a mandatory pre-rotation
                 // commitment (spec §9.7.4.1 §3), which requires a
@@ -9811,11 +9839,10 @@ impl Scp {
                 }
                 #[cfg(feature = "testing")]
                 {
-                    // Initialize the production DID resolver + shared DHT client on
-                    // this instance BEFORE minting so `create` and the freshly-
-                    // minted-document publish below run against the SAME client the
-                    // resolver reads from (matching PyO3/NAPI behavior).
-                    ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
+                    // The resolver and its shared DHT client were installed
+                    // above, so `create` and the freshly-minted-document publish
+                    // below run against the SAME client the resolver reads from
+                    // (matching PyO3/NAPI behavior).
                     let dht = DidDht::with_client(rotation_publish_client(&bi)?);
                     // Mint a fresh per-identity pre-rotation custody (ADR-003 §4b).
                     // Production callback custody integration is a follow-up
@@ -15513,46 +15540,51 @@ impl Scp {
                         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                             revocation_list: &ucan_state.revocation_list,
                         };
-                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                            inner: &mut ucan_state.nonce_tracker,
-                        };
+                        let mut nonce_adapter =
+                            scp_ffi_common::BridgeNonceTracker::new(&mut ucan_state.nonce_tracker);
 
-                        let mut ctx = ValidationContext {
-                            did_resolver: &did_resolver,
-                            nonce_tracker: &mut nonce_adapter,
-                            revocation_checker: &revocation_checker,
-                            proof_resolver: &proof_resolver,
-                            ceiling: &ucan_state.ceiling_strings,
-                            context_creator_did: &ucan_state.creator_did,
-                            presenting_agent_did: agent_did,
-                            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                            clock: &scp_clock::SystemClock,
-                            // Generic validate site: not an outlet-invocation
-                            // path, so caveat resolution is a constant `None`
-                            // (`NoCaveatResolver`). Only outlet-invocation sites
-                            // use `TokenNbCaveatResolver`.
-                            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
-                        };
+                        let result = {
+                            let mut ctx = ValidationContext {
+                                did_resolver: &did_resolver,
+                                nonce_tracker: &mut nonce_adapter,
+                                revocation_checker: &revocation_checker,
+                                proof_resolver: &proof_resolver,
+                                ceiling: &ucan_state.ceiling_strings,
+                                context_creator_did: &ucan_state.creator_did,
+                                presenting_agent_did: agent_did,
+                                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                                clock: &scp_clock::SystemClock,
+                                // Generic validate site: not an outlet-invocation
+                                // path, so caveat resolution is a constant `None`
+                                // (`NoCaveatResolver`). Only outlet-invocation sites
+                                // use `TokenNbCaveatResolver`.
+                                caveat_resolver:
+                                    &scp_core::crypto::ucan::validate::NoCaveatResolver,
+                            };
 
-                        validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
-                            ScpError::Permission {
-                                msg: format!("UCAN validation failed: {e}"),
-                                code: codes::PERM_3002.to_owned(),
-                            }
-                        })
+                            validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
+                                ScpError::Permission {
+                                    msg: format!("UCAN validation failed: {e}"),
+                                    code: codes::PERM_3002.to_owned(),
+                                }
+                            })
+                        };
+                        (result, nonce_adapter.into_outcome())
                     })
                     .ok_or_else(|| ScpError::Permission {
                         msg: format!("context '{}' not found in UCAN registry", handle.context_id),
                         code: codes::PERM_3002.to_owned(),
-                    });
+                    })?;
+                let (validation_result, nonce_outcome) = validation_result;
 
                 // Step 9 of the pipeline records the token's nonce, so write
-                // the context's nonce entries to durable storage before
-                // returning. A rejected token keeps its own error: the caller
-                // is already denied, so a durability failure on that path
-                // grants nothing.
-                let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id);
-                validation_result??;
+                // that one nonce to durable storage before returning. A token
+                // refused before step 9 recorded nothing, so this reaches no
+                // storage call for it. A rejected token keeps its own error:
+                // the caller is already denied, so a durability failure on that
+                // path grants nothing.
+                let persisted = bi.persist_ucan_nonces_blocking(&handle.context_id, &nonce_outcome);
+                validation_result?;
                 persisted?;
 
                 Ok(())
@@ -15684,9 +15716,8 @@ impl Scp {
                         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                             revocation_list: &ucan_state.revocation_list,
                         };
-                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                            inner: &mut ucan_state.nonce_tracker,
-                        };
+                        let mut nonce_adapter =
+                            scp_ffi_common::BridgeNonceTracker::new(&mut ucan_state.nonce_tracker);
 
                         let ctx = ValidationContext {
                             did_resolver: &did_resolver,
@@ -15792,37 +15823,38 @@ impl Scp {
                 )?;
 
                 // Execute the full revocation pipeline within the UCAN state closure.
-                bi.with_ucan_state(&handle.context_id, |ucan_state| {
-                    let authorizer = BridgeRevocationAuthorizer {
-                        issuer_did: parsed.payload.iss.clone(),
-                        creator_did: ucan_state.creator_did.clone(),
-                    };
-                    let distributor = BridgeRevocationDistributor;
-                    let event_log_cell = RefCell::new(&mut ucan_state.event_log);
-                    let event_logger = BridgeRevocationEventLogger {
-                        event_log: &event_log_cell,
-                    };
+                let token_cid = bi
+                    .with_ucan_state(&handle.context_id, |ucan_state| {
+                        let authorizer = BridgeRevocationAuthorizer {
+                            issuer_did: parsed.payload.iss.clone(),
+                            creator_did: ucan_state.creator_did.clone(),
+                        };
+                        let distributor = BridgeRevocationDistributor;
+                        let event_log_cell = RefCell::new(&mut ucan_state.event_log);
+                        let event_logger = BridgeRevocationEventLogger {
+                            event_log: &event_log_cell,
+                        };
 
-                    scp_core::crypto::ucan::revoke::revoke_ucan(
-                        &mut ucan_state.revocation_list,
-                        &token,
-                        &revoker_did,
-                        &authorizer,
-                        &distributor,
-                        &event_logger,
-                    )
-                    .map_err(ScpError::from)
-                })
-                .ok_or_else(|| ScpError::Permission {
-                    msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-                    code: codes::PERM_3006.to_owned(),
-                })??;
+                        scp_core::crypto::ucan::revoke::revoke_ucan(
+                            &mut ucan_state.revocation_list,
+                            &token,
+                            &revoker_did,
+                            &authorizer,
+                            &distributor,
+                            &event_logger,
+                        )
+                        .map_err(ScpError::from)
+                    })
+                    .ok_or_else(|| ScpError::Permission {
+                        msg: format!("context '{}' not found in UCAN registry", handle.context_id),
+                        code: codes::PERM_3006.to_owned(),
+                    })??;
 
-                // Make the revocation durable before returning. The in-memory
-                // list already denies the token, so a failure here leaves the
-                // instance in the more restrictive state and tells the caller
-                // the record did not land.
-                bi.persist_ucan_revocation_blocking(&handle.context_id)?;
+                // Make this one revocation durable before returning, under its
+                // own key. The in-memory list already denies the token, so a
+                // failure here leaves the instance in the more restrictive
+                // state and tells the caller the record did not land.
+                bi.persist_ucan_revocation_blocking(&handle.context_id, &token_cid)?;
 
                 Ok(())
             })
@@ -17430,6 +17462,13 @@ impl Scp {
 
         runtime()
             .spawn(async move {
+                // Install the production DID resolver + shared DHT client on
+                // this instance BEFORE the custody decision, so a shipped build
+                // — which declines every custody type below — still leaves the
+                // instance holding a resolver that later UCAN validations read.
+                // Matches where the `PyO3` and napi bridges call their own copy.
+                ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
+
                 match custody_method {
                     CustodyMethod::InMemory => {
                         #[cfg(not(feature = "testing"))]
@@ -17449,14 +17488,10 @@ impl Scp {
                         {
                             let key_custody =
                                 Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
-                            // Initialize the production DID resolver + shared DHT
-                            // client BEFORE minting so `create_with_agent_key`
-                            // and the freshly-minted-document publish below run
+                            // The resolver and its shared DHT client were
+                            // installed above, so `create_with_agent_key` and
+                            // the freshly-minted-document publish below run
                             // against the SAME client the resolver reads from.
-                            ensure_did_resolver_initialized_on(
-                                &bi,
-                                tokio::runtime::Handle::current(),
-                            )?;
                             let dht = DidDht::with_client(rotation_publish_client(&bi)?);
                             // Fresh per-identity pre-rotation custody (ADR-003 §4b).
                             let pre_rotation_custody =
@@ -21054,12 +21089,11 @@ mod tests {
     /// `target_did` into the returned event's `payload_json`, decoded through the
     /// shared `scp_event_log::payload::project_payload` so the value is
     /// byte-identical across the three native bridges.
-    // Multi-thread flavor: `ensure_ucan_registered` rebuilds the context's
-    // durable UCAN state, and that read bridges sync to async through
-    // `block_in_place`, which a current-thread runtime cannot host. The
-    // bridge's own runtime is multi-threaded, so every production caller
-    // reaches this code on a worker that can step aside.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Current-thread flavor on purpose: `ensure_ucan_registered` rebuilds the
+    // context's durable UCAN state, and `block_on_storage` drives that read on
+    // a dedicated thread when the ambient runtime is current-thread. A
+    // regression that refuses the current-thread regime fails here.
+    #[tokio::test]
     async fn event_log_query_projects_governance_target_did() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
@@ -21112,12 +21146,11 @@ mod tests {
     /// `payload_json`, decoded through the shared
     /// `scp_event_log::payload::project_payload` so the value is byte-identical
     /// across the three native bridges.
-    // Multi-thread flavor: `ensure_ucan_registered` rebuilds the context's
-    // durable UCAN state, and that read bridges sync to async through
-    // `block_in_place`, which a current-thread runtime cannot host. The
-    // bridge's own runtime is multi-threaded, so every production caller
-    // reaches this code on a worker that can step aside.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Current-thread flavor on purpose: `ensure_ucan_registered` rebuilds the
+    // context's durable UCAN state, and `block_on_storage` drives that read on
+    // a dedicated thread when the ambient runtime is current-thread. A
+    // regression that refuses the current-thread regime fails here.
+    #[tokio::test]
     async fn event_log_query_projects_role_assigned_subject_did() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
@@ -21195,6 +21228,58 @@ mod tests {
             }
             other => panic!("expected ScpError::Permission, got {other:?}"),
         }
+    }
+
+    /// R3 — an identity-create call that declines must still leave the
+    /// production DID resolver installed on the instance.
+    ///
+    /// The installer used to carry `#[cfg(feature = "testing")]`, and every
+    /// production custody arm returned before reaching it, so no shipped Swift
+    /// or Kotlin artifact ever held a resolver: every UCAN validation, outlet
+    /// invocation, and MCP capability check on such an artifact fell back to
+    /// `BridgeDidResolver`, which reads a key out of the DID string and
+    /// validates no DID document — no BEP44 signature check, no
+    /// self-certification, no sequence comparison. `identity_create` now
+    /// installs the resolver before it decides which custody backend it can
+    /// serve. `"platform"` custody declines here for want of an injected
+    /// `KeyCustodyProvider`, which is the same shape as a shipped build
+    /// declining every custody type (ADR-062 §Decision 6), and the resolver
+    /// must be installed all the same.
+    #[tokio::test]
+    async fn a_declining_identity_create_still_installs_the_did_resolver() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        assert!(
+            scp.inner.did_resolver().is_none(),
+            "a fresh instance starts without a resolver"
+        );
+
+        let created = scp.identity_create("platform".to_owned(), None).await;
+        assert!(
+            created.is_err(),
+            "platform custody declines without an injected KeyCustodyProvider"
+        );
+        assert!(
+            scp.inner.did_resolver().is_some(),
+            "the declining create must still leave the production resolver installed"
+        );
+    }
+
+    /// R3 — the same contract for `identity_create_with_agent_key`, whose
+    /// production custody arms also returned before the installer.
+    #[tokio::test]
+    async fn a_declining_agent_key_create_still_installs_the_did_resolver() {
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let created = scp
+            .identity_create_with_agent_key("platform".to_owned())
+            .await;
+        assert!(
+            created.is_err(),
+            "platform custody declines without an injected KeyCustodyProvider"
+        );
+        assert!(
+            scp.inner.did_resolver().is_some(),
+            "the declining create must still leave the production resolver installed"
+        );
     }
 
     /// Direct `set_economic_policy` always rejects — must use governance (#728).

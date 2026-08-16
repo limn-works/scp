@@ -49,6 +49,14 @@ fn revocation_key(context_id: &str, token_id: &str) -> Result<String, super::Sto
     Ok(format!("context/{ctx}/ucan_revocation/{tok}"))
 }
 
+/// Builds the prefix for listing all revoked token ids in a context.
+///
+/// Format: `context/{context_id}/ucan_revocation/`
+fn revocation_prefix(context_id: &str) -> Result<String, super::StoreError> {
+    let ctx = super::sanitize_key_component(context_id)?;
+    Ok(format!("context/{ctx}/ucan_revocation/"))
+}
+
 // ---------------------------------------------------------------------------
 // ProtocolRepository — UCAN methods
 // ---------------------------------------------------------------------------
@@ -153,6 +161,29 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn is_revoked(&self, context_id: &str, token_id: &str) -> Result<bool, StoreError> {
         let key = revocation_key(context_id, token_id)?;
         Ok(self.storage.exists(&key).await?)
+    }
+
+    /// Lists every revoked token id recorded for a context.
+    ///
+    /// Reads the ids out of the `context/{context_id}/ucan_revocation/` prefix
+    /// the same way [`Self::list_ucan_tokens`] reads token ids. A caller that
+    /// holds an in-memory revocation list — the FFI bridges hold one per
+    /// context, and step 10 of the ADR-016 validation pipeline consults it —
+    /// rebuilds that list from this call when it constructs the state, so a
+    /// token revoked before the process restarted is still refused after the
+    /// restart. [`Self::is_revoked`] answers one id at a time and cannot
+    /// rebuild a list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
+    pub async fn list_revocations(&self, context_id: &str) -> Result<Vec<String>, StoreError> {
+        let prefix = revocation_prefix(context_id)?;
+        let keys = self.storage.list_keys(&prefix).await?;
+        Ok(keys
+            .into_iter()
+            .filter_map(|key| key.strip_prefix(&prefix).map(String::from))
+            .collect())
     }
 }
 
@@ -276,6 +307,25 @@ mod tests {
     async fn is_revoked_returns_false_for_unrevoked() {
         let store = make_store();
         assert!(!store.is_revoked("ctx-1", "unknown-token").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_revocations_returns_every_revoked_token_id() {
+        let store = make_store();
+        assert!(store.list_revocations("ctx-1").await.unwrap().is_empty());
+
+        store.store_revocation("ctx-1", "tok-aaa").await.unwrap();
+        store.store_revocation("ctx-1", "tok-bbb").await.unwrap();
+        store.store_revocation("ctx-2", "tok-ccc").await.unwrap();
+
+        assert_eq!(
+            store.list_revocations("ctx-1").await.unwrap(),
+            vec!["tok-aaa", "tok-bbb"]
+        );
+        assert_eq!(
+            store.list_revocations("ctx-2").await.unwrap(),
+            vec!["tok-ccc"]
+        );
     }
 
     #[tokio::test]

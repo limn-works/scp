@@ -40,21 +40,25 @@ pub(crate) fn validate_ucan_for_outlet(
     ucan_token: &str,
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
 ) -> Result<(), ScpNapiError> {
-    let validated = validate_ucan_for_outlet_in_memory(
+    let (validated, nonce_outcome) = validate_ucan_for_outlet_in_memory(
         bi,
         context_id,
         outlet_id,
         identity_did,
         ucan_token,
         proof_resolver,
-    );
-    let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id);
+    )?;
+    let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id, &nonce_outcome);
     validated?;
     persisted
 }
 
 /// Runs the outlet-invocation UCAN pipeline against the in-memory per-context
 /// state, leaving durability to [`validate_ucan_for_outlet`].
+///
+/// Returns the pipeline's verdict together with the nonce the run recorded, so
+/// the caller writes exactly that one nonce and writes nothing for a run that
+/// recorded none.
 fn validate_ucan_for_outlet_in_memory(
     bi: &crate::runtime::NapiBridgeInstance,
     context_id: &str,
@@ -62,7 +66,13 @@ fn validate_ucan_for_outlet_in_memory(
     identity_did: &str,
     ucan_token: &str,
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
-) -> Result<(), ScpNapiError> {
+) -> Result<
+    (
+        Result<(), ScpNapiError>,
+        scp_ffi_common::ucan_durable_state::NonceRecordOutcome,
+    ),
+    ScpNapiError,
+> {
     crate::runtime::with_context(bi, context_id, |rt| {
         // SCP-OUT-014: select the split capability stem from the outlet's
         // registered kind — `outlet_query:{id}` for Query outlets,
@@ -83,40 +93,41 @@ fn validate_ucan_for_outlet_in_memory(
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
             revocation_list: &rt.core.revocation_list,
         };
-        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-            inner: &mut rt.core.nonce_tracker,
-        };
+        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker::new(&mut rt.core.nonce_tracker);
 
-        let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-            did_resolver: &did_resolver,
-            nonce_tracker: &mut nonce_adapter,
-            revocation_checker: &revocation_checker,
-            proof_resolver,
-            ceiling: &rt.core.ceiling_strings,
-            context_creator_did: &rt.core.creator_did,
-            presenting_agent_did: identity_did,
-            clock_skew_tolerance_secs:
-                scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_clock::SystemClock,
-            // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
-            // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
-            // and Step 11b (time-box) run over the proof chain's VALIDATED-
-            // NARROWED caveat set. Generic validate/evaluate sites (ucan.rs)
-            // stay on `NoCaveatResolver`.
-            caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
-        };
+        let result = {
+            let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                did_resolver: &did_resolver,
+                nonce_tracker: &mut nonce_adapter,
+                revocation_checker: &revocation_checker,
+                proof_resolver,
+                ceiling: &rt.core.ceiling_strings,
+                context_creator_did: &rt.core.creator_did,
+                presenting_agent_did: identity_did,
+                clock_skew_tolerance_secs:
+                    scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_clock::SystemClock,
+                // §5.4.5 HIGH-3 — outlet-invocation site resolves effective caveats
+                // from each token's `nb` field so §7.3.8 Step 7b (per-edge narrow)
+                // and Step 11b (time-box) run over the proof chain's VALIDATED-
+                // NARROWED caveat set. Generic validate/evaluate sites (ucan.rs)
+                // stay on `NoCaveatResolver`.
+                caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
+            };
 
-        scp_core::context::outlets::validate_outlet_invocation_ucan(
-            ucan_token,
-            context_id,
-            outlet_id,
-            outlet_kind_for_ucan,
-            &mut ctx,
-        )
-        .map_err(|e| ScpNapiError::Permission {
-            message: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
-            code: codes::PERM_3001.to_owned(),
-        })
+            scp_core::context::outlets::validate_outlet_invocation_ucan(
+                ucan_token,
+                context_id,
+                outlet_id,
+                outlet_kind_for_ucan,
+                &mut ctx,
+            )
+            .map_err(|e| ScpNapiError::Permission {
+                message: format!("UCAN authorization failed for outlet '{outlet_id}': {e}"),
+                code: codes::PERM_3001.to_owned(),
+            })
+        };
+        Ok((result, nonce_adapter.into_outcome()))
     })
 }
 

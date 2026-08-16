@@ -294,7 +294,7 @@ pub(crate) async fn ucan_validate_on(
     // and nonce tracker from the runtime registry. This ensures:
     // - Revoked tokens are rejected across calls (persistent RevocationList).
     // - Replayed nonces are detected across calls (persistent NonceTracker).
-    let validated = crate::runtime::with_context(bi, &context_id, |rt| {
+    let (validated, nonce_outcome) = crate::runtime::with_context(bi, &context_id, |rt| {
         // Build validation context using persistent runtime state.
         // Use production DID resolver when available (#311), fallback to string-only.
         let production_resolver = crate::runtime::did_resolver(bi);
@@ -303,37 +303,38 @@ pub(crate) async fn ucan_validate_on(
         let revocation_checker = BridgeRevocationChecker {
             revocation_list: &rt.core.revocation_list,
         };
-        let mut nonce_adapter = BridgeNonceTracker {
-            inner: &mut rt.core.nonce_tracker,
+        let mut nonce_adapter = BridgeNonceTracker::new(&mut rt.core.nonce_tracker);
+
+        let result = {
+            let mut ctx = ValidationContext {
+                did_resolver: &did_resolver,
+                nonce_tracker: &mut nonce_adapter,
+                revocation_checker: &revocation_checker,
+                proof_resolver: &proof_resolver,
+                ceiling: &rt.core.ceiling_strings,
+                context_creator_did: &rt.core.creator_did,
+                presenting_agent_did: agent_did,
+                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_clock::SystemClock,
+                // Generic validate site: not an outlet-invocation path, so caveat
+                // resolution is a constant `None` (`NoCaveatResolver`). Only
+                // outlet-invocation sites use `TokenNbCaveatResolver`.
+                caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+            };
+
+            // Execute the full 11-step validation pipeline.
+            validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpNapiError::from)
         };
+        Ok((result, nonce_adapter.into_outcome()))
+    })
+    .map_err(napi::Error::from)?;
 
-        let mut ctx = ValidationContext {
-            did_resolver: &did_resolver,
-            nonce_tracker: &mut nonce_adapter,
-            revocation_checker: &revocation_checker,
-            proof_resolver: &proof_resolver,
-            ceiling: &rt.core.ceiling_strings,
-            context_creator_did: &rt.core.creator_did,
-            presenting_agent_did: agent_did,
-            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_clock::SystemClock,
-            // Generic validate site: not an outlet-invocation path, so caveat
-            // resolution is a constant `None` (`NoCaveatResolver`). Only
-            // outlet-invocation sites use `TokenNbCaveatResolver`.
-            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
-        };
-
-        // Execute the full 11-step validation pipeline.
-        validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpNapiError::from)?;
-
-        Ok(())
-    });
-
-    // Step 9 of the pipeline records the token's nonce, so write the context's
-    // nonce entries to durable storage before returning. A rejected token keeps
-    // its own error: the caller is already denied, so a durability failure on
-    // that path grants nothing.
-    let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, &context_id);
+    // Step 9 of the pipeline records the token's nonce, so write that one nonce
+    // to durable storage before returning. A token refused before step 9
+    // recorded nothing, so this reaches no storage call for it. A rejected token
+    // keeps its own error: the caller is already denied, so a durability failure
+    // on that path grants nothing.
+    let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, &context_id, &nonce_outcome);
     validated.map_err(napi::Error::from)?;
     persisted.map_err(napi::Error::from)?;
 
@@ -420,9 +421,7 @@ pub(crate) async fn ucan_evaluate_on(
         let revocation_checker = BridgeRevocationChecker {
             revocation_list: &rt.core.revocation_list,
         };
-        let mut nonce_adapter = BridgeNonceTracker {
-            inner: &mut rt.core.nonce_tracker,
-        };
+        let mut nonce_adapter = BridgeNonceTracker::new(&mut rt.core.nonce_tracker);
 
         let ctx = ValidationContext {
             did_resolver: &did_resolver,
@@ -693,7 +692,7 @@ pub(crate) async fn ucan_revoke_on(
     let parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
     let context_id = handle.context_id();
-    crate::runtime::with_context(bi, &context_id, |rt| {
+    let token_cid = crate::runtime::with_context(bi, &context_id, |rt| {
         use std::cell::RefCell;
 
         let authorizer = BridgeRevocationAuthorizer {
@@ -714,16 +713,16 @@ pub(crate) async fn ucan_revoke_on(
             &distributor,
             &event_logger,
         )
-        .map_err(ScpNapiError::from)?;
-
-        Ok(())
+        .map_err(ScpNapiError::from)
     })
     .map_err(napi::Error::from)?;
 
-    // Make the revocation durable before returning. The in-memory list already
-    // denies the token, so a failure here leaves the instance in the more
-    // restrictive state and tells the caller the record did not land.
-    crate::runtime::persist_ucan_revocation_blocking(bi, &context_id).map_err(napi::Error::from)?;
+    // Make this one revocation durable before returning, under its own key. The
+    // in-memory list already denies the token, so a failure here leaves the
+    // instance in the more restrictive state and tells the caller the record
+    // did not land.
+    crate::runtime::persist_ucan_revocation_blocking(bi, &context_id, &token_cid)
+        .map_err(napi::Error::from)?;
 
     Ok(())
 }
@@ -921,9 +920,7 @@ mod tests {
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;
 
-        let mut adapter = BridgeNonceTracker {
-            inner: &mut tracker,
-        };
+        let mut adapter = BridgeNonceTracker::new(&mut tracker);
 
         // First check should succeed.
         assert!(adapter.check_and_record(&nonce, expiry).is_ok());

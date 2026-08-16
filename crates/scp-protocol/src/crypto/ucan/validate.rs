@@ -293,11 +293,14 @@ impl NonceTracker for InMemoryNonceTracker {
         // Freshness check: timestamp within now +/- 5 minutes.
         let now_millis = u128::from(scp_clock::SystemClock.now_millis());
 
-        if nonce_millis + NONCE_FRESHNESS_TOLERANCE_MS < now_millis {
+        // Both adds saturate, matching `nonce::NonceTracker::check_replay`: the
+        // caller supplies `nonce`, and a 39-digit timestamp would overflow
+        // `u128` and panic a debug build.
+        if nonce_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) < now_millis {
             return Err(UcanError::NonceTooOld(nonce.to_owned()));
         }
 
-        if nonce_millis > now_millis + NONCE_FRESHNESS_TOLERANCE_MS {
+        if nonce_millis > now_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) {
             return Err(UcanError::NonceFuture(nonce.to_owned()));
         }
 

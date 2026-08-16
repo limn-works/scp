@@ -309,41 +309,44 @@ impl crate::scp::PyScp {
 
         // Execute the full 11-step validation pipeline within the context runtime.
         // Use production DID resolver when available (#311), fallback to string-only.
-        let validated = crate::runtime::with_context(bi, context_id, |rt| {
+        let (validated, nonce_outcome) = crate::runtime::with_context(bi, context_id, |rt| {
             let production_resolver = crate::runtime::did_resolver(bi);
             let did_resolver =
                 DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
             let revocation_checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
             };
-            let mut nonce_adapter = BridgeNonceTracker {
-                inner: &mut rt.nonce_tracker,
+            let mut nonce_adapter = BridgeNonceTracker::new(&mut rt.nonce_tracker);
+
+            let result = {
+                let mut ctx = ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &rt.ceiling_strings,
+                    context_creator_did: &rt.creator_did,
+                    presenting_agent_did: agent_did,
+                    clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                    clock: &scp_clock::SystemClock,
+                    // Generic validate site: not an outlet-invocation path, so
+                    // caveat resolution is a constant `None` (`NoCaveatResolver`).
+                    // Only outlet-invocation sites use `TokenNbCaveatResolver`.
+                    caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+                };
+
+                validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)
             };
+            Ok((result, nonce_adapter.into_outcome()))
+        })?;
 
-            let mut ctx = ValidationContext {
-                did_resolver: &did_resolver,
-                nonce_tracker: &mut nonce_adapter,
-                revocation_checker: &revocation_checker,
-                proof_resolver: &proof_resolver,
-                ceiling: &rt.ceiling_strings,
-                context_creator_did: &rt.creator_did,
-                presenting_agent_did: agent_did,
-                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                clock: &scp_clock::SystemClock,
-                // Generic validate site: not an outlet-invocation path, so
-                // caveat resolution is a constant `None` (`NoCaveatResolver`).
-                // Only outlet-invocation sites use `TokenNbCaveatResolver`.
-                caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
-            };
-
-            validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)
-        });
-
-        // Step 9 of the pipeline records the token's nonce, so write the
-        // context's nonce entries to durable storage before returning. A
+        // Step 9 of the pipeline records the token's nonce, so write that one
+        // nonce to durable storage before returning. A token refused before
+        // step 9 recorded nothing, so this reaches no storage call for it. A
         // rejected token keeps its own error: the caller is already denied, so
         // a durability failure on that path grants nothing.
-        let persisted = crate::runtime::persist_ucan_nonces_blocking(bi, context_id);
+        let persisted =
+            crate::runtime::persist_ucan_nonces_blocking(bi, context_id, &nonce_outcome);
         validated?;
         persisted?;
 
@@ -459,9 +462,7 @@ impl crate::scp::PyScp {
             let revocation_checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
             };
-            let mut nonce_adapter = BridgeNonceTracker {
-                inner: &mut rt.nonce_tracker,
-            };
+            let mut nonce_adapter = BridgeNonceTracker::new(&mut rt.nonce_tracker);
 
             let ctx = ValidationContext {
                 did_resolver: &did_resolver,
@@ -744,7 +745,7 @@ impl crate::scp::PyScp {
         // Parse the token to extract the issuer DID for authorization.
         let parsed = parse_ucan(token).map_err(ScpPyError::from)?;
 
-        crate::runtime::with_context(bi, context_id, |rt| {
+        let token_cid = crate::runtime::with_context(bi, context_id, |rt| {
             use crate::bridge_adapters::{
                 BridgeRevocationAuthorizer, BridgeRevocationDistributor,
                 BridgeRevocationEventLogger,
@@ -772,11 +773,11 @@ impl crate::scp::PyScp {
             .map_err(ScpPyError::from)
         })?;
 
-        // Make the revocation durable before returning. The in-memory list
-        // already denies the token, so a failure here leaves the instance in
-        // the more restrictive state and tells the caller the record did not
-        // land.
-        crate::runtime::persist_ucan_revocation_blocking(bi, context_id)?;
+        // Make this one revocation durable before returning, under its own key.
+        // The in-memory list already denies the token, so a failure here leaves
+        // the instance in the more restrictive state and tells the caller the
+        // record did not land.
+        crate::runtime::persist_ucan_revocation_blocking(bi, context_id, &token_cid)?;
 
         Ok(())
     }
@@ -1001,9 +1002,7 @@ mod tests {
         let nonce = format!("{now_millis}-aabbccdd11223344aabbccdd11223344");
         let expiry = now_secs + 3600;
 
-        let mut adapter = BridgeNonceTracker {
-            inner: &mut tracker,
-        };
+        let mut adapter = BridgeNonceTracker::new(&mut tracker);
 
         // First check should succeed.
         assert!(adapter.check_and_record(&nonce, expiry).is_ok());

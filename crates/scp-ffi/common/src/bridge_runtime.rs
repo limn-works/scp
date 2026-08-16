@@ -261,6 +261,26 @@ pub enum ProtocolRepoVariant {
 }
 
 impl ProtocolRepoVariant {
+    /// Wraps an encrypted in-memory storage handle in a repository variant.
+    ///
+    /// The `PyO3` bridge keeps its chosen backend as a `StorageProvider` enum
+    /// rather than a `ProtocolRepoVariant`, so it builds a variant here on
+    /// demand to reach the repository's typed domain methods. Constructing a
+    /// `ProtocolRepository` wraps the handle and allocates nothing else, and
+    /// the handle is the same `Arc` the rest of the instance already shares, so
+    /// the variant addresses the same backend (spec §17.6).
+    #[must_use]
+    pub fn from_encrypted_in_memory(handle: EventLogInMemoryStorageHandle) -> Self {
+        Self::InMemory(Arc::new(ProtocolRepository::new(handle)))
+    }
+
+    /// Wraps a `SQLCipher` storage handle in a repository variant, for the
+    /// reason [`Self::from_encrypted_in_memory`] states.
+    #[must_use]
+    pub fn from_sqlite(handle: Arc<scp_platform::sqlite::SqliteStorage>) -> Self {
+        Self::Sqlite(Arc::new(ProtocolRepository::new(handle)))
+    }
+
     /// Constructs a [`ContextEventLogProvider`] backed by this repository.
     ///
     /// The bridge is retained by `Arc` inside
@@ -352,105 +372,119 @@ impl ProtocolRepoVariant {
         }
     }
 
-    /// Writes the context's UCAN revocation list to whichever `Storage` backend
-    /// this repository wraps, so a token revoked now stays revoked after the
-    /// bridge instance is rebuilt.
+    /// Records one revoked token id in whichever `ProtocolRepository` this
+    /// variant wraps, so a token revoked now stays revoked after the bridge
+    /// instance is rebuilt.
     ///
-    /// The napi-rs and `UniFFI` bridges call this from `ucan_revoke` once
-    /// `scp_core::crypto::ucan::revoke::revoke_ucan` has succeeded; the `PyO3`
-    /// bridge calls
-    /// [`persist_revocation_list`](crate::ucan_durable_state::persist_revocation_list)
-    /// directly against its `StorageProvider`. The record lands in the same
-    /// per-instance backend that already holds the event log and the context
-    /// snapshots (spec §17.6).
+    /// Delegates to `ProtocolRepository::store_revocation`, which writes
+    /// `context/{context_id}/ucan_revocation/{token_id}` — the key §17.3 of the
+    /// persistence spec defines for a revoked token. Every bridge calls this
+    /// from `ucan_revoke` with the token id
+    /// `scp_core::crypto::ucan::revoke::revoke_ucan` returned. One key per token
+    /// id, written without reading anything first, is what lets two concurrent
+    /// revocations both survive. The record lands in the same per-instance
+    /// backend that already holds the event log and the context snapshots
+    /// (spec §17.6).
     ///
     /// # Errors
     ///
-    /// Returns [`UcanDurableStateError`](crate::ucan_durable_state::UcanDurableStateError)
-    /// if the context id is not a safe key component, the list cannot be
-    /// encoded, or the storage write fails.
-    pub async fn persist_ucan_revocation_list(
+    /// Returns [`StoreError`](scp_core::store::StoreError) if the context id or
+    /// token id is not a safe key component, or the storage write fails.
+    pub async fn store_ucan_revocation(
         &self,
         context_id: &str,
-        list: &scp_core::crypto::ucan::revoke::RevocationList,
-    ) -> Result<(), crate::ucan_durable_state::UcanDurableStateError> {
+        token_cid: &str,
+    ) -> Result<(), scp_core::store::StoreError> {
+        match self {
+            Self::InMemory(repo) => repo.store_revocation(context_id, token_cid).await,
+            Self::Sqlite(repo) => repo.store_revocation(context_id, token_cid).await,
+        }
+    }
+
+    /// Returns every revoked token id recorded for a context.
+    ///
+    /// Delegates to `ProtocolRepository::list_revocations`. The bridges call
+    /// this when they build a context's UCAN state, to rebuild the in-memory
+    /// `RevocationList` that step 10 of the ADR-016 pipeline consults.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`](scp_core::store::StoreError) if the context id is
+    /// not a safe key component, or the storage read fails.
+    pub async fn list_ucan_revocations(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<String>, scp_core::store::StoreError> {
+        match self {
+            Self::InMemory(repo) => repo.list_revocations(context_id).await,
+            Self::Sqlite(repo) => repo.list_revocations(context_id).await,
+        }
+    }
+
+    /// Records the nonce one run of the ADR-016 validation pipeline consumed,
+    /// and reports whether the durable record had already seen it.
+    ///
+    /// Delegates to `ProtocolRepository::check_and_record_nonce`, which writes
+    /// `context/{context_id}/nonce/{SHA256(nonce)}` — the key §17.3 of the
+    /// persistence spec defines for a consumed nonce — and prunes expired
+    /// records on the spec's hourly gate. `false` means the nonce was already
+    /// recorded, which is how a nonce consumed before a process restart is still
+    /// refused after one: the rebuilt in-memory `NonceTracker` starts empty, and
+    /// this durable record is what remembers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`](scp_core::store::StoreError) if the context id is
+    /// not a safe key component, or a storage call fails.
+    pub async fn check_and_record_ucan_nonce(
+        &self,
+        context_id: &str,
+        nonce: &str,
+        first_seen: u64,
+        token_expiry: u64,
+    ) -> Result<bool, scp_core::store::StoreError> {
+        let hash = crate::ucan_durable_state::nonce_hash(nonce);
         match self {
             Self::InMemory(repo) => {
-                crate::ucan_durable_state::persist_revocation_list(repo.storage(), context_id, list)
+                repo.check_and_record_nonce(context_id, &hash, first_seen, token_expiry)
                     .await
             }
             Self::Sqlite(repo) => {
-                crate::ucan_durable_state::persist_revocation_list(repo.storage(), context_id, list)
+                repo.check_and_record_nonce(context_id, &hash, first_seen, token_expiry)
                     .await
             }
         }
     }
 
-    /// Writes the context's UCAN nonce entries to whichever `Storage` backend
-    /// this repository wraps, so a nonce seen now is still refused after the
-    /// bridge instance is rebuilt.
+    /// Rebuilds a freshly constructed revocation list from the durable record
+    /// held by this repository's backend.
     ///
-    /// The napi-rs and `UniFFI` bridges call this after every UCAN-validation
-    /// pipeline run, because that pipeline is the only writer of nonce state.
-    /// Callers pass `NonceTracker::snapshot_entries`.
+    /// Every bridge calls this at the point where it builds a context's UCAN
+    /// state, which is the point at which the instance first becomes able to
+    /// answer a UCAN validation for that context. The list is added to rather
+    /// than replaced, so calling this on a list that already holds ids, or
+    /// calling it twice, cannot un-revoke a token.
     ///
-    /// # Errors
-    ///
-    /// Returns [`UcanDurableStateError`](crate::ucan_durable_state::UcanDurableStateError)
-    /// if the context id is not a safe key component, the entries cannot be
-    /// encoded, or the storage write fails.
-    pub async fn persist_ucan_nonce_entries<H: std::hash::BuildHasher + Sync>(
-        &self,
-        context_id: &str,
-        entries: &std::collections::HashMap<String, (u64, u64), H>,
-    ) -> Result<(), crate::ucan_durable_state::UcanDurableStateError> {
-        match self {
-            Self::InMemory(repo) => {
-                crate::ucan_durable_state::persist_nonce_entries(
-                    repo.storage(),
-                    context_id,
-                    entries,
-                )
-                .await
-            }
-            Self::Sqlite(repo) => {
-                crate::ucan_durable_state::persist_nonce_entries(
-                    repo.storage(),
-                    context_id,
-                    entries,
-                )
-                .await
-            }
-        }
-    }
-
-    /// Rebuilds a freshly constructed [`UcanContextStateCore`] from the durable
-    /// revocation and nonce records held by this repository's backend.
-    ///
-    /// The napi-rs and `UniFFI` bridges call this at the point where they insert
-    /// a new per-context UCAN state into their registry, which is the point at
-    /// which the instance first becomes able to answer a UCAN validation for
-    /// that context.
+    /// The context's nonce tracker has no counterpart here, because the durable
+    /// nonce key is a hash of the nonce and cannot yield the nonce back;
+    /// [`Self::check_and_record_ucan_nonce`] carries replay protection across a
+    /// restart instead (spec §17.3, "the in-memory `NonceTracker` remains the
+    /// primary, synchronised replay defense on the hot path").
     ///
     /// # Errors
     ///
-    /// Returns [`UcanDurableStateError`](crate::ucan_durable_state::UcanDurableStateError)
-    /// if either storage read fails or either persisted value cannot be decoded.
-    /// The caller fails closed rather than answering validations from an
+    /// Returns [`StoreError`](scp_core::store::StoreError) if the storage read
+    /// fails. The caller fails closed rather than answering validations from an
     /// empty revocation list.
-    pub async fn hydrate_ucan_state(
+    pub async fn hydrate_ucan_revocation_list(
         &self,
         context_id: &str,
-        core: &mut UcanContextStateCore,
-    ) -> Result<(), crate::ucan_durable_state::UcanDurableStateError> {
-        match self {
-            Self::InMemory(repo) => {
-                crate::ucan_durable_state::hydrate_core(repo.storage(), context_id, core).await
-            }
-            Self::Sqlite(repo) => {
-                crate::ucan_durable_state::hydrate_core(repo.storage(), context_id, core).await
-            }
+        list: &mut scp_core::crypto::ucan::revoke::RevocationList,
+    ) -> Result<(), scp_core::store::StoreError> {
+        for token_cid in self.list_ucan_revocations(context_id).await? {
+            list.revoke(token_cid);
         }
+        Ok(())
     }
 }
 

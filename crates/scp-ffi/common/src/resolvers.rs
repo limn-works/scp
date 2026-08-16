@@ -22,6 +22,8 @@ use scp_did::decode_multibase_key;
 use scp_identity::IdentityError;
 use scp_identity::resolver::ResolvedDidDocument;
 
+use crate::ucan_durable_state::NonceRecordOutcome;
+
 // ---------------------------------------------------------------------------
 // BridgeDidResolver
 // ---------------------------------------------------------------------------
@@ -737,8 +739,32 @@ impl ProofResolver for BridgeProofResolver {
 /// The `nonce::NonceTracker` struct and `validate::NonceTracker` trait have
 /// the same `check_and_record` method signature but are separate types. This
 /// adapter bridges the two by wrapping a mutable reference to the struct.
+///
+/// The adapter also reports what the pipeline run left for the durable nonce
+/// record to absorb (see [`NonceRecordOutcome`]). Step 9 of the ADR-016
+/// pipeline records at most one nonce, so the bridge that owns this adapter
+/// writes at most one durable key — and a run that recorded no nonce reaches
+/// storage not at all. Reading the outcome is what lets a rejected request stay
+/// off the storage path.
 pub struct BridgeNonceTracker<'a, C: Clock> {
-    pub inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
+    inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>,
+    outcome: NonceRecordOutcome,
+}
+
+impl<'a, C: Clock> BridgeNonceTracker<'a, C> {
+    /// Wraps a context's nonce tracker for one run of the validation pipeline.
+    pub fn new(inner: &'a mut scp_core::crypto::ucan::nonce::NonceTracker<C>) -> Self {
+        Self {
+            inner,
+            outcome: NonceRecordOutcome::default(),
+        }
+    }
+
+    /// Returns what this run recorded, for the caller to make durable.
+    #[must_use]
+    pub fn into_outcome(self) -> NonceRecordOutcome {
+        self.outcome
+    }
 }
 
 impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
@@ -747,7 +773,11 @@ impl<C: Clock> NonceTrackerTrait for BridgeNonceTracker<'_, C> {
     }
 
     fn record(&mut self, nonce: &str, token_expiry: u64) -> Result<(), CoreUcanError> {
-        self.inner.record(nonce, token_expiry)
+        self.inner.record(nonce, token_expiry)?;
+        if let Some(seen) = self.inner.entry(nonce) {
+            self.outcome.recorded = Some((nonce.to_owned(), seen));
+        }
+        Ok(())
     }
 }
 

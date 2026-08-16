@@ -268,6 +268,8 @@ impl<S: Storage> ProtocolRepository<S> {
     // --- UCAN revocations ---
     pub async fn store_revocation(&self, context_id: &ContextId, token_id: &str) -> Result<(), StoreError>;
     pub async fn is_revoked(&self, context_id: &ContextId, token_id: &str) -> Result<bool, StoreError>;
+    // Rebuilds an in-memory revocation list: `is_revoked` answers one id, this returns every id.
+    pub async fn list_revocations(&self, context_id: &ContextId) -> Result<Vec<String>, StoreError>;
 
     // --- Economic governance (§19) ---
     pub async fn store_economic_policy(&self, context_id: &ContextId, policy: &[u8]) -> Result<(), StoreError>;

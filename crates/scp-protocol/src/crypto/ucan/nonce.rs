@@ -32,6 +32,11 @@ use super::UcanError;
 use scp_clock::Clock;
 
 /// Nonce freshness tolerance: 5 minutes in milliseconds (spec section 9.14).
+///
+/// [`NonceTracker::check_replay`] applies this bound in step 2, before it
+/// consults the seen-set in step 3, so a nonce whose timestamp sits further
+/// than this from the current time is refused whether or not the tracker
+/// remembers it.
 const NONCE_FRESHNESS_TOLERANCE_MS: u128 = 5 * 60 * 1000;
 
 /// Grace period added to `token_expiry` before pruning: 5 minutes in seconds.
@@ -217,11 +222,13 @@ impl<C: Clock> NonceTracker<C> {
         let now_secs = self.clock.now_secs();
         let now_millis = u128::from(now_secs) * 1000;
 
-        if nonce_millis + NONCE_FRESHNESS_TOLERANCE_MS < now_millis {
+        // Both adds saturate: the caller supplies `nonce`, and a 39-digit
+        // timestamp would overflow `u128` and panic a debug build.
+        if nonce_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) < now_millis {
             return Err(UcanError::NonceTooOld(nonce.to_owned()));
         }
 
-        if nonce_millis > now_millis + NONCE_FRESHNESS_TOLERANCE_MS {
+        if nonce_millis > now_millis.saturating_add(NONCE_FRESHNESS_TOLERANCE_MS) {
             return Err(UcanError::NonceFuture(nonce.to_owned()));
         }
 
@@ -394,6 +401,17 @@ impl<C: Clock> NonceTracker<C> {
         self.seen.clone()
     }
 
+    /// Returns one nonce's `(first_seen_secs, token_expiry_secs)` entry, or
+    /// `None` when the tracker has never recorded that nonce.
+    ///
+    /// A caller that persists a single recorded nonce reads its entry here
+    /// instead of cloning the whole seen-set through
+    /// [`Self::snapshot_entries`].
+    #[must_use]
+    pub fn entry(&self, nonce: &str) -> Option<(u64, u64)> {
+        self.seen.get(nonce).copied()
+    }
+
     /// Reconstructs a tracker from a persisted snapshot of entries.
     ///
     /// Used by the context-restore path so spending-UCAN nonce state
@@ -561,6 +579,20 @@ mod tests {
     // -------------------------------------------------------------------
     // Format validation
     // -------------------------------------------------------------------
+
+    /// A caller-supplied timestamp at the top of the `u128` range must be
+    /// refused, not overflow the freshness comparison. A debug build panics on
+    /// an overflowing add, so an unsaturated comparison turns a malformed nonce
+    /// into a crash on the authorization path.
+    #[test]
+    fn check_rejects_a_nonce_whose_timestamp_saturates_the_freshness_add() {
+        let (tracker, _clock) = setup();
+        let nonce = make_nonce(u128::MAX, "aabbccdd11223344aabbccdd11223344");
+        assert!(matches!(
+            tracker.check_replay(&nonce, BASE_SECS + 3600),
+            Err(UcanError::NonceFuture(_))
+        ));
+    }
 
     #[test]
     fn check_rejects_nonce_missing_separator() {

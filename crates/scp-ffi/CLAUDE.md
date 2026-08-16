@@ -15,9 +15,9 @@ This crate is the `_scp_core` Python extension module. It exposes scp-core/scp-m
 **FfiBridgeState (per-context, FFI-only):** Does NOT duplicate Supervisor state:
 - `OutletRegistry` — outlet registration/invocation
 - `EventLog` — event recording, querying, Merkle proofs
-- `RevocationList` — UCAN token revocation tracking
+- `RevocationList` — UCAN token revocation tracking. Rebuilt at registration from `ProtocolRepository::list_revocations` (`context/{ctx}/ucan_revocation/{token_id}`, spec §17.3), so a token revoked before a restart is still refused after one. `ucan_revoke` writes the one id `revoke_ucan` returned via `store_revocation`.
 - `RoleState` — role assignments for UCAN/outlet capability checking (synced with Supervisor)
-- `NonceTracker<SystemClock>` — per-context UCAN nonce replay prevention (ADR-016 step 9)
+- `NonceTracker<SystemClock>` — per-context UCAN nonce replay prevention (ADR-016 step 9). Starts empty on every instance: the durable nonce key is `SHA256(nonce)` (spec §17.3) and no read recovers the nonce string. Replay protection crosses a restart through `ProtocolRepository::check_and_record_nonce`, which every validation entry point calls for the one nonce step 9 recorded; a `false` reply refuses the token. A validation the pipeline refuses before step 9 recorded no nonce and reaches no storage call.
 - `ceiling_strings: HashSet<String>` — capability ceiling as `{resource}:{action}` strings (ADR-016 step 8)
 - `creator_did` — the DID of the context creator
 - `outlet_handlers: HashMap<String, OutletHandler>` — registered outlet handler closures keyed by outlet ID (SCP-212)
