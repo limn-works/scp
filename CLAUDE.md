@@ -138,7 +138,7 @@ bindings/swift/.swiftlint.yml (no_static_var / no_static_lazy_var rules),
 check-bridge-symmetry.sh, bridge-aliases.json, ffi-export-allowlist.json,
 check-call-invariants.py, call-invariants-baseline.json,
 check-pure-helpers.sh, pure-helpers-allowlist.txt,
-bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
+ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
 features only, ZERO nullifier exceptions),
