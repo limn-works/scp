@@ -25,3 +25,6 @@ artifact diverged) so future passes trace faster.
   `scp-client-wasm::WasmScpClient`; `resubscribe_all` was not (inter-layer gap). Also: type
   renames (Socket→RelaySink) leave stray doc refs; native reciprocal-announce is a legit
   recorded follow-up.
+- [Track F five fail-open fixes](trackf_fail_open_five_fixes.md) — custody default survives
+  in the Python SDK, `health_check` still exits from library code, `MemberRole.fromBridge`
+  still fails open in Swift, and `NoOpRevocationChecker` ships ungated.
