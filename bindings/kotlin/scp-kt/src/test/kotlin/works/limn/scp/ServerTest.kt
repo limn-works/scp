@@ -16,6 +16,7 @@ import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class ServerTest {
@@ -174,6 +175,57 @@ class ServerTest {
         assertEquals("ws://127.0.0.1:9876/scp/v1", node.relayUrl)
         assertEquals(9876, node.relayPort)
         assertEquals("did:dht:z6MkTestNode", node.did)
+    }
+
+    // MARK: - Shutdown is one suspending path
+
+    // Neither type implements AutoCloseable. A synchronous `close()` can only reach
+    // `shutdown()` by blocking its calling thread on a coroutine whose dispatcher
+    // neither type controls, which is what `.docs/lessons/kotlin/
+    // oncleared-must-not-block-its-caller.md` forbids. Restoring `: AutoCloseable`
+    // on either declaration fails this method.
+    @Test
+    fun `neither Relay nor Node implements AutoCloseable`() {
+        assertFalse(
+            AutoCloseable::class.java.isAssignableFrom(Relay::class.java),
+            "Relay must expose suspend shutdown() alone, never a blocking close()",
+        )
+        assertFalse(
+            AutoCloseable::class.java.isAssignableFrom(Node::class.java),
+            "Node must expose suspend shutdown() alone, never a blocking close()",
+        )
+    }
+
+    // Every declared method that stops a Node or a Relay suspends. A non-suspending
+    // stop method under any name — `close`, `stop`, `dispose` — reintroduces that
+    // same blocking shape, so this method matches on behaviour rather than on one
+    // interface name. Kotlin compiles a suspend function to a JVM method taking a
+    // trailing `kotlin.coroutines.Continuation`, which is how it is recognised here.
+    @Test
+    fun `every stop method on Relay and Node suspends`() {
+        for (type in listOf(Relay::class.java, Node::class.java)) {
+            val stopMethods = type.declaredMethods.filter { method ->
+                method.name.substringBefore('$') in setOf("shutdown", "close", "stop", "dispose")
+            }
+            assertTrue(
+                stopMethods.isNotEmpty(),
+                "${type.simpleName} must declare a stop method",
+            )
+            for (method in stopMethods) {
+                assertTrue(
+                    method.parameterTypes.lastOrNull()?.name == "kotlin.coroutines.Continuation",
+                    "${type.simpleName}.${method.name} must suspend, so a caller picks its dispatcher",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `shutdown marks a node shut down`() = runTest(testDispatcher) {
+        val node = createNode()
+        assertFalse(node.isShutdown)
+        node.shutdown()
+        assertTrue(node.isShutdown)
     }
 }
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Pure Kotlin ergonomics layer over UniFFI-generated Rust bindings. Provides idiomatic Kotlin API: `suspend` functions, `Flow<T>` streaming, `AutoCloseable` lifecycle. Zero protocol logic — every SDK method delegates through the coroutine bridge to exactly one UniFFI function (ADR-028 flat delegation pattern).
+Pure Kotlin ergonomics layer over UniFFI-generated Rust bindings. Provides idiomatic Kotlin API: `suspend` functions and `Flow<T>` streaming. Lifecycle teardown suspends rather than implementing `AutoCloseable` — see "Teardown suspends" below. Zero protocol logic — every SDK method delegates through one coroutine bridge to exactly one UniFFI function (ADR-028 flat delegation pattern).
 
 ## Breaking Changes
 
@@ -66,6 +66,17 @@ Two-tier streaming architecture per ADR-028:
 **`EventContextBindings`** extends `ContextBindings` with `contextSubscribeEvents()` / `contextUnsubscribeEvents()` for lifecycle event streams. When UniFFI generates the real bindings, implement this interface alongside `NativeBindings`.
 
 ## Gotchas
+
+### Teardown suspends; no SDK type implements `AutoCloseable`
+
+`Relay` and `Node` expose one suspending `shutdown()` each and implement no `AutoCloseable`. An earlier revision implemented it, so that a caller could write `use {}`, with `close()` running `runBlocking(Dispatchers.Default) { shutdown() }`. `shutdown()` routes through `CoroutineBridge.ffiCall`, which suspends on a bridge's injected `ioDispatcher`, so a caller injecting a `StandardTestDispatcher` parked one thread that advances that dispatcher's scheduler and never returned, and an Android caller blocked a main thread. Nothing in this repository ever called that `close()`.
+
+A bounded wait was rejected as a fix: it still blocks a calling thread, and blocking an Android main thread up to a timeout produces an ANR, so it trades a deadlock for an ANR rather than removing a blocking wait. Write `try { … } finally { relay.shutdown() }` inside a coroutine instead.
+
+`ServerTest.neither Relay nor Node implements AutoCloseable` and `ServerTest.every stop method on Relay and Node suspends` fail if either shape returns. That second method matches on a trailing `kotlin.coroutines.Continuation` parameter, so a non-suspending stop method fails it under any name.
+
+See `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
+
 
 ### detekt TooManyFunctions (threshold: 30)
 

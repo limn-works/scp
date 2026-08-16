@@ -91,16 +91,29 @@ and returns. `rememberScpContext`'s KDoc example teaches callers that same shape
 example previously showed `runBlocking(Dispatchers.IO) { bridge.context.leave(...) }` inside a
 disposal callback.
 
-## Where a blocking wait is still a contract
+## No exception for `AutoCloseable`
 
 `Relay.close()` and `Node.close()` in `bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Server.kt`
-call `runBlocking(Dispatchers.Default) { shutdown() }`, and `shutdown()` routes through
+called `runBlocking(Dispatchers.Default) { shutdown() }`, and `shutdown()` routes through
 `CoroutineBridge.ffiCall`, which suspends on an injected `ioDispatcher`. That structure matches
-`onCleared()`'s deadlock, and it stays, because `AutoCloseable.close()` is a synchronous contract a
-caller opts into for `use {}`. What changed is a claim beside it: naming `Dispatchers.Default` keeps
-`runBlocking` from re-entering a caller's own event loop, and it does not rescue a caller whose
-`ioDispatcher` is a `StandardTestDispatcher` that only a parked thread advances. Call `shutdown()`
-from a coroutine when a test injects a `TestDispatcher`.
+`onCleared()`'s deadlock exactly.
+
+An earlier revision kept both and documented a caveat above them, reasoning that
+`AutoCloseable.close()` is a synchronous contract a caller opts into for `use {}`. That reasoning
+does not survive two facts. Nothing in this repository ever called either `close()` — no test, no
+example, no SDK code — so no caller opted into anything. And a rule that a type may break whenever
+an interface asks it to is not a rule; `AutoCloseable` is a choice this SDK makes, not a constraint
+imposed on it.
+
+Both types dropped `AutoCloseable`, leaving one suspending `shutdown()` as one canonical stop path,
+which is also what agent-first API design asks for. A bounded wait was weighed and rejected: it
+still blocks a calling thread, and blocking an Android main thread up to a timeout produces an ANR,
+so it trades a deadlock for an ANR rather than removing a blocking wait.
+
+`ServerTest.neither Relay nor Node implements AutoCloseable` fails if that interface returns.
+`ServerTest.every stop method on Relay and Node suspends` matches on a trailing
+`kotlin.coroutines.Continuation` parameter, so a non-suspending stop method fails it under any name
+— `close`, `stop`, or `dispose`.
 
 ## Affected files
 
