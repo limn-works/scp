@@ -183,14 +183,14 @@
         },
         {
           "name": "verify_attestation",
-          "python": false,
+          "python": true,
           "typescript": false,
           "kotlin": true,
           "swift": false,
+          "notes": "Identity-link attestation verification per spec §3.5.4. GitHub issue #2335 finding 2 recorded a fail-open here: each bridge verified a caller-supplied attestation against a caller-supplied key, so an attacker who supplied both received true. §3.5.4 step 1 resolves an issuer's DID document and takes a signing key from it, which needs a per-instance DID resolver, and phase D (#1695) deleted every process-wide default bridge instance. So each bridge now carries a per-instance method (PyScp::verify_identity_link_attestation, Scp::identity_verify_link_attestation on NAPI and UniFFI) that resolves and runs every §3.5.4 step through scp_ffi_common::attestation::decide_link_attestation, pinned by the link-attestation-verify-runs-the-shared-3-5-4-pipeline call invariant. A module-scope free function of the same foreign name remains exported on all three bridges and DECLINES with a typed SCP-IDENT-1060, never a silent verify-valid. Python routes to that per-instance method; TypeScript, Swift, and Kotlin wrappers still route to that declining free function, so their cells report the state of each wrapper rather than of a bridge.",
           "exemptions": {
-            "python": "bridge does not export verify_link_attestation",
-            "typescript": "bridge does not export verify_link_attestation",
-            "swift": "UniFFI bridge does not export verify_link_attestation"
+            "typescript": "SCP.identityVerifyLinkAttestation in bindings/typescript/src/scp.ts routes to the declining module-scope NAPI free function (SCP-IDENT-1060). bindings/typescript/src/internal/native.ts already routes to the per-instance Scp method; pointing scp.ts at that same route makes this cell true.",
+            "swift": "Identity.verifyLinkAttestation in bindings/swift/Sources/SCP/Identity.swift routes to the declining module-scope UniFFI free function (SCP-IDENT-1060). Pointing it at the generated Scp.identityVerifyLinkAttestation method makes this cell true."
           }
         }
       ]
@@ -2601,6 +2601,28 @@
           "crates/scp-ffi/src/identity.rs PyScp::identity_create → ensure_did_resolver_initialized_on",
           "crates/scp-ffi/napi/src/scp.rs Scp::identity_create → ensure_did_resolver_initialized_on",
           "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_create (in-memory arm) → ensure_did_resolver_initialized_on"
+        ]
+      }
+    },
+    {
+      "rule_id": "link-attestation-verify-runs-the-shared-3-5-4-pipeline",
+      "description": "Every bridge's per-instance identity-link-attestation verifier must call `decide_link_attestation` (crates/scp-ffi/common/src/attestation.rs), which delegates to the pure `verify_identity_link_attestation` seam in scp-protocol. Spec §3.5.4 step 1 resolves an issuer's DID document and takes a signing key from it; a bridge that instead calls `IdentityLinkAttestation::verify_signature` against a caller-supplied key answers true for an attacker who supplies both that key and that attestation, which is the fail-open GitHub issue #2335 finding 2 recorded. Regex matches per-instance methods only: each bridge's declining module-scope free function carries the `_module_scope` suffix on its Rust identifier while keeping its foreign export name.",
+      "applies_to": [
+        "pyo3",
+        "napi",
+        "uniffi"
+      ],
+      "pattern": {
+        "caller_matches": "^(verify_identity_link_attestation|identity_verify_link_attestation)$",
+        "required_callee": "decide_link_attestation",
+        "scope": "same-function",
+        "min_occurrences": 1
+      },
+      "evidence": {
+        "code_sites": [
+          "crates/scp-ffi/src/identity.rs PyScp::verify_identity_link_attestation → decide_link_attestation",
+          "crates/scp-ffi/napi/src/scp.rs Scp::identity_verify_link_attestation → decide_link_attestation",
+          "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_verify_link_attestation → decide_link_attestation"
         ]
       }
     }

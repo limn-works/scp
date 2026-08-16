@@ -689,6 +689,316 @@ pub enum AttestationSignatureError {
 }
 
 // ---------------------------------------------------------------------------
+// §3.5.4 verification seam
+// ---------------------------------------------------------------------------
+
+/// Fragment of a DID document verification method that may sign an identity
+/// link attestation (spec §3.5.2: "the issuer's `#active` or `#agent` key").
+pub const SIGNING_FRAGMENT_ACTIVE: &str = "active";
+
+/// Second admissible signing fragment (§3.5.2), used by an agent acting for
+/// its human under a shared DID (ADR-039 §agent key).
+pub const SIGNING_FRAGMENT_AGENT: &str = "agent";
+
+/// What a consumer did about a Class 2 (Reference) proof resource before
+/// calling [`verify_identity_link_attestation`].
+///
+/// Spec §3.5.4 gives Class 2 attestations — `SignedPost` and `DnsRecord` — a
+/// verification step that no pure function can perform: fetch the post URL or
+/// query the DNS TXT record and confirm that record carries an issuer's DID.
+/// So a caller states the outcome of that fetch, and
+/// [`verify_identity_link_attestation`] holds a caller to it. §3.5.0 forbids a
+/// consumer from granting trust weight to an unfetched Reference attestation:
+/// "An unverified Reference attestation is equivalent to no attestation."
+///
+/// A Class 1 (Cryptographic) attestation — `Oauth` and `ChallengeResponse` —
+/// has no external proof resource, so
+/// [`verify_identity_link_attestation`] ignores this value for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceProofOutcome {
+    /// A consumer fetched a resource named by `evidence.proof` and confirmed
+    /// an issuer's DID appears in that resource (§3.5.4 Class 2 step 2).
+    Confirmed,
+
+    /// A consumer performed no fetch. §3.5.4 Class 2 step 3 then leaves an
+    /// attestation unverified, so [`verify_identity_link_attestation`] rejects
+    /// a Class 2 attestation with
+    /// [`IdentityLinkVerifyError::ReferenceProofUnverified`].
+    NotFetched,
+}
+
+/// Whether an attestation's evidence still sits inside a renewal interval
+/// (spec §3.5.4 step 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityLinkFreshness {
+    /// `evidence.verified_at` is newer than a renewal interval that
+    /// [`VerificationMethod::renewal_interval_secs`] gives for an
+    /// attestation's method.
+    Fresh,
+
+    /// `evidence.verified_at` is older than that renewal interval. §3.5.4
+    /// step 5 degrades a stale attestation — a consumer lowers its trust
+    /// weight — and does NOT reject it.
+    Stale {
+        /// Unix timestamp (seconds) after which evidence became stale.
+        renewal_deadline_secs: u64,
+    },
+}
+
+/// What [`verify_identity_link_attestation`] establishes when every §3.5.4
+/// check passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentityLinkVerified {
+    /// Which fragment of an issuer's DID document published a key that
+    /// verified a signature: [`SIGNING_FRAGMENT_ACTIVE`] or
+    /// [`SIGNING_FRAGMENT_AGENT`].
+    pub signing_key_fragment: &'static str,
+
+    /// Ed25519 public key bytes that verified a signature, taken from an
+    /// issuer's resolved DID document — never from a caller.
+    pub signing_public_key: [u8; 32],
+
+    /// Evidence freshness per §3.5.4 step 5.
+    pub freshness: IdentityLinkFreshness,
+}
+
+/// Why [`verify_identity_link_attestation`] rejected an attestation.
+///
+/// Each variant names one §3.5.4 step. A caller that maps every variant onto a
+/// single `false` loses that distinction, so a caller which reports a reason to
+/// a human reports this error rather than a boolean.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IdentityLinkVerifyError {
+    /// [`IdentityLinkAttestation::validate_structure`] reported errors, so an
+    /// attestation contradicts its own §3.5.2 wire format before any key is
+    /// consulted.
+    #[error("attestation failed structural validation: {0}")]
+    StructurallyInvalid(String),
+
+    /// A resolved DID document identifies a different DID than an
+    /// attestation's `issuer` names. §3.5.4 step 1 resolves *an issuer's*
+    /// document, so a document for anyone else proves nothing about this
+    /// attestation.
+    #[error("resolved DID document identifies {document_id}, attestation issuer is {issuer}")]
+    IssuerDocumentMismatch {
+        /// `id` of a document a caller supplied.
+        document_id: String,
+        /// `issuer` an attestation names.
+        issuer: String,
+    },
+
+    /// An issuer's document publishes neither an `#active` nor an `#agent`
+    /// verification method whose key decodes to 32 Ed25519 bytes and whose
+    /// `controller` is that issuer. §3.5.4 step 1 has no key to hand step 2.
+    #[error(
+        "resolved DID document for {issuer} publishes no usable #active or #agent \
+         verification method"
+    )]
+    SigningKeyNotPublished {
+        /// `issuer` an attestation names.
+        issuer: String,
+    },
+
+    /// §3.5.4 step 2: no key an issuer's document publishes verifies an
+    /// attestation's signature.
+    #[error("signature verifies under no key the issuer's DID document publishes")]
+    SignatureInvalid,
+
+    /// §3.5.4 step 3: `revocation_status` reads `Revoked`.
+    #[error("attestation was revoked at {revoked_at}")]
+    Revoked {
+        /// Unix timestamp (seconds) a revoker recorded.
+        revoked_at: u64,
+    },
+
+    /// §3.5.4 step 4: `expires_at` has passed.
+    #[error("attestation expired at {expires_at}; now is {now_secs}")]
+    Expired {
+        /// `expires_at` an attestation carries.
+        expires_at: u64,
+        /// Timestamp a caller supplied.
+        now_secs: u64,
+    },
+
+    /// A Class 2 (Reference) attestation reached this function with
+    /// [`ReferenceProofOutcome::NotFetched`]. §3.5.0 states that an unverified
+    /// Reference attestation is equivalent to no attestation, so a caller that
+    /// cannot fetch a proof resource gets a rejection rather than a passing
+    /// result that overstates what a signature alone proves.
+    #[error(
+        "class 2 (reference) attestation carries method {method}, whose proof resource \
+         no caller fetched; spec §3.5.4 leaves it unverified"
+    )]
+    ReferenceProofUnverified {
+        /// Wire-format name of a verification method (§3.5.2).
+        method: &'static str,
+    },
+}
+
+/// Inputs [`verify_identity_link_attestation`] needs, as one flat record.
+///
+/// A flat named-field record rather than five positional arguments, per
+/// `.docs/standards/construction.md` and ADR-052, the unified construction
+/// pattern: an LLM author names each field at a call site, so a swapped
+/// argument becomes a compile error rather than a silent security change.
+#[derive(Debug, Clone, Copy)]
+pub struct IdentityLinkVerifyInput<'a> {
+    /// Attestation a consumer received.
+    pub attestation: &'a IdentityLinkAttestation,
+
+    /// DID document a consumer resolved for `attestation.issuer` — §3.5.4
+    /// step 1. A consumer resolves this document itself; passing a document a
+    /// holder supplied returns a holder's own claim to that holder.
+    pub issuer_document: &'a scp_did::DidDocument,
+
+    /// Current Unix time in seconds, for §3.5.4 steps 4 and 5.
+    pub now_secs: u64,
+
+    /// Outcome of a Class 2 proof fetch — see [`ReferenceProofOutcome`].
+    pub reference_proof: ReferenceProofOutcome,
+}
+
+/// Runs spec §3.5.4 verification of an identity link attestation.
+///
+/// Pure, deterministic, side-effect-free, and wasm-safe: it performs no DID
+/// resolution, no network request, and no clock read. A caller resolves an
+/// issuer's DID document (§3.5.4 step 1), reads a clock, and states what it did
+/// about a Class 2 proof resource; this function performs every remaining
+/// check. That split mirrors
+/// `scp_mls::keypackage_attestation::verify_attestation_with_resolution`, which
+/// keeps the same core reusable by an in-browser client (ADR-057).
+///
+/// # Checks, in order
+///
+/// 1. **Structure** — [`IdentityLinkAttestation::validate_structure`] must
+///    report no errors.
+/// 2. **Document binding** — `issuer_document.id` must equal
+///    `attestation.issuer`. Without this comparison a caller could hand over
+///    any document and satisfy step 3 with a key from an unrelated identity.
+/// 3. **Signing key (§3.5.4 step 1)** — collect `#active` and `#agent`
+///    verification methods whose `controller` is an issuer and whose
+///    `publicKeyMultibase` decodes to 32 Ed25519 bytes.
+/// 4. **Signature (§3.5.4 step 2)** — an attestation's signature must verify
+///    under one of those keys. §3.5.2 admits either fragment, so both are
+///    tried and a fragment that verified is reported back.
+/// 5. **Revocation (§3.5.4 step 3)** — `revocation_status` must read `Active`.
+/// 6. **Expiry (§3.5.4 step 4)** — `expires_at`, when present, must not have
+///    passed.
+/// 7. **Class 2 proof (§3.5.4 Class 2 steps 2–3)** — a `SignedPost` or
+///    `DnsRecord` attestation needs [`ReferenceProofOutcome::Confirmed`].
+/// 8. **Freshness (§3.5.4 step 5)** — evidence older than a method's renewal
+///    interval yields [`IdentityLinkFreshness::Stale`], which is a degraded
+///    pass, not a rejection.
+///
+/// §3.5.4 step 6 asks a consumer to trust a self-attestation once steps 1–5
+/// pass, and step 1's `issuer == subject` rule is checked inside
+/// `validate_structure`, so this function returns success rather than asking a
+/// caller for a further decision.
+///
+/// # Errors
+///
+/// Returns [`IdentityLinkVerifyError`] for a first failing check in that order.
+pub fn verify_identity_link_attestation(
+    input: &IdentityLinkVerifyInput<'_>,
+) -> Result<IdentityLinkVerified, IdentityLinkVerifyError> {
+    let attestation = input.attestation;
+
+    // --- 1. Structure.
+    let structural_errors = attestation.validate_structure();
+    if !structural_errors.is_empty() {
+        return Err(IdentityLinkVerifyError::StructurallyInvalid(
+            structural_errors.join("; "),
+        ));
+    }
+
+    // --- 2. Document binding. A document for anyone other than an issuer
+    // proves nothing about this attestation, so compare before reading a key.
+    let issuer_str: &str = (*attestation.issuer).as_ref();
+    if input.issuer_document.id != issuer_str {
+        return Err(IdentityLinkVerifyError::IssuerDocumentMismatch {
+            document_id: input.issuer_document.id.clone(),
+            issuer: issuer_str.to_owned(),
+        });
+    }
+
+    // --- 3. Signing keys published by an issuer's document (§3.5.4 step 1).
+    let mut candidates: Vec<(&'static str, [u8; 32])> = Vec::with_capacity(2);
+    for fragment in [SIGNING_FRAGMENT_ACTIVE, SIGNING_FRAGMENT_AGENT] {
+        let Some(method) = input
+            .issuer_document
+            .verification_method_by_fragment(fragment)
+        else {
+            continue;
+        };
+        // §18.2.2A binds a verification method to its controller. A document
+        // that lists a method controlled by someone else does not authorize
+        // that key to speak for this issuer.
+        if method.controller != issuer_str {
+            continue;
+        }
+        let Ok(key) = scp_did::decode_multibase_key(&method.public_key_multibase) else {
+            continue;
+        };
+        candidates.push((fragment, key));
+    }
+    if candidates.is_empty() {
+        return Err(IdentityLinkVerifyError::SigningKeyNotPublished {
+            issuer: issuer_str.to_owned(),
+        });
+    }
+
+    // --- 4. Signature (§3.5.4 step 2).
+    let verified_with = candidates
+        .into_iter()
+        .find(|(_, key)| attestation.verify_signature(key).is_ok())
+        .ok_or(IdentityLinkVerifyError::SignatureInvalid)?;
+    let (signing_key_fragment, signing_public_key) = verified_with;
+
+    // --- 5. Revocation (§3.5.4 step 3).
+    if let crate::trust::attestation::RevocationStatus::Revoked { revoked_at, .. } =
+        &attestation.revocation_status
+    {
+        return Err(IdentityLinkVerifyError::Revoked {
+            revoked_at: *revoked_at,
+        });
+    }
+
+    // --- 6. Expiry (§3.5.4 step 4).
+    if let Some(expires_at) = attestation.expires_at
+        && attestation.is_time_expired(input.now_secs)
+    {
+        return Err(IdentityLinkVerifyError::Expired {
+            expires_at,
+            now_secs: input.now_secs,
+        });
+    }
+
+    // --- 7. Class 2 proof resource (§3.5.4 Class 2 steps 2–3).
+    if attestation.evidence.method.attestation_class() == AttestationClass::Reference
+        && input.reference_proof == ReferenceProofOutcome::NotFetched
+    {
+        return Err(IdentityLinkVerifyError::ReferenceProofUnverified {
+            method: attestation.evidence.method.as_str(),
+        });
+    }
+
+    // --- 8. Freshness (§3.5.4 step 5) — degrade, never reject.
+    let freshness = if attestation.needs_renewal(input.now_secs) {
+        IdentityLinkFreshness::Stale {
+            renewal_deadline_secs: attestation.renewal_deadline_secs(),
+        }
+    } else {
+        IdentityLinkFreshness::Fresh
+    };
+
+    Ok(IdentityLinkVerified {
+        signing_key_fragment,
+        signing_public_key,
+        freshness,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1525,5 +1835,280 @@ mod tests {
             !errors.iter().any(|e| e.contains("proof")),
             "validate_structure must not inspect proof content: {errors:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // §3.5.4 verification seam
+    // -----------------------------------------------------------------------
+
+    /// Timestamp every seam test reads as "now" — equal to the `issued_at` and
+    /// `verified_at` that `make_signed_attestation` stamps, so evidence is
+    /// fresh unless a test moves this forward.
+    const SEAM_NOW: u64 = 1_700_000_000_000;
+
+    /// Builds a DID document for `did_str` publishing `active_key` at
+    /// `#active`, and `agent_key` at `#agent` when supplied.
+    fn seam_document(
+        did_str: &str,
+        active_key: &[u8; 32],
+        agent_key: Option<&[u8; 32]>,
+    ) -> scp_did::DidDocument {
+        let identity_key = test_signing_key(0x11).verifying_key().to_bytes();
+        let commitment = [0u8; 32];
+        scp_did::DidDocument::new_with_agent_key(
+            did_str,
+            &identity_key,
+            active_key,
+            &commitment,
+            agent_key.map(<[u8; 32]>::as_slice),
+        )
+    }
+
+    /// Runs the seam with a Class 1 posture (no reference proof to fetch).
+    fn run_seam(
+        attestation: &IdentityLinkAttestation,
+        document: &scp_did::DidDocument,
+        now_secs: u64,
+    ) -> Result<IdentityLinkVerified, IdentityLinkVerifyError> {
+        verify_identity_link_attestation(&IdentityLinkVerifyInput {
+            attestation,
+            issuer_document: document,
+            now_secs,
+            reference_proof: ReferenceProofOutcome::NotFetched,
+        })
+    }
+
+    #[test]
+    fn seam_accepts_signature_by_the_active_key_the_document_publishes() {
+        let sk = test_signing_key(0xAA);
+        let attestation = make_signed_attestation(&sk);
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        let verified = run_seam(&attestation, &doc, SEAM_NOW).expect("seam must accept");
+        assert_eq!(verified.signing_key_fragment, SIGNING_FRAGMENT_ACTIVE);
+        assert_eq!(verified.signing_public_key, sk.verifying_key().to_bytes());
+        assert_eq!(verified.freshness, IdentityLinkFreshness::Fresh);
+    }
+
+    /// Regression pin for GitHub issue #2335 finding 2: an attacker's key plus
+    /// an attacker's attestation used to return `true`, because a bridge took
+    /// a verifying key from its caller. A key that an issuer's DID document
+    /// does not publish now fails §3.5.4 step 2.
+    #[test]
+    fn seam_rejects_an_attacker_key_paired_with_an_attacker_attestation() {
+        let attacker = test_signing_key(0xBB);
+        let attestation = make_signed_attestation(&attacker);
+
+        // An issuer's real document publishes a different `#active` key.
+        let honest = test_signing_key(0xAA);
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &honest.verifying_key().to_bytes(),
+            None,
+        );
+
+        assert_eq!(
+            run_seam(&attestation, &doc, SEAM_NOW),
+            Err(IdentityLinkVerifyError::SignatureInvalid)
+        );
+    }
+
+    #[test]
+    fn seam_rejects_a_document_that_identifies_a_different_did() {
+        let sk = test_signing_key(0xAA);
+        let attestation = make_signed_attestation(&sk);
+        let doc = seam_document(
+            "did:dht:z6MkSomebodyElse",
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        assert!(matches!(
+            run_seam(&attestation, &doc, SEAM_NOW),
+            Err(IdentityLinkVerifyError::IssuerDocumentMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn seam_accepts_a_signature_by_the_agent_key() {
+        let agent = test_signing_key(0xCD);
+        let attestation = make_signed_attestation(&agent);
+        let active = test_signing_key(0xAA);
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &active.verifying_key().to_bytes(),
+            Some(&agent.verifying_key().to_bytes()),
+        );
+
+        let verified = run_seam(&attestation, &doc, SEAM_NOW).expect("agent key must verify");
+        assert_eq!(verified.signing_key_fragment, SIGNING_FRAGMENT_AGENT);
+    }
+
+    #[test]
+    fn seam_ignores_a_verification_method_another_did_controls() {
+        let sk = test_signing_key(0xAA);
+        let attestation = make_signed_attestation(&sk);
+        let mut doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+        for method in &mut doc.verification_method {
+            if method.id.ends_with("#active") {
+                method.controller = "did:dht:z6MkAttacker".to_owned();
+            }
+        }
+
+        assert!(matches!(
+            run_seam(&attestation, &doc, SEAM_NOW),
+            Err(IdentityLinkVerifyError::SigningKeyNotPublished { .. })
+        ));
+    }
+
+    #[test]
+    fn seam_rejects_a_revoked_attestation() {
+        use ed25519_dalek::Signer;
+
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.revocation_status = crate::trust::attestation::RevocationStatus::Revoked {
+            reason: "user revoked".to_owned(),
+            revoked_at: SEAM_NOW - 10,
+            revoked_by: attestation.issuer.clone(),
+        };
+        let canonical = attestation.canonical_signing_bytes().unwrap();
+        attestation.signature = sk.sign(&canonical).to_bytes().to_vec();
+
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        assert_eq!(
+            run_seam(&attestation, &doc, SEAM_NOW),
+            Err(IdentityLinkVerifyError::Revoked {
+                revoked_at: SEAM_NOW - 10
+            })
+        );
+    }
+
+    #[test]
+    fn seam_rejects_an_expired_attestation() {
+        use ed25519_dalek::Signer;
+
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.expires_at = Some(SEAM_NOW + 100);
+        let canonical = attestation.canonical_signing_bytes().unwrap();
+        attestation.signature = sk.sign(&canonical).to_bytes().to_vec();
+
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        assert_eq!(
+            run_seam(&attestation, &doc, SEAM_NOW + 200),
+            Err(IdentityLinkVerifyError::Expired {
+                expires_at: SEAM_NOW + 100,
+                now_secs: SEAM_NOW + 200,
+            })
+        );
+    }
+
+    #[test]
+    fn seam_rejects_a_class_2_attestation_whose_proof_nobody_fetched() {
+        use ed25519_dalek::Signer;
+
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.evidence.method = VerificationMethod::SignedPost;
+        let canonical = attestation.canonical_signing_bytes().unwrap();
+        attestation.signature = sk.sign(&canonical).to_bytes().to_vec();
+
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        assert_eq!(
+            run_seam(&attestation, &doc, SEAM_NOW),
+            Err(IdentityLinkVerifyError::ReferenceProofUnverified {
+                method: "signed_post"
+            })
+        );
+    }
+
+    #[test]
+    fn seam_accepts_a_class_2_attestation_whose_proof_a_consumer_confirmed() {
+        use ed25519_dalek::Signer;
+
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.evidence.method = VerificationMethod::SignedPost;
+        let canonical = attestation.canonical_signing_bytes().unwrap();
+        attestation.signature = sk.sign(&canonical).to_bytes().to_vec();
+
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        let verified = verify_identity_link_attestation(&IdentityLinkVerifyInput {
+            attestation: &attestation,
+            issuer_document: &doc,
+            now_secs: SEAM_NOW,
+            reference_proof: ReferenceProofOutcome::Confirmed,
+        })
+        .expect("a confirmed reference proof must pass");
+        assert_eq!(verified.freshness, IdentityLinkFreshness::Fresh);
+    }
+
+    #[test]
+    fn seam_degrades_stale_evidence_rather_than_rejecting_it() {
+        let sk = test_signing_key(0xAA);
+        let attestation = make_signed_attestation(&sk);
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        // OAuth's renewal interval is 30 days; step one second past it.
+        let past_deadline = attestation.renewal_deadline_secs() + 1;
+        let verified = run_seam(&attestation, &doc, past_deadline)
+            .expect("§3.5.4 step 5 degrades, not rejects");
+        assert_eq!(
+            verified.freshness,
+            IdentityLinkFreshness::Stale {
+                renewal_deadline_secs: attestation.renewal_deadline_secs(),
+            }
+        );
+    }
+
+    #[test]
+    fn seam_rejects_a_structurally_invalid_attestation_before_reading_a_key() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        attestation.subject = did("did:dht:z6MkNotTheIssuer");
+
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        assert!(matches!(
+            run_seam(&attestation, &doc, SEAM_NOW),
+            Err(IdentityLinkVerifyError::StructurallyInvalid(_))
+        ));
     }
 }

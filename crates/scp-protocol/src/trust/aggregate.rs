@@ -23,12 +23,13 @@
 use std::collections::HashMap;
 
 use scp_clock::Clock;
+use scp_did::DID;
 use scp_event_log::Event;
 
 use super::attestation::{
     Attestation, AttestationRevocationChecker, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
-    ThresholdRequirement, check_attestation_freshness, check_threshold_attestation,
-    verify_attestation, verify_attestation_with_revocation,
+    ThresholdCheckInput, ThresholdRequirement, check_attestation_freshness,
+    check_threshold_attestation, verify_attestation, verify_attestation_with_revocation,
 };
 use super::challenge::{ChallengeVerification, verify_challenge_verification};
 use super::consequence::ConsequenceRule;
@@ -542,8 +543,13 @@ where
     // 4. Consequence structure comes directly from context params.
     let consequence_structure: Vec<ConsequenceRule> = ctx.consequence_rules.to_vec();
 
-    // 5. Compute threshold counts per attestation type.
-    let threshold_counts = compute_threshold_counts(ctx.threshold_requirements, ctx.attestor_sets);
+    // 5. Compute threshold counts per attestation type. The context revocation
+    //    list reaches the threshold check for the same reason it reaches
+    //    `get_verified_attestations`: an endorsement revoked after its issuer
+    //    signed it must stop counting toward a threshold on the next read.
+    let revoked = ctx.cache.store().get_revocation_state(ctx.context_id)?;
+    let revocation_checker = RevocationMapChecker { revoked: &revoked };
+    let threshold_counts = compute_threshold_counts(ctx, Some(&revocation_checker));
 
     Ok(TrustInput {
         verified_attestations,
@@ -561,20 +567,38 @@ where
 /// Computes threshold counts `(met, required)` per attestation type.
 ///
 /// For each attestation type with a threshold requirement, runs
-/// [`check_threshold_attestation`] against the provided attestor set and
-/// records `(valid_count, required_count)`.
-fn compute_threshold_counts(
-    requirements: &HashMap<AttestationType, ThresholdRequirement>,
-    attestor_sets: &HashMap<AttestationType, Vec<AttestorInfo>>,
-) -> HashMap<AttestationType, (u32, u32)> {
+/// [`check_threshold_attestation`] against the caller-supplied attestor set and
+/// records `(valid_count, required_count)`. `check_threshold_attestation`
+/// applies its own admission rules — subject binding, issuer binding,
+/// signature verification, and DID deduplication — so `attestor_sets` reaches
+/// the count as raw candidates and never as a pre-approved tally.
+fn compute_threshold_counts<S, R, C>(
+    ctx: &AggregationContext<'_, S, R, C>,
+    revocation_checker: Option<&dyn AttestationRevocationChecker>,
+) -> HashMap<AttestationType, (u32, u32)>
+where
+    S: TrustProtocolRepository,
+    R: DidPublicKeyResolver,
+    C: Clock,
+{
     let mut counts = HashMap::new();
+    let subject_did = DID::from(ctx.subject_did);
 
-    for (att_type, requirement) in requirements {
-        let attestors = attestor_sets
+    for (att_type, requirement) in ctx.threshold_requirements {
+        let attestors = ctx
+            .attestor_sets
             .get(att_type)
             .map_or(&[] as &[AttestorInfo], |v| v.as_slice());
 
-        let result = check_threshold_attestation(att_type, attestors, requirement);
+        let result = check_threshold_attestation(&ThresholdCheckInput {
+            attestation_type: att_type,
+            subject_did: &subject_did,
+            attestors,
+            requirement,
+            resolver: ctx.resolver,
+            clock: ctx.clock,
+            revocation_checker,
+        });
         counts.insert(
             att_type.clone(),
             (result.valid_count, result.required_count),
@@ -827,6 +851,95 @@ mod tests {
             signature: vec![0u8; 64],
             renewed_at: None,
         }
+    }
+
+    /// Builds an [`AttestorInfo`] whose attestation `issuer` genuinely signed
+    /// about `subject`, and seeds `resolver` with the issuer's public key so
+    /// [`check_threshold_attestation`] verifies that signature.
+    fn signed_attestor(
+        resolver: &mut TestResolver,
+        issuer: &str,
+        subject: &str,
+        attestation_type: AttestationType,
+        id: &str,
+    ) -> AttestorInfo {
+        use ed25519_dalek::Signer;
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        resolver.keys.insert(
+            issuer.to_owned(),
+            signing_key.verifying_key().to_bytes().to_vec(),
+        );
+
+        let mut attestation = Attestation {
+            id: id.to_owned(),
+            attestation_type,
+            issuer: issuer.into(),
+            subject: subject.into(),
+            claim: serde_json::json!({"test": true}),
+            evidence: None,
+            issued_at: 1000,
+            expires_at: Some(5000),
+            renewal_interval: None,
+            revocation_status: RevocationStatus::Active,
+            signature: vec![],
+            renewed_at: None,
+        };
+        let canonical =
+            crate::trust::attestation::canonical_attestation_bytes(&attestation).unwrap();
+        attestation.signature = signing_key.sign(&canonical).to_bytes().to_vec();
+
+        AttestorInfo {
+            did: issuer.into(),
+            context_memberships: std::collections::HashSet::new(),
+            endorsements: std::collections::HashSet::new(),
+            attestation: Some(attestation),
+        }
+    }
+
+    /// Runs `aggregate_trust_input` for subject `did:key:alice` over a
+    /// single-event log and returns the threshold counts it produced, so each
+    /// threshold assertion exercises the shipped caller path. `revoked_ids`
+    /// names the attestation IDs the context has revoked.
+    fn threshold_counts_via_aggregate(
+        resolver: &TestResolver,
+        requirements: &HashMap<AttestationType, ThresholdRequirement>,
+        attestor_sets: &HashMap<AttestationType, Vec<AttestorInfo>>,
+        revoked_ids: &[&str],
+    ) -> HashMap<AttestationType, (u32, u32)> {
+        let store = InMemoryTrustStore::new();
+        if !revoked_ids.is_empty() {
+            let state: HashMap<String, bool> = revoked_ids
+                .iter()
+                .map(|id| ((*id).to_owned(), true))
+                .collect();
+            store.store_revocation_state("ctx-1", &state).unwrap();
+        }
+        let cache = AttestationCache::new(store);
+        let clock = TestClock::new(2000);
+        let events = vec![make_event(
+            EventType::MessageSent,
+            "did:key:alice",
+            1000,
+            0,
+            vec![],
+        )];
+        let consequence_rules = vec![];
+
+        let ctx = AggregationContext {
+            context_id: "ctx-1",
+            subject_did: "did:key:alice",
+            events: &events,
+            merkle_root: [0u8; 32],
+            consequence_rules: &consequence_rules,
+            threshold_requirements: requirements,
+            attestor_sets,
+            cache: &cache,
+            resolver,
+            clock: &clock,
+        };
+
+        aggregate_trust_input(&ctx).unwrap().threshold_counts
     }
 
     /// Deterministic verifier signing key used by `make_challenge_verification`,
@@ -1312,21 +1425,7 @@ mod tests {
 
     #[test]
     fn aggregate_computes_threshold_counts() {
-        let store = InMemoryTrustStore::new();
-        let clock = TestClock::new(2000);
-        let resolver = TestResolver::new();
-
-        let cache = AttestationCache::new(store);
-
-        let events = vec![make_event(
-            EventType::MessageSent,
-            "did:key:alice",
-            1000,
-            0,
-            vec![],
-        )];
-
-        let consequence_rules = vec![];
+        let mut resolver = TestResolver::new();
 
         // Set up threshold requirements.
         let mut threshold_requirements = HashMap::new();
@@ -1340,46 +1439,28 @@ mod tests {
         attestor_sets.insert(
             AttestationType::Endorsement,
             vec![
-                AttestorInfo {
-                    did: "did:key:attestor1".into(),
-                    context_memberships: std::collections::HashSet::new(),
-                    endorsements: std::collections::HashSet::new(),
-                    attestation: Some(make_attestation(
-                        "att-a1",
-                        "did:key:alice",
-                        AttestationType::Endorsement,
-                    )),
-                },
-                AttestorInfo {
-                    did: "did:key:attestor2".into(),
-                    context_memberships: std::collections::HashSet::new(),
-                    endorsements: std::collections::HashSet::new(),
-                    attestation: Some(make_attestation(
-                        "att-a2",
-                        "did:key:alice",
-                        AttestationType::Endorsement,
-                    )),
-                },
+                signed_attestor(
+                    &mut resolver,
+                    "did:key:attestor1",
+                    "did:key:alice",
+                    AttestationType::Endorsement,
+                    "att-a1",
+                ),
+                signed_attestor(
+                    &mut resolver,
+                    "did:key:attestor2",
+                    "did:key:alice",
+                    AttestationType::Endorsement,
+                    "att-a2",
+                ),
             ],
         );
 
-        let ctx = AggregationContext {
-            context_id: "ctx-1",
-            subject_did: "did:key:alice",
-            events: &events,
-            merkle_root: [0u8; 32],
-            consequence_rules: &consequence_rules,
-            threshold_requirements: &threshold_requirements,
-            attestor_sets: &attestor_sets,
-            cache: &cache,
-            resolver: &resolver,
-            clock: &clock,
-        };
-
-        let input = aggregate_trust_input(&ctx).unwrap();
+        let counts =
+            threshold_counts_via_aggregate(&resolver, &threshold_requirements, &attestor_sets, &[]);
 
         // Threshold counts should show (2, 3) for Endorsement type.
-        let counts = input.threshold_counts.get(&AttestationType::Endorsement);
+        let counts = counts.get(&AttestationType::Endorsement);
         assert!(counts.is_some(), "expected Endorsement in threshold_counts");
         let (met, required) = counts.unwrap();
         assert_eq!(*met, 2);
@@ -1518,36 +1599,39 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // compute_threshold_counts tests
+    // Threshold count tests, driven through aggregate_trust_input
+    //
+    // Every assertion here runs the caller path that ships in TrustInput, so a
+    // rule that `check_threshold_attestation` stops applying fails a test here
+    // rather than only inside the attestation module.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn threshold_counts_with_no_requirements_returns_empty() {
-        let requirements = HashMap::new();
-        let attestor_sets = HashMap::new();
-
-        let counts = compute_threshold_counts(&requirements, &attestor_sets);
+    fn aggregate_threshold_counts_empty_without_requirements() {
+        let resolver = TestResolver::new();
+        let counts =
+            threshold_counts_via_aggregate(&resolver, &HashMap::new(), &HashMap::new(), &[]);
         assert!(counts.is_empty());
     }
 
     #[test]
-    fn threshold_counts_with_empty_attestor_set() {
+    fn aggregate_threshold_counts_with_empty_attestor_set() {
+        let resolver = TestResolver::new();
         let mut requirements = HashMap::new();
         requirements.insert(
             AttestationType::OutletIntegrity,
             ThresholdRequirement::new(2, 3, 0.5),
         );
 
-        let attestor_sets = HashMap::new();
-
-        let counts = compute_threshold_counts(&requirements, &attestor_sets);
+        let counts = threshold_counts_via_aggregate(&resolver, &requirements, &HashMap::new(), &[]);
         let (met, required) = counts.get(&AttestationType::OutletIntegrity).unwrap();
         assert_eq!(*met, 0);
         assert_eq!(*required, 2);
     }
 
     #[test]
-    fn threshold_counts_multiple_types() {
+    fn aggregate_threshold_counts_multiple_types() {
+        let mut resolver = TestResolver::new();
         let mut requirements = HashMap::new();
         requirements.insert(
             AttestationType::Endorsement,
@@ -1561,19 +1645,16 @@ mod tests {
         let mut attestor_sets = HashMap::new();
         attestor_sets.insert(
             AttestationType::Endorsement,
-            vec![AttestorInfo {
-                did: "did:key:a".into(),
-                context_memberships: std::collections::HashSet::new(),
-                endorsements: std::collections::HashSet::new(),
-                attestation: Some(make_attestation(
-                    "att-1",
-                    "did:key:alice",
-                    AttestationType::Endorsement,
-                )),
-            }],
+            vec![signed_attestor(
+                &mut resolver,
+                "did:key:a",
+                "did:key:alice",
+                AttestationType::Endorsement,
+                "att-1",
+            )],
         );
 
-        let counts = compute_threshold_counts(&requirements, &attestor_sets);
+        let counts = threshold_counts_via_aggregate(&resolver, &requirements, &attestor_sets, &[]);
 
         // Endorsement: 1 met, 2 required.
         let (met, required) = counts.get(&AttestationType::Endorsement).unwrap();
@@ -1584,6 +1665,162 @@ mod tests {
         let (met, required) = counts.get(&AttestationType::OutletIntegrity).unwrap();
         assert_eq!(*met, 0);
         assert_eq!(*required, 1);
+    }
+
+    #[test]
+    fn aggregate_counts_repeated_attestor_did_once() {
+        // Spec §7.3.5 rule 1: multiple attestations from one DID count as one.
+        // Five copies of one endorser reaching `aggregate_trust_input` must
+        // report valid_count 1, not 5.
+        let mut resolver = TestResolver::new();
+        let attestor = signed_attestor(
+            &mut resolver,
+            "did:key:a",
+            "did:key:alice",
+            AttestationType::Endorsement,
+            "att-dup",
+        );
+
+        let mut requirements = HashMap::new();
+        requirements.insert(
+            AttestationType::Endorsement,
+            ThresholdRequirement::new(3, 5, 0.5),
+        );
+
+        let mut attestor_sets = HashMap::new();
+        attestor_sets.insert(
+            AttestationType::Endorsement,
+            vec![
+                attestor.clone(),
+                attestor.clone(),
+                attestor.clone(),
+                attestor.clone(),
+                attestor,
+            ],
+        );
+
+        let counts = threshold_counts_via_aggregate(&resolver, &requirements, &attestor_sets, &[]);
+        let (met, required) = counts.get(&AttestationType::Endorsement).unwrap();
+        assert_eq!(*met, 1, "five copies of one DID count once");
+        assert_eq!(*required, 3);
+    }
+
+    #[test]
+    fn aggregate_drops_attestation_naming_another_subject() {
+        let mut resolver = TestResolver::new();
+        let attestor = signed_attestor(
+            &mut resolver,
+            "did:key:a",
+            "did:key:mallory",
+            AttestationType::Endorsement,
+            "att-other-subject",
+        );
+
+        let mut requirements = HashMap::new();
+        requirements.insert(
+            AttestationType::Endorsement,
+            ThresholdRequirement::new(1, 1, 0.5),
+        );
+        let mut attestor_sets = HashMap::new();
+        attestor_sets.insert(AttestationType::Endorsement, vec![attestor]);
+
+        let counts = threshold_counts_via_aggregate(&resolver, &requirements, &attestor_sets, &[]);
+        let (met, _) = counts.get(&AttestationType::Endorsement).unwrap();
+        assert_eq!(
+            *met, 0,
+            "an endorsement written about did:key:mallory must not count for did:key:alice"
+        );
+    }
+
+    #[test]
+    fn aggregate_drops_attestation_issued_by_another_did() {
+        let mut resolver = TestResolver::new();
+        let mut attestor = signed_attestor(
+            &mut resolver,
+            "did:key:real-issuer",
+            "did:key:alice",
+            AttestationType::Endorsement,
+            "att-borrowed",
+        );
+        // The claimant carries an attestation that another DID issued.
+        attestor.did = "did:key:claimant".into();
+
+        let mut requirements = HashMap::new();
+        requirements.insert(
+            AttestationType::Endorsement,
+            ThresholdRequirement::new(1, 1, 0.5),
+        );
+        let mut attestor_sets = HashMap::new();
+        attestor_sets.insert(AttestationType::Endorsement, vec![attestor]);
+
+        let counts = threshold_counts_via_aggregate(&resolver, &requirements, &attestor_sets, &[]);
+        let (met, _) = counts.get(&AttestationType::Endorsement).unwrap();
+        assert_eq!(
+            *met, 0,
+            "an attestor may only claim an attestation that it issued itself"
+        );
+    }
+
+    #[test]
+    fn aggregate_drops_attestation_with_forged_signature() {
+        let mut resolver = TestResolver::new();
+        let mut attestor = signed_attestor(
+            &mut resolver,
+            "did:key:a",
+            "did:key:alice",
+            AttestationType::Endorsement,
+            "att-forged",
+        );
+        if let Some(attestation) = attestor.attestation.as_mut() {
+            attestation.signature = vec![0u8; 64];
+        }
+
+        let mut requirements = HashMap::new();
+        requirements.insert(
+            AttestationType::Endorsement,
+            ThresholdRequirement::new(1, 1, 0.5),
+        );
+        let mut attestor_sets = HashMap::new();
+        attestor_sets.insert(AttestationType::Endorsement, vec![attestor]);
+
+        let counts = threshold_counts_via_aggregate(&resolver, &requirements, &attestor_sets, &[]);
+        let (met, _) = counts.get(&AttestationType::Endorsement).unwrap();
+        assert_eq!(*met, 0, "a forged signature must not count");
+    }
+
+    #[test]
+    fn aggregate_drops_context_revoked_attestation_from_threshold_count() {
+        let mut resolver = TestResolver::new();
+        let attestor = signed_attestor(
+            &mut resolver,
+            "did:key:a",
+            "did:key:alice",
+            AttestationType::Endorsement,
+            "att-revoked",
+        );
+
+        let mut requirements = HashMap::new();
+        requirements.insert(
+            AttestationType::Endorsement,
+            ThresholdRequirement::new(1, 1, 0.5),
+        );
+        let mut attestor_sets = HashMap::new();
+        attestor_sets.insert(AttestationType::Endorsement, vec![attestor]);
+
+        // Sanity: the same endorsement counts while the context has not
+        // revoked it.
+        let counts = threshold_counts_via_aggregate(&resolver, &requirements, &attestor_sets, &[]);
+        let (met, _) = counts.get(&AttestationType::Endorsement).unwrap();
+        assert_eq!(*met, 1, "an unrevoked endorsement counts");
+
+        let counts = threshold_counts_via_aggregate(
+            &resolver,
+            &requirements,
+            &attestor_sets,
+            &["att-revoked"],
+        );
+        let (met, _) = counts.get(&AttestationType::Endorsement).unwrap();
+        assert_eq!(*met, 0, "a context-revoked endorsement must stop counting");
     }
 
     // -----------------------------------------------------------------------

@@ -1345,46 +1345,36 @@ pub struct NapiDIDDocument {
 // `Scp` methods in `scp.rs` are now the only entry points — bridge state
 // flows through `&self.inner` rather than the process-global default.
 //
-// PR-E #28 (ADR-048 §1): `identity_verify_link_attestation` is restored
-// as a module-level free fn. The operation is pure Ed25519 signature
-// verification — no bridge-instance state is required — so the per-
-// instance method on `Scp` was Gaming-the-Gate fraud (`let _ = &self.inner;`
-// to satisfy the pure-helpers scanner). The TypeScript SDK's
-// `SCP.identityVerifyLinkAttestation` routes through the addon's module-
-// level export per ADR-048 §7 (TS keeps the method shape as a TS-local
-// ergonomic choice; the body routes via `nativeFreeFn`).
+// PR-E #28 (ADR-048 §1) restored `identity_verify_link_attestation` as a
+// module-level free fn, on a premise #2335 finding 2 falsified: that the
+// operation is pure Ed25519 signature verification against a caller-supplied
+// key. Spec §3.5.4 step 1 resolves an issuer's DID document FIRST and takes a
+// signing key from it, so a key a caller supplies is an assertion to check
+// rather than a source of truth — and checking it needs this instance's DID
+// resolver. Phase D (#1695) deleted every process-wide default bridge
+// instance, so a free fn reaches no resolver. Free fn below therefore declines
+// with `SCP-IDENT-1060` and names `Scp::identity_verify_link_attestation`
+// (scp.rs), which resolves and runs every §3.5.4 step.
 
-/// Verifies an identity link attestation signature using a provided issuer
-/// public key.
+/// Declines identity link attestation verification at module scope, fail
+/// closed (`SCP-IDENT-1060`).
 ///
-/// Pure Ed25519 signature verification — touches no bridge-instance state
-/// and is exposed at module scope per ADR-048 §1.
+/// See [`crate::scp::Scp::identity_verify_link_attestation`] for a per-instance
+/// method that resolves an issuer's DID document and runs spec §3.5.4.
 ///
 /// # Errors
 ///
-/// Returns `SCP-IDENT-1044` on JSON parse failure or invalid hex.
+/// Always returns `SCP-IDENT-1060`.
 #[napi(js_name = "identityVerifyLinkAttestation")]
-pub fn identity_verify_link_attestation(
+pub fn identity_verify_link_attestation_module_scope(
     attestation_json: String,
     issuer_public_key_hex: String,
 ) -> napi::Result<bool> {
-    use scp_core::identity::attestation::IdentityLinkAttestation;
-
-    let attestation: IdentityLinkAttestation =
-        serde_json::from_str(&attestation_json).map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("failed to parse attestation JSON: {e}"),
-                code: codes::IDENT_1044.to_owned(),
-            })
-        })?;
-
-    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("invalid issuer_public_key_hex: {e}"),
-            code: codes::IDENT_1044.to_owned(),
-        })
-    })?;
-    Ok(attestation.verify_signature(&pub_bytes).is_ok())
+    let _ = (attestation_json, issuer_public_key_hex);
+    Err(NapiError::from(ScpNapiError::Identity {
+        message: scp_ffi_common::attestation::LINK_VERIFY_REQUIRES_INSTANCE.to_owned(),
+        code: codes::IDENT_1060.to_owned(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2123,6 +2113,116 @@ mod tests {
             ),
             "original and migrated identities must share the same Arc<InMemoryKeyCustody>"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity link attestation verification (spec §3.5.4, issue #2335 #2)
+    // -----------------------------------------------------------------------
+
+    /// A module-scope free function reaches no bridge instance, so it cannot
+    /// perform §3.5.4 step 1 and must decline rather than verify a
+    /// caller-supplied key against a caller-supplied attestation.
+    #[test]
+    fn module_scope_link_verification_declines_fail_closed() {
+        let err = identity_verify_link_attestation_module_scope(
+            "{\"not\":\"an attestation\"}".to_owned(),
+            "00".repeat(32),
+        )
+        .expect_err("module-scope verification must decline");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1060),
+            "module-scope verification must decline with SCP-IDENT-1060, got: {msg}"
+        );
+    }
+
+    /// Mints a Class 1 (`oauth`) link attestation on a fresh identity and
+    /// returns an `Scp` bound to that identity's bridge instance, that
+    /// identity's DID, its attestation JSON, and its `#active` key as hex.
+    async fn minted_link_attestation() -> (crate::scp::Scp, String, String, String) {
+        let (identity, active_multibase) = create_test_identity().await;
+        let scp = crate::scp::Scp {
+            inner: Arc::clone(&identity.inner.bi),
+        };
+        let did = identity.did();
+        let attestation_json = scp
+            .identity_create_link_attestation(
+                did.clone(),
+                "google.com".to_owned(),
+                "alice".to_owned(),
+                r#"{"provider":"google.com","subject_id":"12345","verified_at":1700000000}"#
+                    .to_owned(),
+                "oauth".to_owned(),
+                Some("12345".to_owned()),
+            )
+            .await
+            .expect("minting a link attestation must succeed");
+        let active_hex = hex::encode(
+            scp_did::decode_multibase_key(&active_multibase)
+                .expect("a freshly minted #active key must decode"),
+        );
+        (scp, did, attestation_json, active_hex)
+    }
+
+    #[test]
+    fn per_instance_link_verification_accepts_a_key_the_did_document_publishes() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let (scp, _did, attestation_json, active_hex) = minted_link_attestation().await;
+            let verified = scp
+                .identity_verify_link_attestation(attestation_json, active_hex)
+                .await
+                .expect("verification of a freshly minted attestation must not error");
+            assert!(
+                verified,
+                "an attestation signed by the #active key an issuer's DID document \
+                 publishes must verify (spec §3.5.4)"
+            );
+        });
+    }
+
+    /// Regression pin for GitHub issue #2335 finding 2. Until that fix, this
+    /// bridge verified an attestation against whatever key its caller passed,
+    /// so an attacker who supplied both received `true`. Verification now takes
+    /// its key from an issuer's resolved DID document, so a key that document
+    /// does not publish yields `false`.
+    #[test]
+    fn per_instance_link_verification_rejects_a_key_the_did_document_omits() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let (scp, _did, attestation_json, _active_hex) = minted_link_attestation().await;
+            let attacker_hex = "07".repeat(32);
+            let verified = scp
+                .identity_verify_link_attestation(attestation_json, attacker_hex)
+                .await
+                .expect("verification against an unpublished key must not error");
+            assert!(
+                !verified,
+                "a key an issuer's DID document does not publish must not verify \
+                 (spec §3.5.4 step 1)"
+            );
+        });
+    }
+
+    #[test]
+    fn per_instance_link_verification_rejects_a_tampered_attestation() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let (scp, _did, attestation_json, active_hex) = minted_link_attestation().await;
+            let tampered = attestation_json.replace("\"alice\"", "\"mallory\"");
+            assert_ne!(
+                tampered, attestation_json,
+                "tampering must change the attestation JSON"
+            );
+            let verified = scp
+                .identity_verify_link_attestation(tampered, active_hex)
+                .await
+                .expect("verification of a tampered attestation must not error");
+            assert!(
+                !verified,
+                "an attestation whose handle changed after signing must not verify"
+            );
+        });
     }
 }
 

@@ -34,7 +34,7 @@ use scp_core::trust::{
     CustodyViolationType, EarnedCapacityLevel, EnforcementSeverity, FreshnessStatus,
     FreshnessWeight, IdentityDepthAssessment, ParticipationFact, ParticipationInput,
     ParticipationThreshold, RequireParticipation, RevocationStatus, ScpCustodyViolationAttestation,
-    ThresholdRequirement, TrustError, TrustSignal, TrustSignalCategory,
+    ThresholdCheckInput, ThresholdRequirement, TrustError, TrustSignal, TrustSignalCategory,
     check_attestation_freshness, check_threshold_attestation, classify_action,
     compute_participation_record, enforce_category_a, evaluate_consequence_rules,
     evaluate_earned_capacity, evaluate_sybil_resistance, issue_challenge,
@@ -353,26 +353,31 @@ async fn attestation_freshness() {
 #[tokio::test]
 async fn attestation_threshold() {
     let att_type = AttestationType::Endorsement;
+    let subject = did("did:dht:z6MkSubject");
+    let clock = FixedClock(1500);
+    let mut resolver = TestKeyResolver::new();
 
-    // Build 3 attestors with endorsement attestations.
+    // Build 3 attestors, each carrying an endorsement it signed itself about
+    // the subject. `check_threshold_attestation` verifies every signature, so
+    // each attestor's key goes into the resolver.
     let attestors: Vec<AttestorInfo> = (0..3)
         .map(|i| {
-            let att = Attestation {
-                id: format!("att-{i}"),
-                attestation_type: att_type.clone(),
-                issuer: did(&format!("did:dht:z6MkAttestor{i}")),
-                subject: did("did:dht:z6MkSubject"),
-                claim: serde_json::json!({}),
-                evidence: None,
-                issued_at: 1000,
-                expires_at: None,
-                renewal_interval: None,
-                renewed_at: None,
-                revocation_status: RevocationStatus::Active,
-                signature: vec![0; 64],
-            };
+            let sk = sk_for(i);
+            let att = make_signed_attestation(
+                &format!("att-{i}"),
+                att_type.clone(),
+                // `make_signed_attestation` overwrites the issuer with the
+                // did:key form of the signing key it uses.
+                "did:key:placeholder",
+                "did:dht:z6MkSubject",
+                &sk,
+                1000,
+                None,
+                None,
+            );
+            resolver.add(&att.issuer, sk.verifying_key().to_bytes().to_vec());
             AttestorInfo {
-                did: did(&format!("did:dht:z6MkAttestor{i}")),
+                did: att.issuer.clone(),
                 context_memberships: HashSet::new(),
                 endorsements: HashSet::new(),
                 attestation: Some(att),
@@ -382,13 +387,29 @@ async fn attestation_threshold() {
 
     // 2-of-3 threshold should be met.
     let requirement = ThresholdRequirement::new(2, 3, 0.5);
-    let result = check_threshold_attestation(&att_type, &attestors, &requirement);
+    let result = check_threshold_attestation(&ThresholdCheckInput {
+        attestation_type: &att_type,
+        subject_did: &subject,
+        attestors: &attestors,
+        requirement: &requirement,
+        resolver: &resolver,
+        clock: &clock,
+        revocation_checker: None,
+    });
     assert!(result.met, "2-of-3 threshold should be met");
     assert_eq!(result.valid_count, 3);
 
     // 4-of-5 threshold should NOT be met (only 3 attestors provided).
     let strict_requirement = ThresholdRequirement::new(4, 5, 0.5);
-    let result_strict = check_threshold_attestation(&att_type, &attestors, &strict_requirement);
+    let result_strict = check_threshold_attestation(&ThresholdCheckInput {
+        attestation_type: &att_type,
+        subject_did: &subject,
+        attestors: &attestors,
+        requirement: &strict_requirement,
+        resolver: &resolver,
+        clock: &clock,
+        revocation_checker: None,
+    });
     assert!(
         !result_strict.met,
         "4-of-5 threshold should not be met with only 3 attestors"

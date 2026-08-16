@@ -47,13 +47,14 @@ use scp_dht::DhtClient;
 #[cfg(test)]
 use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::dht::FfiDhtClient;
-// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` are named only by the
-// testing-gated DID-resolver-init and DHT-signer helpers (production create
-// fails closed before resolver init — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
+// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` back
+// `ensure_did_resolver_initialized_on`, which every build reaches through
+// `Scp::identity_verify_link_attestation` (spec §3.5.4 step 1 resolves an
+// issuer's DID document) and a testing build also reaches through
+// identity-create (production create fails closed before resolver init —
+// ADR-062 §Decision 6).
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
-#[cfg(feature = "testing")]
 use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 
 use scp_did::DidDocument as CoreDidDocument;
@@ -4311,32 +4312,34 @@ pub async fn identity_verify_device_attestation(
     identity_verify_device_attestation_impl(did, token_base64).await
 }
 
-/// Verifies the Ed25519 signature on an identity link attestation.
+/// Declines identity link attestation verification at module scope, fail
+/// closed (`SCP-IDENT-1060`).
 ///
-/// Signature verification is a pure function and does not require
-/// in-memory custody — only the issuer's Ed25519 public key. ADR-048 §1:
-/// pure helper, no per-instance state.
+/// This function was documented as a pure helper needing only an issuer's
+/// Ed25519 public key. GitHub issue #2335 finding 2 falsified that premise:
+/// spec §3.5.4 step 1 resolves an issuer's DID document and takes a signing key
+/// from it, so a key a caller supplies is an assertion to check rather than a
+/// source of truth. Checking it needs a per-instance DID resolver, and phase D
+/// (pull request #1695) deleted every process-wide default bridge instance, so
+/// a free function reaches none.
 ///
-/// See spec §3.5.1.
-#[uniffi::export]
+/// Callers move to `Scp::identity_verify_link_attestation`, which resolves an
+/// issuer's document and runs every §3.5.4 step.
+///
+/// # Errors
+///
+/// Always returns `SCP-IDENT-1060`.
+#[uniffi::export(name = "identity_verify_link_attestation")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn identity_verify_link_attestation(
+pub fn identity_verify_link_attestation_module_scope(
     attestation_json: String,
     issuer_public_key_hex: String,
 ) -> Result<bool, ScpError> {
-    use scp_core::identity::attestation::IdentityLinkAttestation;
-
-    let attestation: IdentityLinkAttestation =
-        serde_json::from_str(&attestation_json).map_err(|e| ScpError::Identity {
-            msg: format!("failed to parse attestation JSON: {e}"),
-            code: codes::IDENT_1044.to_owned(),
-        })?;
-
-    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| ScpError::Identity {
-        msg: format!("invalid issuer_public_key_hex: {e}"),
-        code: codes::IDENT_1044.to_owned(),
-    })?;
-    Ok(attestation.verify_signature(&pub_bytes).is_ok())
+    let _ = (attestation_json, issuer_public_key_hex);
+    Err(ScpError::Identity {
+        msg: scp_ffi_common::attestation::LINK_VERIFY_REQUIRES_INSTANCE.to_owned(),
+        code: codes::IDENT_1060.to_owned(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -9448,10 +9451,16 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
 /// [`crate::scp::Scp`] identity methods to keep "init on first use"
 /// semantics scoped to the owning instance.
 ///
-/// Only reached from the testing-gated identity-create paths (production create
-/// fails closed before resolver init — ADR-062 §Decision 6).
-#[cfg(feature = "testing")]
-fn ensure_did_resolver_initialized_on(
+/// Two callers reach this initializer. A testing-gated identity-create path
+/// calls it after minting (production create fails closed before resolver
+/// init — ADR-062 §Decision 6). `Scp::identity_verify_link_attestation` calls
+/// it on every build, because spec §3.5.4 step 1 resolves an issuer's DID
+/// document and a verifying instance need never have created an identity of
+/// its own. Body is production-safe on both paths: it builds a DHT client
+/// through `build_ffi_dht_client`, which constructs a real Mainline Pkarr
+/// client on a shipped build and fails closed rather than substituting an
+/// in-memory one (ADR-062 §Decision 1).
+pub(crate) fn ensure_did_resolver_initialized_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: tokio::runtime::Handle,
 ) -> Result<(), ScpError> {
@@ -10024,6 +10033,97 @@ impl Scp {
         let before = entry.len();
         entry.retain(|a| a.id != attestation_id);
         entry.len() < before
+    }
+
+    /// Verifies an identity link attestation per spec §3.5.4.
+    ///
+    /// Resolves an issuer's DID document through this instance's validating
+    /// resolver (§3.5.4 step 1), then runs every remaining step through the
+    /// pure `scp_core::identity::attestation::verify_identity_link_attestation`
+    /// seam: structural validation, document-to-issuer binding, signature
+    /// against a key that document publishes at `#active` or `#agent`,
+    /// `revocation_status`, `expires_at`, and evidence freshness.
+    ///
+    /// A module-level `identity_verify_link_attestation` free function remains
+    /// exported and declines with `SCP-IDENT-1060`: it reaches no bridge
+    /// instance, so it cannot perform §3.5.4 step 1.
+    ///
+    /// # Arguments
+    ///
+    /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+    /// * `issuer_public_key_hex` — Hex-encoded 32-byte Ed25519 public key that
+    ///   a caller asserts signed this attestation. This method checks that
+    ///   assertion against an issuer's resolved DID document; it never uses
+    ///   this key as a substitute for that document.
+    ///
+    /// # Returns
+    ///
+    /// `true` when every §3.5.4 step passes and a key a caller named is a key
+    /// that verified. `false` when a step rejects, including a Class 2
+    /// (`signed_post` / `dns_record`) attestation whose external proof resource
+    /// this bridge does not fetch — §3.5.0 makes an unfetched Reference
+    /// attestation equivalent to no attestation, so a caller performs that
+    /// fetch itself. Stale evidence returns `true`, because §3.5.4 step 5
+    /// degrades rather than rejects. Every rejection reason reaches `tracing`
+    /// at `info` level.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SCP-IDENT-1044` when the JSON or the hex key is malformed, and
+    /// `SCP-IDENT-1060` when an issuer's DID document cannot be resolved — a
+    /// precondition failure, which this method never reports as `false`.
+    pub async fn identity_verify_link_attestation(
+        &self,
+        attestation_json: String,
+        issuer_public_key_hex: String,
+    ) -> Result<bool, ScpError> {
+        use scp_clock::Clock;
+
+        let parsed = scp_ffi_common::attestation::parse_link_attestation(
+            &attestation_json,
+            &issuer_public_key_hex,
+        )
+        .map_err(|e| ScpError::Identity {
+            msg: e.to_string(),
+            code: codes::IDENT_1044.to_owned(),
+        })?;
+
+        let handle = runtime().handle().clone();
+        ensure_did_resolver_initialized_on(&self.inner, handle)?;
+        let resolver = self
+            .inner
+            .did_resolver()
+            .ok_or_else(|| ScpError::Identity {
+                msg: "identity link attestation verification has no DID resolver on this bridge \
+                  instance"
+                    .to_owned(),
+                code: codes::IDENT_1060.to_owned(),
+            })?;
+
+        let issuer = parsed.issuer_did().to_owned();
+        let issuer_document = scp_identity::resolver::DidResolver::resolve(&*resolver, &issuer)
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!(
+                    "identity link attestation verification could not resolve issuer {issuer} \
+                     (spec §3.5.4 step 1): {e}"
+                ),
+                code: codes::IDENT_1060.to_owned(),
+            })?
+            .ok_or_else(|| ScpError::Identity {
+                msg: format!(
+                    "identity link attestation verification found no DID document for issuer \
+                     {issuer} (spec §3.5.4 step 1)"
+                ),
+                code: codes::IDENT_1060.to_owned(),
+            })?;
+
+        let now_secs = scp_clock::SystemClock.now_secs();
+        Ok(scp_ffi_common::attestation::decide_link_attestation(
+            &parsed,
+            &issuer_document.document,
+            now_secs,
+        ))
     }
 
     /// Removes a DID from this instance's SCP-side identity registry.
@@ -25677,5 +25777,40 @@ mod tests {
                 other => panic!("expected SagaAborted (axis a), got {other:?}"),
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity link attestation verification (spec §3.5.4, issue #2335 #2)
+    // -----------------------------------------------------------------------
+
+    /// A module-scope free function reaches no bridge instance, so it cannot
+    /// perform §3.5.4 step 1 (resolve an issuer's DID document) and must
+    /// decline rather than verify a caller-supplied key against a
+    /// caller-supplied attestation.
+    #[test]
+    fn module_scope_link_verification_declines_fail_closed() {
+        let err = identity_verify_link_attestation_module_scope("{}".to_owned(), "00".repeat(32))
+            .expect_err("module-scope verification must decline");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1060),
+            "module-scope verification must decline with SCP-IDENT-1060, got: {msg}"
+        );
+    }
+
+    /// A malformed argument is a caller error (`SCP-IDENT-1044`), reported
+    /// before any resolution attempt — never a `false` verdict, which would
+    /// say "forged" about an attestation nobody parsed.
+    #[test]
+    fn per_instance_link_verification_rejects_malformed_arguments() {
+        let scp = scp_test();
+        let err = runtime()
+            .block_on(scp.identity_verify_link_attestation("not json".to_owned(), "00".repeat(32)))
+            .expect_err("malformed JSON must raise");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(codes::IDENT_1044),
+            "malformed attestation JSON must raise SCP-IDENT-1044, got: {msg}"
+        );
     }
 }

@@ -972,7 +972,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       );
     });
 
-    it("scp.identityVerifyLinkAttestation accepts a freshly-minted attestation", async () => {
+    it("scp.identityVerifyLinkAttestation declines while it routes to a module-level free fn", async () => {
       const identity = await scp.identityCreate("in_memory");
       const attestationJson = await scp.identityCreateLinkAttestation(
         identity.did,
@@ -981,26 +981,26 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         "https://example.com/proof-carol",
         "dns_record",
       );
-      // The resolver needs the issuer's public key hex. We extract it
-      // from the DID document — the first verification method's
-      // publicKeyMultibase encodes the key in base58btc ("z" prefix).
-      const doc = (await scp.identityResolve(identity.did)) as {
-        verificationMethods: Array<{ publicKeyMultibase: string }>;
-      };
-      const multibase = doc.verificationMethods[0]?.publicKeyMultibase;
-      expect(multibase).toBeDefined();
-      // `scp.identityVerifyLinkAttestation` expects hex (not multibase).
-      // Rather than re-derive the hex form here, we verify that
-      // passing a *malformed* key hex rejects — which at least pins
-      // the surface. A happy-path verify requires the issuer public
-      // key hex, which is not exposed on the DID doc directly.
+      // GitHub issue #2335 finding 2: spec §3.5.4 step 1 resolves an issuer's
+      // DID document and takes a signing key from it, so a key a caller
+      // supplies is an assertion to check rather than a source of truth.
+      // Checking it needs a per-instance DID resolver, and a module-level NAPI
+      // free fn reaches no bridge instance (phase D, #1695, deleted every
+      // process-wide default bridge instance). That free fn therefore declines
+      // with SCP-IDENT-1060, and this SCP method still routes to it.
+      //
+      // A per-instance route already exists: the NAPI `Scp` class exports
+      // `identityVerifyLinkAttestation`, and `internal/native.ts` calls it.
+      // Pointing `SCP.identityVerifyLinkAttestation` at that route needs an
+      // edit to bindings/typescript/src/scp.ts.
       let verifyErr: unknown;
       try {
-        await scp.identityVerifyLinkAttestation(attestationJson, "not-hex");
+        await scp.identityVerifyLinkAttestation(attestationJson, "00".repeat(32));
       } catch (e) {
         verifyErr = e;
       }
       expect(verifyErr).toBeInstanceOf(Error);
+      expect((verifyErr as Error).message).toContain("SCP-IDENT-1060");
     });
   });
 

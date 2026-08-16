@@ -986,52 +986,39 @@ pub fn identity_verify_device_attestation(_did: &str, token_base64: &str) -> PyR
     )))
 }
 
-/// Verifies the Ed25519 signature on an identity link attestation.
+/// Declines identity link attestation verification at module scope, fail
+/// closed (`SCP-IDENT-1060`).
 ///
-/// Parses the attestation JSON string and verifies the signature using the
-/// provided issuer public key.
+/// Spec §3.5.4 step 1 resolves an issuer's DID document before any later step,
+/// and a module-level free function reaches no per-instance DID resolver —
+/// phase D (pull request #1695) deleted every process-wide default bridge
+/// instance. So this function verifies nothing and says so.
 ///
-/// The issuer's public key cannot be reliably extracted from the DID string
-/// because attestations are signed with `#active` or `#agent` keys
-/// (spec §3.5.2), not the `#0` identity key embedded in the DID.
+/// Until #2335, this function returned `attestation.verify_signature(&caller_key).is_ok()`.
+/// That answered `true` for an attacker who supplied both an attestation and a
+/// key, because no step bound that key to an issuer's DID document. Callers
+/// move to [`PyScp::verify_identity_link_attestation`], which resolves and runs
+/// every §3.5.4 step.
 ///
 /// # Arguments
 ///
 /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
-/// * `issuer_public_key_hex` — Hex-encoded Ed25519 public key of the
-///   issuer.
-///
-/// # Returns
-///
-/// `True` if the signature is valid, `False` otherwise.
+/// * `issuer_public_key_hex` — Hex-encoded Ed25519 public key of an issuer.
 ///
 /// # Errors
 ///
-/// Raises `IdentityError` if the JSON is malformed or the hex key is
-/// invalid.
-///
-/// See spec §3.5.1.
+/// Always raises `IdentityError` with code `SCP-IDENT-1060`.
 #[pyfunction]
 #[pyo3(name = "py_verify_identity_link_attestation")]
-pub fn verify_identity_link_attestation(
-    py: Python<'_>,
+pub fn verify_identity_link_attestation_module_scope(
     attestation_json: &str,
     issuer_public_key_hex: &str,
 ) -> PyResult<bool> {
-    use scp_core::identity::attestation::IdentityLinkAttestation;
-
-    let json_owned = attestation_json.to_owned();
-    let hex_key_owned = issuer_public_key_hex.to_owned();
-
-    py.allow_threads(move || -> Result<bool, ScpPyError> {
-        let attestation: IdentityLinkAttestation = serde_json::from_str(&json_owned)
-            .map_err(|e| ScpPyError::identity(format!("failed to parse attestation JSON: {e}")))?;
-
-        let pub_bytes = hex::decode(&hex_key_owned)
-            .map_err(|e| ScpPyError::identity(format!("invalid issuer_public_key_hex: {e}")))?;
-        Ok(attestation.verify_signature(&pub_bytes).is_ok())
-    })
-    .map_err(PyErr::from)
+    let _ = (attestation_json, issuer_public_key_hex);
+    Err(PyErr::from(ScpPyError::identity_with_code(
+        scp_ffi_common::attestation::LINK_VERIFY_REQUIRES_INSTANCE.to_owned(),
+        scp_ffi_common::error_codes::IDENT_1060,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,6 +1628,108 @@ impl crate::scp::PyScp {
                 Ok(PyDIDDocument::new(&bi, document))
             })
         })
+    }
+
+    /// Verifies an identity link attestation per spec §3.5.4.
+    ///
+    /// Resolves an issuer's DID document through this instance's validating
+    /// resolver (§3.5.4 step 1), then runs every remaining step through the
+    /// pure `scp_core::identity::attestation::verify_identity_link_attestation`
+    /// seam: structural validation, document-to-issuer binding, signature
+    /// against a key that document publishes at `#active` or `#agent`,
+    /// `revocation_status`, `expires_at`, and evidence freshness.
+    ///
+    /// # Arguments
+    ///
+    /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+    /// * `issuer_public_key_hex` — Hex-encoded 32-byte Ed25519 public key that
+    ///   a caller asserts signed this attestation. This method checks that
+    ///   assertion against an issuer's resolved DID document; it never uses
+    ///   this key as a substitute for that document. A caller who names a key
+    ///   other than one that verified receives `False`.
+    ///
+    /// # Returns
+    ///
+    /// `True` when every §3.5.4 step passes and a key a caller named is a key
+    /// that verified. `False` when a step rejects — a bad signature, a revoked
+    /// or expired attestation, a key an issuer's document does not publish, or
+    /// a Class 2 (`signed_post` / `dns_record`) attestation whose external
+    /// proof resource this bridge does not fetch. Spec §3.5.0 states that an
+    /// unverified Reference attestation is equivalent to no attestation, so a
+    /// caller performs that fetch itself and treats a `False` on a Class 2
+    /// attestation as "not yet verified" rather than as "forged". Every
+    /// rejection reason reaches `tracing` at `info` level.
+    ///
+    /// Stale evidence (§3.5.4 step 5) returns `True`: §3.5.4 degrades a stale
+    /// attestation's trust weight and does not reject it.
+    ///
+    /// # Errors
+    ///
+    /// Raises `IdentityError` with `SCP-IDENT-1044` when the JSON or the hex
+    /// key is malformed, and with `SCP-IDENT-1060` when an issuer's DID
+    /// document cannot be resolved — a precondition failure, which this method
+    /// never reports as `False`.
+    pub fn verify_identity_link_attestation(
+        &self,
+        py: Python<'_>,
+        attestation_json: &str,
+        issuer_public_key_hex: &str,
+    ) -> PyResult<bool> {
+        let parsed = scp_ffi_common::attestation::parse_link_attestation(
+            attestation_json,
+            issuer_public_key_hex,
+        )
+        .map_err(|e| {
+            ScpPyError::identity_with_code(e.to_string(), scp_ffi_common::error_codes::IDENT_1044)
+        })?;
+
+        let rt = crate::runtime()?;
+        let bi = Arc::clone(&self.inner);
+
+        py.allow_threads(move || -> Result<bool, ScpPyError> {
+            ensure_did_resolver_initialized_on(&bi, rt.handle().clone())?;
+            let resolver = crate::runtime::did_resolver(&bi).ok_or_else(|| {
+                ScpPyError::identity_with_code(
+                    "identity link attestation verification has no DID resolver on this \
+                     bridge instance"
+                        .to_owned(),
+                    scp_ffi_common::error_codes::IDENT_1060,
+                )
+            })?;
+            let resolver = Arc::clone(resolver);
+
+            let issuer = parsed.issuer_did().to_owned();
+            let issuer_document = rt
+                .block_on(async {
+                    scp_identity::resolver::DidResolver::resolve(&*resolver, &issuer).await
+                })
+                .map_err(|e| {
+                    ScpPyError::identity_with_code(
+                        format!(
+                            "identity link attestation verification could not resolve issuer \
+                             {issuer} (spec §3.5.4 step 1): {e}"
+                        ),
+                        scp_ffi_common::error_codes::IDENT_1060,
+                    )
+                })?
+                .ok_or_else(|| {
+                    ScpPyError::identity_with_code(
+                        format!(
+                            "identity link attestation verification found no DID document for \
+                             issuer {issuer} (spec §3.5.4 step 1)"
+                        ),
+                        scp_ffi_common::error_codes::IDENT_1060,
+                    )
+                })?;
+
+            let now_secs = scp_clock::SystemClock.now_secs();
+            Ok(scp_ffi_common::attestation::decide_link_attestation(
+                &parsed,
+                &issuer_document.document,
+                now_secs,
+            ))
+        })
+        .map_err(PyErr::from)
     }
 
     /// Rotates the active signing key for an identity.
@@ -2751,7 +2840,10 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // shipped build gets the fail-closed (IDENT_1016) free fn. Both cfg arms
     // define `identity_verify_device_attestation`, so the name always resolves.
     m.add_function(wrap_pyfunction!(identity_verify_device_attestation, m)?)?;
-    m.add_function(wrap_pyfunction!(verify_identity_link_attestation, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        verify_identity_link_attestation_module_scope,
+        m
+    )?)?;
     Ok(())
 }
 
@@ -2836,6 +2928,47 @@ mod tests {
             assert_eq!(
                 recomputed, pre_rot.commitment,
                 "PreRotationProof MUST satisfy SHA-256(revealed_key) == commitment"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity link attestation verification (spec §3.5.4, issue #2335 #2)
+    // -----------------------------------------------------------------------
+
+    /// A module-scope free function reaches no bridge instance, so it cannot
+    /// perform §3.5.4 step 1 (resolve an issuer's DID document) and must
+    /// decline rather than verify a caller-supplied key against a
+    /// caller-supplied attestation.
+    #[test]
+    fn module_scope_link_verification_declines_fail_closed() {
+        setup();
+        Python::with_gil(|_py| {
+            let err = verify_identity_link_attestation_module_scope("{}", &"00".repeat(32))
+                .expect_err("module-scope verification must decline");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(scp_ffi_common::error_codes::IDENT_1060),
+                "module-scope verification must decline with SCP-IDENT-1060, got: {msg}"
+            );
+        });
+    }
+
+    /// A malformed argument is a caller error (`SCP-IDENT-1044`), reported
+    /// before any resolution attempt — never a `False` verdict, which would
+    /// say "forged" about an attestation nobody parsed.
+    #[test]
+    fn per_instance_link_verification_rejects_malformed_arguments() {
+        setup();
+        let scp = default_scp();
+        Python::with_gil(|py| {
+            let err = scp
+                .verify_identity_link_attestation(py, "not json", &"00".repeat(32))
+                .expect_err("malformed JSON must raise");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(scp_ffi_common::error_codes::IDENT_1044),
+                "malformed attestation JSON must raise SCP-IDENT-1044, got: {msg}"
             );
         });
     }

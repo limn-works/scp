@@ -39,7 +39,8 @@ pub use challenge::{
     verify_challenge_verification,
 };
 pub use custody_violation::{
-    ActionCategory, CounterAttestation, CustodyViolationError, CustodyViolationType,
+    ActionCategory, COUNTER_ATTESTATION_DOMAIN, CUSTODY_VIOLATION_DOMAIN, CounterAttestation,
+    CustodyViolationError, CustodyViolationResult, CustodyViolationType,
     ScpCustodyViolationAttestation, classify_action, enforce_category_a,
 };
 pub use participation::{

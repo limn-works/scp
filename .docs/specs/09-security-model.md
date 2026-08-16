@@ -538,6 +538,33 @@ Note: The `ProposalId` is the SHA-256 output (32 bytes). It is deterministic for
 
 Note: The Ed25519 signature is over `SHA-256("SCP-VOTE-V1:" || fields)`. The `proposal_id` binds the vote to a specific proposal, preventing cross-proposal replay. `VoteType` is serialized as compact JSON (equivalent to `json.dumps(separators=(',', ':'))` in Python).
 
+**ScpCustodyViolationAttestation** — domain: `"SCP-CUSTODY-VIOLATION-V1:"`
+
+ADR-039, shared-DID human-agent identity model, defines a custody violation at enforcement-stack layer 4 as a permanent record that one verifier writes about a subject who never consented to it. A reader must be able to establish which verifier wrote a given record, and must be able to detect a record that any other party altered after that verifier signed it. Fields 1 through 7 below feed one Ed25519 signature that carries both properties.
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `subject_did` | 4-byte BE length + UTF-8 bytes |
+| 2 | `timestamp` | 8-byte BE u64 |
+| 3 | `violation_tag` | 1-byte U8 discriminator (`0x00` = `CategoryAViolation`, `0x01` = `AttestationMismatch`) |
+| 4 | `violation_field_1` | 4-byte BE length + bytes — `action` (UTF-8) when `violation_tag` is `0x00`, `claimed_custody` (UTF-8) when `violation_tag` is `0x01` |
+| 5 | `violation_field_2` | 4-byte BE length + bytes — `signer_key_id` (UTF-8 `"#active"` / `"#agent"`) when `violation_tag` is `0x00`, `observed_behavior` (UTF-8) when `violation_tag` is `0x01` |
+| 6 | `violation_field_3` | 4-byte BE length + raw bytes — `signature_evidence` when `violation_tag` is `0x00`, `attestation_evidence` when `violation_tag` is `0x01` |
+| 7 | `verifier_did` | 4-byte BE length + UTF-8 bytes |
+
+Note: `verifier_signature` is one field this preimage omits, and it is the only such field, so a party who alters `subject_did`, `timestamp`, any component of `violation`, or `verifier_did` moves this hash away from whatever value a stored `verifier_signature` covers, and a verifier then rejects that altered record. `violation_tag` at position 3 separates both variants: without `violation_tag`, a `CategoryAViolation` whose three variable-length fields carry the same bytes as an `AttestationMismatch` hashes identically, so a verifier's signature over one variant transfers to another. A verifier resolves `verifier_did` to its `#active` or `#agent` verification method and checks `verifier_signature` against `SHA-256("SCP-CUSTODY-VIOLATION-V1:" || fields)`. `verifier_signature` establishes who wrote a record. It does not establish that a recorded violation occurred, because that verifier alone chose what to write.
+
+**CounterAttestation** — domain: `"SCP-COUNTER-ATTESTATION-V1:"`
+
+| Order | Field | Encoding |
+|-------|-------|----------|
+| 1 | `subject_did` | 4-byte BE length + UTF-8 bytes |
+| 2 | `violation_reference` | 4-byte BE length + UTF-8 bytes |
+| 3 | `explanation` | 4-byte BE length + UTF-8 bytes |
+| 4 | `timestamp` | 8-byte BE u64 |
+
+Note: ADR-039 assigns a counter-attestation signature to `#active` rather than `#agent`, so that publishing a counter-attestation demonstrates human involvement. This preimage carries no `signing_key_id` field, because a party that names its own fragment inside a record it also signs can name `#active` while signing with `#agent`. A verifier instead resolves `#active` from `subject_did`'s current DID document and checks `signature` against that key alone. A signature that only `#agent` produced then fails, which enforces ADR-039's assignment. A verifier that resolves `#agent` establishes agent authorization and establishes nothing about human involvement.
+
 **UCAN signing:** EdDSA (Ed25519) per UCAN specification. The nonce field (`nnc`) is mandatory and must be unique per token issuance. This prevents UCAN token replay. UCAN token expiry (`exp`) MUST NOT exceed 24 hours (matching the nonce deduplication cache window in §9.8.2). Tokens with longer expiry could be replayed after nonce cache eviction. **UCAN revocation** is per-context via `RevocationList` — an append-only map of token CIDs to revocation states (Active, RevocationPending, Revoked). Revocations are distributed as MLS application messages to all context members. Revocation check is step 10 of the 11-step validation pipeline (ADR-016) and is performed on every capability exercise. The system is **fail-closed**: tokens in `RevocationPending` state (revocation initiated but not yet confirmed via MLS) are denied. See ADR-016 criterion 7 and `scp-core/crypto/ucan/revoke.rs` for the full specification.
 
 **UCAN CID computation.** UCAN tokens are identified by Content Identifiers (CIDs) in the `RevocationList` and in delegation chain `prf` references. CID computation MUST use the following parameters:
@@ -1763,6 +1790,8 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash, sign
 | `"SCP-EPOCH-ADVANCE-V1:"` | SenderKeyEpochAdvance signing | §9.5.2 |
 | `"SCP-KEY-REQUEST-V1:"` | SenderKeyRequest signing | §9.5.2 |
 | `"SCP-ATTESTATION-V1:"` | Attestation signing | §9.5.2 |
+| `"SCP-CUSTODY-VIOLATION-V1:"` | `ScpCustodyViolationAttestation` signing — ADR-039 layer-4 custody-violation record, signed by its detecting verifier | §9.5.2 |
+| `"SCP-COUNTER-ATTESTATION-V1:"` | `CounterAttestation` signing — a subject's counter-claim against a custody-violation record, signed by that subject's `#active` key | §9.5.2 |
 | `"SCP-KEYPACKAGE-ATTESTATION-V1:"` | KeyPackage attestation (ephemeral MLS leaf key ↔ DID binding) signing | §9.5.2 |
 | `"SCP-PARTICIPATION-V1:"` | ParticipationProfile signing | §9.5.2 |
 | `"SCP-PARTICIPATION-PROFILE-V1:"` | ParticipationProfile canonical hash | §9.5.2 |

@@ -1055,14 +1055,104 @@ impl Scp {
         .map_err(NapiError::from)
     }
 
-    // `identity_verify_link_attestation` is exposed as a module-level free
-    // fn at `crates/scp-ffi/napi/src/identity.rs::identity_verify_link_attestation`
-    // per ADR-048 §1 — pure Ed25519 signature verification touches no
-    // bridge-instance state. The TypeScript SDK's
-    // `SCP.identityVerifyLinkAttestation` routes through `addon.X` per the
-    // dispatcher-invariant test. Moved out of the `Scp` impl in PR-E #28
-    // along with the cleanup of the `let _ = &self.inner;` gate-defang that
-    // CLAUDE.md flags as "Gaming enforcement tests with dead references".
+    /// Verifies an identity link attestation per spec §3.5.4.
+    ///
+    /// Resolves an issuer's DID document through this instance's validating
+    /// resolver (§3.5.4 step 1), then runs every remaining step through the
+    /// pure `scp_core::identity::attestation::verify_identity_link_attestation`
+    /// seam: structural validation, document-to-issuer binding, signature
+    /// against a key that document publishes at `#active` or `#agent`,
+    /// `revocation_status`, `expires_at`, and evidence freshness.
+    ///
+    /// A module-level `identityVerifyLinkAttestation` free fn remains exported
+    /// and declines with `SCP-IDENT-1060`: it reaches no bridge instance, so it
+    /// cannot perform §3.5.4 step 1 (see `identity.rs`).
+    ///
+    /// # Arguments
+    ///
+    /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+    /// * `issuer_public_key_hex` — Hex-encoded 32-byte Ed25519 public key that
+    ///   a caller asserts signed this attestation. This method checks that
+    ///   assertion against an issuer's resolved DID document; it never uses
+    ///   this key as a substitute for that document.
+    ///
+    /// # Returns
+    ///
+    /// `true` when every §3.5.4 step passes and a key a caller named is a key
+    /// that verified. `false` when a step rejects, including a Class 2
+    /// (`signed_post` / `dns_record`) attestation whose external proof resource
+    /// this bridge does not fetch — §3.5.0 makes an unfetched Reference
+    /// attestation equivalent to no attestation, so a caller performs that
+    /// fetch itself. Stale evidence returns `true`, because §3.5.4 step 5
+    /// degrades rather than rejects. Every rejection reason reaches `tracing`
+    /// at `info` level.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SCP-IDENT-1044` when the JSON or the hex key is malformed, and
+    /// `SCP-IDENT-1060` when an issuer's DID document cannot be resolved — a
+    /// precondition failure, which this method never reports as `false`.
+    #[napi]
+    pub async fn identity_verify_link_attestation(
+        &self,
+        attestation_json: String,
+        issuer_public_key_hex: String,
+    ) -> napi::Result<bool> {
+        use scp_clock::Clock;
+
+        let parsed = scp_ffi_common::attestation::parse_link_attestation(
+            &attestation_json,
+            &issuer_public_key_hex,
+        )
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: e.to_string(),
+                code: codes::IDENT_1044.to_owned(),
+            })
+        })?;
+
+        let bi = &*self.inner;
+        crate::identity::ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
+        let resolver = crate::runtime::did_resolver(bi)
+            .map(Arc::clone)
+            .ok_or_else(|| {
+                NapiError::from(ScpNapiError::Identity {
+                    message: "identity link attestation verification has no DID resolver on \
+                              this bridge instance"
+                        .to_owned(),
+                    code: codes::IDENT_1060.to_owned(),
+                })
+            })?;
+
+        let issuer = parsed.issuer_did().to_owned();
+        let issuer_document = scp_identity::resolver::DidResolver::resolve(&*resolver, &issuer)
+            .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Identity {
+                    message: format!(
+                        "identity link attestation verification could not resolve issuer \
+                             {issuer} (spec §3.5.4 step 1): {e}"
+                    ),
+                    code: codes::IDENT_1060.to_owned(),
+                })
+            })?
+            .ok_or_else(|| {
+                NapiError::from(ScpNapiError::Identity {
+                    message: format!(
+                        "identity link attestation verification found no DID document for \
+                             issuer {issuer} (spec §3.5.4 step 1)"
+                    ),
+                    code: codes::IDENT_1060.to_owned(),
+                })
+            })?;
+
+        let now_secs = scp_clock::SystemClock.now_secs();
+        Ok(scp_ffi_common::attestation::decide_link_attestation(
+            &parsed,
+            &issuer_document.document,
+            now_secs,
+        ))
+    }
 
     /// Per-instance equivalent of `identity_execute_recovery` (spec §9.12).
     ///
