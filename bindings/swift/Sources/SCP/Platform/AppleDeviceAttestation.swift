@@ -31,6 +31,39 @@
         case unsupported(String)
         /// The stored App Attest key ID is missing; call `attest` first.
         case keyNotFound
+        /// Apple answered `attestKey` with `DCError.invalidKey` for a key this
+        /// adapter already attested.
+        ///
+        /// `DCError.h` lists "you call `attestKey:clientDataHash:` for a key
+        /// that's already been attested" as one cause of that code. Apple
+        /// attests one key once, so a caller that holds an attestation already
+        /// calls `assertRequest(requestHash:)` for every later request instead
+        /// of calling `attest` again. This adapter keeps that key.
+        case keyAlreadyAttested(String)
+        /// Apple answered `generateAssertion` with `DCError.invalidKey` for a
+        /// key this adapter generated and never attested.
+        ///
+        /// `DCError.h` lists "you call `generateAssertion:clientDataHash:` with
+        /// an unattested key" as one cause of that code. A caller reaches this
+        /// state when an earlier `attest` failed after key generation, so it
+        /// calls `attest(challenge:deviceId:)` before asserting again. This
+        /// adapter keeps that key.
+        case keyNotAttested(String)
+        /// Apple's App Attest service rejected this device's key, so this
+        /// adapter discarded its key ID.
+        ///
+        /// `DCError.h` lists "the App Attest service rejects the key" as one
+        /// cause of `DCError.invalidKey`. A later `attest(challenge:deviceId:)`
+        /// generates a replacement key.
+        case keyRejected(String)
+        /// Apple could not reach its App Attest service during an attestation.
+        ///
+        /// `DCError.h` instructs a caller to "try the attestation again later
+        /// using the same key and the same value for the `clientDataHash`
+        /// parameter", because "retrying with the same inputs helps to preserve
+        /// the risk metric for a given device". This adapter keeps that key, so
+        /// a retry reaches Apple with a key Apple already saw.
+        case serverUnavailable(String)
         /// An internal invariant was violated.
         case internalError(String)
     }
@@ -42,6 +75,16 @@
     private enum StorageKey {
         /// `UserDefaults` key under which the App Attest key ID is persisted.
         static let appAttestKeyId = "dev.limn.scp.appAttest.keyId"
+
+        /// `UserDefaults` key under which a key ID Apple attested is persisted.
+        ///
+        /// Apple returns one error code, `DCError.invalidKey`, for three
+        /// different conditions, and which condition holds depends on whether a
+        /// key was attested. Recording a successful attestation is what lets
+        /// this adapter tell those conditions apart. This key holds a key ID
+        /// rather than a flag, so a stale value cannot describe a key ID that
+        /// replaced it.
+        static let attestedAppAttestKeyId = "dev.limn.scp.appAttest.attestedKeyId"
     }
 
     // ---------------------------------------------------------------------------
@@ -181,10 +224,18 @@
         /// - Returns: Raw CBOR attestation-object bytes that Apple signed.
         /// - Throws: `AttestationError.unsupported` when
         ///   `DCAppAttestService.isSupported` is `false`.
-        ///   `AttestationError.serviceError` when the App Attest service
-        ///   returns an error on a real device. When that error is
-        ///   `DCError.invalidKey`, this method also forgets a stored key ID, so
-        ///   a later call generates a replacement key.
+        ///   `AttestationError.keyAlreadyAttested` when Apple already attested
+        ///   this device's key, which makes `assertRequest(requestHash:)` a
+        ///   caller's next call.
+        ///   `AttestationError.keyRejected` when Apple's App Attest service
+        ///   rejected this device's key; this method discards its key ID, so a
+        ///   later call generates a replacement.
+        ///   `AttestationError.serverUnavailable` when Apple could not reach its
+        ///   App Attest service; this method keeps that key, so a retry reaches
+        ///   Apple with a key Apple already saw.
+        ///   `AttestationError.serviceError` for every other App Attest error.
+        ///   `classify(_:keyId:operation:)` states which condition each
+        ///   `DCError.invalidKey` maps to.
         public func attest(challenge: Data, deviceId: Data) async throws -> Data {
             guard service.isSupported else {
                 throw AttestationError.unsupported(
@@ -199,19 +250,20 @@
             return try await withCheckedThrowingContinuation { continuation in
                 service.attestKey(keyId, clientDataHash: clientDataHash) { [weak self] attestation, error in
                     if let error {
-                        // Apple reports `DCError.invalidKey` when a key ID no
-                        // longer names a usable Secure Enclave key, which a
-                        // device restore, a rejected key, and an app reinstall
-                        // that kept this defaults domain each produce. Apple's
-                        // guidance is to discard that key ID and generate a new
-                        // key, so this adapter forgets a key ID Apple rejected;
-                        // a later `attest` then generates a replacement instead
-                        // of failing against a dead key forever.
-                        if (error as? DCError)?.code == .invalidKey {
-                            self?.forgetKeyId(keyId)
+                        guard let self else {
+                            continuation.resume(throwing: AttestationError.internalError("self was deallocated"))
+                            return
                         }
-                        continuation.resume(throwing: AttestationError.serviceError(error.localizedDescription))
+                        continuation.resume(throwing: self.classify(
+                            error,
+                            keyId: keyId,
+                            operation: .attestation
+                        ))
                     } else if let attestation {
+                        // Apple attests one key once, so recording which key it
+                        // attested is what tells a later `DCError.invalidKey`
+                        // from `attestKey` apart from a rejected key.
+                        self?.markKeyAttested(keyId)
                         continuation.resume(returning: attestation)
                     } else {
                         continuation.resume(throwing: AttestationError.internalError(
@@ -237,7 +289,12 @@
         ///   `DCAppAttestService.isSupported` is `false`.
         ///   `AttestationError.keyNotFound` when no key ID is stored, which
         ///   happens when no caller has called `attest` yet.
-        ///   `AttestationError.serviceError` when the App Attest service fails.
+        ///   `AttestationError.keyNotAttested` when a key ID is stored and Apple
+        ///   attested no key, which makes `attest(challenge:deviceId:)` a
+        ///   caller's next call; this method keeps that key.
+        ///   `AttestationError.keyRejected` when Apple's App Attest service
+        ///   rejected an attested key; this method discards its key ID.
+        ///   `AttestationError.serviceError` for every other App Attest error.
         public func assertRequest(requestHash: Data) async throws -> Data {
             guard service.isSupported else {
                 throw AttestationError.unsupported(
@@ -253,13 +310,15 @@
             return try await withCheckedThrowingContinuation { continuation in
                 service.generateAssertion(keyId, clientDataHash: requestHash) { [weak self] assertion, error in
                     if let error {
-                        // Same key-invalidation path `attest` documents: forget
-                        // a key ID Apple rejected, so a later `attest` can
-                        // generate a replacement.
-                        if (error as? DCError)?.code == .invalidKey {
-                            self?.forgetKeyId(keyId)
+                        guard let self else {
+                            continuation.resume(throwing: AttestationError.internalError("self was deallocated"))
+                            return
                         }
-                        continuation.resume(throwing: AttestationError.serviceError(error.localizedDescription))
+                        continuation.resume(throwing: self.classify(
+                            error,
+                            keyId: keyId,
+                            operation: .assertion
+                        ))
                     } else if let assertion {
                         continuation.resume(returning: assertion)
                     } else {
@@ -268,6 +327,85 @@
                         ))
                     }
                 }
+            }
+        }
+
+        // MARK: - App Attest error classification
+
+        /// Which App Attest call produced an error.
+        ///
+        /// Apple returns `DCError.invalidKey` for three different conditions,
+        /// and which call raised it narrows those three to two.
+        private enum AppAttestOperation {
+            case attestation
+            case assertion
+        }
+
+        /// Translate an App Attest service error into a typed error, and update
+        /// stored key state when that error says a key is gone.
+        ///
+        /// **Criterion this method applies**, quoting `DCError.h` word for word.
+        /// `DCErrorInvalidKey` is "an error caused by a failed attempt to use
+        /// the App Attest key. You receive this error if something goes wrong
+        /// with generating, retrieving, or using an App Attest cryptographic
+        /// key, when: you call `attestKey:clientDataHash:completionHandler:`
+        /// for a key that's already been attested; you call
+        /// `generateAssertion:clientDataHash:completionHandler:` with an
+        /// unattested key; the App Attest service rejects the key."
+        ///
+        /// Which call raised that code, together with whether this adapter
+        /// recorded an attestation for `keyId`, separates those three:
+        ///
+        /// | Call | Attested | Condition | Key |
+        /// | --- | --- | --- | --- |
+        /// | `attestKey` | yes | already attested | kept |
+        /// | `attestKey` | no | service rejected it | discarded |
+        /// | `generateAssertion` | no | unattested key | kept |
+        /// | `generateAssertion` | yes | service rejected it | discarded |
+        ///
+        /// **One ambiguity this table leaves standing.** A device restored from
+        /// a backup can carry a recorded attestation for a key its Secure
+        /// Enclave no longer holds, and `attestKey` then answers
+        /// `DCError.invalidKey` for a rejected key while this table reads
+        /// "already attested". This method keeps that key rather than
+        /// discarding it, because discarding a live key costs a caller its
+        /// attested key and its device risk metric, while keeping a dead key
+        /// costs one failed call: a caller reaches `assertRequest`, whose
+        /// attested-and-invalid row discards that key and lets a later `attest`
+        /// generate a replacement.
+        private func classify(
+            _ error: Error,
+            keyId: String,
+            operation: AppAttestOperation
+        ) -> AttestationError {
+            guard let code = (error as? DCError)?.code else {
+                return .serviceError(error.localizedDescription)
+            }
+            switch code {
+            case .serverUnavailable:
+                return .serverUnavailable(error.localizedDescription)
+            case .invalidKey:
+                switch (operation, isKeyAttested(keyId)) {
+                case (.attestation, true):
+                    return .keyAlreadyAttested(
+                        "App Attest already attested this key, so ask it for an assertion rather "
+                            + "than for a second attestation: \(error.localizedDescription)"
+                    )
+                case (.assertion, false):
+                    return .keyNotAttested(
+                        "App Attest holds no attestation for this key, so attest it before asking "
+                            + "for an assertion: \(error.localizedDescription)"
+                    )
+                case (.attestation, false), (.assertion, true):
+                    forgetKeyId(keyId)
+                    return .keyRejected(
+                        "App Attest rejected this device's key, and this adapter discarded its key "
+                            + "ID, so a later attest generates a replacement: "
+                            + error.localizedDescription
+                    )
+                }
+            default:
+                return .serviceError(error.localizedDescription)
             }
         }
 
@@ -440,6 +578,10 @@
 
         /// Persist an App Attest key ID to `UserDefaults`.
         ///
+        /// A freshly generated key carries no attestation, so this method also
+        /// removes any recorded attestation, which keeps a record left by a
+        /// previous key from describing this one.
+        ///
         /// Thread-safe: protected by `lock`.
         ///
         /// - Parameter keyId: The key ID returned by
@@ -448,19 +590,51 @@
             lock.lock()
             defer { lock.unlock() }
             defaults.set(keyId, forKey: StorageKey.appAttestKeyId)
+            defaults.removeObject(forKey: StorageKey.attestedAppAttestKeyId)
         }
 
-        /// Remove a stored App Attest key ID, unless another key ID replaced it.
+        /// Record that Apple attested `keyId`.
         ///
         /// Thread-safe: protected by `lock`.
         ///
-        /// - Parameter keyId: A key ID Apple reported as invalid. Removing only
-        ///   this value keeps a concurrent regeneration's key ID in place.
+        /// - Parameter keyId: A key ID `attestKey` answered with an attestation.
+        ///   Recording it only while it is still this adapter's stored key ID
+        ///   keeps a concurrent regeneration's key ID from inheriting an
+        ///   attestation Apple granted to a key it replaced.
+        private func markKeyAttested(_ keyId: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard defaults.string(forKey: StorageKey.appAttestKeyId) == keyId else { return }
+            defaults.set(keyId, forKey: StorageKey.attestedAppAttestKeyId)
+        }
+
+        /// Report whether Apple attested `keyId`.
+        ///
+        /// Thread-safe: protected by `lock`.
+        ///
+        /// - Parameter keyId: A key ID an App Attest call named.
+        /// - Returns: `true` when this adapter recorded an attestation for that
+        ///   exact key ID.
+        private func isKeyAttested(_ keyId: String) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return defaults.string(forKey: StorageKey.attestedAppAttestKeyId) == keyId
+        }
+
+        /// Remove a stored App Attest key ID and any attestation recorded for
+        /// it, unless another key ID replaced it.
+        ///
+        /// Thread-safe: protected by `lock`.
+        ///
+        /// - Parameter keyId: A key ID Apple's App Attest service rejected.
+        ///   Removing only this value keeps a concurrent regeneration's key ID
+        ///   in place.
         private func forgetKeyId(_ keyId: String) {
             lock.lock()
             defer { lock.unlock() }
             guard defaults.string(forKey: StorageKey.appAttestKeyId) == keyId else { return }
             defaults.removeObject(forKey: StorageKey.appAttestKeyId)
+            defaults.removeObject(forKey: StorageKey.attestedAppAttestKeyId)
         }
     }
 
