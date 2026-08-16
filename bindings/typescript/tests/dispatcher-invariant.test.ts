@@ -440,6 +440,18 @@ describe("dispatcher invariant (ADR-048 §1 + §7)", () => {
       // outside an SCP context (test harnesses, examples) can invoke it
       // without constructing an SCP. native.ts routes through the class.
       "checkScopedCapability",
+      // crates/scp-ffi/napi/src/{scp.rs,identity.rs} — spec §3.5.4 step 1
+      // resolves an issuer's DID document before any signature check, which
+      // needs a per-instance resolver, so `Scp::identity_verify_link_attestation`
+      // carries that operation. A module-level free fn of that same JS name
+      // remains exported and DECLINES with `SCP-IDENT-1060`, because phase D
+      // (#1695) deleted every process-wide default bridge instance and it
+      // therefore reaches no resolver. Keeping that declining export is what
+      // lets Swift, Kotlin, and scp.ts keep compiling against a name whose
+      // route to a per-instance method those wrappers have yet to take
+      // (GitHub issue #2335 finding 2). native.ts routes through a class
+      // method; scp.ts still routes through that declining free fn.
+      "identityVerifyLinkAttestation",
     ]);
     const { classMethods, freeFns } = extractNapiSurface();
     const observed: string[] = [];
