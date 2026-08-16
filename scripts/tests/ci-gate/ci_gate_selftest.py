@@ -273,6 +273,25 @@ def main() -> int:
     code, out = run_aggregate(needs, "pull_request")
     check("an unconditional job skipped -> exit 1", code == 1, out)
 
+    # CLAUDE.md §PRD stories states that CI enforces scripts/validate-prd.py.
+    # These two cases are what makes that sentence true: the job carries no
+    # `if:`, so every event selects it, and the gate rejects both a skip and a
+    # failure. A docs-only pull request is the vector that changes a PRD.
+    needs = build_needs(jobs, docs_only, "pull_request", aggregate)
+    check(
+        "prd-validate runs on a pull request that changes nothing else",
+        needs["prd-validate"]["result"] == "success",
+        f"if: {jobs['prd-validate'].get('if')}",
+    )
+    needs["prd-validate"]["result"] = "skipped"
+    code, out = run_aggregate(needs, "pull_request")
+    check("prd-validate skipped -> exit 1", code == 1 and "prd-validate" in out, out)
+
+    needs = build_needs(jobs, docs_only, "pull_request", aggregate)
+    needs["prd-validate"]["result"] = "failure"
+    code, out = run_aggregate(needs, "pull_request")
+    check("prd-validate failed -> exit 1", code == 1 and "prd-validate" in out, out)
+
     needs = build_needs(jobs, docs_only, "pull_request", aggregate)
     needs["shipped-feature-graph"]["result"] = "failure"
     code, out = run_aggregate(needs, "pull_request")

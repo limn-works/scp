@@ -161,6 +161,43 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-error-codes.sh
 
+  # ── PRD structural validation ────────────────────────────────────────
+  # CLAUDE.md §PRD stories tells every agent to run scripts/validate-prd.py
+  # before committing a PRD change and states "CI enforces this". No workflow
+  # ran it. The only reference sat in .github/workflows/prd-validate.yml.disabled,
+  # and GitHub never loads a file with that suffix — commit fffd5de56 renamed
+  # seven workflows on 2026-03-15 under the heading "disable all Claude-powered
+  # GitHub workflows". This validator reaches no model and needs no secret; it
+  # was swept up because it shared a file with a Claude review step. That Claude
+  # step stays disabled, because reversing that decision is Alec's to make.
+  #
+  # No path filter, deliberately. The validator checks that every story's
+  # sources[].file exists and that sources[].section is a real heading in it,
+  # and those 904 references point at .docs/specs (529), .docs/adrs (344),
+  # .docs/standards (16), .docs/scaffold (12) and .docs/sketch.md (3). A filter
+  # naming .docs/prds/** would let a renamed spec heading break provenance while
+  # this job skipped, which is the same defect the binding test jobs carried.
+  # The validator walks 443 stories in under a second, so running it on every
+  # pull request costs less than deciding whether to.
+  prd-validate:
+    needs: check-draft
+    name: PRD structural validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Self-test MUST run first, matching the pyi-generated, block-in-place,
+      # no-panic-abort, saga-gating-granularity and cross-layer jobs: it plants
+      # six violation classes and proves the validator rejects each one, so a
+      # passing real check below means something.
+      - name: Self-test gate
+        run: bash scripts/tests/prd-validate/run-tests.sh
+      - name: Validate every story in .docs/prds/
+        run: python3 scripts/validate-prd.py
+
   # ── Fail-closed pre-rotation (ADR-062 §Decision 6 / SCP-CAPINJECT-006) ──
   # Runs the production (no-`testing`) identity-creation paths and asserts they
   # FAIL CLOSED with the typed IdentityError::NoPreRotationBackend (SCP-IDENT-1059)
@@ -1588,6 +1625,7 @@ jobs:
       - check-draft
       - changes
       - error-codes
+      - prd-validate
       - shipped-feature-graph
       - fail-closed-pre-rotation
       - cross-layer

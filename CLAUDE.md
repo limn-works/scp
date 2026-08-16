@@ -162,7 +162,7 @@ A human must approve before you weaken an existing assertion, delete one, or exe
 - **Before creating, editing, or updating any story in `.docs/prds/`**, read `.docs/standards/prd.md` in full. No exceptions.
 - Fill every field the standard defines. Write every acceptance criterion so a machine can verify it. Point every source at a heading that exists in a file that exists. Point every dependency forward, never backward.
 - The artifact flow applies to stories: stories reference specs and ADRs, never the reverse. If a story can't cite a spec section or ADR, it needs one written first.
-- Run `python3 scripts/validate-prd.py` before committing PRD changes. CI enforces this.
+- Run `python3.12 scripts/validate-prd.py` before committing PRD changes. The `prd-validate` job in `.github/workflows/ci.yml` runs it on every pull request, and the `ci` gate requires that job to pass.
 - A subagent that writes a story validates the story against the standard before it returns. Two audits shipped defective stories because neither audit checked its own output, and that failure is why this standard exists.
 
 **Stubs:**
