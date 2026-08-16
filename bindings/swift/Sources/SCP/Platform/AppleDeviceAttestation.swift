@@ -286,9 +286,12 @@
         /// 2. `fmt` holds text `"apple-appattest"`.
         /// 3. `attStmt` holds a CBOR map whose key set is exactly `x5c`,
         ///    `receipt`, where `x5c` holds an array of at least two byte
-        ///    strings that each parse as a DER X.509 certificate and whose
-        ///    element 0 names element 1 as its issuer, and `receipt` holds a
-        ///    byte string.
+        ///    strings that each parse as a DER X.509 certificate, and `receipt`
+        ///    holds a byte string. Clause 3 also assigns positions: element 0
+        ///    is a credential certificate and element 1 is an Apple App Attest
+        ///    intermediate certificate. `readCertificateChain` documents which
+        ///    part of that assignment it decides and which part it leaves to an
+        ///    SCP relay.
         /// 4. `authData` holds a byte string of at least 87 bytes whose first
         ///    32 bytes equal `SHA-256` of an App ID this adapter was
         ///    initialized with, whose bytes 37 through 52 equal one of two App
@@ -614,38 +617,58 @@
             }
         }
 
-        /// Apply clause 3 to an `x5c` value: an array of at least two byte
-        /// strings that each parse as a DER X.509 certificate, where element 0
-        /// is a credential certificate and element 1 is an issuing App Attest
-        /// intermediate certificate.
+        /// Apply clause 3 to an `x5c` value.
         ///
-        /// Position carries meaning, so this method requires element 0's issuer
-        /// name to equal element 1's subject name. Two unrelated certificates
-        /// in either order fail that requirement.
+        /// **What clause 3 states**, quoting ADR-025 word for word: "`x5c` is
+        /// an array of at least two byte strings, each of which parses as a
+        /// DER-encoded X.509 certificate; the first is the credential
+        /// certificate and the second is the Apple App Attest intermediate
+        /// certificate."
         ///
-        /// Which certification authority element 1 belongs to stays undecided
-        /// here. An SCP relay decides that by calling Apple's App Attest
+        /// **What this method decides**, which is narrower than that sentence:
+        /// an array of at least two elements, each parsing as a DER X.509
+        /// certificate, whose element 0 and element 1 carry different bytes and
+        /// whose element 0 names element 1 by its subject name in its own
+        /// issuer field. Those three conditions are evidence that positions
+        /// hold what clause 3 assigns them; they are not a test of which
+        /// certification authority element 1 belongs to. Nothing here reads
+        /// Apple's name, Apple's public key, or Apple's fingerprint, so a chain
+        /// built from certificates Apple never issued reaches this method's
+        /// `true`. An SCP relay decides authority by calling Apple's App Attest
         /// attestation endpoint, which walks a chain to Apple's App Attest
         /// root, and ADR-025 assigns that decision to a relay.
+        ///
+        /// **One fragility a reader should know about:** normalized-name
+        /// equality compares DER bytes after Apple's normalization, which
+        /// uppercases a `PrintableString` and leaves a `UTF8String` alone. Two
+        /// certificates carrying one common name in two different string
+        /// encodings therefore compare unequal. RFC 5280 §4.1.2.4 requires an
+        /// issuer field to match its issuer's subject field, so a chain Apple
+        /// issues today compares equal.
         private static func readCertificateChain(from reader: inout CBORReader) -> Bool {
             guard let certificateCount = reader.readArrayHeader(),
                   certificateCount >= minimumCertificateCount else { return false }
 
-            var credential: SecCertificate?
-            var issuer: SecCertificate?
-            for position in 0 ..< certificateCount {
+            guard let credentialDer = reader.readByteString(),
+                  let credential = parseCertificate(credentialDer),
+                  let issuerDer = reader.readByteString(),
+                  let issuer = parseCertificate(issuerDer) else { return false }
+
+            // Clause 3 requires every element to parse as a certificate, so
+            // elements past position 1 parse too, even though position decides
+            // nothing about them.
+            for _ in minimumCertificateCount ..< certificateCount {
                 guard let der = reader.readByteString(),
-                      let certificate = parseCertificate(der) else { return false }
-                if position == 0 {
-                    credential = certificate
-                }
-                if position == 1 {
-                    issuer = certificate
-                }
+                      parseCertificate(der) != nil else { return false }
             }
 
-            guard let credential, let issuer,
-                  let credentialIssuerName = SecCertificateCopyNormalizedIssuerSequence(credential),
+            // Clause 3 assigns two certificates to positions 0 and 1. One
+            // self-signed certificate repeated twice satisfies issuer-name
+            // equality trivially, because its own issuer field equals its own
+            // subject field, so rejecting an equal pair keeps that pair out.
+            guard !credentialDer.elementsEqual(issuerDer) else { return false }
+
+            guard let credentialIssuerName = SecCertificateCopyNormalizedIssuerSequence(credential),
                   let issuerSubjectName = SecCertificateCopyNormalizedSubjectSequence(issuer)
             else { return false }
             return CFEqual(credentialIssuerName, issuerSubjectName)

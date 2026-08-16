@@ -24,8 +24,11 @@
 // 3. `attStmt` is a CBOR map whose key set is exactly `x5c`, `receipt`, where
 //    `x5c` is an array of at least two byte strings that each parse as a DER
 //    X.509 certificate, element 0 is a credential certificate and element 1 is
-//    an App Attest intermediate certificate that issued it, and `receipt` is a
-//    byte string.
+//    an Apple App Attest intermediate certificate, and `receipt` is a byte
+//    string. `readCertificateChain` decides two distinct certificates whose
+//    element 0 names element 1 by subject name, and leaves which authority
+//    element 1 belongs to for an SCP relay; cases below test what that method
+//    decides, not what a relay decides.
 // 4. `authData` is a byte string of at least 87 bytes: bytes 0 through 31
 //    hold a relying-party ID hash and equal SHA-256 of an app's App ID, byte
 //    32 holds flags, bytes 33 through 36 hold a sign counter, bytes 37 through
@@ -110,12 +113,23 @@
             clientDataHash _: Data,
             completionHandler: @escaping (Data?, Error?) -> Void
         ) {
-            completionHandler(nil, NSError(
-                domain: DCErrorDomain,
-                code: DCError.invalidKey.rawValue,
-                userInfo: nil
-            ))
+            completionHandler(nil, Self.invalidKeyError)
         }
+
+        override func generateAssertion(
+            _: String,
+            clientDataHash _: Data,
+            completionHandler: @escaping (Data?, Error?) -> Void
+        ) {
+            completionHandler(nil, Self.invalidKeyError)
+        }
+
+        /// What Apple returns when a key ID no longer names a usable key.
+        static let invalidKeyError = NSError(
+            domain: DCErrorDomain,
+            code: DCError.invalidKey.rawValue,
+            userInfo: nil
+        )
     }
 
     /// A `UserDefaults` that keeps every value in memory.
@@ -209,6 +223,25 @@
             tGjGuKr002mL4DAfBgNVHSMEGDAWgBSFz409QF5eQPpTtGjGuKr002mL4DAPBgNVHRMBAf8EBTAD
             AQH/MAoGCCqGSM49BAMCA0gAMEUCIA++aHRExYw6JSqFxZG4dV6CBQqCLYkcGYGr8mcGCFE8AiEA
             9kzA+7bOXbfHds/deoZU063YywGSGsfz7z0vvPAKhrI=
+            """
+        )
+
+        /// `credentialCertificate` with one byte changed: its issuer name's
+        /// first `RelativeDistinguishedName` carries tag `SEQUENCE` where X.501
+        /// requires `SET`. Every enclosing length stays valid, so
+        /// `SecCertificateCreateWithData` still parses it, while
+        /// `SecCertificateCopyNormalizedIssuerSequence` returns nil for it —
+        /// which is a branch `readCertificateChain` fails closed on.
+        static let retaggedIssuerCertificate = der(
+            """
+            MIIBmDCCAT6gAwIBAgIUaqvd+exYmYSALlFVQ/W0O2uFQAEwCgYIKoZIzj0EAwIwKjAoMCYGA1UE
+            AwwfU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZTAgFw0yNjA4MTYxNjAwMjJaGA8yMTI2
+            MDcyMzE2MDAyMlowKDEmMCQGA1UEAwwdU0NQIEFwcEF0dGVzdCBUZXN0IENyZWRlbnRpYWwwWTAT
+            BgcqhkjOPQIBBggqhkjOPQMBBwNCAAQOQ8ei3oFlCZE+Lp6aQV+67h6D8A1UHWenpFK6oM+kMsOf
+            w1kuvOnVCX6dPdVa8MH+zbPBntYm3btEN5gAZYjzo0IwQDAdBgNVHQ4EFgQUnVR1Sv2Fh0JTW/1r
+            riMF1nn/WIEwHwYDVR0jBBgwFoAUhc+NPUBeXkD6U7Roxriq9NNpi+AwCgYIKoZIzj0EAwIDSAAw
+            RQIhANy3qzCL6l/7kTxQytH6MivRZVjwuj5K1257x0whAu0EAiARri/mndaidpfhN1szKhbF8FYn
+            SXA7MCtxCCiCmPGWGQ==
             """
         )
 
@@ -438,6 +471,21 @@
             #expect(defaults.string(forKey: "dev.limn.scp.appAttest.keyId") == nil)
         }
 
+        @Test("assertRequest forgets a key ID Apple rejected as invalid")
+        func assertRequestForgetsInvalidKeyId() async {
+            let defaults = InMemoryUserDefaults()
+            defaults.set("stale-key-id", forKey: "dev.limn.scp.appAttest.keyId")
+            let adapter = AppleDeviceAttestation(
+                appId: CBORFixture.appId,
+                service: InvalidKeyAppAttestService(),
+                defaults: defaults
+            )
+
+            _ = try? await adapter.assertRequest(requestHash: Data(repeating: 0xAB, count: 32))
+
+            #expect(defaults.string(forKey: "dev.limn.scp.appAttest.keyId") == nil)
+        }
+
         @Test("concurrent first attests generate one App Attest key, over 50 rounds")
         func concurrentAttestsGenerateOneKey() async {
             // A caller that reads absence in one critical section and publishes
@@ -655,6 +703,24 @@
 
             let arrayToken = Data(CBORFixture.arrayHeader(0))
             #expect(adapter.verify(token: arrayToken) == false)
+        }
+
+        @Test("verify rejects an array carrying six items a conformant map carries")
+        func verifyRejectsArrayOfKeyValuePairs() {
+            let harness = makeAdapter()
+            let adapter = harness.adapter
+
+            // An array head declaring three elements carries an argument of
+            // three, and six items follow it: three keys and three values a
+            // conformant map carries, in that order. A reader that ignored
+            // major types would accept this token, so a major-type check is
+            // what separates it from that map.
+            var out = CBORFixture.arrayHeader(3)
+            out += CBORFixture.text("fmt") + CBORFixture.text(CBORFixture.appleFormat)
+            out += CBORFixture.text("attStmt") + CBORFixture.attestationStatement()
+            out += CBORFixture.text("authData")
+                + CBORFixture.byteString(CBORFixture.authenticatorData())
+            #expect(adapter.verify(token: Data(out)) == false)
         }
 
         @Test("verify rejects an indefinite-length map")
@@ -879,6 +945,80 @@
             statement += CBORFixture.text("receipt") + CBORFixture.byteString([0x0A])
 
             let token = CBORFixture.attestationObject(attestationStatementValue: statement)
+            #expect(adapter.verify(token: token) == false)
+        }
+
+        @Test("verify rejects an x5c map carrying two certificates as one key and one value")
+        func verifyRejectsMapCertificateChain() {
+            let harness = makeAdapter()
+            let adapter = harness.adapter
+
+            // A map head declaring two entries carries an argument of two, so a
+            // reader that ignored major types would read both certificates from
+            // it exactly as it reads them from a two-element array head. Only a
+            // major-type check separates this token from a conformant one.
+            var statement = CBORFixture.mapHeader(2)
+            statement += CBORFixture.text("x5c")
+            statement += CBORFixture.mapHeader(2)
+            statement += CBORFixture.byteString(CBORFixture.credentialCertificate)
+            statement += CBORFixture.byteString(CBORFixture.intermediateCertificate)
+            statement += CBORFixture.text("receipt") + CBORFixture.byteString([0x0A])
+
+            let token = CBORFixture.attestationObject(attestationStatementValue: statement)
+            #expect(adapter.verify(token: token) == false)
+        }
+
+        @Test("verify rejects an x5c that repeats one self-signed certificate twice")
+        func verifyRejectsDuplicatedCertificate() {
+            let harness = makeAdapter()
+            let adapter = harness.adapter
+
+            // A self-signed certificate names itself in its own issuer field,
+            // so a pair of copies satisfies issuer-to-subject equality without
+            // carrying two certificates. Clause 3 assigns two certificates.
+            let token = CBORFixture.attestationObject(
+                attestationStatementValue: CBORFixture.attestationStatement(
+                    certificates: [
+                        CBORFixture.intermediateCertificate,
+                        CBORFixture.intermediateCertificate
+                    ]
+                )
+            )
+            #expect(adapter.verify(token: token) == false)
+        }
+
+        @Test("verify rejects an x5c whose third element does not parse as a certificate")
+        func verifyRejectsNonCertificateBeyondPositionOne() {
+            let harness = makeAdapter()
+            let adapter = harness.adapter
+
+            let notACertificate: [UInt8] = [0x30, 0x82, 0x01, 0x2C]
+                + [UInt8](repeating: 0x41, count: 300)
+            let token = CBORFixture.attestationObject(
+                attestationStatementValue: CBORFixture.attestationStatement(
+                    certificates: [
+                        CBORFixture.credentialCertificate,
+                        CBORFixture.intermediateCertificate,
+                        notACertificate
+                    ]
+                )
+            )
+            #expect(adapter.verify(token: token) == false)
+        }
+
+        @Test("verify rejects a credential certificate whose issuer name resists normalization")
+        func verifyRejectsUnnormalizableIssuerName() {
+            let harness = makeAdapter()
+            let adapter = harness.adapter
+
+            let token = CBORFixture.attestationObject(
+                attestationStatementValue: CBORFixture.attestationStatement(
+                    certificates: [
+                        CBORFixture.retaggedIssuerCertificate,
+                        CBORFixture.intermediateCertificate
+                    ]
+                )
+            )
             #expect(adapter.verify(token: token) == false)
         }
 
