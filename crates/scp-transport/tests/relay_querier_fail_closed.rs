@@ -1,24 +1,54 @@
-//! The relay querier fails closed when the relay it is bound to goes away
+//! Both relay-querier arms answer without fabricating a DID record — the arm
+//! every shipped assembly selects, and the arm none of them selects
 //! (spec `.docs/specs/17-persistence-and-storage.md` §17.17.1 SCP-CAPSEL-8001;
 //! `.docs/specs/03-identity-and-did.md` §3.10.2/§3.10.4).
 //!
-//! `TransportRelayQuerier` is the shipped production arm of the relay-querier
-//! capability: it is the only non-test implementation of the `scp-identity`
-//! `RelayQuerier` trait, and it answers a DID QUERY over a live relay
-//! connection. Its backing resource is that connection.
+//! # Which arm ships, and which does not
 //!
-//! This test starts a real `RelayServer`, connects a real `NativeRelayAdapter`
-//! to it, binds that adapter into a real `TransportRelayQuerier`, then destroys
-//! the server so the connection is genuinely dead, and asserts the querier
-//! returns the named [`IdentityError::RelayQueryFailed`] variant. A querier
-//! that answered `Ok(candidates)` after its relay died would feed the
-//! `RealMultiRelayQuerier` composer records no relay ever served, which is the
-//! fabricated answer §3.10.4 forbids.
+//! The relay querier is one of the seven provider capabilities §17.17 of the
+//! persistence spec enumerates. Two implementations of it exist outside test
+//! code, and they sit at different levels of the resolver stack:
 //!
-//! The relay server runs on its own tokio runtime in its own thread. Dropping
-//! that runtime tears down the listener and every live connection handler at
-//! once; `ShutdownHandle::shutdown` alone only stops the accept loop and leaves
-//! established connections serving, so it cannot make the resource unavailable.
+//! - `NoOpRelayQuerier` implements the composer trait `MultiRelayQuerier` and
+//!   answers `Ok(None)`. **Every shipped assembly selects it**:
+//!   `crates/scp-ffi/src/identity.rs:142`, `crates/scp-ffi/napi/src/identity.rs:196`,
+//!   `crates/scp-ffi/uniffi/src/bridge.rs:9475`, and
+//!   `crates/scp-node/src/self_host.rs` each construct `Arc::new(NoOpRelayQuerier)`
+//!   and hand it to the `DualLayerResolver`.
+//! - `TransportRelayQuerier` implements the single-relay trait `RelayQuerier`
+//!   and answers a DID QUERY over a live relay connection. **No shipped
+//!   assembly constructs it.** Its only construction sites are this file and
+//!   `crates/scp-transport/src/native/relay_querier.rs`'s own `mod tests`.
+//!   `RealMultiRelayQuerier`, the composer that would wrap it, is likewise
+//!   constructed only from test modules.
+//!
+//! ADR-062, capability injection and prove-absent dev backends, decided that
+//! split rather than inheriting it: its Slice 11 states "`NoOpRelayQuerier`
+//! stays a shipped production arm, unchanged (the honest not-a-DID-source
+//! case)", and its A2↔A4 sequencing paragraph states "The relay resolution
+//! layer is `NoOpRelayQuerier` (returns `Ok(None)`) until **issue #482** builds
+//! the real `MultiRelayQuerier`". Issue #482, relay DID resolution, is the
+//! workstream that will select `TransportRelayQuerier` into the bridges.
+//!
+//! # What each test below therefore proves, and what it does not
+//!
+//! `shipped_no_op_relay_querier_answers_the_honest_absent_state` covers the arm
+//! that ships. §17.17.2 requires each capability's arm to answer honestly, and
+//! for a querier bound to no relay the honest answer is the protocol-supported
+//! absent state `Ok(None)`, not a typed error — a resolver that treated
+//! "no relay layer configured" as an error would break the `DualLayerResolver`
+//! fall-through §3.10.4 defines.
+//!
+//! `unselected_transport_relay_querier_fails_closed_when_its_relay_dies` covers
+//! the arm that does not ship. Deleting `TransportRelayQuerier` from the tree
+//! would leave every shipped binary byte-identical and would delete that test
+//! along with the type, so the test constrains no shipped behaviour today. It
+//! is here for two reasons that hold regardless: it holds the type to
+//! SCP-CAPSEL-8001 before #482 wires it into a bridge, and its presence in this
+//! file is the record that a production type ships unselected. Read the pair
+//! together and the capability's real state is legible: the relay layer answers
+//! "I am not a DID source" in every shipped artifact, and the code that would
+//! make it a DID source is written, tested, and not yet selected.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -29,6 +59,7 @@ use std::time::Duration;
 
 use scp_identity::IdentityError;
 use scp_identity::resolution::RelayQuerier;
+use scp_identity::resolver::{MultiRelayQuerier, NoOpRelayQuerier};
 use scp_transport::native::TransportRelayQuerier;
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::native::server::{RelayConfig, RelayServer};
@@ -97,8 +128,58 @@ impl DedicatedRelay {
     }
 }
 
+/// The arm every shipped assembly selects answers `Ok(None)` — the honest
+/// protocol-supported absent state (§17.17.2, ADR-062 §Decision 5). A shipped
+/// build has no relay DID-resolution layer until issue #482 lands, so the
+/// querier reports that it holds nothing; it never returns a record, and it
+/// never turns "no relay layer" into an error that would stop the
+/// `DualLayerResolver` from consulting the DHT layer (§3.10.4).
 #[tokio::test]
-async fn transport_relay_querier_fails_closed_when_its_relay_dies() {
+async fn shipped_no_op_relay_querier_answers_the_honest_absent_state() {
+    let querier = NoOpRelayQuerier;
+
+    let relay_urls = vec![
+        "wss://relay.example.com/scp/v1".to_owned(),
+        "wss://relay2.example.com/scp/v1".to_owned(),
+    ];
+
+    let answer = querier
+        .query("did:dht:z6MkExampleShippedBuild", &relay_urls)
+        .await
+        .expect("the shipped relay arm reports absence, so it must not error");
+
+    assert!(
+        answer.is_none(),
+        "the shipped relay arm holds no DID record and must answer Ok(None); returning a record \
+         here would hand the resolver a document no relay ever served (§3.10.4)"
+    );
+
+    // The same answer with no relay URLs at all: absence does not depend on
+    // which relays the caller names.
+    let answer_without_relays = querier
+        .query("did:dht:z6MkExampleShippedBuild", &[])
+        .await
+        .expect("the shipped relay arm reports absence, so it must not error");
+    assert!(answer_without_relays.is_none());
+}
+
+/// `TransportRelayQuerier` — the arm no shipped assembly selects, per this
+/// file's module documentation — returns the named
+/// [`IdentityError::RelayQueryFailed`] once the relay it is bound to is gone.
+///
+/// This test starts a real `RelayServer`, connects a real `NativeRelayAdapter`
+/// to it, binds that adapter into a real `TransportRelayQuerier`, then destroys
+/// the server so the connection is genuinely dead. A querier that answered
+/// `Ok(candidates)` after its relay died would feed the `RealMultiRelayQuerier`
+/// composer records no relay ever served, which is the fabricated answer
+/// §3.10.4 forbids.
+///
+/// The relay server runs on its own tokio runtime in its own thread. Dropping
+/// that runtime tears down the listener and every live connection handler at
+/// once; `ShutdownHandle::shutdown` alone only stops the accept loop and leaves
+/// established connections serving, so it cannot make the resource unavailable.
+#[tokio::test]
+async fn unselected_transport_relay_querier_fails_closed_when_its_relay_dies() {
     let relay = DedicatedRelay::start();
     let url = relay.url();
 

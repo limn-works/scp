@@ -33,6 +33,10 @@
 //!
 //! Set `S3_TEST_ENDPOINT` and `S3_TEST_BUCKET` environment variables.
 //!
+//! The construction failure path needs no endpoint:
+//! `crates/scp-transport/tests/s3_blob_fail_closed.rs` opens the store against
+//! an address nothing listens on and asserts `StorageError::Internal`.
+//!
 //! See SCP-PERSIST-068 for the full story.
 
 use std::collections::HashMap;
@@ -92,8 +96,13 @@ impl S3BlobStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Internal`] if the AWS SDK configuration
-    /// cannot be loaded.
+    /// Returns [`StorageError::Internal`] when the AWS SDK configuration cannot
+    /// be loaded, and when the `HeadBucket` request every construction path
+    /// issues against `bucket` does not succeed. That request fails when the
+    /// endpoint refuses or does not answer, when the credential chain resolves
+    /// no credentials, when the credentials are rejected, when no region is
+    /// configured, and when the bucket does not exist or the caller may not
+    /// read it.
     pub async fn open(bucket: &str, prefix: &str) -> Result<Self, StorageError> {
         Self::open_with_clock(bucket, prefix, system_clock()).await
     }
@@ -106,8 +115,13 @@ impl S3BlobStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Internal`] if the AWS SDK configuration
-    /// cannot be loaded.
+    /// Returns [`StorageError::Internal`] when the AWS SDK configuration cannot
+    /// be loaded, and when the `HeadBucket` request every construction path
+    /// issues against `bucket` does not succeed. That request fails when the
+    /// endpoint refuses or does not answer, when the credential chain resolves
+    /// no credentials, when the credentials are rejected, when no region is
+    /// configured, and when the bucket does not exist or the caller may not
+    /// read it.
     pub async fn open_with_clock(
         bucket: &str,
         prefix: &str,
@@ -115,12 +129,7 @@ impl S3BlobStore {
     ) -> Result<Self, StorageError> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
-        Ok(Self {
-            client,
-            bucket: bucket.to_owned(),
-            prefix: prefix.to_owned(),
-            clock,
-        })
+        Self::from_client(client, bucket, prefix, clock).await
     }
 
     /// Creates an `S3BlobStore` with a custom S3-compatible endpoint URL.
@@ -130,8 +139,13 @@ impl S3BlobStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Internal`] if the AWS SDK configuration
-    /// cannot be loaded.
+    /// Returns [`StorageError::Internal`] when the AWS SDK configuration cannot
+    /// be loaded, and when the `HeadBucket` request every construction path
+    /// issues against `bucket` does not succeed. That request fails when the
+    /// endpoint refuses or does not answer, when the credential chain resolves
+    /// no credentials, when the credentials are rejected, when no region is
+    /// configured, and when the bucket does not exist or the caller may not
+    /// read it.
     pub async fn open_with_endpoint(
         bucket: &str,
         prefix: &str,
@@ -144,6 +158,49 @@ impl S3BlobStore {
             .force_path_style(true)
             .build();
         let client = Client::from_conf(s3_config);
+        Self::from_client(client, bucket, prefix, clock).await
+    }
+
+    /// The single construction path: probes the bucket, then builds the store.
+    ///
+    /// Both public constructors funnel through here, so the probe cannot be
+    /// bypassed by choosing one constructor over the other.
+    ///
+    /// The probe issues one `HeadBucket` request. A relay operator who selects
+    /// the S3 backend selects a *reachable, writable* object store; a client
+    /// object alone proves none of that, because `aws_config::load_defaults`
+    /// and `Client::new` perform no I/O and never contact the endpoint. The
+    /// request fails when the endpoint refuses or does not answer, when the
+    /// credential chain resolves no credentials, when the credentials are
+    /// rejected, when no region is configured, and when the bucket does not
+    /// exist or the caller may not read it. Each of those means the selected
+    /// production backend cannot be satisfied, so §17.17.1 SCP-CAPSEL-8001
+    /// requires the construction boundary to hand the caller a terminal error
+    /// instead of a store whose first `store` call is the first thing that
+    /// notices (`.docs/specs/17-persistence-and-storage.md` §17.17.1, §17.7).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::Internal`] carrying the S3 error when the
+    /// `HeadBucket` request does not succeed.
+    async fn from_client(
+        client: Client,
+        bucket: &str,
+        prefix: &str,
+        clock: ClockFn,
+    ) -> Result<Self, StorageError> {
+        client
+            .head_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| {
+                StorageError::Internal(format!(
+                    "S3 head bucket failed for {bucket}: {}",
+                    aws_sdk_s3::error::DisplayErrorContext(&e)
+                ))
+            })?;
+
         Ok(Self {
             client,
             bucket: bucket.to_owned(),

@@ -1017,13 +1017,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // hex roundtrip (via hex crate, validates bridge_adapters integration)
+    // hex encode/decode — the bridge's own `crate::types::encode_hex` encoder
+    // and the `hex` crate's decoder
     // -----------------------------------------------------------------------
 
     #[test]
     fn hex_encode_decode_roundtrip() {
         let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let encoded = hex::encode(bytes);
+        let encoded = crate::types::encode_hex(&bytes);
+        assert_eq!(
+            encoded, "0123456789abcdef",
+            "encode_hex must emit lowercase hex with two characters per byte"
+        );
         let decoded = hex::decode(&encoded).unwrap();
         assert_eq!(decoded, bytes);
     }
