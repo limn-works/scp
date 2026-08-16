@@ -1640,35 +1640,6 @@ class ChallengeResponse(TypedDict):
     signature: list[int]
 
 
-def trust_verify_attestation(
-    attestation: CachedAttestationEnvelope | dict[str, Any],
-) -> dict[str, Any]:
-    """Verify an attestation's signature, evidence, expiry, and revocation
-    status (ADR-017, §7.4).
-
-    Takes the typed attestation envelope
-    (:class:`CachedAttestationEnvelope` — the same wire DTO the
-    cached-attestation inputs use) and serializes it to the serde wire shape
-    internally (ADR-058) before calling the bridge
-    ``trust_verify_attestation`` free function.
-
-    Args:
-        attestation: The typed attestation envelope (or a raw
-            equivalently-shaped dict).
-
-    Returns:
-        A dict with ``valid`` (bool), ``chain_depth`` (int), and ``error``
-        (str | None — the verification failure reason when ``valid`` is
-        ``False``).
-
-    Raises:
-        ScpError: If the bridge module is not available.
-        ValueError: If the serialized envelope fails bridge deserialization.
-    """
-    bridge = _bridge()
-    return bridge.trust_verify_attestation(json.dumps(attestation))
-
-
 def trust_verify_response(
     challenge: ChallengeRequest | dict[str, Any],
     response: ChallengeResponse | dict[str, Any],
@@ -1755,7 +1726,6 @@ __all__ = [
     "evaluate_trust",
     "participation_record",
     "trust_create_challenge",
-    "trust_verify_attestation",
     "trust_verify_response",
     "verify_participation_requirements",
 ]

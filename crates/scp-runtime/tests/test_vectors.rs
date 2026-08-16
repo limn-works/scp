@@ -1267,7 +1267,7 @@ fn vector_34_trust_attestation_signature() {
     print_vec("Trust attestation signature", &signed.signature);
 
     let clock = TestClock::new(1_700_000_001);
-    verify_attestation(&signed, &RefResolver, &clock)
+    verify_attestation(&signed, &RefResolver, &clock, None)
         .expect("trust attestation Vector 34 signature must verify");
 }
 

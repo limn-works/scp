@@ -161,19 +161,21 @@ class TrustAggregateFfiTest {
     fun `trustVerifyAttestation - typed envelope reaches the real verifier`() {
         val result =
             scp.trustVerifyAttestation(
-                CachedAttestationEnvelope(
-                    id = "att-ffi-1",
-                    attestationType = "AgentCapability",
-                    issuer = "did:dht:zIssuer",
-                    subject = "did:dht:zSubject",
-                    claim =
-                        buildJsonObject {
-                            put("capability", "scp:capability:schema-validation/v1")
-                        },
-                    issuedAt = 1_700_000_000uL,
-                    revocationStatus = Json.parseToJsonElement("\"Active\""),
-                    signature = List(64) { 0.toUByte() },
-                ),
+                contextId = "ctx-verify-ffi",
+                attestation =
+                    CachedAttestationEnvelope(
+                        id = "att-ffi-1",
+                        attestationType = "AgentCapability",
+                        issuer = "did:dht:zIssuer",
+                        subject = "did:dht:zSubject",
+                        claim =
+                            buildJsonObject {
+                                put("capability", "scp:capability:schema-validation/v1")
+                            },
+                        issuedAt = 1_700_000_000uL,
+                        revocationStatus = Json.parseToJsonElement("\"Active\""),
+                        signature = List(64) { 0.toUByte() },
+                    ),
             )
         assertFalse(result.valid)
         assertTrue(result.errorMessage.isNotEmpty())

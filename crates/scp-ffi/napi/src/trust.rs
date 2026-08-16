@@ -175,12 +175,23 @@ pub(crate) fn trust_query_score_on(
 
 /// Per-bridge-instance implementation of `trust_verify_attestation`.
 ///
-/// Pure verification — the bridge instance is unused but accepted for API
-/// symmetry with the other `_on` helpers in this module.
+/// Verifies the Ed25519 signature, the evidence, the expiry, the issuer-signed
+/// `revocation_status` field, AND `context_id`'s persisted revocation list,
+/// which this instance's `ProtocolRepoVariant` holds. Section 7.4.4 of
+/// `.docs/specs/07-trust-validation-and-capabilities.md` states that revocation
+/// is immediate for a new verification, and a holder of a pre-revocation copy
+/// still carries `revocation_status: Active`, so the revocation-list read is
+/// what rejects that holder's copy.
 pub(crate) fn trust_verify_attestation_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
+    context_id: String,
     attestation_json: String,
 ) -> napi::Result<NapiAttestationVerificationResult> {
+    // Full format validation (matching the PyO3 reference bridge), so all
+    // native bridges reject malformed ids identically.
+    scp_ffi_common::validate::validate_context_id(&context_id)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
     // VALID_7012 matches the UniFFI bridge's code for malformed attestation
     // JSON so the same logical failure carries the same code on every bridge.
     let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
@@ -191,10 +202,20 @@ pub(crate) fn trust_verify_attestation_on(
             )
         })?;
 
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_clock::SystemClock;
+    // Per-bridge dispatch cannot be `None` — each `NapiBridgeInstance` owns a
+    // concrete `ProtocolRepoVariant` from construction, so this verification
+    // always reaches the same revocation list that `aggregate_trust_input` and
+    // `participation_record` write and read.
+    let outcome = match crate::runtime::protocol_repository(bi) {
+        crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+            run_verify_attestation(repo, &context_id, &attestation)
+        }
+        crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+            run_verify_attestation(repo, &context_id, &attestation)
+        }
+    };
 
-    match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
+    match outcome {
         Ok(()) => Ok(NapiAttestationVerificationResult {
             valid: true,
             chain_depth: 1,
@@ -206,6 +227,27 @@ pub(crate) fn trust_verify_attestation_on(
             error_message: format!("{e}"),
         }),
     }
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
+/// [`ProtocolRepoVariant`](crate::runtime::ProtocolRepoVariant) arm and verifies
+/// one attestation against a context's revocation list. Single source of truth
+/// for the per-backend verification path: both variants route through this one
+/// generic body.
+fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
+    repo: &Arc<scp_core::store::ProtocolRepository<S>>,
+    context_id: &str,
+    attestation: &scp_core::trust::Attestation,
+) -> Result<(), scp_core::trust::TrustError> {
+    let handle = crate::runtime().handle().clone();
+    let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
+    scp_ffi_common::trust_store::verify_attestation_in_context(
+        &bridge,
+        context_id,
+        attestation,
+        &scp_core::trust::IdentityDidPublicKeyResolver,
+        &scp_clock::SystemClock,
+    )
 }
 
 /// Per-bridge-instance implementation of `trust_create_challenge`.
@@ -792,13 +834,109 @@ mod tests {
     #[test]
     fn trust_verify_attestation_rejects_invalid_json() {
         let bi = test_bi();
-        let result = trust_verify_attestation_on(&bi, "not json".to_owned());
+        let result = trust_verify_attestation_on(&bi, "ctx-1".to_owned(), "not json".to_owned());
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
             msg.contains(codes::VALID_7012),
             "expected {}, got: {msg}",
             codes::VALID_7012
+        );
+    }
+
+    #[test]
+    fn trust_verify_attestation_rejects_malformed_context_id() {
+        let bi = test_bi();
+        let result = trust_verify_attestation_on(&bi, String::new(), "{}".to_owned());
+        assert!(
+            result.is_err(),
+            "an empty context_id must not reach verification"
+        );
+    }
+
+    /// A context-revoked attestation must report `valid == false`. This test
+    /// signs an attestation whose own `revocation_status` reads `Active` — the
+    /// copy a holder keeps after an issuer publishes a revoked replacement —
+    /// writes its id into the context's revocation list through the same
+    /// repository this bridge reads, and verifies it again.
+    ///
+    /// Passing `None` for the revocation checker inside
+    /// `verify_attestation_in_context` turns this `valid == false` back into
+    /// `valid == true`, so this assertion fails the moment that regression
+    /// lands.
+    #[test]
+    fn trust_verify_attestation_reports_a_context_revoked_attestation_invalid() {
+        use ed25519_dalek::Signer;
+        use scp_core::trust::aggregate::TrustProtocolRepository;
+
+        let bi = test_bi();
+        let context_id = "ctx-revocation-read";
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[23u8; 32]);
+        let pubkey: [u8; 32] = signing_key.verifying_key().to_bytes();
+        let issuer = scp_did::did_dht_from_public_key(&pubkey);
+        let mut attestation = scp_core::trust::Attestation {
+            id: "att-revoked-by-context".to_owned(),
+            attestation_type: scp_core::trust::AttestationType::Endorsement,
+            issuer,
+            subject: "did:key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb22"
+                .into(),
+            claim: serde_json::json!({"skill": "rust"}),
+            evidence: None,
+            issued_at: 1000,
+            expires_at: Some(u64::MAX),
+            renewal_interval: None,
+            revocation_status: scp_core::trust::RevocationStatus::Active,
+            signature: Vec::new(),
+            renewed_at: None,
+        };
+        let canonical = scp_core::trust::canonical_attestation_bytes(&attestation).unwrap();
+        attestation.signature = signing_key.sign(&canonical).to_bytes().to_vec();
+        let attestation_json = serde_json::to_string(&attestation).unwrap();
+
+        let before =
+            trust_verify_attestation_on(&bi, context_id.to_owned(), attestation_json.clone())
+                .unwrap();
+        assert!(
+            before.valid,
+            "a signed, unexpired, unlisted attestation verifies: {}",
+            before.error_message
+        );
+
+        let mut state = std::collections::HashMap::new();
+        // A revocation-list key binds an issuer to an attestation id, because
+        // §7.4.4 grants a revocation to that issuer alone.
+        state.insert(
+            scp_core::trust::aggregate::revocation_list_key(
+                &attestation.issuer,
+                "att-revoked-by-context",
+            ),
+            true,
+        );
+        let handle = crate::runtime().handle().clone();
+        match crate::runtime::protocol_repository(&bi) {
+            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle)
+                    .store_revocation_state(context_id, &state)
+                    .unwrap();
+            }
+            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle)
+                    .store_revocation_state(context_id, &state)
+                    .unwrap();
+            }
+        }
+
+        let after =
+            trust_verify_attestation_on(&bi, context_id.to_owned(), attestation_json).unwrap();
+        assert!(
+            !after.valid,
+            "a context-revoked attestation must not verify (§7.4.4)"
+        );
+        assert!(
+            after.error_message.contains("revoked"),
+            "expected a revocation error, got: {}",
+            after.error_message
         );
     }
 

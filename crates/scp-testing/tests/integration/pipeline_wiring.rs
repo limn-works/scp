@@ -243,7 +243,13 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // core `scp_core::trust::check_capability_requirements` call and the production
 // `IdentityDidPublicKeyResolver`. The 2J joiner (+4) and capability-admission
 // (+3) additions are disjoint, so the merged floor is 48 + 4 + 3 = 55.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 55;
+// Raised 55 -> 58 when `trust_verify_attestation` started reading a context's
+// persisted revocation list (§7.4.4): one per-bridge assertion (PyO3 / NAPI /
+// UniFFI) pins each verification body to the shared
+// `scp_ffi_common::trust_store::verify_attestation_in_context` helper, so no
+// bridge can go back to calling `verify_attestation` with a
+// `None` checker. Pure coverage expansion.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 58;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -3268,6 +3274,87 @@ fn uniffi_check_capability_requirements_routes_to_core() {
         ),
         "UniFFI check_capability_requirements must call core \
          check_capability_requirements with the production DID resolver"
+    );
+}
+
+// ===========================================================================
+// Attestation verification honors a context's revocation list (§7.4.4)
+// ===========================================================================
+//
+// Section 7.4.4 of `.docs/specs/07-trust-validation-and-capabilities.md` states
+// that revocation is immediate for a new verification. Step 4 of
+// `verify_attestation` reads the `revocation_status` field the
+// attestation itself carries, which a holder of a pre-revocation copy still
+// carries as `Active`; only step 5, the external-checker step, rejects that
+// holder. Each native bridge's verification op MUST therefore route through
+// `scp_ffi_common::trust_store::verify_attestation_in_context`, which reads the
+// context's persisted revocation list and hands a real checker to step 5.
+//
+// Pinning the fully-qualified
+// `scp_ffi_common::trust_store::verify_attestation_in_context(` call makes a
+// self-satisfying substring impossible, and a bridge that reverts to calling
+// `verify_attestation(..., None)` directly fails these
+// assertions.
+
+/// The PyO3 `trust_verify_attestation` bridge op must route to the shared
+/// context-scoped verification helper. Its body lives in
+/// `trust_verify_attestation_impl`, which dispatches per storage backend into
+/// `run_verify_attestation`.
+#[test]
+fn pyo3_trust_verify_attestation_reads_the_context_revocation_list() {
+    assert!(
+        fn_body_contains(
+            PYO3_TRUST_SRC,
+            "trust_verify_attestation_impl",
+            "run_verify_attestation("
+        ) && fn_body_contains(
+            PYO3_TRUST_SRC,
+            "run_verify_attestation",
+            "scp_ffi_common::trust_store::verify_attestation_in_context("
+        ),
+        "PyO3 trust_verify_attestation must verify through \
+         verify_attestation_in_context so a context-revoked attestation is \
+         rejected (§7.4.4)"
+    );
+}
+
+/// The NAPI `trust_verify_attestation` bridge op (body in
+/// `trust_verify_attestation_on`) must route to the shared helper.
+#[test]
+fn napi_trust_verify_attestation_reads_the_context_revocation_list() {
+    assert!(
+        fn_body_contains(
+            NAPI_TRUST_SRC,
+            "trust_verify_attestation_on",
+            "run_verify_attestation("
+        ) && fn_body_contains(
+            NAPI_TRUST_SRC,
+            "run_verify_attestation",
+            "scp_ffi_common::trust_store::verify_attestation_in_context("
+        ),
+        "NAPI trust_verify_attestation_on must verify through \
+         verify_attestation_in_context so a context-revoked attestation is \
+         rejected (§7.4.4)"
+    );
+}
+
+/// The UniFFI `trust_verify_attestation` bridge op must route to the shared
+/// helper.
+#[test]
+fn uniffi_trust_verify_attestation_reads_the_context_revocation_list() {
+    assert!(
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "trust_verify_attestation",
+            "run_verify_attestation("
+        ) && fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "run_verify_attestation",
+            "scp_ffi_common::trust_store::verify_attestation_in_context("
+        ),
+        "UniFFI trust_verify_attestation must verify through \
+         verify_attestation_in_context so a context-revoked attestation is \
+         rejected (§7.4.4)"
     );
 }
 

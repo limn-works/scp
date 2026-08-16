@@ -1168,9 +1168,9 @@ describe("scp.trustVerifyAttestation / scp.trustVerifyResponse — typed challen
       errorMessage: "unresolvable issuer",
     }));
 
-    scp.trustVerifyAttestation(attestationEnvelope);
+    scp.trustVerifyAttestation("ctx-1", attestationEnvelope);
     const call = native.__lastCall("trustVerifyAttestation");
-    expect(call?.args).toEqual([encodeAttestation(attestationEnvelope)]);
+    expect(call?.args).toEqual(["ctx-1", encodeAttestation(attestationEnvelope)]);
   });
 
   it("serializes the typed challenge request and response before crossing FFI", async () => {

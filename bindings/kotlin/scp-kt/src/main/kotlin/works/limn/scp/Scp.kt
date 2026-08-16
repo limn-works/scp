@@ -2012,15 +2012,29 @@ class SCP internal constructor(
         )
 
     /**
-     * Verifies an attestation's Ed25519 signature, evidence, expiry, and
-     * revocation status (ADR-017, §7.4). Takes the typed attestation envelope
-     * ([CachedAttestationEnvelope]) and serializes it to the serde wire shape
-     * internally (ADR-058), then routes through the UniFFI-generated free
-     * function [uniffi.scp.trustVerifyAttestation] unchanged. ADR-048 §1 + §7
-     * Kotlin bullet.
+     * Verifies an attestation against [contextId] (ADR-017, §7.4.4).
+     *
+     * Checks the Ed25519 signature against the issuer key the resolver
+     * returns, the evidence, the expiry, the issuer-signed `revocationStatus`
+     * field, and [contextId]'s persisted revocation list. Section 7.4.4 of the
+     * trust spec states that revocation is immediate for a new verification,
+     * and a holder of a pre-revocation copy still carries an `Active`
+     * revocation status, so reading the revocation list is what rejects that
+     * holder's copy.
+     *
+     * Takes the typed attestation envelope ([CachedAttestationEnvelope]) and
+     * serializes it to the serde wire shape internally (ADR-058), then routes
+     * through [NativeScp.trustVerifyAttestation] on [inner] unchanged.
+     *
+     * @param contextId Context whose revocation list this verification reads.
+     * @param attestation Typed attestation envelope.
      */
-    fun trustVerifyAttestation(attestation: CachedAttestationEnvelope): AttestationVerificationResult =
-        uniffi.scp.trustVerifyAttestation(
+    fun trustVerifyAttestation(
+        contextId: String,
+        attestation: CachedAttestationEnvelope,
+    ): AttestationVerificationResult =
+        inner.trustVerifyAttestation(
+            contextId = contextId,
             attestationJson = encodeAttestationJson(attestation),
         )
 

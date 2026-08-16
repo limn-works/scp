@@ -282,7 +282,7 @@ fn conf_004_agent_binding_attestation() {
     };
     let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
     let clock = scp_clock::TestClock::new(1_700_000_000);
-    scp_core::trust::verify_attestation(&attestation, &resolver, &clock)
+    scp_core::trust::verify_attestation(&attestation, &resolver, &clock, None)
         .expect("cross-verification: manual bytes must match canonical_attestation_bytes()");
 
     print_step(5, "Verify agent key matches attestation");

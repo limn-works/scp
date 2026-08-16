@@ -8,10 +8,10 @@
 //!
 //! # Renewal
 //!
-//! [`renew_attestation`] re-verifies the attestation via [`verify_attestation`]
-//! and then clones it with `renewed_at` set to the current clock time. It
-//! rejects non-renewable attestations (no `renewal_interval`), expired
-//! attestations, and attestations that fail re-verification.
+//! [`renew_attestation`] re-verifies the attestation via
+//! [`verify_attestation`], then clones it with `renewed_at` set to the current
+//! clock time. It rejects non-renewable attestations (no `renewal_interval`),
+//! expired attestations, and attestations that fail re-verification.
 //!
 //! Per spec section 7.3.6: "A claim verified once is a fact about the past.
 //! A claim that must be continuously renewed is a fact about the present."
@@ -27,7 +27,9 @@
 use std::time::Duration;
 
 use super::TrustError;
-use super::attestation::{Attestation, DidPublicKeyResolver, verify_attestation};
+use super::attestation::{
+    Attestation, AttestationRevocationChecker, DidPublicKeyResolver, verify_attestation,
+};
 use scp_clock::Clock;
 
 // ---------------------------------------------------------------------------
@@ -77,9 +79,18 @@ pub enum RenewalError {
 ///
 /// Per spec section 7.3.6, renewal requires re-verification: "A claim verified
 /// once is a fact about the past. A claim that must be continuously renewed is
-/// a fact about the present." This function calls [`verify_attestation`] before
-/// updating the timestamp to ensure the attestation's signature, evidence,
-/// expiry, and revocation status are still valid.
+/// a fact about the present." This function calls [`verify_attestation`]
+/// before updating the timestamp, which checks that the attestation's
+/// signature, evidence, expiry, and revocation status are still valid.
+///
+/// `revocation_checker` carries the external revocation list this caller
+/// consulted. Section 7.4.4 of
+/// `.docs/specs/07-trust-validation-and-capabilities.md` states that revocation
+/// is immediate for a new verification, and a renewal is a new verification, so
+/// a caller that holds a context's revocation list passes it here rather than
+/// extending trust in an attestation that list already names. A caller that
+/// holds no list passes `None`, which restricts revocation checking to the
+/// issuer-signed `revocation_status` field.
 ///
 /// The returned attestation is a clone of the input with only `renewed_at`
 /// updated. Because `renewed_at` is excluded from `canonical_attestation_bytes`,
@@ -94,6 +105,7 @@ pub fn renew_attestation(
     attestation: &Attestation,
     resolver: &impl DidPublicKeyResolver,
     clock: &impl Clock,
+    revocation_checker: Option<&dyn AttestationRevocationChecker>,
 ) -> Result<Attestation, RenewalError> {
     if attestation.renewal_interval.is_none() {
         return Err(RenewalError::NotRenewable {
@@ -112,7 +124,7 @@ pub fn renew_attestation(
         });
     }
 
-    verify_attestation(attestation, resolver, clock).map_err(|e| {
+    verify_attestation(attestation, resolver, clock, revocation_checker).map_err(|e| {
         RenewalError::VerificationFailed {
             attestation_id: attestation.id.clone(),
             source: e,
@@ -317,7 +329,7 @@ mod tests {
             None,
         );
 
-        let renewed = renew_attestation(&attestation, &resolver, &clock).unwrap();
+        let renewed = renew_attestation(&attestation, &resolver, &clock, None).unwrap();
 
         assert_eq!(renewed.renewed_at, Some(2000));
         assert_eq!(renewed.id, attestation.id);
@@ -329,6 +341,52 @@ mod tests {
         assert_eq!(renewed.signature, attestation.signature);
     }
 
+    /// A revocation list holding exactly one attestation id, standing in for a
+    /// context whose issuer revoked that one attestation.
+    struct SingleEntryRevocationList {
+        revoked_id: String,
+        revoked_at: u64,
+    }
+
+    impl AttestationRevocationChecker for SingleEntryRevocationList {
+        fn check_revocation(&self, attestation_id: &str, _issuer: &scp_did::DID) -> Option<u64> {
+            (attestation_id == self.revoked_id).then_some(self.revoked_at)
+        }
+    }
+
+    #[test]
+    fn renew_rejects_attestation_named_by_a_revocation_list() {
+        // Section 7.3.6 makes renewal a new verification, and §7.4.4 makes
+        // revocation immediate for a new verification. A caller that hands
+        // `renew_attestation` a revocation list naming this id must not receive
+        // a renewed attestation, however clean the signature and the expiry are.
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(2000);
+        let attestation = make_signed_renewable_attestation(
+            &signing_key,
+            1000,
+            Some(5000),
+            Duration::from_mins(10),
+            None,
+        );
+        let revocations = SingleEntryRevocationList {
+            revoked_id: attestation.id.clone(),
+            revoked_at: 1500,
+        };
+
+        let result = renew_attestation(&attestation, &resolver, &clock, Some(&revocations));
+
+        match result {
+            Err(RenewalError::VerificationFailed {
+                source: TrustError::AttestationRevoked { revoked_at, .. },
+                ..
+            }) => assert_eq!(revoked_at, 1500),
+            other => panic!("expected VerificationFailed/AttestationRevoked, got {other:?}"),
+        }
+    }
+
     #[test]
     fn renew_rejects_non_renewable() {
         let (signing_key, pubkey_bytes) = test_keypair();
@@ -337,7 +395,7 @@ mod tests {
         let clock = TestClock::new(2000);
         let attestation = make_signed_non_renewable_attestation(&signing_key, 1000, Some(5000));
 
-        let result = renew_attestation(&attestation, &resolver, &clock);
+        let result = renew_attestation(&attestation, &resolver, &clock, None);
 
         assert!(result.is_err());
         match result {
@@ -362,7 +420,7 @@ mod tests {
             None,
         );
 
-        let result = renew_attestation(&attestation, &resolver, &clock);
+        let result = renew_attestation(&attestation, &resolver, &clock, None);
 
         assert!(result.is_err());
         match result {
@@ -391,7 +449,7 @@ mod tests {
             None,
         );
 
-        let renewed = renew_attestation(&attestation, &resolver, &clock).unwrap();
+        let renewed = renew_attestation(&attestation, &resolver, &clock, None).unwrap();
         assert_eq!(renewed.renewed_at, Some(999_999));
     }
 
@@ -409,7 +467,7 @@ mod tests {
             Some(2000),
         );
 
-        let renewed = renew_attestation(&attestation, &resolver, &clock).unwrap();
+        let renewed = renew_attestation(&attestation, &resolver, &clock, None).unwrap();
         assert_eq!(renewed.renewed_at, Some(3000));
     }
 
@@ -428,7 +486,7 @@ mod tests {
         );
         attestation.signature[0] ^= 0xff;
 
-        let result = renew_attestation(&attestation, &resolver, &clock);
+        let result = renew_attestation(&attestation, &resolver, &clock, None);
 
         assert!(result.is_err());
         match result {
@@ -470,7 +528,7 @@ mod tests {
         let sig = signing_key.sign(&canonical);
         attestation.signature = sig.to_bytes().to_vec();
 
-        let result = renew_attestation(&attestation, &resolver, &clock);
+        let result = renew_attestation(&attestation, &resolver, &clock, None);
 
         assert!(result.is_err());
         match result {
@@ -504,7 +562,7 @@ mod tests {
             None,
         );
 
-        let result = renew_attestation(&attestation, &resolver, &clock);
+        let result = renew_attestation(&attestation, &resolver, &clock, None);
 
         assert!(result.is_err());
         match result {

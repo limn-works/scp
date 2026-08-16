@@ -1343,11 +1343,25 @@ public extension SCP {
         try inner.trustCreateChallenge(targetDid: targetDid)
     }
 
-    // `trustQueryScore` and `trustVerifyAttestation` moved to UniFFI-generated
-    // free top-level functions under ADR-048 §1 + §7 Swift bullet. Call
-    // them directly:
+    // `trustQueryScore` moved to a UniFFI-generated free top-level function
+    // under ADR-048 §1 + §7 Swift bullet. Call it directly:
     //   `try trustQueryScore(did:contextId:)`
-    //   `try trustVerifyAttestation(attestationJson:)`
+    //
+    // `trustVerifyAttestation` came back to this object once it began reading
+    // a context's persisted revocation list (§7.4.4), which ADR-048 §1 makes a
+    // per-instance operation rather than a pure helper.
+
+    /// Forwards to ``Scp/trustVerifyAttestation`` on ``inner``.
+    ///
+    /// Verifies the Ed25519 signature, the evidence, the expiry, the
+    /// issuer-signed `revocationStatus` field, and `contextId`'s persisted
+    /// revocation list (§7.4.4).
+    func trustVerifyAttestation(
+        contextId: String,
+        attestationJson: String
+    ) throws -> AttestationVerificationResult {
+        try inner.trustVerifyAttestation(contextId: contextId, attestationJson: attestationJson)
+    }
 
     /// Forwards to ``Scp/trustVerifyResponse`` on ``inner``.
     func trustVerifyResponse(challengeJson: String, responseJson: String) throws -> Bool {

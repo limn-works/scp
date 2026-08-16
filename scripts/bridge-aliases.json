@@ -708,7 +708,6 @@
       "canonical": "trust_verify_attestation",
       "category": "trust",
       "pyo3": [
-        "py_trust_verify_attestation",
         "trust_verify_attestation"
       ],
       "uniffi": [

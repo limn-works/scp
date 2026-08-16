@@ -3894,13 +3894,18 @@ impl Scp {
         crate::trust::trust_query_score_on(&self.inner, did, context_id)
     }
 
-    /// Per-instance equivalent of the free-function `trust_verify_attestation`.
+    /// Verifies an attestation against `contextId`.
+    ///
+    /// Checks the Ed25519 signature, the evidence, the expiry, the
+    /// issuer-signed `revocation_status` field, and this context's persisted
+    /// revocation list (§7.4.4).
     #[napi(js_name = "trustVerifyAttestation")]
     pub fn trust_verify_attestation(
         &self,
+        context_id: String,
         attestation_json: String,
     ) -> napi::Result<NapiAttestationVerificationResult> {
-        crate::trust::trust_verify_attestation_on(&self.inner, attestation_json)
+        crate::trust::trust_verify_attestation_on(&self.inner, context_id, attestation_json)
     }
 
     /// Per-instance equivalent of the free-function `trust_create_challenge`.
