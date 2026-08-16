@@ -34,11 +34,10 @@
   Use the worktree path or `git show <sha>:<file>`.
 
 ### Adversarial Review (PR#4) -- Black Hat Findings
-- See `/tmp/black-hat-review.md` and PR#4 comment for full details
+- PR#4 comment carries full detail
 - Key themes: relay metadata surveillance, missing auth guards, no rate limiting, schema bypass, Sybil weakness
 
 ### PR#76 Audit Findings (2026-02-26)
-- See `pr76-findings.md` for full details (initial review + fix verification)
 - UNFIXED: CurrencyCode Deserialize bypasses ASCII; EventLogMetrics Vecs unbounded; SenderVelocityTracker unbounded HashMap
 
 ### Production Readiness Commits (2026-03-06)
@@ -55,9 +54,6 @@
 - PARTIAL FIX (2026-03-03): Shared PublishRateLimiter + ConnectionTracker across WS/QUIC
 - REMAINING (MEDIUM): Total connection limit TOCTOU
 
-### Transport Expansion Audit (2026-03-04) -- QUIC/HTTP3/WebTransport/UDP/CoAP
-- See `transport-expansion-audit.md` for full finding list (SEC-001 through SEC-008)
-
 ### UCAN (`crates/scp-core/src/crypto/ucan/`)
 - 11-step validation pipeline thorough; SpendingCapability attenuation correct
 - FINDING: `validate_ucan_stateless` skips nonce, revocation, chain, attenuation
@@ -66,10 +62,6 @@
 ### Shadow Identity (`crates/scp-core/src/bridge/`)
 - HIGH: GovernanceAction no signature; canonical hash no field separators
 - MEDIUM: did:key:<hex> non-standard not gated behind cfg(test)
-
-### FFI Bridge -- PyO3 (`crates/scp-ffi/src/`) -- Audit 2026-02-28
-- See `pyo3-audit-20260228.md` for full PR#112 fix list
-- SCP-212: invoke_tool, routing ID derivation findings documented there
 
 ### FFI Bridge -- UniFFI (`crates/scp-ffi/uniffi/`) -- PR#86 + PR#127
 - CRITICAL: scp-platform testing feature in production deps
@@ -128,11 +120,9 @@
 - MEDIUM: No localhost enforcement; unbounded epoch growth; bridge secret in query param
 
 ### Persistence Layer (2026-03-03)
-- See `persistence-layer-findings.md` for details
 - HIGH x3: identity keys not zeroized; MLS bridge bypasses sanitize_key_component; SyncableStorage no auth
 
 ### Governance Gaps (closes #266) -- 2026-03-05
-- See `governance-gaps-findings.md` for details
 - HIGH: validate_projection_ucan structural-only; message_handler Gated check after decryption
 - MEDIUM: conflict_resolution missing RestoreReadAccess vs RestoreReadAccess pair (still open)
 
@@ -174,7 +164,6 @@
 - GOOD: fail-closed economy defaults; lock-drop-async pattern; auto_accept guard; cooldown prevents consequence spam; consequence_rules stripped from public export
 
 ### Wiring Batch 1 Messaging (2026-03-24, updated)
-- See `wiring-batch1-messaging-findings.md` for full details (15 files, line-by-line review)
 - HIGH x4: NAPI/UniFFI signing key .ok() falls back to None; Recovery MessageType bypass skips access key unwrapping; access key TOCTOU between Phase 1/3; reorder buffer stores pre-decrypted plaintext
 - MEDIUM x7: sender key AAD zeros (#1422 -- FIXED in PR#1606); access key wrapping AAD zeros; bridge trust level discarded; SequenceTracker not persisted; SequenceTracker validate() TOCTOU; snapshot key bytes not Zeroizing; FFI access key ops lack authorization
 - GOOD: Sig verify before anti-replay; cross-context injection defense; MLS credential match; constant-time hash; domain-sep routing IDs; fail-closed defaults; correct timestamp validator; sequence 0 rejection; bounded reorder buffer; correct sign order
@@ -278,7 +267,7 @@
 - GOOD: Escrow budget pattern with reverse_spend; ConsequenceRule::validate whitelist; NoOpPaymentAdapter cfg-gated; decrypt collapses CiphertextTooShort into AuthenticationFailed (oracle prevention); TOCTOU guard in enforce_triggered_consequences
 
 ### fix/sdk-coverage-fail-closed-and-parity @ f6caeb5dd (2026-06-20) -- CLEAN
-- See `trust-error-classifier-f6caeb5dd.md`. No CRITICAL/HIGH. trust.ts UCAN error classifier SAFE (START-anchored fixed prefixes + startsWith, attacker data always after fixed colon-literal, output ADVISORY not authz). LESSON: error-string classifiers MUST use startsWith on start-anchored prefixes, never includes(). __setBridgeForTests triple-isolated (not in index.ts + exports map blocks deep import + NODE_ENV guard). check-sdk-coverage all_exempted_ops gate sound for honest-drift not malicious committer. ADR-051 (Proposed) = pre-existing MEDIUM (pre-rotation key shares process-memory substrate, §9.7.4.1 §3). MLS provider.rs = doc-comment-only.
+- No CRITICAL/HIGH. trust.ts UCAN error classifier SAFE (START-anchored fixed prefixes + startsWith, attacker data always after fixed colon-literal, output ADVISORY not authz). LESSON: error-string classifiers MUST use startsWith on start-anchored prefixes, never includes(). __setBridgeForTests triple-isolated (not in index.ts + exports map blocks deep import + NODE_ENV guard). check-sdk-coverage all_exempted_ops gate sound for honest-drift not malicious committer. ADR-051 (Proposed) = pre-existing MEDIUM (pre-rotation key shares process-memory substrate, §9.7.4.1 §3). MLS provider.rs = doc-comment-only.
 
 ### fix/sdk-coverage-fail-closed-and-parity (2026-06-20, HEAD f1edb7498) -- CLEAN
 - test-guard.ts: module-load IIFE freezes _IS_TEST_ENVIRONMENT; Object.hasOwn (proto-pollution resistant); fail-closed on missing process/env/unrecognized NODE_ENV. assertTestEnvironment gates __constructScpWithNativeForTests + __setBridgeForTests (blocks RED-PR5-007/BLACK-PR5-003 native-injection seams in prod).
