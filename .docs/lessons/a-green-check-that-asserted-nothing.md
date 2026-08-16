@@ -1,7 +1,7 @@
-# A Green Check That Asserted Nothing: Five Ways CI Reported Success Over Zero Work
+# A Green Check That Asserted Nothing: Six Ways CI Reported Success Over Zero Work
 
 **Date:** 2026-08-16
-**Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `scripts/check-cross-layer.sh`
+**Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `scripts/check-cross-layer.sh`, `CLAUDE.md` §PRD stories
 
 ## The Rule
 
@@ -10,7 +10,7 @@ fail on the defect it exists to catch, and keep that failure as a test. Every de
 below produced a green check while the work behind it never ran, and every one of them
 had passed review because the check *looked* like it was doing its job.
 
-## The five failure shapes
+## The six failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when the filter selects no test. The two tests it named
@@ -49,6 +49,17 @@ Write `grep PATTERN >/dev/null` instead, so grep reads its whole input.
 No job in this workflow set a timeout, so one hang burned six runner-hours. Size each
 budget from observed durations (`gh api repos/OWNER/REPO/actions/runs/<id>/jobs`).
 
+**6. A document asserting that CI enforces something no workflow runs.** `CLAUDE.md`
+stated "CI enforces this" about `scripts/validate-prd.py`. The only workflow referencing
+that script was `.github/workflows/prd-validate.yml.disabled`, and GitHub never loads a
+file with that suffix. Two rules follow. First, a sentence claiming mechanical enforcement
+must name the job that performs it, so a reader can check the claim in one grep instead of
+trusting it. Second, when a bulk change disables a category of workflows — that rename
+disabled seven at once, all described as Claude-powered — check each file for steps
+outside the category: this one held a plain Python validation step alongside a Claude
+review step, and the step that needed no API key went dark with the step that did. Restore
+the part that never belonged to the category, and leave the deliberate decision alone.
+
 ## The tests that hold these closed
 
 - `scripts/tests/ci-gate/run-tests.sh` — asserts every job sets a `timeout-minutes`, that
@@ -58,6 +69,9 @@ budget from observed durations (`gh api repos/OWNER/REPO/actions/runs/<id>/jobs`
 - `scripts/tests/cross-layer/run-tests.sh` — plants an FFI export at the first line and at
   the last line of a 155 KB diff, proves the gate finds both, then plants a missing export
   and proves the gate still rejects it.
+- `scripts/tests/prd-validate/run-tests.sh` — plants six violation classes and proves the
+  PRD validator rejects each, and asserts the clean run reports a non-zero story count,
+  because a validator that walked zero stories would exit 0 as well.
 
 Both harnesses were run against the unfixed code first and failed on exactly the defect
 they describe. A harness that has never failed has not been tested.
