@@ -59,7 +59,12 @@ scp-identity = { path = "../../scp-identity", features = ["production-dht"] }
 scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common", features = ["custody"] }
-scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
+# NO `allow_unencrypted_storage`: the shared `scp-ffi-common::server` startup
+# path builds every node through `Node::start` and its sealed `EncryptedStorage`
+# bound (ADR-062 §Status). Swift and Kotlin ship from this manifest, so this
+# edge is the one that put a testing-only storage constructor in every mobile
+# artifact. The `testing` feature re-adds it transitively.
+scp-node = { path = "../../scp-node", optional = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 rmp-serde = { workspace = true }

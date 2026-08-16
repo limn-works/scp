@@ -18,9 +18,15 @@ resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-t
 # whose did:key:{hex} branch is itself gated behind `scp-did/testing`; forward
 # the flag so the single shared parser still accepts did:key in test builds.
 # `scp-node?/testing` forwards testing to scp-node ONLY when it is already
-# activated (via the `server` feature): the server.rs auto-generate path calls
-# the testing-gated `ApplicationNode::dev`. The `?` keeps testing usable without
-# `server`. Never in a default/non-testing list (ADR-062 §Decision 1).
+# activated (via the `server` feature): `server.rs`'s auto-generate node path
+# generates an identity, and scp-node gates identity generation on its own
+# `testing` feature (production creation fails closed with SCP-IDENT-1059 until
+# a real pre-rotation custody backend lands, ADR-062 §Decision 4). The `?` keeps
+# testing usable without `server`. Never in a default/non-testing list
+# (ADR-062 §Decision 1).
+# `scp-platform?/testing` compiles `InMemoryKeyCustody`, which the same
+# auto-generate path names directly. scp-node's `testing` also pulls it, but the
+# edge is stated here because THIS crate's source references the type.
 # `scp-core?/testing` makes the testing-gated `FfiCredentialStore::InMemory`
 # arm (which names `scp_core::bridge::credentials::InMemoryCredentialStore`,
 # itself `#[cfg(any(test, feature = "testing"))]`) self-consistent whenever this
@@ -31,6 +37,8 @@ testing = [
     "scp-did/testing",
     "scp-dht/testing",
     "scp-node?/testing",
+    "scp-platform?/testing",
+    "scp-identity?/testing",
 ]
 # Shared callback-custody byte/string parsing helpers (custody_parse module).
 # Requires only scp-platform for the typed return values (KeyHandle,
@@ -41,14 +49,26 @@ custody = ["dep:scp-platform"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform, and
 # tokio. Storage uses the durability-only in-memory-storage feature of
-# scp-platform (ADR-062 Slice 0). This feature does NOT enable
+# scp-platform (ADR-062 Slice 0), wrapped in `scp-platform/encrypting`'s
+# `EncryptingAdapter` so both node front doors satisfy `Node::start`'s sealed
+# `EncryptedStorage` bound. This feature does NOT enable
 # scp-platform's `testing` feature: since ADR-062 Slice 6 (SCP-CAPINJECT-006)
 # server.rs's `Explicit`-identity phantoms are typed to the production
 # `FileKeyCustody` (not the `InMemoryKeyCustody` nullifier), and the dev-relay
 # auto-generate path FAILS CLOSED (`ServerError::AutoGenerateUnavailable`) on a
-# shipped build instead of running a nullifier-backed node. No test-harness
-# platform edge is present, transitively or otherwise — G1 proves it.
-server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
+# shipped build instead of running a nullifier-backed node. It does NOT enable
+# scp-node's `allow_unencrypted_storage` either, so `Node::start_for_testing`
+# and `ProtocolRepository::new_for_testing` are absent from the shipped graph.
+# No test-harness platform edge is present, transitively or otherwise — G1
+# proves it.
+#
+# `dep:scp-core` is listed because `server.rs` names `scp_core::context::supervisor::Supervisor`
+# and `scp_core::crypto::sender_keys::BroadcastKey` in non-optional code. Without
+# it, `cargo check -p scp-ffi-common --no-default-features --features server` —
+# the exact configuration `scripts/check-shipped-feature-graph.sh` models — did
+# not build. It adds no feature edge the gate did not already resolve, because
+# all three bridges depend on scp-core unconditionally.
+server = ["dep:scp-core", "dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }
@@ -64,7 +84,13 @@ scp-identity = { path = "../../scp-identity", optional = true }
 # feature lists — the crate is always present, never feature-gated optional.
 scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-transport = { path = "../../scp-transport", features = ["redb-blob"], optional = true }
-scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
+# NO `allow_unencrypted_storage`: `server.rs` builds every node through
+# `Node::start`, whose sealed `EncryptedStorage` bound both startup functions
+# satisfy with `EncryptingAdapter` (ADR-062 §Status — this edge was the last
+# confidentiality-nullifier residue in the shipped bridge feature graph). The
+# `testing` feature re-adds it via `scp-node?/testing`, which is where
+# `Node::start_for_testing` legitimately lives.
+scp-node = { path = "../../scp-node", optional = true }
 scp-platform = { path = "../../scp-platform", features = ["encrypting", "sqlite", "in-memory-storage"], optional = true }
 async-trait = { workspace = true, optional = true }
 dashmap = { workspace = true }

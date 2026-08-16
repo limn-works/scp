@@ -161,8 +161,12 @@ pub struct NapiContextHandle {
     pub(crate) instance_id: u64,
 }
 
-/// Internal context lifecycle state string helper.
-const fn state_str(state: &ContextState) -> &'static str {
+/// Renders a [`ContextState`] as the bridge's lowercase state string.
+///
+/// Shared by the per-handle cached `state` getter and by
+/// [`crate::runtime::live_context_state_str`], so the cached snapshot and the
+/// authoritative supervisor read speak one vocabulary.
+pub(crate) const fn context_state_str(state: &ContextState) -> &'static str {
     match state {
         ContextState::Creating => "creating",
         ContextState::Active => "active",
@@ -186,6 +190,20 @@ impl NapiContextHandle {
 
     /// Returns the context's current lifecycle state.
     ///
+    /// This is a **best-effort, cached** snapshot taken at the last observed
+    /// transition. ADR-049 §10 records the decision to leave it cached: a live
+    /// supervisor read would add a mailbox round-trip to every `state` access,
+    /// and the watchdog surfaces a crash or a poison through a typed error code
+    /// on the next per-context operation (`SCP-CTX-2134` `ContextPoisoned`,
+    /// `SCP-CTX-2135` `ActorCrashed`) rather than through this getter.
+    ///
+    /// **No authorization gate reads this getter.** The cache lags a close (the
+    /// core handle flips to `Closing` while this cell still reads `"active"`
+    /// until the async finalize completes), so every bridge gate that refuses an
+    /// operation on a non-active context calls
+    /// [`crate::runtime::live_context_state_str`], which reads the per-context
+    /// supervisor actor.
+    ///
     /// # Errors
     ///
     /// Returns an error if the internal state lock is poisoned.
@@ -197,7 +215,7 @@ impl NapiContextHandle {
                 code: codes::CTX_2012.to_owned(),
             })
         })?;
-        Ok(state_str(&guard).to_owned())
+        Ok(context_state_str(&guard).to_owned())
     }
 
     /// Returns the DID of the context creator.
@@ -290,17 +308,6 @@ impl NapiContextHandle {
 }
 
 impl NapiContextHandle {
-    /// Returns the current state string for validation checks.
-    pub(crate) fn current_state_str(&self) -> Result<String, ScpNapiError> {
-        self.state
-            .lock()
-            .map(|g| state_str(&g).to_owned())
-            .map_err(|_| ScpNapiError::Context {
-                message: "context state lock is poisoned".to_owned(),
-                code: codes::CTX_2012.to_owned(),
-            })
-    }
-
     /// Sets the state to Closed.
     pub(crate) fn set_closed(&self) -> Result<(), ScpNapiError> {
         *self.state.lock().map_err(|_| ScpNapiError::Context {
@@ -884,7 +891,9 @@ pub(crate) async fn context_join_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
             message: format!("cannot join context in {state_str:?} state — context must be active"),
@@ -1367,16 +1376,9 @@ pub(crate) async fn context_join_from_welcome_on(
     // successful spawn (see `sync_ceiling_from_params` below).
     crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
         .map_err(NapiError::from)?;
-    // Insert the joiner as a member of the freshly-registered role state. On the
-    // (practically unreachable) failure of this insert into state we just
-    // created, roll it back so a failed join leaves nothing behind.
-    if let Err(e) = crate::runtime::with_context(bi, &sealed.context_id, |st| {
-        st.role_state.members.insert(owning_did.clone());
-        Ok(())
-    }) {
-        crate::runtime::remove_context(bi, &sealed.context_id);
-        return Err(NapiError::from(e));
-    }
+    // The joiner's membership is recorded by `spawn_actor_from_welcome` below,
+    // in the per-context actor that owns the authoritative role state. The
+    // bridge keeps no membership copy to insert into.
 
     let req = scp_core::context::supervisor::WelcomeJoinRequest {
         creator_did: DID(sealed.creator_did.clone()),
@@ -1580,7 +1582,9 @@ pub(crate) async fn context_leave_on(
     identity_did: String,
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
             message: format!(
@@ -1641,7 +1645,9 @@ pub(crate) async fn context_close_on(
     // ttl::close_context checking the ContextClose capability). No bridge-layer
     // auth check — the ContextManager is authoritative.
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
             message: format!(
@@ -1753,7 +1759,9 @@ pub(crate) async fn context_send_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
             message: format!(
@@ -1950,7 +1958,9 @@ pub(crate) async fn context_subscribe_on(
     // where the flag is held but un-guarded.
     let outer_guard = ActiveFlagGuard(Some(Arc::clone(&handle.subscription_active)));
 
-    let state_str = handle.current_state_str().map_err(NapiError::from)?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(NapiError::from)?;
     if state_str != "active" {
         // `outer_guard` Drop resets the flag.
         return Err(ScpNapiError::Context {
@@ -3423,7 +3433,6 @@ pub(crate) async fn context_execute_governance_action_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
-    let proposal_id_log = hex::encode(proposal_id);
 
     // Route through the ADR-049 governance dispatch surface.
     use scp_core::context::actor::commands::{ExecuteGovernanceActionPayload, GovernanceCommand};
@@ -3446,18 +3455,6 @@ pub(crate) async fn context_execute_governance_action_on(
         .await
         .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-    // Re-sync local UCAN role state cache from ContextManager after any
-    // governance action that may have modified roles/membership (#560).
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            proposal_id = %proposal_id_log,
-            error = %e,
-            "failed to sync role state after governance action — \
-             local capability checks may be stale"
-        );
-    }
 
     // Sync FFI handle state for migration transitions (§5.11A).
     match &result {
@@ -3913,8 +3910,6 @@ pub(crate) async fn context_governance_propose_on(
         })
     })?;
 
-    let action_name = action.variant_name();
-
     use scp_core::context::actor::commands::{
         GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
     };
@@ -3962,15 +3957,6 @@ pub(crate) async fn context_governance_propose_on(
                 code: codes::CTX_2041.to_owned(),
             })
         })?;
-
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            action = action_name,
-            error = %e,
-            "failed to sync role state after governance proposal"
-        );
-    }
 
     let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
 
@@ -4034,14 +4020,6 @@ pub(crate) async fn context_governance_approve_on(
             })
         })?;
 
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to sync role state after governance approval"
-        );
-    }
-
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
 
@@ -4096,14 +4074,6 @@ pub(crate) async fn context_governance_reject_on(
             })
         })?;
 
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to sync role state after governance rejection"
-        );
-    }
-
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
 
@@ -4152,14 +4122,6 @@ pub(crate) async fn context_governance_withdraw_on(
                 code: codes::CTX_2044.to_owned(),
             })
         })?;
-
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(bi, &context_id).await {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to sync role state after governance withdrawal"
-        );
-    }
 
     Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
 }
@@ -6532,27 +6494,22 @@ mod tests {
         test_dispatch_create_context(&bi, &ctx_id, params, DID(creator.to_owned())).await;
         crate::runtime::register_test_context(&bi, &ctx_id, creator);
 
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(!st.role_state.members.contains(victim));
-            Ok(())
-        })
-        .unwrap();
+        let before = crate::runtime::live_role_state(&bi, &ctx_id)
+            .await
+            .expect("supervisor holds the freshly created context");
+        assert!(!before.members.contains(victim));
 
         let fabricated = [0x11u8; 32];
         let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated).await;
         assert!(result.is_err(), "forged direct-execute must be rejected");
 
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id)
+        let after = crate::runtime::live_role_state(&bi, &ctx_id)
             .await
-            .unwrap();
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(
-                !st.role_state.members.contains(victim),
-                "rejected forgery must not have added the victim as a member"
-            );
-            Ok(())
-        })
-        .unwrap();
+            .expect("supervisor still holds the context after the rejected execute");
+        assert!(
+            !after.members.contains(victim),
+            "rejected forgery must not have added the victim as a member"
+        );
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 

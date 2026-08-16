@@ -1249,8 +1249,11 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         //
         // Generate a fresh 32-byte PSK, then wrap it for each enrolled
         // device's X25519 public key (excluding the compromised device if
-        // specified) using X25519 ECDH + HKDF + AES-256-GCM (HPKE mode
-        // Base, matching the sender key wrapping pattern in §9.16.2).
+        // specified) via RFC 9180 HPKE Base mode: DHKEM(X25519, HKDF-SHA256),
+        // HKDF-SHA256, AES-128-GCM — the suite §3.7.2 pins, matching the sender
+        // key wrapping pattern in §9.16.2. The block at the wrap loop below
+        // states the same suite; this sentence previously named X25519 ECDH +
+        // HKDF + AES-256-GCM, which the RFC 9180 rewrite (#1794) replaced.
         // The wrapped PSKs are distributed as a recovery notification.
 
         use rand::RngCore as _;

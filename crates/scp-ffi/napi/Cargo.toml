@@ -70,7 +70,10 @@ scp-identity = { path = "../../scp-identity" }
 scp-dht = { path = "../../scp-dht", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common", features = ["custody"] }
-scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], optional = true }
+# NO `allow_unencrypted_storage`: the shared `scp-ffi-common::server` startup
+# path builds every node through `Node::start` and its sealed `EncryptedStorage`
+# bound (ADR-062 §Status). The `testing` feature re-adds it transitively.
+scp-node = { path = "../../scp-node", optional = true }
 # Production dep line: durability-only `in-memory-storage` (the shippable
 # `{"type":"in_memory"}` storage affordance, SCP-CAPSEL-8011) plus
 # `software_platform` for the crypto primitives — NEVER `testing` (ADR-062

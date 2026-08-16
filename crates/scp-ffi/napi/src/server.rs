@@ -640,6 +640,11 @@ pub(crate) async fn node_start_in_memory_on(
 }
 
 /// Per-bridge-instance implementation of `node_start_local`.
+///
+/// `passphrase` is required whether or not the caller supplies an
+/// `identity_did`: Argon2id derives the node's storage-encryption key from it.
+/// Passing `None` returns a `Validation` error carrying `SCP-VALID-7004` rather
+/// than starting a node that writes plaintext protocol state.
 pub(crate) async fn node_start_local_on(
     bi: &Arc<NapiBridgeInstance>,
     data_dir: String,

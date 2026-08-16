@@ -52,6 +52,13 @@ impl From<ServerError> for ScpError {
                 msg: user_msg,
                 code: codes::CTX_2052.to_owned(),
             },
+            // The salt sidecar that derives the node's storage-encryption key is
+            // unusable, so the node refuses to persist state it could not
+            // encrypt (spec §17.6 storage selection fails closed).
+            ServerError::StorageSalt(_) => Self::Context {
+                msg: user_msg,
+                code: codes::CTX_2053.to_owned(),
+            },
             // Both are actionable configuration errors surfaced as validation
             // failures: a missing SQLCipher passphrase, and relay-identity
             // auto-generation being unavailable in this (non-dev) build.
@@ -768,6 +775,11 @@ pub(crate) async fn node_start_in_memory_on(
 
 /// Per-instance helper used by [`crate::Scp::node_start_local`] on the
 /// caller-owned `Scp`.
+///
+/// `passphrase` is required whether or not the caller supplies an `identity`:
+/// Argon2id derives the node's storage-encryption key from it. Passing `None`
+/// returns a `Validation` error carrying `SCP-VALID-7004` rather than starting a
+/// node that writes plaintext protocol state.
 pub(crate) async fn node_start_local_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     data_dir: String,
@@ -1023,12 +1035,13 @@ mod tests {
 
         let tmp =
             std::env::temp_dir().join(format!("scp-uniffi-node-id-test-{}", std::process::id()));
-        // No passphrase needed when passing a pre-existing identity.
+        // The passphrase still derives the storage-encryption key even though
+        // the caller supplies the identity.
         let node = rt()
             .block_on(scp.node_start_local(
                 tmp.to_string_lossy().into_owned(),
                 Some(identity),
-                None,
+                Some("test-passphrase".to_owned()),
             ))
             .unwrap();
 

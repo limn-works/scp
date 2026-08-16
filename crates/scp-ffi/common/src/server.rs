@@ -18,8 +18,11 @@ use scp_did::DidDocument;
 use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
 use scp_node::{DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, NodeError, Reach};
+use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::file::FileKeyCustody;
+use scp_platform::filesystem::FilesystemStorage;
 use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::kdf::{ARGON2_SALT_LEN, derive_argon2id_key};
 
 use crate::dht::{DhtInitError, FfiDhtClient};
 // `ClientDhtConfig` is only referenced by the production (non-test) fail-closed
@@ -41,6 +44,35 @@ use zeroize::Zeroizing;
 /// `PkarrDhtClient` in shipped builds (an in-memory arm only under `testing`,
 /// ADR-062 §Decision 1) — and `SystemClock` (wall-clock time).
 pub type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>;
+
+// ---------------------------------------------------------------------------
+// Encrypted storage aliases — the two backends this module hands `Node::start`
+// ---------------------------------------------------------------------------
+
+/// Ephemeral protocol storage for [`start_node_in_memory`]: `InMemoryStorage`
+/// wrapped in AES-256-GCM.
+///
+/// [`EncryptingAdapter`] is the only way an unsealed backend satisfies the
+/// sealed `EncryptedStorage` bound `Node::start` requires (spec §17.6 / §17.17,
+/// ADR-062 §Status). The node is ephemeral, so the wrapping key is 32 fresh
+/// `OsRng` bytes that die with the process.
+pub type NodeInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
+
+/// Persistent protocol storage for [`start_node_local`]: `FilesystemStorage`
+/// wrapped in AES-256-GCM under a key the caller's passphrase derives.
+///
+/// The bytes outlive the process, so the wrapping key MUST come from the
+/// caller's passphrase through [`derive_argon2id_key`] — never from an
+/// `OsRng` draw the next start cannot reproduce.
+pub type NodeFilesystemStorage = EncryptingAdapter<FilesystemStorage>;
+
+/// File name of the Argon2id salt sidecar for [`start_node_local`]'s encrypted
+/// protocol storage.
+///
+/// The salt is not secret, so it lives beside the encrypted store rather than
+/// inside it — the same arrangement `SqliteStorage`'s passphrase constructor
+/// uses for `scp.salt` beside `scp.db` (`scp_platform::sqlite`).
+const STORAGE_SALT_FILE_NAME: &str = "storage.salt";
 
 /// Pre-existing identity to use when starting an application node.
 ///
@@ -105,6 +137,15 @@ pub enum ServerError {
     /// the in-memory test-harness node is not compiled (fail-closed; ADR-062).
     #[error("auto-generated in-memory node identity is unavailable in this build")]
     AutoGenerateUnavailable,
+
+    /// The Argon2id salt sidecar backing the node's encrypted file storage
+    /// could not be read or initialized, so no storage key can be derived.
+    ///
+    /// This is a terminal error: `start_node_local` refuses to start the node
+    /// rather than write plaintext protocol state (spec §17.6 storage selection
+    /// fails closed).
+    #[error("storage salt error: {0}")]
+    StorageSalt(String),
 }
 
 impl ServerError {
@@ -128,8 +169,125 @@ impl ServerError {
             Self::AutoGenerateUnavailable => {
                 "auto-generated in-memory node identity is unavailable in this build".to_owned()
             }
+            Self::StorageSalt(_) => "storage key derivation failed".to_owned(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Storage-encryption salt sidecar
+// ---------------------------------------------------------------------------
+
+/// Reads `<data_dir>/storage.salt`, or writes a fresh 16-byte `OsRng` salt
+/// there when the node's protocol store holds nothing yet.
+///
+/// The salt feeds [`derive_argon2id_key`], which turns the caller's passphrase
+/// into the AES-256-GCM key wrapping `<data_dir>/storage/`. Every rule below
+/// fails closed, because a salt this function cannot vouch for derives a key
+/// that decrypts nothing:
+///
+/// - `storage_dir` already holds entries but no salt file exists: return an
+///   error. A fresh salt would derive a different key, and every existing value
+///   would then fail its AES-256-GCM tag check.
+/// - The salt path is a symlink: return an error rather than follow it.
+/// - The salt file is not exactly [`ARGON2_SALT_LEN`] bytes: return an error.
+///
+/// # Errors
+///
+/// Returns [`ServerError::StorageSalt`] when any rule above rejects the sidecar,
+/// and [`ServerError::Io`] when reading or writing the sidecar fails.
+fn load_or_init_storage_salt(
+    data_dir: &Path,
+    storage_dir: &Path,
+) -> Result<[u8; ARGON2_SALT_LEN], ServerError> {
+    let salt_path = data_dir.join(STORAGE_SALT_FILE_NAME);
+
+    if salt_path.exists() {
+        let meta = std::fs::symlink_metadata(&salt_path)?;
+        if meta.file_type().is_symlink() {
+            return Err(ServerError::StorageSalt(format!(
+                "salt sidecar at {} is a symlink — refusing to follow it",
+                salt_path.display()
+            )));
+        }
+        let bytes = std::fs::read(&salt_path)?;
+        let salt: [u8; ARGON2_SALT_LEN] = bytes.as_slice().try_into().map_err(|_| {
+            ServerError::StorageSalt(format!(
+                "salt sidecar at {} holds {} bytes, expected {ARGON2_SALT_LEN}",
+                salt_path.display(),
+                bytes.len()
+            ))
+        })?;
+        return Ok(salt);
+    }
+
+    // Brick guard: a populated store whose salt sidecar vanished is
+    // unrecoverable through this path. Generating a fresh salt would derive a
+    // different AES-256-GCM key, so refuse instead of writing values the next
+    // start cannot read.
+    if storage_dir_has_entries(storage_dir)? {
+        return Err(ServerError::StorageSalt(format!(
+            "protocol storage at {} holds data but its salt sidecar at {} is \
+             missing — refusing to generate a new salt, which would derive a \
+             different key and orphan the stored values",
+            storage_dir.display(),
+            salt_path.display()
+        )));
+    }
+
+    let mut salt = [0u8; ARGON2_SALT_LEN];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut salt);
+    write_salt_atomically(&salt_path, &salt)?;
+    Ok(salt)
+}
+
+/// Reports whether `storage_dir` contains at least one entry.
+///
+/// A directory that does not exist counts as empty, which is the first-start
+/// case [`load_or_init_storage_salt`] initializes a salt for.
+fn storage_dir_has_entries(storage_dir: &Path) -> Result<bool, ServerError> {
+    match std::fs::read_dir(storage_dir) {
+        Ok(mut entries) => Ok(entries.next().is_some()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(ServerError::Io(e)),
+    }
+}
+
+/// Writes `salt` to `salt_path` through a uniquely-named temporary file and a
+/// rename, so a concurrent reader sees either no sidecar or the complete one.
+///
+/// On Unix the temporary file is created with mode `0o600` before any bytes
+/// reach it, so the salt never sits on disk world-readable.
+fn write_salt_atomically(
+    salt_path: &Path,
+    salt: &[u8; ARGON2_SALT_LEN],
+) -> Result<(), ServerError> {
+    let parent = salt_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut suffix = [0u8; 8];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut suffix);
+    let temp_path = parent.join(format!(
+        "{STORAGE_SALT_FILE_NAME}.{}.tmp",
+        hex::encode(suffix)
+    ));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        std::io::Write::write_all(&mut file, salt)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, salt_path)
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result.map_err(ServerError::Io)
 }
 
 // ---------------------------------------------------------------------------
@@ -299,12 +457,32 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 // ApplicationNode startup
 // ---------------------------------------------------------------------------
 
-/// Starts a full application node with in-memory storage.
+/// Builds ephemeral encrypted protocol storage for [`start_node_in_memory`].
 ///
-/// When `identity` is `None` (auto-generate): available ONLY in a `testing`
-/// build via the test-harness `ApplicationNode::dev` (in-memory key custody,
-/// [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage), and the
-/// [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
+/// The node dies with the process, so a fresh 32-byte `OsRng` key wraps the
+/// in-memory backend. No later start has to reproduce this key, which is why an
+/// `OsRng` draw is correct here and wrong for [`start_node_local`]. The same
+/// construction backs each bridge instance's own in-memory storage
+/// (`bridge_runtime::build_event_log_provider`).
+fn ephemeral_encrypted_storage() -> NodeInMemoryStorage {
+    let mut key = Zeroizing::new([0u8; 32]);
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, key.as_mut());
+    EncryptingAdapter::new(InMemoryStorage::new(), key)
+}
+
+/// Starts a full application node whose protocol state lives in encrypted
+/// in-memory storage.
+///
+/// The node runs on [`Node::start`], whose `S: EncryptedStorage` bound
+/// [`NodeInMemoryStorage`] satisfies through
+/// [`EncryptingAdapter`](scp_platform::encrypting_adapter::EncryptingAdapter).
+/// No shipped path here reaches `Node::start_for_testing`, so the
+/// `allow_unencrypted_storage` feature never enters a bridge's feature graph
+/// (ADR-062 §Status, spec §17.17 SCP-CAPSEL-8012).
+///
+/// When `identity` is `None` (auto-generate), a `testing` build creates a fresh
+/// identity from in-memory key custody and the
+/// [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier (no real DHT
 /// network). A shipped (no-`testing`) build FAILS CLOSED with
 /// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
 /// node (ADR-062 §Decision 1/6); production callers pass an explicit
@@ -324,14 +502,45 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// provisioning fails.
 pub async fn start_node_in_memory(
     identity: Option<NodeIdentity>,
-) -> Result<scp_node::ApplicationNode<InMemoryStorage>, ServerError> {
+) -> Result<scp_node::ApplicationNode<NodeInMemoryStorage>, ServerError> {
     let node = match identity {
-        // Auto-generate uses the test-harness `ApplicationNode::dev` (in-memory
-        // DHT nullifier), compiled only under `testing` (ADR-062 §Decision 1).
-        // A shipped build fails closed rather than running a nullifier-backed
-        // node; callers pass an explicit `Some(NodeIdentity)` in production.
+        // Auto-generate mints a fresh identity from the in-memory key-custody
+        // and in-memory-DHT nullifiers, both compiled only under `testing`
+        // (ADR-062 §Decision 1). A shipped build fails closed rather than
+        // running a nullifier-backed node; production callers pass an explicit
+        // `Some(NodeIdentity)`.
         #[cfg(any(test, feature = "testing"))]
-        None => scp_node::ApplicationNode::dev(0).await?,
+        None => {
+            use scp_identity::DidCache;
+            use scp_platform::testing::InMemoryKeyCustody;
+
+            let custody = Arc::new(InMemoryKeyCustody::new());
+            let dht_client = Arc::new(FfiDhtClient::InMemory(scp_dht::InMemoryDhtClient::new()));
+            let cache = Arc::new(DidCache::new());
+            let sign_fn = ConcreteDidMethod::make_sign_fn(Arc::clone(&custody));
+            let did_method = Arc::new(ConcreteDidMethod::with_client_and_signer(
+                dht_client, cache, sign_fn,
+            ));
+            Node::start(NodeConfig {
+                bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                dht: DhtMode::Production,
+                ..NodeConfig::defaults(
+                    Reach::Domain {
+                        domain: "localhost".to_owned(),
+                    },
+                    IdentitySource::Generate {
+                        custody,
+                        did_method,
+                    },
+                    ephemeral_encrypted_storage(),
+                    // Explicit durability-only selection for this in-memory
+                    // server front door (SCP-CAPINJECT-010): the blob backend is
+                    // a required selection, never a runtime default.
+                    BlobStorageBackend::in_memory(),
+                )
+            })
+            .await?
+        }
         #[cfg(not(any(test, feature = "testing")))]
         None => return Err(ServerError::AutoGenerateUnavailable),
         Some(id) => {
@@ -340,7 +549,7 @@ pub async fn start_node_in_memory(
             // reproduced by the default `TlsMode::SelfSigned`. `Domain` is a
             // publishing reach, so M2 requires `DhtMode::Production` (advisory
             // in P1 — the in-memory DHT client publishes nothing).
-            Node::start_for_testing(NodeConfig {
+            Node::start(NodeConfig {
                 bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
                 dht: DhtMode::Production,
                 ..NodeConfig::defaults(
@@ -358,7 +567,7 @@ pub async fn start_node_in_memory(
                             did_method: id.did_method,
                         },
                     )),
-                    InMemoryStorage::new(),
+                    ephemeral_encrypted_storage(),
                     // Explicit durability-only selection for this in-memory
                     // server front door (SCP-CAPINJECT-010): the blob backend is
                     // a required selection, never a runtime default.
@@ -378,11 +587,17 @@ pub async fn start_node_in_memory(
     Ok(node)
 }
 
-/// Starts a full application node with file-backed storage for local development.
+/// Starts a full application node with encrypted file-backed storage for local
+/// development.
+///
+/// The node runs on [`Node::start`], whose `S: EncryptedStorage` bound
+/// [`NodeFilesystemStorage`] satisfies, so no shipped path here reaches
+/// `Node::start_for_testing` (ADR-062 §Status, spec §17.17 SCP-CAPSEL-8012).
 ///
 /// Auto-wires:
-/// - [`FilesystemStorage`](scp_platform::filesystem::FilesystemStorage) at
-///   `<data_dir>/storage/` — persistent key-value storage for protocol state
+/// - [`NodeFilesystemStorage`] at `<data_dir>/storage/` — AES-256-GCM over
+///   `FilesystemStorage`, keyed by Argon2id over the caller's `passphrase` and
+///   the `<data_dir>/storage.salt` sidecar
 /// - [`BlobStorageBackend::redb`] at `<data_dir>/blobs.redb` — persistent
 ///   relay blob storage
 /// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT
@@ -401,29 +616,39 @@ pub async fn start_node_in_memory(
 ///
 /// When `identity` is `None`, the node creates or reloads a persistent
 /// identity via [`FileKeyCustody`](scp_platform::file::FileKeyCustody)
-/// backed by `<data_dir>/identity.key`. The `passphrase` parameter is
-/// required in this mode — there is no environment variable fallback.
+/// backed by `<data_dir>/identity.key`.
 ///
 /// On first run, a new DID is generated and persisted to storage. On
 /// subsequent runs, the same DID is reloaded from storage.
 ///
 /// For fully ephemeral setups use [`start_node_in_memory`].
 ///
+/// # Passphrase
+///
+/// `passphrase` is REQUIRED in both identity modes, and there is no environment
+/// variable fallback. The passphrase derives the AES-256-GCM key that
+/// [`NodeFilesystemStorage`] writes `<data_dir>/storage/` under, so a node
+/// started without one has no key with which to encrypt the protocol state it
+/// persists. Passing `None` returns [`ServerError::MissingPassphrase`] instead
+/// of inventing a key or writing plaintext (spec §17.6 storage selection fails
+/// closed, ADR-062 §Status).
+///
 /// # Errors
 ///
 /// Returns [`ServerError`] if:
 /// - The data directory cannot be created ([`ServerError::Io`])
+/// - No passphrase was provided ([`ServerError::MissingPassphrase`])
+/// - The storage salt sidecar is unusable ([`ServerError::StorageSalt`])
+/// - Argon2id key derivation fails ([`ServerError::Platform`])
 /// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
 /// - The redb blob database cannot be opened ([`ServerError::Storage`])
-/// - No passphrase provided when `identity` is `None` ([`ServerError::MissingPassphrase`])
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local(
     data_dir: &Path,
     identity: Option<NodeIdentity>,
     passphrase: Option<zeroize::Zeroizing<String>>,
-) -> Result<scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>, ServerError> {
+) -> Result<scp_node::ApplicationNode<NodeFilesystemStorage>, ServerError> {
     use scp_identity::DidCache;
-    use scp_platform::filesystem::FilesystemStorage;
 
     // Validate and ensure data directory exists.
     validate_data_dir(data_dir)?;
@@ -440,12 +665,27 @@ pub async fn start_node_local(
         std::fs::create_dir_all(data_dir)?;
     }
 
+    // Both identity arms persist protocol state to disk, so both need the
+    // passphrase that derives the storage-encryption key. Refuse before opening
+    // anything rather than start a node that would write plaintext.
+    let passphrase = passphrase.ok_or(ServerError::MissingPassphrase)?;
+
     // Common paths.
     let storage_dir = data_dir.join("storage");
     let blob_path = data_dir.join("blobs.redb");
 
-    // File-backed protocol storage and blob storage (shared across identity modes).
-    let storage = FilesystemStorage::new(&storage_dir)?;
+    // Derive the storage-encryption key from the caller's passphrase through
+    // the crate-wide Argon2id parameterization (`scp_platform::kdf`, the same
+    // derivation `SqliteStorage`'s passphrase constructor uses — spec §17.8).
+    // The salt sidecar makes the derivation reproducible across restarts, which
+    // is what lets the node reopen what it wrote.
+    let salt = load_or_init_storage_salt(data_dir, &storage_dir)?;
+    let storage_key = derive_argon2id_key(passphrase.as_bytes(), &salt)?;
+
+    // Encrypted file-backed protocol storage and blob storage (shared across
+    // identity modes). `EncryptingAdapter` is what satisfies `Node::start`'s
+    // sealed `EncryptedStorage` bound.
+    let storage = EncryptingAdapter::new(FilesystemStorage::new(&storage_dir)?, storage_key);
     let blob_storage = BlobStorageBackend::redb(&blob_path)?;
 
     // Build the node via the ADR-052 flat-config front door (Phase B-P2). The
@@ -456,7 +696,7 @@ pub async fn start_node_local(
     // publishes nothing). The storage values are moved into the config, so the
     // two arms each build their own config.
     let node = if let Some(id) = identity {
-        Node::start_for_testing(NodeConfig {
+        Node::start(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
@@ -483,7 +723,6 @@ pub async fn start_node_local(
         .await?
     } else {
         // Persistent key custody — keys survive process restarts.
-        let passphrase = passphrase.ok_or(ServerError::MissingPassphrase)?;
         let key_path = data_dir.join("identity.key");
         let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
             &key_path,
@@ -495,8 +734,8 @@ pub async fn start_node_local(
         // substitution; ADR-062 §Decision 1) — the node's dht gateways would
         // thread in here; the local path uses direct Mainline DHT (no gateways).
         // A test-harness build (`testing`) uses the in-memory §17.17.3 double so
-        // `Node::start_for_testing`'s mandatory startup publish (a full relay node
-        // always publishes; see `scp_node`) stays offline instead of timing out
+        // `Node::start`'s mandatory startup publish (a full relay node always
+        // publishes; see `scp_node`) stays offline instead of timing out
         // against live Mainline. The client backs both this node's DID
         // publication and its `did:dht` resolution.
         #[cfg(not(any(test, feature = "testing")))]
@@ -509,7 +748,7 @@ pub async fn start_node_local(
             dht_client, cache, sign_fn,
         ));
 
-        Node::start_for_testing(NodeConfig {
+        Node::start(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
@@ -548,16 +787,18 @@ pub async fn start_node_local(
 ///
 /// `ApplicationNode<S>` is generic over `S: Storage`. The `Storage` trait uses
 /// RPITIT and is not object-safe, so we cannot use `dyn Storage`. Instead we
-/// use a closed enum over `InMemoryStorage` and `FilesystemStorage`.
+/// use a closed enum over the two encrypted backends the startup functions
+/// build, [`NodeInMemoryStorage`] and [`NodeFilesystemStorage`].
 ///
 /// This mirrors the pattern established by [`RunningRelay`] — shared in
 /// `scp-ffi-common` so each FFI bridge wraps this rather than duplicating the
 /// enum and its dispatch methods.
 pub enum RunningNode {
-    /// In-memory storage variant (ephemeral — suitable for tests/demos).
-    InMemory(scp_node::ApplicationNode<InMemoryStorage>),
-    /// Filesystem-backed storage variant (persistent — suitable for local dev).
-    Filesystem(scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>),
+    /// Encrypted in-memory storage variant (ephemeral — suitable for tests/demos).
+    InMemory(scp_node::ApplicationNode<NodeInMemoryStorage>),
+    /// Encrypted filesystem-backed storage variant (persistent — suitable for
+    /// local dev).
+    Filesystem(scp_node::ApplicationNode<NodeFilesystemStorage>),
 }
 
 impl RunningNode {
@@ -1367,8 +1608,11 @@ mod tests {
 
         let tmp =
             std::env::temp_dir().join(format!("scp-test-node-local-id-{}", std::process::id()));
-        // No passphrase needed when passing a pre-existing identity.
-        let node = start_node_local(&tmp, Some(test_id), None).await.unwrap();
+        // The passphrase still derives the storage-encryption key even though
+        // the caller supplies the identity.
+        let node = start_node_local(&tmp, Some(test_id), Some(test_passphrase()))
+            .await
+            .unwrap();
 
         assert_eq!(
             node.identity().did(),
@@ -1417,6 +1661,151 @@ mod tests {
         );
 
         // Cleanup (data_dir may not have been fully created).
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Verifies that a caller-supplied identity does NOT excuse the passphrase.
+    ///
+    /// `start_node_local` writes protocol state to `<data_dir>/storage/` in both
+    /// identity arms, and the passphrase is what derives the AES-256-GCM key
+    /// that state is written under. An explicit identity changes who the node
+    /// is, not whether it persists anything, so the requirement holds in both
+    /// arms (ADR-062 §Status; spec §17.6 "Storage Selection Fails Closed").
+    ///
+    /// REVERT LINE: `let passphrase = passphrase.ok_or(ServerError::MissingPassphrase)?;`
+    /// in `start_node_local`, which sits above the `if let Some(id) = identity`
+    /// branch. Moving it back inside the `else` arm makes this test fail,
+    /// because the explicit-identity arm then starts a node with no key.
+    #[tokio::test]
+    async fn node_local_with_identity_still_requires_passphrase() {
+        let test_id = create_test_identity().await;
+        let tmp =
+            std::env::temp_dir().join(format!("scp-test-node-id-no-pass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let result = start_node_local(&tmp, Some(test_id), None).await;
+
+        let err = result
+            .err()
+            .expect("an explicit identity must not bypass the passphrase requirement");
+        assert!(
+            matches!(err, ServerError::MissingPassphrase),
+            "expected ServerError::MissingPassphrase, got: {err:?}"
+        );
+        assert!(
+            !tmp.join("storage").exists(),
+            "a start that fails closed must leave no protocol storage behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Collects every file under `dir`, descending into subdirectories.
+    fn collect_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Reports whether `haystack` contains `needle` as a contiguous run of bytes.
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.len() <= haystack.len()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
+    /// Verifies that the bytes `start_node_local` leaves on disk are ciphertext.
+    ///
+    /// During startup the node persists its own `PersistedIdentity` envelope,
+    /// which embeds the node's DID string, into `<data_dir>/storage/`. This test
+    /// reads every byte under that directory and asserts the DID never appears
+    /// in the clear, which is the observable consequence of `Node::start`'s
+    /// sealed `EncryptedStorage` bound (spec §17.17 SCP-CAPSEL-8012).
+    ///
+    /// REVERT LINE: `let storage = EncryptingAdapter::new(FilesystemStorage::new(&storage_dir)?, storage_key);`
+    /// in `start_node_local`. Reverting it to `let storage = FilesystemStorage::new(&storage_dir)?`
+    /// (which also forces `Node::start` back to `Node::start_for_testing`, since
+    /// a bare `FilesystemStorage` does not satisfy `EncryptedStorage`) makes this
+    /// test fail: the `MessagePack` identity envelope then carries the DID as
+    /// readable text.
+    #[tokio::test]
+    async fn node_local_persists_ciphertext_not_plaintext() {
+        let tmp =
+            std::env::temp_dir().join(format!("scp-test-node-ciphertext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let node = start_node_local(&tmp, None, Some(test_passphrase()))
+            .await
+            .unwrap();
+        let did = node.identity().did().to_owned();
+        node.shutdown();
+        drop(node);
+        // Yield so the relay's background tasks release their file handles.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The salt sidecar is what makes the derived key reproducible across
+        // restarts, so an encrypted store must have one.
+        assert!(
+            tmp.join("storage.salt").is_file(),
+            "the Argon2id salt sidecar should exist at <data_dir>/storage.salt"
+        );
+
+        let mut files = Vec::new();
+        collect_files(&tmp.join("storage"), &mut files);
+        assert!(
+            !files.is_empty(),
+            "the node should have persisted at least one value"
+        );
+
+        for path in &files {
+            let bytes = std::fs::read(path).unwrap();
+            assert!(
+                !contains_bytes(&bytes, did.as_bytes()),
+                "found the node DID in cleartext inside {} — protocol state was \
+                 written unencrypted",
+                path.display()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Verifies the brick guard: a populated protocol store whose salt sidecar
+    /// went missing fails closed instead of deriving a fresh, different key.
+    #[tokio::test]
+    async fn node_local_refuses_to_regenerate_a_salt_beside_existing_data() {
+        let tmp =
+            std::env::temp_dir().join(format!("scp-test-node-salt-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let node = start_node_local(&tmp, None, Some(test_passphrase()))
+            .await
+            .unwrap();
+        node.shutdown();
+        drop(node);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        std::fs::remove_file(tmp.join("storage.salt")).unwrap();
+
+        let result = start_node_local(&tmp, None, Some(test_passphrase())).await;
+        let err = result
+            .err()
+            .expect("a populated store with no salt sidecar must fail closed");
+        assert!(
+            matches!(err, ServerError::StorageSalt(_)),
+            "expected ServerError::StorageSalt, got: {err:?}"
+        );
+        assert_eq!(err.user_message(), "storage key derivation failed");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

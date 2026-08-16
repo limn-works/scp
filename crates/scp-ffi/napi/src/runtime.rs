@@ -35,7 +35,7 @@ use scp_clock::SystemClock;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::outlets::{OutletRegistry, SessionStore};
 use scp_core::context::persistence::ContextPersistence;
-use scp_core::context::roles::{ContextRoleState, default_ceiling};
+use scp_core::context::roles::ContextRoleState;
 use scp_core::context::state::ContextSnapshot;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
@@ -1599,11 +1599,17 @@ where
 /// NAPI-specific fields for outlet management and role state. The core
 /// fields (revocation list, nonce tracker, ceiling, creator DID, event log)
 /// are shared with the `UniFFI` bridge (#1447).
+/// This struct holds NO role state. Membership, role assignments, per-member
+/// capabilities, suspensions, and the capability ceiling belong to the
+/// per-context supervisor actor, and every bridge gate reads them through
+/// [`live_role_state`] / [`live_ceiling_strings`]. The bridge cached a
+/// `ContextRoleState` clone until a remote governance action proved the clone
+/// could not be kept current: five LOCAL governance call sites re-synced it and
+/// no remote path invalidated it, so a `RemoveMember` another participant
+/// committed left every bridge gate authorizing the removed member.
 pub struct UcanContextState {
     /// Core UCAN validation state shared with `UniFFI` bridge.
     pub core: scp_ffi_common::bridge_runtime::UcanContextStateCore,
-    /// Role state for capability checking (outlet registration, invocation).
-    pub role_state: ContextRoleState,
     /// Outlet registry for this context (cross-context + session support).
     pub outlet_registry: OutletRegistry,
     /// Registered outlet handlers keyed by outlet ID.
@@ -1630,15 +1636,16 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
 ///
 /// Shared by [`ensure_registered`] (lazy, idempotent — the UCAN-op path) and
 /// [`register_ffi_state`] (eager, fail-closed — the Welcome-join path) so the
-/// two cannot drift in how they construct per-context FFI state. Mirrors the
-/// `PyO3` reference bridge's `register_ffi_state` state-building: the role state
-/// is seeded from `default_ceiling()` with `creator_did` as admin, and the
-/// caller ceiling drives only the UCAN `ceiling_strings`.
+/// two cannot drift in how they construct per-context FFI state.
+///
+/// Builds no role state: membership, roles, and the enforced ceiling belong to
+/// the per-context supervisor actor, which every gate reads through
+/// [`live_role_state`] and [`live_ceiling_strings`].
 ///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Validation` if a ceiling entry violates the §5.3.1.1
-/// grammar, or `ScpNapiError::Context` if role-state construction fails.
+/// grammar.
 fn build_ucan_context_state(
     context_id: &str,
     creator_did: &str,
@@ -1689,20 +1696,6 @@ fn build_ucan_context_state(
             .collect::<HashSet<String>>()
     };
 
-    // Default ceiling + no custom roles cannot fail validation in practice; the
-    // fallible path is preserved for parity with the shared constructor.
-    let role_state = ContextRoleState::new(
-        context_id,
-        creator_did,
-        default_ceiling(),
-        Vec::new(),
-        &SystemClock,
-    )
-    .map_err(|e| ScpNapiError::Context {
-        message: format!("failed to create role state: {e}"),
-        code: codes::CTX_2023.to_owned(),
-    })?;
-
     Ok(UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
             revocation_list: RevocationList::new(context_id.to_owned()),
@@ -1711,7 +1704,6 @@ fn build_ucan_context_state(
             creator_did: creator_did.to_owned(),
             event_log: EventLog::new(context_id.to_owned()),
         },
-        role_state,
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
@@ -1823,60 +1815,101 @@ pub fn remove_context(bi: &NapiBridgeInstance, context_id: &str) {
     bi.core.remove_known_context(context_id);
 }
 
-/// Re-syncs the `UcanContextState.role_state` for a context from the shared
-/// `ContextManager`.
+/// Reads the AUTHORITATIVE [`ContextRoleState`] for `context_id` from the
+/// per-context supervisor actor.
 ///
-/// Must be called after any governance action that modifies role state
-/// (`ChangeRole`, `ModifyCeiling`, `AddMember`, `RemoveMember`, etc.) so that
-/// the NAPI-side copy used by UCAN/outlet capability checks stays current.
+/// Every bridge gate that decides authorization from membership, role
+/// assignment, per-member capability, suspension, or the capability ceiling
+/// calls this. The bridge holds NO role-state copy: a membership revocation
+/// that another participant commits arrives at the supervisor actor and is
+/// visible to the very next gate, so a remote `RemoveMember` refuses the next
+/// unary call and the next saga call exactly as it already refuses a streaming
+/// call.
+///
+/// The NAPI bridge previously cached a `UcanContextState.role_state` clone and
+/// re-synced it from five LOCAL governance call sites. No remote governance
+/// path invalidated that clone, so a revocation landing through the supervisor
+/// left every bridge gate reading a stale member set. Reading live deletes the
+/// staleness window rather than adding a sixth refresh site.
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError` if the context is not registered in either the
-/// manager or the UCAN state registry.
-pub async fn sync_role_state_from_manager(
+/// Returns `ScpNapiError::Context` (`SCP-CTX-2023`) when the supervisor holds
+/// no actor for `context_id`. Fails CLOSED: an unknown context authorizes
+/// nothing.
+pub async fn live_role_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
-) -> Result<(), ScpNapiError> {
-    use scp_core::context::actor::commands::QueriesCommand;
+) -> Result<ContextRoleState, ScpNapiError> {
     let sup = supervisor(bi).map_err(|e| ScpNapiError::Context {
         message: e.to_string(),
         code: codes::CTX_2000.to_owned(),
     })?;
     let sup = Arc::clone(sup);
-    // Route through the ADR-049 query shim. The handler returns
-    // `Ok(None)` when the context is unknown, matching the legacy
-    // `ContextManager::get_role_state` `Option` contract.
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cmd = QueriesCommand::GetRoleState {
-        context_id: context_id.to_owned(),
-        reply: tx,
-    };
-    sup.dispatch_query(cmd)
+    sup.get_role_state(context_id)
         .await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("supervisor dispatch_query failed: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    let new_role_state = rx
-        .await
-        .map_err(|e| ScpNapiError::Context {
-            message: format!("query shim reply dropped: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })?
-        .map_err(|e| ScpNapiError::Context {
-            message: e.to_string(),
-            code: codes::CTX_2000.to_owned(),
-        })?
         .ok_or_else(|| ScpNapiError::Context {
             message: format!("context '{context_id}' not registered with Supervisor"),
             code: codes::CTX_2023.to_owned(),
-        })?;
+        })
+}
 
-    with_context(bi, context_id, |st| {
-        st.role_state = new_role_state;
-        Ok(())
-    })
+/// Reads the AUTHORITATIVE capability-ceiling string set for `context_id` from
+/// the per-context supervisor actor, in the `{resource}:{action}` form the
+/// ADR-016 step-8 ceiling-containment check consumes.
+///
+/// Governance `ModifyCeiling` narrows a ceiling. A bridge-cached ceiling that
+/// no remote path invalidates keeps admitting a capability the context already
+/// forbids, so every UCAN validation gate reads the ceiling through this
+/// helper.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` (`SCP-CTX-2023`) when the supervisor holds
+/// no actor for `context_id`.
+pub async fn live_ceiling_strings(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<HashSet<String>, ScpNapiError> {
+    Ok(live_role_state(bi, context_id)
+        .await?
+        .ceiling()
+        .to_ucan_string_set())
+}
+
+/// Reads the AUTHORITATIVE lifecycle state for `context_id` from the
+/// per-context supervisor actor and renders it as the bridge's lowercase state
+/// string.
+///
+/// Returns `"unknown"` when the supervisor holds no actor for `context_id`, so
+/// a caller comparing against `"active"` fails CLOSED.
+///
+/// Every gate that refuses an operation because a context is not active calls
+/// this instead of [`crate::context::NapiContextHandle::state`]. That getter
+/// reads a per-handle cached cell which ADR-049 §10 documents as a
+/// best-effort snapshot deliberately NOT promoted to a live read; the cache
+/// lags a close (the core handle flips to `Closing` while the FFI cache still
+/// reads `"active"` until the async finalize completes), and a money-moving
+/// gate reading the lagging value would debit escrow for a closing context.
+///
+/// # Errors
+///
+/// Returns `ScpNapiError::Context` when the bridge instance holds no
+/// supervisor.
+pub async fn live_context_state_str(
+    bi: &NapiBridgeInstance,
+    context_id: &str,
+) -> Result<String, ScpNapiError> {
+    let sup = supervisor(bi).map_err(|e| ScpNapiError::Context {
+        message: e.to_string(),
+        code: codes::CTX_2000.to_owned(),
+    })?;
+    let sup = Arc::clone(sup);
+    Ok(sup
+        .read_context_state(context_id)
+        .await
+        .map_or("unknown", |state| crate::context::context_state_str(&state))
+        .to_owned())
 }
 
 /// Re-syncs the `UcanContextState.core.ceiling_strings` for a context from the
@@ -1975,13 +2008,7 @@ pub fn query_trust_event_counts(
 // `bi.core.with_rate_limit_tracker(identity_did, f)` directly.
 
 /// Registers a test context in the UCAN state registry.
-///
-/// # Panics
-///
-/// Panics if `ContextRoleState::new` fails with default ceiling and no
-/// custom roles, which should be infallible.
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_did: &str) {
     let map = ucan_registry(bi);
 
@@ -1989,16 +2016,6 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
         .iter()
         .map(scp_core::context::roles::Capability::ucan_capability_name)
         .collect::<HashSet<String>>();
-
-    // Default ceiling + no custom roles: infallible in practice.
-    let role_state = ContextRoleState::new(
-        context_id,
-        creator_did,
-        default_ceiling(),
-        Vec::new(),
-        &SystemClock,
-    )
-    .expect("ContextRoleState::new with default ceiling and no custom roles cannot fail");
 
     let state = UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
@@ -2008,7 +2025,6 @@ pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_
             ceiling_strings,
             creator_did: creator_did.to_owned(),
         },
-        role_state,
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),

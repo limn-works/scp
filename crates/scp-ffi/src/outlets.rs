@@ -301,13 +301,18 @@ fn outlet_register_impl(
         signature: vec![],
     };
 
-    // Look up the context runtime and register the outlet.
+    // `register_outlet` decides authorization from the role state, so read the
+    // AUTHORITATIVE state from the per-context supervisor actor BEFORE entering
+    // the sync `with_context` closure — a remote `ChangeRole` or `RemoveMember`
+    // that demoted the registrant refuses this call.
+    let role_state = crate::runtime::live_role_state(bi, context_id)?;
+    let registrant_did = role_state.creator_did.clone();
     let registered_id = crate::runtime::with_context(bi, context_id, |rt| {
         let (registered_id, _event) = scp_core::context::outlets::register_outlet(
             &mut rt.outlet_registry,
-            &rt.role_state,
+            &role_state,
             core_registration,
-            &rt.creator_did.clone(),
+            &registrant_did,
         )
         .map_err(|e| ScpPyError::context(format!("outlet registration failed: {e}")))?;
         Ok(registered_id)
@@ -325,6 +330,13 @@ fn outlet_register_impl(
 /// `pub(crate)` so the §5.4.5 streaming open path in `outlet_stream.rs` reuses
 /// the IDENTICAL bridge-layer UCAN validation (the stream is validated exactly
 /// once at open — "UCAN check locus").
+///
+/// Step 8 (ceiling containment) and the root-issuer check both decide
+/// authorization, so this reads the capability ceiling and the context creator
+/// DID from the per-context supervisor actor rather than from the bridge's FFI
+/// state. A governance `ModifyCeiling` that narrowed the ceiling therefore
+/// refuses the very next invocation. The revocation list and the nonce tracker
+/// stay bridge-owned because the supervisor tracks neither.
 pub(crate) fn validate_outlet_ucan(
     bi: &PyBridgeInstance,
     context_id: &str,
@@ -335,6 +347,10 @@ pub(crate) fn validate_outlet_ucan(
 ) -> PyResult<()> {
     let proof_resolver =
         crate::ucan::build_proof_resolver_from_tokens(proof_tokens.map(Vec::as_slice))?;
+
+    let live_role_state = crate::runtime::live_role_state(bi, context_id)?;
+    let live_ceiling = live_role_state.ceiling().to_ucan_string_set();
+    let live_creator_did = live_role_state.creator_did;
 
     crate::runtime::with_context(bi, context_id, |rt| {
         // SCP-OUT-014: select the split capability stem from the outlet's

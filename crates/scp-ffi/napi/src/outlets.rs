@@ -21,7 +21,14 @@ use crate::error::ScpNapiError;
 /// Validates a UCAN token for outlet invocation authorization.
 ///
 /// Performs the full 11-step ADR-016 validation pipeline.
-pub(crate) fn validate_ucan_for_outlet(
+///
+/// Step 8 (ceiling containment) and the root-issuer check both decide
+/// authorization, so this reads the capability ceiling and the context creator
+/// DID from the per-context supervisor actor rather than from the bridge's UCAN
+/// state. A governance `ModifyCeiling` that narrowed the ceiling therefore
+/// refuses the very next invocation. The revocation list and the nonce tracker
+/// stay bridge-owned because the supervisor tracks neither.
+pub(crate) async fn validate_ucan_for_outlet(
     bi: &crate::runtime::NapiBridgeInstance,
     context_id: &str,
     outlet_id: &str,
@@ -29,6 +36,9 @@ pub(crate) fn validate_ucan_for_outlet(
     ucan_token: &str,
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
 ) -> Result<(), ScpNapiError> {
+    let live_role_state = crate::runtime::live_role_state(bi, context_id).await?;
+    let live_ceiling = live_role_state.ceiling().to_ucan_string_set();
+    let live_creator_did = live_role_state.creator_did;
     crate::runtime::with_context(bi, context_id, |rt| {
         // SCP-OUT-014: select the split capability stem from the outlet's
         // registered kind — `outlet_query:{id}` for Query outlets,
@@ -58,8 +68,8 @@ pub(crate) fn validate_ucan_for_outlet(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver,
-            ceiling: &rt.core.ceiling_strings,
-            context_creator_did: &rt.core.creator_did,
+            ceiling: &live_ceiling,
+            context_creator_did: &live_creator_did,
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
@@ -255,7 +265,9 @@ pub(crate) async fn outlet_register_on(
     crate::napi_check_handle!(&bi.core, handle);
     validate_outlet_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let state_str = handle.state()?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -322,13 +334,20 @@ pub(crate) async fn outlet_register_on(
         signature: Vec::new(),
     };
 
-    // Register the outlet in the context's outlet registry.
+    // Register the outlet in the context's outlet registry. `register_outlet`
+    // decides authorization from the role state, so it reads the AUTHORITATIVE
+    // role state from the per-context supervisor actor — a remote `ChangeRole`
+    // or `RemoveMember` that demoted the registrant refuses this call.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let registrant_did = role_state.creator_did.clone();
     let registered_id = crate::runtime::with_context(bi, &context_id, |rt| {
         let (registered_id, _event) = scp_core::context::outlets::register_outlet(
             &mut rt.outlet_registry,
-            &rt.role_state,
+            &role_state,
             core_registration,
-            &rt.core.creator_did.clone(),
+            &registrant_did,
         )
         .map_err(|e| ScpNapiError::Outlet {
             message: format!("outlet registration failed: {e}"),
@@ -361,7 +380,9 @@ pub(crate) async fn outlet_invoke_on(
         validate_ucan_token(jwt).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     }
 
-    let state_str = handle.state()?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -393,6 +414,7 @@ pub(crate) async fn outlet_invoke_on(
         &ucan_token,
         &proof_resolver,
     )
+    .await
     .map_err(napi::Error::from)?;
 
     // Parse the optional spending UCAN JWT (§19.5 AND-composition).
@@ -533,7 +555,9 @@ pub(crate) async fn outlet_verify_on(
     outlet_id: String,
 ) -> napi::Result<NapiOutletVerificationResult> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.state()?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -608,7 +632,9 @@ pub(crate) async fn outlet_invoke_cross_context_on(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
     // Validate both contexts are active.
-    let source_state = source_handle.state()?;
+    let source_state = crate::runtime::live_context_state_str(bi, &source_handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if source_state != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -619,7 +645,9 @@ pub(crate) async fn outlet_invoke_cross_context_on(
         .into());
     }
 
-    let target_state = target_handle.state()?;
+    let target_state = crate::runtime::live_context_state_str(bi, &target_handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if target_state != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -673,6 +701,7 @@ pub(crate) async fn outlet_invoke_cross_context_on(
         &ucan_token,
         &proof_resolver,
     )
+    .await
     .map_err(napi::Error::from)?;
 
     let input_value: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
@@ -972,7 +1001,9 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
 
     crate::napi_check_handle!(&bi.core, source_handle, target_handle);
 
-    let source_state = source_handle.state()?;
+    let source_state = crate::runtime::live_context_state_str(bi, &source_handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if source_state != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -982,7 +1013,9 @@ pub(crate) async fn outlet_invoke_cross_context_saga_on(
         }
         .into());
     }
-    let target_state = target_handle.state()?;
+    let target_state = crate::runtime::live_context_state_str(bi, &target_handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if target_state != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -1125,7 +1158,9 @@ pub(crate) async fn outlet_session_create_on(
     ttl_seconds: Option<u32>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.state()?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -1192,7 +1227,9 @@ pub(crate) async fn outlet_session_invoke_on(
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.state()?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -1237,6 +1274,7 @@ pub(crate) async fn outlet_session_invoke_on(
         &ucan_token,
         &proof_resolver,
     )
+    .await
     .map_err(napi::Error::from)?;
 
     let output = crate::runtime::with_context(bi, &context_id, |rt| {
@@ -1360,7 +1398,9 @@ pub(crate) async fn outlet_interface_expose_on(
     scp_ffi_common::validate::validate_context_id(&target_context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let state_str = handle.state()?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -1388,6 +1428,12 @@ pub(crate) async fn outlet_interface_expose_on(
         None => None,
     };
 
+    // `expose_outlet` admits the call only for an admin, so it reads the
+    // AUTHORITATIVE role state from the per-context supervisor actor.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let exposer_did = role_state.creator_did.clone();
     crate::runtime::with_context(bi, &context_id, |rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.clone(),
@@ -1398,8 +1444,8 @@ pub(crate) async fn outlet_interface_expose_on(
             context_handle.context_id(),
             &outlet_id,
             &target_context_id,
-            &rt.role_state,
-            &rt.core.creator_did,
+            &role_state,
+            &exposer_did,
             &rt.outlet_registry,
             rate_limit,
             None,
@@ -1425,7 +1471,9 @@ pub(crate) async fn outlet_interface_accept_on(
     interface_json: String,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(&bi.core, handle);
-    let state_str = handle.state()?;
+    let state_str = crate::runtime::live_context_state_str(bi, &handle.context_id())
+        .await
+        .map_err(napi::Error::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Outlet {
             message: format!(
@@ -1447,7 +1495,13 @@ pub(crate) async fn outlet_interface_accept_on(
             })
         })?;
 
-    crate::runtime::with_context(bi, &context_id, |rt| {
+    // `accept_outlet_interface` admits the call only for an admin, so it reads
+    // the AUTHORITATIVE role state from the per-context supervisor actor.
+    let role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let acceptor_did = role_state.creator_did.clone();
+    crate::runtime::with_context(bi, &context_id, |_rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.clone(),
             scp_core::context::ContextParams::default(),
@@ -1456,8 +1510,8 @@ pub(crate) async fn outlet_interface_accept_on(
         scp_core::context::outlets::interface::accept_outlet_interface(
             context_handle.context_id(),
             &mut interface,
-            &rt.role_state,
-            &rt.core.creator_did,
+            &role_state,
+            &acceptor_did,
             None,
         )
         .map_err(|e| ScpNapiError::Outlet {

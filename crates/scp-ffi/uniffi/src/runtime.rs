@@ -808,6 +808,67 @@ impl UniffiBridgeInstance {
             })
     }
 
+    /// Reads the AUTHORITATIVE lifecycle
+    /// [`ContextState`](scp_core::context::ContextState) for `context_id` from
+    /// the per-context supervisor actor.
+    ///
+    /// Every gate that refuses an operation because a context is not `Active`
+    /// calls this. The FFI [`ContextHandle`](crate::ContextHandle) carries a
+    /// `state` mutex that ADR-049 §10 documents as a best-effort snapshot
+    /// deliberately NOT promoted to a live read: the cache lags a close (the
+    /// core handle flips to `Closing` while the FFI cache still reads `Active`
+    /// until the async finalize completes), so a gate reading it admits a
+    /// closing context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ScpError::Context`] when the instance is suspended,
+    /// shut down, holds no supervisor, or when the supervisor holds no actor
+    /// for `context_id` (`SCP-CTX-2023`). Fails CLOSED: a context the
+    /// supervisor does not know reaches no gate's success arm.
+    pub async fn live_context_state(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_core::context::ContextState, crate::ScpError> {
+        let sup = Arc::clone(self.context_manager_or_error()?);
+        sup.read_context_state(context_id)
+            .await
+            .ok_or_else(|| crate::ScpError::Context {
+                msg: format!("context '{context_id}' not registered with Supervisor"),
+                code: codes::CTX_2023.to_owned(),
+            })
+    }
+
+    /// Reads the AUTHORITATIVE
+    /// [`ContextRoleState`](scp_core::context::roles::ContextRoleState) for
+    /// `context_id` from the per-context supervisor actor.
+    ///
+    /// Every gate that decides authorization from membership, role assignment,
+    /// per-member capability, suspension, or the capability ceiling calls this.
+    /// The bridge previously synthesized a `ContextRoleState` from the FFI
+    /// handle's `creator_did` and `default_ceiling()` at each such gate — a
+    /// state in which the creator was the only admin and the member set was
+    /// empty, which admitted a creator whom governance had demoted and refused
+    /// an admin whom governance had promoted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ScpError::Context`] (`SCP-CTX-2023`) when the
+    /// supervisor holds no actor for `context_id`. Fails CLOSED: an unknown
+    /// context authorizes nothing.
+    pub async fn live_role_state(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_core::context::roles::ContextRoleState, crate::ScpError> {
+        let sup = Arc::clone(self.context_manager_or_error()?);
+        sup.get_role_state(context_id)
+            .await
+            .ok_or_else(|| crate::ScpError::Context {
+                msg: format!("context '{context_id}' not registered with Supervisor"),
+                code: codes::CTX_2023.to_owned(),
+            })
+    }
+
     /// Returns the attached `ContextManager` only when the instance is in a
     /// ready state (not suspended, not shut down, and a manager is attached).
     ///

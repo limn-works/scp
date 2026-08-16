@@ -706,18 +706,23 @@ impl crate::scp::PyScp {
         })
     }
 
-    /// Starts a full application node with file-backed storage.
+    /// Starts a full application node with encrypted file-backed storage.
     ///
     /// Opens (or creates) persistent storage at ``<data_dir>/storage/`` and a redb
     /// blob database at ``<data_dir>/blobs.redb``.
     ///
+    /// ``passphrase`` is required in BOTH identity modes: Argon2id derives the
+    /// AES-256-GCM key for ``<data_dir>/storage/`` from it, so a node started
+    /// without one has no key with which to encrypt the protocol state it
+    /// persists. Omitting it raises ``ValidationError`` (SCP-VALID-7004).
+    ///
     /// When ``identity_did`` is ``None`` (the default), the node creates or
-    /// reloads a persistent identity from ``<data_dir>/identity.key``. The
-    /// ``passphrase`` parameter is required in this mode.
+    /// reloads a persistent identity from ``<data_dir>/identity.key``, which the
+    /// same passphrase protects.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
-    /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
-    /// No passphrase is required in this mode.
+    /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``)
+    /// and the passphrase covers storage encryption alone.
     #[pyo3(name = "node_start_local", signature = (data_dir, identity_did=None, passphrase=None))]
     pub fn node_start_local(
         &self,

@@ -10803,18 +10803,16 @@ impl Scp {
             .spawn(async move {
                 validate_did(&identity.did)?;
 
-                let state = handle.state.lock().await;
+                let state = bi.live_context_state(&handle.context_id).await?;
 
-                if !matches!(*state, ContextState::Active) {
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Context {
                         msg: format!(
-                            "cannot join context in {:?} state — context must be active",
-                            *state
+                            "cannot join context in {state:?} state — context must be active"
                         ),
                         code: codes::CTX_2013.to_owned(),
                     });
                 }
-                drop(state);
 
                 // Parse the optional spending UCAN JWT once at the bridge boundary
                 // so malformed tokens are rejected before the manager is touched.
@@ -10979,18 +10977,16 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
+                let state = bi.live_context_state(&handle.context_id).await?;
 
-                if !matches!(*state, ContextState::Active) {
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Context {
                         msg: format!(
-                            "cannot leave context in {:?} state — context must be active",
-                            *state
+                            "cannot leave context in {state:?} state — context must be active"
                         ),
                         code: codes::CTX_2015.to_owned(),
                     });
                 }
-                drop(state);
 
                 // Route through the ADR-049 lifecycle dispatch surface.
                 let sup = bi.context_manager_or_error()?;
@@ -11067,12 +11063,18 @@ impl Scp {
                 // bridge-layer auth check — the ContextManager is authoritative.
                 let identity_did = identity.did.clone();
 
-                let mut state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
+                // The per-handle state cell doubles as a close mutex: taking it
+                // here serializes two concurrent closes on the same handle. The
+                // value it holds is the ADR-049 §10 cached snapshot, so the
+                // AUTHORITATIVE `Active` gate below reads the per-context
+                // supervisor actor rather than this cell.
+                let mut cached_state = handle.state.lock().await;
+
+                let state = bi.live_context_state(&handle.context_id).await?;
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Context {
                         msg: format!(
-                            "cannot close context in {:?} state — context must be active",
-                            *state
+                            "cannot close context in {state:?} state — context must be active"
                         ),
                         code: codes::CTX_2017.to_owned(),
                     });
@@ -11139,8 +11141,8 @@ impl Scp {
                 // Deregister the context handle from the MCP lookup registry.
                 deregister_context_handle(&bi, &handle.context_id);
 
-                *state = ContextState::Closed;
-                drop(state);
+                *cached_state = ContextState::Closed;
+                drop(cached_state);
 
                 Ok(())
             })
@@ -11175,18 +11177,16 @@ impl Scp {
             .spawn(async move {
                 validate_did(&identity.did)?;
 
-                let state = handle.state.lock().await;
+                let state = bi.live_context_state(&handle.context_id).await?;
 
-                if !matches!(*state, ContextState::Active) {
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Context {
                         msg: format!(
-                            "cannot send to context in {:?} state — context must be active",
-                            *state
+                            "cannot send to context in {state:?} state — context must be active"
                         ),
                         code: codes::CTX_2019.to_owned(),
                     });
                 }
-                drop(state);
 
                 // Validate inner envelope signing via the retained KeyCustody
                 // (SCP-214 criterion 6). This ensures the identity's mandatory
@@ -11321,18 +11321,16 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
-        let state = handle.state.lock().await;
+        let state = self.inner.live_context_state(&handle.context_id).await?;
 
-        if !matches!(*state, ContextState::Active) {
+        if !matches!(state, scp_core::context::ContextState::Active) {
             return Err(ScpError::Context {
                 msg: format!(
-                    "cannot subscribe to context in {:?} state — context must be active",
-                    *state
+                    "cannot subscribe to context in {state:?} state — context must be active"
                 ),
                 code: codes::CTX_2021.to_owned(),
             });
         }
-        drop(state);
 
         // Signal stream completion — full transport wiring connects this
         // listener to the message pipeline in integration stories.
@@ -13344,22 +13342,21 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 validate_outlet_name(&definition.name)?;
 
-                let state = handle.state.lock().await;
+                let state = bi.live_context_state(&handle.context_id).await?;
 
-                if !matches!(*state, ContextState::Active) {
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot register outlet in context in {:?} state — context must be active",
-                            *state
+                            "cannot register outlet in context in {state:?} state — context must be active"
                         ),
                         code: codes::OUTLET_6003.to_owned(),
                     });
                 }
-                drop(state);
 
                 let input_schema: serde_json::Value =
                     serde_json::from_str(&definition.input_schema_json).map_err(|e| {
@@ -13449,26 +13446,21 @@ impl Scp {
                     signature: Vec::new(),
                 };
 
-                // Build a role state for capability checking.
-                let ceiling = scp_core::context::roles::default_ceiling();
-                let role_state = scp_core::context::roles::ContextRoleState::new(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    ceiling,
-                    vec![],
-                    &scp_clock::SystemClock,
-                )
-                .map_err(|e| ScpError::Outlet {
-                    msg: format!("failed to create role state: {e}"),
-                    code: codes::OUTLET_6003.to_owned(),
-                })?;
+                // `register_outlet` admits the call only when the registrant
+                // holds the outlet-registration capability, so the role state it
+                // reads is the AUTHORITATIVE one owned by the per-context
+                // supervisor actor. The bridge used to synthesize a role state
+                // from `handle.creator_did` and `default_ceiling()` here, which
+                // admitted a creator whom governance had demoted.
+                let role_state = bi.live_role_state(&handle.context_id).await?;
+                let registrant_did = role_state.creator_did.clone();
 
                 let mut registry = handle.outlet_registry.lock().await;
                 let (registered_id, _event) = scp_core::context::outlets::register_outlet(
                     &mut registry,
                     &role_state,
                     core_registration,
-                    &handle.creator_did,
+                    &registrant_did,
                 )
                 .map_err(|e| ScpError::Outlet {
                     msg: format!("outlet registration failed: {e}"),
@@ -13527,18 +13519,16 @@ impl Scp {
                     validate_ucan_token(jwt)?;
                 }
 
-                let state = handle.state.lock().await;
+                let state = bi.live_context_state(&handle.context_id).await?;
 
-                if !matches!(*state, ContextState::Active) {
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot invoke outlet in context in {:?} state — context must be active",
-                            *state
+                            "cannot invoke outlet in context in {state:?} state — context must be active"
                         ),
                         code: codes::OUTLET_6005.to_owned(),
                     });
                 }
-                drop(state);
 
                 // SCP-OUT-014: select the split capability stem from the
                 // outlet's registered kind — `outlet_query:{id}` for Query
@@ -13728,20 +13718,19 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
+                let state = bi.live_context_state(&handle.context_id).await?;
 
-                if !matches!(*state, ContextState::Active) {
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot verify outlet in context in {:?} state — context must be active",
-                            *state
+                            "cannot verify outlet in context in {state:?} state — context must be active"
                         ),
                         code: codes::OUTLET_6007.to_owned(),
                     });
                 }
-                drop(state);
 
                 Ok(OutletVerificationResult {
                     outlet_id,
@@ -13789,30 +13778,26 @@ impl Scp {
         runtime()
             .spawn(async move {
                 // Validate source context is active.
-                let source_state = source_handle.state.lock().await;
-                if !matches!(*source_state, ContextState::Active) {
+                let source_state = bi.live_context_state(&source_handle.context_id).await?;
+                if !matches!(source_state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot invoke cross-context outlet: source context in {:?} state",
-                            *source_state
+                            "cannot invoke cross-context outlet: source context in {source_state:?} state"
                         ),
                         code: codes::OUTLET_6010.to_owned(),
                     });
                 }
-                drop(source_state);
 
                 // Validate target context is active.
-                let target_state = target_handle.state.lock().await;
-                if !matches!(*target_state, ContextState::Active) {
+                let target_state = bi.live_context_state(&target_handle.context_id).await?;
+                if !matches!(target_state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot invoke cross-context outlet: target context in {:?} state",
-                            *target_state
+                            "cannot invoke cross-context outlet: target context in {target_state:?} state"
                         ),
                         code: codes::OUTLET_6011.to_owned(),
                     });
                 }
-                drop(target_state);
 
                 // Validate chain depth (context-configurable, default 8 per ADR-043).
                 let max_chain_depth = {
@@ -14059,6 +14044,37 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
+                // Both contexts MUST be Active before this money-moving saga
+                // touches any state, matching the gates its sibling
+                // cross-context paths already carry. Read the AUTHORITATIVE
+                // lifecycle state from the per-context supervisor actor: the
+                // per-handle cached cell lags a close (the core handle flips to
+                // `Closing` while the cache still reads `Active` until the async
+                // finalize completes), and a saga admitted on the lagging value
+                // debits escrow for a closing context. Checked BEFORE the
+                // caller-principal binding and the saga drive, so a non-active
+                // context is rejected before any reservation.
+                let caller_state = bi.live_context_state(&caller_context_id).await?;
+                if !matches!(caller_state, scp_core::context::ContextState::Active) {
+                    return Err(ScpError::Outlet {
+                        msg: format!(
+                            "cannot start cross-context saga: caller context in \
+                             {caller_state:?} state"
+                        ),
+                        code: codes::OUTLET_6010.to_owned(),
+                    });
+                }
+                let target_state = bi.live_context_state(&target_context_id).await?;
+                if !matches!(target_state, scp_core::context::ContextState::Active) {
+                    return Err(ScpError::Outlet {
+                        msg: format!(
+                            "cannot start cross-context saga: target context in \
+                             {target_state:?} state"
+                        ),
+                        code: codes::OUTLET_6011.to_owned(),
+                    });
+                }
+
                 // Caller-principal binding (§6.2.4 *Caller authentication*) —
                 // BEFORE the saga runs, so the supervisor never observes an
                 // unauthenticated caller. Clone the supervisor `Arc` out of the
@@ -14194,17 +14210,15 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
+                let state = bi.live_context_state(&handle.context_id).await?;
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot create session in context in {:?} state — context must be active",
-                            *state
+                            "cannot create session in context in {state:?} state — context must be active"
                         ),
                         code: codes::OUTLET_6014.to_owned(),
                     });
                 }
-                drop(state);
 
                 let mut store = handle.session_store.lock().await;
 
@@ -14274,17 +14288,15 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
+                let state = bi.live_context_state(&handle.context_id).await?;
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot invoke session in context in {:?} state — context must be active",
-                            *state
+                            "cannot invoke session in context in {state:?} state — context must be active"
                         ),
                         code: codes::OUTLET_6017.to_owned(),
                     });
                 }
-                drop(state);
 
                 // Look up outlet_id from session for UCAN validation.
                 let outlet_id_for_ucan = {
@@ -14454,21 +14466,20 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 validate_outlet_id(&outlet_id)?;
 
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
+                let state = bi.live_context_state(&handle.context_id).await?;
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot expose outlet interface in context in {:?} state — context must be active",
-                            *state
+                            "cannot expose outlet interface in context in {state:?} state — context must be active"
                         ),
                         code: codes::OUTLET_6030.to_owned(),
                     });
                 }
-                drop(state);
 
                 let rate_limit = match rate_limit_json {
                     Some(ref json) => {
@@ -14482,18 +14493,11 @@ impl Scp {
                     None => None,
                 };
 
-                let ceiling = scp_core::context::roles::default_ceiling();
-                let role_state = scp_core::context::roles::ContextRoleState::new(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    ceiling,
-                    vec![],
-                    &scp_clock::SystemClock,
-                )
-                .map_err(|e| ScpError::Outlet {
-                    msg: format!("failed to create role state: {e}"),
-                    code: codes::OUTLET_6030.to_owned(),
-                })?;
+                // `expose_outlet` admits the call only for an admin, so the role
+                // state it reads is the AUTHORITATIVE one owned by the
+                // per-context supervisor actor.
+                let role_state = bi.live_role_state(&handle.context_id).await?;
+                let exposer_did = role_state.creator_did.clone();
 
                 let context_handle = scp_core::context::ContextHandle::new(
                     handle.context_id.clone(),
@@ -14507,7 +14511,7 @@ impl Scp {
                     &outlet_id,
                     &target_context_id,
                     &role_state,
-                    &handle.creator_did,
+                    &exposer_did,
                     &registry,
                     rate_limit,
                     None,
@@ -14542,19 +14546,18 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let state = handle.state.lock().await;
-                if !matches!(*state, ContextState::Active) {
+                let state = bi.live_context_state(&handle.context_id).await?;
+                if !matches!(state, scp_core::context::ContextState::Active) {
                     return Err(ScpError::Outlet {
                         msg: format!(
-                            "cannot accept outlet interface in context in {:?} state — context must be active",
-                            *state
+                            "cannot accept outlet interface in context in {state:?} state — context must be active"
                         ),
                         code: codes::OUTLET_6032.to_owned(),
                     });
                 }
-                drop(state);
 
                 let mut interface: scp_core::context::outlets::interface::OutletInterface =
                     serde_json::from_str(&interface_json).map_err(|e| ScpError::Validation {
@@ -14562,18 +14565,11 @@ impl Scp {
                         code: codes::VALID_7041.to_owned(),
                     })?;
 
-                let ceiling = scp_core::context::roles::default_ceiling();
-                let role_state = scp_core::context::roles::ContextRoleState::new(
-                    &handle.context_id,
-                    &handle.creator_did,
-                    ceiling,
-                    vec![],
-                    &scp_clock::SystemClock,
-                )
-                .map_err(|e| ScpError::Outlet {
-                    msg: format!("failed to create role state: {e}"),
-                    code: codes::OUTLET_6032.to_owned(),
-                })?;
+                // `accept_outlet_interface` admits the call only for an admin,
+                // so the role state it reads is the AUTHORITATIVE one owned by
+                // the per-context supervisor actor.
+                let role_state = bi.live_role_state(&handle.context_id).await?;
+                let acceptor_did = role_state.creator_did.clone();
 
                 let context_handle = scp_core::context::ContextHandle::new(
                     handle.context_id.clone(),
@@ -14584,7 +14580,7 @@ impl Scp {
                     context_handle.context_id(),
                     &mut interface,
                     &role_state,
-                    &handle.creator_did,
+                    &acceptor_did,
                     None,
                 )
                 .map_err(|e| ScpError::Outlet {

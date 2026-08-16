@@ -290,6 +290,16 @@ pub(crate) async fn ucan_validate_on(
 
     let context_id = handle.context_id();
 
+    // The ADR-016 step-8 ceiling-containment check and the root-issuer check
+    // decide authorization, so both inputs come from the per-context supervisor
+    // actor. A governance `ModifyCeiling` that narrowed the ceiling refuses the
+    // very next validation.
+    let live_role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let live_ceiling = live_role_state.ceiling().to_ucan_string_set();
+    let live_creator_did = live_role_state.creator_did;
+
     // Run validation inside with_context to use persistent revocation list
     // and nonce tracker from the runtime registry. This ensures:
     // - Revoked tokens are rejected across calls (persistent RevocationList).
@@ -312,8 +322,8 @@ pub(crate) async fn ucan_validate_on(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &rt.core.ceiling_strings,
-            context_creator_did: &rt.core.creator_did,
+            ceiling: &live_ceiling,
+            context_creator_did: &live_creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,
@@ -403,6 +413,15 @@ pub(crate) async fn ucan_evaluate_on(
 
     let context_id = handle.context_id();
 
+    // The ceiling and the creator DID come from the per-context supervisor
+    // actor, matching `ucan_validate_on`: this diagnostic must report the same
+    // verdict the enforcing path would reach.
+    let live_role_state = crate::runtime::live_role_state(bi, &context_id)
+        .await
+        .map_err(napi::Error::from)?;
+    let live_ceiling = live_role_state.ceiling().to_ucan_string_set();
+    let live_creator_did = live_role_state.creator_did;
+
     // evaluate_ucan takes `&ValidationContext` and is read-only — it probes the
     // nonce tracker via check_replay but never records, so the persistent
     // NonceTracker is not mutated.
@@ -422,8 +441,8 @@ pub(crate) async fn ucan_evaluate_on(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &rt.core.ceiling_strings,
-            context_creator_did: &rt.core.creator_did,
+            ceiling: &live_ceiling,
+            context_creator_did: &live_creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_clock::SystemClock,

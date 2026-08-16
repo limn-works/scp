@@ -445,6 +445,7 @@ pub(crate) async fn outlet_stream_open_on(
         &ucan_token,
         &proof_resolver,
     )
+    .await
     .map_err(napi::Error::from)?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
@@ -1266,6 +1267,7 @@ pub(crate) async fn outlet_streaming_saga_open_on(
         &ucan_token,
         &proof_resolver,
     )
+    .await
     .map_err(napi::Error::from)?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
