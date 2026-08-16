@@ -589,7 +589,6 @@ The adapter itself is stateless with respect to the recovery protocol — it sto
 
 7. **Conformance test suite:**
    - All four providers pass the platform trait conformance macros defined in `scp-platform/testing/` (ADR-006): `key_custody_conformance!()`, `storage_conformance!()`, `attestation_conformance!()`, `push_conformance!()`.
-   - `attestation_conformance!()` includes an `invalid_token_rejected` case (§16.12.4 of the test-infrastructure spec) that feeds `verify` a fabricated token and asserts `false`. `AppleDeviceAttestation.verify` satisfies that case through the acceptance-criterion-3 criterion, which rejects a fabricated token at clause 1 or clause 2.
    - Tests run on real devices (CI must include a physical iOS device lane for Keychain and App Attest tests). On the simulator `DCAppAttestService.shared.isSupported` reads `false`, so the simulator lane asserts the fail-closed path rather than exercising a substitute attestation.
    - `AppleKeyCustody` round-trip test: `generateKeypair(.ed25519)` → `sign(data)` → `publicKey()` → verify signature → `destroyKey()` → confirm re-fetch fails.
    - `AppleStorage` round-trip test: `store(key, data)` → `retrieve(key)` → `listKeys(prefix)` → `delete(key)` → `exists(key) == false`.
