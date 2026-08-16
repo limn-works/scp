@@ -401,6 +401,18 @@ All SCP SDK operations involving I/O (network, storage, crypto operations) are a
 | C# | `IAsyncEnumerable<Message>` |
 | Java | `Flow.Publisher<Message>` (Reactive Streams) |
 
+### An outlet stream that ends without a terminal chunk
+
+§5.4.5 of the contexts spec ("Signature refusal") requires an implementation to end a stream in a way the member reads as abnormal whenever the operator key refuses both a chunk and the refusal terminal that would have reported it. §5.4.5 states the obligation and leaves the shape to each implementation, because no peer observes it. This is the shape for this project.
+
+**The requirement.** A caller draining an outlet stream MUST be able to tell that close apart from a completed stream without inspecting any chunk, and MUST NOT be able to reach the completion path by writing the obvious drain loop. Ending the iteration with no signal fails this: a caller that reads to the end sees the same thing either way.
+
+**Rust runtime.** The channel item is `OutletStreamItem`, an alias for `Result<OutletStreamChunk, ChunkSignatureRefused>`. The `Err` arm is the channel's last item. `StreamSessionHandle::receiver()` carries the same item type, so both the direct and the dispatch-pump paths surface it.
+
+**Bridges and SDKs.** Every FFI bridge raises its typed outlet error carrying `SCP-OUTLET-6137` on that item, and never the channel-closed sentinel — a bridge that returned the sentinel would hand the SDK a completed stream. Each SDK propagates that error out of its drain: Python raises, TypeScript rejects, Swift throws, Kotlin throws. No SDK catches it to end its iterator.
+
+**Why not a side channel.** A second channel or a completion handle a caller may ignore fails the second half of the requirement, because the obvious drain loop still reaches completion. Putting the failure in the item type makes reading it the only way to get a chunk.
+
 ## Resource Lifecycle
 
 SCP objects hold crypto state (MLS groups, key material, WebSocket connections) that must be properly released. Each language uses its idiomatic resource management pattern.

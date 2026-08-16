@@ -79,8 +79,10 @@ const fn bounded_reason(err: &StreamSignerError) -> &'static str {
     match err {
         // `as_str` returns one compile-time constant per category. Carrying the
         // category rather than the backend's error string is what the category
-        // type exists for (ADR-006 custody isolation / ADR-061 error-detail
-        // sanitization), so forwarding it leaks nothing.
+        // type exists for — see `StreamSignerCustodyCategory`'s own doc in
+        // `scp-runtime`, which states that no backend error text, key material,
+        // or raw preimage can cross into the runtime through it — so forwarding
+        // it leaks nothing.
         StreamSignerError::Custody { category } => category.as_str(),
         // The canonicalizer built its message from the executor's chunk payload,
         // so the bridge names the failure and drops the text (module doc,

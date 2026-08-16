@@ -3499,12 +3499,15 @@ fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
     // commit fires at stream-close, outside the loop). In-string format
     // placeholders (`{SLUG_…}`) are balanced, so they net-zero the depth count.
     let loop_start = seal_fn
-        // The binder is `item` because the channel carries `OutletStreamItem`
-        // (§5.4.5 "Signature refusal" gives it an `Err` arm the seal task
-        // matches before it holds a chunk). This locator names the loop header
-        // so the brace-matched body below is the loop's; the three assertions
-        // over that body are unchanged.
-        .find("while let Some(item) = inner_rx.recv().await")
+        // Anchored on the receive expression, not on the loop's binder. The
+        // binder was `chunk` until the channel item became a `Result` (§5.4.5
+        // "Signature refusal" gives it an `Err` arm the seal task matches
+        // before it holds a chunk), and a locator that spells the binder turns
+        // every honest rename inside this loop into an edit to an enforcement
+        // file. `inner_rx.recv().await` appears once in this function, so the
+        // brace-matched body below is still the loop's, and the three
+        // assertions over that body are unchanged.
+        .find("inner_rx.recv().await")
         .expect("the seal task must have a per-chunk pump loop");
     let open_rel = seal_fn[loop_start..]
         .find('{')

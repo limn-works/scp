@@ -2681,8 +2681,26 @@ impl PumpSigningContext {
     /// through the same `Arc<dyn StreamSigner>`: two refusals do not establish
     /// a third, and a custody backend that refused one call can serve the next.
     ///
+    /// The §5.4.5 terminal status is recorded on `terminal_summary` either way,
+    /// so the `OutletInvokedEvent` the pump emits at settlement names the
+    /// refusal even when no chunk carried it. Without that fold the summary
+    /// keeps its `Default`, which is `Error(SCP-OUTLET-6130)` — the §5.4.4
+    /// code whose default slug is `execution.handler-panic`, a condition that
+    /// did not occur.
+    ///
+    /// Both hand-offs are bounded by `send_deadline`. The pump must reach its
+    /// settlement block, which releases the escrow, the per-context and origin
+    /// admission counters, and the node-wide pump permit; awaiting an unbounded
+    /// send on the bounded outer channel would park the pump there whenever an
+    /// invoker stops draining with the channel full, and §5.4.5 requires that
+    /// permit to be released when the pump exits.
+    ///
     /// Returns `true` when a signed terminal was ingested and emitted, so the
-    /// caller knows the manifest and the §5.4.5 event cover a terminal chunk.
+    /// caller knows the manifest covers a terminal chunk.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the pump's close state is four independent live locals (channel, frontier, terminal summary, deadline) plus the refused attempt; a wrapper struct would hold two &mut borrows of locals the caller still uses, relocating the parameters without reducing them"
+    )]
     async fn close_on_signature_refusal(
         &self,
         request_id: RequestId,
@@ -2691,6 +2709,7 @@ impl PumpSigningContext {
         outer_tx: &mpsc::Sender<OutletStreamItem>,
         frontier: &mut scp_protocol::context::outlets::stream::MerkleFrontier,
         terminal_summary: &mut StreamTerminalSummary,
+        send_deadline: Duration,
     ) -> bool {
         match self
             .try_build_signed_chunk(request_id, sequence, signing_refused_terminal_payload())
@@ -2698,10 +2717,25 @@ impl PumpSigningContext {
         {
             Ok(chunk) => {
                 ingest_stream_chunk(frontier, terminal_summary, &chunk);
-                let _ = outer_tx.send(Ok(chunk)).await;
+                if tokio::time::timeout(send_deadline, outer_tx.send(Ok(chunk)))
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        request_id = %hex::encode(request_id),
+                        outlet_id = %self.outlet_id,
+                        context_id = %self.context_id,
+                        sequence,
+                        "dispatch pump: invoker did not drain the refusal terminal within the \
+                         cancel-ack window — settling the stream without it"
+                    );
+                }
                 true
             }
             Err(refused_terminal) => {
+                // No chunk carries this close, so fold the refusal's terminal
+                // status onto the summary directly.
+                terminal_summary.observe(&signing_refused_terminal_payload());
                 let refusal = ChunkSignatureRefused {
                     refused_chunk,
                     refused_terminal,
@@ -2715,7 +2749,19 @@ impl PumpSigningContext {
                     "dispatch pump: stream closed with no terminal chunk — receiver was handed \
                      the typed ChunkSignatureRefused"
                 );
-                let _ = outer_tx.send(Err(refusal)).await;
+                if tokio::time::timeout(send_deadline, outer_tx.send(Err(refusal)))
+                    .await
+                    .is_err()
+                {
+                    tracing::error!(
+                        request_id = %hex::encode(request_id),
+                        outlet_id = %self.outlet_id,
+                        context_id = %self.context_id,
+                        sequence,
+                        "dispatch pump: invoker did not drain the typed refusal within the \
+                         cancel-ack window — settling the stream without it"
+                    );
+                }
                 false
             }
         }
@@ -3024,6 +3070,7 @@ async fn run_stream_pump_v2(
                             &outer_tx,
                             &mut frontier,
                             &mut terminal_summary,
+                            stream_cancel_ack,
                         )
                         .await;
                     break;
@@ -3091,6 +3138,7 @@ async fn run_stream_pump_v2(
                                     &outer_tx,
                                     &mut frontier,
                                     &mut terminal_summary,
+                                    stream_cancel_ack,
                                 )
                                 .await;
                             break;
@@ -3116,6 +3164,7 @@ async fn run_stream_pump_v2(
                                     &outer_tx,
                                     &mut frontier,
                                     &mut terminal_summary,
+                                    stream_cancel_ack,
                                 )
                                 .await;
                             break;
@@ -3182,6 +3231,7 @@ async fn run_stream_pump_v2(
                                     &outer_tx,
                                     &mut frontier,
                                     &mut terminal_summary,
+                                    stream_cancel_ack,
                                 )
                                 .await;
                             break;
@@ -3207,6 +3257,7 @@ async fn run_stream_pump_v2(
                                     &outer_tx,
                                     &mut frontier,
                                     &mut terminal_summary,
+                                    stream_cancel_ack,
                                 )
                                 .await;
                             break;
@@ -3282,6 +3333,7 @@ async fn run_stream_pump_v2(
                         &outer_tx,
                         &mut frontier,
                         &mut terminal_summary,
+                        stream_cancel_ack,
                     )
                     .await;
                 break;
@@ -3346,6 +3398,7 @@ async fn run_stream_pump_v2(
                                 &outer_tx,
                                 &mut frontier,
                                 &mut terminal_summary,
+                                stream_cancel_ack,
                             )
                             .await;
                         break;
@@ -4789,6 +4842,91 @@ mod tests {
         assert_eq!(
             summary.billed_count, 0,
             "a refused chunk is never billed, and the refusal terminal is not a Data chunk"
+        );
+    }
+
+    /// §5.4.5 "Signature refusal" propagated from the INNER invoke pump: when
+    /// the inner pump hands this pump a `ChunkSignatureRefused` on `inner_rx`,
+    /// this pump MUST NOT treat it as a plain upstream close. It attempts its
+    /// own refusal terminal and delivers one, so the receiver reads the
+    /// §5.4.4 `SCP-OUTLET-6137` terminal rather than a closed channel.
+    ///
+    /// The two sibling tests drive this pump's own signer through
+    /// `set_operator_signer` and send `Ok` items, so neither reaches the
+    /// `Some(Err(_))` arm this test covers. The arm is reachable in production
+    /// because both pumps sign through the same `Arc<dyn StreamSigner>`.
+    #[tokio::test]
+    async fn pump_forwards_the_inner_pumps_refusal_as_its_own_terminal() {
+        let state = build_test_state();
+        let request_id: RequestId = [0x33; 16];
+        let (_handle, mut outer_rx, summary_rx, pump_join, inner_tx) =
+            spawn_test_pump(state, request_id, Duration::from_secs(3_601));
+
+        // The inner pump's operator key refused a chunk and then refused the
+        // terminal error chunk that would have reported it.
+        let backend_fault = StreamSignerError::Custody {
+            category: super::super::signer::StreamSignerCustodyCategory::BackendFault,
+        };
+        inner_tx
+            .send(Err(ChunkSignatureRefused {
+                refused_chunk: backend_fault.clone(),
+                refused_terminal: backend_fault,
+            }))
+            .await
+            .expect("inner send");
+
+        let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+            .await
+            .expect("pump emits its own refusal terminal within 2s")
+            .expect("an item arrives")
+            .expect("this pump's key signs its refusal terminal");
+        assert_eq!(
+            chunk.sequence, 0,
+            "the inner pump's refused chunk never reached this pump, so slot 0 is free"
+        );
+        assert_ne!(chunk.sig, [0u8; 64]);
+        let ChunkPayload::Error { code, .. } = &chunk.payload else {
+            panic!("expected a terminal Error payload; got {:?}", chunk.payload);
+        };
+        assert_eq!(code, error_codes::CODE_EXECUTION_SIGNING_REFUSED);
+
+        drop(inner_tx);
+        pump_join.await.expect("pump settles");
+        let summary = summary_rx.await.expect("summary published");
+        assert_eq!(summary.billed_count, 0);
+    }
+
+    /// When this pump's key refuses its refusal terminal too, the §5.4.5
+    /// `OutletInvokedEvent` MUST name `SCP-OUTLET-6137`. No chunk carries that
+    /// close, so without an explicit fold the summary keeps its `Default` —
+    /// `Error(SCP-OUTLET-6130)`, whose §5.4.4 default slug is
+    /// `execution.handler-panic`, a condition that did not occur.
+    #[tokio::test]
+    async fn a_double_refusal_records_6137_on_the_audit_event() {
+        let state = build_test_state();
+        let vk = fixed_signing_key().verifying_key();
+        set_operator_signer(&state, Arc::new(AlwaysRefuseStreamSigner(vk)));
+        let request_id: RequestId = [0x34; 16];
+        let mut pump = spawn_capturing_pump(
+            state,
+            request_id,
+            Duration::from_secs(3_601),
+            Duration::from_secs(3_601),
+            0,
+            0,
+        );
+
+        send_inner_data(&pump.inner_tx, 0).await;
+        drop(pump.inner_tx);
+        pump.pump_join.await.expect("pump settles");
+
+        let event = pump.event_rx.recv().await.expect("one event per stream");
+        assert_eq!(
+            event.stream_terminal_status,
+            scp_protocol::context::outlets::stream::StreamTerminalStatus::Error(
+                error_codes::CODE_EXECUTION_SIGNING_REFUSED.to_owned()
+            ),
+            "the audit event names the signature refusal, never the 6130 handler-panic default"
         );
     }
 

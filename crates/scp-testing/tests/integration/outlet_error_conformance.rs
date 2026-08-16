@@ -18,7 +18,7 @@
 //! cross-SDK byte identity.
 //!
 //! Coverage the fixtures assert:
-//!   * ≥ 1 VALID fixture per allocated code (all 15 in `ALL_CODES`), AND
+//!   * ≥ 1 VALID fixture per allocated code (every entry in `ALL_CODES`), AND
 //!   * exactly one VALID fixture per unique `(code, slug)` pair covering every
 //!     slug in the §5.4.4 taxonomy — pinned against the registry's pub
 //!     `CODE_*`/`SLUG_*` constants in [`EXPECTED_PAIRS`] (so a registry rename
@@ -68,7 +68,13 @@ struct Fixture {
     class: OutletErrorClass,
     message: String,
     retry: RetryPolicy,
-    detail: DetailBody,
+    /// Omitted when the condition carries no measurable detail. §5.4.4 makes
+    /// `detail` (tag 6) a per-class typed shape and lets a class with no
+    /// detail omit the tag, so a fixture that borrowed a sibling variant's
+    /// shape would assert a value its condition never produces — an
+    /// `elapsed_ms` for a failure nothing timed.
+    #[serde(default)]
+    detail: Option<DetailBody>,
     pad_nonce: String,
     registration_event_id: String,
     /// Present only on the malformed corpus; defaults false for valid fixtures.
@@ -299,7 +305,7 @@ fn construct(f: &Fixture) -> Result<OutletError, OutletErrorConstructionFailed> 
         code: &f.code,
         slug: &f.slug,
         retry: f.retry.clone(),
-        detail: Some(f.detail.clone()),
+        detail: f.detail.clone(),
         source_chain: Vec::new(),
         pad_nonce,
     })
@@ -339,7 +345,7 @@ fn valid_fixtures_cover_every_code_slug_pair() {
     );
 
     // Coverage bounds: ≥ 1 per code, and total ≥ the taxonomy count. The AC's
-    // "≥ 12 codes / ≥ 30 total" is a floor the current 15-code taxonomy
+    // "≥ 12 codes / ≥ 30 total" is a floor the current taxonomy
     // exceeds; assert the real coverage.
     assert_eq!(
         file.fixtures.len(),
@@ -377,7 +383,7 @@ fn valid_fixtures_cover_every_code_slug_pair() {
     );
 }
 
-/// Every allocated code in `ALL_CODES` (all 15) has at least one valid fixture.
+/// Every allocated code in `ALL_CODES` has at least one valid fixture.
 #[test]
 fn every_allocated_code_has_a_valid_fixture() {
     let file = load();
@@ -477,8 +483,7 @@ fn valid_fixtures_are_registry_consistent_and_constructible() {
         assert_eq!(env.pad_nonce, pad, "fixture {}", f.name);
         assert_eq!(env.registration_event_id, reg, "fixture {}", f.name);
         assert_eq!(
-            env.detail.as_ref(),
-            Some(&f.detail),
+            env.detail, f.detail,
             "fixture {}: detail not preserved",
             f.name
         );
@@ -522,10 +527,16 @@ fn malformed_detail_fixtures_are_rejected_at_construction() {
         );
         classes.insert(f.class);
 
+        // A malformed fixture exists to exercise the shape gate, so it MUST
+        // carry a detail — an omitted one reaches no gate at all.
+        let detail = f
+            .detail
+            .as_ref()
+            .unwrap_or_else(|| panic!("malformed fixture {} must carry a detail", f.name));
         // The detail's kind genuinely disagrees with the class's expected shape.
         assert_ne!(
             f.class.expected_detail(),
-            f.detail.kind(),
+            detail.kind(),
             "malformed fixture {} is not actually a shape mismatch",
             f.name
         );
@@ -536,7 +547,7 @@ fn malformed_detail_fixtures_are_rejected_at_construction() {
         match construct(f) {
             Err(OutletErrorConstructionFailed::DetailShapeMismatch { class, actual }) => {
                 assert_eq!(class, f.class, "malformed fixture {}", f.name);
-                assert_eq!(actual, f.detail.kind(), "malformed fixture {}", f.name);
+                assert_eq!(actual, detail.kind(), "malformed fixture {}", f.name);
             }
             other => panic!(
                 "malformed fixture {}: expected DetailShapeMismatch, got {other:?}",
@@ -597,9 +608,15 @@ fn supplementary_hazard_fixtures_round_trip_with_exact_field_fidelity() {
                 f.name
             )
         });
-        assert_eq!(env.detail.as_ref(), Some(&f.detail), "fixture {}", f.name);
+        assert_eq!(env.detail, f.detail, "fixture {}", f.name);
 
-        match &f.detail {
+        // A supplementary fixture exists to pin a round-trip hazard carried IN
+        // a detail, so an omitted one pins nothing.
+        let detail = f
+            .detail
+            .as_ref()
+            .unwrap_or_else(|| panic!("supplementary fixture {} must carry a detail", f.name));
+        match detail {
             // Hazard 1: the ONLY fixed-length-byte-array + custom-serde detail
             // variant — the 32-byte hash must survive JSON → DetailBody exactly.
             DetailBody::ExecutionPanic {

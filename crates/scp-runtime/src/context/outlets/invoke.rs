@@ -3407,27 +3407,29 @@ fn executor_error_to_terminal_payload(err: &OutletExecutorError) -> ChunkPayload
 /// The remaining fields are the honest structural facts this layer knows:
 /// - `source_context` — the hosting context id (real).
 /// - `source_type` — `Persistent`, and deliberately NOT derived from
-///   `memory_scope`. §7.7.1 of the trust spec governs both fields and
-///   separates them in one note: "`sourceType` describes the current
-///   availability of the source data, not the context's creation-time memory
-///   scope setting", and it states the deciding question as "can the source
-///   data be independently verified right now?". §5.11 destroys an ephemeral
-///   context's keys at close, and [`invoke_outlet`] rejects the open unless
-///   `context.state()` is `ContextState::Active`, so while a stream runs the
-///   hosting context is open and its event log is readable — the source data
-///   is verifiable right now whether the context declared `Ephemeral`,
-///   `Summary`, or `Full` retention.
+///   `memory_scope`. §24.5.2 of the provenance spec is the operative rule: it
+///   is a table keyed on the source context's state, and it maps `Active` to
+///   `Persistent` for every context, whatever retention that context
+///   declared. [`invoke_outlet`] rejects the open unless `context.state()` is
+///   `ContextState::Active`, so a stream builds this record while its hosting
+///   context sits in the row that yields `Persistent`.
 ///
-///   The stamped value is a claim about emission time, and §7.7.1's own
-///   worked example says so: a context created with `memoryScope: .full`
-///   "that is still open" has `sourceType: .persistent`. A reader does not
-///   treat it as a standing claim, because §24.5 of the provenance spec has
-///   `evaluate_quality` map "a `DataProvenance` record **and the current
-///   operational state of the source context**" to a quality tier — the live
-///   state, not the stamped field, decides what the record is worth once the
-///   context closes. That matters here because the chunk is operator-signed
-///   and forwarded verbatim, so nothing downstream can refresh this field
-///   without invalidating the signature.
+///   §7.7.1 of the trust spec gives the reason the table reads that way:
+///   "`sourceType` describes the current availability of the source data, not
+///   the context's creation-time memory scope setting", deciding it on
+///   whether "the source data be independently verified right now". §5.11
+///   destroys an ephemeral context's keys at close, so an open context's log
+///   is readable and its data is verifiable now under any scope.
+///
+///   The stamped value is a claim about emission time, which is why §24.5.2
+///   titles itself "Source Type Updates" and expects a reader to refresh it as
+///   the context transitions: "provenance quality can degrade over time as
+///   source contexts close." Nothing downstream can refresh THIS record — the
+///   chunk is operator-signed and forwarded verbatim, so an edit would
+///   invalidate the signature. A reader is not left holding a stale claim,
+///   because §24.5 evaluates quality from "a `DataProvenance` record **and the
+///   current operational state of the source context**", so the live state
+///   decides what the record is worth once the context closes.
 /// - `counterparties` — empty (cross-context-safe redacted default). The
 ///   operator-signed terminal `End` chunk is forwarded VERBATIM across the
 ///   cross-context streaming bridge (`run_cross_context_bridge` calls
@@ -3452,9 +3454,12 @@ fn executor_error_to_terminal_payload(err: &OutletExecutorError) -> ChunkPayload
 ///   stream.
 /// - `chain_depth` / `chain_path` — `0` / `None`: first hop, no
 ///   intermediaries.
-/// - `payment_*` — `None`: the best-effort *outlet stream* is zero-escrow
-///   (§5.4.5 / ADR-061); a paid, metered stream flows through the streaming
-///   saga (§6.2.4), not this path.
+/// - `payment_*` — `None`: the best-effort cross-context *outlet stream* is
+///   zero-escrow (§6.2.5 "Cross-context economy", ADR-061), and a paid,
+///   metered stream flows through the streaming saga (§6.2.5, the transactional
+///   mode), not this path. A paid same-context Action outlet does escrow
+///   (§5.4.5), and its settlement is the dispatch pump's, recorded on the
+///   close-time `PaymentReceipt` rather than on this chunk.
 fn stream_output_provenance(
     context_id: &str,
     memory_scope: scp_protocol::context::params::MemoryScope,
@@ -3558,12 +3563,13 @@ pub type OutletStreamItem = Result<OutletStreamChunk, ChunkSignatureRefused>;
 const SIGNING_REFUSED_MESSAGE_SUFFIX: &str =
     "the operator key refused the chunk at this sequence, so the stream closed without it";
 
-/// `ChunkPayload::Error.message` is a §5.4.5 stream field with no cap of its
-/// own. This assertion holds the constant under the §5.4.4
-/// `OutletError.message` pre-HMAC cap ([`MESSAGE_MAX_BYTES`], 1 KiB) anyway,
-/// matching the bound `outlet_error_message` applies on the sibling path, so a
-/// future edit that lengthens the text fails the build rather than producing a
-/// terminal chunk longer than any other operator message the protocol carries.
+/// `ChunkPayload::Error.message` is a §5.4.5 stream field, and §5.4.5 caps its
+/// length nowhere. This assertion holds the constant under
+/// [`MESSAGE_MAX_BYTES`] (1 KiB) anyway — the bound
+/// [`OutletError::new`](scp_protocol::context::outlets::errors::OutletError::new)
+/// applies to a `catalog_key` on the typed-envelope path — so a future edit
+/// that lengthens the text fails the build rather than producing a terminal
+/// chunk longer than any other operator message the protocol carries.
 const _: () = assert!(
     SLUG_EXECUTION_SIGNING_REFUSED.len() + 2 + SIGNING_REFUSED_MESSAGE_SUFFIX.len()
         <= MESSAGE_MAX_BYTES
@@ -3598,22 +3604,22 @@ pub(crate) fn signing_refused_terminal_payload() -> ChunkPayload {
 /// the constant refusal terminal when the preferred terminal cannot be signed.
 ///
 /// **What this decides:** whether the operator's key will sign the refusal
-/// terminal. It decides that by asking and reading the answer, which §5.4.5
-/// "Signature refusal" requires: "The implementation decides which of the two
-/// applies by attempting the terminal and reading the operator key's answer,
-/// never by classifying the first refusal."
+/// terminal. §5.4.5 "Signature refusal" states the criterion as an outcome —
+/// the member receives the terminal whenever the key would sign it — and
+/// leaves the strategy open. This function asks the key and reads the answer,
+/// which meets the criterion by construction.
 ///
-/// The [`StreamSignerError`] variant of the first refusal is evidence about
-/// the answer, not the answer. A [`StreamSignerError::Jcs`] refusal came from
-/// the payload rather than the key, and a
+/// Predicting the answer from the first refusal's [`StreamSignerError`] would
+/// not. Two of the five refusal shapes predict a signature: a
+/// [`StreamSignerError::Jcs`] refusal came from the payload rather than the
+/// key, and
 /// [`StreamSignerCustodyCategory::BackendFault`](crate::context::outlets::signer::StreamSignerCustodyCategory::BackendFault)
-/// is documented as the conservative catch-all a transient fault falls into —
-/// both predict a signature. The three remaining custody categories
-/// (`KeyNotFound`, `WrongKeyType`, `Unsupported`) each state a condition of
-/// the key itself and predict another refusal. Reading the answer costs one
-/// signing call in those three cases and buys the receiver a signed terminal
-/// in the other two, and only an attempt tells the two groups apart on a
-/// backend that classifies conservatively.
+/// is documented as the conservative catch-all a transient fault falls into.
+/// The other three (`KeyNotFound`, `WrongKeyType`, `Unsupported`) each state a
+/// condition of the key itself and predict another refusal. A backend that
+/// classifies conservatively puts a recoverable fault in the first group, so
+/// only an attempt separates them; asking costs one signing call in the three
+/// cases that were going to refuse anyway.
 ///
 /// `pending` is `Some` when an earlier chunk already failed to sign. In that
 /// case `preferred` is skipped and the refusal terminal is attempted directly,
@@ -5321,12 +5327,6 @@ pub(crate) async fn run_cross_context_bridge(
     // fires iff `!delivered_terminal && outer_open`.
     let mut delivered_terminal = false;
     let mut outer_open = true;
-    // Set when B's pump reports that the operator key refused a chunk and
-    // refused the terminal error chunk that would have named the refusal
-    // (§5.4.5 "Signature refusal"). The post-loop synthesis then tells A what
-    // actually stopped the stream instead of calling it a bridge failure.
-    let mut upstream_refusal: Option<ChunkSignatureRefused> = None;
-
     while let Some(item) = inner_rx.recv().await {
         let chunk = match item {
             Ok(chunk) => chunk,
@@ -5338,7 +5338,6 @@ pub(crate) async fn run_cross_context_bridge(
                     "cross-context bridge: operating context's operator key refused both a chunk \
                      and the terminal error chunk — synthesizing a bridge terminal that names it"
                 );
-                upstream_refusal = Some(refusal);
                 break;
             }
         };
@@ -5509,21 +5508,21 @@ pub(crate) async fn run_cross_context_bridge(
     // transport-fault terminal so A never truncates after a non-terminal `Data`
     // while recording a default `Error` terminal.
     if !delivered_terminal && outer_open {
-        // The bridge authors this terminal and does not sign it, so it names
-        // the cause it observed rather than the one it can attest: a reported
-        // signature refusal is an Execution-class fault of the operating
-        // context, and only a genuinely silent close is a bridge failure.
-        let payload = if upstream_refusal.is_some() {
-            signing_refused_terminal_payload()
-        } else {
-            ChunkPayload::Error {
-                code: CODE_TRANSPORT_FAULT.to_owned(),
-                message: format!(
-                    "{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: operating context closed the \
-                     stream without a terminal chunk (§5.4.5)"
-                ),
-                terminal: true,
-            }
+        // The bridge authors this terminal and carries no operator signature on
+        // it, so §5.4.5 "Signature refusal" bounds what it may claim: the
+        // bridge's own observation, Transport class, never a claim about
+        // another participant's key. A reported upstream signature refusal is
+        // exactly such a claim — B's operator would have to sign it for A to
+        // hold B to it, and the refusal is the case where B's key would not.
+        // Relaying it here would put an unattested accusation against B into
+        // A's manifest, so the cause reaches the bridge's log and stops there.
+        let payload = ChunkPayload::Error {
+            code: CODE_TRANSPORT_FAULT.to_owned(),
+            message: format!(
+                "{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: operating context closed the \
+                 stream without a terminal chunk (§5.4.5)"
+            ),
+            terminal: true,
         };
         let next_seq = reassembled
             .last()
@@ -5628,10 +5627,6 @@ pub(crate) async fn run_streaming_saga_seal_task(
     // prefix (a well-defined truncated close; the journal stays `Committing` so
     // crash recovery reconciles). Set only on the actor-mailbox error paths.
     let mut capture_broke = false;
-    // Set when B's pump reports a §5.4.5 signature refusal it could not name
-    // under a signature; the post-loop synthesis then names it for A.
-    let mut upstream_refusal: Option<ChunkSignatureRefused> = None;
-
     while let Some(item) = inner_rx.recv().await {
         let chunk = match item {
             Ok(chunk) => chunk,
@@ -5642,7 +5637,6 @@ pub(crate) async fn run_streaming_saga_seal_task(
                     "streaming saga seal: operating context's operator key refused both a chunk \
                      and the terminal error chunk — sealing over the durable prefix"
                 );
-                upstream_refusal = Some(refusal);
                 break;
             }
         };
@@ -5726,6 +5720,19 @@ pub(crate) async fn run_streaming_saga_seal_task(
             break;
         }
 
+        // A holds this chunk now, so record the delivery BEFORE the fallible
+        // capture below. A capture fault closes the seal over the durable
+        // prefix; it never un-delivers what A already read. Recording after the
+        // capture let a capture fault on the operator's own terminal chunk
+        // leave `delivered_terminal == false` and `last_sequence` one short, so
+        // the post-loop guarantee sent A a second terminal at a sequence A had
+        // already seen, and sealed a transport-fault status over a stream that
+        // ended on `End`. The sibling `run_cross_context_bridge` orders it this
+        // way too: forward, then record, with nothing fallible between them.
+        terminal.observe(&chunk.payload);
+        last_sequence = Some(chunk.sequence);
+        delivered_terminal = is_terminal;
+
         // Durable capture: fold the just-forwarded operator chunk into B's
         // `SagaId`-keyed frontier (§6.2.5 replay snapshot; Class-S KEEP monotonic
         // credit). Forwarding already happened — the capture never gates delivery.
@@ -5765,10 +5772,7 @@ pub(crate) async fn run_streaming_saga_seal_task(
             }
         }
 
-        terminal.observe(&chunk.payload);
-        last_sequence = Some(chunk.sequence);
         if is_terminal {
-            delivered_terminal = true;
             break;
         }
     }
@@ -5783,12 +5787,11 @@ pub(crate) async fn run_streaming_saga_seal_task(
     //     `capture_broke` path was previously excluded, silently truncating A
     //     after a non-terminal `Data` and losing the §5.4.5 terminal guarantee).
     if !delivered_terminal && outer_open {
-        // See the sibling synthesis in `run_cross_context_bridge`: a reported
-        // signature refusal names an Execution-class fault of the operating
-        // context, not a bridge failure.
-        let payload = if upstream_refusal.is_some() {
-            signing_refused_terminal_payload()
-        } else {
+        // See the sibling synthesis in `run_cross_context_bridge`: this chunk
+        // carries no operator signature, so it states the bridge's own
+        // observation and never relays B's reported key refusal as a claim A
+        // would record against B.
+        let payload = {
             let message = if capture_broke {
                 format!(
                     "{SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE}: durable frontier capture \
@@ -7802,17 +7805,13 @@ mod tests {
             );
             // The honest source context is the hosting context.
             assert_eq!(end.source_context, context.context_id());
-            // §7.7.1 separates `source_type` from `memory_scope` in the note
-            // that governs both: `sourceType` answers "can the source data be
-            // independently verified right now?", not what retention the
-            // context declared at creation. `invoke_outlet` rejects a
-            // non-`Active` open, so the hosting context is open and its data
-            // is verifiable for every scope — which is the same mapping
-            // `scp_protocol::provenance::evaluate::update_source_type` applies
-            // to `SourceContextState::Active`. Stamping `Ephemeral` to mirror
-            // an ephemeral `memory_scope` would make
-            // `evaluate_quality(.., Active)` read the record as inconsistent
-            // and degrade its tier.
+            // §24.5.2 of the provenance spec maps the source context's state
+            // to its source type, and `Active` yields `Persistent` for every
+            // context whatever retention it declared. `invoke_outlet` rejects
+            // a non-`Active` open, so every stream builds this record from
+            // that row. §7.7.1 gives the reason: `sourceType` answers "can the
+            // source data be independently verified right now?", not what
+            // retention the context declared at creation.
             assert_eq!(
                 end.source_type,
                 scp_protocol::provenance::SourceType::Persistent,
