@@ -183,17 +183,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: scp-node self-host create paths fail closed
         run: cargo test -p scp-node --lib pre_rotation_severance -- --nocapture
-      # scp-identity and pyo3 each carry a `#[cfg(not(feature = "testing"))]`
-      # fail-closed proof, matching scp-node. A workspace test lane enables
-      # `testing` on both, and a pyo3 production lane below builds without
-      # `testing` yet runs no test, so neither proof executed anywhere.
+      # scp-identity carries two `#[cfg(not(feature = "testing"))]` fail-closed
+      # proofs, matching scp-node. A workspace test lane enables `testing`, which
+      # compiles both away, so neither proof executed anywhere.
+      #
+      # nextest with `--no-tests=fail`, not `cargo test <filter>`: a filter that
+      # selects nothing exits 0 under `cargo test`, so a dependency edge turning
+      # `testing` on for scp-identity would delete both proofs and leave this lane
+      # green over zero assertions. `--no-tests=fail` exits 4 instead.
       - name: scp-identity create paths fail closed
-        run: cargo test -p scp-identity --lib fails_closed_without_pre_rotation_backend -- --nocapture
-      - name: pyo3 bridge create paths fail closed
-        run: cargo test -p scp-ffi --lib fails_closed -- --nocapture
+        run: cargo nextest run --no-tests=fail -p scp-identity --lib -E 'test(fails_closed_without_pre_rotation_backend)'
 
   # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
   # Asserts every shipped FFI bridge and the scp-node/scp-relay binaries' resolved
@@ -674,7 +677,12 @@ jobs:
           # list twice per transport: once for a feature-off arm and once for a
           # feature-on arm. --workspace activates neither http3 nor udp, so only
           # those off arms ran.
-          cargo test -p scp-node --features http3,udp,testing --lib well_known
+          #
+          # nextest with `--no-tests=fail`, not `cargo test <filter>`: a filter
+          # that selects nothing exits 0 under `cargo test`, so renaming this
+          # module would leave a green lane over zero assertions. `--no-tests=fail`
+          # exits 4 instead. That expression selects 12 tests today.
+          cargo nextest run --no-tests=fail -p scp-node --features http3,udp,testing --lib -E 'test(well_known)'
           # scp-platform gates its Apple SQLCipher storage adapter behind `apple`
           # and its syncable-storage trait behind `sync`. No crate enables either,
           # so both modules' tests — including a storage_conformance! expansion
