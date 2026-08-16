@@ -22,6 +22,7 @@ jobs:
       github.event_name == 'merge_group' ||
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - run: echo "Not a draft PR, proceeding"
 
@@ -47,6 +48,7 @@ jobs:
     # so this workflow names each of them once. `scripts/check-toolchain-wiring.sh` reads
     # these output names out of this file and fails when one of them drops the OR, so a
     # lane added later is covered without editing that gate.
+    timeout-minutes: 10
     outputs:
       rust: ${{ steps.filter.outputs.rust == 'true' || steps.filter.outputs.toolchain == 'true' }}
       python: ${{ steps.filter.outputs.python == 'true' || steps.filter.outputs.toolchain == 'true' }}
@@ -154,6 +156,7 @@ jobs:
     needs: check-draft
     name: Error code conformance
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-error-codes.sh
@@ -171,12 +174,22 @@ jobs:
     needs: check-draft
     name: Fail-closed pre-rotation (SCP-IDENT-1059)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: scp-node self-host create paths fail closed
-        run: cargo test -p scp-node --lib pre_rotation_severance -- --nocapture
+        # nextest, not `cargo test`, because `cargo test <filter>` exits 0 when
+        # its filter selects no test. Both tests this lane names carry
+        # `#[cfg(not(feature = "testing"))]`, so a dependency edge that turned
+        # `testing` on for scp-node would delete them and leave the lane green
+        # over zero assertions. Measured on this tree: `cargo test -p scp-node
+        # --lib no_such_name` exits 0, while `cargo nextest run
+        # --no-tests=fail -p scp-node --lib -E 'test(no_such_name)'` exits 4.
+        # The lane now reports the loss instead of hiding it.
+        run: cargo nextest run --no-tests=fail -p scp-node --lib -E 'test(pre_rotation_severance)'
 
   # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
   # Asserts every shipped FFI bridge and the scp-node/scp-relay binaries' resolved
@@ -193,6 +206,7 @@ jobs:
     needs: check-draft
     name: Shipped-feature-graph (G1 prove-absence)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -206,12 +220,21 @@ jobs:
     if: github.event_name == 'pull_request'
     name: Cross-layer check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Fetch base branch
         run: git fetch origin ${{ github.base_ref }} --depth=1
+      # Self-test MUST run first, following the convention the pyi-generated,
+      # block-in-place, no-panic-abort and saga-gating-granularity jobs set: it
+      # plants an FFI export at the first line and at the last line of a 155 KB
+      # diff and proves the gate finds both, then plants a missing export and
+      # proves the gate still rejects it. The gate's search used to return a
+      # different verdict for the first case than for the second.
+      - name: Self-test gate
+        run: bash scripts/tests/cross-layer/run-tests.sh
       - name: Check cross-layer coverage
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
@@ -231,6 +254,7 @@ jobs:
     needs: check-draft
     name: Bridge symmetry
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -250,6 +274,7 @@ jobs:
     needs: check-draft
     name: SDK capability matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -272,6 +297,7 @@ jobs:
     needs: check-draft
     name: Protocol sync check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -285,6 +311,7 @@ jobs:
     needs: check-draft
     name: Python stub signature parity
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -308,6 +335,7 @@ jobs:
     needs: check-draft
     name: Construction pattern (ADR-052)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -319,6 +347,7 @@ jobs:
     needs: check-draft
     name: Protocol deps check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -330,6 +359,7 @@ jobs:
     needs: check-draft
     name: FFI / no-bridge-globals + OnceLock ratchet
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -341,6 +371,7 @@ jobs:
     needs: check-draft
     name: FFI / no-fallback-registry regression
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-no-fallback-registry.sh
@@ -349,6 +380,7 @@ jobs:
     needs: check-draft
     name: FFI / handle-affinity check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-handle-affinity.sh
@@ -385,6 +417,7 @@ jobs:
     needs: check-draft
     name: enforcement / no-mutable-globals (rust workspace)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-no-mutable-globals.sh
@@ -393,6 +426,7 @@ jobs:
     needs: check-draft
     name: enforcement / no-mutable-module-globals (python sdk)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -404,6 +438,7 @@ jobs:
     needs: check-draft
     name: enforcement / no-mutable-globals (typescript sdk)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-no-ts-mutable-globals.sh
@@ -412,6 +447,7 @@ jobs:
     needs: check-draft
     name: enforcement / no-mutable-globals (kotlin sdk)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-no-kotlin-mutable-globals.sh
@@ -430,6 +466,7 @@ jobs:
     needs: check-draft
     name: Actor / block-in-place AST check + ratchet
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -447,6 +484,7 @@ jobs:
     needs: check-draft
     name: Actor / deleted primitives ban
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-deleted-primitives.sh
@@ -455,6 +493,7 @@ jobs:
     needs: check-draft
     name: Actor / handler panic-family ban (ADR-049 §10)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-handler-no-panic.sh
@@ -463,6 +502,7 @@ jobs:
     needs: check-draft
     name: FFI / no panic=abort in cdylib profiles
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       # Self-test MUST run first: it plants panic = "abort" in a scratch
@@ -478,6 +518,7 @@ jobs:
     needs: check-draft
     name: Actor / saga gating granularity (ADR-049 §3a)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       # Self-test MUST run first: it plants an instance-wide AtomicBool saga
@@ -493,6 +534,7 @@ jobs:
     needs: check-draft
     name: Actor / BridgeInstance lifecycle drift
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -505,6 +547,7 @@ jobs:
     needs: check-draft
     name: WASM / protocol
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -516,6 +559,7 @@ jobs:
     needs: check-draft
     name: WASM / test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -543,6 +587,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     name: Rust / fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -555,6 +600,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     name: Rust / clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |
@@ -590,6 +636,7 @@ jobs:
     needs: changes
     name: Rust / test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -666,6 +713,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     name: Rust / test (napi production config)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |
@@ -703,15 +751,20 @@ jobs:
   # re-gate a production identity/SCPID/custody op behind the test-only
   # `testing` feature — making it vanish from the production lib —
   # and the regression would go unnoticed until release. This is the per-PR guard
-  # against that over-gating regression class. Build-only (lib + bins): the pyo3
-  # test suite assumes in-memory custody and does not compile in prod config, so
-  # a full prod-config test lane is a separate follow-up. The lib build still
-  # catches the bug class — a production op gated out of the lib won't compile.
+  # against that over-gating regression class.
+  #
+  # This job carried a "build-only" note claiming the pyo3 test suite assumes
+  # in-memory custody and does not compile in prod config. Measured on this tree,
+  # `cargo test -p scp-ffi --features server --no-run` exits 0 and links two test
+  # binaries, so that reason no longer holds. The second step below runs the two
+  # shipped-build fail-closed assertions the crate documents at
+  # crates/scp-ffi/src/scp.rs:536.
   rust-build-pyo3-production:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    name: Rust / build (pyo3 production config)
+    name: Rust / build + fail-closed test (pyo3 production config)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |
@@ -719,6 +772,7 @@ jobs:
           df -h /
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -729,6 +783,27 @@ jobs:
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Default features = production: `server` on, no `testing`.
           cargo build -p scp-ffi --features server
+      - name: Shipped pyo3 fail-closed assertions
+        run: |
+          # Assigned before the export so a failing python3 stops the step
+          # (shellcheck SC2155), which the rust-test lane already does.
+          LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          # The doc block at crates/scp-ffi/src/scp.rs:536 states that the two
+          # `#[cfg(not(feature = "testing"))]` tests below it run in the shipped
+          # test lane, "`cargo test -p scp-ffi` with the crate's own `testing`
+          # feature OFF". No lane ran them: this job built the bridge and never
+          # tested it, and the workspace lane compiles them out by enabling
+          # `scp-ffi/testing`. This step is the lane the doc block names, so the
+          # AC5 (identity_create → SCP-IDENT-1059) and AC3 (device-attestation
+          # verify → SCP-IDENT-1016) per-bridge proofs now execute.
+          #
+          # nextest supplies the process-per-test isolation that the SAFETY
+          # comment at crates/scp-ffi/src/scp.rs:560-565 rests two
+          # `std::env::set_var` calls on, and `--no-tests=fail` exits 4 rather
+          # than 0 if a feature flip selects zero tests.
+          cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
+            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed)'
 
   # Builds the uniffi bridge (`scp-ffi-uniffi`) in its PRODUCTION configuration:
   # default features (`server` on) but WITHOUT `testing`. Same
@@ -744,6 +819,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     name: Rust / build (uniffi production config)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |
@@ -762,6 +838,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     name: Rust / doc
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |
@@ -783,6 +860,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     name: Rust / deny
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -829,6 +907,7 @@ jobs:
     if: needs.changes.outputs.python == 'true'
     name: Python / lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: bindings/python
@@ -849,11 +928,30 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3.12 scripts/check-python-falsy-optionals.py
 
+  # The `rust` clause is load-bearing. `scp-ffi`, the PyO3 bridge this job
+  # builds through maturin, depends on scp-core, scp-runtime, scp-transport,
+  # scp-mls, scp-node and eleven more workspace crates (`cargo tree -p scp-ffi
+  # -e no-dev`). The `python` filter lists only bindings/python/**,
+  # crates/scp-ffi/src/** and crates/scp-ffi/common/**, so a pull request that
+  # changed crates/scp-runtime/ alone skipped this job and every assertion in
+  # bindings/python/tests/ went unexecuted under a green check.
+  #
+  # `rust` is the whole-workspace filter (crates/**, Cargo.toml, Cargo.lock,
+  # deny.toml), which is a superset of this bridge's Rust path-dependency
+  # closure and stays a superset by construction: a new crate lands under
+  # crates/**. Enumerating the closure per job — the shape typescript-wasm-check
+  # uses, which works there because scp-client-wasm reaches nine crates — would
+  # here list nearly every crate and would need re-verification on every new
+  # dependency edge. bridge-parity below already ORs on `rust` for the same
+  # reason.
   python-test:
     needs: changes
-    if: needs.changes.outputs.python == 'true'
+    if: >-
+      needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.rust == 'true'
     name: Python / test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |
@@ -890,11 +988,18 @@ jobs:
           PYTHONPATH=. pytest tests/ -v -m "not parity"
 
   # ── TypeScript ──────────────────────────────────────────────────────
+  # ORs on `rust` for the reason spelled out above python-test: the NAPI addon
+  # this job compiles reaches the whole Rust workspace through scp-core, while
+  # the `typescript` filter names only bindings/typescript/**,
+  # crates/scp-ffi/napi/** and crates/scp-ffi/common/**.
   typescript-check:
     needs: changes
-    if: needs.changes.outputs.typescript == 'true'
+    if: >-
+      needs.changes.outputs.typescript == 'true' ||
+      needs.changes.outputs.rust == 'true'
     name: TypeScript / check + lint + test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |
@@ -951,6 +1056,7 @@ jobs:
     if: needs.changes.outputs.typescript-wasm == 'true'
     name: TypeScript-wasm / build + check + lint + guards + test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Free disk space
         run: |
@@ -992,11 +1098,23 @@ jobs:
   # build that package first (it emits the dist/ the scaffold resolves), then
   # install + typecheck + lint + bundle the scaffold. Build + check + lint +
   # build — not a new enforcement framework.
+  #
+  # ORs on `typescript-wasm` because this job runs `bun run build` inside
+  # bindings/typescript-wasm, which invokes wasm-pack over scp-client-wasm. The
+  # `scaffold-typescript-web` filter names scaffolds/typescript-web/** and
+  # bindings/typescript-wasm/** but not that crate's Rust path-dependency
+  # closure, so a change to crates/scp-mls/ could break this build while the job
+  # skipped. The `typescript-wasm` filter above already enumerates that closure
+  # and is verified against `cargo tree -p scp-client-wasm -e no-dev`, so ORing
+  # on it reuses one enumeration instead of copying it into a second place.
   scaffold-typescript-web-check:
     needs: changes
-    if: needs.changes.outputs.scaffold-typescript-web == 'true'
+    if: >-
+      needs.changes.outputs.scaffold-typescript-web == 'true' ||
+      needs.changes.outputs.typescript-wasm == 'true'
     name: TypeScript-web scaffold / build wasm dep + check + lint + build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Free disk space
         run: |
@@ -1034,6 +1152,7 @@ jobs:
     if: needs.changes.outputs.kotlin == 'true'
     name: Kotlin / lint + format
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: bindings/kotlin
@@ -1074,11 +1193,19 @@ jobs:
       # belongs in this job rather than in `kotlin-test`.
       - run: ./gradlew :scp-kt:checkUniffiBindingsOrdering
 
+  # ORs on `rust` for the reason spelled out above python-test: this job builds
+  # the UniFFI cdylib and runs the Kotlin suite against it, and that cdylib
+  # reaches the whole Rust workspace through scp-core, while the `kotlin` filter
+  # names only bindings/kotlin/**, crates/scp-ffi/uniffi/** and
+  # crates/scp-ffi/common/**.
   kotlin-test:
     needs: changes
-    if: needs.changes.outputs.kotlin == 'true'
+    if: >-
+      needs.changes.outputs.kotlin == 'true' ||
+      needs.changes.outputs.rust == 'true'
     name: Kotlin / test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |
@@ -1128,6 +1255,7 @@ jobs:
     if: needs.changes.outputs.swift == 'true'
     name: Swift / lint + format
     runs-on: macos-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: bindings/swift
@@ -1143,11 +1271,19 @@ jobs:
       - run: swiftlint lint --strict
       - run: swiftformat --lint Sources/ Tests/
 
+  # ORs on `rust` for the reason spelled out above python-test: this job builds
+  # the XCFramework and runs the Swift suite against it, and that XCFramework
+  # reaches the whole Rust workspace through scp-core, while the `swift` filter
+  # names only bindings/swift/**, crates/scp-ffi/uniffi/** and
+  # crates/scp-ffi/common/**.
   swift-build-test:
     needs: changes
-    if: needs.changes.outputs.swift == 'true'
+    if: >-
+      needs.changes.outputs.swift == 'true' ||
+      needs.changes.outputs.rust == 'true'
     name: Swift / build + test
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: swift-actions/setup-swift@v2
@@ -1174,6 +1310,7 @@ jobs:
     if: needs.changes.outputs.fuzz == 'true'
     name: Fuzz / build check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
@@ -1201,6 +1338,7 @@ jobs:
       needs.changes.outputs.rust == 'true'
     name: Cross-bridge runtime parity
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |
@@ -1298,6 +1436,7 @@ jobs:
       needs.changes.outputs.rust == 'true'
     name: Cross-bridge runtime parity (UniFFI Kotlin)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         run: |
@@ -1376,6 +1515,7 @@ jobs:
       needs.changes.outputs.rust == 'true'
     name: Cross-bridge runtime parity (UniFFI Swift)
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -1410,13 +1550,43 @@ jobs:
           cd bindings/python
           PYTHONPATH=. pytest tests/bridge_parity/ -v -m parity -k "uniffi-swift"
 
+  # ── CI workflow self-test ───────────────────────────────────────────
+  # The `ci` gate below decides every merge, so the logic that decides it gets
+  # its own tests. scripts/tests/ci-gate/run-tests.sh feeds synthetic dependency
+  # results to scripts/ci-aggregate-result.py and asserts the verdict, and it
+  # asserts the two structural properties of this workflow that no single run
+  # can demonstrate: every job carries a timeout-minutes, and every job is a
+  # dependency of `ci`.
+  ci-workflow-selftest:
+    needs: check-draft
+    name: CI workflow / self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned to a compatible range so a breaking upstream release cannot red
+      # the only required status check, matching the pytest pin in sdk-coverage.
+      - run: pip install 'pyyaml>=6,<7'
+      - run: bash scripts/tests/ci-gate/run-tests.sh
+
   # ── CI Gate ─────────────────────────────────────────────────────────
-  # Single required check for branch protection. Depends on all CI jobs
-  # and uses if: always() so it runs even when paths-filter skips jobs.
-  # Reports success only when every non-skipped job succeeded.
+  # The single status check the repository ruleset requires, so this job decides
+  # every merge. `if: always()` runs it even when a dependency skipped.
+  #
+  # The verdict lives in scripts/ci-aggregate-result.py, not in this file. That
+  # script reads `toJSON(needs)`, so it covers every dependency by construction
+  # rather than by a second hand-written copy of the dependency list, and it
+  # decides per job whether that job was supposed to run by evaluating the job's
+  # own `if:` condition against the `changes` job's filter outputs. A job that
+  # was supposed to run and did not report success fails this gate.
   ci:
     if: always()
     needs:
+      - check-draft
+      - changes
       - error-codes
       - shipped-feature-graph
       - fail-closed-pre-rotation
@@ -1424,6 +1594,8 @@ jobs:
       - bridge-symmetry
       - sdk-coverage
       - protocol-sync
+      - pyi-generated
+      - construction-pattern
       - protocol-deps
       - bridge-globals
       - fallback-registry
@@ -1434,6 +1606,7 @@ jobs:
       - no-panic-abort
       - handler-no-panic
       - saga-gating-granularity
+      - block-in-place
       - deleted-primitives
       - bridge-instance-lifecycle
       - toolchain-wiring
@@ -1465,64 +1638,18 @@ jobs:
       - bridge-parity
       - bridge-parity-kotlin
       - bridge-parity-swift
+      - ci-workflow-selftest
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned to a compatible range so a breaking upstream release cannot red
+      # the only required status check, matching the pytest pin in sdk-coverage.
+      - run: pip install 'pyyaml>=6,<7'
       - name: Check job results
-        run: |
-          results=( \
-            "${{ needs.error-codes.result }}" \
-            "${{ needs.shipped-feature-graph.result }}" \
-            "${{ needs.fail-closed-pre-rotation.result }}" \
-            "${{ needs.cross-layer.result }}" \
-            "${{ needs.bridge-symmetry.result }}" \
-            "${{ needs.sdk-coverage.result }}" \
-            "${{ needs.protocol-sync.result }}" \
-            "${{ needs.protocol-deps.result }}" \
-            "${{ needs.bridge-globals.result }}" \
-            "${{ needs.fallback-registry.result }}" \
-            "${{ needs.handle-affinity.result }}" \
-            "${{ needs.pyi-generated.result }}" \
-            "${{ needs.construction-pattern.result }}" \
-            "${{ needs.block-in-place.result }}" \
-            "${{ needs.no-panic-abort.result }}" \
-            "${{ needs.handler-no-panic.result }}" \
-            "${{ needs.saga-gating-granularity.result }}" \
-            "${{ needs.deleted-primitives.result }}" \
-            "${{ needs.bridge-instance-lifecycle.result }}" \
-            "${{ needs.toolchain-wiring.result }}" \
-            "${{ needs.docker-image.result }}" \
-            "${{ needs.no-mutable-globals-rust.result }}" \
-            "${{ needs.no-mutable-globals-python.result }}" \
-            "${{ needs.no-mutable-globals-ts.result }}" \
-            "${{ needs.no-mutable-globals-kotlin.result }}" \
-            "${{ needs.wasm-protocol.result }}" \
-            "${{ needs.wasm-test.result }}" \
-            "${{ needs.rust-fmt.result }}" \
-            "${{ needs.rust-clippy.result }}" \
-            "${{ needs.rust-test.result }}" \
-            "${{ needs.rust-test-napi-production.result }}" \
-            "${{ needs.rust-build-pyo3-production.result }}" \
-            "${{ needs.rust-build-uniffi-production.result }}" \
-            "${{ needs.rust-doc.result }}" \
-            "${{ needs.rust-deny.result }}" \
-            "${{ needs.python-lint.result }}" \
-            "${{ needs.python-test.result }}" \
-            "${{ needs.typescript-check.result }}" \
-            "${{ needs.typescript-wasm-check.result }}" \
-            "${{ needs.scaffold-typescript-web-check.result }}" \
-            "${{ needs.kotlin-lint.result }}" \
-            "${{ needs.kotlin-test.result }}" \
-            "${{ needs.swift-lint.result }}" \
-            "${{ needs.swift-build-test.result }}" \
-            "${{ needs.fuzz-build.result }}" \
-            "${{ needs.bridge-parity.result }}" \
-            "${{ needs.bridge-parity-kotlin.result }}" \
-            "${{ needs.bridge-parity-swift.result }}" \
-          )
-          for r in "${results[@]}"; do
-            if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
-              echo "::error::CI job failed or was cancelled: $r"
-              exit 1
-            fi
-          done
-          echo "All CI jobs passed or were skipped."
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/ci-aggregate-result.py .github/workflows/ci.yml

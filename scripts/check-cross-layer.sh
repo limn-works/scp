@@ -175,21 +175,32 @@ for i in "${!NEW_PUB_FNS[@]}"; do
     # Patterns: exact name, py_ prefix (PyO3), snake_case, camelCase
     found=0
 
+    # Every search below writes grep's output to /dev/null instead of passing
+    # grep the -q flag. `set -o pipefail` (line 28) makes a pipeline report the
+    # last non-zero exit status any stage returned. `grep -q` stops reading at
+    # its first match and exits, which closes the pipe while `echo` is still
+    # writing; `echo` then dies of SIGPIPE and returns 141, and pipefail hands
+    # 141 to the caller even though grep found the name. The gate read that 141
+    # as "no FFI export" and rejected the pull request. Measured on a 74 KB FFI
+    # diff: a name on the first line returned 141, the same name on the last
+    # line returned 0. `grep -w … >/dev/null` reads its whole input, so `echo`
+    # never receives SIGPIPE and the pipeline reports grep's own verdict.
+    # scripts/tests/cross-layer/run-tests.sh asserts both offsets.
     if [[ -n "$FFI_ADDED" ]]; then
         # Exact name match (word boundary — prevents "send" matching "send_message")
-        if echo "$FFI_ADDED" | grep -qw "$fn_name"; then
+        if echo "$FFI_ADDED" | grep -w "$fn_name" >/dev/null; then
             found=1
         fi
 
         # PyO3 py_ prefix
-        if [[ $found -eq 0 ]] && echo "$FFI_ADDED" | grep -qw "py_${fn_name}"; then
+        if [[ $found -eq 0 ]] && echo "$FFI_ADDED" | grep -w "py_${fn_name}" >/dev/null; then
             found=1
         fi
 
         # camelCase conversion: foo_bar_baz → fooBarBaz
         # Use perl (not sed) — BSD sed on macOS doesn't support \U
         camel=$(echo "$fn_name" | perl -pe 's/_([a-z])/uc($1)/ge')
-        if [[ $found -eq 0 ]] && echo "$FFI_ADDED" | grep -qw "$camel"; then
+        if [[ $found -eq 0 ]] && echo "$FFI_ADDED" | grep -w "$camel" >/dev/null; then
             found=1
         fi
     fi
@@ -261,14 +272,19 @@ for i in "${!UNMATCHED[@]}"; do
     fn_file="${fn_full%%::*}"
     exempted=0
 
+    # The three searches below write to /dev/null rather than passing grep -q,
+    # for the SIGPIPE-under-pipefail reason documented at the FFI-diff search
+    # above: a marker near the top of a long pull-request body would otherwise
+    # read as absent, and the author would see their valid exemption ignored.
+
     # [cross-layer: pub-crate-visibility] — function could be pub(crate) but needs cross-crate access
-    if echo "$PR_TEXT" | grep -q "\[cross-layer: pub-crate-visibility\].*${fn_name}"; then
+    if echo "$PR_TEXT" | grep "\[cross-layer: pub-crate-visibility\].*${fn_name}" >/dev/null; then
         echo "  EXEMPT (pub-crate-visibility): $fn_full" >&2
         exempted=1
     fi
 
     # [cross-layer: test-infrastructure] — must be in a testing module or behind testing feature
-    if [[ $exempted -eq 0 ]] && echo "$PR_TEXT" | grep -q "\[cross-layer: test-infrastructure\].*${fn_name}"; then
+    if [[ $exempted -eq 0 ]] && echo "$PR_TEXT" | grep "\[cross-layer: test-infrastructure\].*${fn_name}" >/dev/null; then
         if [[ "$fn_file" == *"/testing"* ]] || [[ "$fn_file" == *"/tests/"* ]] || grep -q "cfg.*feature.*testing" "$(git rev-parse --show-toplevel)/${fn_file}" 2>/dev/null; then
             echo "  EXEMPT (test-infrastructure): $fn_full" >&2
             exempted=1
@@ -278,7 +294,7 @@ for i in "${!UNMATCHED[@]}"; do
     fi
 
     # [cross-layer: internal-crypto] — must be in crypto/ directory
-    if [[ $exempted -eq 0 ]] && echo "$PR_TEXT" | grep -q "\[cross-layer: internal-crypto\].*${fn_name}"; then
+    if [[ $exempted -eq 0 ]] && echo "$PR_TEXT" | grep "\[cross-layer: internal-crypto\].*${fn_name}" >/dev/null; then
         if [[ "$fn_file" == *"/crypto/"* ]]; then
             echo "  EXEMPT (internal-crypto): $fn_full" >&2
             exempted=1
