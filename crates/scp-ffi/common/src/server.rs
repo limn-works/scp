@@ -6,6 +6,14 @@
 //! FFI consumers. All functions bind to `127.0.0.1:0` (OS-assigned port) so
 //! tests can run in parallel without port conflicts.
 //!
+//! [`start_node_local`] does not select or open a protocol-storage backend.
+//! A caller selected one when it constructed its bridge instance
+//! (`SCP.with_storage({...})` → `StorageConfig::InMemory` or
+//! `StorageConfig::Sqlite`), and passes that same handle here, so a node's
+//! event log, saga journal, `OpenMLS` store, and context snapshots all land in
+//! one backend that instance already owns (spec §17.6). A caller wanting a node
+//! on a different backend constructs a second bridge instance.
+//!
 //! Gated behind the `server` feature.
 
 use std::net::SocketAddr;
@@ -18,9 +26,11 @@ use scp_did::DidDocument;
 use scp_identity::ScpIdentity;
 use scp_identity::dht::DidDht;
 use scp_node::{DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, NodeError, Reach};
+use scp_platform::EncryptedStorage;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::file::FileKeyCustody;
 use scp_platform::in_memory::InMemoryStorage;
+use scp_platform::sqlite::SqliteStorage;
 
 use crate::dht::{DhtInitError, FfiDhtClient};
 // `ClientDhtConfig` is only referenced by the production (non-test) fail-closed
@@ -300,30 +310,41 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 // ApplicationNode startup
 // ---------------------------------------------------------------------------
 
-/// Ephemeral storage backend for [`start_node_in_memory`]: the durability-only
+/// Ephemeral storage backend for [`start_node_in_memory`]: a durability-only
 /// [`InMemoryStorage`] wrapped in an [`EncryptingAdapter`] under a per-node
 /// `OsRng` AES-256-GCM key.
 ///
-/// The wrap is what makes the ephemeral backend satisfy the sealed
+/// That wrap is what makes an ephemeral backend satisfy a sealed
 /// `EncryptedStorage` bound, so this shipped `server`-feature front door goes
-/// through the production [`Node::start`] constructor rather than
-/// `Node::start_for_testing`. This is the canonical spec §17.5 pattern, already
-/// used by
+/// through a production [`Node::start`] constructor rather than
+/// `Node::start_for_testing`. Spec §17.5 names this pattern canonical, and
+/// it already appears in
 /// [`build_event_log_provider`](crate::bridge_runtime::build_event_log_provider).
+/// A bridge instance that selected in-memory storage holds
+/// `Arc<EncryptedInMemoryStorage>`, so a node built here and a node built by
+/// [`start_node_local`] on such an instance carry one `ApplicationNode` type and
+/// land in one [`RunningNode`] variant.
+///
+/// **Do not copy this key lifetime onto a durable backend.** A per-node `OsRng`
+/// key dies with its process, which costs nothing here because
+/// [`InMemoryStorage`] dies with that same process. Wrapping a durable backend
+/// under a per-process key would satisfy `EncryptedStorage` at compile time and
+/// then lose every byte on restart, so a durable backend takes `SqliteStorage`
+/// (`SQLCipher`, keyed from custody) instead.
 pub type EncryptedInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
 
 /// Starts a full application node with encrypted in-memory storage.
 ///
-/// Storage is the ephemeral [`EncryptedInMemoryStorage`] — `InMemoryStorage`
-/// under a per-node `OsRng` AES-256-GCM [`EncryptingAdapter`] — so the node is
-/// built through the production [`Node::start`] constructor and its
+/// Storage is an ephemeral [`EncryptedInMemoryStorage`] — `InMemoryStorage`
+/// under a per-node `OsRng` AES-256-GCM [`EncryptingAdapter`] — so a node is
+/// built through a production [`Node::start`] constructor and its
 /// `EncryptedStorage` bound. Nothing on this path reaches
 /// `Node::start_for_testing`.
 ///
 /// When `identity` is `None` (auto-generate): available ONLY in a `testing`
-/// build via the test-harness `ApplicationNode::dev` (in-memory key custody and
-/// the [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
-/// network; its storage is the same encrypted in-memory backend). A shipped
+/// build via a test-harness `ApplicationNode::dev` (in-memory key custody and
+/// an [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
+/// network; its storage is that same encrypted in-memory backend). A shipped
 /// (no-`testing`) build FAILS CLOSED with
 /// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
 /// node (ADR-062 §Decision 1/6); production callers pass an explicit
@@ -334,6 +355,15 @@ pub type EncryptedInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
 /// identity instead of generating a fresh one. This enables identity
 /// portability — the same DID persists across node restarts.
 ///
+/// **This store is independent of whichever backend a caller's bridge instance
+/// selected.** A node built here opens a fresh ephemeral store, so a caller on a
+/// `SQLCipher` instance gets node state — identity records, TLS certificate
+/// cache, credentials — that its database never receives and that process exit
+/// discards, while that instance's supervisor, event log, and saga journal keep
+/// writing to `SQLCipher`. A caller wanting one backend for both calls
+/// [`start_node_local`] instead; this front door exists for callers who want an
+/// ephemeral node whatever their instance holds.
+///
 /// The relay is started during construction. The HTTP server is **not** started;
 /// call `ApplicationNode::serve` if HTTP endpoints are needed.
 ///
@@ -343,7 +373,7 @@ pub type EncryptedInMemoryStorage = EncryptingAdapter<InMemoryStorage>;
 /// provisioning fails.
 pub async fn start_node_in_memory(
     identity: Option<NodeIdentity>,
-) -> Result<scp_node::ApplicationNode<EncryptedInMemoryStorage>, ServerError> {
+) -> Result<scp_node::ApplicationNode<Arc<EncryptedInMemoryStorage>>, ServerError> {
     let node = match identity {
         // Auto-generate uses the test-harness `ApplicationNode::dev` (in-memory
         // DHT nullifier), compiled only under `testing` (ADR-062 §Decision 1).
@@ -360,12 +390,12 @@ pub async fn start_node_in_memory(
             // publishing reach, so M2 requires `DhtMode::Production` (advisory
             // in P1 — the in-memory DHT client publishes nothing).
             //
-            // Constructed via the PRODUCTION `Node::start` (spec §17.5: FFI
-            // bridges must not rely on the `allow_unencrypted_storage` escape
-            // hatch). The ephemeral `InMemoryStorage` is wrapped in
+            // Constructed via a PRODUCTION `Node::start` (spec §17.5: FFI
+            // bridges must not rely on an `allow_unencrypted_storage` escape
+            // hatch). An ephemeral `InMemoryStorage` is wrapped in
             // `EncryptingAdapter` under a fresh `OsRng` AES-256-GCM key, which
-            // satisfies the sealed `EncryptedStorage` bound — the canonical
-            // §17.5 pattern already used by `build_event_log_provider`.
+            // satisfies a sealed `EncryptedStorage` bound — a §17.5 canonical
+            // pattern already used by `build_event_log_provider`.
             let mut storage_key = Zeroizing::new([0u8; 32]);
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *storage_key);
             Node::start(NodeConfig {
@@ -386,7 +416,7 @@ pub async fn start_node_in_memory(
                             did_method: id.did_method,
                         },
                     )),
-                    EncryptingAdapter::new(InMemoryStorage::new(), storage_key),
+                    Arc::new(EncryptingAdapter::new(InMemoryStorage::new(), storage_key)),
                     // Explicit durability-only selection for this in-memory
                     // server front door (SCP-CAPINJECT-010): the blob backend is
                     // a required selection, never a runtime default.
@@ -401,57 +431,156 @@ pub async fn start_node_in_memory(
         relay_url = %node.relay_url(),
         relay_addr = %node.relay().bound_addr(),
         did = %node.identity().did(),
-        "application node started (in-memory)"
+        "application node started (encrypted in-memory)"
     );
     Ok(node)
 }
 
-/// Starts a full application node with file-backed storage for local development.
+/// Logs a warning when `data_dir` holds a `storage/` subdirectory.
 ///
-/// Auto-wires:
-/// - [`FilesystemStorage`](scp_platform::filesystem::FilesystemStorage) at
-///   `<data_dir>/storage/` — persistent key-value storage for protocol state
-/// - [`BlobStorageBackend::redb`] at `<data_dir>/blobs.redb` — persistent
-///   relay blob storage
-/// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT
-///   network — suitable for local-only use)
-/// - Self-signed TLS (for the localhost domain)
-/// - Relay bound to `127.0.0.1:0` (OS-assigned port)
+/// Earlier revisions of [`start_node_local`] opened a plaintext
+/// `FilesystemStorage` there. This revision reads no such directory, so one left
+/// behind by an earlier run is plaintext protocol state that no code path opens
+/// and no upgrade converts. Silence would make an operator believe their
+/// protocol state is encrypted while key-per-file plaintext sits beside it, so
+/// this names a path an operator can delete.
 ///
-/// The relay is started during construction. The HTTP server is **not** started;
-/// call `ApplicationNode::serve` if HTTP endpoints are needed.
+/// A warning rather than an error: `storage/` is an ordinary directory name, and
+/// refusing to start would break a caller who put something unrelated there.
+fn warn_on_stale_plaintext_store(data_dir: &Path) {
+    let stale = data_dir.join("storage");
+    if stale.is_dir() {
+        tracing::warn!(
+            path = %stale.display(),
+            "found a `storage/` directory a previous SCP revision wrote as \
+             plaintext protocol state; this node reads whichever storage handle \
+             its caller passed instead, so nothing opens, migrates, or deletes \
+             that directory — delete it once you have salvaged anything you need"
+        );
+    }
+}
+
+/// Logs a warning when `data_dir` grants group or other any access on Unix.
+///
+/// [`start_node_local`] creates `data_dir` at mode `0o700`, and that mode
+/// applies only to a directory this call creates. When `data_dir` already
+/// exists, its existing mode stands, so `blobs.redb` — which carries blob
+/// identifiers, sizes, timestamps, and TTLs in plaintext — can land in a
+/// directory every local user traverses. `FileKeyCustody` sets `0o600` on
+/// `identity.key` itself, so key material stays protected either way.
+///
+/// A warning rather than a `chmod`: tightening a directory a caller created
+/// could break an operator who deliberately shares it with a backup account.
+#[cfg(unix)]
+fn warn_on_permissive_data_dir(data_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = std::fs::metadata(data_dir) else {
+        return;
+    };
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        tracing::warn!(
+            path = %data_dir.display(),
+            mode = format!("{mode:04o}"),
+            "node data directory grants group or other access; `blobs.redb` \
+             exposes blob identifiers, sizes, timestamps, and TTLs to every \
+             local user who can traverse it — `chmod 700` closes that"
+        );
+    }
+}
+
+/// No-op counterpart of a Unix permission warning.
+///
+/// Windows expresses directory access through ACLs rather than through a mode
+/// word, so a mode check has nothing to read there.
+#[cfg(not(unix))]
+const fn warn_on_permissive_data_dir(_data_dir: &Path) {}
+
+/// Starts a full application node on a caller's own protocol-storage handle.
+///
+/// A caller chose its storage backend when it constructed its bridge instance
+/// (`SCP.with_storage({...})` — encrypted in-memory or `SQLCipher`), and passes
+/// that same handle as `storage`. This function opens no protocol store of its
+/// own, so a node's context snapshots, Merkle event log, saga journal, and
+/// `OpenMLS` store share one backend that instance already owns (spec §17.6).
+/// Two consequences follow, and both are deliberate:
+/// - A caller wanting a node on a different backend constructs a second bridge
+///   instance. No per-node storage parameter exists to reach for.
+/// - `SqliteStorage::new` takes a non-blocking exclusive lock on
+///   `<dir>/scp.db.lock`, so a node opening its own `SQLCipher` database under a
+///   directory its instance already uses would either fail that lock or run a
+///   second, silently diverging store. Inheriting one handle removes both
+///   failures.
+///
+/// `storage` is bound by [`EncryptedStorage`], so this function reaches
+/// [`Node::start`] — a production constructor — and never
+/// `Node::start_for_testing`.
+///
+/// `data_dir` names two node-local files and no protocol store:
+/// - [`BlobStorageBackend::redb`] at `<data_dir>/blobs.redb` — a relay's
+///   durable blob database, passed as a required selection (SCP-CAPINJECT-010).
+///   redb applies no encryption of its own. Blob payloads are MLS ciphertext, so
+///   content stays sealed, and blob identifiers, sizes, timestamps, and TTLs sit
+///   in plaintext next to `identity.key`. Blob storage is a separately injected
+///   capability, so `storage` being `EncryptedStorage` says nothing about it.
+/// - `<data_dir>/identity.key` — a [`FileKeyCustody`] key file, read only
+///   when `identity` is `None`. `FileKeyCustody::generate_keypair` appends
+///   rather than replaces, so a caller whose instance selected ephemeral storage
+///   adds one unreachable entry per process start (see *Identity modes*).
+///
+/// Also wired: self-signed TLS for a localhost domain, and a relay bound to
+/// `127.0.0.1:0` (an OS-assigned port).
+///
+/// **No migration path (SCP is pre-release).** Earlier revisions of
+/// `start_node_local` opened a plaintext `FilesystemStorage` at
+/// `<data_dir>/storage/`. This revision never reads that directory. A data
+/// directory holding one carries protocol state that no code path opens, and a
+/// node starts against whatever `storage` contains instead. Finding one logs a
+/// `tracing::warn!` naming its path, because plaintext protocol state that
+/// nothing reads is still plaintext protocol state on disk. Delete it; nothing
+/// converts it.
+///
+/// A relay starts during construction. An HTTP server does **not** start;
+/// call `ApplicationNode::serve` when HTTP endpoints are needed.
 ///
 /// # Identity modes
 ///
-/// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
-/// identity. This enables identity portability — the same DID persists
-/// across node restarts and can be shared across FFI bridge instances.
+/// When `identity` is `Some(NodeIdentity)`, a node uses that pre-existing
+/// identity. Identity portability follows — one DID persists across node
+/// restarts and can be shared across FFI bridge instances.
 ///
-/// When `identity` is `None`, the node creates or reloads a persistent
-/// identity via [`FileKeyCustody`](scp_platform::file::FileKeyCustody)
-/// backed by `<data_dir>/identity.key`. The `passphrase` parameter is
-/// required in this mode — there is no environment variable fallback.
+/// When `identity` is `None`, a node creates or reloads a persistent identity
+/// via [`FileKeyCustody`] backed by
+/// `<data_dir>/identity.key`. A `passphrase` argument is required in this
+/// mode, and no environment variable substitutes for it.
 ///
-/// On first run, a new DID is generated and persisted to storage. On
-/// subsequent runs, the same DID is reloaded from storage.
+/// On first run, a new DID is generated and written to `storage`. On a later
+/// run against that same `storage` handle, a node reloads that same DID. A
+/// caller whose instance selected encrypted in-memory storage therefore gets a
+/// fresh DID per process, because that backend keeps nothing across process
+/// exit; a caller whose instance selected `SQLCipher` keeps its DID.
 ///
 /// For fully ephemeral setups use [`start_node_in_memory`].
 ///
 /// # Errors
 ///
 /// Returns [`ServerError`] if:
-/// - The data directory cannot be created ([`ServerError::Io`])
-/// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
-/// - The redb blob database cannot be opened ([`ServerError::Storage`])
-/// - No passphrase provided when `identity` is `None` ([`ServerError::MissingPassphrase`])
+/// - A data directory cannot be created ([`ServerError::Io`])
+/// - A redb blob database cannot be opened ([`ServerError::Storage`])
+/// - A key custody file cannot be opened ([`ServerError::Platform`])
+/// - No passphrase arrived when `identity` is `None` ([`ServerError::MissingPassphrase`])
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
-pub async fn start_node_local(
+pub async fn start_node_local<S>(
     data_dir: &Path,
+    storage: S,
     identity: Option<NodeIdentity>,
     passphrase: Option<zeroize::Zeroizing<String>>,
-) -> Result<scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>, ServerError> {
+) -> Result<scp_node::ApplicationNode<S>, ServerError>
+where
+    S: EncryptedStorage + 'static,
+{
     use scp_identity::DidCache;
-    use scp_platform::filesystem::FilesystemStorage;
 
     // Validate and ensure data directory exists.
     validate_data_dir(data_dir)?;
@@ -468,12 +597,10 @@ pub async fn start_node_local(
         std::fs::create_dir_all(data_dir)?;
     }
 
-    // Common paths.
-    let storage_dir = data_dir.join("storage");
-    let blob_path = data_dir.join("blobs.redb");
+    warn_on_stale_plaintext_store(data_dir);
+    warn_on_permissive_data_dir(data_dir);
 
-    // File-backed protocol storage and blob storage (shared across identity modes).
-    let storage = FilesystemStorage::new(&storage_dir)?;
+    let blob_path = data_dir.join("blobs.redb");
     let blob_storage = BlobStorageBackend::redb(&blob_path)?;
 
     // Build the node via the ADR-052 flat-config front door (Phase B-P2). The
@@ -481,10 +608,10 @@ pub async fn start_node_local(
     // explicit `SelfSignedTlsProvider::new("localhost")` is reproduced by the
     // default `TlsMode::SelfSigned`. `Domain` is a publishing reach, so M2
     // requires `DhtMode::Production` (advisory in P1 — the in-memory DHT client
-    // publishes nothing). The storage values are moved into the config, so the
-    // two arms each build their own config.
+    // publishes nothing). Each arm moves `storage` into its own config, so both
+    // arms build a config separately.
     let node = if let Some(id) = identity {
-        Node::start_for_testing(NodeConfig {
+        Node::start(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
@@ -523,8 +650,8 @@ pub async fn start_node_local(
         // substitution; ADR-062 §Decision 1) — the node's dht gateways would
         // thread in here; the local path uses direct Mainline DHT (no gateways).
         // A test-harness build (`testing`) uses the in-memory §17.17.3 double so
-        // `Node::start_for_testing`'s mandatory startup publish (a full relay node
-        // always publishes; see `scp_node`) stays offline instead of timing out
+        // `Node::start`'s mandatory startup publish (a full relay node always
+        // publishes; see `scp_node`) stays offline instead of timing out
         // against live Mainline. The client backs both this node's DID
         // publication and its `did:dht` resolution.
         #[cfg(not(any(test, feature = "testing")))]
@@ -537,7 +664,7 @@ pub async fn start_node_local(
             dht_client, cache, sign_fn,
         ));
 
-        Node::start_for_testing(NodeConfig {
+        Node::start(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
@@ -562,7 +689,7 @@ pub async fn start_node_local(
         relay_addr = %node.relay().bound_addr(),
         did = %node.identity().did(),
         data_dir = %data_dir.display(),
-        "application node started (local file-backed)"
+        "application node started on a caller-supplied storage handle"
     );
     Ok(node)
 }
@@ -571,50 +698,89 @@ pub async fn start_node_local(
 // RunningNode — type-erased ApplicationNode wrapper (shared across bridges)
 // ---------------------------------------------------------------------------
 
-/// Type-erased wrapper over `ApplicationNode<S>` for the two concrete storage
-/// backends used by the shared server code.
+/// Type-erased wrapper over `ApplicationNode<S>` for every concrete storage
+/// backend this module produces.
 ///
-/// `ApplicationNode<S>` is generic over `S: Storage`. The `Storage` trait uses
-/// RPITIT and is not object-safe, so we cannot use `dyn Storage`. Instead we
-/// use a closed enum over [`EncryptedInMemoryStorage`] and `FilesystemStorage`.
+/// `ApplicationNode<S>` is generic over `S: Storage`. A `Storage` trait uses
+/// RPITIT and is not object-safe, so `dyn Storage` does not compile. A closed
+/// enum stands in. Its two variants are exactly two backends a bridge instance
+/// can hold: an encrypted in-memory handle and a `SQLCipher` handle. Each
+/// mirrors one arm of a bridge's `StorageConfig` selector, so no third arm can
+/// appear here without a matching selector arm a caller can choose.
+/// [`start_node_in_memory`] builds its own encrypted in-memory handle and lands
+/// in that first variant, because both handles carry one type.
 ///
-/// This mirrors the pattern established by [`RunningRelay`] — shared in
-/// `scp-ffi-common` so each FFI bridge wraps this rather than duplicating the
-/// enum and its dispatch methods.
+/// [`RunningRelay`] established this pattern — shared in `scp-ffi-common` so
+/// each FFI bridge wraps one enum rather than duplicating it and its dispatch
+/// methods.
 pub enum RunningNode {
-    /// Encrypted in-memory storage variant (ephemeral — suitable for
-    /// tests/demos). See [`EncryptedInMemoryStorage`].
-    InMemory(scp_node::ApplicationNode<EncryptedInMemoryStorage>),
-    /// Filesystem-backed storage variant (persistent — suitable for local dev).
-    Filesystem(scp_node::ApplicationNode<scp_platform::filesystem::FilesystemStorage>),
+    /// An encrypted in-memory handle: either one [`start_node_in_memory`]
+    /// builds for itself, or one [`start_node_local`] receives from a
+    /// `StorageConfig::InMemory` bridge instance. Both are ephemeral.
+    InMemoryEncrypted(scp_node::ApplicationNode<Arc<EncryptedInMemoryStorage>>),
+    /// A caller's `SQLCipher` handle, produced by [`start_node_local`] on a
+    /// `StorageConfig::Sqlite` bridge instance.
+    Sqlite(scp_node::ApplicationNode<Arc<SqliteStorage>>),
+}
+
+/// Rejects, at compile time, a [`RunningNode`] variant whose storage backend
+/// does not satisfy a sealed `EncryptedStorage` bound.
+///
+/// `ApplicationNode<S>` asks only for `S: Storage`, so nothing else stops a
+/// future variant from carrying a plaintext backend. A plaintext backend would
+/// force whichever front door produced it onto `Node::start_for_testing`, which
+/// drops a bound that [`Node::start`] carries, which in turn would put
+/// `ProtocolRepository::new_for_testing` back into this crate's shipped graph
+/// through a `scp-node/allow_unencrypted_storage` dependency edge. A `match`
+/// below is exhaustive, so adding a variant fails to compile here until its
+/// backend satisfies `EncryptedStorage`, and an author reads that error instead
+/// of a reviewer catching an omission.
+///
+/// `scripts/check-shipped-feature-graph.sh` proves a second half: no shipped
+/// artifact resolves any of three `allow_unencrypted_storage` features, so a
+/// shipped build compiles no `new_for_testing` at all.
+#[allow(dead_code)]
+const fn assert_running_node_backends_are_encrypted(node: &RunningNode) {
+    const fn require_encrypted<S: EncryptedStorage>(_node: &scp_node::ApplicationNode<S>) {}
+    match node {
+        RunningNode::InMemoryEncrypted(n) => require_encrypted(n),
+        RunningNode::Sqlite(n) => require_encrypted(n),
+    }
+}
+
+/// Binds whichever `ApplicationNode<S>` a [`RunningNode`] holds to `$n` and
+/// evaluates `$body` against it.
+///
+/// Every [`RunningNode`] method dispatches over both variants. Written out per
+/// method, each body appears twice, and one copy can drift from its sibling —
+/// drift of exactly that kind left only a `PyO3` bridge wired for webhook
+/// events. One body per method removes that risk.
+macro_rules! dispatch_running_node {
+    ($self:expr, |$n:ident| $body:expr) => {
+        match $self {
+            RunningNode::InMemoryEncrypted($n) => $body,
+            RunningNode::Sqlite($n) => $body,
+        }
+    };
 }
 
 impl RunningNode {
     /// Returns the WebSocket URL clients should connect to for this node's relay.
     #[must_use]
     pub fn relay_url(&self) -> &str {
-        match self {
-            Self::InMemory(n) => n.relay_url(),
-            Self::Filesystem(n) => n.relay_url(),
-        }
+        dispatch_running_node!(self, |n| n.relay_url())
     }
 
     /// Returns the node's DID string.
     #[must_use]
     pub fn did(&self) -> &str {
-        match self {
-            Self::InMemory(n) => n.identity().did(),
-            Self::Filesystem(n) => n.identity().did(),
-        }
+        dispatch_running_node!(self, |n| n.identity().did())
     }
 
     /// Returns the port the node's relay is listening on.
     #[must_use]
     pub const fn relay_port(&self) -> u16 {
-        match self {
-            Self::InMemory(n) => n.relay().bound_addr().port(),
-            Self::Filesystem(n) => n.relay().bound_addr().port(),
-        }
+        dispatch_running_node!(self, |n| n.relay().bound_addr().port())
     }
 
     /// Returns the internal relay WebSocket URL for in-process connections.
@@ -638,27 +804,18 @@ impl RunningNode {
     /// **Security:** This value is a secret. Do not log or expose it.
     #[must_use]
     pub fn bridge_token_hex(&self) -> Zeroizing<String> {
-        match self {
-            Self::InMemory(n) => n.bridge_token_hex(),
-            Self::Filesystem(n) => n.bridge_token_hex(),
-        }
+        dispatch_running_node!(self, |n| n.bridge_token_hex())
     }
 
     /// Returns `true` if shutdown has already been signaled.
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
-        match self {
-            Self::InMemory(n) => n.relay().shutdown_handle().is_shutdown(),
-            Self::Filesystem(n) => n.relay().shutdown_handle().is_shutdown(),
-        }
+        dispatch_running_node!(self, |n| n.relay().shutdown_handle().is_shutdown())
     }
 
     /// Signals the node to stop (relay + background tasks).
     pub fn shutdown(&self) {
-        match self {
-            Self::InMemory(n) => n.shutdown(),
-            Self::Filesystem(n) => n.shutdown(),
-        }
+        dispatch_running_node!(self, |n| n.shutdown());
     }
 
     /// Spawns a background task forwarding local `Supervisor` events to this
@@ -679,10 +836,7 @@ impl RunningNode {
             scp_core::context::membership::ContextEvent,
         )>,
     ) -> tokio::task::JoinHandle<()> {
-        match self {
-            Self::InMemory(n) => n.wire_context_events(events),
-            Self::Filesystem(n) => n.wire_context_events(events),
-        }
+        dispatch_running_node!(self, |n| n.wire_context_events(events))
     }
 
     /// Subscribes to the supervisor's event channel, wires the consumer into
@@ -738,28 +892,15 @@ impl RunningNode {
         admission: scp_core::context::broadcast::BroadcastAdmission,
         site_config: Option<scp_node::projection::SiteConfig>,
     ) -> Result<(), NodeError> {
-        match self {
-            Self::InMemory(n) => {
-                n.enable_broadcast_projection_with_site(
-                    context_id,
-                    broadcast_key,
-                    admission,
-                    None,
-                    site_config,
-                )
-                .await
-            }
-            Self::Filesystem(n) => {
-                n.enable_broadcast_projection_with_site(
-                    context_id,
-                    broadcast_key,
-                    admission,
-                    None,
-                    site_config,
-                )
-                .await
-            }
-        }
+        dispatch_running_node!(self, |n| n
+            .enable_broadcast_projection_with_site(
+                context_id,
+                broadcast_key,
+                admission,
+                None,
+                site_config,
+            )
+            .await)
     }
 
     /// Commits a deploy for a projected context.
@@ -772,10 +913,7 @@ impl RunningNode {
         context_id: &str,
         deploy_id: &str,
     ) -> Result<usize, NodeError> {
-        match self {
-            Self::InMemory(n) => n.commit_deploy(context_id, deploy_id).await,
-            Self::Filesystem(n) => n.commit_deploy(context_id, deploy_id).await,
-        }
+        dispatch_running_node!(self, |n| n.commit_deploy(context_id, deploy_id).await)
     }
 
     /// Rolls back to a previous deploy for a projected context.
@@ -788,18 +926,12 @@ impl RunningNode {
         context_id: &str,
         deploy_id: &str,
     ) -> Result<(), NodeError> {
-        match self {
-            Self::InMemory(n) => n.rollback_deploy(context_id, deploy_id).await,
-            Self::Filesystem(n) => n.rollback_deploy(context_id, deploy_id).await,
-        }
+        dispatch_running_node!(self, |n| n.rollback_deploy(context_id, deploy_id).await)
     }
 
     /// Deactivates HTTP broadcast projection for the given context.
     pub async fn disable_broadcast_projection(&self, context_id: &str) {
-        match self {
-            Self::InMemory(n) => n.disable_broadcast_projection(context_id).await,
-            Self::Filesystem(n) => n.disable_broadcast_projection(context_id).await,
-        }
+        dispatch_running_node!(self, |n| n.disable_broadcast_projection(context_id).await);
     }
 
     /// Starts the HTTP server in the background on the given bind address.
@@ -814,18 +946,12 @@ impl RunningNode {
         &self,
         bind_addr: Option<std::net::SocketAddr>,
     ) -> Result<std::net::SocketAddr, NodeError> {
-        match self {
-            Self::InMemory(n) => n.serve_background(bind_addr).await,
-            Self::Filesystem(n) => n.serve_background(bind_addr).await,
-        }
+        dispatch_running_node!(self, |n| n.serve_background(bind_addr).await)
     }
 
     /// Returns the HTTP URL of the background server, or `None` if not serving.
     pub async fn http_url(&self) -> Option<String> {
-        match self {
-            Self::InMemory(n) => n.http_url().await,
-            Self::Filesystem(n) => n.http_url().await,
-        }
+        dispatch_running_node!(self, |n| n.http_url().await)
     }
 }
 
@@ -993,9 +1119,42 @@ impl ResolvedBroadcastKey {
 mod tests {
     use super::*;
 
+    use scp_platform::traits::Storage as _;
+
     /// Passphrase used by tests that exercise the `FileKeyCustody` path.
     fn test_passphrase() -> zeroize::Zeroizing<String> {
         zeroize::Zeroizing::new("test-passphrase".to_owned())
+    }
+
+    /// Builds a handle that a `StorageConfig::InMemory` bridge instance holds:
+    /// an `Arc<EncryptingAdapter<InMemoryStorage>>` under a fresh random key.
+    ///
+    /// `start_node_local` receives this same value a bridge already owns, so
+    /// these tests exercise a production call shape rather than a substitute.
+    fn instance_in_memory_storage() -> Arc<EncryptingAdapter<InMemoryStorage>> {
+        use rand_core::RngCore as _;
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand_core::OsRng.fill_bytes(&mut *key);
+        Arc::new(EncryptingAdapter::new(InMemoryStorage::new(), key))
+    }
+
+    /// Opens a handle that a `StorageConfig::Sqlite` bridge instance holds: an
+    /// `Arc<SqliteStorage>` over `<dir>/scp.db`, keyed by a fixed test key.
+    ///
+    /// Each caller closes a returned handle before reopening that directory,
+    /// because `SqliteStorage::new` takes a non-blocking exclusive lock on
+    /// `<dir>/scp.db.lock`.
+    fn instance_sqlite_storage(dir: &Path) -> Arc<SqliteStorage> {
+        Arc::new(SqliteStorage::new(dir, &[0x11u8; 32]).expect("SQLCipher open must succeed"))
+    }
+
+    /// Returns a unique temp directory path per call, so parallel tests and
+    /// repeated runs never share a data directory or a `SQLCipher` lock file.
+    fn temp_dir_for(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("scp-test-{label}-{}-{seq}", std::process::id()))
     }
 
     #[tokio::test]
@@ -1067,10 +1226,15 @@ mod tests {
 
     #[tokio::test]
     async fn node_local_returns_relay_url_and_did() {
-        let tmp = std::env::temp_dir().join(format!("scp-test-node-local-{}", std::process::id()));
-        let node = start_node_local(&tmp, None, Some(test_passphrase()))
-            .await
-            .unwrap();
+        let tmp = temp_dir_for("node-local");
+        let node = start_node_local(
+            &tmp,
+            instance_in_memory_storage(),
+            None,
+            Some(test_passphrase()),
+        )
+        .await
+        .unwrap();
 
         // Relay URL should be a valid ws:// or wss:// URL.
         let url = node.relay_url();
@@ -1088,8 +1252,6 @@ mod tests {
 
         assert_ne!(node.relay().bound_addr().port(), 0);
 
-        // Storage directory should have been created.
-        assert!(tmp.join("storage").is_dir(), "storage dir should exist");
         // Blob database should have been created.
         assert!(tmp.join("blobs.redb").exists(), "blobs.redb should exist");
         // Key file should have been created.
@@ -1103,41 +1265,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// `start_node_local` opens no protocol store under `data_dir`. A node
+    /// writes protocol state into whichever handle a caller passed in, and a
+    /// plaintext `<data_dir>/storage/` directory, which earlier revisions
+    /// created, never appears.
     #[tokio::test]
-    async fn node_local_reuses_data_dir_across_restarts() {
-        let tmp =
-            std::env::temp_dir().join(format!("scp-test-node-persist-{}", std::process::id()));
+    async fn node_local_writes_into_the_callers_storage_and_opens_no_store_of_its_own() {
+        let tmp = temp_dir_for("node-local-inherits");
+        let storage = instance_in_memory_storage();
+
+        // A caller keeps its own clone — exactly what a bridge instance does.
+        let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
+            .await
+            .unwrap();
+
+        let keys = storage.list_keys("").await.unwrap();
+        assert!(
+            !keys.is_empty(),
+            "a node must persist protocol state into a caller-supplied storage \
+             handle, yet that handle held no keys after startup"
+        );
+
+        assert!(
+            !tmp.join("storage").exists(),
+            "start_node_local must create no protocol store under a data \
+             directory; found {}",
+            tmp.join("storage").display()
+        );
+
+        node.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A `storage/` directory that an earlier SCP revision wrote neither blocks
+    /// startup nor disappears. `start_node_local` warns about it and moves on,
+    /// so an operator keeps whatever that directory holds and decides when to
+    /// delete it.
+    #[tokio::test]
+    async fn node_local_leaves_a_stale_plaintext_store_untouched_and_still_starts() {
+        let tmp = temp_dir_for("node-local-stale-store");
+        let stale = tmp.join("storage");
+        std::fs::create_dir_all(&stale).unwrap();
+        let marker = stale.join("leftover-key");
+        std::fs::write(&marker, b"plaintext protocol state").unwrap();
+
+        let node = start_node_local(
+            &tmp,
+            instance_in_memory_storage(),
+            None,
+            Some(test_passphrase()),
+        )
+        .await
+        .expect("a stale plaintext store must not block startup");
+
+        assert!(
+            marker.is_file(),
+            "start_node_local must not delete a stale plaintext store; \
+             {} disappeared",
+            marker.display()
+        );
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"plaintext protocol state",
+            "start_node_local must not rewrite a stale plaintext store"
+        );
+
+        node.shutdown();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A caller whose instance selected `SQLCipher` keeps its node DID across
+    /// restarts, because that DID persists in a caller's database rather than
+    /// in a store a node opened for itself.
+    #[tokio::test]
+    async fn node_local_reuses_the_callers_sqlite_storage_across_restarts() {
+        let tmp = temp_dir_for("node-persist");
+        let db_dir = tmp.join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
 
         let first_did;
-        // First run — creates storage directory, blob database, and identity key.
+        // First run — writes an identity into a caller's SQLCipher database.
         {
-            let node = start_node_local(&tmp, None, Some(test_passphrase()))
+            let storage = instance_sqlite_storage(&db_dir);
+            let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
                 .await
                 .unwrap();
-            assert!(tmp.join("storage").is_dir());
             assert!(tmp.join("blobs.redb").exists());
             assert!(tmp.join("identity.key").exists());
             first_did = node.identity().did().to_owned();
             node.shutdown();
             // Drop the node so background tasks release the redb file lock.
             drop(node);
+            // Release an advisory lock on `<db_dir>/scp.db.lock` before a
+            // second open, which `SqliteStorage::new` takes non-blockingly.
+            storage.close();
+            drop(storage);
             // Yield to let the tokio runtime drain cancelled relay tasks.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        // Second run — should open the same data directory without error.
-        // With FileKeyCustody + identity_with_storage, the same DID is
-        // reloaded from persistent storage across restarts.
+        // Second run — reopens that same database and reloads that same DID.
         {
-            let node = start_node_local(&tmp, None, Some(test_passphrase()))
+            let storage = instance_sqlite_storage(&db_dir);
+            let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
                 .await
                 .unwrap();
             assert_eq!(
                 node.identity().did(),
                 first_did,
-                "second run should produce the same DID (persistent identity)"
+                "second run against one caller storage handle must reload one DID"
             );
             node.shutdown();
+            drop(node);
+            storage.close();
         }
 
         // Cleanup
@@ -1217,7 +1457,7 @@ mod tests {
     #[tokio::test]
     async fn running_node_in_memory_dispatch() {
         let node = start_node_in_memory(None).await.unwrap();
-        let running = RunningNode::InMemory(node);
+        let running = RunningNode::InMemoryEncrypted(node);
         assert!(
             running.relay_url().starts_with("ws://") || running.relay_url().starts_with("wss://")
         );
@@ -1226,6 +1466,61 @@ mod tests {
         assert!(!running.is_shutdown());
         running.shutdown();
         assert!(running.is_shutdown());
+    }
+
+    /// Two variants that `start_node_local` produces answer every dispatch
+    /// method an in-memory variant answers, so a bridge holding either one
+    /// reads relay URL, DID, port, and shutdown state through identical calls.
+    #[tokio::test]
+    async fn running_node_caller_storage_variants_dispatch() {
+        let tmp = temp_dir_for("running-node-encrypted");
+        let node = start_node_local(
+            &tmp,
+            instance_in_memory_storage(),
+            None,
+            Some(test_passphrase()),
+        )
+        .await
+        .unwrap();
+        let running = RunningNode::InMemoryEncrypted(node);
+        // Calls an exhaustive compile-time bound assertion with a real value,
+        // so that assertion runs rather than sitting merely named.
+        assert_running_node_backends_are_encrypted(&running);
+        assert!(
+            running.relay_url().starts_with("ws://") || running.relay_url().starts_with("wss://")
+        );
+        assert!(running.did().starts_with("did:"));
+        assert!(running.relay_port() > 0);
+        assert!(running.internal_relay_url().contains("/scp/v1"));
+        assert!(!running.bridge_token_hex().is_empty());
+        assert!(!running.is_shutdown());
+        running.shutdown();
+        assert!(running.is_shutdown());
+        drop(running);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let tmp = temp_dir_for("running-node-sqlite");
+        let db_dir = tmp.join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let storage = instance_sqlite_storage(&db_dir);
+        let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
+            .await
+            .unwrap();
+        let running = RunningNode::Sqlite(node);
+        assert_running_node_backends_are_encrypted(&running);
+        assert!(
+            running.relay_url().starts_with("ws://") || running.relay_url().starts_with("wss://")
+        );
+        assert!(running.did().starts_with("did:"));
+        assert!(running.relay_port() > 0);
+        assert!(running.internal_relay_url().contains("/scp/v1"));
+        assert!(!running.bridge_token_hex().is_empty());
+        assert!(!running.is_shutdown());
+        running.shutdown();
+        assert!(running.is_shutdown());
+        drop(running);
+        storage.close();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Sends a minimal HTTP/1.1 GET request and returns the status line.
@@ -1394,10 +1689,11 @@ mod tests {
         let test_id = create_test_identity().await;
         let expected_did = test_id.identity.did.clone();
 
-        let tmp =
-            std::env::temp_dir().join(format!("scp-test-node-local-id-{}", std::process::id()));
+        let tmp = temp_dir_for("node-local-id");
         // No passphrase needed when passing a pre-existing identity.
-        let node = start_node_local(&tmp, Some(test_id), None).await.unwrap();
+        let node = start_node_local(&tmp, instance_in_memory_storage(), Some(test_id), None)
+            .await
+            .unwrap();
 
         assert_eq!(
             node.identity().did(),
@@ -1411,9 +1707,13 @@ mod tests {
         );
         assert_ne!(node.relay().bound_addr().port(), 0);
 
-        // Storage and blob dirs should still be created.
-        assert!(tmp.join("storage").is_dir(), "storage dir should exist");
+        // A blob database still opens under a data directory; a protocol
+        // store does not.
         assert!(tmp.join("blobs.redb").exists(), "blobs.redb should exist");
+        assert!(
+            !tmp.join("storage").exists(),
+            "no protocol store belongs under a data directory"
+        );
         // No identity.key file when using pre-existing identity.
         assert!(
             !tmp.join("identity.key").exists(),
@@ -1430,9 +1730,8 @@ mod tests {
     /// not a generic `Io` error — so the actionable message reaches callers.
     #[tokio::test]
     async fn node_local_without_identity_requires_passphrase() {
-        let tmp =
-            std::env::temp_dir().join(format!("scp-test-node-no-pass-{}", std::process::id()));
-        let result = start_node_local(&tmp, None, None).await;
+        let tmp = temp_dir_for("node-no-pass");
+        let result = start_node_local(&tmp, instance_in_memory_storage(), None, None).await;
 
         let err = result.err().expect("should fail without passphrase");
         assert!(

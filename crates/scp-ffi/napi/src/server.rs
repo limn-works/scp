@@ -5,8 +5,7 @@
 //!
 //! - [`NapiRelayHandle`] — opaque handle to a running relay server.
 //! - [`NapiNodeHandle`] — opaque handle to a running application node (wraps
-//!   both `InMemoryStorage` and `FilesystemStorage` variants via an internal
-//!   enum).
+//!   encrypted-in-memory and `SQLCipher` variants via an internal enum).
 //! - `relay_start_in_memory` / `relay_start_local` — relay startup.
 //! - `node_start_in_memory` / `node_start_local` — node startup.
 //!
@@ -628,7 +627,7 @@ pub(crate) async fn node_start_in_memory_on(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
-    let inner = RunningNode::InMemory(node);
+    let inner = RunningNode::InMemoryEncrypted(node);
     wire_node_webhook_events(bi, &inner).await;
 
     increment_handle_count();
@@ -640,6 +639,10 @@ pub(crate) async fn node_start_in_memory_on(
 }
 
 /// Per-bridge-instance implementation of `node_start_local`.
+///
+/// A node inherits whichever storage backend an instance was constructed with
+/// (`SCP.withStorage({...})`), so it opens no protocol store of its own. A
+/// caller wanting a node on a different backend constructs a second `SCP`.
 pub(crate) async fn node_start_local_on(
     bi: &Arc<NapiBridgeInstance>,
     data_dir: String,
@@ -654,20 +657,31 @@ pub(crate) async fn node_start_local_on(
         None => None,
     };
     let zeroized_passphrase = passphrase.map(Zeroizing::new);
-    let node = server::start_node_local(
-        std::path::Path::new(&data_dir),
-        node_identity,
-        zeroized_passphrase,
-    )
-    .await
+    let data_dir = std::path::Path::new(&data_dir);
+    // `ProtocolRepository::storage()` yields this instance's own chosen
+    // backend; cloning that `Arc` hands a node one store that an event log, a
+    // saga journal, and an `OpenMLS` view already share (spec §17.6).
+    let inner = match crate::runtime::protocol_repository(bi) {
+        crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+            let storage = Arc::clone(repo.storage());
+            server::start_node_local(data_dir, storage, node_identity, zeroized_passphrase)
+                .await
+                .map(RunningNode::InMemoryEncrypted)
+        }
+        crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+            let storage = Arc::clone(repo.storage());
+            server::start_node_local(data_dir, storage, node_identity, zeroized_passphrase)
+                .await
+                .map(RunningNode::Sqlite)
+        }
+    }
     .map_err(server_err)?;
 
-    let did = node.identity().did().to_owned();
-    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
-    let bridge_token = node.bridge_token_hex();
+    let did = inner.did().to_owned();
+    let relay_url = inner.internal_relay_url();
+    let bridge_token = inner.bridge_token_hex();
     auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
-    let inner = RunningNode::Filesystem(node);
     wire_node_webhook_events(bi, &inner).await;
 
     increment_handle_count();
@@ -824,7 +838,7 @@ mod tests {
     #[test]
     fn enable_site_projection_dispatches_through_node_inner() {
         let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
-        let inner = RunningNode::InMemory(node);
+        let inner = RunningNode::InMemoryEncrypted(node);
         let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
             scp_core::crypto::sender_keys::SenderKey::from_bytes([0xAB; 32]),
             0,
@@ -845,7 +859,7 @@ mod tests {
     #[test]
     fn commit_deploy_returns_error_for_unprojected_context() {
         let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
-        let inner = RunningNode::InMemory(node);
+        let inner = RunningNode::InMemoryEncrypted(node);
         let result = rt().block_on(inner.commit_deploy("no-such-ctx", "deploy-1"));
         assert!(
             result.is_err(),
@@ -857,7 +871,7 @@ mod tests {
     #[test]
     fn rollback_deploy_returns_error_for_unprojected_context() {
         let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
-        let inner = RunningNode::InMemory(node);
+        let inner = RunningNode::InMemoryEncrypted(node);
         let result = rt().block_on(inner.rollback_deploy("no-such-ctx", "deploy-1"));
         assert!(
             result.is_err(),
@@ -869,7 +883,7 @@ mod tests {
     #[test]
     fn disable_site_projection_is_noop_for_unprojected_context() {
         let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
-        let inner = RunningNode::InMemory(node);
+        let inner = RunningNode::InMemoryEncrypted(node);
         rt().block_on(inner.disable_broadcast_projection("no-such-ctx"));
         // Should not panic.
         inner.shutdown();

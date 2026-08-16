@@ -89,10 +89,10 @@ scp-relay-client = { path = "../scp-relay-client" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage"] }
-# `filesystem` backs the ADR-052 §AC-9 `EncryptedStorage` seal assertions:
-# `FilesystemStorage` is the plaintext backend that `Node::start`'s
-# `compile_fail,E0277` doctest proves cannot reach the production constructor,
-# and whose `EncryptingAdapter`-wrapped form is the positive control in
+# `filesystem` backs ADR-052 §AC-9 `EncryptedStorage` seal assertions:
+# `FilesystemStorage` is a plaintext backend that `Node::start`'s
+# `compile_fail,E0277` doctest proves cannot reach a production constructor, and
+# whose `EncryptingAdapter`-wrapped form is a positive control in
 # `tests/encrypted_storage_seal.rs`.
 scp-platform = { path = "../scp-platform", features = ["testing", "filesystem"] }
 # The node's tests (config.rs, lib.rs, self_host.rs) and `ApplicationNode::dev`
@@ -108,14 +108,21 @@ tempfile = "3"
 
 [features]
 # Gates `Node::start_for_testing` — accepts any `Storage`
-# backend without the `EncryptedStorage` bound. See issue #695.
+# backend without an `EncryptedStorage` bound. See issue #695. This crate has no
+# `default` feature list, so a shipped `scp-node` binary enables neither this
+# feature nor `testing`, and `scripts/check-shipped-feature-graph.sh` rejects a
+# resolved set that names either.
 allow_unencrypted_storage = ["scp-core/allow_unencrypted_storage"]
 # Test-harness-only. Carries `scp-dht/testing` so `ApplicationNode::dev`,
 # `DhtMode::Memory`, and `build_memory_did_method` (all in-memory-DHT test
-# doubles) compile; implies `allow_unencrypted_storage` because
-# `ApplicationNode::dev` builds through `Node::start_for_testing`. MUST NOT
-# appear in any default/non-testing feature list (ADR-062 §Decision 1); a
-# shipped node build never enables it, so the in-memory DHT nullifier is absent
+# doubles) compile. It implies `allow_unencrypted_storage` for this crate's
+# integration-test crates — `tests/integration.rs`, `tests/quic_listener.rs`, and
+# `tests/quic_cross_transport.rs` each call `Node::start_for_testing`, and an
+# external test crate cannot see a `#[cfg(test)]` half of that gate.
+# `ApplicationNode::dev` no longer needs that implication: it wraps its ephemeral
+# store in `EncryptingAdapter` and builds through a production `Node::start`.
+# MUST NOT appear in any default/non-testing feature list (ADR-062 §Decision 1);
+# a shipped node build never enables it, so an in-memory DHT nullifier is absent
 # from shipped artifacts.
 testing = ["scp-dht/testing", "scp-platform/testing", "allow_unencrypted_storage"]
 quic = ["scp-transport/quic", "dep:quinn"]

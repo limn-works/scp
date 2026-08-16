@@ -29,6 +29,53 @@ members = [
     "crates/scp-ffi/napi-test-stubs",
 ]
 
+# Every member except `crates/scp-testing`, which a bare `cargo build` at this
+# root must not compile.
+#
+# `scp-testing` is a `publish = false` test harness whose `helpers.rs` names
+# `InMemoryDhtClient` and `TestDidDht` at lib level, so its `scp-core`,
+# `scp-identity`, `scp-platform`, `scp-dht`, and `scp-node` edges carry
+# `testing` / `allow_unencrypted_storage` as NORMAL dependencies rather than
+# dev-dependencies. Resolver 2 unifies normal-dependency features across every
+# package one invocation builds, so a workspace-wide `cargo build` compiles
+# `InMemoryKeyCustody`, `InMemoryDhtClient`, `InMemoryPreRotationCustody`, and
+# `ProtocolRepository::new_for_testing` into each FFI bridge cdylib — binaries
+# `.github/workflows/build-matrix.yml` uploads and
+# `.github/workflows/release.yml` Authenticode-signs. Excluding one member here
+# removes that unification path, and
+# `scripts/check-shipped-feature-graph.sh` asserts a default-members build
+# resolves nothing outside its permitted-production allowlist.
+#
+# A test run still covers `scp-testing`: CI passes `--workspace` explicitly,
+# which overrides this list.
+default-members = [
+    "crates/scp-clock",
+    "crates/scp-crypto",
+    "crates/scp-did",
+    "crates/scp-dht",
+    "crates/scp-platform",
+    "crates/scp-identity",
+    "crates/scp-event-log",
+    "crates/scp-protocol",
+    "crates/scp-relay-client",
+    "crates/scp-mls",
+    "crates/scp-client",
+    "crates/scp-client-wasm",
+    "crates/scp-relay-mock",
+    "crates/scp-runtime",
+    "crates/scp-core",
+    "crates/scp-transport",
+    "crates/scp-mcp",
+    "crates/scp-media",
+    "crates/scp-node",
+    "crates/scp-relay",
+    "crates/scp-ffi",
+    "crates/scp-ffi/common",
+    "crates/scp-ffi/uniffi",
+    "crates/scp-ffi/napi",
+    "crates/scp-ffi/napi-test-stubs",
+]
+
 [workspace.package]
 edition = "2024"
 repository = "https://github.com/limn/scp"

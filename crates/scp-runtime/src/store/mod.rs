@@ -182,7 +182,7 @@ impl<S: EncryptedStorage> ProtocolRepository<S> {
     ///
     /// # Structural seal test (ADR-052 §AC-9)
     ///
-    /// The bound is not merely documented — it is asserted mechanically. A
+    /// This bound is not merely documented — it is asserted mechanically. A
     /// plaintext backend (`FilesystemStorage`, key-per-file, no encryption)
     /// **must not compile** against this constructor. `EncryptedStorage` is
     /// sealed in `scp-platform`, so no downstream crate can vote itself in:
@@ -191,17 +191,17 @@ impl<S: EncryptedStorage> ProtocolRepository<S> {
     /// use scp_platform::filesystem::FilesystemStorage;
     /// use scp_runtime::store::ProtocolRepository;
     ///
-    /// // E0277: the trait bound `FilesystemStorage: EncryptedStorage`
+    /// // E0277: a trait bound `FilesystemStorage: EncryptedStorage`
     /// // is not satisfied.
     /// fn unsealed(storage: FilesystemStorage) {
     ///     let _repo = ProtocolRepository::new(storage);
     /// }
     /// ```
     ///
-    /// The **same** call over the same backend wrapped in `EncryptingAdapter`
-    /// does compile. This pairing is what makes the assertion above sound: it
-    /// proves the failure is attributable to the missing `EncryptedStorage`
-    /// impl, not to a typo or an unrelated error that happens to share the
+    /// That **same** call over that same backend wrapped in `EncryptingAdapter`
+    /// does compile. This pairing is what makes an assertion above sound: it
+    /// proves that a failure is attributable to a missing `EncryptedStorage`
+    /// impl, not to a typo or an unrelated error that happens to share this
     /// code:
     ///
     /// ```

@@ -43,6 +43,11 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+// `Clock` brings `SystemClock::now_secs` into scope for one `testing`-gated
+// pre-rotation reveal arm of `py_identity_rotate_key`, this crate's only caller.
+// A shipped build (no `testing`) compiles no user of that trait, so this import
+// carries a matching gate, which keeps such a build warning-free.
+#[cfg(feature = "testing")]
 use scp_clock::Clock;
 use scp_did::DidDocument;
 // Production DHT construction (real fail-closed Pkarr) and the `testing`

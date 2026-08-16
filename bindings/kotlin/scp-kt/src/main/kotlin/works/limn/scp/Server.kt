@@ -36,7 +36,7 @@ interface ServerBindings {
     fun relayStartLocal(dataDir: String): String
 
     /**
-     * Starts a full application node with in-memory storage.
+     * Starts a full application node with encrypted in-memory storage.
      *
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
@@ -44,7 +44,7 @@ interface ServerBindings {
     fun nodeStartInMemory(identityDid: String? = null): String
 
     /**
-     * Starts a full application node with file-backed storage.
+     * Starts a full application node on this instance's own storage backend.
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
@@ -427,14 +427,16 @@ class Node internal constructor(
 
     companion object {
         /**
-         * Starts a full application node with in-memory storage.
+         * Starts a full application node with encrypted in-memory storage.
          *
          * When [identityDid] is provided, the node uses the pre-existing
          * identity instead of generating a fresh one. This enables identity
          * portability -- the same DID persists across node restarts.
          *
-         * Auto-wires in-memory key custody, in-memory storage, in-memory DHT
-         * client, self-signed TLS, and a relay on an OS-assigned port.
+         * Auto-wires encrypted in-memory storage (ephemeral), self-signed TLS,
+         * and a relay on an OS-assigned port. A build carrying a test-harness
+         * feature also auto-wires in-memory key custody and an in-memory DHT
+         * client; a shipped build fails closed instead when `identity` is absent.
          *
          * @param bridge The [ServerBridge] providing FFI access.
          * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.
@@ -446,7 +448,7 @@ class Node internal constructor(
         ): Node = bridge.startNodeInMemory(identityDid)
 
         /**
-         * Starts a full application node with file-backed storage.
+         * Starts a full application node on this instance's own storage backend.
          *
          * When [identityDid] is provided, the node uses the pre-existing
          * identity. When `null`, the node creates or reloads a persistent
@@ -517,7 +519,7 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Starts a full application node with in-memory storage.
+     * Starts a full application node with encrypted in-memory storage.
      *
      * When [identityDid] is provided, the node uses the pre-existing
      * identity instead of generating a fresh one.
@@ -539,7 +541,7 @@ class ServerBridge internal constructor(
         }
 
     /**
-     * Starts a full application node with file-backed storage.
+     * Starts a full application node on this instance's own storage backend.
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity, or null to generate a fresh one.

@@ -19,23 +19,23 @@
 //!    `EncryptedStorage: Storage` supertrait is ever severed. Unlike a comment
 //!    or a doc-note, a compile failure is machine-verified on every CI run.
 //!
-//! 3. **Positive controls for the ADR-052 §AC-9 compile-fail assertions.** The
+//! 3. **Positive controls for ADR-052 §AC-9 compile-fail assertions.** A
 //!    negative half of §AC-9 — that a plaintext `FilesystemStorage` cannot
 //!    reach `Node::start` or `ProtocolRepository::new` — is asserted by
 //!    `compile_fail,E0277` doctests on those two constructors
 //!    (`crates/scp-node/src/config.rs`,
-//!    `crates/scp-runtime/src/store/mod.rs`), because rustdoc is the
+//!    `crates/scp-runtime/src/store/mod.rs`), because rustdoc is a
 //!    toolchain's built-in compile-fail harness and needs no new dependency or
 //!    committed `.stderr` fixture to drift.
 //!
 //!    A bare `compile_fail` is only as strong as its control: it passes for
-//!    *any* compile error, including a typo. The functions below are that
-//!    control. They call the **same** constructors over the **same** backend
-//!    wrapped in `EncryptingAdapter` and must compile, which pins the doctest
-//!    failures to the missing `EncryptedStorage` impl rather than to an
-//!    unrelated breakage. They live here rather than only in doctests so every
-//!    `cargo test` / `cargo nextest` / `cargo clippy --all-targets` lane
-//!    type-checks them, not just CI's doctest job.
+//!    *any* compile error, including a typo. Functions below are that control.
+//!    They call **same** constructors over a **same** backend wrapped in
+//!    `EncryptingAdapter` and must compile, which pins each doctest failure to
+//!    a missing `EncryptedStorage` impl rather than to an unrelated breakage.
+//!    They live here rather than only in doctests so every `cargo test` /
+//!    `cargo nextest` / `cargo clippy --all-targets` lane type-checks them, not
+//!    just CI's doctest job.
 
 use scp_core::store::ProtocolRepository;
 use scp_identity::DidMethod;
@@ -64,18 +64,18 @@ fn _assert_encrypted_storage_extends_storage<S: EncryptedStorage>() {
 // ---------------------------------------------------------------------------
 // ADR-052 §AC-9 positive controls
 //
-// Each function is the exact counterpart of a `compile_fail,E0277` doctest,
-// differing ONLY in that the plaintext backend is wrapped in
-// `EncryptingAdapter`. If one of these ever stops compiling, the paired
-// doctest's "failure" has stopped being attributable to the seal and the
-// §AC-9 guarantee is no longer proven.
+// Each function is an exact counterpart of one `compile_fail,E0277` doctest,
+// differing ONLY in that a plaintext backend is wrapped in `EncryptingAdapter`.
+// If one of these ever stops compiling, its paired doctest's "failure" has
+// stopped being attributable to a storage seal, and §AC-9's guarantee is no
+// longer proven.
 // ---------------------------------------------------------------------------
 
-/// Counterpart of the `Node::start` compile-fail doctest.
+/// Counterpart of a `Node::start` compile-fail doctest.
 ///
-/// `EncryptingAdapter<FilesystemStorage>` satisfies the sealed
-/// `EncryptedStorage` bound, so the production constructor accepts it. The
-/// doctest asserts the bare `FilesystemStorage` form does not compile.
+/// `EncryptingAdapter<FilesystemStorage>` satisfies a sealed `EncryptedStorage`
+/// bound, so a production constructor accepts it. That doctest asserts a bare
+/// `FilesystemStorage` form does not compile.
 #[allow(dead_code)]
 fn _assert_encrypted_filesystem_reaches_production_node_start<K, D>(
     config: NodeConfig<K, D, EncryptingAdapter<FilesystemStorage>>,
@@ -86,10 +86,10 @@ fn _assert_encrypted_filesystem_reaches_production_node_start<K, D>(
     let _fut = Node::start(config);
 }
 
-/// Counterpart of the `ProtocolRepository::new` compile-fail doctest.
+/// Counterpart of a `ProtocolRepository::new` compile-fail doctest.
 ///
-/// Same backend, same constructor — only the `EncryptingAdapter` wrap differs
-/// from the form the doctest proves cannot compile.
+/// Same backend, same constructor — only an `EncryptingAdapter` wrap differs
+/// from a form that doctest proves cannot compile.
 #[allow(dead_code)]
 fn _assert_encrypted_filesystem_reaches_production_repository_new(
     storage: EncryptingAdapter<FilesystemStorage>,

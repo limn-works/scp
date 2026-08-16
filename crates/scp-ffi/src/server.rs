@@ -6,8 +6,7 @@
 //!
 //! - [`PyRelayHandle`] -- opaque handle to a running relay server.
 //! - [`PyNodeHandle`] -- opaque handle to a running application node (wraps
-//!   both `InMemoryStorage` and `FilesystemStorage` variants via an internal
-//!   enum).
+//!   encrypted-in-memory and `SQLCipher` variants via an internal enum).
 //! - `PyScp::relay_start_in_memory` / `PyScp::relay_start_local` -- relay
 //!   startup.
 //! - `PyScp::node_start_in_memory` / `PyScp::node_start_local` -- node
@@ -653,11 +652,16 @@ impl crate::scp::PyScp {
         })
     }
 
-    /// Starts a full application node with in-memory storage.
+    /// Starts a full application node with encrypted in-memory storage.
     ///
-    /// When ``identity_did`` is ``None`` (the default), auto-wires in-memory key
-    /// custody, in-memory storage, in-memory DHT client, self-signed TLS, and a
-    /// relay on an OS-assigned port with a fresh DID.
+    /// Storage is an ephemeral ``InMemoryStorage`` under an ``EncryptingAdapter``
+    /// keyed by a fresh `OsRng` AES-256-GCM key, so a node is built through a
+    /// production ``Node::start`` constructor and its ``EncryptedStorage`` bound.
+    ///
+    /// When ``identity_did`` is ``None`` (a default), a build carrying a
+    /// test-harness feature auto-wires in-memory key custody, an in-memory DHT
+    /// client, self-signed TLS, and a relay on an OS-assigned port with a fresh
+    /// DID; a shipped build fails closed instead.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
     /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
@@ -695,7 +699,7 @@ impl crate::scp::PyScp {
         let bridge_token = node.bridge_token_hex();
         auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
 
-        let inner = RunningNode::InMemory(node);
+        let inner = RunningNode::InMemoryEncrypted(node);
         wire_node_webhook_events(bi, py, rt, &inner);
 
         let instance_id = bi.core.instance_id();
@@ -706,18 +710,26 @@ impl crate::scp::PyScp {
         })
     }
 
-    /// Starts a full application node with file-backed storage.
+    /// Starts a full application node on this instance's own storage backend.
     ///
-    /// Opens (or creates) persistent storage at ``<data_dir>/storage/`` and a redb
-    /// blob database at ``<data_dir>/blobs.redb``.
+    /// A node inherits whichever storage handle this ``SCP`` instance was
+    /// constructed with (``SCP.with_storage({...})``) — encrypted in-memory or
+    /// `SQLCipher` — so its context snapshots, Merkle event log, saga journal,
+    /// and `OpenMLS` store land in one backend this instance already owns. A
+    /// caller wanting a node on a different backend constructs a second ``SCP``
+    /// instance; no per-node storage argument exists.
     ///
-    /// When ``identity_did`` is ``None`` (the default), the node creates or
-    /// reloads a persistent identity from ``<data_dir>/identity.key``. The
-    /// ``passphrase`` parameter is required in this mode.
+    /// ``data_dir`` holds a redb blob database at ``<data_dir>/blobs.redb`` and,
+    /// under auto-identity mode, a key file at ``<data_dir>/identity.key``.
+    /// No protocol store is created there.
     ///
-    /// When ``identity_did`` is provided, the node uses the pre-existing identity
-    /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
-    /// No passphrase is required in this mode.
+    /// When ``identity_did`` is ``None`` (a default), a node creates or reloads
+    /// a persistent identity from ``<data_dir>/identity.key``, and a
+    /// ``passphrase`` argument is required in that mode.
+    ///
+    /// When ``identity_did`` is provided, a node uses that pre-existing identity
+    /// from a `PyO3` identity registry (populated by ``PyScp::identity_create``),
+    /// and no passphrase is required.
     #[pyo3(name = "node_start_local", signature = (data_dir, identity_did=None, passphrase=None))]
     pub fn node_start_local(
         &self,
@@ -736,24 +748,42 @@ impl crate::scp::PyScp {
             None => None,
         };
         let zeroized_passphrase = passphrase.map(Zeroizing::new);
-        let node = py.allow_threads(|| {
-            rt.block_on(server::start_node_local(
-                std::path::Path::new(&data_dir),
-                node_identity,
-                zeroized_passphrase,
-            ))
+        // Clone this instance's chosen backend out (a cheap `Arc` clone) before
+        // crossing into `allow_threads`. `get_storage` fails closed when an
+        // instance was built without a storage selection, rather than letting a
+        // node open a store of its own (SCP-CAPSEL-8000, spec §17.6).
+        let storage = crate::runtime::get_storage(bi)?.clone();
+        let inner = py.allow_threads(|| {
+            let data_dir = std::path::Path::new(&data_dir);
+            match storage {
+                crate::runtime::StorageProvider::InMemoryEncrypted(s) => rt
+                    .block_on(server::start_node_local(
+                        data_dir,
+                        s,
+                        node_identity,
+                        zeroized_passphrase,
+                    ))
+                    .map(RunningNode::InMemoryEncrypted),
+                crate::runtime::StorageProvider::Sqlite(s) => rt
+                    .block_on(server::start_node_local(
+                        data_dir,
+                        s,
+                        node_identity,
+                        zeroized_passphrase,
+                    ))
+                    .map(RunningNode::Sqlite),
+            }
             .map_err(server_err)
         })?;
 
         // Auto-wire the ContextManager with relay transport so that
         // context operations work immediately after node startup.
         // Use the internal loopback URL — see comment in `node_start_in_memory`.
-        let did = node.identity().did().to_owned();
-        let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
-        let bridge_token = node.bridge_token_hex();
+        let did = inner.did().to_owned();
+        let relay_url = inner.internal_relay_url();
+        let bridge_token = inner.bridge_token_hex();
         auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
 
-        let inner = RunningNode::Filesystem(node);
         wire_node_webhook_events(bi, py, rt, &inner);
 
         let instance_id = bi.core.instance_id();
@@ -868,21 +898,40 @@ mod tests {
         });
     }
 
+    /// `node_start_local` drives a node onto whichever backend an `SCP`
+    /// instance already holds, so this test selects in-memory storage through
+    /// `PyScp::with_storage`, then asserts a node starts on that same handle.
     #[test]
-    fn node_local_starts_and_returns_did() {
+    fn node_local_starts_on_the_instance_storage_handle() {
+        crate::init_runtime().ok();
+        pyo3::prepare_freethreaded_python();
         let tmp = std::env::temp_dir().join(format!("scp-pyo3-node-test-{}", std::process::id()));
-        let passphrase = Zeroizing::new("test-passphrase".to_owned());
-        let node = rt()
-            .block_on(server::start_node_local(&tmp, None, Some(passphrase)))
-            .unwrap();
-        let url = node.relay_url();
-        assert!(
-            url.starts_with("ws://") || url.starts_with("wss://"),
-            "expected ws(s):// URL, got: {url}"
-        );
-        assert!(node.identity().did().starts_with("did:"));
-        assert_ne!(node.relay().bound_addr().port(), 0);
-        node.shutdown();
+        Python::with_gil(|py| {
+            let config = pyo3::types::PyDict::new(py);
+            config
+                .set_item("type", "in_memory")
+                .expect("set storage type");
+            let scp = crate::scp::PyScp::with_storage(py, &config)
+                .expect("in-memory storage config must construct");
+            let handle = scp
+                .node_start_local(
+                    py,
+                    tmp.display().to_string(),
+                    None,
+                    Some("test-passphrase".to_owned()),
+                )
+                .expect("node startup must succeed on an instance storage handle");
+            assert!(
+                handle.relay_url().starts_with("ws://") || handle.relay_url().starts_with("wss://")
+            );
+            assert!(handle.did().starts_with("did:"));
+            assert!(handle.relay_port() > 0);
+            assert!(
+                !tmp.join("storage").exists(),
+                "node_start_local must open no protocol store under a data directory"
+            );
+            handle.shutdown();
+        });
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -958,7 +1007,7 @@ mod tests {
     fn node_inner_lifecycle_dispatch() {
         // Test the RunningNode dispatch methods (which are the FFI layer).
         let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
-        let inner = RunningNode::InMemory(node);
+        let inner = RunningNode::InMemoryEncrypted(node);
 
         // enable_site_projection via RunningNode
         let key = scp_core::crypto::sender_keys::BroadcastKey::from_parts(
@@ -995,7 +1044,7 @@ mod tests {
     #[test]
     fn serve_background_dispatches_through_node_inner() {
         let node = rt().block_on(server::start_node_in_memory(None)).unwrap();
-        let inner = RunningNode::InMemory(node);
+        let inner = RunningNode::InMemoryEncrypted(node);
 
         // serve_background with port 0 (OS-assigned)
         let addr = rt()

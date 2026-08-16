@@ -1492,8 +1492,10 @@ impl<S: Storage> ApplicationNode<S> {
 #[cfg(any(test, feature = "testing"))]
 impl
     ApplicationNode<
-        scp_platform::encrypting_adapter::EncryptingAdapter<
-            scp_platform::in_memory::InMemoryStorage,
+        Arc<
+            scp_platform::encrypting_adapter::EncryptingAdapter<
+                scp_platform::in_memory::InMemoryStorage,
+            >,
         >,
     >
 {
@@ -1503,9 +1505,11 @@ impl
     /// - [`InMemoryKeyCustody`](scp_platform::testing::InMemoryKeyCustody)
     /// - [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage) wrapped in
     ///   [`EncryptingAdapter`](scp_platform::encrypting_adapter::EncryptingAdapter)
-    ///   under a fresh `OsRng` AES-256-GCM key, so this constructor satisfies the
+    ///   under a fresh `OsRng` AES-256-GCM key, so this constructor satisfies a
     ///   production [`Node::start`](crate::Node::start) `EncryptedStorage` bound
-    ///   (spec §17.5 canonical usage pattern)
+    ///   (spec §17.5 canonical usage pattern). An `Arc` around that adapter
+    ///   matches a handle shape a bridge instance holds, so an FFI caller places
+    ///   a `dev` node and a caller-supplied-storage node in one enum variant.
     /// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT network)
     /// - [`SelfSignedTlsProvider`] (self-signed TLS certificate for `localhost`)
     /// - Relay bound to `127.0.0.1:<port>`
@@ -1557,9 +1561,9 @@ impl
         // is a publishing reach, so M2 requires `DhtMode::Production`
         // (advisory in P1 — the in-memory DHT client publishes nothing).
         //
-        // Storage goes through the production `Node::start` front door: the
+        // Storage goes through a production `Node::start` front door: an
         // ephemeral `InMemoryStorage` is wrapped in `EncryptingAdapter` under a
-        // fresh `OsRng` AES-256-GCM key, which satisfies the sealed
+        // fresh `OsRng` AES-256-GCM key, which satisfies a sealed
         // `EncryptedStorage` bound (spec §17.5). `dev` is a *DHT/custody*
         // test-harness affordance, not a storage-encryption one — it has no
         // reason to reach for `start_for_testing`.
@@ -1576,7 +1580,7 @@ impl
                     custody,
                     did_method,
                 },
-                EncryptingAdapter::new(InMemoryStorage::new(), storage_key),
+                Arc::new(EncryptingAdapter::new(InMemoryStorage::new(), storage_key)),
                 // Durability-only blob arm, selected explicitly — `dev()` is a
                 // documented dev/prototyping affordance (SCP-CAPINJECT-010).
                 BlobStorageBackend::in_memory(),
