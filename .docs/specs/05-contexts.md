@@ -250,6 +250,20 @@ where:
 
 The `V2` suffix, the `kind_byte` inclusion, the mandatory length prefixes on every variable-length field, and the explicit `description_hash` + `catalog_hash` terms together constitute the break from the pre-rename `SCP-TOOL-REGISTRATION-V1` domain; pre-migration signatures are not honored. The length-prefix requirement closes the "split-shift" preimage-collision class that the unprefixed pre-rename concatenation admitted (where a suffix of `outlet_id` could be reinterpreted as a prefix of `name`).
 
+**Signing key.** An outlet registration is signed by its operator's **Active Signing Key (`#active`)**, resolved from a DID document `operator_did` names. An Agent Signing Key (`#agent`) MUST NOT sign an outlet registration, and an Identity Key (`#0`) MUST NOT sign one either — §3.9.1 restricts `#0` to DID document updates and pre-rotation commitments.
+
+Three grounds fix `#active` here, and each ground restates a claim this corpus already carries:
+
+1. §5.7.2 rules `#active` for context metadata, because metadata publication is governance-adjacent and requires human-accountable authorization. Publishing an outlet registration commits an operator to accountability for every invocation a registered outlet admits (§5.4, `operator_did`), so registration carries at least as much governance weight as metadata publication carries.
+2. §5.7.2 already binds a context's metadata to `#active`. Signing a registration under a different verification method would put two keys on one governance-adjacent publication surface, and a verifier would then need two procedures where §5.7.2 defines one.
+3. §3.9.1 forbids `#0` from signing content at all, so `#0` was never available for a registration.
+
+**Signer verification.** A party verifying an outlet registration: (1) resolves `operator_did` via DID resolution (§3), (2) extracts an `#active` verification method from a resolved DID document, (3) verifies an Ed25519 signature over a V2 canonical digest defined above, (4) rejects a registration whose signature verifies under `#agent` or under `#0` instead of under `#active`. Steps 1 through 3 mirror §5.7.2 signer verification for metadata; step 4 states, for a registration, a key-role restriction §5.7.2 states for metadata.
+
+**Scope.** Signing-key and signer-verification rules above govern a registration signature only. A per-chunk operator signature at invocation time (`SCP-OUTLET-CHUNK-SIG-V1`, §5.4.5) is a runtime signature verified against an opaque `operator_pk` a receiver pins at stream open, and §5.4.5 names no verification method for it. Three native FFI bridges sign a chunk with an identity's Active Signing Key today, and `.docs/standards/sdk-capability-matrix.json` records that behaviour, but no spec clause rules it — §5.4.5 carries an open gap, and §5.4.1 does not close it.
+
+> **Provenance note.** §5.4.1 shipped without naming a signing key, and an implementing agent then picked one. Signing-key text above records no new decision: it applies §3.9.1 and §5.7.2 to registrations. No human ruled on it. Grounds 1 through 3 above argue from artifacts this corpus already carries, so a reader who doubts a conclusion should read §5.7.2 (its "Signing key" paragraph) and §3.9.1 rather than take §5.4.1 as authority in its own right.
+
 ### 5.4.2 Outlet Classification (Query vs Action)
 
 Outlets declare their semantic class at registration time. Classification is structural, not advisory — the runtime enforces it. It is the basis of the capability split (§5.3.1): a Query outlet is invoked under the `outlet:query` / `outlet_query` capability family; an Action outlet under `outlet:call` / `outlet_call`.

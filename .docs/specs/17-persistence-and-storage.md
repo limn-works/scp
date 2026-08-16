@@ -557,6 +557,31 @@ Storage selection remains explicit and fails closed (see below): a browser clien
 
 A **custodial remote thin client** — the node holding the protocol engine, MLS group state, custody, event log, and persistent storage, with the browser issuing operations over RPC/WebSocket — remains a valid *opt-in* secondary mode for users who explicitly choose convenience over self-sovereignty (ADR-057 Alternatives). It is not the default and not what "browser client" means.
 
+### A Node Inherits Storage; It Never Re-Selects Storage
+
+Pluggable storage backends stay exposed on a developer-facing API: a developer picks a first-party adapter from a table at §17.6's head, or supplies a custom adapter through §17.11. A node repeats none of that. Storage is selected once, at `SCP`-instance construction, and a node receives an already-opened handle from an `SCP` instance. A deployment that wants a node on different storage runs a second `SCP` instance. (Ruled by Alec Marcus, 2026-08-14.)
+
+Two mechanisms make re-selection unsound:
+
+- **A durable open takes a non-blocking exclusive lock.** `SqliteStorage::new(dir, key)` (`crates/scp-platform/src/sqlite/mod.rs`) calls `try_lock_exclusive` on `{dir}/scp.db.lock` before opening `{dir}/scp.db`, and holds that lock for a returned value's lifetime. A node opening its own store on a directory an `SCP` instance already opened therefore fails at construction — a loud failure, but a failure a caller has no way to satisfy while both components want one directory.
+- **Two handles mean two divergent stores.** Protocol state, a Merkle event log (§7.3.1), a saga journal (§17.16), per-context snapshots (§17.15), and OpenMLS provider state (§17.9) all live behind one `Storage` handle under one key convention (§17.3). Two handles opened on separate directories both succeed, then diverge silently: two event logs, two saga journals, two MLS stores, and no reconciliation path between them.
+
+**Reconciliation with ADR-052 §AC-3.** ADR-052 §AC-3 requires `NodeConfig` to carry a required storage slot and forbids a whole-struct `Default`. Inheritance satisfies §AC-3 rather than overriding it: selection stays mandatory, explicit, and never defaulted (§17.6 rules above), and `NodeConfig` still carries a storage slot as a required non-`Option` field. Inheritance settles which value fills a slot — an already-opened handle an `SCP` instance owns, expressed in Rust core as `StorageSlot::Custom(handle)` (`.docs/standards/construction.md` §Storage vocabulary) — instead of a fresh descriptor a node opens for itself.
+
+**Storage inheritance is not blob-backend sharing.** ADR-053 rejected handing a co-located participant a node's blob backend as a shared `Arc`, so that a bundled binary exercises a real publish → relay → `commit_deploy` path over a loopback relay. A `Storage` handle is a different object with a different reason: it holds protocol state a participant and a node must not fork, and sharing it introduces no shortcut around a relay path.
+
+### Blob Storage Selection Belongs to a Node
+
+`NodeConfig.blob_storage` (`crates/scp-node/src/config.rs`) is a required, non-`Option` field of type `BlobStorageBackend`, and it stays one. Blob selection does not move onto an `SCP` instance: a relay needs blob storage, and a relay is not an `SCP` instance. (Ruled by Alec Marcus, 2026-08-14.)
+
+A relay blob backend is selected through a key in a node's configuration file, with an environment-variable override, on one configuration path shared with every other node setting. A bespoke `SCP_RELAY_STORAGE_BACKEND` variable is not a supported selection mechanism. (Approved by Alec Marcus, 2026-08-14.)
+
+### Node Configuration Layers a File Under Environment Overrides
+
+One `serde`-derived typed configuration struct serves two entry points: an SDK caller constructing it programmatically, and a `scp-node` binary loading TOML. Environment variables override values a TOML file supplies, so an operator changes a setting without editing a file.
+
+**A wrinkle "one struct" has to accommodate.** `BlobStorageBackend` (`crates/scp-transport/src/native/storage.rs`) is an enum over *opened* stores — its variants carry constructed values such as `SqliteBlobStore`, `RedbBlobStore`, and `S3BlobStore` — so it describes a store already open rather than a store to open, and it does not deserialize. "One typed configuration struct" therefore means a pair in practice: a deserializable descriptor that TOML and environment variables populate, plus a constructed `NodeConfig` carrying opened handles, produced from a descriptor by one construction step. Both entry points share one descriptor type and one construction step; an SDK caller holding handles already may construct `NodeConfig` directly and skip a descriptor.
+
 ### PostgreSQL Is NOT First-Party for Client Storage
 
 The client SDK does not need Postgres — SQLite covers all native platforms including server-side agents. Server-side deployments wanting Postgres can implement the 6-method trait trivially. PostgreSQL IS first-party for `BlobStore` (relay storage) — see section 17.7.

@@ -771,6 +771,21 @@ A DID whose method admits **no** canonical string form (no deterministic single 
 
 Identity keys follow a defined lifecycle: generation (in hardware security modules where available), distribution (via DID document publication), rotation (DID document update with authorization chain from old key), and destruction (for ephemeral context keys). The full key lifecycle specification, including compromise recovery, is in §9.7.4.
 
+### 3.9.1 Which Key Signs What
+
+A DID string encodes an Identity Key; a DID document carries signing keys. Conflating a DID string with a DID document breaks rotation, so §3.9.1 states one rule a reader applies to any signed SCP object.
+
+**Rule.** An Identity Key (`#0`) signs DID document updates and pre-rotation commitments, and signs nothing else (§9.7.4, key generation). Every signature over protocol content is produced by an Active Signing Key (`#active`) or an Agent Signing Key (`#agent`), and a verifier obtains such a key by resolving a signer's DID document (§3.10.4) and reading a named verification method out of a resolved document.
+
+**Why a DID string is not a source of signing keys.** A did:dht DID string is a z-base-32 encoding of one Ed25519 public key (§9.6.1), namely `#0`. Both `#active` and `#agent` rotate through a DID document update signed by `#0`, and neither rotation changes a DID string (§9.7.4, key rotation; §3.2.1 item 1). Code that recovers a verifying key by decoding a DID string therefore recovers `#0`, never a rotated key, and two failures follow:
+
+- A verifier built on a decoded DID string rejects every signature an honest signer produces under `#active` or under `#agent`, because `#0` produced none of them.
+- An implementation that *also* signs with a key it pairs with a DID string keeps producing and accepting signatures under `#0` after an operator rotates `#active`. Rotation and revocation then stop working: §9.12 compromise recovery removes a compromised key from a DID document, and a verifier that never reads a DID document never observes a removal.
+
+**Drafting consequence.** A specification clause defining a signed wire object names which verification method signs it, and a verification procedure for a signed wire object resolves a DID document rather than decoding a DID string. §3.5.2 (identity attestations), §3.11.3 (`signing_key_id` on a DID-authentication response), §5.7.2 (context metadata), §5.4.1 (outlet registrations), and §23.13 (event verification during reconciliation, which resolves a public key from an actor's DID document using `actor_did` and `signing_key_id`) each carry such a clause.
+
+> **Provenance note.** §3.9.1 records no new decision. It restates, as one applicable rule, what §9.7.4 (key generation, key rotation), §9.6.1 (did:dht self-certification), §3.2.1 (custody migration), and §3.11.6 (security properties, whose agent-versus-human paragraph binds `signing_key_id` to a key role) already establish piecewise. No human ruled on §3.9.1. It exists because §5.4.1 shipped without naming a signing key, an implementing agent then picked one, and a rule stated in one place would have settled a question §5.4.1 left open.
+
 ## 3.10 DID Resolution Layers
 
 DID resolution is the trust root for identity verification (§3.8). The current architecture resolves identities exclusively via Mainline DHT — BEP44 signed mutable items stored on BitTorrent's distributed hash table, a network of millions of nodes with over 20 years of operational history. This works, and it works well. But it routes all identity resolution through infrastructure SCP does not control, cannot improve, and cannot guarantee will continue to operate on terms compatible with the protocol's needs.
