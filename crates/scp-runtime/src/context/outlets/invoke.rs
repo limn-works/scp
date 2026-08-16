@@ -5706,6 +5706,21 @@ mod tests {
     use scp_protocol::context::outlets::registry::{
         OutletRegistration, OutletSchema, register_outlet,
     };
+
+    /// The Ed25519 key every fixture outlet's operator DID encodes.
+    fn test_operator_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32])
+    }
+
+    /// Points `registration.operator_did` at the fixture operator and writes
+    /// the matching §5.4.1 signature, so `register_outlet` verifies it against
+    /// the key that DID encodes instead of rejecting an unsigned registration.
+    fn sign_as_test_operator(registration: &mut OutletRegistration) {
+        let key = test_operator_key();
+        registration.operator_did =
+            scp_did::did_dht_from_public_key(&key.verifying_key().to_bytes());
+        scp_protocol::context::outlets::sign_outlet_registration(registration, &key);
+    }
     use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 
     /// Creates a test capability ceiling with all capabilities.
@@ -5790,6 +5805,8 @@ mod tests {
             registered_at: 0,
             signature: Vec::new(),
         };
+        let mut registration = registration;
+        sign_as_test_operator(&mut registration);
         register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
         registry
     }
@@ -5831,6 +5848,8 @@ mod tests {
             registered_at: 0,
             signature: Vec::new(),
         };
+        let mut registration = registration;
+        sign_as_test_operator(&mut registration);
         register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
         // The registered kind must round-trip through the registry — this is
         // what the invoke gate and the UCAN stem selection read back.

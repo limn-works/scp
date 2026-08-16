@@ -252,15 +252,7 @@ pub struct UniffiBridgeInstance {
     ///
     /// Cleared on shutdown — dropping the `Arc<UniffiKeyCustody>` values
     /// zeroizes any underlying key material via the custody provider's `Drop`.
-    pub(crate) identity_custody_registry: Arc<
-        DashMap<
-            String,
-            (
-                Arc<crate::bridge::UniffiKeyCustody>,
-                scp_platform::KeyHandle,
-            ),
-        >,
-    >,
+    pub(crate) identity_custody_registry: Arc<DashMap<String, crate::bridge::IdentityCustodyEntry>>,
 
     /// Protocol repository used for trust aggregation + event log persistence.
     ///
@@ -663,15 +655,7 @@ impl UniffiBridgeInstance {
     #[allow(dead_code)]
     pub(crate) const fn identity_custody_registry(
         &self,
-    ) -> &Arc<
-        DashMap<
-            String,
-            (
-                Arc<crate::bridge::UniffiKeyCustody>,
-                scp_platform::KeyHandle,
-            ),
-        >,
-    > {
+    ) -> &Arc<DashMap<String, crate::bridge::IdentityCustodyEntry>> {
         &self.identity_custody_registry
     }
 

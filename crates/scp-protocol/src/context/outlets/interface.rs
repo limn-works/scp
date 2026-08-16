@@ -2017,7 +2017,7 @@ mod tests {
         registrant_did: &str,
     ) -> OutletRegistry {
         let mut registry = OutletRegistry::new();
-        let registration = OutletRegistration {
+        let mut registration = OutletRegistration {
             outlet_id: "calculator".to_owned(),
             kind: crate::context::outlets::OutletKind::Action,
             name: "Calculator".to_owned(),
@@ -2040,12 +2040,13 @@ mod tests {
             },
             implementation_hash: [0xAA; 32],
             test_vectors: vec![],
-            operator_did: "did:dht:z6MkOperator".into(),
+            operator_did: crate::context::outlets::test_operator::did(),
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
             message_catalog: Vec::new(),
         };
+        crate::context::outlets::test_operator::sign(&mut registration);
         register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
         registry
     }

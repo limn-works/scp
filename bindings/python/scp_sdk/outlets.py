@@ -226,6 +226,27 @@ class OutletDefinition:
     #: Optional per-invocation cost metadata (spec section 5.4.1).
     cost: OutletCost | None = None
 
+    #: The operator's 64-byte Ed25519 signature over the section 5.4.1 V2
+    #: canonical registration digest.
+    #:
+    #: Supply this when registering an outlet operated by someone else, whose
+    #: key this SDK instance does not hold. Leave it ``None`` when ``operator``
+    #: names an identity created on this instance: the bridge then signs the
+    #: registration with that identity's own key. Registration fails when the
+    #: SDK can neither sign nor read a supplied signature, because
+    #: ``register_outlet`` verifies the signature against the key
+    #: ``operator_did`` encodes.
+    operator_signature: bytes | None = None
+
+    #: Registration timestamp, in seconds since the Unix epoch.
+    #:
+    #: An operator signing out of band chooses this value and hands it to the
+    #: registrant alongside :attr:`operator_signature`, because the section
+    #: 5.4.1 preimage commits ``registered_at``; a bridge-chosen clock reading
+    #: would produce a digest the operator never signed. Leave it ``None`` to
+    #: let the bridge stamp the current second.
+    registered_at: int | None = None
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to the registration dict the PyO3 bridge expects.
 
@@ -246,6 +267,11 @@ class OutletDefinition:
           only when set).
         - ``cost`` — ``{amount, currency, payee, cost_formula}`` (present only
           when set).
+        - ``operator_signature`` — the operator's 64 signature bytes (present
+          only when set; absent means the bridge signs with the operator's own
+          key from its key custody).
+        - ``registered_at`` — seconds since the Unix epoch (present only when
+          set; absent means the bridge stamps the current second).
         """
         operator = self.operator
         # ``operator`` is an Identity (has ``.did``), a plain DID string, or None.
@@ -278,6 +304,10 @@ class OutletDefinition:
                 "payee": self.cost.payee,
                 "cost_formula": self.cost.cost_formula,
             }
+        if self.operator_signature is not None:
+            result["operator_signature"] = self.operator_signature
+        if self.registered_at is not None:
+            result["registered_at"] = self.registered_at
         return result
 
 

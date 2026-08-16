@@ -316,6 +316,11 @@ pub fn register_outlet(
     // 4. Validate operator DID is resolvable (basic format check).
     validate_did(&registration.operator_did)?;
 
+    // 4b. Verify the §5.4.1 operator signature against the key the
+    //     `operator_did` itself carries. Without this call a registrant names
+    //     any operator it likes and the registry records that claim as fact.
+    verify_outlet_registration_provenance(&registration)?;
+
     // 5. Check for duplicate outlet ID.
     if registry.contains(&registration.outlet_id) {
         return Err(OutletError::OutletAlreadyRegistered {
@@ -417,6 +422,12 @@ pub fn update_outlet(
 
     // 5. Validate operator DID.
     validate_did(&new_registration.operator_did)?;
+
+    // 5b. Verify the §5.4.1 operator signature on the replacement registration.
+    //     An update writes a new registration body, so it carries its own
+    //     signature; skipping the check here would let an admin rewrite the
+    //     operator_did of an outlet the named operator never signed for.
+    verify_outlet_registration_provenance(&new_registration)?;
 
     // Build event payload recording changes.
     let mut changed_fields = Vec::new();
@@ -551,23 +562,31 @@ pub fn compute_outlet_registration_canonical_bytes(registration: &OutletRegistra
 
 /// Verifies the Ed25519 signature on a outlet registration.
 ///
-/// If the `signature` field is empty (backward compatibility with pre-signature
-/// registrations), verification is skipped. If non-empty, it MUST be a valid
-/// 64-byte Ed25519 signature over the canonical registration bytes, verifiable
-/// against the provided `registrant_public_key`.
+/// §5.4.1 makes `signature` a required field: the operator signs the V2
+/// canonical digest, and §5.4.1 states that pre-migration signatures are not
+/// honored. An empty `signature` therefore fails verification — it is not a
+/// legacy sentinel that skips the check. The signature MUST be exactly 64
+/// bytes and MUST verify against `registrant_public_key` over the canonical
+/// registration bytes.
 ///
 /// # Errors
 ///
 /// Returns [`OutletError::SignatureVerificationFailed`] if:
+/// - The signature is empty.
 /// - The signature is non-empty but not 64 bytes.
 /// - The signature does not verify against the public key.
 pub fn verify_outlet_registration_signature(
     registration: &OutletRegistration,
     registrant_public_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<(), OutletError> {
-    // Empty signature = backward-compatible registration without provenance.
     if registration.signature.is_empty() {
-        return Ok(());
+        return Err(OutletError::SignatureVerificationFailed {
+            reason: format!(
+                "registration {:?} carries no operator signature; §5.4.1 requires \
+                 a 64-byte Ed25519 signature by {:?} over the V2 canonical digest",
+                registration.outlet_id, registration.operator_did.0
+            ),
+        });
     }
 
     let sig_bytes: [u8; 64] = registration.signature.as_slice().try_into().map_err(|_| {
@@ -587,6 +606,65 @@ pub fn verify_outlet_registration_signature(
         .map_err(|e| OutletError::SignatureVerificationFailed {
             reason: format!("Ed25519 verification failed: {e}"),
         })
+}
+
+/// Signs `registration` in place with the operator's Ed25519 signing key,
+/// writing the §5.4.1 V2 signature into `registration.signature`.
+///
+/// The inverse of [`verify_outlet_registration_signature`]. Both functions read
+/// the preimage from [`compute_outlet_registration_canonical_bytes`], so a
+/// signature this function writes verifies against the key whose DID the
+/// registration names, provided `signing_key` is the key `operator_did`
+/// encodes.
+///
+/// A caller that holds the operator key out of process — an FFI bridge whose
+/// key custody signs on request, for example — calls
+/// [`compute_outlet_registration_canonical_bytes`], hands those bytes to
+/// custody, and assigns the returned 64 bytes to `signature` instead of calling
+/// this function.
+pub fn sign_outlet_registration(
+    registration: &mut OutletRegistration,
+    signing_key: &ed25519_dalek::SigningKey,
+) {
+    use ed25519_dalek::Signer as _;
+    let canonical = compute_outlet_registration_canonical_bytes(registration);
+    registration.signature = signing_key.sign(&canonical).to_bytes().to_vec();
+}
+
+/// Derives the operator's Ed25519 verifying key from `registration.operator_did`
+/// and verifies the §5.4.1 V2 registration signature against that key.
+///
+/// The key comes from the DID string itself
+/// ([`scp_did::extract_public_key_from_did`]), never from a caller-supplied
+/// key, so a registration cannot name one operator and carry another
+/// operator's signature. `scp-event-log` verifies event signatures the same
+/// way, and deriving the key from the DID keeps the check self-certifying:
+/// a verifier needs no resolver and no relay to run it.
+///
+/// [`register_outlet`] and [`update_outlet`] call this function, so every
+/// registration a context stores names an operator that signed it.
+///
+/// # Errors
+///
+/// Returns [`OutletError::UnresolvableDid`] when `operator_did` carries no
+/// Ed25519 key the protocol can derive, and
+/// [`OutletError::SignatureVerificationFailed`] when the signature is absent,
+/// mis-sized, or does not verify.
+pub fn verify_outlet_registration_provenance(
+    registration: &OutletRegistration,
+) -> Result<(), OutletError> {
+    let key_bytes =
+        scp_did::extract_public_key_from_did(&registration.operator_did.0).map_err(|_reason| {
+            OutletError::UnresolvableDid {
+                did: registration.operator_did.0.clone(),
+            }
+        })?;
+    let operator_key = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes).map_err(|_e| {
+        OutletError::UnresolvableDid {
+            did: registration.operator_did.0.clone(),
+        }
+    })?;
+    verify_outlet_registration_signature(registration, &operator_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -670,8 +748,17 @@ mod tests {
         state
     }
 
-    /// Creates a valid outlet registration for testing.
+    /// Creates a valid outlet registration for testing, signed by the shared
+    /// test operator so `register_outlet` accepts its §5.4.1 provenance.
     fn valid_registration(outlet_id: &str) -> OutletRegistration {
+        let mut registration = unsigned_registration(outlet_id);
+        crate::context::outlets::test_operator::sign(&mut registration);
+        registration
+    }
+
+    /// Creates the same registration body without a §5.4.1 signature, so a
+    /// test can assert what the registry does with an unsigned registration.
+    fn unsigned_registration(outlet_id: &str) -> OutletRegistration {
         OutletRegistration {
             outlet_id: outlet_id.to_owned(),
             kind: OutletKind::Action,
@@ -707,7 +794,7 @@ mod tests {
                     description: "3 * 4 = 12".to_owned(),
                 },
             ],
-            operator_did: "did:dht:z6MkTestOperator".into(),
+            operator_did: crate::context::outlets::test_operator::did(),
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
@@ -741,6 +828,177 @@ mod tests {
         // Verify outlet is stored.
         assert!(registry.contains("outlet-1"));
         assert_eq!(registry.len(), 1);
+    }
+
+    // ----- §5.4.1 registration-provenance tests -----
+
+    #[test]
+    fn register_outlet_rejects_empty_signature() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = OutletRegistry::new();
+        let registration = unsigned_registration("outlet-unsigned");
+
+        let err = register_outlet(
+            &mut registry,
+            &role_state,
+            registration,
+            "did:dht:z6MkCreator",
+        )
+        .expect_err("an unsigned registration names an unverified operator");
+
+        assert!(
+            matches!(err, OutletError::SignatureVerificationFailed { .. }),
+            "expected SignatureVerificationFailed, got {err:?}"
+        );
+        assert!(
+            !registry.contains("outlet-unsigned"),
+            "a rejected registration must not reach the registry"
+        );
+    }
+
+    #[test]
+    fn register_outlet_rejects_signature_from_a_key_the_operator_did_does_not_encode() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = OutletRegistry::new();
+
+        // Sign with an impostor key while naming the real operator's DID —
+        // the forgery a registrant would attempt to claim someone else's outlet.
+        let impostor = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let mut registration = unsigned_registration("outlet-forged");
+        registration.operator_did = crate::context::outlets::test_operator::did();
+        sign_outlet_registration(&mut registration, &impostor);
+
+        let err = register_outlet(
+            &mut registry,
+            &role_state,
+            registration,
+            "did:dht:z6MkCreator",
+        )
+        .expect_err("a signature by a key the operator DID does not encode must fail");
+
+        assert!(
+            matches!(err, OutletError::SignatureVerificationFailed { .. }),
+            "expected SignatureVerificationFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn register_outlet_rejects_a_field_edited_after_signing() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = OutletRegistry::new();
+
+        let mut registration = valid_registration("outlet-tampered");
+        // The V2 preimage commits `description_hash`, so editing the prose
+        // after signing invalidates the signature.
+        registration.description = "A calculator that also drains your wallet".to_owned();
+
+        let err = register_outlet(
+            &mut registry,
+            &role_state,
+            registration,
+            "did:dht:z6MkCreator",
+        )
+        .expect_err("an edit after signing must invalidate the signature");
+
+        assert!(
+            matches!(err, OutletError::SignatureVerificationFailed { .. }),
+            "expected SignatureVerificationFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn register_outlet_rejects_operator_did_carrying_no_derivable_key() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = OutletRegistry::new();
+
+        let mut registration = unsigned_registration("outlet-unresolvable");
+        registration.operator_did = "did:web:example.com".into();
+        // Sign with a real key: the failure is that the DID encodes no key to
+        // check the signature against, not that the signature is missing.
+        sign_outlet_registration(
+            &mut registration,
+            &ed25519_dalek::SigningKey::from_bytes(&[0x22u8; 32]),
+        );
+
+        let err = register_outlet(
+            &mut registry,
+            &role_state,
+            registration,
+            "did:dht:z6MkCreator",
+        )
+        .expect_err("an operator DID with no derivable key must fail");
+
+        assert!(
+            matches!(err, OutletError::UnresolvableDid { .. }),
+            "expected UnresolvableDid, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn update_outlet_rejects_an_unsigned_replacement() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = OutletRegistry::new();
+        register_outlet(
+            &mut registry,
+            &role_state,
+            valid_registration("outlet-1"),
+            "did:dht:z6MkCreator",
+        )
+        .expect("the signed registration registers");
+
+        let mut replacement = unsigned_registration("outlet-1");
+        replacement.description = "A rewritten description".to_owned();
+
+        let err = update_outlet(
+            &mut registry,
+            &role_state,
+            "outlet-1",
+            replacement,
+            "did:dht:z6MkCreator",
+        )
+        .expect_err("an unsigned replacement must not overwrite a signed registration");
+
+        assert!(
+            matches!(err, OutletError::SignatureVerificationFailed { .. }),
+            "expected SignatureVerificationFailed, got {err:?}"
+        );
+        assert_eq!(
+            registry
+                .get("outlet-1")
+                .expect("the outlet stays")
+                .description,
+            "A simple calculator outlet",
+            "the stored registration must survive a rejected update"
+        );
+    }
+
+    #[test]
+    fn verify_outlet_registration_signature_rejects_an_empty_signature() {
+        let registration = unsigned_registration("outlet-1");
+        let key = crate::context::outlets::test_operator::signing_key().verifying_key();
+
+        let err = verify_outlet_registration_signature(&registration, &key)
+            .expect_err("an empty signature is not a legacy sentinel");
+
+        match err {
+            OutletError::SignatureVerificationFailed { reason } => {
+                assert!(
+                    reason.contains("no operator signature"),
+                    "the reason must name the missing signature: {reason}"
+                );
+            }
+            other => panic!("expected SignatureVerificationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sign_outlet_registration_produces_a_signature_the_provenance_check_accepts() {
+        let mut registration = unsigned_registration("outlet-1");
+        crate::context::outlets::test_operator::sign(&mut registration);
+
+        assert_eq!(registration.signature.len(), 64);
+        verify_outlet_registration_provenance(&registration)
+            .expect("the signature the signer wrote verifies against the operator DID");
     }
 
     #[test]
@@ -841,6 +1099,7 @@ mod tests {
             }),
             aggregate_schema: None,
         };
+        crate::context::outlets::test_operator::sign(&mut registration);
 
         let result = register_outlet(
             &mut registry,
@@ -956,6 +1215,7 @@ mod tests {
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: None,
         });
+        crate::context::outlets::test_operator::sign(&mut registration);
 
         let result = register_outlet(
             &mut registry,
@@ -975,12 +1235,14 @@ mod tests {
 
     #[test]
     fn update_outlet_succeeds_by_operator() {
-        let role_state = test_role_state_with_member("did:dht:z6MkCreator", "did:dht:z6MkOperator");
+        // `valid_registration` names the shared test operator, so the role
+        // state admits that same DID as the member who updates the outlet.
+        let operator = crate::context::outlets::test_operator::did();
+        let role_state = test_role_state_with_member("did:dht:z6MkCreator", &operator.0);
         let mut registry = OutletRegistry::new();
 
         // Register with operator DID.
-        let mut registration = valid_registration("outlet-1");
-        registration.operator_did = "did:dht:z6MkOperator".into();
+        let registration = valid_registration("outlet-1");
         register_outlet(
             &mut registry,
             &role_state,
@@ -991,17 +1253,11 @@ mod tests {
 
         // Update by operator.
         let mut new_reg = valid_registration("outlet-1");
-        new_reg.operator_did = "did:dht:z6MkOperator".into();
         new_reg.name = "updated-calculator".to_owned();
         new_reg.implementation_hash = [0xCD; 32];
+        crate::context::outlets::test_operator::sign(&mut new_reg);
 
-        let result = update_outlet(
-            &mut registry,
-            &role_state,
-            "outlet-1",
-            new_reg,
-            "did:dht:z6MkOperator",
-        );
+        let result = update_outlet(&mut registry, &role_state, "outlet-1", new_reg, &operator.0);
         assert!(result.is_ok());
 
         let event = result.unwrap();
@@ -1027,6 +1283,7 @@ mod tests {
         // Admin can update even though they are not the operator.
         let mut new_reg = valid_registration("outlet-1");
         new_reg.description = "updated description".to_owned();
+        crate::context::outlets::test_operator::sign(&mut new_reg);
 
         let result = update_outlet(
             &mut registry,
@@ -1051,6 +1308,7 @@ mod tests {
 
         let mut registration = valid_registration("outlet-1");
         registration.implementation_hash = [0x11; 32];
+        crate::context::outlets::test_operator::sign(&mut registration);
         register_outlet(
             &mut registry,
             &role_state,
@@ -1061,6 +1319,7 @@ mod tests {
 
         let mut new_reg = valid_registration("outlet-1");
         new_reg.implementation_hash = [0x22; 32];
+        crate::context::outlets::test_operator::sign(&mut new_reg);
 
         let event = update_outlet(
             &mut registry,
@@ -1268,6 +1527,7 @@ mod tests {
 
         let mut registration = valid_registration("outlet-1");
         registration.test_vectors = vec![];
+        crate::context::outlets::test_operator::sign(&mut registration);
         register_outlet(
             &mut registry,
             &role_state,
@@ -1540,6 +1800,7 @@ mod tests {
             aggregate_schema: None,
         };
         new_reg.test_vectors = vec![];
+        crate::context::outlets::test_operator::sign(&mut new_reg);
 
         let event = update_outlet(
             &mut registry,
@@ -1920,6 +2181,7 @@ mod tests {
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: None,
         });
+        crate::context::outlets::test_operator::sign(&mut original);
         register_outlet(&mut registry, &role_state, original, "did:dht:z6MkCreator").unwrap();
 
         // Try to update by flipping to Query while keeping the positive
@@ -1932,6 +2194,7 @@ mod tests {
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: None,
         });
+        crate::context::outlets::test_operator::sign(&mut flipped);
         let err = update_outlet(
             &mut registry,
             &role_state,

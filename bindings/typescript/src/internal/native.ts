@@ -813,6 +813,10 @@ export function createNativeBridge(scp: SCP): Bridge {
               costFormula: definition.cost.costFormula,
             }
           : undefined,
+        operatorSignature: definition.operatorSignature
+          ? Array.from(definition.operatorSignature)
+          : undefined,
+        registeredAt: definition.registeredAt,
       };
       const outletId = await (
         native.outletRegister as (h: BridgeContextHandle, d: typeof napiDef) => Promise<string>

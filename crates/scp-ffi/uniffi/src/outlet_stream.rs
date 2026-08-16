@@ -235,8 +235,8 @@ async fn resolve_stream_signer(
                 // (SCP-OUT-047 pass-3a cross-bridge alignment).
                 code: codes::CTX_2001.to_owned(),
             })?;
-        let (custody, key_handle) = entry.value();
-        (Arc::clone(custody), *key_handle)
+        let held = entry.value();
+        (Arc::clone(&held.custody), held.active_signing_key)
     };
     let public_key = custody
         .public_key(&handle)
@@ -1129,8 +1129,8 @@ async fn resolve_context_active_signing_key_by_id(
             // PyO3 bridges surface (SCP-OUT-047 pass-3a cross-bridge alignment).
             code: codes::CTX_2001.to_owned(),
         })?;
-        let (custody, key_handle) = entry.value();
-        (Arc::clone(custody), *key_handle)
+        let held = entry.value();
+        (Arc::clone(&held.custody), held.active_signing_key)
     };
     custody
         .export_ed25519_signing_key(&key_handle)

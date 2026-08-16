@@ -120,6 +120,13 @@ pub mod credentials;
 #[cfg(feature = "resolvers")]
 pub mod outlet_stream_credit;
 
+// Shared §5.4.1 operator-signature attachment for outlet registration. Decides
+// between a caller-supplied signature and a locally-signed one, checks the
+// Ed25519 width, and owns the refusal prose the three bridges emit when neither
+// source can produce a signature. Requires scp-core (behind `resolvers`).
+#[cfg(feature = "resolvers")]
+pub mod outlet_signature;
+
 // Bridge-agnostic pieces of the §5.4.5 cross-context streaming-saga FFI surface
 // (SCP-OUT-047): the per-instance registry value, the chunk serialize/terminal
 // step, and the ADR-056-chokepoint key-bearing truncated-close recovery driver.

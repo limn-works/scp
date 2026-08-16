@@ -60,6 +60,36 @@ pub mod schema;
 pub mod stream;
 pub mod summary;
 
+/// Fixtures that give a unit test a real operator keypair, so a test
+/// registration carries a §5.4.1 signature that
+/// [`registry::verify_outlet_registration_provenance`] accepts.
+///
+/// Compiled only for this crate's own `cargo test` run. A test in another
+/// crate builds the same pair from [`scp_did::did_dht_from_public_key`] and
+/// [`registry::sign_outlet_registration`] directly.
+#[cfg(test)]
+pub(crate) mod test_operator {
+    use super::registration::OutletRegistration;
+
+    /// The fixed Ed25519 signing key every unit-test operator DID encodes.
+    pub fn signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x5Au8; 32])
+    }
+
+    /// The `did:dht` DID that [`signing_key`] produces.
+    pub fn did() -> scp_did::DID {
+        scp_did::did_dht_from_public_key(&signing_key().verifying_key().to_bytes())
+    }
+
+    /// Sets `operator_did` to [`did`] and writes the matching §5.4.1
+    /// signature, so `register_outlet` and `update_outlet` accept the
+    /// registration.
+    pub fn sign(registration: &mut OutletRegistration) {
+        registration.operator_did = did();
+        super::registry::sign_outlet_registration(registration, &signing_key());
+    }
+}
+
 use crate::context::roles;
 
 pub use cross_context_saga::{
@@ -83,7 +113,8 @@ pub use message_catalog::{
 pub use registration::{OutletRegistration, RegistrationError};
 pub use registry::{
     OutletCost, OutletRegistry, OutletSchema, OutletTestVector, OutletVerificationResult,
-    VectorResult, register_outlet, update_outlet, verify_outlet,
+    VectorResult, register_outlet, sign_outlet_registration, update_outlet, verify_outlet,
+    verify_outlet_registration_provenance, verify_outlet_registration_signature,
 };
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
 pub use stream::{

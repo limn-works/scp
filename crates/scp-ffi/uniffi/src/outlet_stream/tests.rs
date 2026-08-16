@@ -271,6 +271,9 @@ async fn seed_owner_document_into_resolver(
 ))]
 fn streaming_context_params(ceiling: &[&str]) -> crate::bridge::ContextParams {
     crate::bridge::ContextParams {
+        participation_requirements_json: None,
+        capability_requirements_json: None,
+        sybil_policy_json: None,
         mode: crate::bridge::ContextMode::Encrypted,
         ceiling: ceiling.iter().map(|s| (*s).to_owned()).collect(),
         ceiling_policy: crate::bridge::CeilingPolicy::Immutable,
@@ -364,6 +367,8 @@ async fn live_poll_next_drains_to_terminal() {
     // Zero-cost Action outlet operated by the creator, registered into the
     // handle's per-context registry (the streaming open reads it from there).
     let definition = crate::bridge::OutletDefinition {
+        registered_at: None,
+        operator_signature: None,
         name: "uniffi_streaming_live".to_owned(),
         description: "live streaming outlet".to_owned(),
         kind: crate::bridge::OutletKind::Action,
@@ -575,6 +580,8 @@ mod streaming_vectors_live {
         let ctx = handle.context_id.clone();
 
         let definition = crate::bridge::OutletDefinition {
+            registered_at: None,
+            operator_signature: None,
             name: outlet_name.to_owned(),
             description: "SCP-OUT-039 live vector outlet".to_owned(),
             kind: crate::bridge::OutletKind::Action,

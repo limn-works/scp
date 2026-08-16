@@ -80,6 +80,18 @@ const OUTLETS_INVOKE_SRC: &str =
 // The structural assertions in `c4_outlet_invoke_economy_*` below pin
 // the bridge → runtime delegation so a future refactor cannot silently
 // regress to the bypass path.
+// §5.4.1 outlet-registration provenance. `register_outlet` / `update_outlet`
+// live here, and the assertions below pin that BOTH call the operator-signature
+// verifier rather than storing a registration whose named operator never signed
+// for it.
+const PROTOCOL_OUTLET_REGISTRY_SRC: &str =
+    include_str!("../../../../crates/scp-protocol/src/context/outlets/registry.rs");
+
+// Shared context-parameter builder — the single line all three bridges cross to
+// turn caller input into `ContextParams`.
+const SHARED_CONTEXT_PARAMS_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/common/src/context_params.rs");
+
 const PYO3_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/outlets.rs");
 // §5.4.5 streaming-native outlet invocation (SCP-OUT-037, C7). The PyO3
 // reference bridge for the streaming open + control plane.
@@ -2464,6 +2476,129 @@ fn c4_uniffi_outlet_invoke_accepts_spending_ucan() {
         "UniFFI outlet_invoke must parse the spending UCAN JWT into a UcanToken \
          before passing it to invoke_outlet_with_economy."
     );
+}
+
+// ===========================================================================
+// §5.4.1 outlet-registration provenance
+//
+// A stored outlet registration names the operator accountable for the outlet.
+// The registry MUST verify the operator's signature before it stores one,
+// otherwise a registrant names any operator it likes and the registry records
+// that claim as fact. These assertions pin the call chain that establishes the
+// operator: `register_outlet` / `update_outlet` ->
+// `verify_outlet_registration_provenance` ->
+// `verify_outlet_registration_signature`. They add coverage; they weaken
+// nothing.
+// ===========================================================================
+
+#[test]
+fn register_outlet_verifies_the_operator_signature() {
+    assert!(
+        fn_body_contains(
+            PROTOCOL_OUTLET_REGISTRY_SRC,
+            "register_outlet",
+            "verify_outlet_registration_provenance"
+        ),
+        "register_outlet must call verify_outlet_registration_provenance before it          stores a registration. Without that call the registry records a          caller-asserted operator_did that nobody signed for (§5.4.1)."
+    );
+}
+
+#[test]
+fn update_outlet_verifies_the_operator_signature() {
+    assert!(
+        fn_body_contains(
+            PROTOCOL_OUTLET_REGISTRY_SRC,
+            "update_outlet",
+            "verify_outlet_registration_provenance"
+        ),
+        "update_outlet must call verify_outlet_registration_provenance on the          replacement registration. An update writes a new registration body and          carries its own signature; skipping the check lets an admin rewrite the          operator_did of an outlet the named operator never signed for (§5.4.1)."
+    );
+}
+
+#[test]
+fn registration_provenance_derives_the_key_from_the_operator_did_and_verifies() {
+    let body = extract_fn_body(
+        PROTOCOL_OUTLET_REGISTRY_SRC,
+        "verify_outlet_registration_provenance",
+    )
+    .expect("verify_outlet_registration_provenance body must exist");
+    assert!(
+        body.contains("extract_public_key_from_did"),
+        "verify_outlet_registration_provenance must derive the verifying key from          registration.operator_did, so a registration cannot name one operator and          carry another party's signature (§5.4.1)."
+    );
+    assert!(
+        body.contains("verify_outlet_registration_signature"),
+        "verify_outlet_registration_provenance must call          verify_outlet_registration_signature with the derived key."
+    );
+}
+
+#[test]
+fn every_bridge_attaches_a_real_operator_signature_before_registering() {
+    for (src, function, bridge) in [
+        (PYO3_OUTLETS_SRC, "outlet_register_impl", "PyO3"),
+        (NAPI_OUTLETS_SRC, "outlet_register_on", "NAPI"),
+        (UNIFFI_BRIDGE_SRC, "outlet_register", "UniFFI"),
+    ] {
+        assert!(
+            fn_body_contains(src, function, "attach_operator_signature"),
+            "{bridge} {function} must call attach_operator_signature before              register_outlet. Each bridge previously constructed              OutletRegistration {{ signature: vec![] }}, which named an operator              the protocol never verified (§5.4.1)."
+        );
+    }
+}
+
+#[test]
+fn every_bridge_signature_attachment_reads_the_canonical_preimage() {
+    for (src, bridge) in [
+        (PYO3_OUTLETS_SRC, "PyO3"),
+        (NAPI_OUTLETS_SRC, "NAPI"),
+        (UNIFFI_BRIDGE_SRC, "UniFFI"),
+    ] {
+        let body = extract_fn_body(src, "attach_operator_signature")
+            .unwrap_or_else(|| panic!("{bridge} attach_operator_signature body must exist"));
+        assert!(
+            body.contains("registration_signing_preimage"),
+            "{bridge} attach_operator_signature must sign the §5.4.1 canonical              preimage, not some other byte string."
+        );
+        assert!(
+            body.contains("accept_supplied_signature"),
+            "{bridge} attach_operator_signature must accept a caller-supplied              operator signature so a registrant can register an outlet operated              by another party."
+        );
+        assert!(
+            body.contains("operator_key_unavailable"),
+            "{bridge} attach_operator_signature must fail closed when it can              neither sign for the operator nor read a supplied signature."
+        );
+    }
+}
+
+#[test]
+fn the_shared_context_params_builder_verifies_declared_outlet_registrations() {
+    assert!(
+        fn_body_contains(
+            SHARED_CONTEXT_PARAMS_SRC,
+            "build_outlets",
+            "verify_outlet_registration_provenance"
+        ),
+        "build_outlets must verify each declared outlet registration. It \
+         previously fabricated a fixed placeholder operator DID alongside an \
+         empty signature, so every SDK-created context declared outlets whose \
+         operator nobody established (§5.4.1)."
+    );
+}
+
+#[test]
+fn the_shared_context_params_builder_carries_the_three_admission_fields() {
+    let body = extract_fn_body(SHARED_CONTEXT_PARAMS_SRC, "build_context_params")
+        .expect("build_context_params body must exist");
+    for parser in [
+        "parse_participation_requirements",
+        "parse_capability_requirements",
+        "parse_sybil_policy",
+    ] {
+        assert!(
+            body.contains(parser),
+            "build_context_params must call {parser}. All three admission fields              were previously hardcoded empty, so no SDK-created context could              declare a participation requirement (§7.3.2.1), a capability              requirement (§7.3.4.4), or a Sybil policy (§9.3)."
+        );
+    }
 }
 
 // ===========================================================================

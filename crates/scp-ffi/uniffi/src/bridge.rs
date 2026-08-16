@@ -1923,6 +1923,21 @@ pub struct ContextParams {
     /// `None` means the default config (severe enforcement tiers gated to
     /// governance only).
     pub consequence_config_json: Option<String>,
+    /// Optional participation admission requirements as a JSON-encoded array
+    /// (spec §7.3.2.1). `None` means the context requires no participation
+    /// attestation for admission.
+    ///
+    /// Carried as a JSON string for the same reason as
+    /// `consequence_rules_json`: the `RequireParticipation` type tree would
+    /// otherwise have to be mirrored across the UDL surface.
+    pub participation_requirements_json: Option<String>,
+    /// Optional capability admission requirements as a JSON-encoded array
+    /// (spec §7.3.4.4, ADR-041 AC6). `None` means the context requires no
+    /// verified capability for admission.
+    pub capability_requirements_json: Option<String>,
+    /// Optional per-context Sybil resistance policy as a JSON-encoded object
+    /// (spec §9.3). `None` means the context admits any valid DID.
+    pub sybil_policy_json: Option<String>,
 }
 
 /// A message received from an SCP context.
@@ -2270,6 +2285,22 @@ pub struct OutletDefinition {
     pub implementation_hash: Option<Vec<u8>>,
     /// Optional per-invocation cost metadata (spec §5.4.1).
     pub cost: Option<OutletCostDefinition>,
+    /// The operator's 64-byte Ed25519 signature over the §5.4.1 V2 canonical
+    /// registration digest.
+    ///
+    /// Supply this when registering an outlet operated by someone else, whose
+    /// key this bridge instance does not hold. Leave it absent when
+    /// `operator_did` names an identity created on this bridge instance: the
+    /// bridge then signs the registration with that identity's own key.
+    pub operator_signature: Option<Vec<u8>>,
+    /// Registration timestamp, in seconds since the Unix epoch.
+    ///
+    /// An operator signing out of band chooses this value and hands it to the
+    /// registrant alongside `operator_signature`, because the §5.4.1 preimage
+    /// commits `registered_at`; a bridge-chosen clock reading would produce a
+    /// digest the operator never signed. Absent, the bridge stamps the current
+    /// second.
+    pub registered_at: Option<u64>,
 }
 
 /// Per-invocation cost metadata for an outlet (spec §5.4.1).
@@ -4082,10 +4113,85 @@ fn identity_link_attestation_registry(
 /// identity ops that read it (`scpid_sign`, `identity_create_link_attestation`,
 /// `identity_remove*`) — exist in bare production builds, not only when
 /// `testing` is enabled.
+/// Writes the §5.4.1 operator signature onto `registration`.
+///
+/// A caller registering an outlet it operates itself supplies no
+/// `operator_signature`; this function then signs the canonical registration
+/// digest with the operator's own identity key from this bridge instance's key
+/// custody. A caller registering someone else's outlet passes that operator's
+/// 64-byte signature, which this function accepts after a width check.
+///
+/// When the caller supplies neither, the function returns an error rather than
+/// leaving `signature` empty, because `register_outlet` verifies the signature
+/// against the key `operator_did` encodes and an empty signature would name an
+/// operator the protocol never verified.
+async fn attach_operator_signature(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    registration: &mut scp_core::context::outlets::OutletRegistration,
+    supplied: Option<Vec<u8>>,
+) -> Result<(), ScpError> {
+    use scp_ffi_common::outlet_signature as sig;
+
+    let operator_did = registration.operator_did.0.clone();
+
+    let signature = if let Some(bytes) = supplied {
+        sig::accept_supplied_signature(&operator_did, bytes).map_err(|e| ScpError::Validation {
+            msg: e.to_string(),
+            code: codes::VALID_7000.to_owned(),
+        })?
+    } else {
+        let preimage = sig::registration_signing_preimage(registration);
+        // Clone custody and the key handle out of the DashMap entry so no
+        // shard guard is held across the async sign.
+        let (custody, key) = {
+            let entry = identity_custody_registry(bi)
+                .get(&operator_did)
+                .ok_or_else(|| ScpError::Validation {
+                    msg: sig::operator_key_unavailable(&operator_did).to_string(),
+                    code: codes::VALID_7000.to_owned(),
+                })?;
+            let held = entry.value();
+            (Arc::clone(&held.custody), held.identity_key)
+        };
+        let produced = custody
+            .sign(&key, &preimage)
+            .await
+            .map_err(|e| ScpError::Outlet {
+                msg: sig::custody_signing_failed(&operator_did, &e.to_string()).to_string(),
+                code: codes::OUTLET_6001.to_owned(),
+            })?
+            .into_bytes();
+        sig::accept_custody_signature(&operator_did, produced).map_err(|e| ScpError::Outlet {
+            msg: e.to_string(),
+            code: codes::OUTLET_6001.to_owned(),
+        })?
+    };
+
+    registration.signature = signature;
+    Ok(())
+}
+
 pub(crate) fn identity_custody_registry(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
-) -> &dashmap::DashMap<String, (Arc<UniffiKeyCustody>, scp_platform::KeyHandle)> {
+) -> &dashmap::DashMap<String, IdentityCustodyEntry> {
     bi.identity_custody_registry.as_ref()
+}
+
+/// The key custody and key handles this bridge instance retains for one local
+/// identity, keyed by DID.
+///
+/// The two handles sign different artifacts and are not interchangeable, so the
+/// registry names them rather than carrying an unlabelled pair.
+pub(crate) struct IdentityCustodyEntry {
+    /// The custody provider that holds this identity's key material.
+    pub(crate) custody: Arc<UniffiKeyCustody>,
+    /// The `#active` operational signing key (§3). Signs governance actions,
+    /// metadata records (§5.7.2), and context-export snapshots (§23.16.8).
+    pub(crate) active_signing_key: scp_platform::KeyHandle,
+    /// Verification method `#0` — the key the `did:dht` string encodes. Signs
+    /// §5.4.1 outlet registrations, because a verifier recovers that key from
+    /// `operator_did` alone and so checks the registration with no resolver.
+    pub(crate) identity_key: scp_platform::KeyHandle,
 }
 
 /// Registers an in-memory identity's custody + active signing key in the
@@ -4111,6 +4217,7 @@ fn register_identity_custody(
     did: &str,
     custody: &Arc<UniffiKeyCustody>,
     active_key: scp_platform::KeyHandle,
+    identity_key: scp_platform::KeyHandle,
 ) -> Result<(), ScpError> {
     use scp_ffi_common::error_codes as codes;
 
@@ -4118,7 +4225,11 @@ fn register_identity_custody(
     let len = registry.len();
     match registry.entry(did.to_owned()) {
         dashmap::mapref::entry::Entry::Occupied(mut occ) => {
-            occ.insert((Arc::clone(custody), active_key));
+            occ.insert(IdentityCustodyEntry {
+                custody: Arc::clone(custody),
+                active_signing_key: active_key,
+                identity_key,
+            });
         }
         dashmap::mapref::entry::Entry::Vacant(vac) => {
             if len >= UNIFFI_CUSTODY_REGISTRY_CAP {
@@ -4130,7 +4241,11 @@ fn register_identity_custody(
                     code: codes::VALID_7403.to_owned(),
                 });
             }
-            vac.insert((Arc::clone(custody), active_key));
+            vac.insert(IdentityCustodyEntry {
+                custody: Arc::clone(custody),
+                active_signing_key: active_key,
+                identity_key,
+            });
         }
     }
     Ok(())
@@ -4220,7 +4335,13 @@ async fn identity_create_link_attestation_impl(
 
     // Store custody for later verification lookups. Shared with
     // `identity_create` so the registry contract stays in sync.
-    register_identity_custody(bi, &identity.did, &custody, active_key)?;
+    register_identity_custody(
+        bi,
+        &identity.did,
+        &custody,
+        active_key,
+        core_id.identity_key,
+    )?;
 
     // Use entry() API to avoid TOCTOU between contains_key and insert.
     {
@@ -6429,8 +6550,8 @@ async fn resolve_local_custody_verifying_key(
     let (custody, key_handle) = {
         let registry = identity_custody_registry(bi);
         let entry = registry.get(did)?;
-        let (custody, handle) = entry.value();
-        (Arc::clone(custody), *handle)
+        let held = entry.value();
+        (Arc::clone(&held.custody), held.active_signing_key)
     };
 
     let public_key = custody.public_key(&key_handle).await.ok()?;
@@ -6652,6 +6773,9 @@ fn bridge_params_to_core(
         economic_policy_json: params.economic_policy.clone(),
         consequence_rules_json: params.consequence_rules_json.clone(),
         consequence_config_json: params.consequence_config_json.clone(),
+        participation_requirements_json: params.participation_requirements_json.clone(),
+        capability_requirements_json: params.capability_requirements_json.clone(),
+        sybil_policy_json: params.sybil_policy_json.clone(),
         ..Default::default()
     };
 
@@ -9656,6 +9780,7 @@ impl Scp {
                                 &identity.did,
                                 &Arc::new(UniffiKeyCustody::InMemory(Arc::clone(&key_custody))),
                                 identity.active_signing_key,
+                                identity.identity_key,
                             )?;
 
                             // Publish the freshly minted document into the shared
@@ -9807,6 +9932,7 @@ impl Scp {
                         &identity.did,
                         &Arc::new(UniffiKeyCustody::Callback(Arc::clone(&callback_custody))),
                         identity.active_signing_key,
+                        identity.identity_key,
                     )?;
 
                     // Publish the freshly minted document into the shared resolver
@@ -13320,6 +13446,7 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 validate_outlet_name(&definition.name)?;
@@ -13391,7 +13518,11 @@ impl Scp {
                     })?,
                 };
 
-                let outlet_id = format!("outlet-{}", definition.name.replace(' ', "-").to_lowercase());
+                // Shared with every other bridge via `scp_ffi_common::outlet_id`.
+                // The §5.4.1 preimage commits `outlet_id`, so a signature an
+                // operator produced for one bridge must verify on the others,
+                // which requires one derivation rule.
+                let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id(&definition.name);
 
                 let cost = definition.cost.map(|c| scp_core::context::outlets::OutletCost {
                     // ADR-060: `OutletCost.amount` is the `Amount` newtype. UniFFI
@@ -13404,7 +13535,12 @@ impl Scp {
                     cost_formula: c.cost_formula,
                 });
 
-                let core_registration = scp_core::context::outlets::OutletRegistration {
+                let supplied_signature = definition.operator_signature.clone();
+                let registered_at = definition
+                    .registered_at
+                    .unwrap_or_else(|| scp_clock::Clock::now_secs(&scp_clock::SystemClock));
+
+                let mut core_registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: outlet_id.clone(),
                     // §5.4.2: caller-supplied semantic class selects the
                     // invocation capability stem (`outlet_query:` vs `outlet_call:`).
@@ -13421,9 +13557,15 @@ impl Scp {
                     operator_did: definition.operator_did.into(),
                     cost,
                     message_catalog: Vec::new(),
-                    registered_at: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+                    registered_at,
                     signature: Vec::new(),
                 };
+
+                // §5.4.1: the operator signs the registration. `register_outlet`
+                // verifies that signature against the key `operator_did`
+                // encodes, so the bridge fills it in before it calls that
+                // function.
+                attach_operator_signature(&bi, &mut core_registration, supplied_signature).await?;
 
                 // Build a role state for capability checking.
                 let ceiling = scp_core::context::roles::default_ceiling();
@@ -17188,6 +17330,11 @@ impl Scp {
                                 .ok()
                                 .map(|pk| hex::encode(pk.as_bytes()));
                         let new_active_key = new_identity.active_signing_key;
+                        // Migration mints a new DID, so the key that DID encodes
+                        // changes with it; the registry must carry the new one or
+                        // §5.4.1 outlet registrations would be signed with a key
+                        // the new `operator_did` does not encode.
+                        let new_identity_key = new_identity.identity_key;
                         let handle = Arc::new(Identity {
                             did: new_identity.did.clone(),
                             custody_type,
@@ -17231,10 +17378,15 @@ impl Scp {
                             // so the old entry's key handle is stale (and destroyed);
                             // reuse the same custody enum but swap in the new handle.
                             let registry = identity_custody_registry(&bi);
-                            if let Some((_, (custody_enum, _stale_handle))) =
-                                registry.remove(&old_did)
-                            {
-                                registry.insert(new_did, (custody_enum, new_active_key));
+                            if let Some((_, stale)) = registry.remove(&old_did) {
+                                registry.insert(
+                                    new_did,
+                                    IdentityCustodyEntry {
+                                        custody: stale.custody,
+                                        active_signing_key: new_active_key,
+                                        identity_key: new_identity_key,
+                                    },
+                                );
                             }
                         }
 
@@ -17293,6 +17445,11 @@ impl Scp {
                             snapshot_verifying_key_hex(cc.as_ref(), &new_identity.identity_key)
                                 .await;
                         let new_active_key = new_identity.active_signing_key;
+                        // Migration mints a new DID, so the key that DID encodes
+                        // changes with it; the registry must carry the new one or
+                        // §5.4.1 outlet registrations would be signed with a key
+                        // the new `operator_did` does not encode.
+                        let new_identity_key = new_identity.identity_key;
                         let handle = Arc::new(Identity {
                             did: new_identity.did.clone(),
                             custody_type,
@@ -17335,10 +17492,15 @@ impl Scp {
                             // so the old entry's key handle is stale (and destroyed);
                             // reuse the same custody enum but swap in the new handle.
                             let registry = identity_custody_registry(&bi);
-                            if let Some((_, (custody_enum, _stale_handle))) =
-                                registry.remove(&old_did)
-                            {
-                                registry.insert(new_did, (custody_enum, new_active_key));
+                            if let Some((_, stale)) = registry.remove(&old_did) {
+                                registry.insert(
+                                    new_did,
+                                    IdentityCustodyEntry {
+                                        custody: stale.custody,
+                                        active_signing_key: new_active_key,
+                                        identity_key: new_identity_key,
+                                    },
+                                );
                             }
                         }
 
@@ -17431,6 +17593,7 @@ impl Scp {
                                 &identity.did,
                                 &Arc::new(UniffiKeyCustody::InMemory(Arc::clone(&key_custody))),
                                 identity.active_signing_key,
+                                identity.identity_key,
                             )?;
 
                             // Publish the freshly minted document into the shared
@@ -19131,6 +19294,9 @@ mod tests {
     #[cfg(feature = "testing")]
     fn encrypted_join_test_params() -> ContextParams {
         ContextParams {
+            participation_requirements_json: None,
+            capability_requirements_json: None,
+            sybil_policy_json: None,
             mode: ContextMode::Encrypted,
             ceiling: Vec::new(),
             ceiling_policy: CeilingPolicy::Immutable,
@@ -19762,6 +19928,9 @@ mod tests {
         let creator_did = identity.did();
 
         let params = ContextParams {
+            participation_requirements_json: None,
+            capability_requirements_json: None,
+            sybil_policy_json: None,
             mode: ContextMode::Broadcast,
             // Broadcast contexts require MemoryScope::Full (spec §5.14).
             memory_scope: MemoryScope::Full,
@@ -21488,6 +21657,8 @@ mod tests {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
         let def = OutletDefinition {
+            registered_at: None,
+            operator_signature: None,
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             kind: OutletKind::Action,
@@ -21520,6 +21691,8 @@ mod tests {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
         let def = OutletDefinition {
+            registered_at: None,
+            operator_signature: None,
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             kind: OutletKind::Action,
@@ -21554,6 +21727,8 @@ mod tests {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
         let def = OutletDefinition {
+            registered_at: None,
+            operator_signature: None,
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             kind: OutletKind::Action,
@@ -21590,6 +21765,8 @@ mod tests {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
         let def = OutletDefinition {
+            registered_at: None,
+            operator_signature: None,
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             kind: OutletKind::Action,
@@ -21628,6 +21805,8 @@ mod tests {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
         let def = OutletDefinition {
+            registered_at: None,
+            operator_signature: None,
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             kind: OutletKind::Action,
@@ -21661,6 +21840,8 @@ mod tests {
         let handle = test_handle_for(&scp);
         // Array of objects missing required fields for TestVector deserialization.
         let def = OutletDefinition {
+            registered_at: None,
+            operator_signature: None,
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             kind: OutletKind::Action,
@@ -21691,6 +21872,8 @@ mod tests {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
         let def = OutletDefinition {
+            registered_at: None,
+            operator_signature: None,
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             kind: OutletKind::Action,
@@ -21727,6 +21910,8 @@ mod tests {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
         let def = OutletDefinition {
+            registered_at: None,
+            operator_signature: None,
             name: "test-outlet".to_owned(),
             description: "desc".to_owned(),
             kind: OutletKind::Action,
@@ -21855,6 +22040,60 @@ mod tests {
         }
     }
 
+    /// The Ed25519 key every fixture outlet's operator DID encodes.
+    fn test_operator_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32])
+    }
+
+    /// Builds a definition whose `operator_signature` the fixture operator
+    /// produced out of band over the exact registration body the bridge builds
+    /// (§5.4.1). Mirrors the third-party-operator path: the caller pins
+    /// `registered_at` so the operator and the bridge digest the same bytes.
+    fn signed_outlet_definition(name: &str, kind: OutletKind) -> OutletDefinition {
+        let key = test_operator_key();
+        let operator_did = scp_did::did_dht_from_public_key(&key.verifying_key().to_bytes());
+        let input_schema_json =
+            r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                .to_owned();
+        let output_schema_json = r#"{"type":"object"}"#.to_owned();
+        let registered_at = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+
+        let mut probe = scp_core::context::outlets::OutletRegistration {
+            outlet_id: scp_ffi_common::outlet_id::generate_outlet_id(name),
+            kind: kind.into(),
+            name: name.to_owned(),
+            description: "probes registered_at value".to_owned(),
+            schema: scp_core::context::outlets::OutletSchema {
+                input_schema: serde_json::from_str(&input_schema_json).expect("valid schema JSON"),
+                output_schema: serde_json::from_str(&output_schema_json)
+                    .expect("valid schema JSON"),
+                aggregate_schema: None,
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: operator_did.clone(),
+            cost: None,
+            message_catalog: Vec::new(),
+            registered_at,
+            signature: Vec::new(),
+        };
+        scp_core::context::outlets::sign_outlet_registration(&mut probe, &key);
+
+        OutletDefinition {
+            registered_at: Some(registered_at),
+            operator_signature: Some(probe.signature),
+            name: name.to_owned(),
+            description: "probes registered_at value".to_owned(),
+            kind,
+            input_schema_json,
+            output_schema_json,
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: operator_did.0,
+            cost: None,
+        }
+    }
+
     /// `registered_at` on an outlet registered via the `UniFFI` bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
     /// Calls the actual `outlet_register` bridge function and inspects the
@@ -21863,19 +22102,7 @@ mod tests {
     async fn registered_at_is_seconds_epoch() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-        let def = OutletDefinition {
-            name: "timestamp-probe".to_owned(),
-            description: "probes registered_at value".to_owned(),
-            kind: OutletKind::Action,
-            input_schema_json:
-                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
-                    .to_owned(),
-            output_schema_json: r#"{"type":"object"}"#.to_owned(),
-            test_vectors_json: None,
-            implementation_hash: None,
-            operator_did: "did:dht:z6MkTestUser".to_owned(),
-            cost: None,
-        };
+        let def = signed_outlet_definition("timestamp-probe", OutletKind::Action);
 
         let outlet_id = scp
             .outlet_register(handle.clone(), def)
@@ -21901,19 +22128,7 @@ mod tests {
     async fn register_query_outlet_round_trips_kind() {
         let scp = scp_test();
         let handle = test_handle_for(&scp);
-        let def = OutletDefinition {
-            name: "query-probe".to_owned(),
-            description: "probes kind round-trip".to_owned(),
-            kind: OutletKind::Query,
-            input_schema_json:
-                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
-                    .to_owned(),
-            output_schema_json: r#"{"type":"object"}"#.to_owned(),
-            test_vectors_json: None,
-            implementation_hash: None,
-            operator_did: "did:dht:z6MkTestUser".to_owned(),
-            cost: None,
-        };
+        let def = signed_outlet_definition("query-probe", OutletKind::Query);
 
         let outlet_id = scp
             .outlet_register(handle.clone(), def)
@@ -21923,6 +22138,54 @@ mod tests {
         let registry = handle.outlet_registry.lock().await;
         let reg = registry.get(&outlet_id).expect("registered");
         assert_eq!(reg.kind, scp_core::context::outlets::OutletKind::Query);
+    }
+
+    /// The `UniFFI` bridge refuses to register an outlet naming an operator
+    /// whose key it does not hold, instead of writing an empty signature the
+    /// registry would then have to accept on faith.
+    #[tokio::test]
+    async fn outlet_register_fails_closed_for_an_operator_the_bridge_cannot_sign_for() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+        let mut def = signed_outlet_definition("unsignable-probe", OutletKind::Action);
+        def.operator_signature = None;
+        def.registered_at = None;
+
+        let err = scp
+            .outlet_register(handle.clone(), def)
+            .await
+            .expect_err("a registration the bridge cannot sign for must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("operator_signature"),
+            "the refusal must tell the caller how to supply the operator's signature: {msg}"
+        );
+
+        let registry = handle.outlet_registry.lock().await;
+        assert_eq!(
+            registry.len(),
+            0,
+            "a refused registration must not reach the registry"
+        );
+    }
+
+    /// A caller-supplied signature of the wrong width is refused at the bridge
+    /// boundary rather than handed to the registry.
+    #[tokio::test]
+    async fn outlet_register_rejects_a_supplied_signature_of_the_wrong_width() {
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
+        let mut def = signed_outlet_definition("badsig-probe", OutletKind::Action);
+        def.operator_signature = Some(vec![0x01; 32]);
+
+        let err = scp
+            .outlet_register(handle.clone(), def)
+            .await
+            .expect_err("32 bytes is not an Ed25519 signature");
+        assert!(
+            format!("{err}").contains("64"),
+            "the refusal must state the required width: {err}"
+        );
     }
 
     /// The `UniFFI` `OutletKind` → core `OutletKind` mapping is exact.
@@ -24707,6 +24970,9 @@ mod tests {
         /// otherwise-default fields. Mirrors the `PyO3` e2e's `params_a` / `params_b`.
         fn saga_context_params(ceiling: &[&str]) -> ContextParams {
             ContextParams {
+                participation_requirements_json: None,
+                capability_requirements_json: None,
+                sybil_policy_json: None,
                 mode: ContextMode::Encrypted,
                 ceiling: ceiling.iter().map(|s| (*s).to_owned()).collect(),
                 ceiling_policy: CeilingPolicy::Immutable,
@@ -24959,6 +25225,8 @@ mod tests {
             // matches the governance registration), then attach the deterministic
             // handler the executor snapshots at Commit-B.
             let definition = OutletDefinition {
+                registered_at: None,
+                operator_signature: None,
                 name: outlet_name.to_owned(),
                 description: format!("Outlet: {outlet_name}"),
                 kind: OutletKind::Action,
@@ -25137,6 +25405,8 @@ mod tests {
             // output schema — but DO NOT attach a handler. The absence of a handler
             // is what drives the executor's schema-only echo branch.
             let definition = OutletDefinition {
+                registered_at: None,
+                operator_signature: None,
                 name: outlet_name.to_owned(),
                 description: format!("Outlet: {outlet_name}"),
                 kind: OutletKind::Action,

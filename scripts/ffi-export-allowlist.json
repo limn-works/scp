@@ -106,6 +106,12 @@
       "reason": "Python debug-representation dunder on bridge result types; not a protocol operation."
     },
     {
+      "name": "capability_requirements",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "getter",
+      "reason": "Getter for the capability admission requirements on a metadata result type (spec \u00a77.3.4.4)."
+    },
+    {
       "name": "ceiling",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",
@@ -232,6 +238,12 @@
       "reason": "Getter for the sealed-invitation delivery flag on the PyInviteMemberOutcome result type (ADR-049 Phase 2J / FFI-02 Option A). Not an operation."
     },
     {
+      "name": "participation_requirements",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "getter",
+      "reason": "Getter for the participation admission requirements on a metadata result type (spec \u00a77.3.2.1)."
+    },
+    {
       "name": "promotion_policy",
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",
@@ -260,6 +272,12 @@
       "path": "crates/scp-ffi/src/context.rs",
       "kind": "getter",
       "reason": "Getter for a context/handle state on a result type."
+    },
+    {
+      "name": "sybil_policy",
+      "path": "crates/scp-ffi/src/context.rs",
+      "kind": "getter",
+      "reason": "Getter for the per-context Sybil resistance policy on a metadata result type (spec §9.3)."
     },
     {
       "name": "template_id",

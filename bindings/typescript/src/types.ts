@@ -78,8 +78,17 @@ export function outletCall(outletId: string): string {
 export interface ContextParams {
   /** Capability ceiling — maximum capabilities available in this context. */
   readonly ceiling: readonly string[];
-  /** Outlet definitions to register at context creation. */
-  readonly outlets?: readonly OutletDefinition[];
+  /**
+   * Outlet registrations declared at context creation, each a spec section
+   * 5.4.1 registration object.
+   *
+   * Every entry carries `operator_did` and the operator's 64-byte `signature`
+   * over the section 5.4.1 V2 canonical digest; context creation fails when a
+   * signature does not verify against the key `operator_did` encodes. A caller
+   * that cannot sign registers the outlet through `outletRegister` after
+   * creation instead, where the bridge signs with the operator's own key.
+   */
+  readonly outlets?: readonly Readonly<Record<string, unknown>>[];
   /** Role definitions: role name to capability list mapping. */
   readonly roles?: Readonly<Record<string, readonly string[]>>;
   /** Time-to-live in seconds. Omit for persistent contexts. */
@@ -126,6 +135,30 @@ export interface ContextParams {
    * permit `RevokeAccess` rules.
    */
   readonly consequenceConfig?: ConsequenceConfig;
+  /**
+   * Participation admission requirements (spec section 7.3.2.1).
+   *
+   * A joining member must present participation attestations satisfying every
+   * entry. Omit for a context that requires no participation attestation.
+   * Each entry is a `RequireParticipation` object: `fact`, `threshold`,
+   * `max_age_secs`, `min_contexts`.
+   */
+  readonly participationRequirements?: readonly Readonly<Record<string, unknown>>[];
+  /**
+   * Capability admission requirements (spec section 7.3.4.4, ADR-041 AC6).
+   *
+   * Each entry pairs a `capability` URI with the `verification_level` a joining
+   * agent must reach (`self_attested` or `challenge_verified`). Omit for a
+   * context that requires no verified capability.
+   */
+  readonly capabilityRequirements?: readonly Readonly<Record<string, unknown>>[];
+  /**
+   * Per-context Sybil resistance policy (spec section 9.3).
+   *
+   * Evaluated against a joining member's trust signals. Omit for a context that
+   * admits any valid DID.
+   */
+  readonly sybilPolicy?: Readonly<Record<string, unknown>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -717,6 +750,28 @@ export interface OutletDefinition {
   readonly implementationHash?: Uint8Array;
   /** Optional per-invocation cost metadata (spec section 5.4.1). */
   readonly cost?: OutletCost;
+  /**
+   * The operator's 64-byte Ed25519 signature over the spec section 5.4.1 V2
+   * canonical registration digest.
+   *
+   * Supply this when registering an outlet operated by someone else, whose key
+   * this SDK instance does not hold. Omit it when `operator` names an identity
+   * created on this instance: the bridge then signs the registration with that
+   * identity's own key. Registration fails when the bridge can neither sign nor
+   * read a supplied signature, because the protocol verifies the signature
+   * against the key `operator` encodes.
+   */
+  readonly operatorSignature?: Uint8Array;
+  /**
+   * Registration timestamp, in seconds since the Unix epoch.
+   *
+   * An operator signing out of band chooses this value and hands it to the
+   * registrant alongside `operatorSignature`, because the spec section 5.4.1
+   * preimage commits `registered_at`; a bridge-chosen clock reading would
+   * produce a digest the operator never signed. Omit it to let the bridge stamp
+   * the current second.
+   */
+  readonly registeredAt?: number;
 }
 
 /** Per-invocation cost metadata for an outlet (spec section 5.4.1). */

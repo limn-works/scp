@@ -146,6 +146,22 @@ pub struct NapiOutletDefinition {
     pub implementation_hash: Option<Vec<u8>>,
     /// Optional per-invocation cost metadata (spec §5.4.1).
     pub cost: Option<NapiOutletCost>,
+    /// The operator's 64-byte Ed25519 signature over the §5.4.1 V2 canonical
+    /// registration digest.
+    ///
+    /// Supply this when registering an outlet operated by someone else, whose
+    /// key this bridge instance does not hold. Leave it absent when
+    /// `operator_did` names an identity created on this bridge instance: the
+    /// bridge then signs the registration with that identity's own key.
+    pub operator_signature: Option<Vec<u8>>,
+    /// Registration timestamp, in seconds since the Unix epoch.
+    ///
+    /// An operator signing out of band chooses this value and hands it to the
+    /// registrant alongside `operator_signature`, because the §5.4.1 preimage
+    /// commits `registered_at`; a bridge-chosen clock reading would produce a
+    /// digest the operator never signed. Absent, the bridge stamps the current
+    /// second.
+    pub registered_at: Option<i64>,
 }
 
 /// Per-invocation cost metadata for an outlet (spec §5.4.1).
@@ -245,8 +261,74 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
 // Bridge functions
 // ---------------------------------------------------------------------------
 
+/// Writes the §5.4.1 operator signature onto `registration`.
+///
+/// A caller registering an outlet it operates itself supplies no
+/// `operator_signature`; this function then signs the canonical registration
+/// digest with the operator's own identity key from this bridge instance's key
+/// custody. A caller registering someone else's outlet passes that operator's
+/// 64-byte signature, which this function accepts after a width check.
+///
+/// When the caller supplies neither, the function returns an error rather than
+/// leaving `signature` empty, because `register_outlet` verifies the signature
+/// against the key `operator_did` encodes and an empty signature would name an
+/// operator the protocol never verified.
+async fn attach_operator_signature(
+    bi: &crate::runtime::NapiBridgeInstance,
+    registration: &mut scp_core::context::outlets::OutletRegistration,
+    supplied: Option<Vec<u8>>,
+) -> napi::Result<()> {
+    use scp_ffi_common::outlet_signature as sig;
+    use scp_platform::traits::KeyCustody as _;
+
+    let operator_did = registration.operator_did.0.clone();
+
+    let signature = if let Some(bytes) = supplied {
+        sig::accept_supplied_signature(&operator_did, bytes).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: e.to_string(),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?
+    } else {
+        let preimage = sig::registration_signing_preimage(registration);
+        // Clone custody and the key handle out of the closure so no DashMap
+        // shard guard is held across the async sign.
+        let (custody, key) = crate::runtime::with_identity(bi, &operator_did, |entry| {
+            Ok((
+                std::sync::Arc::clone(&entry.custody),
+                entry.identity.identity_key,
+            ))
+        })
+        .map_err(|_not_registered| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: sig::operator_key_unavailable(&operator_did).to_string(),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?;
+        let produced = custody
+            .sign(&key, &preimage)
+            .await
+            .map_err(|e| {
+                napi::Error::from(ScpNapiError::Outlet {
+                    message: sig::custody_signing_failed(&operator_did, &e.to_string()).to_string(),
+                    code: codes::OUTLET_6001.to_owned(),
+                })
+            })?
+            .into_bytes();
+        sig::accept_custody_signature(&operator_did, produced).map_err(|e| {
+            napi::Error::from(ScpNapiError::Outlet {
+                message: e.to_string(),
+                code: codes::OUTLET_6001.to_owned(),
+            })
+        })?
+    };
+
+    registration.signature = signature;
+    Ok(())
+}
+
 /// Per-bridge-instance implementation of [`outlet_register`].
-#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn outlet_register_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -301,7 +383,21 @@ pub(crate) async fn outlet_register_on(
         )
         .transpose()?;
 
-    let core_registration = scp_core::context::outlets::OutletRegistration {
+    let supplied_signature = definition.operator_signature.clone();
+
+    let registered_at: u64 = match definition.registered_at {
+        None => scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+        Some(seconds) => u64::try_from(seconds).map_err(|_| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: "registeredAt must be a non-negative count of seconds since the \
+                          Unix epoch (§5.4.1)"
+                    .to_owned(),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?,
+    };
+
+    let mut core_registration = scp_core::context::outlets::OutletRegistration {
         outlet_id,
         // §5.4.2: the caller-supplied semantic class selects the invocation
         // capability stem (`outlet_query:` vs `outlet_call:`).
@@ -318,9 +414,14 @@ pub(crate) async fn outlet_register_on(
         operator_did: definition.operator_did.into(),
         cost,
         message_catalog: Vec::new(),
-        registered_at: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+        registered_at,
         signature: Vec::new(),
     };
+
+    // §5.4.1: the operator signs the registration. `register_outlet` verifies
+    // that signature against the key `operator_did` encodes, so the bridge
+    // fills it in before it calls that function.
+    attach_operator_signature(bi, &mut core_registration, supplied_signature).await?;
 
     // Register the outlet in the context's outlet registry.
     let registered_id = crate::runtime::with_context(bi, &context_id, |rt| {
@@ -1680,6 +1781,64 @@ mod tests {
         assert!(msg.contains("got 0"));
     }
 
+    /// The Ed25519 key every fixture outlet's operator DID encodes.
+    fn test_operator_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32])
+    }
+
+    /// The `did:dht` DID that [`test_operator_key`] produces.
+    fn test_operator_did() -> String {
+        scp_did::did_dht_from_public_key(&test_operator_key().verifying_key().to_bytes()).0
+    }
+
+    /// Builds a definition whose `operator_signature` the fixture operator
+    /// produced out of band over the exact registration body the bridge builds
+    /// (§5.4.1). Mirrors the third-party-operator path: the caller pins
+    /// `registered_at` so the operator and the bridge digest the same bytes.
+    fn signed_definition(name: &str, kind: NapiOutletKind) -> NapiOutletDefinition {
+        let input_schema_json =
+            r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
+                .to_owned();
+        let output_schema_json = r#"{"type":"object"}"#.to_owned();
+        let now = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+        let registered_at = i64::try_from(now).expect("the current second fits in i64");
+
+        let mut probe = scp_core::context::outlets::OutletRegistration {
+            outlet_id: scp_ffi_common::outlet_id::generate_outlet_id(name),
+            kind: kind.into(),
+            name: name.to_owned(),
+            description: "probes registered_at value".to_owned(),
+            schema: scp_core::context::outlets::OutletSchema {
+                input_schema: serde_json::from_str(&input_schema_json).expect("valid schema JSON"),
+                output_schema: serde_json::from_str(&output_schema_json)
+                    .expect("valid schema JSON"),
+                aggregate_schema: None,
+            },
+            implementation_hash: [0u8; 32],
+            test_vectors: vec![],
+            operator_did: test_operator_did().into(),
+            cost: None,
+            message_catalog: Vec::new(),
+            registered_at: now,
+            signature: Vec::new(),
+        };
+        scp_core::context::outlets::sign_outlet_registration(&mut probe, &test_operator_key());
+
+        NapiOutletDefinition {
+            registered_at: Some(registered_at),
+            operator_signature: Some(probe.signature),
+            name: name.to_owned(),
+            description: "probes registered_at value".to_owned(),
+            kind,
+            input_schema_json,
+            output_schema_json,
+            test_vectors_json: None,
+            implementation_hash: None,
+            operator_did: test_operator_did(),
+            cost: None,
+        }
+    }
+
     /// `registered_at` on an outlet registered via the NAPI bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
     /// Calls the actual `outlet_register` bridge function and inspects the
@@ -1694,19 +1853,7 @@ mod tests {
 
         let handle = NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator_did.to_owned());
 
-        let definition = NapiOutletDefinition {
-            name: "napi-timestamp-probe".to_owned(),
-            description: "probes registered_at value".to_owned(),
-            kind: NapiOutletKind::Action,
-            input_schema_json:
-                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
-                    .to_owned(),
-            output_schema_json: r#"{"type":"object"}"#.to_owned(),
-            test_vectors_json: None,
-            implementation_hash: None,
-            operator_did: creator_did.to_owned(),
-            cost: None,
-        };
+        let definition = signed_definition("napi-timestamp-probe", NapiOutletKind::Action);
 
         let outlet_id = outlet_register_on(&bi, &handle, definition)
             .await
@@ -1744,19 +1891,7 @@ mod tests {
         let creator_did = "did:dht:z6MkNapiKindTest";
         let handle = NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator_did.to_owned());
 
-        let definition = NapiOutletDefinition {
-            name: "napi-query-probe".to_owned(),
-            description: "probes kind round-trip".to_owned(),
-            kind: NapiOutletKind::Query,
-            input_schema_json:
-                r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
-                    .to_owned(),
-            output_schema_json: r#"{"type":"object"}"#.to_owned(),
-            test_vectors_json: None,
-            implementation_hash: None,
-            operator_did: creator_did.to_owned(),
-            cost: None,
-        };
+        let definition = signed_definition("napi-query-probe", NapiOutletKind::Query);
 
         let outlet_id = outlet_register_on(&bi, &handle, definition)
             .await
@@ -2049,6 +2184,8 @@ mod tests {
         /// handler's response validates at Commit-B.
         fn build_napi_outlet_def(outlet_name: &str, owner: &str) -> NapiOutletDefinition {
             NapiOutletDefinition {
+                registered_at: None,
+                operator_signature: None,
             name: outlet_name.to_owned(),
             description: format!("Outlet: {outlet_name}"),
             kind: NapiOutletKind::Action,

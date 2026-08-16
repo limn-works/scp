@@ -193,6 +193,102 @@ impl PySagaResult {
 // Bridge helpers — per-bridge implementations used by PyScp methods
 // ---------------------------------------------------------------------------
 
+/// Writes the §5.4.1 operator signature onto `registration`.
+///
+/// A caller registering an outlet it operates itself supplies no
+/// `operator_signature`; this function then signs the canonical registration
+/// digest with the operator's own identity key from this bridge instance's key
+/// custody. A caller registering someone else's outlet passes that operator's
+/// 64-byte signature, which this function accepts after a width check.
+///
+/// When the caller supplies neither, the function returns an error rather than
+/// leaving `signature` empty, because `register_outlet` verifies the signature
+/// against the key `operator_did` encodes and an empty signature would name an
+/// operator the protocol never verified.
+fn attach_operator_signature(
+    bi: &PyBridgeInstance,
+    registration: &mut scp_core::context::outlets::OutletRegistration,
+    supplied: Option<Vec<u8>>,
+) -> PyResult<()> {
+    use scp_ffi_common::outlet_signature as sig;
+    use scp_platform::traits::KeyCustody as _;
+
+    let operator_did = registration.operator_did.0.clone();
+
+    let signature = if let Some(bytes) = supplied {
+        sig::accept_supplied_signature(&operator_did, bytes)
+            .map_err(|e| ScpPyError::validation(e.to_string()))?
+    } else {
+        let preimage = sig::registration_signing_preimage(registration);
+        let rt = crate::runtime()?;
+        // Clone custody and the key handle out of the closure so no DashMap
+        // shard guard is held across the async sign (#1940).
+        let (custody, key) = crate::runtime::with_identity(bi, &operator_did, |entry| {
+            Ok((entry.custody.clone(), entry.identity.identity_key))
+        })
+        .map_err(|_not_registered| {
+            ScpPyError::validation(sig::operator_key_unavailable(&operator_did).to_string())
+        })?;
+        let produced = rt
+            .block_on(async move { custody.sign(&key, &preimage).await })
+            .map_err(|e| {
+                ScpPyError::context(
+                    sig::custody_signing_failed(&operator_did, &e.to_string()).to_string(),
+                )
+            })?
+            .into_bytes();
+        sig::accept_custody_signature(&operator_did, produced)
+            .map_err(|e| ScpPyError::context(e.to_string()))?
+    };
+
+    registration.signature = signature;
+    Ok(())
+}
+
+/// Reads the two §5.4.1 fields an out-of-band operator signature depends on:
+/// the registration timestamp and the signature itself.
+///
+/// An operator signing out of band chooses `registered_at` and hands it to the
+/// registrant alongside the signature, because the §5.4.1 preimage commits
+/// `registered_at`; a bridge-chosen clock reading would produce a digest the
+/// operator never signed. When the caller supplies no timestamp the bridge
+/// stamps the current second, and when it supplies no signature the bridge
+/// signs with the operator's own key from key custody.
+///
+/// # Errors
+///
+/// Returns a validation error when `registered_at` is not a non-negative
+/// integer or `operator_signature` is not bytes.
+fn extract_operator_signature_inputs(
+    registration: &Bound<'_, PyDict>,
+) -> PyResult<(u64, Option<Vec<u8>>)> {
+    let registered_at: u64 = match registration.get_item("registered_at")? {
+        None => scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+        Some(value) if value.is_none() => scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+        Some(value) => value.extract::<u64>().map_err(|_| {
+            ScpPyError::validation(
+                "'registered_at' must be a non-negative integer count of seconds \
+                 since the Unix epoch (§5.4.1)"
+                    .to_owned(),
+            )
+        })?,
+    };
+
+    let supplied_signature: Option<Vec<u8>> = match registration.get_item("operator_signature")? {
+        None => None,
+        Some(value) if value.is_none() => None,
+        Some(value) => Some(value.extract::<Vec<u8>>().map_err(|_| {
+            ScpPyError::validation(
+                "'operator_signature' must be bytes — the operator's 64-byte Ed25519 \
+                 signature over the canonical registration digest (§5.4.1)"
+                    .to_owned(),
+            )
+        })?),
+    };
+
+    Ok((registered_at, supplied_signature))
+}
+
 /// Registers an outlet in an SCP context on the given bridge instance.
 ///
 /// See ADR-013 §4.
@@ -281,8 +377,10 @@ fn outlet_register_impl(
     // Shared with every other bridge via `scp_ffi_common::outlet_id`.
     let outlet_id = scp_ffi_common::outlet_id::generate_outlet_id(&name);
 
+    let (registered_at, supplied_signature) = extract_operator_signature_inputs(registration)?;
+
     // Build the scp-core OutletRegistration.
-    let core_registration = scp_core::context::outlets::OutletRegistration {
+    let mut core_registration = scp_core::context::outlets::OutletRegistration {
         outlet_id,
         kind,
         name,
@@ -297,9 +395,14 @@ fn outlet_register_impl(
         operator_did: operator_did.into(),
         cost,
         message_catalog: Vec::new(),
-        registered_at: scp_clock::Clock::now_secs(&scp_clock::SystemClock),
+        registered_at,
         signature: vec![],
     };
+
+    // §5.4.1: the operator signs the registration. `register_outlet` verifies
+    // that signature against the key `operator_did` encodes, so the bridge
+    // fills it in before it calls that function.
+    attach_operator_signature(bi, &mut core_registration, supplied_signature)?;
 
     // Look up the context runtime and register the outlet.
     let registered_id = crate::runtime::with_context(bi, context_id, |rt| {
@@ -2721,68 +2824,236 @@ mod tests {
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
     /// Calls the actual `PyScp::outlet_register` bridge method and inspects the
     /// stored `OutletRegistration`. Catches the original bug from issue #871.
+    /// Fills `dict` with a registration body whose schema meets the §6.2
+    /// specificity floor (at least two properties on one side).
+    fn fill_registration_dict(py: Python<'_>, dict: &Bound<'_, PyDict>, operator_did: &str) {
+        dict.set_item("name", "timestamp-probe").unwrap();
+        dict.set_item("description", "probes registered_at value")
+            .unwrap();
+        dict.set_item("operator_did", operator_did).unwrap();
+
+        let schema = PyDict::new(py);
+        let input = PyDict::new(py);
+        input.set_item("type", "object").unwrap();
+        let props = PyDict::new(py);
+        let str_type = PyDict::new(py);
+        str_type.set_item("type", "string").unwrap();
+        props.set_item("a", str_type).unwrap();
+        let num_type = PyDict::new(py);
+        num_type.set_item("type", "number").unwrap();
+        props.set_item("b", num_type).unwrap();
+        input.set_item("properties", props).unwrap();
+        schema.set_item("input_schema", input).unwrap();
+        let output = PyDict::new(py);
+        output.set_item("type", "object").unwrap();
+        schema.set_item("output_schema", output).unwrap();
+        dict.set_item("schema", schema).unwrap();
+    }
+
     #[test]
     fn registered_at_is_seconds_epoch() {
         // Use a unique context ID to avoid collisions with concurrent tests.
-        let ctx_id = format!("ctx-ts-test-{}", std::process::id());
-        let creator_did = "did:dht:z6MkTestTimestamp";
+        let ctx_id = format!("ctx-ts-test-{}", uuid::Uuid::new_v4());
 
         let scp = default_scp();
-        let bi = &*scp.inner;
-
-        // Register FFI state so the context exists in the runtime registry.
-        crate::runtime::register_ffi_state(bi, &ctx_id, creator_did, &[]).unwrap();
+        let bi = std::sync::Arc::clone(&scp.inner);
 
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let dict = PyDict::new(py);
-            dict.set_item("name", "timestamp-probe").unwrap();
-            dict.set_item("description", "probes registered_at value")
-                .unwrap();
-            dict.set_item("operator_did", creator_did).unwrap();
+            // §5.4.1: the bridge signs the registration with the operator's own
+            // key, so the operator must be an identity this instance holds.
+            let operator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = operator.did().to_owned();
+            crate::runtime::register_ffi_state(&bi, &ctx_id, &creator_did, &[]).unwrap();
 
-            // Schema must meet the specificity floor (>=2 properties on at
-            // least one side).
-            let schema = PyDict::new(py);
-            let input = PyDict::new(py);
-            input.set_item("type", "object").unwrap();
-            let props = PyDict::new(py);
-            let str_type = PyDict::new(py);
-            str_type.set_item("type", "string").unwrap();
-            props.set_item("a", str_type).unwrap();
-            let num_type = PyDict::new(py);
-            num_type.set_item("type", "number").unwrap();
-            props.set_item("b", num_type).unwrap();
-            input.set_item("properties", props).unwrap();
-            schema.set_item("input_schema", input).unwrap();
-            let output = PyDict::new(py);
-            output.set_item("type", "object").unwrap();
-            schema.set_item("output_schema", output).unwrap();
-            dict.set_item("schema", schema).unwrap();
+            let dict = PyDict::new(py);
+            fill_registration_dict(py, &dict, &creator_did);
 
             let outlet_id = scp
                 .outlet_register(&ctx_id, &dict.as_borrowed())
                 .expect("outlet_register should succeed");
 
             // Read the stored registration back from the runtime registry.
-            let registered_at = crate::runtime::with_ffi_state(bi, &ctx_id, |state| {
-                let reg = state
-                    .outlet_registry
-                    .get(&outlet_id)
-                    .expect("outlet should exist in registry after successful registration");
-                Ok(reg.registered_at)
-            })
-            .unwrap();
+            let (registered_at, signature_len) =
+                crate::runtime::with_ffi_state(&bi, &ctx_id, |state| {
+                    let reg = state
+                        .outlet_registry
+                        .get(&outlet_id)
+                        .expect("outlet should exist in registry after successful registration");
+                    Ok((reg.registered_at, reg.signature.len()))
+                })
+                .unwrap();
 
             assert!(
                 registered_at > 1_700_000_000 && registered_at < 2_000_000_000,
                 "registered_at should be seconds-epoch (got {registered_at}); \
                  milliseconds would be ~1.7 trillion, hardcoded 0 would fail lower bound"
             );
-        });
+            assert_eq!(
+                signature_len, 64,
+                "the stored registration must carry the operator's 64-byte §5.4.1 signature"
+            );
 
-        // Clean up global state.
-        crate::runtime::remove_ffi_state(bi, &ctx_id);
+            crate::runtime::remove_ffi_state(&bi, &ctx_id);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.4.1 operator-signature attachment
+    // -----------------------------------------------------------------------
+
+    /// The bridge refuses to register an outlet naming an operator whose key it
+    /// does not hold, instead of writing an empty signature the registry would
+    /// then have to accept on faith.
+    #[test]
+    fn outlet_register_fails_closed_for_an_operator_the_bridge_cannot_sign_for() {
+        let ctx_id = format!("ctx-unsigned-{}", uuid::Uuid::new_v4());
+
+        let scp = default_scp();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let creator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = creator.did().to_owned();
+            crate::runtime::register_ffi_state(&bi, &ctx_id, &creator_did, &[]).unwrap();
+
+            // A well-formed did:dht that names nobody this instance holds.
+            let stranger = scp_did::did_dht_from_public_key(
+                &ed25519_dalek::SigningKey::from_bytes(&[0x77; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            );
+
+            let dict = PyDict::new(py);
+            fill_registration_dict(py, &dict, &stranger.0);
+
+            let err = scp
+                .outlet_register(&ctx_id, &dict.as_borrowed())
+                .expect_err("a registration the bridge cannot sign for must be refused");
+            let message = err.to_string();
+            assert!(
+                message.contains("operator_signature"),
+                "the refusal must tell the caller how to supply the operator's \
+                 signature: {message}"
+            );
+
+            let stored = crate::runtime::with_ffi_state(&bi, &ctx_id, |state| {
+                Ok(state.outlet_registry.len())
+            })
+            .unwrap();
+            assert_eq!(
+                stored, 0,
+                "a refused registration must not reach the registry"
+            );
+
+            crate::runtime::remove_ffi_state(&bi, &ctx_id);
+        });
+    }
+
+    /// A caller registering another party's outlet supplies that operator's
+    /// signature, and the bridge accepts it.
+    #[test]
+    fn outlet_register_accepts_a_supplied_operator_signature() {
+        let ctx_id = format!("ctx-supplied-sig-{}", uuid::Uuid::new_v4());
+
+        let scp = default_scp();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let creator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = creator.did().to_owned();
+            crate::runtime::register_ffi_state(&bi, &ctx_id, &creator_did, &[]).unwrap();
+
+            let operator_key = ed25519_dalek::SigningKey::from_bytes(&[0x88; 32]);
+            let operator_did =
+                scp_did::did_dht_from_public_key(&operator_key.verifying_key().to_bytes());
+
+            // Build the same registration body the bridge builds, so the
+            // out-of-band signature covers the identical canonical digest.
+            let registered_at = scp_clock::Clock::now_secs(&scp_clock::SystemClock);
+            let mut probe = scp_core::context::outlets::OutletRegistration {
+                outlet_id: scp_ffi_common::outlet_id::generate_outlet_id("timestamp-probe"),
+                kind: scp_core::context::outlets::OutletKind::default(),
+                name: "timestamp-probe".to_owned(),
+                description: "probes registered_at value".to_owned(),
+                schema: scp_core::context::outlets::OutletSchema {
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"a": {"type": "string"}, "b": {"type": "number"}}
+                    }),
+                    output_schema: serde_json::json!({"type": "object"}),
+                    aggregate_schema: None,
+                },
+                implementation_hash: [0u8; 32],
+                test_vectors: vec![],
+                operator_did: operator_did.clone(),
+                cost: None,
+                message_catalog: Vec::new(),
+                registered_at,
+                signature: Vec::new(),
+            };
+            scp_core::context::outlets::sign_outlet_registration(&mut probe, &operator_key);
+
+            let dict = PyDict::new(py);
+            fill_registration_dict(py, &dict, &operator_did.0);
+            dict.set_item("registered_at", registered_at).unwrap();
+            dict.set_item("operator_signature", probe.signature.clone())
+                .unwrap();
+
+            let outlet_id = scp
+                .outlet_register(&ctx_id, &dict.as_borrowed())
+                .expect("a registration carrying the operator's own signature is accepted");
+
+            let stored_operator = crate::runtime::with_ffi_state(&bi, &ctx_id, |state| {
+                Ok(state
+                    .outlet_registry
+                    .get(&outlet_id)
+                    .expect("outlet is stored")
+                    .operator_did
+                    .clone())
+            })
+            .unwrap();
+            assert_eq!(
+                stored_operator, operator_did,
+                "the stored registration names the operator that signed it"
+            );
+
+            crate::runtime::remove_ffi_state(&bi, &ctx_id);
+        });
+    }
+
+    /// A caller-supplied signature of the wrong width is refused at the bridge
+    /// boundary rather than handed to the registry.
+    #[test]
+    fn outlet_register_rejects_a_supplied_signature_of_the_wrong_width() {
+        let ctx_id = format!("ctx-badsig-{}", uuid::Uuid::new_v4());
+
+        let scp = default_scp();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let creator = scp.identity_create(py, "in_memory", None).unwrap();
+            let creator_did = creator.did().to_owned();
+            crate::runtime::register_ffi_state(&bi, &ctx_id, &creator_did, &[]).unwrap();
+
+            let dict = PyDict::new(py);
+            fill_registration_dict(py, &dict, &creator_did);
+            dict.set_item("operator_signature", vec![0x01u8; 32])
+                .unwrap();
+
+            let err = scp
+                .outlet_register(&ctx_id, &dict.as_borrowed())
+                .expect_err("32 bytes is not an Ed25519 signature");
+            assert!(
+                err.to_string().contains("64"),
+                "the refusal must state the required width: {err}"
+            );
+
+            crate::runtime::remove_ffi_state(&bi, &ctx_id);
+        });
     }
 
     // ------------------------------------------------------------------

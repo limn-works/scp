@@ -30457,8 +30457,23 @@ mod open_outlet_stream_tests {
         role_state
     }
 
+    /// The Ed25519 key every fixture outlet's operator DID encodes.
+    fn test_operator_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32])
+    }
+
+    /// Points `registration.operator_did` at the fixture operator and writes
+    /// the matching §5.4.1 signature, so `register_outlet` verifies it against
+    /// the key that DID encodes instead of rejecting an unsigned registration.
+    fn sign_as_test_operator(registration: &mut OutletRegistration) {
+        let key = test_operator_key();
+        registration.operator_did =
+            scp_did::did_dht_from_public_key(&key.verifying_key().to_bytes());
+        scp_protocol::context::outlets::sign_outlet_registration(registration, &key);
+    }
+
     fn registration() -> OutletRegistration {
-        OutletRegistration {
+        let mut registration = OutletRegistration {
             outlet_id: "calculator".to_owned(),
             kind: OutletKind::Action,
             name: "Calculator".to_owned(),
@@ -30481,7 +30496,9 @@ mod open_outlet_stream_tests {
             message_catalog: Vec::new(),
             registered_at: 0,
             signature: Vec::new(),
-        }
+        };
+        sign_as_test_operator(&mut registration);
+        registration
     }
 
     /// Open → grant → drain N Data → signed cancel → close → assert the pump's
@@ -31484,6 +31501,9 @@ mod open_outlet_stream_tests {
             payee: DID::from("did:dht:z6MkPayee"),
             cost_formula: None,
         });
+        // Editing `cost` after `registration()` signed invalidates the §5.4.1
+        // signature, so re-sign the edited body.
+        sign_as_test_operator(&mut paid);
         let mut registry = OutletRegistry::new();
         register_outlet(&mut registry, &role_state, paid, &invoker().0)
             .expect("register paid outlet");
@@ -32210,36 +32230,41 @@ mod streaming_saga_tests {
         caps.insert(Capability::OutletCallAll);
         caps.insert(Capability::OutletRegister);
         let mut registry = OutletRegistry::new();
-        register_outlet(
-            &mut registry,
-            &role_state,
-            OutletRegistration {
-                outlet_id: SS_OUTLET.to_owned(),
-                kind: OutletKind::Action,
-                name: "Calculator".to_owned(),
-                description: "adds".to_owned(),
-                schema: OutletSchema {
-                    input_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
-                    }),
-                    output_schema: serde_json::json!({
-                        "type": "object",
-                        "properties": { "result": {"type": "number"} }
-                    }),
-                    aggregate_schema: None,
-                },
-                implementation_hash: [0xAA; 32],
-                test_vectors: vec![],
-                operator_did: DID("did:dht:z6MkStreamSagaOperator".to_owned()),
-                cost: None,
-                message_catalog: Vec::new(),
-                registered_at: 0,
-                signature: Vec::new(),
+        let mut ss_registration = OutletRegistration {
+            outlet_id: SS_OUTLET.to_owned(),
+            kind: OutletKind::Action,
+            name: "Calculator".to_owned(),
+            description: "adds".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "result": {"type": "number"} }
+                }),
+                aggregate_schema: None,
             },
-            &ss_invoker().0,
-        )
-        .expect("register streaming outlet");
+            implementation_hash: [0xAA; 32],
+            test_vectors: vec![],
+            operator_did: DID("did:dht:z6MkStreamSagaOperator".to_owned()),
+            cost: None,
+            message_catalog: Vec::new(),
+            registered_at: 0,
+            signature: Vec::new(),
+        };
+        // §5.4.1: register_outlet verifies the operator signature against the
+        // key `operator_did` encodes, so the fixture signs with a key whose
+        // did:dht it then names.
+        {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32]);
+            ss_registration.operator_did =
+                scp_did::did_dht_from_public_key(&key.verifying_key().to_bytes());
+            scp_protocol::context::outlets::sign_outlet_registration(&mut ss_registration, &key);
+        }
+        register_outlet(&mut registry, &role_state, ss_registration, &ss_invoker().0)
+            .expect("register streaming outlet");
         registry
     }
 

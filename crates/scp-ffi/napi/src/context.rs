@@ -568,6 +568,30 @@ struct ParsedContextParams {
 ///
 /// Returns `ScpNapiError::Validation` (`SCP-VALID-7000`) if the JSON is
 /// malformed or the parameters fail the common builder's validation.
+/// Normalizes one admission-policy field into the JSON string the shared
+/// context-params builder parses.
+///
+/// A caller passes the native JSON shape (an array for the two requirement
+/// lists, an object for the Sybil policy) or a JSON-encoded string; both reach
+/// the builder as a string. JSON `null` and an absent key both mean the caller
+/// declared nothing.
+///
+/// # Errors
+///
+/// Returns a validation error when the value cannot be re-serialized to JSON.
+fn admission_json(value: &serde_json::Value, field: &str) -> napi::Result<Option<String>> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s.clone())),
+        other => Ok(Some(serde_json::to_string(other).map_err(|e| {
+            NapiError::from(ScpNapiError::Validation {
+                message: format!("invalid {field}: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?)),
+    }
+}
+
 fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> {
     let params: serde_json::Value = serde_json::from_str(params_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
@@ -627,6 +651,37 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         })?),
     };
 
+    // Parse the three admission-policy declarations (spec §7.3.2.1, §7.3.4.4,
+    // §9.3). Each accepts the native JSON shape (preferred) or a JSON-encoded
+    // string, matching the consequence-rule surface above.
+    // Outlet declarations (spec §5.4.1). Each entry is a registration object
+    // carrying `operator_did` and the operator's `signature`; the shared
+    // builder verifies each signature and rejects the whole create when one
+    // fails, so a context never declares an outlet its named operator did not
+    // sign for.
+    let outlets: Vec<String> = match params["outlets"].as_array() {
+        None => Vec::new(),
+        Some(entries) => entries
+            .iter()
+            .map(|entry| {
+                serde_json::to_string(entry).map_err(|e| {
+                    NapiError::from(ScpNapiError::Validation {
+                        message: format!("invalid outlets entry: {e}"),
+                        code: codes::VALID_7000.to_owned(),
+                    })
+                })
+            })
+            .collect::<napi::Result<Vec<String>>>()?,
+    };
+
+    let participation_requirements_json = admission_json(
+        &params["participationRequirements"],
+        "participationRequirements",
+    )?;
+    let capability_requirements_json =
+        admission_json(&params["capabilityRequirements"], "capabilityRequirements")?;
+    let sybil_policy_json = admission_json(&params["sybilPolicy"], "sybilPolicy")?;
+
     // Parse minProtocolVersion: [major, minor] array or null (spec §13.4).
     let min_protocol_version = params["minProtocolVersion"].as_array().and_then(|arr| {
         let major = u8::try_from(arr.first()?.as_u64()?).ok()?;
@@ -667,6 +722,10 @@ fn parse_context_params(params_json: &str) -> napi::Result<ParsedContextParams> 
         economic_policy_json: economic_policy.clone(),
         consequence_rules_json,
         consequence_config_json,
+        participation_requirements_json,
+        capability_requirements_json,
+        sybil_policy_json,
+        outlets,
         ..Default::default()
     };
 

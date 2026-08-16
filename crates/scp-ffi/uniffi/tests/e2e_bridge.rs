@@ -51,6 +51,9 @@ use scp_ffi_uniffi::{
 /// Full capability set including context:close and role:assign for lifecycle tests.
 fn full_capability_params() -> ContextParams {
     ContextParams {
+        participation_requirements_json: None,
+        capability_requirements_json: None,
+        sybil_policy_json: None,
         mode: ContextMode::Encrypted,
         ceiling: vec![
             "messages:read".to_owned(),
@@ -78,6 +81,9 @@ fn full_capability_params() -> ContextParams {
 
 fn default_encrypted_params() -> ContextParams {
     ContextParams {
+        participation_requirements_json: None,
+        capability_requirements_json: None,
+        sybil_policy_json: None,
         mode: ContextMode::Encrypted,
         ceiling: vec![
             "messages:read".to_owned(),
@@ -702,6 +708,8 @@ async fn outlet_register_and_verify() {
         .unwrap();
 
     let definition = OutletDefinition {
+        registered_at: None,
+        operator_signature: None,
         name: "calculator".to_owned(),
         description: "A simple calculator outlet".to_owned(),
         kind: OutletKind::Action,
@@ -1100,6 +1108,9 @@ async fn context_create_with_all_governance_models() {
         GovernanceModel::TokenVoting,
     ] {
         let params = ContextParams {
+            participation_requirements_json: None,
+            capability_requirements_json: None,
+            sybil_policy_json: None,
             mode: ContextMode::Encrypted,
             ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: CeilingPolicy::Immutable,
@@ -1134,6 +1145,9 @@ async fn context_create_with_all_memory_scopes() {
         MemoryScope::Full,
     ] {
         let params = ContextParams {
+            participation_requirements_json: None,
+            capability_requirements_json: None,
+            sybil_policy_json: None,
             mode: ContextMode::Encrypted,
             ceiling: vec!["messages:read".to_owned()],
             ceiling_policy: CeilingPolicy::Immutable,

@@ -744,6 +744,9 @@ mod tests {
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
+            participation_requirements_json: None,
+            capability_requirements_json: None,
+            sybil_policy_json: None,
             mode: bridge::ContextMode::Encrypted,
             ceiling: Vec::new(),
             ceiling_policy: bridge::CeilingPolicy::Immutable,
@@ -807,6 +810,9 @@ mod tests {
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
+            participation_requirements_json: None,
+            capability_requirements_json: None,
+            sybil_policy_json: None,
             mode: bridge::ContextMode::Encrypted,
             ceiling: Vec::new(),
             ceiling_policy: bridge::CeilingPolicy::Immutable,

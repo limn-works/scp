@@ -1058,7 +1058,32 @@ class SCP:
         return await asyncio.to_thread(self._native.context_close, handle, identity_did)
 
     async def context_create(self, identity_did: str, params: dict[str, Any]) -> Any:
-        """Delegate to ``_scp_core.SCP.context_create`` (returns :class:`Context`)."""
+        """Delegate to ``_scp_core.SCP.context_create`` (returns :class:`Context`).
+
+        ``params`` accepts these admission keys alongside the ceiling, role,
+        governance, and TTL keys:
+
+        - ``participation_requirements`` — JSON array string of
+          ``RequireParticipation`` objects a joining member must satisfy
+          (spec section 7.3.2.1). Omit for a context that requires no
+          participation attestation.
+        - ``capability_requirements`` — JSON array string of
+          ``CapabilityRequirement`` objects pairing a capability URI with the
+          verification level a joining agent must reach (spec section 7.3.4.4).
+          Omit for a context that requires no verified capability.
+        - ``sybil_policy`` — JSON object string carrying the per-context Sybil
+          resistance policy (spec section 9.3). Omit for a context that admits
+          any valid DID.
+        - ``outlets`` — list of JSON strings, each a section 5.4.1 outlet
+          registration object carrying ``operator_did`` and the operator's
+          64-byte ``signature``. Creation fails when a signature does not
+          verify against the key ``operator_did`` encodes; a caller that cannot
+          sign registers the outlet through ``outlet_register`` after creation
+          instead, where the bridge signs with the operator's own key.
+
+        Read any of them back from the returned context's params object, which
+        carries the same JSON strings.
+        """
         from scp_sdk.context import Context
 
         raw = await asyncio.to_thread(self._native.context_create, identity_did, params)

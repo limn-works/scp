@@ -2496,6 +2496,10 @@ export class SCP {
               costFormula: definition.cost.costFormula,
             }
           : undefined,
+        operatorSignature: definition.operatorSignature
+          ? Array.from(definition.operatorSignature)
+          : undefined,
+        registeredAt: definition.registeredAt,
       };
       return await (
         this.#native.outletRegister as (h: unknown, d: typeof napiDef) => Promise<string>

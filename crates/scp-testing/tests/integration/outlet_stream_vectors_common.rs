@@ -436,6 +436,32 @@ impl ReceiverSequenceTracker {
 // Shared outlet registration
 // ---------------------------------------------------------------------------
 
+/// The Ed25519 key the conformance operator DID encodes.
+///
+/// §5.4.1 makes the operator sign the registration and `register_outlet`
+/// verifies that signature against the key `operator_did` encodes, so the
+/// conformance operator is a real keypair rather than a bare DID string.
+#[must_use]
+pub fn conformance_operator_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32])
+}
+
+/// The `did:dht` DID that [`conformance_operator_key`] produces.
+#[must_use]
+pub fn conformance_operator_did() -> DID {
+    scp_did::did_dht_from_public_key(&conformance_operator_key().verifying_key().to_bytes())
+}
+
+/// Builds the conformance registration already signed by
+/// [`conformance_operator_key`], so `register_outlet` accepts its §5.4.1
+/// provenance.
+#[must_use]
+pub fn signed_registration(outlet_id: &str, kind: OutletKind) -> OutletRegistration {
+    let mut reg = registration(outlet_id, kind, &conformance_operator_did());
+    scp_protocol::context::outlets::sign_outlet_registration(&mut reg, &conformance_operator_key());
+    reg
+}
+
 pub fn registration(outlet_id: &str, kind: OutletKind, operator: &DID) -> OutletRegistration {
     OutletRegistration {
         outlet_id: outlet_id.to_owned(),

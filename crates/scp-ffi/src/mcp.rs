@@ -2629,6 +2629,18 @@ mod tests {
     // Helper: register a context with an outlet for FfiBridgeProvider tests.
     // -----------------------------------------------------------------------
 
+    /// The Ed25519 key every fixture outlet's operator DID encodes.
+    fn test_operator_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x5A; 32])
+    }
+
+    /// The `did:dht` DID that [`test_operator_key`] produces, so
+    /// `register_outlet` can derive the verifying key from the DID string and
+    /// accept the fixture's §5.4.1 signature.
+    fn test_operator_did() -> scp_did::DID {
+        scp_did::did_dht_from_public_key(&test_operator_key().verifying_key().to_bytes())
+    }
+
     /// Registers a context in the runtime registry and optionally adds an outlet.
     /// Returns a unique context ID to avoid collisions with parallel tests.
     ///
@@ -2669,12 +2681,20 @@ mod tests {
                     },
                     implementation_hash: [0xAA; 32],
                     test_vectors: vec![],
-                    operator_did: "did:dht:z6MkOperator".into(),
+                    // §5.4.1: register_outlet verifies the operator signature
+                    // against the key `operator_did` encodes, so the fixture
+                    // names a DID whose key it holds and signs with it.
+                    operator_did: test_operator_did(),
                     cost: None,
                     message_catalog: Vec::new(),
                     registered_at: 0,
                     signature: Vec::new(),
                 };
+                let mut registration = registration;
+                scp_core::context::outlets::sign_outlet_registration(
+                    &mut registration,
+                    &test_operator_key(),
+                );
                 scp_core::context::outlets::register_outlet(
                     &mut rt.outlet_registry,
                     &rt.role_state,
@@ -2821,12 +2841,17 @@ mod tests {
                 },
                 implementation_hash: [0xAA; 32],
                 test_vectors: vec![],
-                operator_did: "did:dht:z6MkOperator".into(),
+                operator_did: test_operator_did(),
                 cost: None,
                 message_catalog: Vec::new(),
                 registered_at: 0,
                 signature: Vec::new(),
             };
+            let mut registration = registration;
+            scp_core::context::outlets::sign_outlet_registration(
+                &mut registration,
+                &test_operator_key(),
+            );
             scp_core::context::outlets::register_outlet(
                 &mut rt.outlet_registry,
                 &rt.role_state,

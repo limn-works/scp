@@ -54,7 +54,7 @@ use scp_did::DID;
 use common::{
     DrainOutcome, EndStatus, STREAM_EPOCH, ScriptedExecutor, Vector, apply_grant,
     assert_data_prefix, assert_terminal_status, assert_transcript_matches, build_script,
-    load_vectors, registration, vector,
+    load_vectors, signed_registration, vector,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,7 +125,7 @@ async fn drive_vector(vec: &Vector) -> DrainOutcome {
     register_outlet(
         &mut registry,
         &role_state,
-        registration(&outlet_id, kind, &invoker_did()),
+        signed_registration(&outlet_id, kind),
         &invoker_did().0,
     )
     .expect("register conformance outlet");

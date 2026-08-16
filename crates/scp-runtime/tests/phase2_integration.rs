@@ -335,6 +335,10 @@ async fn phase2_end_to_end_integration() {
         registered_at: 0,
         signature: Vec::new(),
     };
+    // §5.4.1: register_outlet verifies the operator signature against the key
+    // `operator_did` encodes. Alice operates this outlet, so she signs it.
+    let mut calc_registration = calc_registration;
+    scp_protocol::context::outlets::sign_outlet_registration(&mut calc_registration, &alice_sk);
     let (outlet_id, _outlet_registered_event) = register_outlet(
         &mut outlet_registry,
         &role_state,

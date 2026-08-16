@@ -255,6 +255,8 @@ async fn live_poll_next_drains_to_terminal() {
 
     // Zero-cost Action outlet operated by the creator.
     let definition = crate::outlets::NapiOutletDefinition {
+        registered_at: None,
+        operator_signature: None,
         name: "napi_streaming_live".to_owned(),
         description: "live streaming outlet".to_owned(),
         kind: crate::outlets::NapiOutletKind::Action,
@@ -897,6 +899,8 @@ mod streaming_vectors_live {
         let ctx = handle.context_id();
 
         let definition = crate::outlets::NapiOutletDefinition {
+            registered_at: None,
+            operator_signature: None,
             name: outlet_name.to_owned(),
             description: "SCP-OUT-039 live vector outlet".to_owned(),
             kind: crate::outlets::NapiOutletKind::Action,

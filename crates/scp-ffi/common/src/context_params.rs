@@ -19,7 +19,8 @@ use scp_core::context::params::{
 };
 use scp_core::context::roles::Capability;
 use scp_core::provenance::CounterpartyPolicy;
-use scp_core::trust::ConsequenceRule;
+use scp_core::trust::sybil::ContextSybilPolicy;
+use scp_core::trust::{CapabilityRequirement, ConsequenceRule, RequireParticipation};
 
 // ---------------------------------------------------------------------------
 // Bridge-agnostic intermediate type
@@ -94,11 +95,41 @@ pub struct CommonContextParams {
     /// `None` means default config.
     pub consequence_config_json: Option<String>,
 
+    /// Participation admission requirements as a JSON array (spec §7.3.2.1).
+    ///
+    /// Deserializes into `Vec<RequireParticipation>` and lands on
+    /// [`ContextParams::participation_requirements`]. `None` or an empty
+    /// string declares no participation requirement.
+    pub participation_requirements_json: Option<String>,
+
+    /// Capability admission requirements as a JSON array (spec §7.3.4.4,
+    /// ADR-041 AC6).
+    ///
+    /// Deserializes into `Vec<CapabilityRequirement>` and lands on
+    /// [`ContextParams::capability_requirements`]. `None` or an empty string
+    /// declares no capability requirement.
+    pub capability_requirements_json: Option<String>,
+
+    /// Per-context Sybil resistance policy as a JSON object (spec §9.3).
+    ///
+    /// Deserializes into `ContextSybilPolicy` and lands on
+    /// [`ContextParams::sybil_policy`]. `None` or an empty string leaves the
+    /// context with no Sybil policy, which admits any valid DID.
+    pub sybil_policy_json: Option<String>,
+
     /// Role definitions mapping role names to capability lists.
     /// Used by `PyO3` bridge; others leave empty.
     pub roles: Vec<(String, Vec<String>)>,
 
-    /// Initial outlet names. Used by `PyO3` bridge; others leave empty.
+    /// Initial outlet registrations, each a JSON object matching the §5.4.1
+    /// wire format. Used by the `PyO3` bridge; others leave empty.
+    ///
+    /// Each entry MUST carry `operator_did` and a 64-byte `signature` the
+    /// operator produced over the §5.4.1 V2 canonical digest;
+    /// [`build_context_params`] verifies every signature and rejects the whole
+    /// call when one fails. A caller that cannot sign registers the outlet
+    /// through `outlet_register` after creation instead, where the bridge signs
+    /// with the operator's own key from its key custody.
     pub outlets: Vec<String>,
 
     /// Optional template identifier (spec §5.14). Used by `PyO3` bridge.
@@ -165,13 +196,19 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         .as_deref()
         .and_then(|tid| parse_template_id(tid).ok());
 
+    let participation_requirements =
+        parse_participation_requirements(params.participation_requirements_json.as_ref())?;
+    let capability_requirements =
+        parse_capability_requirements(params.capability_requirements_json.as_ref())?;
+    let sybil_policy = parse_sybil_policy(params.sybil_policy_json.as_ref())?;
+
     Ok(ContextParams {
         mode,
         ceiling,
         ceiling_policy,
         promotion_policy,
         roles: build_roles(&params.roles)?,
-        outlets: build_outlets(&params.outlets),
+        outlets: build_outlets(&params.outlets)?,
         ttl,
         memory_scope,
         governance,
@@ -184,14 +221,14 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         max_nesting_depth: params.max_nesting_depth,
         session_cap: params.session_cap,
         counterparty_policy: CounterpartyPolicy::default(),
-        participation_requirements: Vec::new(),
-        capability_requirements: Vec::new(),
+        participation_requirements,
+        capability_requirements,
         incomplete_verification_policy: IncompleteVerificationPolicy::default(),
         min_protocol_version: params.min_protocol_version,
         migration_source: None,
         consequence_rules,
         consequence_config,
-        sybil_policy: None,
+        sybil_policy,
         // §9.18.B streaming ContextParams fields (SCP-OUT-034) are not yet
         // projected onto the FFI `CommonContextParams` surface; a context
         // created through the bridges takes the protocol defaults until the
@@ -313,29 +350,107 @@ fn build_roles(roles: &[(String, Vec<String>)]) -> Result<Vec<RoleDefinition>, S
         .collect()
 }
 
-/// Converts outlet name strings into core `OutletRegistration` values with
-/// placeholder schemas and metadata (matching the existing `PyO3` bridge
-/// behavior for bridge-level outlet declarations).
-fn build_outlets(outlets: &[String]) -> Vec<OutletRegistration> {
+/// Parses the §7.3.2.1 participation admission requirements a caller declared.
+///
+/// `None` and the empty string both mean the caller declared none.
+///
+/// # Errors
+///
+/// Returns `Err(String)` when the JSON does not deserialize into
+/// `Vec<RequireParticipation>`.
+fn parse_participation_requirements(
+    json: Option<&String>,
+) -> Result<Vec<RequireParticipation>, String> {
+    Ok(json
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            serde_json::from_str::<Vec<RequireParticipation>>(s)
+                .map_err(|e| format!("invalid participation_requirements JSON: {e}"))
+        })
+        .transpose()?
+        .unwrap_or_default())
+}
+
+/// Parses the §7.3.4.4 capability admission requirements a caller declared.
+///
+/// `None` and the empty string both mean the caller declared none.
+///
+/// # Errors
+///
+/// Returns `Err(String)` when the JSON does not deserialize into
+/// `Vec<CapabilityRequirement>`.
+fn parse_capability_requirements(
+    json: Option<&String>,
+) -> Result<Vec<CapabilityRequirement>, String> {
+    Ok(json
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            serde_json::from_str::<Vec<CapabilityRequirement>>(s)
+                .map_err(|e| format!("invalid capability_requirements JSON: {e}"))
+        })
+        .transpose()?
+        .unwrap_or_default())
+}
+
+/// Parses the §9.3 per-context Sybil resistance policy a caller declared.
+///
+/// `None` and the empty string both mean the caller declared none, which
+/// admits any valid DID.
+///
+/// # Errors
+///
+/// Returns `Err(String)` when the JSON does not deserialize into
+/// `ContextSybilPolicy`.
+fn parse_sybil_policy(json: Option<&String>) -> Result<Option<ContextSybilPolicy>, String> {
+    json.map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            serde_json::from_str::<ContextSybilPolicy>(s)
+                .map_err(|e| format!("invalid sybil_policy JSON: {e}"))
+        })
+        .transpose()
+}
+
+/// Parses each §5.4.1 outlet-registration JSON object and verifies the
+/// operator signature it carries.
+///
+/// Every field of the returned registration comes from the caller. The
+/// signature check runs through
+/// [`scp_core::context::outlets::verify_outlet_registration_provenance`], which
+/// derives the verifying key from the registration's own `operator_did`, so a
+/// context cannot declare an outlet whose named operator never signed for it.
+///
+/// # Errors
+///
+/// Returns `Err(String)` when an entry is not a §5.4.1 registration object,
+/// when its `operator_did` encodes no Ed25519 key, or when its signature does
+/// not verify.
+fn build_outlets(outlets: &[String]) -> Result<Vec<OutletRegistration>, String> {
     outlets
         .iter()
-        .map(|name| OutletRegistration {
-            outlet_id: name.clone(),
-            kind: scp_core::context::outlets::OutletKind::default(),
-            name: name.clone(),
-            description: String::new(),
-            schema: scp_core::context::outlets::OutletSchema {
-                input_schema: serde_json::Value::Object(serde_json::Map::default()),
-                output_schema: serde_json::Value::Object(serde_json::Map::default()),
-                aggregate_schema: None,
-            },
-            implementation_hash: [0u8; 32],
-            test_vectors: vec![],
-            operator_did: scp_did::DID("did:key:placeholder".to_owned()),
-            cost: None,
-            message_catalog: Vec::new(),
-            registered_at: 0,
-            signature: Vec::new(),
+        .enumerate()
+        .map(|(index, entry)| {
+            let registration: OutletRegistration = serde_json::from_str(entry).map_err(|e| {
+                format!(
+                    "invalid outlets[{index}] JSON: {e} — each entry is a §5.4.1 outlet \
+                         registration object carrying outlet_id, kind, name, description, \
+                         schema, implementation_hash, test_vectors, operator_did, and the \
+                         operator's 64-byte signature"
+                )
+            })?;
+            scp_core::context::outlets::verify_outlet_registration_provenance(&registration)
+                .map_err(|e| {
+                    format!(
+                        "outlets[{index}] (outlet_id {:?}) names operator {:?} but its §5.4.1 \
+                         signature does not establish that operator: {e} — sign the \
+                         registration with the operator's key, or register the outlet through \
+                         outlet_register after creation so the bridge signs it",
+                        registration.outlet_id, registration.operator_did.0
+                    )
+                })?;
+            Ok(registration)
         })
         .collect()
 }
@@ -381,7 +496,7 @@ fn parse_template_id(tid: &str) -> Result<scp_core::context::params::TemplateId,
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -570,14 +685,200 @@ mod tests {
         assert_eq!(ctx.roles[0].name, "admin");
     }
 
+    /// Builds a §5.4.1 registration JSON string signed by `key`, naming the
+    /// `did:dht` DID that `key` encodes as the operator.
+    fn signed_outlet_json(outlet_id: &str, key: &ed25519_dalek::SigningKey) -> String {
+        let mut registration = OutletRegistration {
+            outlet_id: outlet_id.to_owned(),
+            kind: scp_core::context::outlets::OutletKind::Action,
+            name: "calculator".to_owned(),
+            description: "adds two numbers".to_owned(),
+            schema: scp_core::context::outlets::OutletSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+                aggregate_schema: None,
+            },
+            implementation_hash: [0x33; 32],
+            test_vectors: vec![],
+            operator_did: scp_did::did_dht_from_public_key(&key.verifying_key().to_bytes()),
+            cost: None,
+            message_catalog: Vec::new(),
+            registered_at: 11,
+            signature: Vec::new(),
+        };
+        scp_core::context::outlets::sign_outlet_registration(&mut registration, key);
+        serde_json::to_string(&registration).unwrap()
+    }
+
     #[test]
-    fn outlets_converted() {
+    fn signed_outlet_registration_is_accepted_and_keeps_the_callers_operator_did() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
+        let expected_operator = scp_did::did_dht_from_public_key(&key.verifying_key().to_bytes());
+
         let ctx = build_ok(&CommonContextParams {
+            outlets: vec![signed_outlet_json("calculator", &key)],
+            ..Default::default()
+        });
+
+        assert_eq!(ctx.outlets.len(), 1);
+        assert_eq!(ctx.outlets[0].name, "calculator");
+        assert_eq!(ctx.outlets[0].operator_did, expected_operator);
+        assert_eq!(ctx.outlets[0].signature.len(), 64);
+    }
+
+    #[test]
+    fn bare_outlet_name_is_rejected_instead_of_becoming_a_fabricated_registration() {
+        let err = build_err(&CommonContextParams {
             outlets: vec!["calculator".to_owned()],
             ..Default::default()
         });
-        assert_eq!(ctx.outlets.len(), 1);
-        assert_eq!(ctx.outlets[0].name, "calculator");
+        assert!(
+            err.contains("invalid outlets[0] JSON"),
+            "a bare name must report the missing registration fields: {err}"
+        );
+        assert!(
+            err.contains("operator_did"),
+            "the message must name the operator_did the caller has to supply: {err}"
+        );
+    }
+
+    #[test]
+    fn outlet_registration_with_an_empty_signature_is_rejected() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        let signed: serde_json::Value =
+            serde_json::from_str(&signed_outlet_json("calculator", &key)).unwrap();
+        let mut unsigned = signed;
+        unsigned["signature"] = serde_json::json!([]);
+
+        let err = build_err(&CommonContextParams {
+            outlets: vec![unsigned.to_string()],
+            ..Default::default()
+        });
+        assert!(
+            err.contains("does not establish that operator"),
+            "an unsigned declaration must be refused: {err}"
+        );
+    }
+
+    #[test]
+    fn outlet_registration_signed_by_a_different_key_is_rejected() {
+        let operator = ed25519_dalek::SigningKey::from_bytes(&[0x66; 32]);
+        let impostor = ed25519_dalek::SigningKey::from_bytes(&[0x67; 32]);
+        let mut registration: OutletRegistration =
+            serde_json::from_str(&signed_outlet_json("calculator", &operator)).unwrap();
+        // Keep the operator's DID, swap in a signature by another key.
+        scp_core::context::outlets::sign_outlet_registration(&mut registration, &impostor);
+
+        let err = build_err(&CommonContextParams {
+            outlets: vec![serde_json::to_string(&registration).unwrap()],
+            ..Default::default()
+        });
+        assert!(
+            err.contains("does not establish that operator"),
+            "a forged signature must be refused: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Admission policy fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn participation_requirements_reach_the_context() {
+        let requirement = RequireParticipation {
+            fact: scp_core::trust::ParticipationFact::AttestationCount,
+            threshold: scp_core::trust::ParticipationThreshold::AtLeast(3),
+            max_age_secs: 86_400,
+            min_contexts: 2,
+        };
+        let json = serde_json::to_string(&vec![requirement.clone()]).unwrap();
+
+        let ctx = build_ok(&CommonContextParams {
+            participation_requirements_json: Some(json),
+            ..Default::default()
+        });
+        assert_eq!(
+            ctx.participation_requirements,
+            vec![requirement],
+            "the caller's participation requirement must land on the context unchanged"
+        );
+    }
+
+    #[test]
+    fn capability_requirements_reach_the_context() {
+        let requirement = CapabilityRequirement {
+            capability: scp_core::trust::CapabilityUri::Protocol {
+                name: "device-attestation".to_owned(),
+                version: 1,
+            },
+            verification_level: scp_core::trust::VerificationLevel::ChallengeVerified,
+        };
+        let json = serde_json::to_string(&vec![requirement.clone()]).unwrap();
+
+        let ctx = build_ok(&CommonContextParams {
+            capability_requirements_json: Some(json),
+            ..Default::default()
+        });
+        assert_eq!(
+            ctx.capability_requirements,
+            vec![requirement],
+            "the caller's capability requirement must land on the context unchanged"
+        );
+    }
+
+    #[test]
+    fn sybil_policy_reaches_the_context() {
+        let mut policy = ContextSybilPolicy::standard();
+        policy.require_device_attestation = true;
+        let json = serde_json::to_string(&policy).unwrap();
+
+        let ctx = build_ok(&CommonContextParams {
+            sybil_policy_json: Some(json),
+            ..Default::default()
+        });
+        let stored = ctx
+            .sybil_policy
+            .expect("the caller's Sybil policy must land on the context");
+        assert!(
+            stored.require_device_attestation,
+            "the device-attestation requirement the caller set must survive the bridge"
+        );
+        assert_eq!(stored, policy);
+    }
+
+    #[test]
+    fn admission_fields_stay_empty_when_the_caller_declares_none() {
+        let ctx = build_ok(&CommonContextParams::default());
+        assert!(ctx.participation_requirements.is_empty());
+        assert!(ctx.capability_requirements.is_empty());
+        assert!(ctx.sybil_policy.is_none());
+    }
+
+    #[test]
+    fn invalid_participation_requirements_json_rejected() {
+        let err = build_err(&CommonContextParams {
+            participation_requirements_json: Some("not json".to_owned()),
+            ..Default::default()
+        });
+        assert!(err.contains("invalid participation_requirements JSON"));
+    }
+
+    #[test]
+    fn invalid_capability_requirements_json_rejected() {
+        let err = build_err(&CommonContextParams {
+            capability_requirements_json: Some("not json".to_owned()),
+            ..Default::default()
+        });
+        assert!(err.contains("invalid capability_requirements JSON"));
+    }
+
+    #[test]
+    fn invalid_sybil_policy_json_rejected() {
+        let err = build_err(&CommonContextParams {
+            sybil_policy_json: Some("not json".to_owned()),
+            ..Default::default()
+        });
+        assert!(err.contains("invalid sybil_policy JSON"));
     }
 
     #[test]

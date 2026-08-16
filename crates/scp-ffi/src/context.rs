@@ -185,7 +185,8 @@ impl PyContextHandle {
 /// The dict may contain any of these keys (all optional):
 /// - `ceiling` -- list of capability strings
 /// - `roles` -- dict mapping role names to lists of capability strings
-/// - `outlets` -- list of outlet name strings
+/// - `outlets` -- list of JSON strings, each a §5.4.1 outlet registration
+///   object carrying `operator_did` and the operator's 64-byte `signature`
 /// - `ttl` -- float (seconds) or `None`
 /// - `memory_scope` -- string: "ephemeral", "summary", "full"
 /// - `governance` -- string: `"single_admin"`
@@ -194,6 +195,12 @@ impl PyContextHandle {
 /// - `promotion_policy` -- string: `"no_promotion"` (default), `"promotable"` (spec §5.10)
 /// - `template_id` -- optional string: template identifier (spec §5.14)
 /// - `economic_policy` -- optional JSON string: economic policy (spec §19)
+/// - `participation_requirements` -- optional JSON array string: participation
+///   admission requirements (spec §7.3.2.1)
+/// - `capability_requirements` -- optional JSON array string: capability
+///   admission requirements (spec §7.3.4.4)
+/// - `sybil_policy` -- optional JSON object string: per-context Sybil
+///   resistance policy (spec §9.3)
 ///
 /// Unrecognized keys are silently ignored. Missing keys use protocol defaults.
 #[pyclass]
@@ -203,7 +210,7 @@ pub struct PyContextParams {
     ceiling: Vec<String>,
     /// Role definitions mapping role names to capability lists.
     roles: HashMap<String, Vec<String>>,
-    /// Initial outlet registrations by name.
+    /// Initial outlet registrations, each a §5.4.1 registration JSON object.
     outlets: Vec<String>,
     /// Optional time-to-live in seconds.
     ttl: Option<f64>,
@@ -240,6 +247,17 @@ pub struct PyContextParams {
     /// When `None`, defaults to `ConsequenceConfig::default()` (all severe
     /// enforcement tiers gated to governance only).
     consequence_config: Option<String>,
+    /// Optional participation admission requirements as a JSON array string
+    /// (spec §7.3.2.1). When `None`, the context requires no participation
+    /// attestation for admission.
+    participation_requirements: Option<String>,
+    /// Optional capability admission requirements as a JSON array string
+    /// (spec §7.3.4.4). When `None`, the context requires no verified
+    /// capability for admission.
+    capability_requirements: Option<String>,
+    /// Optional per-context Sybil resistance policy as a JSON object string
+    /// (spec §9.3). When `None`, the context admits any valid DID.
+    sybil_policy: Option<String>,
 }
 
 #[pymethods]
@@ -369,6 +387,29 @@ impl PyContextParams {
     #[getter]
     fn consequence_config(&self) -> Option<&str> {
         self.consequence_config.as_deref()
+    }
+
+    /// Returns the participation admission requirements as a JSON array
+    /// string, or `None` when the context requires no participation
+    /// attestation (spec §7.3.2.1).
+    #[getter]
+    fn participation_requirements(&self) -> Option<&str> {
+        self.participation_requirements.as_deref()
+    }
+
+    /// Returns the capability admission requirements as a JSON array string,
+    /// or `None` when the context requires no verified capability
+    /// (spec §7.3.4.4).
+    #[getter]
+    fn capability_requirements(&self) -> Option<&str> {
+        self.capability_requirements.as_deref()
+    }
+
+    /// Returns the per-context Sybil resistance policy as a JSON object
+    /// string, or `None` when the context admits any valid DID (spec §9.3).
+    #[getter]
+    fn sybil_policy(&self) -> Option<&str> {
+        self.sybil_policy.as_deref()
     }
 
     fn __repr__(&self) -> String {
@@ -613,6 +654,29 @@ impl PyContextParams {
             None => None,
         };
 
+        // participation_requirements: Optional[str] (JSON array) -- spec §7.3.2.1
+        let participation_requirements: Option<String> =
+            match dict.get_item("participation_requirements")? {
+                Some(val) if val.is_none() => None,
+                Some(val) => Some(val.extract()?),
+                None => None,
+            };
+
+        // capability_requirements: Optional[str] (JSON array) -- spec §7.3.4.4
+        let capability_requirements: Option<String> =
+            match dict.get_item("capability_requirements")? {
+                Some(val) if val.is_none() => None,
+                Some(val) => Some(val.extract()?),
+                None => None,
+            };
+
+        // sybil_policy: Optional[str] (JSON object) -- spec §9.3
+        let sybil_policy: Option<String> = match dict.get_item("sybil_policy")? {
+            Some(val) if val.is_none() => None,
+            Some(val) => Some(val.extract()?),
+            None => None,
+        };
+
         Ok(Self {
             ceiling,
             roles,
@@ -631,7 +695,40 @@ impl PyContextParams {
             session_cap,
             consequence_rules,
             consequence_config,
+            participation_requirements,
+            capability_requirements,
+            sybil_policy,
         })
+    }
+
+    /// Projects the three admission-policy fields (§7.3.2.1, §7.3.4.4, §9.3)
+    /// into the JSON strings `PyContextParams` carries.
+    ///
+    /// A prospective member reads a context's admission policy before joining,
+    /// so the projection carries all three instead of dropping them. Each is
+    /// `None` when the context declares nothing for it.
+    fn project_admission_policy(
+        params: &scp_core::context::ContextParams,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let participation_requirements = if params.participation_requirements.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&params.participation_requirements).ok()
+        };
+        let capability_requirements = if params.capability_requirements.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&params.capability_requirements).ok()
+        };
+        let sybil_policy = params
+            .sybil_policy
+            .as_ref()
+            .and_then(|policy| serde_json::to_string(policy).ok());
+        (
+            participation_requirements,
+            capability_requirements,
+            sybil_policy,
+        )
     }
 
     /// Projects an AUTHENTICATED core [`ContextParams`](scp_core::context::ContextParams)
@@ -643,7 +740,7 @@ impl PyContextParams {
     /// inside the runtime). This is the inverse of the forward
     /// `build_core_context_params` path: it recovers exactly the subset of
     /// fields `PyContextParams` projects (the rest of `ContextParams` — metadata
-    /// visibility, projection policy, participation requirements, etc. — has no
+    /// visibility, projection policy, and the migration source — has no
     /// `PyContextParams` field and is not surfaced here, matching the forward
     /// path which fills those with defaults). Enum discriminants are rendered to
     /// their canonical bridge string form; capability sets to their user-facing
@@ -704,7 +801,14 @@ impl PyContextParams {
                 (rd.name.clone(), caps)
             })
             .collect();
-        let outlets: Vec<String> = params.outlets.iter().map(|t| t.name.clone()).collect();
+        // Outlet declarations project as the §5.4.1 registration JSON the
+        // forward path accepts, so a caller reads back the operator DID and
+        // the operator signature rather than a bare name.
+        let outlets: Vec<String> = params
+            .outlets
+            .iter()
+            .filter_map(|reg| serde_json::to_string(reg).ok())
+            .collect();
 
         // JSON-backed projections. `None` when absent/empty/default so the
         // getters honor their "None means default/free" contract.
@@ -727,6 +831,8 @@ impl PyContextParams {
         } else {
             serde_json::to_string(&params.consequence_config).ok()
         };
+        let (participation_requirements, capability_requirements, sybil_policy) =
+            Self::project_admission_policy(params);
 
         Self {
             ceiling,
@@ -746,6 +852,9 @@ impl PyContextParams {
             session_cap: params.session_cap,
             consequence_rules,
             consequence_config,
+            participation_requirements,
+            capability_requirements,
+            sybil_policy,
         }
     }
 }
@@ -1457,6 +1566,9 @@ fn build_core_context_params(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         outlets: py_params.outlets.clone(),
+        participation_requirements_json: py_params.participation_requirements.clone(),
+        capability_requirements_json: py_params.capability_requirements.clone(),
+        sybil_policy_json: py_params.sybil_policy.clone(),
         template_id: py_params.template_id.clone(),
         governance_threshold: None, // PyO3 bridge uses string-only governance for now
         governance_signers: None,
@@ -7214,6 +7326,9 @@ mod tests {
             session_cap: None,
             consequence_rules: None,
             consequence_config: None,
+            participation_requirements: None,
+            capability_requirements: None,
+            sybil_policy: None,
         }
     }
 
