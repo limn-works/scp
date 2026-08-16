@@ -130,16 +130,20 @@ jobs:
         run: cargo test -p scp-node --lib pre_rotation_severance -- --nocapture
 
   # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
-  # Asserts every shipped FFI bridge and the scp-node/scp-relay binaries' resolved
-  # SCP-crate feature set (dev-deps EXCLUDED) is a subset of an explicit
-  # durability-only + real-backend allowlist — so NO
-  # in-memory nullifier (custody / attestation / pre-rotation / DHT / did:key)
-  # feature can reach a production binary. Closed ⊆-whitelist; ZERO nullifier
-  # features is the gate's design mandate/target, with one disclosed
-  # allow_unencrypted_storage residue — see ADR-062 §Status / #2292.
-  # The fixture harness (a/b/c + soundness + allowlist hygiene) runs
-  # first and must pass before the real workspace gate. NEVER add a resolved
-  # nullifier feature to the allowlist to make this pass — fix the dependency edge.
+  # Two subset assertions over each shipped artifact's cargo-resolved graph (the
+  # three FFI bridges and the scp-node/scp-relay binaries, dev-deps EXCLUDED):
+  #   1. every SCP crate the graph reaches is admitted by name by PERMITTED_CRATES;
+  #   2. the resolved SCP-crate feature set is a subset of an explicit
+  #      durability-only + real-backend allowlist.
+  # So NO in-memory nullifier (custody / attestation / pre-rotation / DHT /
+  # did:key) feature can reach a production binary, and no crate carrying such an
+  # implementation can reach one either. The crate dimension is not redundant: a
+  # crate that declares no `[features]` table emits no feature edge, so the
+  # feature comparison has nothing to reject it with. Both are closed
+  # ⊆-whitelists; ZERO nullifier features is the gate's design mandate/target,
+  # with one disclosed allow_unencrypted_storage residue — see ADR-062 §Status /
+  # #2292. NEVER add a resolved crate or feature to make this pass — fix the
+  # dependency edge.
   shipped-feature-graph:
     needs: check-draft
     name: Shipped-feature-graph (G1 prove-absence)
@@ -148,7 +152,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: G1 — shipped-feature-graph ⊆ permitted-production allowlist (ZERO-nullifier mandate)
+      - name: Self-test — crate and feature dimensions, closed, load-bearing, hygienic
+        run: bash scripts/check-shipped-feature-graph.sh --self-test
+      - name: G1 — shipped crates and features ⊆ permitted-production allowlists (ZERO-nullifier mandate)
         run: bash scripts/check-shipped-feature-graph.sh
 
   # G1 proves the `testing`-gated nullifier arms absent from shipped artifacts.

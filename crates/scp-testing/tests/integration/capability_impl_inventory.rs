@@ -42,18 +42,22 @@
 //! in every recorded field are two impls; that multiplicity counts copies of one
 //! identity and is not the cardinality the ratchet refuses to key on.
 //!
-//! # The registry, and the gate's three lists
+//! # The registry, and the gate's four lists
 //!
 //! The trait names in the detector's `CAPABILITY_TRAITS` are frozen here, so
 //! replacing one registered trait with another that also resolves — which holds
 //! both the capability count and the trait count constant — fails rather than
 //! quietly narrowing both gates' scope.
 //!
-//! The three lists `scripts/check-shipped-feature-graph.sh` evaluates are frozen
+//! The four lists `scripts/check-shipped-feature-graph.sh` evaluates are frozen
 //! here too, read from that gate's own `--dump-lists` output:
 //!
 //! - `PERMITTED_ALLOWLIST` is where an author who wants a nullifier feature
 //!   shipped would put it, so growth there fails this ratchet.
+//! - `PERMITTED_CRATES` is where an author who wants a nullifier-carrying CRATE
+//!   shipped would put it. That list exists because a crate declaring no
+//!   `[features]` table emits no feature edge, so `PERMITTED_ALLOWLIST` never
+//!   sees it and the gate's feature comparison has nothing to reject it with.
 //! - `NULLIFIER_CONTROL_FEATURES` holds the positive controls the gate's
 //!   `assert_allowlist_has_no_nullifier` check runs, so deleting an entry
 //!   retires one of those controls. The gate's own
@@ -1054,7 +1058,7 @@ struct Baseline {
     impls: BTreeMap<ImplRecord, usize>,
     /// The trait names the detector's `CAPABILITY_TRAITS` registers.
     registry_traits: Vec<String>,
-    /// The three lists `scripts/check-shipped-feature-graph.sh` evaluates,
+    /// The four lists `scripts/check-shipped-feature-graph.sh` evaluates,
     /// keyed by list name.
     gate_lists: BTreeMap<String, Vec<String>>,
 }
@@ -1393,6 +1397,17 @@ fn shipped_feature_graph_lists_match_the_baseline() {
              shipped would put it, so growth here fails this ratchet until a \
              human reviews the entry and records it in the baseline. A removal \
              narrows what ships and is safe, and it fails too, because a removal \
+             paired with an addition is a swap that leaves the entry count \
+             unchanged.",
+        ),
+        (
+            "permitted_crates",
+            "An entry here is where an author who wants a nullifier-carrying \
+             crate shipped would put it. The crate dimension exists because a \
+             crate that declares no `[features]` table emits no feature edge, \
+             so `permitted_allowlist` cannot see it — growth here therefore \
+             fails this ratchet until a human reads what the crate implements. \
+             A removal narrows what may ship and fails too, because a removal \
              paired with an addition is a swap that leaves the entry count \
              unchanged.",
         ),
@@ -1983,5 +1998,19 @@ fn fixture_gate_list_reader_returns_the_evaluated_lists() {
         artifacts.len() >= 5,
         "the gate checks five shipped artifacts and emitted {}: {artifacts:?}",
         artifacts.len()
+    );
+
+    let crates = lists
+        .get("permitted_crates")
+        .expect("the gate emits its permitted-production crate allowlist");
+    assert!(
+        crates.iter().any(|e| e == "scp-relay"),
+        "`scp-relay` declares no `[features]` table, so it contributes no \
+         feature edge and the crate list is the only place the gate can admit \
+         it; its absence means the reader broke: {crates:?}"
+    );
+    assert!(
+        crates.iter().all(|e| !e.contains('/')),
+        "every permitted-crate entry names a crate and nothing else: {crates:?}"
     );
 }

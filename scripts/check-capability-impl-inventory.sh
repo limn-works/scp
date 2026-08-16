@@ -2,7 +2,7 @@
 # check-capability-impl-inventory.sh — freeze the `impl`s of the seven
 # production-capability traits that `.docs/specs/17-persistence-and-storage.md`
 # §17.17.2 enumerates, the trait registry those capabilities resolve to, and the
-# three lists scripts/check-shipped-feature-graph.sh evaluates.
+# four lists scripts/check-shipped-feature-graph.sh evaluates.
 #
 # Wrapper around the syn-based test target
 # `crates/scp-testing/tests/integration/capability_impl_inventory.rs`. The Rust
@@ -13,9 +13,10 @@
 # `ratchet/capability-impl-inventory.json` must hold the same records. Any
 # difference fails: an impl added, an impl removed, a `gating` that flipped
 # between `production` and `testing-gated`, a change to the registered trait
-# names, or an entry added to or removed from any of the three lists
+# names, or an entry added to or removed from any of the four lists
 # scripts/check-shipped-feature-graph.sh evaluates (its permitted-production
-# allowlist, its nullifier control features, and its shipped-artifact list).
+# feature allowlist, its permitted-production crate allowlist, its nullifier
+# control features, and its shipped-artifact list).
 #
 # WHAT IT RECORDS. Only facts about a DEFINITION: the impl item, its trait, its
 # type, the file that holds it, and the `cfg` predicates that decide whether a
@@ -26,7 +27,7 @@
 # resolution in an AST walker, which is an unbounded arms race and must not be
 # attempted."
 #
-# WHY IT ASKS THE GATE RATHER THAN READING IT. The three frozen lists come from
+# WHY IT ASKS THE GATE RATHER THAN READING IT. The four frozen lists come from
 # `check-shipped-feature-graph.sh --dump-lists`, which prints what bash
 # evaluated. Scraping the arrays out of that file's source text instead lets the
 # two disagree: a `cat` heredoc ends at its terminator while the surrounding
@@ -40,9 +41,11 @@
 # ratchet/block-in-place-count.json from per-crate aggregates to per-file
 # entries.
 #
-# WHY AN ALLOWLIST ENTRY FAILS TOO. An entry on the permitted-production
+# WHY AN ALLOWLIST ENTRY FAILS TOO. An entry on the permitted-production feature
 # allowlist is where an author who wants a nullifier feature shipped would put
-# it, so growth there needs the same human review a new impl needs.
+# it, and an entry on the permitted-production crate allowlist is where an author
+# who wants a nullifier-carrying crate shipped would put it, so growth in either
+# needs the same human review a new impl needs.
 #
 # RELATIONSHIP TO THE OTHER TWO MECHANISMS.
 #   - scripts/check-capability-nullifiers.sh keys on the SHAPE of a method body:
@@ -57,7 +60,7 @@
 #     convincing fake cannot evade.
 #
 # Exit codes mirror cargo test:
-#   0 — the workspace's capability-trait impls and the gate's allowlist match
+#   0 — the workspace's capability-trait impls and the gate's four lists match
 #       the baseline
 #   1 — at least one differs; read the reported difference, decide whether the
 #       implementation belongs on a production path, and record that decision in

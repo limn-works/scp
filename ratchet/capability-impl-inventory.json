@@ -1,6 +1,6 @@
 {
-  "_comment": "Identity ratchet over every `impl` of the seven production-capability traits that spec .docs/specs/17-persistence-and-storage.md §17.17.2 enumerates, over the trait registry those capabilities resolve to, and over the three lists scripts/check-shipped-feature-graph.sh evaluates. The gate is crates/scp-testing/tests/integration/capability_impl_inventory.rs, run by scripts/check-capability-impl-inventory.sh. It FAILS on any difference between the workspace scan and this file: an impl added, an impl removed, a gating that flipped, a change to the registered trait names, or an entry added to or removed from any of the three gate lists. Enforcement is on IDENTITY, never on a total count. A ratchet that recorded how many impls exist is defeated by deleting one implementation and adding another in the same commit, which is the swap this ratchet exists to catch — the same reasoning that moved ratchet/block-in-place-count.json from per-crate aggregates to per-file entries.",
-  "_updated": "2026-08-15 (ADR-062 §Decision 6 G1 step 4 — first freeze). 73 records covering 74 impls: 49 production records, 24 `testing`-gated. 18 registered trait names. Gate lists: artifacts 5, nullifier_control_features 8, permitted_allowlist 36.",
+  "_comment": "Identity ratchet over every `impl` of the seven production-capability traits that spec .docs/specs/17-persistence-and-storage.md §17.17.2 enumerates, over the trait registry those capabilities resolve to, and over the four lists scripts/check-shipped-feature-graph.sh evaluates. The gate is crates/scp-testing/tests/integration/capability_impl_inventory.rs, run by scripts/check-capability-impl-inventory.sh. It FAILS on any difference between the workspace scan and this file: an impl added, an impl removed, a gating that flipped, a change to the registered trait names, or an entry added to or removed from any of the four gate lists. Enforcement is on IDENTITY, never on a total count. A ratchet that recorded how many impls exist is defeated by deleting one implementation and adding another in the same commit, which is the swap this ratchet exists to catch — the same reasoning that moved ratchet/block-in-place-count.json from per-crate aggregates to per-file entries.",
+  "_updated": "2026-08-15 (ADR-062 §Decision 6 G1 step 5 — the crate dimension). 73 records covering 74 impls: 49 production records, 24 `testing`-gated. 18 registered trait names. Gate lists: artifacts 5, nullifier_control_features 8, permitted_allowlist 36, permitted_crates 21. `permitted_crates` is new in step 5: the gate now asserts the SCP crates each shipped artifact reaches, not only the features they resolve, because a crate that declares no `[features]` table emits no feature edge and the feature comparison therefore had nothing to reject it with.",
   "_context": "Three mechanisms guard SCP-CAPSEL-8012, and each keys on a different property. capability_nullifiers.rs keys on the SHAPE of a method body, so a fake that reads a parameter and discards the value evades it. The failure-path tests key on BEHAVIOUR, so they catch a production arm rewritten in place from real to fake. Neither notices a new, plausible-looking fake ADDED alongside the real implementations. This baseline keys on an implementation EXISTING, which a convincing fake cannot evade. The gate reads its trait scope out of the `CAPABILITY_TRAITS` const in crates/scp-testing/tests/integration/capability_nullifiers.rs rather than restating it, so the two mechanisms cannot disagree about which traits are in scope.",
   "_field_meanings": {
     "file": "the workspace-relative path of the file that holds the `impl Trait for Type` item",
@@ -11,8 +11,8 @@
     "impl_count": "how many impls carry this record. Two impls that agree in every field above are two impls; collapsing them would let a commit delete one without moving the inventory. This multiplicity counts identical copies of ONE identity — it is not the total cardinality the ratchet refuses to key on."
   },
   "_no_reachability_field": "No field records whether production code constructs the implementing type. `gating` already answers whether a production build compiles the impl at all, and the compiler decides that. The narrower question has no sound source-side answer: .docs/lessons/ast-gate-checks-definition-not-name-resolution.md states that a source-text gate 'may only assert structural facts about a type's definition', and that verifying a use-site property 'is reimplementing the compiler's name resolution in an AST walker, which is an unbounded arms race and must not be attempted.' An earlier draft carried a `constructed_in_production` boolean; because it matched bare head identifiers, the two distinct `InMemoryRelayQuerier` types shared one flag, and the blanket `Arc<T>` impls read `true` because something in the workspace calls `Arc::new`.",
-  "_how_to_update": "A human reads each difference the gate reports, decides whether the implementation belongs on a production path, and then records that decision here. `scripts/check-capability-impl-inventory.sh --print` prints the workspace's current inventory as the three members below, so the update is a diff a reviewer reads rather than a hundred records transcribed by hand. Printing is not approving: pasting the print output without reading the diff is the bypass this ratchet exists to prevent.",
-  "_gate_lists": "`shipped_feature_graph_lists` freezes what scripts/check-shipped-feature-graph.sh EVALUATES, read from its `--dump-lists` output rather than scraped from its source text. bash and a text reader disagree about what those arrays hold — a `cat` heredoc ends at its terminator while the surrounding command substitution keeps running, so an `echo` after the terminator adds an entry no text reader sees, and a second assignment wins for bash and loses to a first-match reader. `permitted_allowlist` is the set of features a shipped artifact may resolve, and an entry there is where an author who wants a nullifier feature shipped would put it. `nullifier_control_features` holds the positive controls the gate's allowlist-hygiene check runs, so deleting an entry retires a control. `artifacts` names each shipped artifact and the feature configuration the gate resolves it in, so deleting an entry stops gating that artifact and editing a feature string gates it in a configuration it does not ship.",
+  "_how_to_update": "A human reads each difference the gate reports, decides whether the implementation belongs on a production path, and then records that decision here. `scripts/check-capability-impl-inventory.sh --print` prints the workspace's current inventory as the three members below (the impls, the registry traits, and the gate's four lists), so the update is a diff a reviewer reads rather than a hundred records transcribed by hand. Printing is not approving: pasting the print output without reading the diff is the bypass this ratchet exists to prevent.",
+  "_gate_lists": "`shipped_feature_graph_lists` freezes what scripts/check-shipped-feature-graph.sh EVALUATES, read from its `--dump-lists` output rather than scraped from its source text. bash and a text reader disagree about what those arrays hold — a `cat` heredoc ends at its terminator while the surrounding command substitution keeps running, so an `echo` after the terminator adds an entry no text reader sees, and a second assignment wins for bash and loses to a first-match reader. `permitted_allowlist` is the set of features a shipped artifact may resolve, and an entry there is where an author who wants a nullifier feature shipped would put it. `nullifier_control_features` holds the positive controls the gate's allowlist-hygiene check runs, so deleting an entry retires a control. `artifacts` names each shipped artifact and the feature configuration the gate resolves it in, so deleting an entry stops gating that artifact and editing a feature string gates it in a configuration it does not ship. `permitted_crates` is the set of SCP crates a shipped artifact's dependency graph may reach, and an entry there is where an author who wants a nullifier-carrying CRATE shipped would put it — the crate dimension exists because a crate that declares no `[features]` table emits no feature edge, so `permitted_allowlist` never sees it.",
   "schema_version": "2.0",
   "capability_trait_impls": [
     {
@@ -675,6 +675,29 @@
       "scp-transport/s3-blob",
       "scp-transport/sqlite-blob",
       "scp-transport/startup"
+    ],
+    "permitted_crates": [
+      "scp-clock",
+      "scp-core",
+      "scp-crypto",
+      "scp-dht",
+      "scp-did",
+      "scp-event-log",
+      "scp-ffi",
+      "scp-ffi-common",
+      "scp-ffi-napi",
+      "scp-ffi-uniffi",
+      "scp-identity",
+      "scp-mcp",
+      "scp-media",
+      "scp-mls",
+      "scp-node",
+      "scp-platform",
+      "scp-protocol",
+      "scp-relay",
+      "scp-relay-client",
+      "scp-runtime",
+      "scp-transport"
     ]
   }
 }

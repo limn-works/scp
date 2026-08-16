@@ -140,8 +140,14 @@ check-call-invariants.py, call-invariants-baseline.json,
 check-pure-helpers.sh, pure-helpers-allowlist.txt,
 ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
-feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
-features only, ZERO nullifier exceptions),
+prove-absence gate, two closed ⊆-allowlists over each artifact's cargo-resolved
+graph: PERMITTED_ALLOWLIST over the resolved SCP-crate features, which permits
+durability-only features only with ZERO nullifier exceptions, and
+PERMITTED_CRATES over the SCP crates the graph reaches. The crate dimension is
+not redundant with the feature one: a crate that declares no `[features]` table
+emits no feature edge, so the feature comparison has nothing to reject it with
+and a nullifier-carrying featureless crate would be invisible to the gate whose
+job is proving nullifiers absent),
 check-capability-nullifiers.sh + capability_nullifiers.rs (spec §17.17.2
 SCP-CAPSEL-8012 — the workspace-wide three-conjunct nullifier detector for the
 seven provider capabilities; it covers the UNGATED arms that G1's feature-graph
@@ -150,7 +156,7 @@ false-positive fixtures that a weakening has to delete visibly),
 check-capability-impl-inventory.sh + capability_impl_inventory.rs +
 ratchet/capability-impl-inventory.json (spec §17.17.2 SCP-CAPSEL-8012 — the
 identity ratchet over every `impl` of those same seven provider capabilities,
-over the trait registry they resolve to, and over the three lists
+over the trait registry they resolve to, and over the four lists
 check-shipped-feature-graph.sh evaluates. The detector keys on the shape of a
 method body and the failure-path tests key on behaviour, so neither sees a new
 plausible-looking fake ADDED, which is what this ratchet keys on. It records
