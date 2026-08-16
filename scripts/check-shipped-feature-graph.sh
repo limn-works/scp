@@ -319,29 +319,43 @@ resolve_scp_features() {
 #   it names, sorted-unique. Pure text, so the fixture harness drives it with
 #   synthetic input and pins exactly what it admits and refuses.
 #
-#   `--prefix none` prints one `<name> v<version> [(<source>)] [(proc-macro)]
-#   [(*)]` line per graph node, anchored at column 0. cargo's own status output
-#   ("Blocking waiting for file lock on package cache", "Updating crates.io
-#   index", "Adding foo v0.1.0 (/path)") is indented, and a cargo error line
-#   begins `error:`. Both extractions below therefore anchor on `^` AND on the
-#   ` v<digit>` version token, which no status line carries at column 0.
+#   STEP 1 — SELECT THE NODE LINES. `--prefix none` prints one node per line
+#   anchored at column 0, beginning `<name> v<version>`. cargo's own status
+#   output ("Blocking waiting for file lock on package cache", "Locking 1
+#   package to latest compatible version", "Adding foo v0.1.0 (/path)") is
+#   INDENTED, and a cargo error line begins `error:`, so anchoring on `^` plus
+#   the ` v<digit>` version token admits node lines and nothing cargo writes to
+#   stderr. That anchoring is why a contended package-cache lock can no longer
+#   produce a crate named `Blocking`.
 #
-#   TWO POSITIVE EXTRACTIONS, never a denylist of noise spellings:
-#     1. CRITERION — a node whose source is a LOCAL PATH: cargo renders it
-#        ` (/…)`. That is provenance: the crate's code lives on this machine
-#        rather than in a registry, which is what "a crate this repository
-#        authors" means. It covers a workspace member, a `vendor/` crate that
-#        declares its own `[workspace]` table and is therefore NOT a workspace
-#        member, and a path dependency pointing outside the repository. An
-#        earlier draft asked cargo for the workspace MEMBER list instead; a crate
-#        with its own `[workspace]` table is repo-authored and is not a member,
-#        so that draft substituted an indicator for the criterion and let such a
-#        crate through.
-#     2. EXTENSION — a node whose name begins `scp-`, from any source. This
-#        covers a crate published to a registry or a git remote under an SCP
-#        name, which clause 1 cannot see. It admits nothing clause 1 misses
-#        today; it is here so that publishing an SCP-named crate elsewhere and
-#        depending on it does not become a way in.
+#   STEP 2 — CLASSIFY EACH NODE LINE. Two positive tests, never a denylist of
+#   noise spellings:
+#     1. CRITERION — the line carries a LOCAL-PATH source token ` (/…)`. That is
+#        provenance: the crate's code lives on this machine rather than in a
+#        registry, which is what "a crate this repository authors" means. It
+#        covers a workspace member, a `vendor/` crate that declares its own
+#        `[workspace]` table and is therefore NOT a workspace member, and a path
+#        dependency pointing outside the repository. An earlier draft asked cargo
+#        for the workspace MEMBER list instead; a crate with its own
+#        `[workspace]` table is repo-authored and is not a member, so that draft
+#        substituted an indicator for the criterion and let such a crate through.
+#     2. EXTENSION — the name begins `scp-`, from any source. This covers a crate
+#        published to a registry or a git remote under an SCP name, which
+#        clause 1 cannot see. It admits nothing clause 1 misses today; it is here
+#        so that publishing an SCP-named crate elsewhere and depending on it does
+#        not become a way in.
+#
+#   CLAUSE 1 TESTS THE WHOLE LINE FOR THE SOURCE TOKEN, NEVER ITS POSITION.
+#   cargo interposes markers between the version and the source, and it renders
+#   a path proc-macro as `name v1.0 (proc-macro) (/path)` — the marker comes
+#   FIRST. An earlier draft required the source to follow the version
+#   immediately, so it dropped every repo-authored proc-macro crate and the gate
+#   returned PASS for a graph carrying one. A derive that expands to an
+#   always-succeeds verifier is exactly the nullifier this gate exists to prove
+#   absent, and a proc-macro is a normal non-dev dependency whose expansion
+#   ships. Matching a marker's position is an indicator; carrying a local-path
+#   source is the fact, so test for the fact and let cargo order its markers
+#   however it likes.
 #
 #   A third-party registry crate satisfies neither clause, so this gate makes no
 #   claim about one. `cargo deny` and the reviewed `Cargo.lock` govern
@@ -349,10 +363,11 @@ resolve_scp_features() {
 #   which 21 are SCP crates.
 # ---------------------------------------------------------------------------
 extract_scp_crate_names() {
-  sed -nE \
-    -e 's/^([A-Za-z0-9_.+-]+) v[0-9][^ ]* \(\/.*$/\1/p' \
-    -e 's/^(scp-[A-Za-z0-9_.+-]*) v[0-9].*$/\1/p' \
-    | sort -u
+  local nodes
+  nodes="$(sed -nE '/^[A-Za-z0-9_.+-]+ v[0-9]/p')"
+  { printf '%s\n' "$nodes" | grep -F ' (/' || true
+    printf '%s\n' "$nodes" | grep -E '^scp-' || true
+  } | sed -E 's/ v[0-9].*$//' | grep -v '^$' | sort -u
 }
 
 # ---------------------------------------------------------------------------
@@ -681,6 +696,7 @@ assert_crate_resolution_is_load_bearing() {
     '      Adding limn-attest v0.1.0 (/repo/vendor/limn-attest)' \
     'error: failed to select a version' \
     'limn-attest v0.1.0 (/repo/vendor/limn-attest)' \
+    'limn-attest-derive v0.1.0-beta.2+build.1 (proc-macro) (/repo/vendor/limn-attest-derive) (*)' \
     'scp-core v0.1.0-beta.2 (/repo/crates/scp-core) (*)' \
     'scp-published-elsewhere v9.9.9' \
     'axum v0.8.8' \
@@ -694,6 +710,13 @@ assert_crate_resolution_is_load_bearing() {
   expect "(crate-extract) a local-path crate with no scp- name and no workspace membership IS kept" "PASS" "$rc"
   printf '%s\n' "$extracted" | grep -qxF 'scp-core'; rc=$?
   expect "(crate-extract) a local-path crate carrying the (*) repeat marker IS kept" "PASS" "$rc"
+  # cargo renders a path proc-macro as `name v1.0 (proc-macro) (/path)`, putting
+  # the marker BEFORE the source. A draft that required the source to follow the
+  # version immediately dropped every repo-authored proc-macro crate, and a
+  # derive that expands to an always-succeeds verifier is exactly the nullifier
+  # this gate exists to prove absent.
+  printf '%s\n' "$extracted" | grep -qxF 'limn-attest-derive'; rc=$?
+  expect "(crate-extract) a local-path PROC-MACRO crate, whose source cargo prints after the marker, IS kept" "PASS" "$rc"
   # EXTENSION: an scp-named crate from a registry is kept.
   printf '%s\n' "$extracted" | grep -qxF 'scp-published-elsewhere'; rc=$?
   expect "(crate-extract) an scp-named registry crate IS kept" "PASS" "$rc"

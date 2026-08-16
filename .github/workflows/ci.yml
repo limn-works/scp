@@ -125,9 +125,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
       - name: scp-node self-host create paths fail closed
-        run: cargo test -p scp-node --lib pre_rotation_severance -- --nocapture
+        # `cargo test <filter>` exits 0 when the filter matches nothing.
+        # Measured on this tree: `cargo test -p scp-node --features testing
+        # --lib pre_rotation_severance` runs 0 tests and exits 0, because both
+        # tests are `#[cfg(not(feature = "testing"))]`. A feature edge that
+        # turned `testing` on for scp-node would leave this lane green while it
+        # asserted nothing. `cargo nextest run --no-tests=fail` exits 4 when its
+        # filter selects zero tests, so the lane reports the loss.
+        run: cargo nextest run --no-tests=fail -p scp-node --lib -E 'test(pre_rotation_severance)'
 
   # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
   # Two subset assertions over each shipped artifact's cargo-resolved graph (the
@@ -695,10 +703,10 @@ jobs:
   # re-gate a production identity/SCPID/custody op behind the test-only
   # `testing` feature — making it vanish from the production lib —
   # and the regression would go unnoticed until release. This is the per-PR guard
-  # against that over-gating regression class. Build-only (lib + bins): the pyo3
-  # test suite assumes in-memory custody and does not compile in prod config, so
-  # a full prod-config test lane is a separate follow-up. The lib build still
-  # catches the bug class — a production op gated out of the lib won't compile.
+  # against that over-gating regression class. The lib build catches the bug
+  # class — a production op gated out of the lib won't compile — and the step
+  # after it runs the two shipped fail-closed assertions that only exist in this
+  # configuration.
   rust-build-pyo3-production:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -711,6 +719,7 @@ jobs:
           df -h /
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -721,6 +730,25 @@ jobs:
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           # Default features = production: `server` on, no `testing`.
           cargo build -p scp-ffi --features server
+      - name: Shipped pyo3 fail-closed assertions execute under nextest
+        run: |
+          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          # The doc block at crates/scp-ffi/src/scp.rs:536 says the two
+          # `#[cfg(not(feature = "testing"))]` tests below it "run in the
+          # shipped (no-`testing`) test lane (`cargo test -p scp-ffi` with the
+          # crate's own `testing` feature OFF)", and the SAFETY comment at
+          # :560-565 rests the soundness of two `std::env::set_var` calls on
+          # nextest running each test in its own process. Before this step no
+          # lane ran either test: this job built the pyo3 bridge and never
+          # tested it. This step is that lane. nextest supplies the
+          # process-per-test isolation the SAFETY comment names, and
+          # `--no-tests=fail` exits 4 if a feature flip selects zero tests.
+          #
+          # The former "the pyo3 test suite does not compile in prod config"
+          # note was stale: `cargo test -p scp-ffi --features server --no-run`
+          # exits 0 on this tree, and both tests pass under nextest.
+          cargo nextest run --no-tests=fail -p scp-ffi --features server --lib \
+            -E 'test(identity_create_fails_closed_without_pre_rotation_backend) + test(verify_device_attestation_fails_closed)'
 
   # Builds the uniffi bridge (`scp-ffi-uniffi`) in its PRODUCTION configuration:
   # default features (`server` on) but WITHOUT `testing`. Same
