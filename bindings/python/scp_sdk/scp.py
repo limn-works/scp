@@ -1020,13 +1020,33 @@ class SCP:
     async def verify_identity_link_attestation(
         self, attestation_json: str, issuer_public_key_hex: str
     ) -> Any:
-        """Delegate to ``_scp_core.py_verify_identity_link_attestation``.
+        """Verify an identity link attestation per spec §3.5.4.
 
-        ADR-048 §1: pure helper exposed as a module-level free function.
+        Delegates to ``_scp_core.SCP.verify_identity_link_attestation``, a
+        per-instance method. It resolves an issuer's DID document through this
+        instance's resolver (§3.5.4 step 1), then checks structure, a binding
+        between that document and an issuer, a signature under a key that
+        document publishes at ``#active`` or ``#agent``, revocation status,
+        expiry, and evidence freshness.
+
+        ``issuer_public_key_hex`` states which key a caller believes signed.
+        That statement is checked against an issuer's resolved document; it is
+        never a substitute for it. Before GitHub issue #2335 finding 2, a
+        module-level free function verified against that key alone and returned
+        ``True`` for an attacker who supplied both an attestation and a key.
+        That free function now raises ``SCP-IDENT-1060``.
+
+        Returns ``True`` when every §3.5.4 step passes. Returns ``False`` when a
+        step rejects, including a Class 2 (``signed_post`` / ``dns_record``)
+        attestation whose external proof resource no bridge fetches — §3.5.0
+        makes an unfetched Reference attestation equivalent to no attestation,
+        so a caller performs that fetch itself.
+
+        Raises ``SCP-IDENT-1044`` when an argument is malformed, and
+        ``SCP-IDENT-1060`` when an issuer's DID document cannot be resolved.
         """
-        mod = _native_mod()
         return await asyncio.to_thread(
-            mod.py_verify_identity_link_attestation,
+            self._native.verify_identity_link_attestation,
             attestation_json,
             issuer_public_key_hex,
         )

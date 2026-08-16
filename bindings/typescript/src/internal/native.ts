@@ -1723,10 +1723,12 @@ export function createNativeBridge(scp: SCP): Bridge {
       attestationJson: string,
       issuerPublicKeyHex: string,
     ): Promise<boolean> {
-      // Module-level NAPI free fn (per ADR-048 §1) — route through `addon`.
-      // The previous `Scp::identity_verify_link_attestation` method (with its
-      // `let _ = &self.inner;` gate-defang) was deleted in PR-E #28.
-      return (addon.identityVerifyLinkAttestation as (j: string, k: string) => boolean)(
+      // Per-instance `Scp` method — route through `native`. Spec §3.5.4 step 1
+      // resolves an issuer's DID document before any signature check, which
+      // needs this instance's resolver. A module-level free function of the
+      // same name still exists and now declines with `SCP-IDENT-1060`, because
+      // it reaches no bridge instance (GitHub issue #2335 finding 2).
+      return (native.identityVerifyLinkAttestation as (j: string, k: string) => Promise<boolean>)(
         attestationJson,
         issuerPublicKeyHex,
       );

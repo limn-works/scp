@@ -290,6 +290,29 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 /// (Option A) is out of scope (Discussion #1553).
 pub const IDENT_1059: &str = "SCP-IDENT-1059";
 
+/// Identity-link attestation verification could not resolve an issuer's DID
+/// document, or ran on a surface that reaches no DID resolver (FAIL CLOSED).
+///
+/// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`). Spec §3.5.4
+/// step 1 makes resolution of an issuer's DID document a precondition of every
+/// later step, so a bridge that cannot resolve cannot decide whether an
+/// attestation is genuine. Reporting `false` would say "forged" about an
+/// attestation nobody checked, so a bridge raises this code instead. Two
+/// callers meet it:
+///
+/// 1. A per-instance `verify_link_attestation` whose resolver returned no
+///    document, or reported a network fault, for an issuer's DID.
+/// 2. A module-level `identity_verify_link_attestation` free function, which
+///    reaches no bridge instance and therefore no DID resolver at all (phase D,
+///    pull request #1695, deleted every process-wide default bridge instance).
+///    Every caller of that free function moves to a per-instance
+///    `verify_link_attestation` method on `SCP`.
+///
+/// Distinct from `IDENT_1006` (a DID resolution failure a caller asked for
+/// directly) so an SDK consumer can tell an attestation-verification
+/// precondition failure apart from a plain resolve call that failed.
+pub const IDENT_1060: &str = "SCP-IDENT-1060";
+
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
 // -------------------------------------------------------------------------
