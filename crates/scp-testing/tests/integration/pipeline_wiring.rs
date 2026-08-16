@@ -243,7 +243,7 @@ const NAPI_TRUST_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/t
 // core `scp_core::trust::check_capability_requirements` call and the production
 // `IdentityDidPublicKeyResolver`. The 2J joiner (+4) and capability-admission
 // (+3) additions are disjoint, so the merged floor is 48 + 4 + 3 = 55.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 55;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 56;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -3432,6 +3432,97 @@ fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
          identity_custody_registry AND is_member (authenticated-principal \
          binding, ADR-049 §3a:94)"
     );
+}
+
+// ===========================================================================
+// §5.4.5 "Signature refusal" — the refusal reaches a receiver at every layer
+// ===========================================================================
+
+/// §5.4.5 "Signature refusal" — the operator key's refusal to sign a chunk is
+/// WIRED at every layer, so no layer is left answering it by closing a channel
+/// silently.
+///
+/// **What this checks and what it does not.** It checks that the seam exists:
+/// each pump reaches the close helper, each helper reaches the refusal
+/// payload, and each bridge reaches the shared renderer. It does NOT check
+/// that the payload the helper signs is the refusal payload — a source-text
+/// check reads names, not argument binding, and swapping the argument for
+/// another payload constructor leaves every assertion here green. That
+/// property is behavioural and belongs to the tests that read the emitted
+/// chunk's code:
+/// `dispatch::tests::pump_refused_chunk_closes_on_a_signed_refusal_terminal`,
+/// `dispatch::tests::a_double_refusal_records_6137_on_the_audit_event`, and
+/// `invoke::tests::a_refused_data_chunk_closes_the_stream_on_a_signed_terminal_error`.
+/// Both were confirmed to fail under that swap; this assertion was confirmed
+/// not to.
+///
+/// Anchored on symbols rather than statement spellings, so a rename inside a
+/// body does not force an edit to this enforcement file.
+///
+/// Additive assertion — it weakens no existing pipeline check.
+#[test]
+fn signature_refusal_reaches_a_receiver_at_every_layer() {
+    let invoke = include_str!("../../../scp-runtime/src/context/outlets/invoke.rs");
+    let dispatch = include_str!("../../../scp-runtime/src/context/outlets/dispatch.rs");
+
+    // The inner invoke pump closes through the attempt-then-fault helper.
+    assert!(
+        fn_body_contains(
+            invoke,
+            "run_streaming_executor_task",
+            "sign_terminal_or_refusal"
+        ),
+        "§5.4.5: the invoke pump must close a refused stream through          `sign_terminal_or_refusal`, never by dropping its sender"
+    );
+    // That helper attempts the constant refusal terminal.
+    assert!(
+        fn_body_contains(
+            invoke,
+            "sign_terminal_or_refusal",
+            "signing_refused_terminal_payload"
+        ),
+        "§5.4.5: the close must attempt the SCP-OUTLET-6137 refusal terminal"
+    );
+    // The dispatch pump does the same through its own helper.
+    assert!(
+        fn_body_contains(dispatch, "run_stream_pump_v2", "close_on_signature_refusal"),
+        "§5.4.5: the dispatch pump must close a refused stream through          `close_on_signature_refusal`, never by breaking without emitting"
+    );
+    assert!(
+        fn_body_contains(
+            dispatch,
+            "close_on_signature_refusal",
+            "signing_refused_terminal_payload"
+        ),
+        "§5.4.5: the dispatch close must attempt the SCP-OUTLET-6137 refusal terminal"
+    );
+
+    // Every bridge surfaces the refusal rather than the closed sentinel. The
+    // shared renderer is the single source of the code and the message, so
+    // naming it is naming the whole surface.
+    for (bridge, source) in [
+        (
+            "pyo3",
+            include_str!("../../../scp-ffi/src/outlet_stream.rs"),
+        ),
+        (
+            "napi",
+            include_str!("../../../scp-ffi/napi/src/outlet_stream.rs"),
+        ),
+        (
+            "uniffi",
+            include_str!("../../../scp-ffi/uniffi/src/outlet_stream.rs"),
+        ),
+    ] {
+        assert!(
+            source.contains("SIGNATURE_REFUSED_CODE"),
+            "§5.4.5: the {bridge} bridge must surface the signature refusal as a typed error              carrying SCP-OUTLET-6137, never as the channel-closed sentinel"
+        );
+        assert!(
+            source.contains("signature_refused_message"),
+            "§5.4.5: the {bridge} bridge must render the refusal through the shared              bounded-message helper, so no canonicalizer detail reaches an SDK caller"
+        );
+    }
 }
 
 // ===========================================================================

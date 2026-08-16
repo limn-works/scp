@@ -2688,19 +2688,25 @@ impl PumpSigningContext {
     /// code whose default slug is `execution.handler-panic`, a condition that
     /// did not occur.
     ///
-    /// Both hand-offs are bounded by `send_deadline`. The pump must reach its
-    /// settlement block, which releases the escrow, the per-context and origin
-    /// admission counters, and the node-wide pump permit; awaiting an unbounded
-    /// send on the bounded outer channel would park the pump there whenever an
-    /// invoker stops draining with the channel full, and §5.4.5 requires that
-    /// permit to be released when the pump exits.
+    /// Both hand-offs await the outer channel without a deadline, exactly as
+    /// the pump's six other terminal sends do. A bounded send was tried and
+    /// reverted: on expiry it dropped the item and let the pump settle, so the
+    /// receiver read a bare channel close — the completion path, and the very
+    /// ambiguity §5.4.5 "Signature refusal" exists to remove. The deadline was
+    /// `stream_cancel_ack_secs`, which the operating context sets and which has
+    /// no floor, so an operator could have set it to zero and suppressed the
+    /// record of its own suppression.
+    ///
+    /// An invoker that stops draining with the outer channel full therefore
+    /// parks this pump short of its settlement block, holding the escrow, the
+    /// admission counters, and the node-wide pump permit. That hazard is real
+    /// and it is not this path's: the same unbounded await sits on every
+    /// terminal send in this pump. Releasing the permit before the send would
+    /// close it, and that is a change to the pump's task shape rather than to
+    /// this helper.
     ///
     /// Returns `true` when a signed terminal was ingested and emitted, so the
     /// caller knows the manifest covers a terminal chunk.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the pump's close state is four independent live locals (channel, frontier, terminal summary, deadline) plus the refused attempt; a wrapper struct would hold two &mut borrows of locals the caller still uses, relocating the parameters without reducing them"
-    )]
     async fn close_on_signature_refusal(
         &self,
         request_id: RequestId,
@@ -2709,7 +2715,6 @@ impl PumpSigningContext {
         outer_tx: &mpsc::Sender<OutletStreamItem>,
         frontier: &mut scp_protocol::context::outlets::stream::MerkleFrontier,
         terminal_summary: &mut StreamTerminalSummary,
-        send_deadline: Duration,
     ) -> bool {
         match self
             .try_build_signed_chunk(request_id, sequence, signing_refused_terminal_payload())
@@ -2717,25 +2722,17 @@ impl PumpSigningContext {
         {
             Ok(chunk) => {
                 ingest_stream_chunk(frontier, terminal_summary, &chunk);
-                if tokio::time::timeout(send_deadline, outer_tx.send(Ok(chunk)))
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(
-                        request_id = %hex::encode(request_id),
-                        outlet_id = %self.outlet_id,
-                        context_id = %self.context_id,
-                        sequence,
-                        "dispatch pump: invoker did not drain the refusal terminal within the \
-                         cancel-ack window — settling the stream without it"
-                    );
-                }
+                let _ = outer_tx.send(Ok(chunk)).await;
                 true
             }
             Err(refused_terminal) => {
-                // No chunk carries this close, so fold the refusal's terminal
-                // status onto the summary directly.
-                terminal_summary.observe(&signing_refused_terminal_payload());
+                // No chunk carries this close, so record the refusal's terminal
+                // status on the summary directly.
+                terminal_summary.record_terminal_status(
+                    scp_protocol::context::outlets::stream::StreamTerminalStatus::Error(
+                        error_codes::CODE_EXECUTION_SIGNING_REFUSED.to_owned(),
+                    ),
+                );
                 let refusal = ChunkSignatureRefused {
                     refused_chunk,
                     refused_terminal,
@@ -2749,19 +2746,7 @@ impl PumpSigningContext {
                     "dispatch pump: stream closed with no terminal chunk — receiver was handed \
                      the typed ChunkSignatureRefused"
                 );
-                if tokio::time::timeout(send_deadline, outer_tx.send(Err(refusal)))
-                    .await
-                    .is_err()
-                {
-                    tracing::error!(
-                        request_id = %hex::encode(request_id),
-                        outlet_id = %self.outlet_id,
-                        context_id = %self.context_id,
-                        sequence,
-                        "dispatch pump: invoker did not drain the typed refusal within the \
-                         cancel-ack window — settling the stream without it"
-                    );
-                }
+                let _ = outer_tx.send(Err(refusal)).await;
                 false
             }
         }
@@ -3070,7 +3055,6 @@ async fn run_stream_pump_v2(
                             &outer_tx,
                             &mut frontier,
                             &mut terminal_summary,
-                            stream_cancel_ack,
                         )
                         .await;
                     break;
@@ -3138,7 +3122,6 @@ async fn run_stream_pump_v2(
                                     &outer_tx,
                                     &mut frontier,
                                     &mut terminal_summary,
-                                    stream_cancel_ack,
                                 )
                                 .await;
                             break;
@@ -3164,7 +3147,6 @@ async fn run_stream_pump_v2(
                                     &outer_tx,
                                     &mut frontier,
                                     &mut terminal_summary,
-                                    stream_cancel_ack,
                                 )
                                 .await;
                             break;
@@ -3231,7 +3213,6 @@ async fn run_stream_pump_v2(
                                     &outer_tx,
                                     &mut frontier,
                                     &mut terminal_summary,
-                                    stream_cancel_ack,
                                 )
                                 .await;
                             break;
@@ -3257,7 +3238,6 @@ async fn run_stream_pump_v2(
                                     &outer_tx,
                                     &mut frontier,
                                     &mut terminal_summary,
-                                    stream_cancel_ack,
                                 )
                                 .await;
                             break;
@@ -3333,7 +3313,6 @@ async fn run_stream_pump_v2(
                         &outer_tx,
                         &mut frontier,
                         &mut terminal_summary,
-                        stream_cancel_ack,
                     )
                     .await;
                 break;
@@ -3398,7 +3377,6 @@ async fn run_stream_pump_v2(
                                 &outer_tx,
                                 &mut frontier,
                                 &mut terminal_summary,
-                                stream_cancel_ack,
                             )
                             .await;
                         break;
@@ -4843,6 +4821,83 @@ mod tests {
             summary.billed_count, 0,
             "a refused chunk is never billed, and the refusal terminal is not a Data chunk"
         );
+    }
+
+    /// §5.4.5 "Signature refusal", first half of the criterion: the pump MUST
+    /// NOT abandon a signed refusal terminal on a deadline of its own. A
+    /// consumer that stops draining until the outer channel is FULL, and only
+    /// then resumes, MUST still read the terminal.
+    ///
+    /// A bounded send was tried here and reverted. On expiry it dropped the
+    /// item and settled, so the consumer read a bare channel close — which
+    /// every bridge maps to the completion sentinel, putting a suppressed
+    /// stream and a completed one back on the same exit. The deadline was
+    /// `stream_cancel_ack_secs`, which the operating context sets and which
+    /// has no floor, so an operator could have set it to zero and erased the
+    /// record of its own suppression.
+    ///
+    /// The full channel is what makes this test bite: with room to spare the
+    /// send completes on its first poll and no deadline can fire. The outer
+    /// channel holds `OUTER_CAP` items, so the consumer must leave that many
+    /// queued before the refusal terminal is signed.
+    #[tokio::test]
+    async fn a_slow_consumer_still_receives_the_refusal_terminal() {
+        // `spawn_test_pump` builds both channels at this capacity.
+        const OUTER_CAP: u64 = 16;
+
+        let state = build_test_state();
+        // The first `OUTER_CAP` chunks sign and fill the outer channel; the
+        // next is refused, and the refusal terminal after it signs. So the
+        // terminal's send is the one that meets a full channel.
+        set_operator_signer(
+            &state,
+            Arc::new(RefuseNthStreamSigner::new(
+                usize::try_from(OUTER_CAP).expect("fits") + 1,
+            )),
+        );
+        let request_id: RequestId = [0x35; 16];
+        let (_handle, mut outer_rx, _summary_rx, pump_join, inner_tx) =
+            spawn_test_pump(state, request_id, Duration::from_secs(3_601));
+
+        // Feed from a task: the inner channel is bounded too, so the test
+        // would otherwise block before the pump ever fills the outer one.
+        let feeder = tokio::spawn(async move {
+            for seq in 0..=OUTER_CAP {
+                send_inner_data(&inner_tx, seq).await;
+            }
+            inner_tx
+        });
+
+        // Let the pump fill the outer channel and park on the refusal
+        // terminal's send. The consumer reads nothing during this window.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Now drain. The queued chunks come first, then the terminal the pump
+        // held rather than discarded.
+        let mut terminal_code = None;
+        for _ in 0..=OUTER_CAP + 1 {
+            let Ok(Some(item)) =
+                tokio::time::timeout(Duration::from_secs(5), outer_rx.recv()).await
+            else {
+                break;
+            };
+            let chunk = item.expect("every emitted item is a signed chunk on this path");
+            if let ChunkPayload::Error { code, .. } = &chunk.payload {
+                terminal_code = Some(code.clone());
+                break;
+            }
+        }
+
+        assert_eq!(
+            terminal_code.as_deref(),
+            Some(error_codes::CODE_EXECUTION_SIGNING_REFUSED),
+            "a consumer that filled the outer channel and paused still reads the refusal \
+             terminal; the pump must not discard it on a deadline of its own"
+        );
+
+        let inner_tx = feeder.await.expect("feeder completes");
+        drop(inner_tx);
+        pump_join.await.expect("pump settles");
     }
 
     /// §5.4.5 "Signature refusal" propagated from the INNER invoke pump: when

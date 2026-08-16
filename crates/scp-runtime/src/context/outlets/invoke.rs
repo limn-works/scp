@@ -3501,9 +3501,16 @@ fn stream_output_provenance(
 ///
 /// This value carries no chunk and never crosses the §5.4.5 wire: it holds no
 /// `sequence`, enters no `stream_manifest_hash`, and is not forwarded across a
-/// context boundary. Both fields record a distinct signing attempt the
-/// operator's key refused; the pump substitutes an all-zero signature for
-/// neither.
+/// context boundary. Both fields record a signing attempt the operator's key
+/// refused; the pump substitutes an all-zero signature for neither.
+///
+/// When a stream crosses both pumps the two fields can come from different
+/// ones. The inner pump's refusal reaches the dispatch pump on the channel;
+/// that pump keeps `refused_chunk`, because it names what stopped the stream,
+/// and replaces `refused_terminal` with its own attempt, because that attempt
+/// is the one that decided this receiver holds no terminal. The inner pump's
+/// terminal attempt reaches `tracing` and stops there — a member gains nothing
+/// from a third refusal by the same key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkSignatureRefused {
     /// The signer's error on the chunk that stopped the stream — an executor
@@ -3623,8 +3630,9 @@ pub(crate) fn signing_refused_terminal_payload() -> ChunkPayload {
 ///
 /// `pending` is `Some` when an earlier chunk already failed to sign. In that
 /// case `preferred` is skipped and the refusal terminal is attempted directly,
-/// so the pump makes at most two signing attempts per stream close and each
-/// [`ChunkSignatureRefused`] field records a distinct refused attempt.
+/// so this pump makes at most two signing attempts per stream close and fills
+/// each [`ChunkSignatureRefused`] field from a distinct one of them. A value
+/// that crosses both pumps is stitched — see [`ChunkSignatureRefused`].
 ///
 /// # Errors
 ///
@@ -4411,9 +4419,14 @@ pub struct StreamTerminalSummary {
 
 impl Default for StreamTerminalSummary {
     /// A stream that ends WITHOUT an `End` or terminal `Error` chunk (the
-    /// receiver dropped, signing failed, upstream closed) records the
-    /// §5.4.5 default `Error(CODE_EXECUTION_FAULT)` terminal — the same
-    /// value the batch builder started its scan from.
+    /// receiver dropped, upstream closed) records the §5.4.5 default
+    /// `Error(CODE_EXECUTION_FAULT)` terminal — the same value the batch
+    /// builder started its scan from.
+    ///
+    /// A §5.4.5 signature refusal does NOT keep this default: it names its own
+    /// condition through [`Self::record_terminal_status`], because
+    /// `CODE_EXECUTION_FAULT`'s §5.4.4 default slug is
+    /// `execution.handler-panic`, an executor bug that did not occur.
     fn default() -> Self {
         Self {
             output_hash: None,
@@ -4424,6 +4437,26 @@ impl Default for StreamTerminalSummary {
 }
 
 impl StreamTerminalSummary {
+    /// Records the terminal status for a close that NO chunk carried.
+    ///
+    /// [`Self::observe`] reads a status out of an emitted chunk's payload, so
+    /// it cannot record a close the receiver holds no chunk for — the §5.4.5
+    /// signature refusal where the operator key refused the terminal error
+    /// chunk too. This setter states that status directly rather than minting
+    /// a chunk-shaped payload nothing emitted.
+    ///
+    /// It does not touch `output_hash`: that field summarizes an `End`
+    /// chunk's aggregate, and a close with no chunk produced none. It does not
+    /// touch the caller's `MerkleFrontier` either, because the manifest covers
+    /// emitted chunks and this close emitted none.
+    pub fn record_terminal_status(&mut self, status: StreamTerminalStatus) {
+        self.legacy_status = match status {
+            StreamTerminalStatus::Ok | StreamTerminalStatus::Cancelled => OutletStatus::Success,
+            StreamTerminalStatus::Error(_) => OutletStatus::Error,
+        };
+        self.terminal_status = status;
+    }
+
     /// Folds one emitted chunk's payload into the terminal summary. `Data`
     /// and `Progress` (and non-terminal `Error`) leave it unchanged; `End`
     /// sets `Ok` + `output_hash`; a terminal `Error` sets `Error(code)`.
