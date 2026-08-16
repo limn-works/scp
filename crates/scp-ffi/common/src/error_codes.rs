@@ -290,6 +290,21 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 /// (Option A) is out of scope (Discussion #1553).
 pub const IDENT_1059: &str = "SCP-IDENT-1059";
 
+/// A caller reached an identity-creation method without naming a key custody
+/// backend.
+///
+/// §17.17.1 of `.docs/specs/17-persistence-and-storage.md`
+/// (`SCP-CAPSEL-8000`) requires an explicit custody selection and forbids any
+/// form that selects one for a caller, and §17.8 classifies
+/// `InMemoryKeyCustody` as a security nullifier. An SDK whose type system can
+/// require that argument does so; this code is what its runtime guard reports
+/// when a caller defeats those types (JavaScript, `any`, a type-suppression
+/// directive) and arrives with no selection. It reports an absent selection
+/// only — an unrecognized custody name is `VALID_7005`, and a named backend
+/// this build cannot serve is `IDENT_1003` or `IDENT_1008`. This is a custody
+/// analogue of `STORAGE_8000`.
+pub const IDENT_1060: &str = "SCP-IDENT-1060";
+
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
 // -------------------------------------------------------------------------
@@ -1088,6 +1103,36 @@ pub const ATTEST_9017: &str = "SCP-ATTEST-9017";
 
 /// Cryptographic-class verification method not verifiable via browser fetch.
 pub const ATTEST_9018: &str = "SCP-ATTEST-9018";
+
+// -------------------------------------------------------------------------
+// Governance (SCP-GOV- 11000--11999)
+// -------------------------------------------------------------------------
+//
+// `scp-runtime` already emits three numbers in this band as message text
+// instead of as constants — 11020 and 11021 in its participation-threshold
+// checks and 11030 in its proposal-rate check, all in
+// `crates/scp-runtime/src/context/governance_helpers.rs`. Those numbers are
+// taken. So is 11001, which TypeScript SDK bridge-error tests pin as a
+// governance error a bridge raised.
+
+/// Generic governance failure.
+///
+/// A Python SDK `GovernanceError` carries this code when a caller constructs
+/// it without one (`bindings/python/scp_sdk/errors.py`).
+pub const GOV_11000: &str = "SCP-GOV-11000";
+
+/// An engine executed a governance action and returned an outcome this SDK
+/// version cannot name.
+///
+/// An SDK enumerates whichever outcomes
+/// `scp_core::context::state::GovernanceActionResult` defines. An SDK older
+/// than a bridge it calls therefore reads a string no member matches.
+/// Reporting that outcome as a generic executed action is a fail-open on an
+/// authorization surface, so each SDK raises this code instead and carries
+/// that raw string, which tells a caller two things a generic governance
+/// failure does not: that action DID execute, and this SDK is older than its
+/// bridge.
+pub const GOV_11040: &str = "SCP-GOV-11040";
 
 // -------------------------------------------------------------------------
 // Economy (SCP-ECON- 12000--12999)

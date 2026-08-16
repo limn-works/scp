@@ -3479,7 +3479,11 @@ pub(crate) async fn context_execute_governance_action_on(
         _ => {}
     }
 
-    Ok(format!("{result:?}"))
+    // One shared mapping names every outcome, so this bridge hands a caller a
+    // string identical to what PyO3 and UniFFI hand theirs.
+    // `format!("{result:?}")` used to stand here, and its payload-carrying
+    // variants rendered as a Rust debug dump that no SDK enum matches.
+    Ok(scp_ffi_common::governance_result::governance_action_result_name(&result).to_owned())
 }
 
 // ---------------------------------------------------------------------------

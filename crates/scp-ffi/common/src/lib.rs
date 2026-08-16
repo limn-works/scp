@@ -145,6 +145,12 @@ pub mod event_log;
 #[cfg(feature = "resolvers")]
 pub mod trust_store;
 
+// One name per governance outcome, shared by PyO3, napi-rs, and UniFFI so a
+// caller reads an identical string whichever bridge it called. Requires
+// scp-core (behind `resolvers` feature).
+#[cfg(feature = "resolvers")]
+pub mod governance_result;
+
 // Canonical §6.2.4 SagaError decomposition shared across PyO3, napi-rs, and
 // UniFFI. Pins the `RateLimited → Option<u64>` read, the `None`-never-`0` rule,
 // and the `SCP-SAGA-{code}` formatting in ONE place so the three bridges'

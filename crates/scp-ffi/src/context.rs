@@ -3915,38 +3915,11 @@ impl crate::scp::PyScp {
                 }
             }
 
-            use scp_core::context::state::GovernanceActionResult;
-            let result_str = match result {
-                GovernanceActionResult::MemberAdded { .. } => "MemberAdded",
-                GovernanceActionResult::MemberRemoved => "MemberRemoved",
-                GovernanceActionResult::RoleChanged => "RoleChanged",
-                GovernanceActionResult::OutletRegistered => "OutletRegistered",
-                GovernanceActionResult::OutletRemoved => "OutletRemoved",
-                GovernanceActionResult::CeilingModified => "CeilingModified",
-                GovernanceActionResult::ContextClosed => "ContextClosed",
-                GovernanceActionResult::TtlExtended => "TtlExtended",
-                GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
-                GovernanceActionResult::AdminTransferred => "AdminTransferred",
-                GovernanceActionResult::SignerAdded => "SignerAdded",
-                GovernanceActionResult::SignerRemoved => "SignerRemoved",
-                GovernanceActionResult::ThresholdModified => "ThresholdModified",
-                GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-                GovernanceActionResult::OutletInterfaceEstablished => "OutletInterfaceEstablished",
-                GovernanceActionResult::MemberReset => "MemberReset",
-                GovernanceActionResult::ConflictResolved => "ConflictResolved",
-                GovernanceActionResult::ContextPromoted => "ContextPromoted",
-                GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
-                GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
-                GovernanceActionResult::AccessRestored(_) => "AccessRestored",
-                GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
-                GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-                GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
-                GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
-                GovernanceActionResult::Executed => "Executed",
-                GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
-                GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
-                GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
-            };
+            // One shared mapping names every outcome, so PyO3, napi-rs, and
+            // UniFFI hand a caller identical strings
+            // (`scp_ffi_common::governance_result`).
+            let result_str =
+                scp_ffi_common::governance_result::governance_action_result_name(&result);
 
             // Sync FFI handle state for migration transitions (§5.11A).
             // The core ContextManager has already transitioned; keep the
@@ -5730,9 +5703,17 @@ impl crate::scp::PyScp {
         let sup =
             crate::runtime::supervisor(bi).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let context_id = handle.context_id.clone();
+        // Report a role by name, which is what napi-rs already reports.
+        // `format!("{r:?}")` stood here and rendered a whole `RoleAssignment`
+        // struct, so `MemberRole.from_bridge` in Python and `fromBridge` in
+        // Swift matched no member and read every role — administrator included
+        // — as a custom role. Both parse a name without regard to case, and
+        // TypeScript capitalizes a first letter in its bridge wrapper
+        // (`bindings/typescript/src/internal/native.ts`), so a lowercase
+        // `role_name` reaches each one correctly.
         Ok(rt
             .block_on(sup.member_role(&context_id, did))
-            .map(|r| format!("{r:?}")))
+            .map(|r| r.role_name))
     }
 
     /// Drains all pending events from the context's receive buffer.
