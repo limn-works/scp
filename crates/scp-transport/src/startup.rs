@@ -111,22 +111,24 @@ pub async fn storage_from_env() -> BlobStorageBackend {
             let path =
                 env::var("SCP_RELAY_STORAGE_PATH").unwrap_or_else(|_| "./scp-relay.db".to_owned());
             let path = PathBuf::from(path);
-            tracing::info!(path = %path.display(), "using sqlite blob storage");
-            BlobStorageBackend::sqlite(&path).unwrap_or_else(|e| {
+            let store = BlobStorageBackend::sqlite(&path).unwrap_or_else(|e| {
                 tracing::error!(error = %e, path = %path.display(), "failed to open sqlite storage");
                 std::process::exit(1);
-            })
+            });
+            tracing::info!(path = %path.display(), "using sqlite blob storage");
+            store
         }
         #[cfg(feature = "redb-blob")]
         "redb" => {
             let path = env::var("SCP_RELAY_STORAGE_PATH")
                 .unwrap_or_else(|_| "./scp-relay.redb".to_owned());
             let path = PathBuf::from(path);
-            tracing::info!(path = %path.display(), "using redb blob storage");
-            BlobStorageBackend::redb(&path).unwrap_or_else(|e| {
+            let store = BlobStorageBackend::redb(&path).unwrap_or_else(|e| {
                 tracing::error!(error = %e, path = %path.display(), "failed to open redb storage");
                 std::process::exit(1);
-            })
+            });
+            tracing::info!(path = %path.display(), "using redb blob storage");
+            store
         }
         #[cfg(feature = "postgres-blob")]
         "postgres" => {
@@ -136,13 +138,13 @@ pub async fn storage_from_env() -> BlobStorageBackend {
                 );
                 std::process::exit(1);
             };
-            tracing::info!("using postgres blob storage");
             let store = crate::native::postgres_blob::PostgresBlobStore::open(&url)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::error!(error = %e, "failed to connect to postgres");
                     std::process::exit(1);
                 });
+            tracing::info!("using postgres blob storage");
             BlobStorageBackend::Postgres(store)
         }
         #[cfg(feature = "s3-blob")]
@@ -154,13 +156,18 @@ pub async fn storage_from_env() -> BlobStorageBackend {
                 std::process::exit(1);
             };
             let prefix = env::var("SCP_RELAY_S3_PREFIX").unwrap_or_else(|_| "blobs/".to_owned());
-            tracing::info!(bucket = %bucket, prefix = %prefix, "using s3 blob storage");
+            // `S3BlobStore::open` probes the bucket, so it reports an
+            // unreachable endpoint, absent credentials or a missing bucket as
+            // `StorageError::Internal` and this arm exits. The success log runs
+            // only after that probe answers, so it never claims a backend the
+            // relay does not have.
             let store = crate::native::s3_blob::S3BlobStore::open(&bucket, &prefix)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::error!(error = %e, "failed to initialize s3 storage");
                     std::process::exit(1);
                 });
+            tracing::info!(bucket = %bucket, prefix = %prefix, "using s3 blob storage");
             BlobStorageBackend::S3(store)
         }
         "memory" => {

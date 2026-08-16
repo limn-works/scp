@@ -43,6 +43,10 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+// `Clock::now_secs` is called from one site, the `#[cfg(feature = "testing")]`
+// rotation arm below, so the trait import carries the same gate. Without it a
+// shipped-configuration build warns that the import is unused.
+#[cfg(feature = "testing")]
 use scp_clock::Clock;
 use scp_did::DidDocument;
 // Production DHT construction (real fail-closed Pkarr) and the `testing`
