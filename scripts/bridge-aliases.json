@@ -2797,13 +2797,16 @@
       "canonical": "identity_verify_link_attestation",
       "category": "identity",
       "pyo3": [
-        "verify_identity_link_attestation"
+        "verify_identity_link_attestation",
+        "verify_identity_link_attestation_module_scope"
       ],
       "uniffi": [
-        "identity_verify_link_attestation"
+        "identity_verify_link_attestation",
+        "identity_verify_link_attestation_module_scope"
       ],
       "napi": [
-        "identity_verify_link_attestation"
+        "identity_verify_link_attestation",
+        "identity_verify_link_attestation_module_scope"
       ]
     },
     {
