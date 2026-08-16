@@ -2,7 +2,7 @@
 
 **Date:** March 9, 2026
 **Status:** Buildable design — this document is the engineering blueprint
-**Prerequisite reading:** specs/ (protocol design), sketch.md (API surfaces), adrs/ (technology decisions + resolved open questions)
+**Prerequisite reading:** specs/ (protocol design), sketch.md (API surfaces), planning-sessions/planning-session-04.md + planning-sessions/planning-session-06.md (technology decisions + resolved open questions)
 
 ---
 
@@ -1323,9 +1323,9 @@ This is a hard requirement, not an aspiration. Every protocol mechanism must be 
 
 - **Specific API signatures.** See sketch.md for API surfaces (§1–§14) and security APIs (§16).
 - **Protocol semantics.** See .docs/specs/ for the full protocol design.
-- **Cryptographic security model.** See .docs/specs/ 09 §9.5–§9.15 for the full security specification (MITM prevention, replay prevention, relay threat model, key lifecycle, forward secrecy, PCS, compromise recovery).
-- **Technology selection rationale.** See ADR-001 (MLS wrapper) and ADR-003 (did:dht creation) in adrs/phase-1.md.
-- **Context extension design.** See .docs/specs/ 05 §5.10 (context TTL), §5.11 (memory scope), and §5.12 (context templates).
-- **Adapter trait definitions.** See ADR-005 in adrs/phase-1.md for transport adapter traits.
+- **Cryptographic security model.** See .docs/specs/ 09 §9.5–§9.15 for the full security specification (MITM prevention, replay prevention, relay threat model, key lifecycle, forward secrecy, PCS, compromise recovery). See planning-session-05.md for the security design rationale.
+- **Technology selection rationale.** See planning-session-04.md for why MLS over Sender Keys, why did:dht, etc.
+- **Context extension design.** See planning-session-03.md for the Moltbook analysis and context extension design (TTL, memory scope, templates).
+- **Adapter trait definitions.** See planning-session-04.md for full Rust trait definitions.
 - **Deployment operations.** Undesigned. Needed before launch. (Governance is designed — see ADR-031, GovernanceEngine trait with SingleAdmin, Threshold, Majority, and Unanimity models.)
 - **Pricing/business model.** Out of scope for this document.

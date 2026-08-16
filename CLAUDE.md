@@ -302,6 +302,7 @@ The orchestrator never writes code. It manages execution, maintains plan alignme
 ├── sketch.md        # API surface sketches — pseudocode for all operations
 ├── adrs/            # Architecture Decision Records (phase-1 through phase-6)
 ├── lessons/         # Evergreen learnings, grouped by topic
+├── planning-sessions/
 ├── runbooks/        # Operator runbooks (incident diagnosis + remediation)
 ├── scaffold/        # Per-language SDK build blueprints
 ├── specs/           # Product specs — what to build
