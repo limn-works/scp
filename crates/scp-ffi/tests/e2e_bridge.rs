@@ -1345,8 +1345,8 @@ fn cross_domain_identity_context_outlet_eventlog_provenance() {
         let events = scp.event_log_query(py, &ctx_id, None).unwrap();
         assert!(!events.is_empty());
 
-        // Revoke a token as the context creator. The bridge layer has no MLS
-        // application-message broadcast, so `revoke_ucan` reports the
+        // Revoke a token as the context creator. The bridge layer reaches no
+        // seal-and-send path for a token CID, so `revoke_ucan` reports the
         // undistributed revocation, rolls the pending entry back, and the
         // bridge raises. The caller learns the token is still valid instead of
         // being told the revocation reached the other members.

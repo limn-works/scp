@@ -766,8 +766,8 @@ async fn ucan_mint_and_revoke() {
     let caps = token.capabilities();
     assert!(!caps.is_empty(), "Capabilities should be non-empty");
 
-    // Revoke the token as the context creator. The bridge layer has no MLS
-    // application-message broadcast, so the revocation reaches no other member.
+    // Revoke the token as the context creator. The bridge layer reaches no
+    // seal-and-send path for a token CID, so the revocation reaches no other member.
     // `revoke_ucan` reports that, rolls the pending entry back, and this call
     // raises — the caller learns the token is still valid rather than being
     // told the revocation propagated.

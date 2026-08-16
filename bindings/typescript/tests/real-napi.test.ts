@@ -728,14 +728,48 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       await napi.ucanValidate(ctx, token.encoded, fullUri, member.did);
     });
 
-    test("revokes a token", async () => {
+    test("ucanRevoke reports the undistributed revocation and rolls it back", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
-      // Revocation by the context creator should not throw.
-      await napi.ucanRevoke(ctx, token.encoded, admin.did);
+      const cap = token.capabilities[0] as string;
+
+      // `messageCount` is the leaf count of the per-context UCAN-state event
+      // log — the exact log `BridgeRevocationEventLogger` appends a
+      // `TokenRevoked` leaf to. Sync the durable lifecycle leaves into it
+      // first (`eventLogVerify` performs that sync), so the counter below is a
+      // live detector rather than a constant zero.
+      await napi.eventLogVerify(ctx, { type: "inclusion", leafIndex: 0 });
+      const leafCount = (): number =>
+        (scpInstance.trustQueryScore(admin.did, ctx.contextId) as { messageCount: number })
+          .messageCount;
+      const leavesBefore = leafCount();
+      expect(leavesBefore).toBeGreaterThan(0);
+
+      // The bridge reaches no seal-and-send path for a token CID, so
+      // `revoke_ucan` reports step 3 (distribution) as failed. It rolls the
+      // `RevocationPending` entry back and never reaches step 6 (the event-log
+      // append), and the bridge rejects with the UCAN permission code.
+      let revokeError: unknown;
+      try {
+        await napi.ucanRevoke(ctx, token.encoded, admin.did);
+      } catch (e) {
+        revokeError = e;
+      }
+      expect(revokeError).toBeInstanceOf(Error);
+      expect((revokeError as Error).name).toBe("UcanPermissionError");
+      expect((revokeError as Error).message).toMatch(/SCP-PERM-3001/);
+      expect((revokeError as Error).message).toMatch(/did not distribute the revocation/);
+
+      // Rollback, part 1: no `TokenRevoked` leaf was appended.
+      expect(leafCount()).toBe(leavesBefore);
+
+      // Rollback, part 2: the token is still valid. A `RevocationPending` or
+      // `Revoked` entry would deny this call, so its success is what proves
+      // the list returned to `Active`.
+      await napi.ucanValidate(ctx, token.encoded, cap, member.did);
     });
 
     // C3c (ADR-059, §7.2.4): structured read-only diagnostic.
@@ -1805,7 +1839,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
 
   describe("E2E UCAN lifecycle (real NAPI)", () => {
     // identity_create now publishes to the shared InMemoryDhtClient (#1144).
-    test("mint -> validate -> revoke lifecycle", async () => {
+    test("mint -> validate -> revoke rolls back and leaves the token valid", async () => {
       const admin = await napi.identityCreate("in_memory");
       const member = await napi.identityCreate("in_memory");
       const ctx = await napi.contextCreate(
@@ -1831,18 +1865,50 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       await napi.ucanValidate(ctx, readToken.encoded, readCap, member.did);
       await napi.ucanValidate(ctx, writeToken.encoded, writeCap, member.did);
 
-      // Revoke the read token (revoker is the admin/context creator).
-      await napi.ucanRevoke(ctx, readToken.encoded, admin.did);
+      // `messageCount` is the leaf count of the per-context UCAN-state event
+      // log — the log `BridgeRevocationEventLogger` appends a `TokenRevoked`
+      // leaf to. `eventLogVerify` syncs the durable lifecycle leaves into it
+      // first, so the counter is a live detector rather than a constant zero.
+      await napi.eventLogVerify(ctx, { type: "inclusion", leafIndex: 0 });
+      const leafCount = (): number =>
+        (scpInstance.trustQueryScore(admin.did, ctx.contextId) as { messageCount: number })
+          .messageCount;
+      const leavesBefore = leafCount();
+      expect(leavesBefore).toBeGreaterThan(0);
 
-      // Verify the revoked token is rejected.
-      await expect(
-        napi.ucanValidate(ctx, readToken.encoded, readCap, member.did),
-      ).rejects.toThrow();
+      // The revocation list is keyed by token CID, so the token this call
+      // names is the only one whose rollback the validation below can prove.
+      // `readToken`'s nonce is already consumed, so revoke a second read token
+      // that no validation has presented yet.
+      const revokedToken = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      const revokedCap = revokedToken.capabilities[0] as string;
 
-      // Mint a fresh write token to verify non-revoked capabilities still work.
-      // The original writeToken's nonce was already consumed at line 927, so
-      // re-validating it would fail on nonce replay (ADR-016 step 9) before
-      // the revocation check is reached.
+      // The revoker is the admin (the context creator). The bridge reaches no
+      // seal-and-send path for a token CID, so `revoke_ucan` reports step 3
+      // (distribution) as failed, rolls the `RevocationPending` entry back, and
+      // never reaches step 6 (the event-log append).
+      let revokeError: unknown;
+      try {
+        await napi.ucanRevoke(ctx, revokedToken.encoded, admin.did);
+      } catch (e) {
+        revokeError = e;
+      }
+      expect(revokeError).toBeInstanceOf(Error);
+      expect((revokeError as Error).name).toBe("UcanPermissionError");
+      expect((revokeError as Error).message).toMatch(/SCP-PERM-3001/);
+      expect((revokeError as Error).message).toMatch(/did not distribute the revocation/);
+
+      // Rollback, part 1: no `TokenRevoked` leaf was appended.
+      expect(leafCount()).toBe(leavesBefore);
+
+      // Rollback, part 2: the token the failed revoke named is still valid. A
+      // `RevocationPending` or `Revoked` entry under its CID would deny this
+      // call, so its success is what proves the list returned to `Active`.
+      await napi.ucanValidate(ctx, revokedToken.encoded, revokedCap, member.did);
+
+      // Non-revoked capabilities are untouched. The original writeToken's
+      // nonce was already consumed above, so re-validating it would fail on
+      // nonce replay (ADR-016 step 9) before the revocation check is reached.
       const freshWriteToken = await napi.ucanMint(ctx, member.did, ["messages:write"]);
       const freshWriteCap = freshWriteToken.capabilities[0] as string;
       await napi.ucanValidate(ctx, freshWriteToken.encoded, freshWriteCap, member.did);

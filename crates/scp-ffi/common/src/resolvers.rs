@@ -733,9 +733,35 @@ impl scp_core::crypto::ucan::revoke::RevocationAuthorizer for BridgeRevocationAu
 /// the local revocation is rolled back (transactional) so there is no
 /// split-brain between the revoker and other members."
 ///
-/// No type in this workspace broadcasts a revocation as an MLS application
-/// message, so an FFI caller's revocation reaches no other member. The
-/// predecessor of this type logged the revocation and returned `Ok`, which
+/// # What this workspace does and does not send
+///
+/// One send path does encrypt and transmit a serialized `RevocationList`:
+/// `RecoveryOrchestrator::revoke_ucans` in
+/// `crates/scp-runtime/src/identity/recovery.rs` builds a blanket revocation
+/// entry, serializes the list, and calls `dispatch_recovery_send_notification`,
+/// which reaches `recovery_send_notification` in
+/// `crates/scp-runtime/src/context/trust_recovery_helpers.rs`. That helper
+/// seals the payload through the context actor's MLS group crypto
+/// (`ContextCryptoState::seal`) and hands the ciphertext to
+/// `deps.transport.send_message`. So the claim that no type in this workspace
+/// sends a revocation over MLS is false.
+///
+/// Three facts nonetheless leave an FFI caller's `ucan_revoke` undistributed.
+/// First, that path is unreachable from this trait method: it belongs to the
+/// trust-recovery orchestrator, it is `async`, and it needs a context actor
+/// handle, while `distribute_revocation` is sync and receives only a context id
+/// and a token CID. Second, no receiver applies what it sends —
+/// `verify_and_unwrap` in `crates/scp-runtime/src/context/messaging_helpers.rs`
+/// hands a `MessageType::Recovery` payload back to the application as
+/// plaintext, and `RevocationList::merge` has no non-test caller anywhere in
+/// the workspace, so a member that receives the payload never adds the CID to
+/// its own list. Third, the receive side admits a narrower set of senders than
+/// the revoke side authorizes: `verify_and_unwrap` rejects a `Recovery` message
+/// unless the sender holds `Capability::ContextClose`, while
+/// [`BridgeRevocationAuthorizer`] also authorizes the token's own issuer, so a
+/// non-admin issuer's revocation would be dropped by every receiver.
+///
+/// The predecessor of this type logged the revocation and returned `Ok`, which
 /// committed the revoker's own list to `Revoked` while every other member kept
 /// accepting the token — the split-brain the spec entry forbids — and told the
 /// caller that distribution had happened. Returning
@@ -743,9 +769,27 @@ impl scp_core::crypto::ucan::revoke::RevocationAuthorizer for BridgeRevocationAu
 /// pending entry back and hand the caller a typed error, so the caller learns
 /// that the token is still live.
 ///
-/// When a revocation broadcast lands, replace this type at its three bridge
-/// call sites with the type that performs the broadcast. Do not change this
-/// method to return `Ok`.
+/// # What real distribution requires
+///
+/// The resolved spec entry states that "revocations are distributed as MLS
+/// application messages", so building it needs all four of these:
+///
+/// 1. A receive-side handler that deserializes the sealed payload into a
+///    `RevocationList` and calls `RevocationList::merge` into the receiving
+///    context's list, plus the message type or payload discriminator that tells
+///    a receiver the payload is a revocation list rather than application
+///    content.
+/// 2. A receive-side authorization rule that accepts the same revokers
+///    [`BridgeRevocationAuthorizer`] accepts (the token's issuer and the
+///    context creator), rather than only members holding
+///    `Capability::ContextClose`.
+/// 3. An async, actor-reachable send path for a single token CID. Either
+///    `RevocationDistributor::distribute_revocation` becomes async and carries
+///    the context handle the seal-and-send path needs, or `revoke_ucan` moves
+///    onto the context actor and calls `recovery_send_notification`'s
+///    seal-and-send body directly.
+/// 4. A distributor type that performs that send, replacing this type at its
+///    three bridge call sites. Do not change this method to return `Ok`.
 pub struct UnavailableRevocationDistributor;
 
 impl scp_core::crypto::ucan::revoke::RevocationDistributor for UnavailableRevocationDistributor {
@@ -757,14 +801,16 @@ impl scp_core::crypto::ucan::revoke::RevocationDistributor for UnavailableRevoca
         warn!(
             context_id = context_id,
             token_cid = token_cid,
-            "refusing to report a revocation as distributed: the FFI bridge layer has no MLS \
-             application-message broadcast, so this revocation reached no other context member"
+            "refusing to report a revocation as distributed: the FFI bridge layer reaches no \
+             seal-and-send path for a token CID, and no receiver merges a revocation list it \
+             receives, so this revocation reached no other context member"
         );
         Err(CoreUcanError::RevocationFailed(format!(
             "the FFI bridge layer did not distribute the revocation of token '{token_cid}' in \
-             context '{context_id}', because no MLS application-message broadcast for \
-             revocations exists. The local revocation rolled back, so the revoker and the other \
-             members still agree, and the token remains valid."
+             context '{context_id}'. The bridge reaches no seal-and-send path for a single token \
+             CID, and a member that received one would not merge it into its own revocation \
+             list. The local revocation rolled back, so the revoker and the other members still \
+             agree, and the token remains valid."
         )))
     }
 }
@@ -900,14 +946,22 @@ mod tests {
             panic!("an absent DID resolver must be reported, never substituted");
         };
         assert_eq!(reason, NO_VERIFYING_DID_RESOLVER);
-
-        // No type in this crate resolves that DID to its key without a
-        // document, so the key encoded in the DID string is unreachable here.
         assert!(
-            !NO_VERIFYING_DID_RESOLVER.is_empty(),
-            "the reported reason must name what is missing"
+            reason.contains("Create an identity on this bridge instance first"),
+            "the reported reason must tell the caller how to install a resolver: {reason}"
         );
-        drop(did);
+
+        // The installed resolver never answers `did` with the 32 bytes spelled
+        // inside `did`. It reads the DID document, and nothing published a
+        // document for this DID, so it reports the missing document instead of
+        // the key the deleted substitute decoded out of the string.
+        let installed = make_identity_resolver();
+        let verifying = require_did_resolver(Some(&installed)).expect("resolver is installed");
+        let answer = CoreDidResolver::resolve_public_key(verifying, &did);
+        assert!(
+            !matches!(&answer, Ok(key) if key == &pk_bytes),
+            "the key spelled in the DID string must never be returned: {answer:?}"
+        );
     }
 
     #[test]

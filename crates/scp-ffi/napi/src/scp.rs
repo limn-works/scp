@@ -430,7 +430,8 @@ impl Scp {
         };
 
         let bi = &*self.inner;
-        ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
+        ensure_did_resolver_initialized_on(bi, crate::runtime().handle().clone())
+            .map_err(NapiError::from)?;
 
         match custody.as_str() {
             #[cfg(feature = "testing")]
@@ -568,7 +569,8 @@ impl Scp {
         validate_custody_type(&custody).map_err(NapiError::from)?;
 
         let bi = &*self.inner;
-        ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
+        ensure_did_resolver_initialized_on(bi, crate::runtime().handle().clone())
+            .map_err(NapiError::from)?;
 
         match custody.as_str() {
             #[cfg(feature = "testing")]
@@ -714,7 +716,8 @@ impl Scp {
         use crate::identity::ensure_did_resolver_initialized_on;
 
         let bi_arc = Arc::clone(&self.inner);
-        ensure_did_resolver_initialized_on(&bi_arc).map_err(NapiError::from)?;
+        ensure_did_resolver_initialized_on(&bi_arc, crate::runtime().handle().clone())
+            .map_err(NapiError::from)?;
 
         // Promote the JS callbacks to threadsafe functions on the JS
         // thread (consuming the non-Send `Function`s). A malformed

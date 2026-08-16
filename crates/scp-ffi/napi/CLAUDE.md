@@ -109,8 +109,12 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
   registry's `EventLog` is used separately for per-context Merkle proofs.
 - `NapiUcanToken.encoded` carries the full JWT so `ucan_revoke` can compute the revocation CID.
 - **`ucan_revoke` fails closed (no revocation broadcast)**: `scp_ffi_common::UnavailableRevocationDistributor`
-  reports step 3 of the ADR-016 revocation flow as failed, because no type in this workspace
-  broadcasts a revocation as an MLS application message. `revoke_ucan` then rolls the
+  reports step 3 of the ADR-016 revocation flow as failed, because the bridge layer reaches no
+  seal-and-send path for a single token CID and no receiver merges a revocation list it receives
+  (`RevocationList::merge` has no non-test caller). The recovery orchestrator does seal and send a
+  serialized `RevocationList` (`crates/scp-runtime/src/identity/recovery.rs` through
+  `crates/scp-runtime/src/context/trust_recovery_helpers.rs`), which the distributor's doc comment
+  describes along with what building real distribution requires. `revoke_ucan` then rolls the
   `RevocationPending` entry back and `ucan_revoke_on` rejects. The resolved "UCAN revocation
   mechanism" entry in `.docs/specs/00-open-questions.md` requires that rollback so the revoker and
   the other members do not disagree about the token.

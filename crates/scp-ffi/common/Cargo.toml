@@ -9,14 +9,18 @@ publish = false
 
 [features]
 default = ["resolvers"]
-# Full resolver implementations (BridgeDidResolver, IdentityBackedDidResolver, etc.).
+# Full resolver implementations (IdentityBackedDidResolver, BridgeRevocationChecker, etc.).
 # Requires scp-core, scp-identity, tokio, scp-mcp.
 resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:scp-platform", "dep:scp-mcp", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:thiserror", "dep:tracing", "dep:rand", "dep:ed25519-dalek"]
-# Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
-# non-standard test convenience — production builds must resolve via did:dht:z.
-# BridgeDidResolver delegates decoding to `scp_did::extract_public_key_from_did`,
-# whose did:key:{hex} branch is itself gated behind `scp-did/testing`; forward
-# the flag so the single shared parser still accepts did:key in test builds.
+# Enables the did:key:{hex} DID format in `scp_did::extract_public_key_from_did`,
+# which owns the sole workspace-wide `zbase32::decode` (ADR-057, the in-browser
+# client, task T1c-b). That branch is itself gated behind `scp-did/testing`, so
+# this feature forwards the flag rather than re-deriving the format here. This is
+# a non-standard test convenience — production builds resolve did:dht:z only. The
+# type this comment used to name, `BridgeDidResolver`, was deleted: it read the
+# identity key out of the DID string without fetching a DID document, so a token
+# signed by a key the document had since retired still passed signature
+# verification.
 # `scp-node?/testing` forwards testing to scp-node ONLY when it is already
 # activated (via the `server` feature): the server.rs auto-generate path calls
 # the testing-gated `ApplicationNode::dev`. The `?` keeps testing usable without

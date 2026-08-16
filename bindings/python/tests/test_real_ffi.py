@@ -618,10 +618,28 @@ class TestUcan:
         )
         sig = base64.urlsafe_b64encode(b"test-sig-bytes-0000000000000000").rstrip(b"=").decode()
         test_jwt = f"{header}.{payload}.{sig}"
-        try:
+
+        # ``message_count`` is the leaf count of the per-context FFI-state event
+        # log — the log ``BridgeRevocationEventLogger`` appends a
+        # ``TokenRevoked`` leaf to.
+        def leaf_count() -> int:
+            score = scp._native.trust_query_score(alice.did, handle.context_id)
+            return int(score["message_count"])
+
+        leaves_before = leaf_count()
+
+        # The bridge reaches no seal-and-send path for a token CID, so
+        # ``revoke_ucan`` reports step 3 (distribution) as failed, rolls the
+        # ``RevocationPending`` entry back, and never reaches step 6 (the
+        # event-log append).
+        with pytest.raises(Exception) as excinfo:
             scp._native.ucan_revoke(handle.context_id, test_jwt, alice.did)
-        except Exception:
-            pass  # May fail depending on implementation state
+        message = str(excinfo.value)
+        assert "did not distribute the revocation" in message, message
+        assert "SCP-PERM-3001" in message, message
+
+        # Rollback: no ``TokenRevoked`` leaf was appended.
+        assert leaf_count() == leaves_before
 
     async def test_ucan_validate_fails_closed_without_presenting_agent(self, scp: SCP):
         """The ENFORCING ucan_validate gate requires a presenting agent.

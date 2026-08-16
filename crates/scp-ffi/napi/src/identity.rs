@@ -158,16 +158,28 @@ pub(crate) fn shared_did_method()
 /// circuits. For a fresh `SCP` instance that hasn't yet acquired a resolver,
 /// this reuses the process-wide `SHARED_DHT_CLIENT` (if already set) to build
 /// the instance-local `DualLayerResolver`.
+///
+/// # Why `handle` is a parameter
+///
+/// This helper used to read the ambient runtime with
+/// `tokio::runtime::Handle::try_current()` and return `Ok(())` when no runtime
+/// was current, installing nothing. `identityCreateWithCustody` (`scp.rs`)
+/// calls it from the JavaScript thread, which carries no tokio context, so that
+/// arm ran on a production path: the caller saw a successful create, and every
+/// later UCAN validation on that instance failed with `SCP-PERM-3031` telling
+/// the caller to create an identity they had already created. The caller now
+/// passes a handle, matching the `PyO3` and `UniFFI` initializers, so this
+/// helper either installs the resolver or returns a typed [`ScpNapiError`].
+/// Every call site passes the handle of the crate's own process-lifetime
+/// runtime (`crate::runtime()`), which is live on the JavaScript thread and on
+/// a napi worker alike.
 pub(crate) fn ensure_did_resolver_initialized_on(
     bi: &crate::runtime::NapiBridgeInstance,
+    handle: tokio::runtime::Handle,
 ) -> Result<(), ScpNapiError> {
     if crate::runtime::did_resolver(bi).is_some() {
         return Ok(());
     }
-
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return Ok(()); // No runtime available; skip initialization.
-    };
 
     // Reuse the process-wide `SHARED_DHT_CLIENT` when already set so Alice
     // (on `SCP` A) publishes to the same DHT Bob (on `SCP` B) reads from.
@@ -249,7 +261,7 @@ async fn invalidate_resolver_cache(bi: &crate::runtime::NapiBridgeInstance, did:
 
 // Phase D (#1695): `ensure_did_resolver_initialized` default-bridge wrapper
 // deleted. All callers pass `&NapiBridgeInstance` and invoke
-// `ensure_did_resolver_initialized_on(bi)` directly.
+// `ensure_did_resolver_initialized_on(bi, handle)` directly.
 
 /// Publishes a newly created DID document to the shared [`FfiDhtClient`].
 ///
@@ -1398,6 +1410,39 @@ mod tests {
     use super::*;
     use scp_ffi_common::error_codes as codes;
 
+    /// `identityCreateWithCustody` (`scp.rs`) calls the initializer from the
+    /// JavaScript thread, which carries no tokio context. The predecessor read
+    /// the ambient runtime with `Handle::try_current()` and returned `Ok(())`
+    /// when there was none, installing nothing — so the create reported success
+    /// and every later UCAN validation on that instance failed
+    /// `SCP-PERM-3031`, telling the caller to create an identity they had
+    /// already created. This pins the contract: the initializer installs a
+    /// resolver or returns a typed error, from a thread with no runtime.
+    #[test]
+    fn ensure_did_resolver_initialized_on_installs_a_resolver_without_an_ambient_runtime() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "this test must run outside a tokio runtime to reproduce the JS-thread posture"
+        );
+
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
+        assert!(
+            crate::runtime::did_resolver(&bi).is_none(),
+            "a fresh bridge instance starts with no resolver"
+        );
+
+        ensure_did_resolver_initialized_on(&bi, crate::runtime().handle().clone())
+            .expect("the initializer must install a resolver rather than report an empty success");
+
+        let installed = crate::runtime::did_resolver(&bi);
+        assert!(
+            installed.is_some(),
+            "the initializer returned Ok, so a resolver must be attached to the instance"
+        );
+        scp_ffi_common::require_did_resolver(installed.map(std::convert::AsRef::as_ref))
+            .expect("the attached resolver must be the one every validation site reads");
+    }
+
     /// Creates a test `NapiIdentity` with in-memory custody, returning the
     /// identity (stamped with a dedicated `NapiBridgeInstance`) and its
     /// initial active signing key's public key (multibase).
@@ -1421,7 +1466,7 @@ mod tests {
         // simulates `identityCreate`, so it must reproduce that ordering rather
         // than bypass the fail-closed guard.
         let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
-        ensure_did_resolver_initialized_on(&bi)
+        ensure_did_resolver_initialized_on(&bi, crate::runtime().handle().clone())
             .expect("shared DHT client init (testing in-memory seam) must succeed");
 
         // Mint over the process-shared client — exactly as `identity_create`

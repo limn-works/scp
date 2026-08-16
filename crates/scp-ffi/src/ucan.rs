@@ -315,7 +315,7 @@ impl crate::scp::PyScp {
             let installed_resolver = crate::runtime::did_resolver(bi);
             let did_resolver =
                 require_did_resolver(installed_resolver.map(std::convert::AsRef::as_ref))
-                    .map_err(ScpPyError::ucan)?;
+                    .map_err(ScpPyError::no_verifying_did_resolver)?;
             let revocation_checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
             };
@@ -451,7 +451,7 @@ impl crate::scp::PyScp {
             let installed_resolver = crate::runtime::did_resolver(bi);
             let did_resolver =
                 require_did_resolver(installed_resolver.map(std::convert::AsRef::as_ref))
-                    .map_err(ScpPyError::ucan)?;
+                    .map_err(ScpPyError::no_verifying_did_resolver)?;
             let revocation_checker = BridgeRevocationChecker {
                 revocation_list: &rt.revocation_list,
             };
@@ -720,9 +720,11 @@ impl crate::scp::PyScp {
     ///
     /// # This bridge cannot perform step 3
     ///
-    /// No type in this workspace broadcasts a revocation as an MLS application
-    /// message, so [`UnavailableRevocationDistributor`](crate::bridge_adapters::UnavailableRevocationDistributor)
-    /// reports step 3 as failed. `revoke_ucan` then rolls the pending entry back
+    /// This bridge reaches no seal-and-send path for a single token CID, and no
+    /// receiver merges a revocation list it receives, so
+    /// [`UnavailableRevocationDistributor`](crate::bridge_adapters::UnavailableRevocationDistributor)
+    /// reports step 3 as failed. Its doc comment names both gaps and lists what
+    /// building real distribution requires. `revoke_ucan` then rolls the pending entry back
     /// and this method raises `UcanError`. The token stays valid, and the caller
     /// reads that fact from the error rather than being told the revocation
     /// succeeded. The resolved "UCAN revocation mechanism" entry in
@@ -894,6 +896,58 @@ mod tests {
             panic!("a bridge instance without an identity has no verifying DID resolver");
         };
         assert_eq!(reason, NO_VERIFYING_DID_RESOLVER);
+    }
+
+    /// A syntactically valid UCAN JWT: `parse_ucan` accepts it, so
+    /// `ucan_validate` reaches the resolver lookup instead of stopping at the
+    /// parse step. Its signature is meaningless, which does not matter — the
+    /// call under test fails before any signature check.
+    const PARSEABLE_UCAN: &str = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
+        eyJpc3MiOiJkaWQ6a2V5OnRlc3QiLCJhdWQiOiJkaWQ6a2V5OnRlc3QyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
+        dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw";
+
+    #[test]
+    fn ucan_validate_reports_an_absent_resolver_as_perm_3031() {
+        // `SCP-PERM-3031` names one condition: this bridge instance has no
+        // verifying DID resolver. The generic `SCP-PERM-3001` that
+        // `ScpPyError::ucan` applies is shared by malformed tokens, ceiling
+        // violations, and nonce replay, so reporting the absent resolver under
+        // it leaves a caller unable to tell a missing resolver apart from a
+        // rejected token. The NAPI and UniFFI bridges already report
+        // `SCP-PERM-3031` here.
+        //
+        // Registering FFI state directly reaches the resolver lookup without
+        // creating an identity — identity creation is what installs
+        // `IdentityBackedDidResolver`, so a created identity would hide the
+        // condition under test.
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        crate::runtime::register_ffi_state(
+            scp.bridge_instance(),
+            "ctx-without-resolver",
+            "did:dht:zcreator",
+            &["messages:read".to_owned()],
+        )
+        .expect("FFI state registration must succeed");
+
+        let outcome = scp.ucan_validate(
+            "ctx-without-resolver",
+            PARSEABLE_UCAN,
+            "scp:ctx:ctx-without-resolver/messages:read",
+            "did:key:test2",
+            None,
+        );
+        let Err(error) = outcome else {
+            panic!("validation must fail closed when no verifying resolver is installed");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains(scp_ffi_common::error_codes::PERM_3031),
+            "the absent resolver must carry SCP-PERM-3031: {message}"
+        );
+        assert!(
+            message.contains("no verifying DID resolver is installed"),
+            "the error must name what is missing: {message}"
+        );
     }
 
     // -----------------------------------------------------------------------

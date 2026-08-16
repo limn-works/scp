@@ -1258,7 +1258,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(nonceReplayErr).toBeInstanceOf(Error);
     });
 
-    it("scp.ucanRevoke causes subsequent validation to fail", async () => {
+    it("scp.ucanRevoke reports the undistributed revocation and rolls it back", async () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
@@ -1267,14 +1267,41 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
         capabilities: string[];
       };
       const cap = token.capabilities[0] as string;
-      await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
-      let revokedErr: unknown;
+
+      // `messageCount` is the leaf count of the per-context UCAN-state event
+      // log — the log `BridgeRevocationEventLogger` appends a `TokenRevoked`
+      // leaf to. `eventLogVerify` syncs the durable lifecycle leaves into it
+      // first, so the counter is a live detector rather than a constant zero.
+      await scp.eventLogVerify(
+        ctx._rawHandle,
+        JSON.stringify({ type: "inclusion", leaf_index: 0 }),
+      );
+      const leafCount = (): number =>
+        (scp.trustQueryScore(admin.did, ctx.contextId) as { messageCount: number }).messageCount;
+      const leavesBefore = leafCount();
+      expect(leavesBefore).toBeGreaterThan(0);
+
+      // The bridge reaches no seal-and-send path for a token CID, so
+      // `revoke_ucan` reports step 3 (distribution) as failed, rolls the
+      // `RevocationPending` entry back, and never reaches step 6 (the
+      // event-log append).
+      let revokeErr: unknown;
       try {
-        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
+        await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
       } catch (e) {
-        revokedErr = e;
+        revokeErr = e;
       }
-      expect(revokedErr).toBeInstanceOf(Error);
+      expect(revokeErr).toBeInstanceOf(UcanPermissionError);
+      expect((revokeErr as Error).message).toMatch(/SCP-PERM-3001/);
+      expect((revokeErr as Error).message).toMatch(/did not distribute the revocation/);
+
+      // Rollback, part 1: no `TokenRevoked` leaf was appended.
+      expect(leafCount()).toBe(leavesBefore);
+
+      // Rollback, part 2: the token is still valid. A `RevocationPending` or
+      // `Revoked` entry would deny this call, so its success is what proves the
+      // list returned to `Active`.
+      await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
     });
 
     it("scp.ucanDelegate scopes a minted token down to a subset audience", async () => {
@@ -2083,7 +2110,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       await scp.contextClose(ctx._rawHandle, alice.did);
     });
 
-    it("E2E UCAN lifecycle: mint -> validate -> revoke -> validation fails", async () => {
+    it("E2E UCAN lifecycle: mint -> validate -> revoke rolls back -> token still valid", async () => {
       const admin = await scp.identityCreate("in_memory");
       const member = await scp.identityCreate("in_memory");
       const ctx = await scp.contextCreate(
@@ -2096,14 +2123,55 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       };
       const cap = token.capabilities[0] as string;
       await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
-      await scp.ucanRevoke(ctx._rawHandle, token.encoded, admin.did);
-      let e2eRevokedErr: unknown;
+
+      // `messageCount` is the leaf count of the per-context UCAN-state event
+      // log — the log `BridgeRevocationEventLogger` appends a `TokenRevoked`
+      // leaf to. `eventLogVerify` syncs the durable lifecycle leaves into it
+      // first, so the counter is a live detector rather than a constant zero.
+      await scp.eventLogVerify(
+        ctx._rawHandle,
+        JSON.stringify({ type: "inclusion", leaf_index: 0 }),
+      );
+      const leafCount = (): number =>
+        (scp.trustQueryScore(admin.did, ctx.contextId) as { messageCount: number }).messageCount;
+      const leavesBefore = leafCount();
+      expect(leavesBefore).toBeGreaterThan(0);
+
+      // The revocation list is keyed by token CID, so the token the revoke
+      // names is the only one whose rollback the validation below can prove.
+      // The first token's nonce is already consumed, so revoke a second token
+      // that no validation has presented yet.
+      const revoked = (await scp.ucanMint(ctx._rawHandle, member.did, ["messages:read"])) as {
+        encoded: string;
+        capabilities: string[];
+      };
+
+      // The bridge reaches no seal-and-send path for a token CID, so
+      // `revoke_ucan` reports step 3 (distribution) as failed, rolls the
+      // `RevocationPending` entry back, and never reaches step 6 (the
+      // event-log append).
+      let e2eRevokeErr: unknown;
       try {
-        await scp.ucanValidate(ctx._rawHandle, token.encoded, cap, member.did);
+        await scp.ucanRevoke(ctx._rawHandle, revoked.encoded, admin.did);
       } catch (e) {
-        e2eRevokedErr = e;
+        e2eRevokeErr = e;
       }
-      expect(e2eRevokedErr).toBeInstanceOf(Error);
+      expect(e2eRevokeErr).toBeInstanceOf(UcanPermissionError);
+      expect((e2eRevokeErr as Error).message).toMatch(/SCP-PERM-3001/);
+      expect((e2eRevokeErr as Error).message).toMatch(/did not distribute the revocation/);
+
+      // Rollback, part 1: no `TokenRevoked` leaf was appended.
+      expect(leafCount()).toBe(leavesBefore);
+
+      // Rollback, part 2: the token the failed revoke named is still valid. A
+      // `RevocationPending` or `Revoked` entry under its CID would deny this
+      // call, so its success is what proves the list returned to `Active`.
+      await scp.ucanValidate(
+        ctx._rawHandle,
+        revoked.encoded,
+        revoked.capabilities[0] as string,
+        member.did,
+      );
     });
 
     it("E2E broadcast lifecycle: create -> subscribe -> publish -> unsubscribe", async () => {

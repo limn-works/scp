@@ -331,6 +331,26 @@ impl ScpPyError {
         }
     }
 
+    /// UCAN/permission error reporting that this bridge instance has no
+    /// verifying DID resolver.
+    ///
+    /// Carries [`codes::PERM_3031`] rather than the generic
+    /// [`codes::PERM_3001`] that [`Self::ucan`] applies, so a caller can tell
+    /// the absent-resolver condition apart from every other UCAN failure. The
+    /// NAPI and `UniFFI` bridges report the same code for the same condition,
+    /// and `codes::PERM_3031`'s own documentation names all three bridges.
+    ///
+    /// Pass the reason
+    /// [`scp_ffi_common::NO_VERIFYING_DID_RESOLVER`] returns, so the three
+    /// bridges describe the absent capability in the same words.
+    #[must_use]
+    pub fn no_verifying_did_resolver(reason: &str) -> Self {
+        Self::UcanError {
+            message: reason.to_owned(),
+            code: codes::PERM_3031.to_owned(),
+        }
+    }
+
     /// Validation error with the given message and the generic validation code.
     pub fn validation(msg: impl Into<String>) -> Self {
         Self::ValidationError {
