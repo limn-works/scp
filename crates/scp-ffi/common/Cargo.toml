@@ -40,15 +40,24 @@ testing = [
 custody = ["dep:scp-platform"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform, and
-# tokio. Storage uses the durability-only in-memory-storage feature of
-# scp-platform (ADR-062 Slice 0). This feature does NOT enable
-# scp-platform's `testing` feature: since ADR-062 Slice 6 (SCP-CAPINJECT-006)
-# server.rs's `Explicit`-identity phantoms are typed to the production
-# `FileKeyCustody` (not the `InMemoryKeyCustody` nullifier), and the dev-relay
-# auto-generate path FAILS CLOSED (`ServerError::AutoGenerateUnavailable`) on a
-# shipped build instead of running a nullifier-backed node. No test-harness
-# platform edge is present, transitively or otherwise — G1 proves it.
-server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/filesystem", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
+# tokio. `start_node_local` opens no protocol store: it receives a caller's
+# already-selected `EncryptedStorage` handle and reaches `Node::start`, so it
+# needs no `scp-platform/filesystem` edge — plaintext `FilesystemStorage`, which
+# `start_node_local` once constructed, has no consumer in this crate.
+# `scp-platform/in-memory-storage` remains for `start_node_in_memory`
+# (ADR-062 Slice 0, durability-only). One caller still holds
+# `allow_unencrypted_storage` open on a scp-node edge below:
+# `start_node_in_memory` reaches `Node::start_for_testing`, and pull request
+# #2283, sealing in-memory node startup, routes that arm through `Node::start`.
+# Drop that edge once #2283 lands; `start_node_local` no longer needs it. This feature
+# does NOT enable scp-platform's `testing` feature: since ADR-062 Slice 6
+# (SCP-CAPINJECT-006) server.rs's `Explicit`-identity phantoms are typed to the
+# production `FileKeyCustody` (not the `InMemoryKeyCustody` nullifier), and the
+# dev-relay auto-generate path FAILS CLOSED
+# (`ServerError::AutoGenerateUnavailable`) on a shipped build instead of running
+# a nullifier-backed node. No test-harness platform edge is present,
+# transitively or otherwise — G1 proves it.
+server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/file", "dep:scp-identity", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }

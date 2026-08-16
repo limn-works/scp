@@ -5,7 +5,7 @@
 //!
 //! - [`NapiRelayHandle`] — opaque handle to a running relay server.
 //! - [`NapiNodeHandle`] — opaque handle to a running application node (wraps
-//!   both `InMemoryStorage` and `FilesystemStorage` variants via an internal
+//!   `InMemoryStorage`, encrypted-in-memory, and `SQLCipher` variants via an internal
 //!   enum).
 //! - `relay_start_in_memory` / `relay_start_local` — relay startup.
 //! - `node_start_in_memory` / `node_start_local` — node startup.
@@ -640,6 +640,10 @@ pub(crate) async fn node_start_in_memory_on(
 }
 
 /// Per-bridge-instance implementation of `node_start_local`.
+///
+/// A node inherits whichever storage backend an instance was constructed with
+/// (`SCP.withStorage({...})`), so it opens no protocol store of its own. A
+/// caller wanting a node on a different backend constructs a second `SCP`.
 pub(crate) async fn node_start_local_on(
     bi: &Arc<NapiBridgeInstance>,
     data_dir: String,
@@ -654,20 +658,31 @@ pub(crate) async fn node_start_local_on(
         None => None,
     };
     let zeroized_passphrase = passphrase.map(Zeroizing::new);
-    let node = server::start_node_local(
-        std::path::Path::new(&data_dir),
-        node_identity,
-        zeroized_passphrase,
-    )
-    .await
+    let data_dir = std::path::Path::new(&data_dir);
+    // `ProtocolRepository::storage()` yields this instance's own chosen
+    // backend; cloning that `Arc` hands a node one store that an event log, a
+    // saga journal, and an `OpenMLS` view already share (spec §17.6).
+    let inner = match crate::runtime::protocol_repository(bi) {
+        crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+            let storage = Arc::clone(repo.storage());
+            server::start_node_local(data_dir, storage, node_identity, zeroized_passphrase)
+                .await
+                .map(RunningNode::InMemoryEncrypted)
+        }
+        crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+            let storage = Arc::clone(repo.storage());
+            server::start_node_local(data_dir, storage, node_identity, zeroized_passphrase)
+                .await
+                .map(RunningNode::Sqlite)
+        }
+    }
     .map_err(server_err)?;
 
-    let did = node.identity().did().to_owned();
-    let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
-    let bridge_token = node.bridge_token_hex();
+    let did = inner.did().to_owned();
+    let relay_url = inner.internal_relay_url();
+    let bridge_token = inner.bridge_token_hex();
     auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
-    let inner = RunningNode::Filesystem(node);
     wire_node_webhook_events(bi, &inner).await;
 
     increment_handle_count();

@@ -17,7 +17,7 @@ path = "src/bin/uniffi-bindgen.rs"
 
 [features]
 default = ["server"]
-# Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
+# Shared relay/node startup code. Pulls in scp-node.
 server = ["scp-ffi-common/server", "dep:scp-node"]
 # Single test-harness feature (ADR-062 §Decision 6): folds in every in-memory
 # nullifier double. `scp-platform/testing` compiles `InMemoryKeyCustody`/
@@ -74,7 +74,7 @@ rmp-serde = { workspace = true }
 # `EncryptingAdapter` in `build_event_log_provider` (#1447 / #484). The
 # `testing` crate-feature above adds `scp-platform/testing` for
 # dev/test/desktop builds only (ADR-062 §Decision 6).
-scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting", "filesystem", "sqlite"] }
+scp-platform = { path = "../../scp-platform", features = ["software_platform", "encrypting", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-transport = { path = "../../scp-transport" }
 ed25519-dalek = { workspace = true }

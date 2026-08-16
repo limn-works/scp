@@ -12,7 +12,7 @@ crate-type = ["cdylib", "lib"]
 
 [features]
 default = ["server"]
-# Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
+# Shared relay/node startup code. Pulls in scp-node.
 server = ["scp-ffi-common/server", "dep:scp-node"]
 # Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
 # be enabled in production builds; the parity harness (ADR-046) enables it.
@@ -78,7 +78,7 @@ scp-node = { path = "../../scp-node", features = ["allow_unencrypted_storage"], 
 # NOT reachable in production: production pre-rotation create FAILS CLOSED with a
 # typed `IdentityError` (SCP-IDENT-1059) rather than mint `InMemoryPreRotationCustody`.
 # The `testing` crate-feature adds `scp-platform/testing` on top for test builds.
-scp-platform = { path = "../../scp-platform", features = ["software_platform", "in-memory-storage", "encrypting", "filesystem", "sqlite"] }
+scp-platform = { path = "../../scp-platform", features = ["software_platform", "in-memory-storage", "encrypting", "sqlite"] }
 scp-mcp = { path = "../../scp-mcp" }
 scp-testing = { path = "../../scp-testing", optional = true }
 scp-transport = { path = "../../scp-transport" }

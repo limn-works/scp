@@ -19,7 +19,7 @@ default = ["server"]
 # but incompatible with test binaries. Maturin passes this explicitly.
 # cargo test runs WITHOUT it, so auto-initialize can embed Python.
 extension-module = ["pyo3/extension-module"]
-# Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
+# Shared relay/node startup code. Pulls in scp-node.
 server = ["scp-ffi-common/server", "dep:scp-node"]
 # Enables testing-only affordances like `scpid_sign(signed_at_override=...)`
 # used by the cross-bridge parity harness (ADR-046). MUST NOT be enabled in
@@ -72,7 +72,7 @@ scp-mcp = { path = "../scp-mcp" }
 # `{"type":"in_memory"}` storage affordance, SCP-CAPSEL-8011) — NEVER `testing`
 # (that would ship the in-memory custody/attestation/pre-rotation nullifiers).
 # The `testing` crate-feature adds `scp-platform/testing` on top for test builds.
-scp-platform = { path = "../scp-platform", features = ["software_platform", "file", "in-memory-storage", "encrypting", "filesystem", "sqlite"] }
+scp-platform = { path = "../scp-platform", features = ["software_platform", "file", "in-memory-storage", "encrypting", "sqlite"] }
 scp-media = { path = "../scp-media" }
 scp-testing = { path = "../scp-testing", optional = true }
 scp-transport = { path = "../scp-transport" }
