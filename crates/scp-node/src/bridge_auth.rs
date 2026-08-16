@@ -151,6 +151,17 @@ pub struct BridgeJwtClaims {
 ///
 /// Stored as a request extension so downstream handlers can access the
 /// authenticated bridge identity without re-parsing the JWT.
+///
+/// # Authorized scope
+///
+/// [`bridge_auth_middleware`] admits a request only when the JWT `scp_bridge_id`
+/// names a registered bridge, the JWT `iss` equals that bridge's
+/// `operator_did`, and the JWT `scp_context_id` equals that bridge's
+/// `registration_context`. A `BridgeAuthContext` therefore authorizes exactly
+/// one bridge instance acting inside exactly one context — never a set of
+/// contexts and never a node-wide role. A handler reading this context MUST
+/// restrict every record it enumerates, mutates, or emits to
+/// [`context_id`](Self::context_id) and [`bridge_id`](Self::bridge_id).
 #[derive(Debug, Clone)]
 pub struct BridgeAuthContext {
     /// The verified JWT claims.
@@ -158,6 +169,70 @@ pub struct BridgeAuthContext {
 
     /// The resolved bridge connector from the registry.
     pub bridge: BridgeConnector,
+}
+
+impl BridgeAuthContext {
+    /// Returns the single context this request is authorized to act inside.
+    #[must_use]
+    pub fn context_id(&self) -> &str {
+        &self.bridge.registration_context
+    }
+
+    /// Returns the single bridge instance this request is authorized to act as.
+    #[must_use]
+    pub fn bridge_id(&self) -> &str {
+        &self.bridge.bridge_id
+    }
+}
+
+/// A webhook signing key together with the bridge instance it belongs to.
+///
+/// Spec §12.10.2 registers a platform's Ed25519 public key through the
+/// `RegisterBridge` governance action, and step 3 of that flow states that the
+/// bridge node "stores the platform key associated with the bridge instance."
+/// Storing a bare key without that association lets any platform holding any
+/// registered key act on any context's shadows, so this type carries the
+/// association that the signature check alone cannot supply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookKeyBinding {
+    /// The platform's Ed25519 public key.
+    pub public_key: [u8; 32],
+
+    /// The bridge instance this key signs for.
+    pub bridge_id: String,
+}
+
+/// Validated webhook authentication context extracted by the middleware.
+///
+/// Stored as a request extension so the webhook handler can restrict the events
+/// it processes to the signing platform's own bridge and context.
+///
+/// # Authorized scope
+///
+/// [`webhook_auth_middleware`] admits a request only when the `X-SCP-Signature`
+/// header verifies under the key registered for the `X-SCP-Platform-Key-Id`
+/// header, and that key's [`WebhookKeyBinding::bridge_id`] names an active
+/// registered bridge. This context therefore authorizes exactly one bridge
+/// instance inside exactly one context, matching what a
+/// [`BridgeAuthContext`] authorizes on the bearer-token path.
+#[derive(Debug, Clone)]
+pub struct WebhookAuthContext {
+    /// The resolved bridge connector whose platform key signed the request.
+    pub bridge: BridgeConnector,
+}
+
+impl WebhookAuthContext {
+    /// Returns the single context this request is authorized to act inside.
+    #[must_use]
+    pub fn context_id(&self) -> &str {
+        &self.bridge.registration_context
+    }
+
+    /// Returns the single bridge instance this request is authorized to act as.
+    #[must_use]
+    pub fn bridge_id(&self) -> &str {
+        &self.bridge.bridge_id
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,11 +256,12 @@ pub trait BridgeLookup: Send + Sync + 'static {
     /// MAY cache resolved documents with TTL (spec section 12.10.2).
     fn resolve_did_document(&self, did: &str) -> Option<DidDocument>;
 
-    /// Look up a pre-registered webhook signing public key by key ID.
+    /// Look up a pre-registered webhook signing key by key ID.
     ///
-    /// Returns the Ed25519 public key bytes for the given platform key ID.
-    /// Returns `None` if no key with that ID is registered.
-    fn find_webhook_key(&self, key_id: &str) -> Option<[u8; 32]>;
+    /// Returns the Ed25519 public key together with the bridge instance the
+    /// key was registered for (spec §12.10.2, platform key registration step
+    /// 3). Returns `None` if no key with that ID is registered.
+    fn find_webhook_key(&self, key_id: &str) -> Option<WebhookKeyBinding>;
 
     /// Returns the expected audience (node URL) for JWT validation.
     fn expected_audience(&self) -> &str;
@@ -231,7 +307,7 @@ pub struct StorageBridgeLookup<S: Storage> {
     /// In-memory cache of DID documents keyed by DID string.
     did_docs: std::sync::RwLock<HashMap<String, DidDocument>>,
     /// In-memory cache of webhook signing keys keyed by key ID.
-    webhook_keys: std::sync::RwLock<HashMap<String, [u8; 32]>>,
+    webhook_keys: std::sync::RwLock<HashMap<String, WebhookKeyBinding>>,
     /// The expected JWT audience (node URL).
     audience: String,
 }
@@ -312,20 +388,23 @@ impl<S: Storage> StorageBridgeLookup<S> {
         }
 
         // Load webhook keys — collect from storage first, then insert into cache.
+        //
+        // A record that does not deserialize into a `WebhookKeyBinding` carries
+        // no bridge association, so the node cannot tell which context the key
+        // authorizes. Such a record is dropped rather than loaded with a
+        // guessed bridge, because loading it would authorize the key against
+        // every context.
         let wh_keys = storage.list_keys(BRIDGE_WEBHOOK_KEY_PREFIX).await?;
         let mut loaded_wh_keys = Vec::new();
         for key in &wh_keys {
             if let Some(data) = storage.retrieve(key).await? {
-                if data.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&data);
+                if let Ok(binding) = serde_json::from_slice::<WebhookKeyBinding>(&data) {
                     let key_id = key.strip_prefix(BRIDGE_WEBHOOK_KEY_PREFIX).unwrap_or(key);
-                    loaded_wh_keys.push((key_id.to_owned(), arr));
+                    loaded_wh_keys.push((key_id.to_owned(), binding));
                 } else {
                     tracing::warn!(
                         key = %key,
-                        len = data.len(),
-                        "skipping webhook key with invalid length (expected 32)"
+                        "skipping webhook key record that carries no bridge binding"
                     );
                 }
             }
@@ -335,8 +414,8 @@ impl<S: Storage> StorageBridgeLookup<S> {
                 .webhook_keys
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (key_id, arr) in loaded_wh_keys {
-                cache.insert(key_id, arr);
+            for (key_id, binding) in loaded_wh_keys {
+                cache.insert(key_id, binding);
             }
         }
 
@@ -431,8 +510,13 @@ impl<S: Storage> StorageBridgeLookup<S> {
         Ok(())
     }
 
-    /// Registers a webhook signing key, persisting to storage and updating
-    /// the cache.
+    /// Registers a webhook signing key against the bridge instance it signs
+    /// for, persisting to storage and updating the cache.
+    ///
+    /// Spec §12.10.2 requires the node to store a platform key associated with
+    /// a bridge instance, so `bridge_id` names the bridge whose registration
+    /// carried this key. The webhook middleware resolves that bridge to decide
+    /// which context a signed webhook request may touch.
     ///
     /// # Errors
     ///
@@ -440,14 +524,21 @@ impl<S: Storage> StorageBridgeLookup<S> {
     pub async fn register_webhook_key(
         &self,
         key_id: &str,
+        bridge_id: &str,
         public_key: [u8; 32],
     ) -> Result<(), scp_platform::PlatformError> {
+        let binding = WebhookKeyBinding {
+            public_key,
+            bridge_id: bridge_id.to_owned(),
+        };
         let key = format!("{BRIDGE_WEBHOOK_KEY_PREFIX}{key_id}");
-        self.repo.storage().store(&key, &public_key).await?;
+        let data = serde_json::to_vec(&binding)
+            .map_err(|e| scp_platform::PlatformError::StorageError(e.to_string()))?;
+        self.repo.storage().store(&key, &data).await?;
         self.webhook_keys
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key_id.to_owned(), public_key);
+            .insert(key_id.to_owned(), binding);
         Ok(())
     }
 
@@ -487,12 +578,12 @@ impl<S: Storage + 'static> BridgeLookup for StorageBridgeLookup<S> {
             .cloned()
     }
 
-    fn find_webhook_key(&self, key_id: &str) -> Option<[u8; 32]> {
+    fn find_webhook_key(&self, key_id: &str) -> Option<WebhookKeyBinding> {
         self.webhook_keys
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(key_id)
-            .copied()
+            .cloned()
     }
 
     fn expected_audience(&self) -> &str {
@@ -660,6 +751,83 @@ fn verify_bridge_jwt(token: &str, lookup: &dyn BridgeLookup) -> Result<BridgeJwt
 // Bridge auth middleware
 // ---------------------------------------------------------------------------
 
+/// Rejects a bridge whose governance status forbids it from acting.
+///
+/// Both the bearer-token path and the webhook-signature path admit a request
+/// only for an `Active` bridge, so this check lives in one place and both
+/// middlewares call it.
+fn reject_inactive_bridge(bridge: &BridgeConnector) -> Option<(StatusCode, Json<ApiError>)> {
+    match bridge.status {
+        BridgeStatus::Active => None,
+        BridgeStatus::Suspended => Some(bridge_suspended(format!(
+            "bridge {} is suspended by context governance",
+            bridge.bridge_id
+        ))),
+        BridgeStatus::Revoked => Some(bridge_not_authorized(format!(
+            "bridge {} has been revoked",
+            bridge.bridge_id
+        ))),
+    }
+}
+
+/// Authorizes a bearer-token bridge request and returns the scope it grants.
+///
+/// Verifies the `Authorization: Bearer <JWT>` header against the issuer's DID
+/// document, resolves the bridge named by `scp_bridge_id`, and requires the
+/// JWT issuer and context to match that bridge's registration. Both
+/// [`bridge_auth_middleware`] and [`bridge_auth_middleware_dyn`] call this
+/// function, so the generic and type-erased entry points enforce one rule set.
+///
+/// # Errors
+///
+/// Returns the HTTP status and body the middleware sends when any check fails.
+fn authorize_bearer_request(
+    headers: &axum::http::HeaderMap,
+    lookup: &dyn BridgeLookup,
+) -> Result<BridgeAuthContext, (StatusCode, Json<ApiError>)> {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let token = match auth_header {
+        Some(value) if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") => &value[7..],
+        _ => {
+            return Err(bridge_not_authorized(
+                "missing or invalid Authorization header",
+            ));
+        }
+    };
+
+    let claims = verify_bridge_jwt(token, lookup).map_err(bridge_not_authorized)?;
+
+    let Some(bridge) = lookup.find_bridge(&claims.scp_bridge_id) else {
+        return Err(bridge_not_authorized(format!(
+            "bridge not found: {}",
+            claims.scp_bridge_id
+        )));
+    };
+
+    // Validate that the JWT issuer matches the bridge operator.
+    if bridge.operator_did != claims.iss {
+        return Err(bridge_not_authorized(
+            "JWT issuer does not match bridge operator DID",
+        ));
+    }
+
+    // Validate that the context ID matches.
+    if claims.scp_context_id != bridge.registration_context {
+        return Err(bridge_not_authorized(
+            "JWT context ID does not match bridge registration context",
+        ));
+    }
+
+    if let Some(rejection) = reject_inactive_bridge(&bridge) {
+        return Err(rejection);
+    }
+
+    Ok(BridgeAuthContext { claims, bridge })
+}
+
 /// Axum middleware that validates DID-signed bearer tokens for bridge
 /// endpoints.
 ///
@@ -683,64 +851,11 @@ pub async fn bridge_auth_middleware<L: BridgeLookup>(
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    // Extract the Authorization header.
-    let auth_header = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-
-    let token = match auth_header {
-        Some(value) if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") => &value[7..],
-        _ => {
-            return bridge_not_authorized("missing or invalid Authorization header")
-                .into_response();
-        }
+    let auth_ctx = match authorize_bearer_request(req.headers(), lookup.as_ref()) {
+        Ok(ctx) => ctx,
+        Err(rejection) => return rejection.into_response(),
     };
 
-    // Verify the JWT.
-    let claims = match verify_bridge_jwt(token, lookup.as_ref()) {
-        Ok(claims) => claims,
-        Err(msg) => {
-            return bridge_not_authorized(msg).into_response();
-        }
-    };
-
-    // Look up the bridge in the registry.
-    let Some(bridge) = lookup.find_bridge(&claims.scp_bridge_id) else {
-        return bridge_not_authorized(format!("bridge not found: {}", claims.scp_bridge_id))
-            .into_response();
-    };
-
-    // Validate that the JWT issuer matches the bridge operator.
-    if bridge.operator_did != claims.iss {
-        return bridge_not_authorized("JWT issuer does not match bridge operator DID")
-            .into_response();
-    }
-
-    // Validate that the context ID matches.
-    if claims.scp_context_id != bridge.registration_context {
-        return bridge_not_authorized("JWT context ID does not match bridge registration context")
-            .into_response();
-    }
-
-    // Check bridge status.
-    match bridge.status {
-        BridgeStatus::Active => {}
-        BridgeStatus::Suspended => {
-            return bridge_suspended(format!(
-                "bridge {} is suspended by context governance",
-                bridge.bridge_id
-            ))
-            .into_response();
-        }
-        BridgeStatus::Revoked => {
-            return bridge_not_authorized(format!("bridge {} has been revoked", bridge.bridge_id))
-                .into_response();
-        }
-    }
-
-    // Insert the auth context for downstream handlers.
-    let auth_ctx = BridgeAuthContext { claims, bridge };
     req.extensions_mut().insert(auth_ctx);
 
     next.run(req).await.into_response()
@@ -758,64 +873,11 @@ pub async fn bridge_auth_middleware_dyn(
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    // Extract the Authorization header.
-    let auth_header = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-
-    let token = match auth_header {
-        Some(value) if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") => &value[7..],
-        _ => {
-            return bridge_not_authorized("missing or invalid Authorization header")
-                .into_response();
-        }
+    let auth_ctx = match authorize_bearer_request(req.headers(), lookup.as_ref()) {
+        Ok(ctx) => ctx,
+        Err(rejection) => return rejection.into_response(),
     };
 
-    // Verify the JWT.
-    let claims = match verify_bridge_jwt(token, lookup.as_ref()) {
-        Ok(claims) => claims,
-        Err(msg) => {
-            return bridge_not_authorized(msg).into_response();
-        }
-    };
-
-    // Look up the bridge in the registry.
-    let Some(bridge) = lookup.find_bridge(&claims.scp_bridge_id) else {
-        return bridge_not_authorized(format!("bridge not found: {}", claims.scp_bridge_id))
-            .into_response();
-    };
-
-    // Validate that the JWT issuer matches the bridge operator.
-    if bridge.operator_did != claims.iss {
-        return bridge_not_authorized("JWT issuer does not match bridge operator DID")
-            .into_response();
-    }
-
-    // Validate that the context ID matches.
-    if claims.scp_context_id != bridge.registration_context {
-        return bridge_not_authorized("JWT context ID does not match bridge registration context")
-            .into_response();
-    }
-
-    // Check bridge status.
-    match bridge.status {
-        BridgeStatus::Active => {}
-        BridgeStatus::Suspended => {
-            return bridge_suspended(format!(
-                "bridge {} is suspended by context governance",
-                bridge.bridge_id
-            ))
-            .into_response();
-        }
-        BridgeStatus::Revoked => {
-            return bridge_not_authorized(format!("bridge {} has been revoked", bridge.bridge_id))
-                .into_response();
-        }
-    }
-
-    // Insert the auth context for downstream handlers.
-    let auth_ctx = BridgeAuthContext { claims, bridge };
     req.extensions_mut().insert(auth_ctx);
 
     next.run(req).await.into_response()
@@ -825,11 +887,15 @@ pub async fn bridge_auth_middleware_dyn(
 // Webhook signature verification
 // ---------------------------------------------------------------------------
 
-/// Verifies an Ed25519 webhook signature from an external platform.
+/// Verifies an Ed25519 webhook signature from an external platform and returns
+/// the bridge binding the signing key carries.
 ///
-/// Extracts the `X-SCP-Signature` and `X-SCP-Platform-Key-Id` headers,
-/// looks up the platform's pre-registered public key, and verifies the
-/// Ed25519 signature over the raw request body.
+/// Looks up the key registered under `key_id`, verifies the Ed25519 signature
+/// over `timestamp_bytes || body_bytes`, and hands the caller the
+/// [`WebhookKeyBinding`] so the caller can restrict the request to the bridge
+/// that key was registered for. A verified signature proves which key signed
+/// the request; it does not by itself say which context that key may touch,
+/// which is why this function returns the binding rather than `()`.
 ///
 /// See spec section 12.10.2.
 ///
@@ -849,7 +915,7 @@ pub fn verify_webhook_signature(
     timestamp_header: Option<&str>,
     body: &[u8],
     lookup: &dyn BridgeLookup,
-) -> Result<(), String> {
+) -> Result<WebhookKeyBinding, String> {
     // Validate and check timestamp freshness (replay protection per §12.10.2).
     let timestamp_str =
         timestamp_header.ok_or_else(|| "missing X-SCP-Timestamp header".to_owned())?;
@@ -870,12 +936,12 @@ pub fn verify_webhook_signature(
         ));
     }
 
-    // Look up the platform's signing key.
-    let pub_key_bytes = lookup
+    // Look up the platform's signing key together with the bridge it signs for.
+    let binding = lookup
         .find_webhook_key(key_id)
         .ok_or_else(|| format!("unknown platform key ID: {key_id}"))?;
 
-    let verifying_key = VerifyingKey::from_bytes(&pub_key_bytes)
+    let verifying_key = VerifyingKey::from_bytes(&binding.public_key)
         .map_err(|e| format!("invalid platform public key: {e}"))?;
 
     // Decode the signature from base64url.
@@ -898,7 +964,75 @@ pub fn verify_webhook_signature(
 
     verifying_key
         .verify_strict(&signed_payload, &signature)
-        .map_err(|e| format!("webhook signature verification failed: {e}"))
+        .map_err(|e| format!("webhook signature verification failed: {e}"))?;
+
+    Ok(binding)
+}
+
+/// Maximum webhook request body the middleware buffers for signature
+/// verification (10 MiB).
+const MAX_WEBHOOK_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Authorizes a signed webhook request and returns the scope it grants.
+///
+/// Verifies the `X-SCP-Signature` header over `X-SCP-Timestamp || body`, then
+/// resolves the bridge that the signing key was registered for and requires
+/// that bridge to be active. Both [`webhook_auth_middleware`] and
+/// [`webhook_auth_middleware_dyn`] call this function, so the generic and
+/// type-erased entry points enforce one rule set.
+///
+/// # Errors
+///
+/// Returns the HTTP status and body the middleware sends when any check fails.
+fn authorize_webhook_request(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    lookup: &dyn BridgeLookup,
+) -> Result<WebhookAuthContext, (StatusCode, Json<ApiError>)> {
+    let Some(signature_header) = headers.get("x-scp-signature").and_then(|v| v.to_str().ok())
+    else {
+        return Err(bridge_not_authorized("missing X-SCP-Signature header"));
+    };
+
+    let Some(key_id) = headers
+        .get("x-scp-platform-key-id")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Err(bridge_not_authorized(
+            "missing X-SCP-Platform-Key-Id header",
+        ));
+    };
+
+    let Some(timestamp_header) = headers.get("x-scp-timestamp").and_then(|v| v.to_str().ok())
+    else {
+        return Err(bridge_not_authorized("missing X-SCP-Timestamp header"));
+    };
+
+    let binding = verify_webhook_signature(
+        signature_header,
+        key_id,
+        Some(timestamp_header),
+        body,
+        lookup,
+    )
+    .map_err(bridge_not_authorized)?;
+
+    // Resolve the bridge the key was registered against. A verified signature
+    // says which platform signed the request; this lookup says which context
+    // that platform may touch, and the webhook handler restricts every record
+    // it reads or mutates to that context.
+    let Some(bridge) = lookup.find_bridge(&binding.bridge_id) else {
+        return Err(bridge_not_authorized(format!(
+            "webhook key {key_id} is bound to unregistered bridge {}",
+            binding.bridge_id
+        )));
+    };
+
+    if let Some(rejection) = reject_inactive_bridge(&bridge) {
+        return Err(rejection);
+    }
+
+    Ok(WebhookAuthContext { bridge })
 }
 
 /// Axum middleware that validates webhook signatures from external platforms.
@@ -907,8 +1041,11 @@ pub fn verify_webhook_signature(
 /// `X-SCP-Timestamp` headers and verifies the Ed25519 signature over the
 /// timestamped request body per spec §12.10.2.
 ///
-/// On success, the request proceeds to the next handler. On failure,
-/// returns 401 with error code `BRIDGE_NOT_AUTHORIZED`.
+/// On success, inserts a [`WebhookAuthContext`] into the request extensions so
+/// the webhook handler can restrict its work to the signing platform's bridge
+/// and context. On failure, returns 401 with error code
+/// `BRIDGE_NOT_AUTHORIZED`, or 403 with `BRIDGE_SUSPENDED` when the bound
+/// bridge is suspended.
 ///
 /// See spec section 12.10.2.
 pub async fn webhook_auth_middleware<L: BridgeLookup>(
@@ -916,44 +1053,10 @@ pub async fn webhook_auth_middleware<L: BridgeLookup>(
     req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    // Extract required headers.
-    let signature_header = match req
-        .headers()
-        .get("x-scp-signature")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(s) => s.to_owned(),
-        None => {
-            return bridge_not_authorized("missing X-SCP-Signature header").into_response();
-        }
-    };
-
-    let key_id = match req
-        .headers()
-        .get("x-scp-platform-key-id")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(k) => k.to_owned(),
-        None => {
-            return bridge_not_authorized("missing X-SCP-Platform-Key-Id header").into_response();
-        }
-    };
-
-    let timestamp_header = match req
-        .headers()
-        .get("x-scp-timestamp")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(t) => t.to_owned(),
-        None => {
-            return bridge_not_authorized("missing X-SCP-Timestamp header").into_response();
-        }
-    };
-
-    // We need to read the body for signature verification, then reconstruct
-    // the request for downstream handlers.
+    // Read the body for signature verification, then reconstruct the request
+    // for downstream handlers.
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_WEBHOOK_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             return bridge_not_authorized(format!("failed to read request body: {e}"))
@@ -961,19 +1064,14 @@ pub async fn webhook_auth_middleware<L: BridgeLookup>(
         }
     };
 
-    // Verify the signature (includes timestamp validation per §12.10.2).
-    if let Err(msg) = verify_webhook_signature(
-        &signature_header,
-        &key_id,
-        Some(&timestamp_header),
-        &body_bytes,
-        lookup.as_ref(),
-    ) {
-        return bridge_not_authorized(msg).into_response();
-    }
+    let webhook_ctx = match authorize_webhook_request(&parts.headers, &body_bytes, lookup.as_ref())
+    {
+        Ok(ctx) => ctx,
+        Err(rejection) => return rejection.into_response(),
+    };
 
-    // Reconstruct the request with the body bytes.
-    let req = Request::from_parts(parts, Body::from(body_bytes));
+    let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    req.extensions_mut().insert(webhook_ctx);
     next.run(req).await.into_response()
 }
 
@@ -988,43 +1086,9 @@ pub async fn webhook_auth_middleware_dyn(
     req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    // Extract required headers.
-    let signature_header = match req
-        .headers()
-        .get("x-scp-signature")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(s) => s.to_owned(),
-        None => {
-            return bridge_not_authorized("missing X-SCP-Signature header").into_response();
-        }
-    };
-
-    let key_id = match req
-        .headers()
-        .get("x-scp-platform-key-id")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(k) => k.to_owned(),
-        None => {
-            return bridge_not_authorized("missing X-SCP-Platform-Key-Id header").into_response();
-        }
-    };
-
-    let timestamp_header = match req
-        .headers()
-        .get("x-scp-timestamp")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(t) => t.to_owned(),
-        None => {
-            return bridge_not_authorized("missing X-SCP-Timestamp header").into_response();
-        }
-    };
-
     // Read the body for signature verification, then reconstruct.
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, MAX_WEBHOOK_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             return bridge_not_authorized(format!("failed to read request body: {e}"))
@@ -1032,19 +1096,14 @@ pub async fn webhook_auth_middleware_dyn(
         }
     };
 
-    // Verify the signature (includes timestamp validation per §12.10.2).
-    if let Err(msg) = verify_webhook_signature(
-        &signature_header,
-        &key_id,
-        Some(&timestamp_header),
-        &body_bytes,
-        lookup.as_ref(),
-    ) {
-        return bridge_not_authorized(msg).into_response();
-    }
+    let webhook_ctx = match authorize_webhook_request(&parts.headers, &body_bytes, lookup.as_ref())
+    {
+        Ok(ctx) => ctx,
+        Err(rejection) => return rejection.into_response(),
+    };
 
-    // Reconstruct the request with the body bytes.
-    let req = Request::from_parts(parts, Body::from(body_bytes));
+    let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    req.extensions_mut().insert(webhook_ctx);
     next.run(req).await.into_response()
 }
 
@@ -1102,6 +1161,7 @@ mod tests {
 
     use axum::Router;
     use axum::body::Body;
+    use axum::extract::Extension;
     use axum::http::{Request, StatusCode};
     use axum::middleware;
     use axum::routing::get;
@@ -1120,7 +1180,7 @@ mod tests {
     struct TestBridgeLookup {
         bridges: Vec<BridgeConnector>,
         did_docs: Vec<(String, DidDocument)>,
-        webhook_keys: Vec<(String, [u8; 32])>,
+        webhook_keys: Vec<(String, WebhookKeyBinding)>,
         audience: String,
     }
 
@@ -1150,15 +1210,23 @@ mod tests {
                 .map(|(_, doc)| doc.clone())
         }
 
-        fn find_webhook_key(&self, key_id: &str) -> Option<[u8; 32]> {
+        fn find_webhook_key(&self, key_id: &str) -> Option<WebhookKeyBinding> {
             self.webhook_keys
                 .iter()
                 .find(|(id, _)| id == key_id)
-                .map(|(_, key)| *key)
+                .map(|(_, binding)| binding.clone())
         }
 
         fn expected_audience(&self) -> &str {
             &self.audience
+        }
+    }
+
+    /// Builds a webhook key binding for `bridge_id` carrying `public_key`.
+    fn test_webhook_binding(bridge_id: &str, public_key: [u8; 32]) -> WebhookKeyBinding {
+        WebhookKeyBinding {
+            public_key,
+            bridge_id: bridge_id.to_owned(),
         }
     }
 
@@ -1658,9 +1726,10 @@ mod tests {
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         let mut lookup = TestBridgeLookup::new("https://node.example.com");
-        lookup
-            .webhook_keys
-            .push(("platform-key-1".to_owned(), pub_key));
+        lookup.webhook_keys.push((
+            "platform-key-1".to_owned(),
+            test_webhook_binding("bridge-wh", pub_key),
+        ));
 
         let result = verify_webhook_signature(&sig_b64, "platform-key-1", Some(&ts), body, &lookup);
         assert!(result.is_ok());
@@ -1682,9 +1751,10 @@ mod tests {
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         let mut lookup = TestBridgeLookup::new("https://node.example.com");
-        lookup
-            .webhook_keys
-            .push(("platform-key-1".to_owned(), pub_key));
+        lookup.webhook_keys.push((
+            "platform-key-1".to_owned(),
+            test_webhook_binding("bridge-wh", pub_key),
+        ));
 
         let result = verify_webhook_signature(&sig_b64, "platform-key-1", Some(&ts), body, &lookup);
         assert!(result.is_err());
@@ -1722,9 +1792,10 @@ mod tests {
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         let mut lookup = TestBridgeLookup::new("https://node.example.com");
-        lookup
-            .webhook_keys
-            .push(("platform-key-1".to_owned(), pub_key));
+        lookup.webhook_keys.push((
+            "platform-key-1".to_owned(),
+            test_webhook_binding("bridge-wh", pub_key),
+        ));
 
         let result = verify_webhook_signature(
             &sig_b64,
@@ -1741,7 +1812,10 @@ mod tests {
         let body = b"webhook payload";
         let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 64]);
         let mut lookup = TestBridgeLookup::new("https://node.example.com");
-        lookup.webhook_keys.push(("key-1".to_owned(), [0u8; 32]));
+        lookup.webhook_keys.push((
+            "key-1".to_owned(),
+            test_webhook_binding("bridge-wh", [0u8; 32]),
+        ));
 
         let result = verify_webhook_signature(&sig_b64, "key-1", None, body, &lookup);
         assert!(result.is_err());
@@ -1770,9 +1844,10 @@ mod tests {
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         let mut lookup = TestBridgeLookup::new("https://node.example.com");
-        lookup
-            .webhook_keys
-            .push(("platform-key-1".to_owned(), pub_key));
+        lookup.webhook_keys.push((
+            "platform-key-1".to_owned(),
+            test_webhook_binding("bridge-wh", pub_key),
+        ));
 
         let result =
             verify_webhook_signature(&sig_b64, "platform-key-1", Some(&stale_ts), body, &lookup);
@@ -1783,6 +1858,169 @@ mod tests {
                 .contains("timestamp outside acceptable window"),
             "expected timestamp drift error"
         );
+    }
+
+    #[test]
+    fn verified_webhook_signature_returns_its_bridge_binding() {
+        use ed25519_dalek::Signer;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let pub_key = *signing_key.verifying_key().as_bytes();
+        let body = b"webhook payload content";
+        let ts = current_timestamp_str();
+        let signature = signing_key.sign(&webhook_signed_payload(&ts, body));
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.webhook_keys.push((
+            "platform-key-1".to_owned(),
+            test_webhook_binding("bridge-owner", pub_key),
+        ));
+
+        let binding =
+            verify_webhook_signature(&sig_b64, "platform-key-1", Some(&ts), body, &lookup).unwrap();
+        assert_eq!(binding.bridge_id, "bridge-owner");
+        assert_eq!(binding.public_key, pub_key);
+    }
+
+    // -------------------------------------------------------------------
+    // Webhook middleware scope tests
+    //
+    // A verified signature says which platform signed a request. These tests
+    // require the middleware to also resolve the bridge that signing key was
+    // registered against (spec §12.10.2, platform key registration step 3) and
+    // to hand that bridge to the handler, so the handler can restrict its work
+    // to one context.
+    // -------------------------------------------------------------------
+
+    /// Builds a webhook-authenticated app whose handler echoes the bridge ID
+    /// and context ID that the middleware authorized.
+    fn webhook_test_app(lookup: Arc<TestBridgeLookup>) -> Router {
+        Router::new()
+            .route(
+                "/webhook",
+                axum::routing::post(|Extension(ctx): Extension<WebhookAuthContext>| async move {
+                    format!("{}|{}", ctx.bridge_id(), ctx.context_id())
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                lookup,
+                webhook_auth_middleware::<TestBridgeLookup>,
+            ))
+    }
+
+    /// Builds a signed webhook request for `body` under `key_id`.
+    fn signed_webhook_request(
+        signing_key: &SigningKey,
+        key_id: &str,
+        body: &'static str,
+    ) -> Request<Body> {
+        use ed25519_dalek::Signer;
+
+        let ts = current_timestamp_str();
+        let signature = signing_key.sign(&webhook_signed_payload(&ts, body.as_bytes()));
+        Request::builder()
+            .method("POST")
+            .uri("/webhook")
+            .header(
+                "x-scp-signature",
+                URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            )
+            .header("x-scp-platform-key-id", key_id)
+            .header("x-scp-timestamp", ts)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// Builds a lookup holding one webhook key bound to a bridge with `status`.
+    fn webhook_lookup_with_bridge(
+        pub_key: [u8; 32],
+        bridge_id: &str,
+        context_id: &str,
+        status: BridgeStatus,
+    ) -> TestBridgeLookup {
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.webhook_keys.push((
+            "platform-key-1".to_owned(),
+            test_webhook_binding(bridge_id, pub_key),
+        ));
+        lookup.bridges.push(test_bridge(
+            bridge_id,
+            "did:dht:z6MkOperator",
+            context_id,
+            status,
+        ));
+        lookup
+    }
+
+    #[tokio::test]
+    async fn webhook_middleware_hands_the_handler_its_bound_bridge() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let pub_key = *signing_key.verifying_key().as_bytes();
+        let lookup =
+            webhook_lookup_with_bridge(pub_key, "bridge-owner", "ctx-owner", BridgeStatus::Active);
+
+        let app = webhook_test_app(Arc::new(lookup));
+        let req = signed_webhook_request(&signing_key, "platform-key-1", "{}");
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(response_body(resp).await, "bridge-owner|ctx-owner");
+    }
+
+    #[tokio::test]
+    async fn webhook_middleware_rejects_a_key_bound_to_an_unregistered_bridge() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let pub_key = *signing_key.verifying_key().as_bytes();
+
+        // The key names a bridge the registry does not hold, so the node cannot
+        // tell which context the request may touch.
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.webhook_keys.push((
+            "platform-key-1".to_owned(),
+            test_webhook_binding("bridge-missing", pub_key),
+        ));
+
+        let app = webhook_test_app(Arc::new(lookup));
+        let req = signed_webhook_request(&signing_key, "platform-key-1", "{}");
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(response_body(resp).await.contains("BRIDGE_NOT_AUTHORIZED"));
+    }
+
+    #[tokio::test]
+    async fn webhook_middleware_rejects_a_suspended_bound_bridge() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let pub_key = *signing_key.verifying_key().as_bytes();
+        let lookup = webhook_lookup_with_bridge(
+            pub_key,
+            "bridge-owner",
+            "ctx-owner",
+            BridgeStatus::Suspended,
+        );
+
+        let app = webhook_test_app(Arc::new(lookup));
+        let req = signed_webhook_request(&signing_key, "platform-key-1", "{}");
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(response_body(resp).await.contains("BRIDGE_SUSPENDED"));
+    }
+
+    #[tokio::test]
+    async fn webhook_middleware_rejects_a_revoked_bound_bridge() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let pub_key = *signing_key.verifying_key().as_bytes();
+        let lookup =
+            webhook_lookup_with_bridge(pub_key, "bridge-owner", "ctx-owner", BridgeStatus::Revoked);
+
+        let app = webhook_test_app(Arc::new(lookup));
+        let req = signed_webhook_request(&signing_key, "platform-key-1", "{}");
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(response_body(resp).await.contains("BRIDGE_NOT_AUTHORIZED"));
     }
 
     // -------------------------------------------------------------------
@@ -1839,13 +2077,13 @@ mod tests {
         let pub_key = [42u8; 32];
 
         lookup
-            .register_webhook_key("platform-key-1", pub_key)
+            .register_webhook_key("platform-key-1", "bridge-wh", pub_key)
             .await
             .unwrap();
 
-        let found = lookup.find_webhook_key("platform-key-1");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap(), pub_key);
+        let found = lookup.find_webhook_key("platform-key-1").unwrap();
+        assert_eq!(found.public_key, pub_key);
+        assert_eq!(found.bridge_id, "bridge-wh");
 
         assert!(lookup.find_webhook_key("nonexistent-key").is_none());
     }
@@ -1877,7 +2115,7 @@ mod tests {
     async fn storage_lookup_deregister_webhook_key() {
         let lookup = make_storage_lookup();
         lookup
-            .register_webhook_key("key-1", [1u8; 32])
+            .register_webhook_key("key-1", "bridge-wh", [1u8; 32])
             .await
             .unwrap();
 
@@ -1905,7 +2143,7 @@ mod tests {
         lookup1.register_did_document(doc).await.unwrap();
 
         lookup1
-            .register_webhook_key("wh-key-rt", [99u8; 32])
+            .register_webhook_key("wh-key-rt", "bridge-rt", [99u8; 32])
             .await
             .unwrap();
 
@@ -1916,7 +2154,13 @@ mod tests {
 
         assert!(lookup2.find_bridge("bridge-rt").is_some());
         assert!(lookup2.resolve_did_document(&did).is_some());
-        assert_eq!(lookup2.find_webhook_key("wh-key-rt"), Some([99u8; 32]));
+        assert_eq!(
+            lookup2.find_webhook_key("wh-key-rt"),
+            Some(WebhookKeyBinding {
+                public_key: [99u8; 32],
+                bridge_id: "bridge-rt".to_owned(),
+            })
+        );
     }
 
     #[tokio::test]
