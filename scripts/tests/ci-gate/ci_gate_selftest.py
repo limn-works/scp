@@ -37,11 +37,14 @@ REPO = Path(__file__).resolve().parents[3]
 WORKFLOW = REPO / ".github/workflows/ci.yml"
 AGGREGATE = REPO / "scripts/ci-aggregate-result.py"
 
-# A job whose work is a script or a lint finishes in under a minute; a job that
-# compiles the workspace takes about twenty. No job in this workflow has a
-# defensible reason to run longer than this, and the point of the ceiling is
-# that a hang costs minutes rather than six hours.
+# A ci.yml job whose work is a script or a lint finishes in under a minute; one
+# that compiles the workspace takes about twenty. The point of a ceiling is that
+# a hang costs minutes rather than the six hours GitHub allows by default.
 MAX_TIMEOUT_MINUTES = 90
+
+# The scheduled fuzz and release workflows run longer by design: fuzz-weekly
+# passes `-max_total_time=7200` to libFuzzer, and a release builds every target.
+MAX_TIMEOUT_MINUTES_OTHER_WORKFLOWS = 240
 
 # Cargo flags that consume the token after them. Any other bare token following
 # `cargo test` is a test-name filter, and `cargo test` exits 0 when a filter
@@ -159,14 +162,24 @@ def main() -> int:
     jobs = workflow["jobs"]
     aggregate = load_aggregate()
 
-    print("timeout — every job bounds its own runtime")
-    for job_id in sorted(jobs):
-        budget = jobs[job_id].get("timeout-minutes")
-        check(
-            f"{job_id} sets timeout-minutes",
-            isinstance(budget, int) and 0 < budget <= MAX_TIMEOUT_MINUTES,
-            f"got {budget!r}, want an integer in 1..{MAX_TIMEOUT_MINUTES}",
+    print("timeout — every job in every workflow bounds its own runtime")
+    for path in sorted((REPO / ".github/workflows").glob("*.yml")):
+        ceiling = (
+            MAX_TIMEOUT_MINUTES
+            if path == WORKFLOW
+            else MAX_TIMEOUT_MINUTES_OTHER_WORKFLOWS
         )
+        for job_id, job in sorted(yaml.safe_load(path.read_text())["jobs"].items()):
+            if "uses" in job:
+                # A reusable-workflow call takes no timeout-minutes; the called
+                # workflow's own jobs carry the budget.
+                continue
+            budget = job.get("timeout-minutes")
+            check(
+                f"{path.name}:{job_id} sets timeout-minutes",
+                isinstance(budget, int) and 0 < budget <= ceiling,
+                f"got {budget!r}, want an integer in 1..{ceiling}",
+            )
 
     print("coverage — every job reaches the required status check")
     defined = set(jobs) - {"ci"}

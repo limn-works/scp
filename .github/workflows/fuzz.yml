@@ -34,6 +34,7 @@ jobs:
   toolchain:
     name: Fuzz / read the pinned nightly
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       channel: ${{ steps.read.outputs.channel }}
     steps:
@@ -56,6 +57,7 @@ jobs:
     name: Fuzz / ${{ matrix.target }}
     needs: toolchain
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
@@ -190,6 +192,7 @@ jobs:
     name: Fuzz / fuzz_mls_decrypt (release, debug-assertions off)
     needs: toolchain
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Free disk space
@@ -279,6 +282,7 @@ jobs:
     name: Deep Fuzz / ${{ matrix.target }}
     needs: toolchain
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     if: github.event.schedule == '0 0 * * 6' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
