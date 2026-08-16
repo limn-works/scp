@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Self-test for the CI gate: the workflow's structure and the aggregate's verdict.
+"""Self-test for a CI gate: workflow structure, plus an aggregate's verdict.
 
 Every assertion here corresponds to a defect where a check ran and enforced
 nothing:
 
-  timeout      No job set `timeout-minutes`, so a hung job burned the 360-minute
+  timeout      No job set `timeout-minutes`, so a hung job burned a 360-minute
                per-job runner ceiling.
   coverage     Three enforcement jobs (pyi-generated, construction-pattern,
-               block-in-place) were not dependencies of `ci`, the only required
+               block-in-place) were not dependencies of `ci`, one required
                status check, so their failures never blocked a merge.
-  skip         The aggregate compared results against "failure" and "cancelled"
+  skip         An aggregate compared results against "failure" and "cancelled"
                only, so a skipped dependency and a passing dependency produced
-               the same verdict.
-  rust-fanout  The python, typescript, kotlin and swift filters listed only the
-               bindings and their own bridge directory, so a pull request that
-               touched crates/scp-runtime/ alone skipped all four test jobs.
-  zero-test    `cargo test <filter>` exits 0 when the filter selects no test, so
+               one verdict.
+  rust-fanout  Filters named python, typescript, kotlin and swift listed only
+               bindings plus their own bridge directory, so a pull request
+               touching crates/scp-runtime/ alone skipped all four test jobs.
+  zero-test    `cargo test <filter>` exits 0 when a filter selects no test, so
                a fail-closed lane reported success over zero assertions.
   scaled-input Two fuzz jobs pass a workflow_dispatch input to libFuzzer as
                `-max_total_time`, so an operator sets how long they run. A
@@ -43,8 +43,8 @@ WORKFLOW = REPO / ".github/workflows/ci.yml"
 AGGREGATE = REPO / "scripts/ci-aggregate-result.py"
 
 # A ci.yml job whose work is a script or a lint finishes in under a minute; one
-# that compiles the workspace takes about twenty. The point of a ceiling is that
-# a hang costs minutes rather than the six hours GitHub allows by default.
+# compiling a workspace takes about twenty. A ceiling exists so that a hang
+# costs minutes rather than six hours, which GitHub allows by default.
 MAX_TIMEOUT_MINUTES = 90
 
 # Scheduled fuzz and release workflows run longer by design: fuzz-weekly passes
@@ -74,7 +74,7 @@ RUNTIME_SCALING_INPUTS = {"fuzz_time": 10}
 ARM_PATTERN = re.compile(r"github\.event\.inputs\.(\w+)\s*==\s*'([^']*)'\s*&&\s*(\d+)")
 FALLBACK_PATTERN = re.compile(r"\|\|\s*(\d+)\s*\}\}\s*$")
 
-# Cargo flags that consume the token after them. Any other bare token following
+# Cargo flags consuming whichever token follows them. Any other bare token after
 # `cargo test` is a test-name filter, and `cargo test` exits 0 when a filter
 # selects nothing.
 VALUE_FLAGS = {
@@ -127,7 +127,7 @@ def logical_lines(script: str) -> list[str]:
 
 
 def positional_filters(command: str) -> list[str]:
-    """Return the bare test-name arguments a cargo command carries."""
+    """Return bare test-name arguments a cargo command carries."""
     tokens = shlex.split(command.split(" -- ", 1)[0])
     for word in ("cargo", "test", "nextest", "run"):
         if tokens and tokens[0] == word:
@@ -253,7 +253,7 @@ def run_aggregate(needs: dict, event_name: str) -> tuple[int, str]:
 def build_needs(
     jobs: dict, outputs: dict[str, str], event_name: str, aggregate
 ) -> dict:
-    """Every dependency reports the result its own `if:` condition implies."""
+    """Every dependency reports whatever result its own `if:` condition implies."""
     needs = {}
     for job_id in set(jobs) - {"ci"}:
         if job_id == "check-draft":
@@ -303,11 +303,11 @@ def main() -> int:
                 )
             check_scaling_input_sizes_budget(label, job, budget)
 
-    print("coverage — every job reaches the required status check")
+    print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
     declared = set(jobs["ci"]["needs"])
     check(
-        "`ci` depends on every job the workflow defines",
+        "`ci` depends on every job a workflow defines",
         defined == declared,
         f"missing {sorted(defined - declared)}, unknown {sorted(declared - defined)}",
     )
@@ -333,7 +333,7 @@ def main() -> int:
                         f"{job_id}: {line[:58]}",
                         "--no-tests=fail" in line,
                         "a filtered nextest selection must set --no-tests=fail, which exits 4 "
-                        "when the selection is empty",
+                        "when a selection is empty",
                     )
 
     rust_only = {
@@ -348,7 +348,7 @@ def main() -> int:
     }
     docs_only = dict.fromkeys(rust_only, "false")
 
-    print("rust-fanout — a Rust-only change runs the binding test jobs")
+    print("rust-fanout — a Rust-only change runs binding test jobs")
     for job_id in (
         "python-test",
         "typescript-check",
@@ -362,7 +362,7 @@ def main() -> int:
             f"if: {condition}",
         )
 
-    print("skip — the aggregate separates a skipped dependency from a passing one")
+    print("skip — an aggregate separates a skipped dependency from a passing one")
 
     needs = build_needs(jobs, rust_only, "pull_request", aggregate)
     code, out = run_aggregate(needs, "pull_request")
@@ -384,7 +384,7 @@ def main() -> int:
         "kotlin-test",
         "swift-build-test",
     ):
-        check(f"  and the failure names {job_id}", job_id in out, out)
+        check(f"  and a failure names {job_id}", job_id in out, out)
 
     needs = build_needs(jobs, docs_only, "pull_request", aggregate)
     code, out = run_aggregate(needs, "pull_request")
@@ -396,9 +396,9 @@ def main() -> int:
     check("an unconditional job skipped -> exit 1", code == 1, out)
 
     # CLAUDE.md §PRD stories states that CI enforces scripts/validate-prd.py.
-    # These two cases are what makes that sentence true: the job carries no
-    # `if:`, so every event selects it, and the gate rejects both a skip and a
-    # failure. A docs-only pull request is the vector that changes a PRD.
+    # Two cases below make that sentence true: this job carries no `if:`, so
+    # every event selects it, and an aggregate rejects both a skip and a
+    # failure. A docs-only pull request is one vector changing a PRD.
     needs = build_needs(jobs, docs_only, "pull_request", aggregate)
     check(
         "prd-validate runs on a pull request that changes nothing else",
@@ -429,15 +429,15 @@ def main() -> int:
     for job_id in ("rust-clippy", "rust-fmt", "python-test", "typescript-check"):
         needs[job_id]["result"] = "skipped"
     code, out = run_aggregate(needs, "pull_request")
-    check("the filter job failed and its dependants skipped -> exit 1", code == 1, out)
+    check("a filter job failed and its dependants skipped -> exit 1", code == 1, out)
 
     needs = build_needs(jobs, docs_only, "push", aggregate)
     code, out = run_aggregate(needs, "push")
-    check("push event, the pull-request-only job skipped -> exit 0", code == 0, out)
+    check("push event, a pull-request-only job skipped -> exit 0", code == 0, out)
 
-    # merge_group is the event the merge queue runs, so it is the event that
-    # actually gates a merge. cross-layer skips there because it diffs against a
-    # pull request's base branch, and no other job may.
+    # merge_group names whichever event a merge queue runs, so it gates every
+    # merge. cross-layer skips there because it diffs against a pull request's
+    # base branch, and no other job may.
     needs = build_needs(jobs, rust_only, "merge_group", aggregate)
     code, out = run_aggregate(needs, "merge_group")
     check("merge_group event, a Rust change -> exit 0", code == 0, out)
@@ -445,13 +445,13 @@ def main() -> int:
     needs = build_needs(jobs, rust_only, "merge_group", aggregate)
     needs["rust-test"]["result"] = "skipped"
     code, out = run_aggregate(needs, "merge_group")
-    check("merge_group event, the workspace test job skipped -> exit 1", code == 1, out)
+    check("merge_group event, a workspace test job skipped -> exit 1", code == 1, out)
 
     needs = build_needs(jobs, docs_only, "pull_request", aggregate)
     needs["cross-layer"]["result"] = "skipped"
     code, out = run_aggregate(needs, "pull_request")
     check(
-        "pull_request event, the pull-request-only job skipped -> exit 1",
+        "pull_request event, a pull-request-only job skipped -> exit 1",
         code == 1,
         out,
     )
@@ -466,7 +466,7 @@ def main() -> int:
     needs = build_needs(jobs, docs_only, "pull_request", aggregate)
     needs.pop("wasm-test")
     code, out = run_aggregate(needs, "pull_request")
-    check("a job missing from the dependency list -> exit 1", code == 1, out)
+    check("a job missing from a dependency list -> exit 1", code == 1, out)
 
     print(f"\n{checks - len(failures)} of {checks} assertions passed")
     if failures:

@@ -164,20 +164,20 @@ jobs:
   # ── PRD structural validation ────────────────────────────────────────
   # CLAUDE.md §PRD stories tells every agent to run scripts/validate-prd.py
   # before committing a PRD change and states "CI enforces this". No workflow
-  # ran it. The only reference sat in .github/workflows/prd-validate.yml.disabled,
+  # ran it. One reference sat in .github/workflows/prd-validate.yml.disabled,
   # and GitHub never loads a file with that suffix — commit fffd5de56 renamed
-  # seven workflows on 2026-03-15 under the heading "disable all Claude-powered
+  # seven workflows on 2026-03-15 under a heading, "disable all Claude-powered
   # GitHub workflows". This validator reaches no model and needs no secret; it
   # was swept up because it shared a file with a Claude review step. That Claude
   # step stays disabled, because reversing that decision is Alec's to make.
   #
-  # No path filter, deliberately. The validator checks that every story's
+  # No path filter, deliberately. This validator checks that every story's
   # sources[].file exists and that sources[].section is a real heading in it,
   # and those 904 references point at .docs/specs (529), .docs/adrs (344),
   # .docs/standards (16), .docs/scaffold (12) and .docs/sketch.md (3). A filter
   # naming .docs/prds/** would let a renamed spec heading break provenance while
-  # this job skipped, which is the same defect the binding test jobs carried.
-  # The validator walks 443 stories in under a second, so running it on every
+  # this job skipped, a defect four binding test jobs also carried.
+  # It walks 443 stories in under a second, so running it on every
   # pull request costs less than deciding whether to.
   prd-validate:
     needs: check-draft
@@ -189,9 +189,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Self-test MUST run first, matching the pyi-generated, block-in-place,
+      # Self-test MUST run first, matching pyi-generated, block-in-place,
       # no-panic-abort, saga-gating-granularity and cross-layer jobs: it plants
-      # six violation classes and proves the validator rejects each one, so a
+      # six violation classes and proves this validator rejects each one, so a
       # passing real check below means something.
       - name: Self-test gate
         run: bash scripts/tests/prd-validate/run-tests.sh
@@ -221,11 +221,11 @@ jobs:
         # nextest, not `cargo test`, because `cargo test <filter>` exits 0 when
         # its filter selects no test. Both tests this lane names carry
         # `#[cfg(not(feature = "testing"))]`, so a dependency edge that turned
-        # `testing` on for scp-node would delete them and leave the lane green
+        # `testing` on for scp-node would delete them and leave this lane green
         # over zero assertions. Measured on this tree: `cargo test -p scp-node
         # --lib no_such_name` exits 0, while `cargo nextest run
         # --no-tests=fail -p scp-node --lib -E 'test(no_such_name)'` exits 4.
-        # The lane now reports the loss instead of hiding it.
+        # This lane now reports such a loss instead of hiding it.
         run: cargo nextest run --no-tests=fail -p scp-node --lib -E 'test(pre_rotation_severance)'
 
   # ── G1: shipped-feature-graph prove-absence gate (ADR-062 §Decision 6) ──
@@ -264,12 +264,12 @@ jobs:
           fetch-depth: 0
       - name: Fetch base branch
         run: git fetch origin ${{ github.base_ref }} --depth=1
-      # Self-test MUST run first, following the convention the pyi-generated,
+      # Self-test MUST run first, following a convention pyi-generated,
       # block-in-place, no-panic-abort and saga-gating-granularity jobs set: it
-      # plants an FFI export at the first line and at the last line of a 155 KB
-      # diff and proves the gate finds both, then plants a missing export and
-      # proves the gate still rejects it. The gate's search used to return a
-      # different verdict for the first case than for the second.
+      # plants an FFI export at a first line and at a last line of a 155 KB
+      # diff and proves this gate finds both, then plants a missing export and
+      # proves it still rejects that. Its search used to return one verdict
+      # for a first case and a different verdict for a second.
       - name: Self-test gate
         run: bash scripts/tests/cross-layer/run-tests.sh
       - name: Check cross-layer coverage
@@ -790,11 +790,11 @@ jobs:
   # and the regression would go unnoticed until release. This is the per-PR guard
   # against that over-gating regression class.
   #
-  # This job carried a "build-only" note claiming the pyo3 test suite assumes
+  # This job carried a "build-only" note claiming a pyo3 test suite assumes
   # in-memory custody and does not compile in prod config. Measured on this tree,
   # `cargo test -p scp-ffi --features server --no-run` exits 0 and links two test
-  # binaries, so that reason no longer holds. The second step below runs the two
-  # shipped-build fail-closed assertions the crate documents at
+  # binaries, so that reason no longer holds. A second step below runs two
+  # shipped-build fail-closed assertions this crate documents at
   # crates/scp-ffi/src/scp.rs:536.
   rust-build-pyo3-production:
     needs: changes
@@ -822,20 +822,20 @@ jobs:
           cargo build -p scp-ffi --features server
       - name: Shipped pyo3 fail-closed assertions
         run: |
-          # Assigned before the export so a failing python3 stops the step
-          # (shellcheck SC2155), which the rust-test lane already does.
+          # Assigned before an export so a failing python3 stops this step
+          # (shellcheck SC2155), matching what rust-test already does.
           LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
           export LD_LIBRARY_PATH="${LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          # The doc block at crates/scp-ffi/src/scp.rs:536 states that the two
-          # `#[cfg(not(feature = "testing"))]` tests below it run in the shipped
+          # A doc block at crates/scp-ffi/src/scp.rs:536 states that two
+          # `#[cfg(not(feature = "testing"))]` tests below it run in a shipped
           # test lane, "`cargo test -p scp-ffi` with the crate's own `testing`
-          # feature OFF". No lane ran them: this job built the bridge and never
-          # tested it, and the workspace lane compiles them out by enabling
-          # `scp-ffi/testing`. This step is the lane the doc block names, so the
+          # feature OFF". No lane ran them: this job built that bridge and never
+          # tested it, and a workspace lane compiles them out by enabling
+          # `scp-ffi/testing`. This step is a lane that doc block names, so
           # AC5 (identity_create → SCP-IDENT-1059) and AC3 (device-attestation
           # verify → SCP-IDENT-1016) per-bridge proofs now execute.
           #
-          # nextest supplies the process-per-test isolation that the SAFETY
+          # nextest supplies process-per-test isolation, which a SAFETY
           # comment at crates/scp-ffi/src/scp.rs:560-565 rests two
           # `std::env::set_var` calls on, and `--no-tests=fail` exits 4 rather
           # than 0 if a feature flip selects zero tests.
@@ -965,21 +965,21 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3.12 scripts/check-python-falsy-optionals.py
 
-  # The `rust` clause is load-bearing. `scp-ffi`, the PyO3 bridge this job
+  # A `rust` clause is load-bearing. `scp-ffi`, a PyO3 bridge this job
   # builds through maturin, depends on scp-core, scp-runtime, scp-transport,
   # scp-mls, scp-node and eleven more workspace crates (`cargo tree -p scp-ffi
-  # -e no-dev`). The `python` filter lists only bindings/python/**,
+  # -e no-dev`). A `python` filter lists only bindings/python/**,
   # crates/scp-ffi/src/** and crates/scp-ffi/common/**, so a pull request that
   # changed crates/scp-runtime/ alone skipped this job and every assertion in
   # bindings/python/tests/ went unexecuted under a green check.
   #
-  # `rust` is the whole-workspace filter (crates/**, Cargo.toml, Cargo.lock,
+  # `rust` is a whole-workspace filter (crates/**, Cargo.toml, Cargo.lock,
   # deny.toml), which is a superset of this bridge's Rust path-dependency
   # closure and stays a superset by construction: a new crate lands under
-  # crates/**. Enumerating the closure per job — the shape typescript-wasm-check
+  # crates/**. Enumerating a closure per job — a shape typescript-wasm-check
   # uses, which works there because scp-client-wasm reaches nine crates — would
   # here list nearly every crate and would need re-verification on every new
-  # dependency edge. bridge-parity below already ORs on `rust` for the same
+  # dependency edge. bridge-parity below already ORs on `rust` for that same
   # reason.
   python-test:
     needs: changes
@@ -1025,9 +1025,9 @@ jobs:
           PYTHONPATH=. pytest tests/ -v -m "not parity"
 
   # ── TypeScript ──────────────────────────────────────────────────────
-  # ORs on `rust` for the reason spelled out above python-test: the NAPI addon
-  # this job compiles reaches the whole Rust workspace through scp-core, while
-  # the `typescript` filter names only bindings/typescript/**,
+  # ORs on `rust` for a reason spelled out above python-test: a NAPI addon
+  # this job compiles reaches every Rust workspace crate through scp-core, while
+  # a `typescript` filter names only bindings/typescript/**,
   # crates/scp-ffi/napi/** and crates/scp-ffi/common/**.
   typescript-check:
     needs: changes
@@ -1137,11 +1137,11 @@ jobs:
   # build — not a new enforcement framework.
   #
   # ORs on `typescript-wasm` because this job runs `bun run build` inside
-  # bindings/typescript-wasm, which invokes wasm-pack over scp-client-wasm. The
+  # bindings/typescript-wasm, which invokes wasm-pack over scp-client-wasm. A
   # `scaffold-typescript-web` filter names scaffolds/typescript-web/** and
   # bindings/typescript-wasm/** but not that crate's Rust path-dependency
-  # closure, so a change to crates/scp-mls/ could break this build while the job
-  # skipped. The `typescript-wasm` filter above already enumerates that closure
+  # closure, so a change to crates/scp-mls/ could break this build while this job
+  # skipped. A `typescript-wasm` filter above already enumerates that closure
   # and is verified against `cargo tree -p scp-client-wasm -e no-dev`, so ORing
   # on it reuses one enumeration instead of copying it into a second place.
   scaffold-typescript-web-check:
@@ -1230,9 +1230,9 @@ jobs:
       # belongs in this job rather than in `kotlin-test`.
       - run: ./gradlew :scp-kt:checkUniffiBindingsOrdering
 
-  # ORs on `rust` for the reason spelled out above python-test: this job builds
-  # the UniFFI cdylib and runs the Kotlin suite against it, and that cdylib
-  # reaches the whole Rust workspace through scp-core, while the `kotlin` filter
+  # ORs on `rust` for a reason spelled out above python-test: this job builds
+  # a UniFFI cdylib and runs a Kotlin suite against it, and that cdylib
+  # reaches every Rust workspace crate through scp-core, while a `kotlin` filter
   # names only bindings/kotlin/**, crates/scp-ffi/uniffi/** and
   # crates/scp-ffi/common/**.
   kotlin-test:
@@ -1308,9 +1308,9 @@ jobs:
       - run: swiftlint lint --strict
       - run: swiftformat --lint Sources/ Tests/
 
-  # ORs on `rust` for the reason spelled out above python-test: this job builds
-  # the XCFramework and runs the Swift suite against it, and that XCFramework
-  # reaches the whole Rust workspace through scp-core, while the `swift` filter
+  # ORs on `rust` for a reason spelled out above python-test: this job builds
+  # an XCFramework and runs a Swift suite against it, and that XCFramework
+  # reaches every Rust workspace crate through scp-core, while a `swift` filter
   # names only bindings/swift/**, crates/scp-ffi/uniffi/** and
   # crates/scp-ffi/common/**.
   swift-build-test:
@@ -1588,10 +1588,10 @@ jobs:
           PYTHONPATH=. pytest tests/bridge_parity/ -v -m parity -k "uniffi-swift"
 
   # ── CI workflow self-test ───────────────────────────────────────────
-  # The `ci` gate below decides every merge, so the logic that decides it gets
-  # its own tests. scripts/tests/ci-gate/run-tests.sh feeds synthetic dependency
-  # results to scripts/ci-aggregate-result.py and asserts the verdict, and it
-  # asserts the two structural properties of this workflow that no single run
+  # A `ci` gate below decides every merge, so logic deciding it gets its own
+  # tests. scripts/tests/ci-gate/run-tests.sh feeds synthetic dependency
+  # results to scripts/ci-aggregate-result.py and asserts each verdict, and it
+  # asserts two structural properties of this workflow that no single run
   # can demonstrate: every job carries a timeout-minutes, and every job is a
   # dependency of `ci`.
   ci-workflow-selftest:
@@ -1605,7 +1605,7 @@ jobs:
         with:
           python-version: "3.12"
       # Pinned to a compatible range so a breaking upstream release cannot red
-      # the only required status check, matching the pytest pin in sdk-coverage.
+      # one required status check, matching a pytest pin in sdk-coverage.
       - run: pip install 'pyyaml>=6,<7'
       - run: bash scripts/tests/ci-gate/run-tests.sh
       # Two fuzz.yml jobs size `timeout-minutes` by selecting a whole-minute
@@ -1626,14 +1626,14 @@ jobs:
           echo "matching arm -> $MATCHED_ARM, absent input -> $ABSENT_INPUT"
 
   # ── CI Gate ─────────────────────────────────────────────────────────
-  # The single status check the repository ruleset requires, so this job decides
+  # One status check this repository's ruleset requires, so this job decides
   # every merge. `if: always()` runs it even when a dependency skipped.
   #
-  # The verdict lives in scripts/ci-aggregate-result.py, not in this file. That
+  # Its verdict lives in scripts/ci-aggregate-result.py, not in this file. That
   # script reads `toJSON(needs)`, so it covers every dependency by construction
-  # rather than by a second hand-written copy of the dependency list, and it
-  # decides per job whether that job was supposed to run by evaluating the job's
-  # own `if:` condition against the `changes` job's filter outputs. A job that
+  # rather than by a second hand-written copy of a dependency list, and it
+  # decides per job whether that job was supposed to run by evaluating its
+  # own `if:` condition against a `changes` job's filter outputs. A job that
   # was supposed to run and did not report success fails this gate.
   ci:
     if: always()
@@ -1701,7 +1701,7 @@ jobs:
         with:
           python-version: "3.12"
       # Pinned to a compatible range so a breaking upstream release cannot red
-      # the only required status check, matching the pytest pin in sdk-coverage.
+      # one required status check, matching a pytest pin in sdk-coverage.
       - run: pip install 'pyyaml>=6,<7'
       - name: Check job results
         env:

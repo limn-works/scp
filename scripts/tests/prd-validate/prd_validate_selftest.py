@@ -2,17 +2,17 @@
 """Self-test for scripts/validate-prd.py.
 
 CLAUDE.md tells every agent to run this validator before committing a PRD change
-and states that CI enforces it. No workflow ran it: the only reference lived in
+and states that CI enforces it. No workflow ran it: one reference lived in
 .github/workflows/prd-validate.yml.disabled, and GitHub never loads a file with
 that suffix. Commit fffd5de56 renamed seven workflows to `.disabled` on
-2026-03-15 under the heading "disable all Claude-powered GitHub workflows"; this
+2026-03-15 under a heading, "disable all Claude-powered GitHub workflows"; this
 validator is a plain Python script that reaches no model and needs no secret,
 and it was swept up because it shared a file with a Claude review step.
 
-Before wiring the validator into ci.yml, this self-test proves it rejects each
+Before wiring that validator into ci.yml, this self-test proves it rejects each
 violation class it claims to catch. A gate nobody has ever seen fail is a gate
 nobody has tested. Each case plants one violation in a scratch copy of `.docs`
-and asserts the validator exits non-zero and names the story.
+and asserts that validator exits non-zero and names a story.
 
 Run: python3 scripts/tests/prd-validate/prd_validate_selftest.py
 """
@@ -80,7 +80,7 @@ def unknown_gate(story, prd):
 
 MUTATIONS = [
     ("a story missing a required field", drop_required_field),
-    ("a status the standard does not define", invalid_status),
+    ("a status no standard defines", invalid_status),
     ("a source pointing at a file that does not exist", missing_source_file),
     ("a source pointing at a heading that does not exist", missing_source_section),
     ("a dependency on a story ID that does not exist", unknown_dependency),
@@ -104,17 +104,17 @@ def main() -> int:
         shutil.copytree(REPO / ".docs", work / ".docs")
         shutil.copytree(REPO / "scripts", work / "scripts")
 
-        print("the validator accepts the tree as it stands")
+        print("this validator accepts a tree as it stands")
         clean = run_validator(work)
         check(
             "an unmutated tree passes",
             clean.returncode == 0,
             clean.stdout + clean.stderr,
         )
-        # A validator that walked zero stories would also exit 0, which is the
-        # shape of a gate that enforces nothing. Assert it walked the corpus.
+        # A validator walking zero stories would also exit 0, which is how a
+        # gate enforcing nothing behaves. Assert it walked a whole corpus.
         check(
-            "and reports the story count it walked",
+            "and reports a story count it walked",
             "stories" in clean.stdout and "0 stories" not in clean.stdout,
             clean.stdout.strip(),
         )
@@ -122,7 +122,7 @@ def main() -> int:
         target = work / ".docs/prds/adr062-capability-injection.json"
         original = target.read_text()
 
-        print("the validator rejects each violation it claims to catch")
+        print("this validator rejects each violation it claims to catch")
         for name, mutate in MUTATIONS:
             prd = json.loads(original)
             expected = mutate(prd["stories"][0], prd)
@@ -134,7 +134,7 @@ def main() -> int:
                 result.stdout + result.stderr,
             )
             check(
-                f"  and the message says {expected!r}",
+                f"  and a message says {expected!r}",
                 expected in result.stdout,
                 result.stdout.strip()[:400],
             )

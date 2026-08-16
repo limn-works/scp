@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
-"""Decide whether the `ci` aggregate job passes.
+"""Decide whether a `ci` aggregate job passes.
 
-`ci` is the only status check the repository ruleset requires, so `ci` decides
-every merge. Before this script, the `ci` job compared each dependency's result
-against the two strings `failure` and `cancelled` and let every other value
+`ci` is one status check this repository's ruleset requires, so `ci` decides
+every merge. Before this script, that job compared each dependency's result
+against two strings, `failure` and `cancelled`, and let every other value
 through, which meant a `skipped` dependency and a `success` dependency produced
-the same verdict. A path filter that wrongly skipped a job, or a `changes` job
-that failed and left every filtered job skipped, therefore reported a green
-merge gate over work that never ran.
+one verdict. A path filter that wrongly skipped a job, or a `changes` job that
+failed and left every filtered job skipped, therefore reported a green merge
+gate over work that never ran.
 
 This script decides, per dependency, whether that dependency was SUPPOSED to
-run, and requires `success` from every dependency that was. It reads the
-supposed-to-run answer out of the workflow file itself — it evaluates each job's
-own `if:` expression against the `changes` job's published filter outputs — so
-the answer cannot drift away from the workflow the way a second hand-maintained
-copy of the job list drifts.
+run, and requires `success` from every dependency that was. It reads that
+supposed-to-run answer out of a workflow file itself — it evaluates each job's
+own `if:` expression against a `changes` job's published filter outputs — so
+no answer can drift away from a workflow, as a second hand-maintained copy of
+a job list drifts.
 
 Inputs:
-  NEEDS_JSON         `toJSON(needs)` from the `ci` job: a map of job id to
+  NEEDS_JSON         `toJSON(needs)` from a `ci` job: a map of job id to
                      {"result": ..., "outputs": {...}}.
-  GITHUB_EVENT_NAME  the event that triggered the run.
-  argv[1]            path to the workflow file (default .github/workflows/ci.yml).
+  GITHUB_EVENT_NAME  whichever event triggered this run.
+  argv[1]            path to a workflow file (default .github/workflows/ci.yml).
 
 Exit 0: every dependency that was supposed to run reported success.
 Exit 1: a dependency failed, was cancelled, or skipped when it was supposed to
-        run; or the workflow and the aggregate disagree about the job list.
-Exit 2: the workflow contains an `if:` expression this evaluator cannot read.
-        Teach the evaluator the new construct — do NOT silence the job.
+        run; or a workflow and this aggregate disagree about a job list.
+Exit 2: a workflow carries an `if:` expression this evaluator cannot read.
+        Teach this evaluator that construct — do NOT silence a job.
 """
 
 from __future__ import annotations
@@ -42,16 +42,16 @@ AGGREGATE_JOB = "ci"
 DRAFT_GATE_JOB = "check-draft"
 FILTER_JOB = "changes"
 
-# Literal operands the evaluator understands on the right of `==`.
+# Literal operands this evaluator understands to a right of `==`.
 _QUOTED = re.compile(r"^'([^']*)'$")
 
 
 class Unreadable(Exception):
-    """The workflow uses an `if:` construct this evaluator does not implement."""
+    """A workflow uses an `if:` construct this evaluator does not implement."""
 
 
 def resolve_operand(token: str, outputs: dict[str, str], event_name: str) -> str:
-    """Return the value of one side of a comparison, as a string."""
+    """Return a value from one side of a comparison, as a string."""
     token = token.strip()
     quoted = _QUOTED.match(token)
     if quoted:
@@ -69,9 +69,9 @@ def resolve_operand(token: str, outputs: dict[str, str], event_name: str) -> str
 def evaluate(expression: str, outputs: dict[str, str], event_name: str) -> bool:
     """Evaluate a disjunction of equality comparisons.
 
-    The grammar this accepts is exactly what the workflow uses today: one or
+    Grammar accepted here is exactly what this workflow uses today: one or
     more `LHS == RHS` comparisons joined by `||`. Anything else raises
-    Unreadable, so a new construct stops the gate instead of being guessed at.
+    Unreadable, so a new construct stops this gate instead of being guessed at.
     """
     expression = " ".join(expression.split())
     if "&&" in expression or "!" in expression or "(" in expression:
@@ -100,10 +100,10 @@ def main() -> int:
 
     failures: list[str] = []
 
-    # Drift guard. Every job the workflow defines must be a dependency of the
-    # aggregate, or that job's failure never reaches the merge gate. Three
+    # Drift guard. Every job a workflow defines must be a dependency of this
+    # aggregate, or that job's failure never reaches a merge gate. Three
     # enforcement jobs (pyi-generated, construction-pattern, block-in-place)
-    # were missing from the dependency list when this guard was written.
+    # were missing from a dependency list when this guard was written.
     defined = set(jobs) - {AGGREGATE_JOB}
     declared = set(needs)
     if defined != declared:
@@ -123,13 +123,13 @@ def main() -> int:
     if draft_result == "skipped":
         print(
             f"`{DRAFT_GATE_JOB}` skipped: this pull request is a draft, so no CI job ran. "
-            "GitHub blocks merging a draft, and the merge queue re-runs this workflow on "
-            "the merge_group event, where this gate does apply."
+            "GitHub blocks merging a draft, and a merge queue re-runs this workflow on "
+            "a merge_group event, where this gate does apply."
         )
         return 0
     if draft_result != "success":
         print(
-            f"::error::{DRAFT_GATE_JOB}: {draft_result} (the gate cannot trust any other result)"
+            f"::error::{DRAFT_GATE_JOB}: {draft_result} (this gate cannot trust any other result)"
         )
         return 1
 
@@ -137,7 +137,7 @@ def main() -> int:
     if filter_result != "success":
         print(
             f"::error::{FILTER_JOB}: {filter_result} — every path-filtered job skips when "
-            "the filter job does not publish its outputs, so no other result is trustworthy"
+            "a filter job does not publish its outputs, so no other result is trustworthy"
         )
         return 1
     outputs = needs[FILTER_JOB].get("outputs") or {}
@@ -154,7 +154,7 @@ def main() -> int:
         except Unreadable as unreadable:
             print(
                 f"::error::{job_id}: this gate cannot read its `if:` condition ({unreadable}). "
-                "Add the construct to scripts/ci-aggregate-result.py — a condition the gate "
+                "Add that construct to scripts/ci-aggregate-result.py — a condition this gate "
                 "cannot read is a job whose skip it cannot judge."
             )
             return 2

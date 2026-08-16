@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs the PRD-validator self-test. See
+# Runs a PRD-validator self-test. See
 # scripts/tests/prd-validate/prd_validate_selftest.py for what each assertion
 # guards against and why this validator ran in no workflow until now.
 set -euo pipefail
