@@ -681,6 +681,34 @@ salt       = per-file 16-byte salt             // generated once, persisted with
 
 These are the same parameters the SQLCipher passphrase key-derivation mode (§17.6) MUST use. A single Argon2id parameterization is REQUIRED across the codebase: both the `FileKeyCustody` passphrase-to-wrapping-key derivation and the SQLCipher passphrase-to-PRAGMA-key derivation MUST draw from one shared parameter source. Implementations MUST NOT define a second, divergent Argon2id parameter set.
 
+### FileKeyCustody Key-File Format
+
+A `FileKeyCustody` file holds a header followed by zero or more fixed-width encrypted entries. Version `0x02` is current:
+
+```
+version:      u8         (1 byte, 0x02)
+argon2id_salt:[u8; 16]   (16 bytes, generated once at creation)
+commitment:   [u8; 32]   (32 bytes, HMAC-SHA-256)
+file_hmac:    [u8; 32]   (32 bytes, HMAC-SHA-256)
+entry_count:  u32 LE     (4 bytes)
+entry[i]:     key_type u8 | nonce [u8; 12] | ciphertext+tag [u8; 48]
+```
+
+**Key separation.** One Argon2id derivation over a caller's passphrase and `argon2id_salt` produces a root secret. Three HMAC-SHA-256 invocations expand that root secret under three distinct labels and MUST NOT share a label: one yields an AES-256-GCM key that wraps each stored private key, one yields a file HMAC key, and one yields a stored `commitment`. Each output is a pseudorandom function of that root secret and its own label, so storing `commitment` in cleartext reveals nothing about either key.
+
+**SCP-CAPSEL-8001 at construction.** Opening an existing file MUST check both header values before returning a custody object, and MUST report them as two distinct conditions:
+
+1. A stored `commitment` that differs from one a caller's passphrase produces means those two passphrases differ. Construction MUST return an error naming a wrong passphrase. This check answers for a file holding zero entries, where no stored key exists to test a passphrase against.
+2. A `file_hmac` that does not match, computed over every byte of that file except `file_hmac` itself (version, salt, commitment, entry count, and every entry in order), means that file changed after custody wrote it. Construction MUST return an error naming an integrity failure, because an operator answers it by restoring a backup rather than by retyping a passphrase.
+
+Authenticating `entry_count` and every entry is what makes two attacks detectable: splicing one file's header onto another file's entries, and rewriting `entry_count` to zero to hide stored keys. Every write path (creation, append, and a rewrite that key destruction performs) MUST recompute `file_hmac` before it writes.
+
+**Every read, not construction alone.** An implementation MUST verify `file_hmac` on every read of that file, not once at construction. Verifying once leaves two attacks open against a process holding an open custody object: a writer who swaps two entry blocks redirects a handle, so a later `sign` returns a signature under a key its caller never designated; and a later append or key destruction, reading bytes it never authenticated, recomputes `file_hmac` over a writer's ordering and hands a modified file a valid tag.
+
+**Creation and versions.** Creating a file MUST use an exclusive create (`O_EXCL` or a platform equivalent), so two processes creating one path never both succeed and one never overwrites another's keys. An implementation reading a version other than `0x02` MUST reject that file by version rather than open it, because an earlier version carries neither header value and its passphrase and integrity are therefore uncheckable.
+
+**What these two checks do not catch.** Both values live inside a file they authenticate, so both roll back with it. An attacker who copies a key file, waits for an operator to destroy a compromised key, and restores that copy presents a file whose commitment matches an operator's passphrase and whose HMAC matches its own bytes; construction accepts it and a destroyed key is back in service. Detecting a rollback needs monotonic state outside that file, which this format does not carry — an operator who destroys a key MUST treat a restorable copy of a key file as live key material.
+
 ## 17.9 OpenMLS StorageProvider Bridge
 
 OpenMLS requires a `StorageProvider` trait implementation for persisting MLS group state (tree nodes, key schedules, proposals, etc.). `MlsStorageBridge` wraps `ProtocolRepository` and delegates to the `mls/{context_id}/...` key prefix.

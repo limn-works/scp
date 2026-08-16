@@ -5,6 +5,68 @@ All notable changes to SCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-08-16
+
+### Five fail-open fixes, and what they change for a caller
+
+Each item below removes a path where a capability reported success without
+delivering what that success claims. Four of them change a caller-visible
+contract, so each names what a caller does differently.
+
+**Custody selection is required, with no in-memory default.** TypeScript
+`SCP.identityCreate` and `SCP.identityCreateWithAgentKey`, and Kotlin's
+`IdentityAdvanced.createWithAgentKey(custody: String)` overload, defaulted
+`custody` to `"in_memory"`; Python's `SCP.identity_create` and
+`SCP.identity_create_with_agent_key` defaulted it to `CustodyType.FILE`.
+Persistence spec §17.8 classifies `InMemoryKeyCustody` as a security
+nullifier, and `SCP-CAPSEL-8000` (§17.17.1) forbids a form that selects a
+backend for a caller, whichever backend it picks. **A caller now names a
+custody backend on every call.** TypeScript also rejects a missing selection at
+runtime with `SCP-IDENT-1060`, which a JavaScript caller reaches without a type
+check.
+
+**An unknown governance outcome fails closed.** Python's
+`GovernanceActionResult.from_bridge` returned `EXECUTED` for a string it did not
+recognize, and Swift's `executeGovernanceAction` returned `.executed` in that
+same way. **Both now raise `SCP-GOV-11040`**, and Python's
+`UnknownGovernanceOutcomeError` carries `raw_outcome`. Python's
+`SCP.governance_execute` and TypeScript's
+`SCP.contextExecuteGovernanceAction` now return that typed outcome rather than
+a bare string. Python, Swift, and TypeScript each gained three outcomes
+their enums lacked — `MigrationProposed`, `MigrationCancelled`,
+`ContextTombstoned` — and all three bridges name an outcome through one shared
+mapping, which replaces a napi-rs `format!("{result:?}")` whose
+payload-carrying variants rendered as a Rust debug dump.
+
+**`FileKeyCustody` rejects a wrong passphrase at construction.**
+`FileKeyCustody::new` used to return custody built from any passphrase, and
+every later `sign` failed. Key-file format version `0x02` adds a passphrase
+commitment and an HMAC-SHA-256 over every other byte in a file, so construction
+reports a wrong passphrase and a modified file as two conditions
+(`SCP-CAPSEL-8001`, persistence spec §17.8). **A `0x01` file is rejected
+by version**: it carries neither value, so neither its passphrase nor its
+integrity is checkable. Creation now uses an exclusive create, so two processes
+racing on one path no longer overwrite each other's keys.
+
+**A relay names its blob storage backend.**
+`scp_transport::startup::storage_from_env` substituted `sqlite` when
+`SCP_RELAY_STORAGE_BACKEND` was unset and called `std::process::exit(1)` on
+every failure. It now returns `Result<BlobStorageBackend, StorageError>`, and
+`start_relay_from_env` returns `Result<_, StartupError>`; each binary turns
+those errors into exit code 1 at its own boundary. **An operator sets
+`SCP_RELAY_STORAGE_BACKEND` on every `scp-relay` run and on every persistent
+`scp-node` run** — `docker-compose.yml`, this repository's README, and
+`docs/guides/relay-operations.md` name `sqlite` in every example. `--ephemeral`
+still selects an in-memory blob backend and reads no env var. `health_check`
+returns a verdict instead of exiting, and `shutdown_signal` waits on ctrl_c
+alone when a kernel refuses a SIGTERM handler.
+
+**Three in-memory or always-succeeds implementations left public API.**
+`InMemoryFfiTrustStore`, `InMemoryViolationStore`, and `NoOpRevocationChecker`
+were `pub` and ungated while nothing outside a test constructed any of them.
+All three now carry `#[cfg(any(test, feature = "testing"))]`, and
+`InMemoryFfiTrustStore` lost an `impl Default` that read as a default selection.
+
 ## [Unreleased] - 2026-05-10
 
 ### Enforcement infra hardening — PR-E (PR #1735)
