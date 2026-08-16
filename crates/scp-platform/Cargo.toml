@@ -17,6 +17,7 @@ software_platform = [
     "dep:rand",
     "dep:hmac",
     "dep:sha2",
+    "dep:subtle",
     "dep:scp-crypto",
     "dep:uuid",
 ]
@@ -76,7 +77,9 @@ zeroize = { workspace = true }
 rmp-serde = { workspace = true }
 
 # file dependencies, gated behind the `file` feature flag.
-aes-gcm = { workspace = true, optional = true }
+# `zeroize` clears an AES key schedule and a GHASH subkey when a cipher object
+# drops; aes-gcm leaves that feature off by default.
+aes-gcm = { workspace = true, features = ["zeroize"], optional = true }
 argon2 = { workspace = true, optional = true }
 
 # software_platform dependencies, gated behind the `software_platform` feature flag.
@@ -85,6 +88,9 @@ x25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+# Constant-time equality for a file-custody passphrase commitment and a file
+# HMAC, so neither comparison leaks a prefix-match length.
+subtle = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 # Per-context pseudonym derivation (§9.10.4.A) lives in the wasm-safe `scp-crypto`
 # leaf (ADR-057 Option A); every software-custody backend delegates to it. Its

@@ -13,8 +13,10 @@
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────┐
-//! │ version: u8          (1 byte, currently 0x01)  │
+//! │ version: u8          (1 byte, currently 0x02)  │
 //! │ argon2id_salt: [u8]  (16 bytes)                │
+//! │ commitment: [u8]     (32 bytes, HMAC-SHA-256)  │
+//! │ file_hmac: [u8]      (32 bytes, HMAC-SHA-256)  │
 //! ├────────────────────────────────────────────────┤
 //! │ entry_count: u32 LE  (4 bytes)                 │
 //! ├────────────────────────────────────────────────┤
@@ -32,6 +34,40 @@
 //! for all entries. Each entry has a unique AES-256-GCM nonce. The
 //! ciphertext is the 32-byte private key encrypted under AES-256-GCM;
 //! the tag (16 bytes) is appended by the AEAD.
+//!
+//! # Passphrase commitment and file HMAC
+//!
+//! One Argon2id derivation over a caller's passphrase and a stored salt
+//! produces a root secret, and three HMAC-SHA-256 invocations expand that root
+//! under three labels: `…/wrap` gives an AES-256-GCM key that wraps each stored
+//! private key, `…/mac` gives a key for this file's HMAC, and `…/commit` gives
+//! a commitment that this header stores. Each output is a pseudorandom function
+//! of that root and of its own label, so publishing a commitment reveals
+//! nothing about either key.
+//!
+//! `open_existing` checks two things before it returns a custody object, and
+//! reports them as two different conditions:
+//!
+//! 1. **A passphrase commitment.** A stored commitment that differs from what
+//!    this caller's passphrase produces proves two passphrases differ.
+//!    `SCP-CAPSEL-8001` (§17.17.1 of
+//!    `.docs/specs/17-persistence-and-storage.md`) lists "a key or credential
+//!    is wrong" among conditions a construction boundary MUST reject, and this
+//!    check is how construction detects one — including on a file that holds
+//!    zero entries, where no stored key exists to test a passphrase against.
+//! 2. **A file HMAC**, computed over every byte outside that HMAC field
+//!    itself: version, salt, commitment, entry count, and every entry in order.
+//!    A matching commitment with a mismatched HMAC proves something modified
+//!    this file after custody wrote it — a header transplanted from another
+//!    file, a rewritten entry count that hides keys, a reordered entry that
+//!    redirects a handle, a flipped `key_type` byte that reads an X25519 secret
+//!    as an Ed25519 signing key, or a flipped ciphertext bit. An operator
+//!    answers a modified file by restoring a backup, so this condition carries
+//!    its own message instead of reading as a wrong passphrase.
+//!
+//! Every write path (`create_new`, `append_entry`, and a `destroy_key`
+//! rewrite) recomputes this HMAC as its last step before an atomic write, so a
+//! file on disk always carries an HMAC over whatever bytes sit beside it.
 //!
 //! # Security Properties
 //!
@@ -55,6 +91,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::RngCore;
 use std::sync::Mutex as StdMutex;
+use subtle::ConstantTimeEq as _;
 use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -70,7 +107,14 @@ use crate::traits::{
 // ---------------------------------------------------------------------------
 
 /// Current file format version.
-const FORMAT_VERSION: u8 = 0x01;
+///
+/// Version `0x02` adds two header fields a `0x01` file does not carry: a
+/// passphrase commitment, which decides whether a caller's passphrase created
+/// this file, and an HMAC over every other byte in this file, which decides
+/// whether anything modified it since custody last wrote it. `open_existing`
+/// checks both before it returns a custody object, so it rejects a `0x01` file
+/// by version instead of opening a file it can check neither way.
+const FORMAT_VERSION: u8 = 0x02;
 
 /// Argon2id salt length in bytes.
 const SALT_LEN: usize = 16;
@@ -87,8 +131,45 @@ const TAG_LEN: usize = 16;
 /// Size of one encrypted entry on disk: `key_type` (1) + nonce (12) + ciphertext (32) + tag (16).
 const ENTRY_SIZE: usize = 1 + NONCE_LEN + KEY_LEN + TAG_LEN;
 
-/// Header size: version (1) + salt (16) + `entry_count` (4).
-const HEADER_SIZE: usize = 1 + SALT_LEN + 4;
+/// Label that derives an AES-256-GCM wrapping key from one Argon2id output.
+const WRAP_KEY_LABEL: &[u8] = b"scp-file-key-custody/v2/wrap";
+
+/// Label that derives a file HMAC key from one Argon2id output.
+const MAC_KEY_LABEL: &[u8] = b"scp-file-key-custody/v2/mac";
+
+/// Label that derives a passphrase commitment from one Argon2id output.
+///
+/// A commitment derived under its own label is a one-way function of that
+/// Argon2id output, so storing it publishes no value that any key on disk is
+/// also a function of.
+const COMMITMENT_LABEL: &[u8] = b"scp-file-key-custody/v2/commit";
+
+/// Length of a derived key, of a commitment, and of a file HMAC: SHA-256
+/// output width.
+const DIGEST_LEN: usize = 32;
+
+/// Byte offset of an Argon2id salt: it follows a 1-byte version field.
+const SALT_OFFSET: usize = 1;
+
+/// Byte offset of a passphrase commitment: it follows that salt.
+const COMMITMENT_OFFSET: usize = SALT_OFFSET + SALT_LEN;
+
+/// Byte offset of a file HMAC: it follows that commitment.
+const MAC_OFFSET: usize = COMMITMENT_OFFSET + DIGEST_LEN;
+
+/// Byte offset one past that file HMAC.
+const MAC_END: usize = MAC_OFFSET + DIGEST_LEN;
+
+/// Byte offset of a little-endian `u32` entry count: it follows that file
+/// HMAC, which covers this field, so an attacker cannot rewrite a count.
+const ENTRY_COUNT_OFFSET: usize = MAC_END;
+
+/// Byte width of that entry count.
+const ENTRY_COUNT_LEN: usize = 4;
+
+/// Header size: version (1) + salt (16) + commitment (32) + file HMAC (32) +
+/// `entry_count` (4).
+const HEADER_SIZE: usize = ENTRY_COUNT_OFFSET + ENTRY_COUNT_LEN;
 
 /// Key type byte for Ed25519.
 const KEY_TYPE_ED25519: u8 = 0x01;
@@ -240,6 +321,211 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), PlatformError> {
     Ok(())
 }
 
+/// Three values a passphrase and salt produce, each under its own label.
+///
+/// One Argon2id derivation feeds one HMAC-SHA-256 invocation per label, so each
+/// output is a pseudorandom function of that Argon2id output and of its own
+/// label, and learning one output reveals nothing about another.
+struct DerivedMaterial {
+    /// AES-256-GCM key that wraps each stored private key.
+    wrap_key: Zeroizing<[u8; DIGEST_LEN]>,
+    /// HMAC-SHA-256 key over every file byte outside a file's HMAC field.
+    mac_key: Zeroizing<[u8; DIGEST_LEN]>,
+    /// Value stored in a header that decides whether a caller's passphrase
+    /// created a file.
+    commitment: [u8; DIGEST_LEN],
+}
+
+/// Expands one Argon2id output into a wrapping key, a MAC key, and a
+/// passphrase commitment.
+fn derive_material(
+    passphrase: &str,
+    salt: &[u8; SALT_LEN],
+) -> Result<DerivedMaterial, PlatformError> {
+    let root = crate::kdf::derive_argon2id_key(passphrase.as_bytes(), salt)?;
+
+    Ok(DerivedMaterial {
+        wrap_key: Zeroizing::new(hmac_sha256(root.as_ref(), WRAP_KEY_LABEL)?),
+        mac_key: Zeroizing::new(hmac_sha256(root.as_ref(), MAC_KEY_LABEL)?),
+        commitment: hmac_sha256(root.as_ref(), COMMITMENT_LABEL)?,
+    })
+}
+
+/// Computes `HMAC-SHA-256(key, message)`.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::CustodyError`] when HMAC rejects `key`. HMAC
+/// accepts a key of any length, so no call here reaches that arm today; it
+/// returns an error rather than a fixed digest because a fixed digest would
+/// make a commitment every passphrase produces and a file MAC every file
+/// produces, which turns two checks in `open_existing` into two constants.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<[u8; DIGEST_LEN], PlatformError> {
+    use hmac::Mac as _;
+
+    let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(key)
+        .map_err(|e| PlatformError::CustodyError(format!("HMAC rejected its key: {e}")))?;
+    mac.update(message);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+/// Computes a file HMAC over every byte of `data` except its HMAC field.
+///
+/// Covered bytes are version, salt, commitment, entry count, and every entry,
+/// so a reader detects a transplanted header, a rewritten entry count, a
+/// reordered entry, and a flipped ciphertext bit alike.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::CustodyError`] when `data` is shorter than a
+/// header, or when HMAC rejects `mac_key`.
+fn compute_file_mac(
+    mac_key: &Zeroizing<[u8; DIGEST_LEN]>,
+    data: &[u8],
+) -> Result<[u8; DIGEST_LEN], PlatformError> {
+    use hmac::Mac as _;
+
+    if data.len() < HEADER_SIZE {
+        return Err(PlatformError::CustodyError(
+            "key file too short for header".into(),
+        ));
+    }
+
+    let mut mac = <hmac::Hmac<sha2::Sha256> as hmac::Mac>::new_from_slice(mac_key.as_ref())
+        .map_err(|e| PlatformError::CustodyError(format!("HMAC rejected its key: {e}")))?;
+    mac.update(&data[..MAC_OFFSET]);
+    mac.update(&data[MAC_END..]);
+    Ok(mac.finalize().into_bytes().into())
+}
+
+/// Writes a file HMAC into `data` in place, over `data`'s current contents.
+///
+/// Every write path calls this as its last step before `atomic_write`, so a
+/// file on disk always carries an HMAC over whatever bytes sit beside it.
+///
+/// # Errors
+///
+/// Returns whatever [`compute_file_mac`] reports.
+fn seal_file_mac(
+    mac_key: &Zeroizing<[u8; DIGEST_LEN]>,
+    data: &mut [u8],
+) -> Result<(), PlatformError> {
+    let mac = compute_file_mac(mac_key, data)?;
+    data[MAC_OFFSET..MAC_END].copy_from_slice(&mac);
+    Ok(())
+}
+
+/// Creates an empty file at `path` with `O_EXCL`, so exactly one caller wins
+/// when several create a single path at once.
+///
+/// Returns `true` when this call created that file and `false` when one was
+/// already there, which lets `FileKeyCustody::new` branch on a value rather
+/// than on error text.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::CustodyError`] when a create fails for any reason
+/// other than an existing file.
+fn create_file_exclusive(path: &Path) -> Result<bool, PlatformError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+
+    match options.open(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(PlatformError::CustodyError(format!(
+            "failed to create key file at {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Reads a header's Argon2id salt after checking version and header length.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::CustodyError`] when `data` is empty, when its
+/// version byte names another format version, or when it is shorter than a
+/// header. A version check runs before a length check, because a file an
+/// earlier format wrote is shorter than this format's header and its real
+/// problem is its version.
+fn read_header_salt(data: &[u8]) -> Result<[u8; SALT_LEN], PlatformError> {
+    let Some(&version) = data.first() else {
+        return Err(PlatformError::CustodyError("key file is empty".into()));
+    };
+
+    if version != FORMAT_VERSION {
+        return Err(PlatformError::CustodyError(format!(
+            "unsupported key file version: {version:#04x}"
+        )));
+    }
+
+    if data.len() < HEADER_SIZE {
+        return Err(PlatformError::CustodyError(
+            "key file too short for header".into(),
+        ));
+    }
+
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&data[SALT_OFFSET..COMMITMENT_OFFSET]);
+    Ok(salt)
+}
+
+/// Authenticates whole file bytes and reports how many entries they hold.
+///
+/// Every path that reads this file runs this check, not construction alone. A
+/// writer who swaps two entry blocks, truncates a file, or flips a `key_type`
+/// byte between construction and a later `sign` gets detected on that read. An
+/// earlier version verified once at construction, so a later `sign` decrypted
+/// whatever bytes sat on disk and reported success, and a later `append_entry`
+/// re-sealed modified bytes with a victim's own MAC key.
+///
+/// # Errors
+///
+/// Returns [`PlatformError::CustodyError`] when a version, a header length, an
+/// entry count, a total length, or a stored HMAC does not check out.
+fn verify_file(data: &[u8], mac_key: &Zeroizing<[u8; DIGEST_LEN]>) -> Result<usize, PlatformError> {
+    // A version and header-length check runs first, so every slice below sits
+    // inside `data`.
+    read_header_salt(data)?;
+
+    let entry_count = u32::from_le_bytes(
+        data[ENTRY_COUNT_OFFSET..HEADER_SIZE]
+            .try_into()
+            .map_err(|_| PlatformError::CustodyError("invalid entry count bytes".into()))?,
+    ) as usize;
+
+    let overflow =
+        || PlatformError::CustodyError("key file entry count overflows a byte length".into());
+    let expected_len = entry_count
+        .checked_mul(ENTRY_SIZE)
+        .and_then(|entries_len| HEADER_SIZE.checked_add(entries_len))
+        .ok_or_else(overflow)?;
+    if data.len() != expected_len {
+        return Err(PlatformError::CustodyError(format!(
+            "key file length does not match its entry count: expected {expected_len} bytes, \
+             got {}",
+            data.len()
+        )));
+    }
+
+    let expected_mac = compute_file_mac(mac_key, data)?;
+    if !bool::from(expected_mac.ct_eq(&data[MAC_OFFSET..MAC_END])) {
+        return Err(PlatformError::CustodyError(
+            "key file failed its integrity check — its bytes changed after custody wrote them \
+             (restore a backup; retyping a passphrase will not help)"
+                .into(),
+        ));
+    }
+
+    Ok(entry_count)
+}
+
 /// Best-effort fsync of a directory so a preceding `rename` into it is durable.
 ///
 /// On Unix, opens the directory and calls `sync_all`. Errors are tolerated
@@ -277,7 +563,10 @@ pub struct FileKeyCustody {
     /// Path to the key file on disk.
     path: PathBuf,
     /// AES-256-GCM encryption key derived from the passphrase.
-    derived_key: Zeroizing<[u8; 32]>,
+    derived_key: Zeroizing<[u8; DIGEST_LEN]>,
+    /// HMAC-SHA-256 key, derived from that same passphrase under its own label,
+    /// that authenticates every byte of a key file outside its HMAC field.
+    mac_key: Zeroizing<[u8; DIGEST_LEN]>,
     /// Maps handle IDs to key type and entry index.
     handle_map: Mutex<HandleMap>,
     /// Counter for allocating new handle IDs.
@@ -292,44 +581,84 @@ pub struct FileKeyCustody {
 impl FileKeyCustody {
     /// Opens an existing key file or creates a new one at `path`.
     ///
-    /// The passphrase is used to derive the AES-256-GCM encryption key via
-    /// Argon2id. If the file exists, it is read and validated; if the
-    /// passphrase is wrong, decryption of existing entries will fail on
-    /// access (the derived key will differ).
+    /// A passphrase derives an AES-256-GCM encryption key via Argon2id. On an
+    /// existing file, this constructor re-opens a header verifier that
+    /// `create_new` sealed under whichever passphrase created that file: a
+    /// wrong passphrase fails that check, so this constructor returns an error
+    /// and produces no custody object. `SCP-CAPSEL-8001` (§17.17.1 of
+    /// `.docs/specs/17-persistence-and-storage.md`) requires a construction
+    /// boundary to reject a wrong key or credential, so this check runs here
+    /// instead of on a later `sign` call.
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::CustodyError`] if the file exists but has
-    /// an invalid format, or if I/O operations fail.
+    /// Returns [`PlatformError::CustodyError`] when a caller's passphrase does
+    /// not match whichever passphrase created an existing file, when a file
+    /// exists but carries an invalid format or an unsupported version, or when
+    /// an I/O operation fails.
     pub fn new(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
-        if path.exists() {
-            Self::open_existing(path, passphrase)
+        // `create_file_exclusive` creates a file with `O_EXCL` and reports
+        // `false` when it loses that race, so two processes calling this
+        // constructor at once never both create a file and never overwrite each
+        // other's keys. A `path.exists()` test ahead of that creation would
+        // leave exactly this window open.
+        if create_file_exclusive(path)? {
+            Self::finish_new(path, passphrase)
         } else {
-            Self::create_new(path, passphrase)
+            Self::open_existing_when_written(path, passphrase)
         }
     }
 
-    /// Creates a new key file at `path` with a fresh salt.
+    /// Opens an existing key file, waiting briefly when another process
+    /// reserved that path and has not written it yet.
     ///
-    /// Uses write-to-tmp + rename for crash-safe atomic writes (#1470).
-    fn create_new(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
-        let mut salt = [0u8; SALT_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+    /// A creating process holds a zero-byte reservation across its Argon2id
+    /// derivation, which takes hundreds of milliseconds. A second constructor
+    /// arriving inside that window reads zero bytes, so it polls rather than
+    /// reporting an empty file that a moment later holds a header.
+    fn open_existing_when_written(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
+        // Six attempts at 250 ms bound this wait at 1.5 s, which exceeds one
+        // Argon2id derivation at this crate's parameters (64 MiB, 3 passes).
+        const ATTEMPTS: u32 = 6;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 
-        let derived_key = Self::derive_key(passphrase, &salt)?;
+        for attempt in 0..ATTEMPTS {
+            match std::fs::metadata(path) {
+                Ok(metadata) if metadata.len() > 0 => return Self::open_existing(path, passphrase),
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(PlatformError::CustodyError(format!(
+                        "failed to read key file metadata at {}: {e}",
+                        path.display()
+                    )));
+                }
+            }
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(PAUSE);
+            }
+        }
 
-        // Write the initial file: version + salt + entry_count(0).
-        let mut data = Vec::with_capacity(HEADER_SIZE);
-        data.push(FORMAT_VERSION);
-        data.extend_from_slice(&salt);
-        data.extend_from_slice(&0u32.to_le_bytes());
+        Err(PlatformError::CustodyError(format!(
+            "key file at {} is empty: an earlier creation reserved that path and did not \
+             finish writing it. Delete that file and retry.",
+            path.display()
+        )))
+    }
 
-        // Write to temp file, sync, then atomic rename (#1470).
-        atomic_write(path, &data)?;
+    /// Derives key material, writes an initial header, and returns custody over
+    /// a file `create_file_exclusive` just created.
+    fn finish_new(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
+        // Every failure from here on removes whichever empty file a caller just
+        // reserved, so a failed creation leaves nothing behind for a later
+        // `new` to read as a zero-byte key file.
+        let material = Self::write_new_file(path, passphrase).inspect_err(|_| {
+            let _ = std::fs::remove_file(path);
+        })?;
 
         Ok(Self {
             path: path.to_path_buf(),
-            derived_key,
+            derived_key: material.wrap_key,
+            mac_key: material.mac_key,
             handle_map: Mutex::new(HandleMap::new()),
             next_id: AtomicU64::new(1),
             pseudonym_keys: Mutex::new(HashMap::new()),
@@ -337,42 +666,59 @@ impl FileKeyCustody {
         })
     }
 
+    /// Derives key material and writes an initial header into a file
+    /// `create_file_exclusive` already reserved.
+    fn write_new_file(path: &Path, passphrase: &str) -> Result<DerivedMaterial, PlatformError> {
+        let mut salt = [0u8; SALT_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+
+        let material = derive_material(passphrase, &salt)?;
+
+        // Write an initial file: version + salt + commitment + HMAC +
+        // entry_count(0). That commitment lets a later `open_existing` reject a
+        // different passphrase; that HMAC lets it reject a modified file.
+        let mut data = Vec::with_capacity(HEADER_SIZE);
+        data.push(FORMAT_VERSION);
+        data.extend_from_slice(&salt);
+        data.extend_from_slice(&material.commitment);
+        data.extend_from_slice(&[0u8; DIGEST_LEN]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        seal_file_mac(&material.mac_key, &mut data)?;
+
+        // Write to a temp file, sync, then atomic rename over whichever file a
+        // caller reserved (#1470).
+        atomic_write(path, &data)?;
+
+        Ok(material)
+    }
+
     /// Opens an existing key file at `path` and loads entry metadata.
     fn open_existing(path: &Path, passphrase: &str) -> Result<Self, PlatformError> {
         let data = std::fs::read(path)
             .map_err(|e| PlatformError::CustodyError(format!("failed to read key file: {e}")))?;
 
-        if data.len() < HEADER_SIZE {
+        let salt = read_header_salt(&data)?;
+        let material = derive_material(passphrase, &salt)?;
+
+        // Reject a wrong passphrase HERE, at construction, instead of letting
+        // a caller hold a custody object whose every `sign` call fails
+        // (`SCP-CAPSEL-8001`, §17.17.1 of
+        // `.docs/specs/17-persistence-and-storage.md`). This commitment answers
+        // for a file that holds zero entries too, which no stored-entry check
+        // could answer for.
+        if !bool::from(
+            material
+                .commitment
+                .ct_eq(&data[COMMITMENT_OFFSET..MAC_OFFSET]),
+        ) {
             return Err(PlatformError::CustodyError(
-                "key file too short for header".into(),
+                "wrong passphrase for key file (passphrase commitment did not match)".into(),
             ));
         }
 
-        if data[0] != FORMAT_VERSION {
-            return Err(PlatformError::CustodyError(format!(
-                "unsupported key file version: {:#04x}",
-                data[0]
-            )));
-        }
-
-        let mut salt = [0u8; SALT_LEN];
-        salt.copy_from_slice(&data[1..=SALT_LEN]);
-
-        let entry_count = u32::from_le_bytes(
-            data[1 + SALT_LEN..HEADER_SIZE]
-                .try_into()
-                .map_err(|_| PlatformError::CustodyError("invalid entry count bytes".into()))?,
-        ) as usize;
-
-        let expected_len = HEADER_SIZE + entry_count * ENTRY_SIZE;
-        if data.len() < expected_len {
-            return Err(PlatformError::CustodyError(format!(
-                "key file truncated: expected {expected_len} bytes, got {}",
-                data.len()
-            )));
-        }
-
-        let derived_key = Self::derive_key(passphrase, &salt)?;
+        // A passphrase that reached this line is right, so an HMAC mismatch
+        // reports a modified file rather than a wrong passphrase.
+        let entry_count = verify_file(&data, &material.mac_key)?;
 
         // Build the handle map from stored entries.
         let mut handle_map = HandleMap::new();
@@ -390,24 +736,13 @@ impl FileKeyCustody {
 
         Ok(Self {
             path: path.to_path_buf(),
-            derived_key,
+            derived_key: material.wrap_key,
+            mac_key: material.mac_key,
             handle_map: Mutex::new(handle_map),
             next_id: AtomicU64::new(next_id),
             pseudonym_keys: Mutex::new(HashMap::new()),
             file_write_lock: StdMutex::new(()),
         })
-    }
-
-    /// Derives an AES-256 key from a passphrase and salt using Argon2id.
-    ///
-    /// Delegates to [`crate::kdf::derive_argon2id_key`] — the single source of
-    /// the Argon2id parameterization (spec §17.6 / §17.8). Behavior is
-    /// byte-identical to the historical inline derivation.
-    fn derive_key(
-        passphrase: &str,
-        salt: &[u8; SALT_LEN],
-    ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        crate::kdf::derive_argon2id_key(passphrase.as_bytes(), salt)
     }
 
     /// Encrypts a 32-byte private key using AES-256-GCM with a fresh nonce.
@@ -463,10 +798,25 @@ impl FileKeyCustody {
         Ok(key_bytes)
     }
 
-    /// Reads the key file from disk.
+    /// Reads a key file from disk and authenticates its bytes before returning
+    /// them.
+    ///
+    /// Every read path — `sign`, `public_key`, `dh_agree`, `destroy_key`,
+    /// `append_entry`, and key import — goes through here, so a writer who
+    /// modifies a file between construction and a later call gets detected on
+    /// that call. Authenticating here also keeps every entry-offset slice in
+    /// bounds, because a verified length equals `HEADER_SIZE + count *
+    /// ENTRY_SIZE` exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] when a read fails, or when
+    /// [`verify_file`] rejects what it read.
     fn read_file(&self) -> Result<Vec<u8>, PlatformError> {
-        std::fs::read(&self.path)
-            .map_err(|e| PlatformError::CustodyError(format!("failed to read key file: {e}")))
+        let data = std::fs::read(&self.path)
+            .map_err(|e| PlatformError::CustodyError(format!("failed to read key file: {e}")))?;
+        verify_file(&data, &self.mac_key)?;
+        Ok(data)
     }
 
     /// Appends an encrypted key entry to the file and updates the entry count.
@@ -484,9 +834,8 @@ impl FileKeyCustody {
         let mut data = self.read_file()?;
 
         // Read current entry count.
-        let count_offset = 1 + SALT_LEN;
         let current_count = u32::from_le_bytes(
-            data[count_offset..count_offset + 4]
+            data[ENTRY_COUNT_OFFSET..HEADER_SIZE]
                 .try_into()
                 .map_err(|_| PlatformError::CustodyError("invalid entry count".into()))?,
         );
@@ -503,7 +852,12 @@ impl FileKeyCustody {
 
         // Update entry count.
         let new_count = current_count + 1;
-        data[count_offset..count_offset + 4].copy_from_slice(&new_count.to_le_bytes());
+        data[ENTRY_COUNT_OFFSET..HEADER_SIZE].copy_from_slice(&new_count.to_le_bytes());
+
+        // Re-authenticate this whole file: this write changed an entry count
+        // and appended an entry, so a stored HMAC no longer covers what sits on
+        // disk.
+        seal_file_mac(&self.mac_key, &mut data)?;
 
         // Write to temp file with sync_all, then atomic rename (#1470).
         atomic_write(&self.path, &data)?;
@@ -712,9 +1066,8 @@ impl KeyCustody for FileKeyCustody {
 
             // Reconstruct the file: copy header, skip the destroyed entry,
             // decrement the entry count.
-            let count_offset = 1 + SALT_LEN;
             let current_count = u32::from_le_bytes(
-                data[count_offset..count_offset + 4]
+                data[ENTRY_COUNT_OFFSET..HEADER_SIZE]
                     .try_into()
                     .map_err(|_| PlatformError::CustodyError("invalid entry count".into()))?,
             );
@@ -738,8 +1091,9 @@ impl KeyCustody for FileKeyCustody {
             let new_count = current_count - 1;
             let mut new_data = Vec::with_capacity(HEADER_SIZE + (new_count as usize) * ENTRY_SIZE);
 
-            // Copy header (version + salt).
-            new_data.extend_from_slice(&data[..count_offset]);
+            // Copy header (version + salt + commitment + an HMAC field, which
+            // `seal_file_mac` overwrites below).
+            new_data.extend_from_slice(&data[..ENTRY_COUNT_OFFSET]);
             // Write updated entry count.
             new_data.extend_from_slice(&new_count.to_le_bytes());
 
@@ -751,6 +1105,11 @@ impl KeyCustody for FileKeyCustody {
                 let entry_offset = HEADER_SIZE + i * ENTRY_SIZE;
                 new_data.extend_from_slice(&data[entry_offset..entry_offset + ENTRY_SIZE]);
             }
+
+            // Re-authenticate this whole file: this rewrite dropped an entry
+            // and changed an entry count, so a stored HMAC no longer covers
+            // what sits on disk.
+            seal_file_mac(&self.mac_key, &mut new_data)?;
 
             // Commit to disk BEFORE mutating the in-memory map. If
             // `atomic_write` fails, the map still references the
@@ -1067,8 +1426,13 @@ mod tests {
         );
     }
 
+    /// `SCP-CAPSEL-8001` (§17.17.1 of
+    /// `.docs/specs/17-persistence-and-storage.md`): construction rejects a
+    /// wrong passphrase and returns no custody object. Deleting a commitment
+    /// comparison from `open_existing` makes `FileKeyCustody::new` return `Ok`
+    /// here, so this assertion fails.
     #[tokio::test]
-    async fn reopen_with_wrong_passphrase_fails() {
+    async fn reopen_with_wrong_passphrase_fails_at_construction() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("keys.scp");
 
@@ -1077,23 +1441,255 @@ mod tests {
         custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         drop(custody);
 
-        // Reopen with the wrong passphrase — file opens but operations fail.
-        let custody2 = FileKeyCustody::new(&path, "wrong").unwrap();
-        let handle = KeyHandle::new(1);
-        let result = custody2.sign(&handle, b"data").await;
+        let result = FileKeyCustody::new(&path, "wrong");
         assert!(
             result.is_err(),
-            "wrong passphrase must cause decryption failure"
+            "construction must reject a wrong passphrase"
         );
-        match result.unwrap_err() {
+        match result.err().unwrap() {
             PlatformError::CustodyError(msg) => {
                 assert!(
-                    msg.contains("decryption failed"),
-                    "error must mention decryption: {msg}"
+                    msg.contains("wrong passphrase"),
+                    "error must name a wrong passphrase: {msg}"
                 );
             }
             other => panic!("expected CustodyError, got {other:?}"),
         }
+    }
+
+    /// Swapping two entry blocks after construction redirects a handle: each
+    /// block carries its own nonce, so both still decrypt, and an entry's
+    /// `key_type` comes from an in-memory handle map rather than from a file.
+    /// `sign` on a swapped file must report an integrity failure rather than a
+    /// signature under a key its caller never designated. Verifying only at
+    /// construction — an earlier version of this file — returns that signature.
+    #[tokio::test]
+    async fn entry_swap_after_construction_fails_a_later_sign() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        let first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        // Swap entry 0 with entry 1 while custody stays open.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let first_start = HEADER_SIZE;
+        let second_start = HEADER_SIZE + ENTRY_SIZE;
+        let mut swapped = bytes[..first_start].to_vec();
+        swapped.extend_from_slice(&bytes[second_start..second_start + ENTRY_SIZE]);
+        swapped.extend_from_slice(&bytes[first_start..first_start + ENTRY_SIZE]);
+        swapped.extend_from_slice(&bytes[second_start + ENTRY_SIZE..]);
+        bytes = swapped;
+        std::fs::write(&path, &bytes).unwrap();
+
+        match custody.sign(&first, b"payload").await.err().unwrap() {
+            PlatformError::CustodyError(msg) => {
+                assert!(
+                    msg.contains("integrity check"),
+                    "a swapped entry must fail an integrity check on a later read: {msg}"
+                );
+            }
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+    }
+
+    /// A write path must not re-seal bytes it never authenticated. Appending a
+    /// key after an external swap would otherwise stamp a valid HMAC over an
+    /// attacker's ordering, and a later construction would accept that file.
+    #[tokio::test]
+    async fn a_write_after_tampering_neither_reseals_nor_hides_it() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        // Flip one ciphertext bit while custody stays open.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            custody.generate_keypair(KeyType::Ed25519).await.is_err(),
+            "a write path must reject a modified file rather than re-seal it"
+        );
+        assert!(
+            FileKeyCustody::new(&path, "passphrase").is_err(),
+            "a later construction must still report that modified file"
+        );
+    }
+
+    /// Truncating a file after construction leaves a length no entry count
+    /// explains. A later read reports that rather than indexing past its end.
+    #[tokio::test]
+    async fn truncation_after_construction_reports_an_error_and_never_panics() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        std::fs::write(&path, [FORMAT_VERSION; 20]).unwrap();
+
+        assert!(
+            custody.public_key(&handle).await.is_err(),
+            "a truncated file must produce an error rather than a panic"
+        );
+    }
+
+    /// Splicing one file's header onto another file's entries produces a file
+    /// whose commitment opens under a header owner's passphrase and whose
+    /// entries decrypt under nobody's. Without a file HMAC, construction
+    /// succeeds and every key operation then fails; with it, construction
+    /// reports an integrity failure and hands back no custody object.
+    #[tokio::test]
+    async fn transplanted_header_is_rejected_at_construction() {
+        let dir = TempDir::new().unwrap();
+        let victim_path = dir.path().join("victim.scp");
+        let attacker_path = dir.path().join("attacker.scp");
+
+        // Victim file: one key under its own passphrase.
+        let victim = FileKeyCustody::new(&victim_path, "victim-passphrase").unwrap();
+        victim.generate_keypair(KeyType::Ed25519).await.unwrap();
+        drop(victim);
+
+        // Attacker file: one key under a passphrase an attacker knows, so its
+        // header carries a commitment that same passphrase opens.
+        let attacker = FileKeyCustody::new(&attacker_path, "attacker-passphrase").unwrap();
+        attacker.generate_keypair(KeyType::Ed25519).await.unwrap();
+        drop(attacker);
+
+        let victim_bytes = std::fs::read(&victim_path).unwrap();
+        let attacker_bytes = std::fs::read(&attacker_path).unwrap();
+
+        let mut spliced = attacker_bytes[..HEADER_SIZE].to_vec();
+        spliced.extend_from_slice(&victim_bytes[HEADER_SIZE..]);
+        std::fs::write(&victim_path, &spliced).unwrap();
+
+        match FileKeyCustody::new(&victim_path, "attacker-passphrase")
+            .err()
+            .unwrap()
+        {
+            PlatformError::CustodyError(msg) => {
+                assert!(
+                    msg.contains("integrity check"),
+                    "a transplanted header must fail an integrity check: {msg}"
+                );
+            }
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+    }
+
+    /// Rewriting an entry count to zero and truncating every entry hides every
+    /// stored key. A file HMAC covers both that count and those entries, so
+    /// construction rejects such a file instead of returning custody that holds
+    /// no keys.
+    #[tokio::test]
+    async fn rewritten_entry_count_is_rejected_at_construction() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        drop(custody);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[ENTRY_COUNT_OFFSET..HEADER_SIZE].copy_from_slice(&0u32.to_le_bytes());
+        bytes.truncate(HEADER_SIZE);
+        std::fs::write(&path, &bytes).unwrap();
+
+        match FileKeyCustody::new(&path, "passphrase").err().unwrap() {
+            PlatformError::CustodyError(msg) => {
+                assert!(
+                    msg.contains("integrity check"),
+                    "a rewritten entry count must fail an integrity check: {msg}"
+                );
+            }
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+    }
+
+    /// A flipped ciphertext bit is a modified file, not a wrong passphrase, and
+    /// construction says so — an operator restores a backup rather than
+    /// retyping a passphrase.
+    #[tokio::test]
+    async fn flipped_entry_bit_reports_an_integrity_failure_not_a_wrong_passphrase() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+
+        let custody = FileKeyCustody::new(&path, "passphrase").unwrap();
+        custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        drop(custody);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        match FileKeyCustody::new(&path, "passphrase").err().unwrap() {
+            PlatformError::CustodyError(msg) => {
+                assert!(
+                    msg.contains("integrity check"),
+                    "a flipped bit must report an integrity failure: {msg}"
+                );
+                assert!(
+                    !msg.contains("wrong passphrase"),
+                    "a flipped bit must not read as a wrong passphrase: {msg}"
+                );
+            }
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+    }
+
+    /// A file an older format version wrote carries neither a commitment nor a
+    /// file HMAC, so construction can check neither its passphrase nor its
+    /// integrity. `open_existing` rejects it by version and names that version,
+    /// rather than reporting a length problem or opening it anyway.
+    #[tokio::test]
+    async fn reopen_earlier_format_version_is_rejected_by_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v1-keys.scp");
+
+        // A version-0x01 header: version (1) + salt (16) + entry_count (4).
+        let mut v1 = Vec::with_capacity(1 + SALT_LEN + ENTRY_COUNT_LEN);
+        v1.push(0x01);
+        v1.extend_from_slice(&[0x11; SALT_LEN]);
+        v1.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &v1).unwrap();
+
+        match FileKeyCustody::new(&path, "any").err().unwrap() {
+            PlatformError::CustodyError(msg) => {
+                assert!(
+                    msg.contains("unsupported key file version"),
+                    "error must name that version: {msg}"
+                );
+            }
+            other => panic!("expected CustodyError, got {other:?}"),
+        }
+    }
+
+    /// A key file that holds zero entries carries no stored key to test a
+    /// passphrase against, so only a header verifier can reject a wrong
+    /// passphrase on it. Construction rejects one here as well.
+    #[tokio::test]
+    async fn reopen_empty_file_with_wrong_passphrase_fails_at_construction() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty-keys.scp");
+
+        // Create a file and store nothing in it.
+        let custody = FileKeyCustody::new(&path, "correct").unwrap();
+        drop(custody);
+
+        assert!(
+            FileKeyCustody::new(&path, "wrong").is_err(),
+            "construction must reject a wrong passphrase on a zero-entry file"
+        );
+        assert!(
+            FileKeyCustody::new(&path, "correct").is_ok(),
+            "construction must accept an original passphrase on a zero-entry file"
+        );
     }
 
     #[tokio::test]
@@ -1395,10 +1991,9 @@ mod tests {
         drop(map);
 
         // The encrypted file must contain exactly one entry — the
-        // header records `entry_count` at offset `1 + SALT_LEN`.
+        // header records `entry_count` at offset `ENTRY_COUNT_OFFSET`.
         let bytes = std::fs::read(&custody.path).unwrap();
-        let count_offset = 1 + SALT_LEN;
-        let count = u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap());
+        let count = u32::from_le_bytes(bytes[ENTRY_COUNT_OFFSET..HEADER_SIZE].try_into().unwrap());
         assert_eq!(count, 1, "duplicate import must not append a file entry");
 
         // Sanity: the public key must match what the seed derives to.
@@ -1493,8 +2088,7 @@ mod tests {
 
         // File-level check: exactly one entry persisted.
         let bytes = std::fs::read(&custody.path).unwrap();
-        let count_offset = 1 + SALT_LEN;
-        let count = u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap());
+        let count = u32::from_le_bytes(bytes[ENTRY_COUNT_OFFSET..HEADER_SIZE].try_into().unwrap());
         assert_eq!(
             count, 1,
             "concurrent dedup must not append a parallel encrypted entry"
@@ -1576,9 +2170,8 @@ mod tests {
         // out-of-bounds index that `decrypt_entry` would reject above.
         let map = custody.handle_map.lock().await;
         let bytes = std::fs::read(&custody.path).unwrap();
-        let count_offset = 1 + SALT_LEN;
         let count =
-            u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap()) as usize;
+            u32::from_le_bytes(bytes[ENTRY_COUNT_OFFSET..HEADER_SIZE].try_into().unwrap()) as usize;
         for (id, (_kt, idx)) in &map.entries {
             assert!(
                 *idx < count,
