@@ -30651,7 +30651,8 @@ mod open_outlet_stream_tests {
             let chunk = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("data chunk within 5s")
-                .expect("data chunk present");
+                .expect("data chunk present")
+                .expect("the operator key signed every chunk in this stream");
             match chunk.payload {
                 ChunkPayload::Data { .. } => data_seen += 1,
                 other => panic!("expected Data, got {other:?}"),
@@ -30682,7 +30683,7 @@ mod open_outlet_stream_tests {
         let terminal = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match rx.recv().await {
-                    Some(chunk)
+                    Some(Ok(chunk))
                         if matches!(
                             chunk.payload,
                             ChunkPayload::End { .. } | ChunkPayload::Error { terminal: true, .. }
@@ -30903,7 +30904,8 @@ mod open_outlet_stream_tests {
             let chunk = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("data chunk within 5s")
-                .expect("data chunk present");
+                .expect("data chunk present")
+                .expect("the operator key signed every chunk in this stream");
             if matches!(chunk.payload, ChunkPayload::Data { .. }) {
                 data_seen += 1;
             }
@@ -30926,7 +30928,7 @@ mod open_outlet_stream_tests {
         let terminal = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match rx.recv().await {
-                    Some(chunk)
+                    Some(Ok(chunk))
                         if matches!(
                             chunk.payload,
                             ChunkPayload::End { .. } | ChunkPayload::Error { terminal: true, .. }

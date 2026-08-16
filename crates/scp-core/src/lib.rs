@@ -126,7 +126,7 @@ pub mod context {
         pub use scp_runtime::context::InvocationCaveatBinding;
         pub use scp_runtime::context::outlets::invoke;
         pub use scp_runtime::context::outlets::invoke::{
-            InvocationError, OutletStreamItem, StreamFault, has_outlet_call_capability,
+            ChunkSignatureRefused, InvocationError, OutletStreamItem, has_outlet_call_capability,
             has_outlet_invocation_capability, has_outlet_query_capability, invoke_outlet,
             invoke_outlet_aggregating, invoke_outlet_with_cancellation_aggregating,
             one_shot_to_stream, validate_outlet_invocation_ucan,

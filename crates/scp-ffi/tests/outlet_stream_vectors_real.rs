@@ -582,6 +582,95 @@ mod live {
         });
     }
 
+    /// §5.4.5 "Signature refusal" step 2: when the operator key refuses a chunk
+    /// AND refuses the terminal `Error` chunk that would have reported that
+    /// refusal, the pump hands its receiver a typed `ChunkSignatureRefused`
+    /// instead of a chunk. `outlet_stream_poll_next` RAISES `SCP-OUTLET-6137`
+    /// for that item and evicts the registry entry. Returning the closed
+    /// sentinel instead would tell an iterating caller the stream completed,
+    /// which is the reading §5.4.5 step 2 exists to prevent.
+    ///
+    /// The refusal is armed on the live stream's receiver rather than produced
+    /// by a failing custody call: no bridge export makes the operator's custody
+    /// backend refuse a chosen signature mid-pump. Everything downstream of the
+    /// item is the production path — the live registry entry, `poll_next`, the
+    /// error it builds, and the eviction it performs.
+    #[test]
+    fn signature_refusal_raises_6137_and_evicts_the_entry() {
+        use scp_core::context::outlets::error_codes::CODE_EXECUTION_SIGNING_REFUSED;
+        use scp_core::context::outlets::{
+            ChunkSignatureRefused, StreamSignerCustodyCategory, StreamSignerError,
+        };
+
+        Python::with_gil(|py| {
+            setup();
+            let scp = _scp_core::scp::PyScp::new_in_memory_for_test();
+            let bi = scp.bridge_instance();
+            runtime::init_context_manager_for_test(bi);
+
+            let (_ctx, _outlet, _invoker, handle_id) = open_live(
+                py,
+                &scp,
+                bi,
+                "vec_signature_refusal",
+                c"lambda i: {'sum': 3, 'ok': 1}",
+                Some(1),
+            );
+
+            // The canonicalizer message is derived from the executor's payload,
+            // so this marker must NOT reach the caller's exception text.
+            let payload_marker = "outlet-payload-fragment-7c3d";
+            assert!(
+                scp.arm_test_stream_signature_refusal(
+                    &handle_id,
+                    ChunkSignatureRefused {
+                        refused_chunk: StreamSignerError::Custody {
+                            category: StreamSignerCustodyCategory::KeyNotFound,
+                        },
+                        refused_terminal: StreamSignerError::Jcs(format!(
+                            "key must be a string: {payload_marker}"
+                        )),
+                    },
+                ),
+                "the live open registered a stream entry to arm"
+            );
+
+            let err = scp
+                .outlet_stream_poll_next(py, &handle_id)
+                .expect_err("a signature refusal raises instead of returning the closed sentinel");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains(CODE_EXECUTION_SIGNING_REFUSED),
+                "the raised error carries the §5.4.4 signing-refused code: {rendered}"
+            );
+            assert!(
+                rendered.contains(StreamSignerCustodyCategory::KeyNotFound.as_str()),
+                "the message names the custody category the key refused with: {rendered}"
+            );
+            assert!(
+                !rendered.contains(payload_marker),
+                "the canonicalizer's payload-derived text stays out of the message: {rendered}"
+            );
+
+            assert!(
+                !scp.test_stream_entry_present(&handle_id),
+                "the refusal evicted the registry entry, as the terminal and \
+                 closed paths do"
+            );
+
+            // The evicted handle now reads as the distinct not-found error the
+            // control plane uses — never `Ok(None)`, which would still look like
+            // a clean close.
+            let after = scp
+                .outlet_stream_poll_next(py, &handle_id)
+                .expect_err("the evicted handle is a not-found error, not a clean close");
+            assert!(
+                after.to_string().contains("no active outlet stream"),
+                "the post-refusal poll is the not-found error: {after}"
+            );
+        });
+    }
+
     /// `cancellation`: exercises the real cancel control plane end-to-end.
     /// CRITICAL #1 — a non-invoker caller is rejected `SCP-PERM-3001` before any
     /// signing. The pinned invoker's bridge-signed cancel is never a

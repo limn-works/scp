@@ -216,6 +216,13 @@ const EXPECTED_PAIRS: &[(&str, &str)] = &[
         CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
         SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
     ),
+    // 6137 — Execution, operator signature refusal (§5.4.5 "Signature
+    // refusal"). Its own code rather than a slug under 6130, because §5.4.4
+    // keys the retry policy on the code and this one is `WithBackoff`.
+    (
+        CODE_EXECUTION_SIGNING_REFUSED,
+        SLUG_EXECUTION_SIGNING_REFUSED,
+    ),
     // 6140 — Output.
     (CODE_OUTPUT_VIOLATION, SLUG_OUTPUT_SCHEMA_VIOLATION),
     (CODE_OUTPUT_VIOLATION, SLUG_OUTPUT_TOO_LARGE),

@@ -96,10 +96,11 @@ use tokio::sync::{Notify, mpsc};
 use crate::context::ContextHandle;
 
 use super::invoke::{
-    HandlerPanicSink, InvocationError, OutletExecutor, OutletInvokedEventSink, OutletStreamItem,
-    QueryMisdeclarationSink, StreamGateOutcome, StreamSettlement, StreamSettlementSink,
-    accrue_data_chunk_if_billable, apply_stream_chunk_gate, ingest_stream_chunk, invoke_outlet,
-    release_stream_admission,
+    ChunkSignatureRefused, HandlerPanicSink, InvocationError, OutletExecutor,
+    OutletInvokedEventSink, OutletStreamItem, QueryMisdeclarationSink, StreamGateOutcome,
+    StreamSettlement, StreamSettlementSink, StreamTerminalSummary, accrue_data_chunk_if_billable,
+    apply_stream_chunk_gate, ingest_stream_chunk, invoke_outlet, release_stream_admission,
+    signing_refused_terminal_payload,
 };
 use super::stream::{
     AdmissionCaps, AdmissionOutcome, CancelAckTracker, CreditTracker, GrantError, OpenError,
@@ -835,7 +836,7 @@ pub struct CancelIdentity {
 ///   after the pump flushes (used by the event-log path and tests).
 pub struct StreamSessionHandle {
     /// Receiver returned to the caller.
-    receiver: Option<mpsc::Receiver<OutletStreamChunk>>,
+    receiver: Option<mpsc::Receiver<OutletStreamItem>>,
     /// Shared per-stream state (Arc-shared with the pump task).
     state: Arc<RwLock<SharedSessionState>>,
     /// Notifier used to wake the pump from a credit-stall pause when a
@@ -919,7 +920,15 @@ pub struct StreamCloseSummary {
 
 impl StreamSessionHandle {
     /// Detaches the chunk receiver. Returns `None` if already taken.
-    pub const fn receiver(&mut self) -> Option<mpsc::Receiver<OutletStreamChunk>> {
+    ///
+    /// Each item is an [`OutletStreamItem`]. `Ok` carries one operator-signed
+    /// chunk; `Err` carries the [`ChunkSignatureRefused`] that §5.4.5
+    /// "Signature refusal" requires the pump to surface when the operator key
+    /// refused both a chunk and the terminal error chunk that would have
+    /// reported it, and it is the last item the channel yields. Match both
+    /// arms: `while let Some(Ok(chunk))` stops on the `Err` arm, which puts a
+    /// signature refusal and a completed stream back on the same exit.
+    pub const fn receiver(&mut self) -> Option<mpsc::Receiver<OutletStreamItem>> {
         self.receiver.take()
     }
 
@@ -2048,7 +2057,7 @@ fn spawn_pump_task(
     cancel_wake: Arc<Notify>,
     terminate_wake: Arc<Notify>,
     inner_rx: mpsc::Receiver<OutletStreamItem>,
-    outer_tx: mpsc::Sender<OutletStreamChunk>,
+    outer_tx: mpsc::Sender<OutletStreamItem>,
     summary_tx: tokio::sync::oneshot::Sender<StreamCloseSummary>,
     stream_credit_stall_secs: u32,
     stream_cancel_ack_secs: u32,
@@ -2511,7 +2520,7 @@ where
         }
     }
 
-    let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamChunk>(
+    let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamItem>(
         scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW as usize,
     );
     let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
@@ -2619,21 +2628,26 @@ impl PumpSigningContext {
     /// Builds a fully-formed signed [`OutletStreamChunk`] for the
     /// given `(sequence, payload)` pair.
     ///
-    /// Returns `None` when [`Self::sign_outer_chunk`] fails — either JCS
+    /// Returns `Err` when [`Self::sign_outer_chunk`] fails — either JCS
     /// canonicalization (a structural invariant violation in the pump) or
-    /// a signer-side custody failure. On `None` the caller logs the error
-    /// and breaks the pump loop without emitting; this guarantees the
-    /// test invariant "no chunk emitted by the pump ever has
-    /// `sig == [0u8; 64]`" because we never construct an unsigned
-    /// chunk on the failure path.
+    /// a signer-side custody failure. On `Err` the caller routes the close
+    /// through [`Self::close_on_signature_refusal`] rather than emitting;
+    /// this guarantees the test invariant "no chunk emitted by the pump ever
+    /// has `sig == [0u8; 64]`" because we never construct an unsigned chunk on
+    /// the failure path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operator key's [`StreamSignerError`] verbatim, so the
+    /// caller can record which attempt the key refused.
     async fn try_build_signed_chunk(
         &self,
         request_id: RequestId,
         sequence: u64,
         payload: ChunkPayload,
-    ) -> Option<OutletStreamChunk> {
+    ) -> Result<OutletStreamChunk, StreamSignerError> {
         match self.sign_outer_chunk(&request_id, sequence, &payload).await {
-            Ok(sig) => Some(OutletStreamChunk {
+            Ok(sig) => Ok(OutletStreamChunk {
                 request_id,
                 sequence,
                 payload,
@@ -2646,10 +2660,63 @@ impl PumpSigningContext {
                     context_id = %self.context_id,
                     sequence,
                     error = %e,
-                    "dispatch pump: chunk signing failed — \
-                     pump will break without emitting; downstream receiver sees stream end"
+                    "dispatch pump: chunk signing refused — pump will close on the §5.4.5 \
+                     refusal terminal without emitting an unsigned chunk"
                 );
-                None
+                Err(e)
+            }
+        }
+    }
+
+    /// Closes the outer stream after the operator key refused a chunk, per
+    /// §5.4.5 "Signature refusal".
+    ///
+    /// Attempts the constant refusal terminal at `sequence` — the slot the
+    /// refused chunk did not consume — and hands the receiver either that
+    /// signed terminal or the typed [`ChunkSignatureRefused`]. §5.4.5 requires
+    /// the implementation to decide between the two "by attempting the
+    /// terminal and reading the operator key's answer, never by classifying
+    /// the first refusal", which is why this pump attempts a signature of its
+    /// own even when the refusal it is reacting to came from the inner pump
+    /// through the same `Arc<dyn StreamSigner>`: two refusals do not establish
+    /// a third, and a custody backend that refused one call can serve the next.
+    ///
+    /// Returns `true` when a signed terminal was ingested and emitted, so the
+    /// caller knows the manifest and the §5.4.5 event cover a terminal chunk.
+    async fn close_on_signature_refusal(
+        &self,
+        request_id: RequestId,
+        sequence: u64,
+        refused_chunk: StreamSignerError,
+        outer_tx: &mpsc::Sender<OutletStreamItem>,
+        frontier: &mut scp_protocol::context::outlets::stream::MerkleFrontier,
+        terminal_summary: &mut StreamTerminalSummary,
+    ) -> bool {
+        match self
+            .try_build_signed_chunk(request_id, sequence, signing_refused_terminal_payload())
+            .await
+        {
+            Ok(chunk) => {
+                ingest_stream_chunk(frontier, terminal_summary, &chunk);
+                let _ = outer_tx.send(Ok(chunk)).await;
+                true
+            }
+            Err(refused_terminal) => {
+                let refusal = ChunkSignatureRefused {
+                    refused_chunk,
+                    refused_terminal,
+                };
+                tracing::error!(
+                    request_id = %hex::encode(request_id),
+                    outlet_id = %self.outlet_id,
+                    context_id = %self.context_id,
+                    sequence,
+                    error = %refusal,
+                    "dispatch pump: stream closed with no terminal chunk — receiver was handed \
+                     the typed ChunkSignatureRefused"
+                );
+                let _ = outer_tx.send(Err(refusal)).await;
+                false
             }
         }
     }
@@ -2818,7 +2885,7 @@ async fn run_stream_pump_v2(
     cancel_wake: Arc<Notify>,
     terminate_wake: Arc<Notify>,
     mut inner_rx: mpsc::Receiver<OutletStreamItem>,
-    outer_tx: mpsc::Sender<OutletStreamChunk>,
+    outer_tx: mpsc::Sender<OutletStreamItem>,
     summary_tx: tokio::sync::oneshot::Sender<StreamCloseSummary>,
     stream_credit_stall: Duration,
     stream_cancel_ack: Duration,
@@ -2943,16 +3010,27 @@ async fn run_stream_pump_v2(
         };
         if let Some(pt) = pending {
             let payload = build_pending_terminate_payload(&pt);
-            let Some(chunk) = signing_ctx
+            let chunk = match signing_ctx
                 .try_build_signed_chunk(request_id, next_seq, payload)
                 .await
-            else {
-                // Signing failed: pump breaks without emitting.
-                // `try_build_signed_chunk` already logged the cause.
-                break;
+            {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    signing_ctx
+                        .close_on_signature_refusal(
+                            request_id,
+                            next_seq,
+                            e,
+                            &outer_tx,
+                            &mut frontier,
+                            &mut terminal_summary,
+                        )
+                        .await;
+                    break;
+                }
             };
             ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
-            let _ = outer_tx.send(chunk).await;
+            let _ = outer_tx.send(Ok(chunk)).await;
             break;
         }
 
@@ -2999,26 +3077,52 @@ async fn run_stream_pump_v2(
                 biased;
                 () = cancel_timer_fut => {
                     let payload = CancelAckTracker::cancel_ack_timeout_payload();
-                    let Some(chunk) = signing_ctx
+                    let chunk = match signing_ctx
                         .try_build_signed_chunk(request_id, next_seq, payload)
                         .await
-                    else {
-                        break;
+                    {
+                        Ok(chunk) => chunk,
+                        Err(e) => {
+                            signing_ctx
+                                .close_on_signature_refusal(
+                                    request_id,
+                                    next_seq,
+                                    e,
+                                    &outer_tx,
+                                    &mut frontier,
+                                    &mut terminal_summary,
+                                )
+                                .await;
+                            break;
+                        }
                     };
                     ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
-                    let _ = outer_tx.send(chunk).await;
+                    let _ = outer_tx.send(Ok(chunk)).await;
                     break;
                 }
                 () = credit_timer_fut => {
                     let payload = CancelAckTracker::credit_stall_payload();
-                    let Some(chunk) = signing_ctx
+                    let chunk = match signing_ctx
                         .try_build_signed_chunk(request_id, next_seq, payload)
                         .await
-                    else {
-                        break;
+                    {
+                        Ok(chunk) => chunk,
+                        Err(e) => {
+                            signing_ctx
+                                .close_on_signature_refusal(
+                                    request_id,
+                                    next_seq,
+                                    e,
+                                    &outer_tx,
+                                    &mut frontier,
+                                    &mut terminal_summary,
+                                )
+                                .await;
+                            break;
+                        }
                     };
                     ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
-                    let _ = outer_tx.send(chunk).await;
+                    let _ = outer_tx.send(Ok(chunk)).await;
                     break;
                 }
                 () = grant_wake.notified() => {
@@ -3064,26 +3168,52 @@ async fn run_stream_pump_v2(
                 biased;
                 () = cancel_timer_fut => {
                     let payload = CancelAckTracker::cancel_ack_timeout_payload();
-                    let Some(chunk) = signing_ctx
+                    let chunk = match signing_ctx
                         .try_build_signed_chunk(request_id, next_seq, payload)
                         .await
-                    else {
-                        break;
+                    {
+                        Ok(chunk) => chunk,
+                        Err(e) => {
+                            signing_ctx
+                                .close_on_signature_refusal(
+                                    request_id,
+                                    next_seq,
+                                    e,
+                                    &outer_tx,
+                                    &mut frontier,
+                                    &mut terminal_summary,
+                                )
+                                .await;
+                            break;
+                        }
                     };
                     ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
-                    let _ = outer_tx.send(chunk).await;
+                    let _ = outer_tx.send(Ok(chunk)).await;
                     break;
                 }
                 () = credit_timer_fut => {
                     let payload = CancelAckTracker::credit_stall_payload();
-                    let Some(chunk) = signing_ctx
+                    let chunk = match signing_ctx
                         .try_build_signed_chunk(request_id, next_seq, payload)
                         .await
-                    else {
-                        break;
+                    {
+                        Ok(chunk) => chunk,
+                        Err(e) => {
+                            signing_ctx
+                                .close_on_signature_refusal(
+                                    request_id,
+                                    next_seq,
+                                    e,
+                                    &outer_tx,
+                                    &mut frontier,
+                                    &mut terminal_summary,
+                                )
+                                .await;
+                            break;
+                        }
                     };
                     ingest_stream_chunk(&mut frontier, &mut terminal_summary, &chunk);
-                    let _ = outer_tx.send(chunk).await;
+                    let _ = outer_tx.send(Ok(chunk)).await;
                     break;
                 }
                 () = grant_wake.notified() => {
@@ -3125,20 +3255,35 @@ async fn run_stream_pump_v2(
         let chunk = match chunk_opt {
             None => break, // upstream closed
             Some(Ok(chunk)) => chunk,
-            Some(Err(fault)) => {
-                // The inner invoke pump refused to sign a chunk AND refused to
-                // sign the terminal error chunk that would have reported it, so
-                // it handed over this typed fault instead of an unsigned chunk.
-                // Both pumps sign through the same `Arc<dyn StreamSigner>`, so
-                // this pump cannot sign a terminal of its own either: it stops
-                // here, and the escrow guard settles as it unwinds.
+            Some(Err(refusal)) => {
+                // The inner invoke pump's operator key refused a chunk AND
+                // refused the terminal error chunk that would have reported it,
+                // so it handed over this typed value instead of an unsigned
+                // chunk. This pump signs through the same
+                // `Arc<dyn StreamSigner>`, and it still attempts its own
+                // terminal: §5.4.5 "Signature refusal" has the implementation
+                // read the key's answer rather than classify a prior refusal,
+                // and two refusals do not establish a third. The refused
+                // chunk's own refusal is the one this pump reports, because
+                // that is what stopped the stream.
                 tracing::error!(
                     request_id = %hex::encode(request_id),
                     outlet_id = %signing_ctx.outlet_id,
                     context_id = %signing_ctx.context_id,
-                    error = %fault,
-                    "dispatch pump: inner invoke pump could not sign — pump stops without emitting"
+                    error = %refusal,
+                    "dispatch pump: inner invoke pump's operator key refused — closing on the \
+                     §5.4.5 refusal terminal"
                 );
+                signing_ctx
+                    .close_on_signature_refusal(
+                        request_id,
+                        next_seq,
+                        refusal.refused_chunk,
+                        &outer_tx,
+                        &mut frontier,
+                        &mut terminal_summary,
+                    )
+                    .await;
                 break;
             }
         };
@@ -3183,14 +3328,28 @@ async fn run_stream_pump_v2(
                 // can verify each chunk against `chunk.sequence` as
                 // delivered. Without this, the inner sig is dead weight
                 // (verifies under a sequence the wire never carries).
-                let Some(final_chunk) = signing_ctx
+                let final_chunk = match signing_ctx
                     .try_build_signed_chunk(request_id, seq, chunk.payload.clone())
                     .await
-                else {
-                    // Signing failed: do not advance `next_seq`, do not
-                    // emit, break out. Receiver sees stream end without
-                    // an unsigned chunk on the wire.
-                    break;
+                {
+                    Ok(final_chunk) => final_chunk,
+                    Err(e) => {
+                        // The key refused this chunk: do not advance
+                        // `next_seq`, do not emit it, and close the stream on
+                        // the §5.4.5 refusal terminal at the slot the refused
+                        // chunk did not consume.
+                        signing_ctx
+                            .close_on_signature_refusal(
+                                request_id,
+                                seq,
+                                e,
+                                &outer_tx,
+                                &mut frontier,
+                                &mut terminal_summary,
+                            )
+                            .await;
+                        break;
+                    }
                 };
                 let terminal = final_chunk.payload.is_terminal();
                 // Crisp invariant: every chunk reaching a bridge consumer
@@ -3276,7 +3435,7 @@ async fn run_stream_pump_v2(
                     continue;
                 }
                 ingest_stream_chunk(&mut frontier, &mut terminal_summary, &final_chunk);
-                if outer_tx.send(final_chunk).await.is_err() {
+                if outer_tx.send(Ok(final_chunk)).await.is_err() {
                     break;
                 }
                 if terminal {
@@ -3981,7 +4140,7 @@ mod tests {
 
         let sink = Arc::new(RecordingSettlementSink::default());
         let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(16);
-        let (outer_tx, _outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, _outer_rx) = mpsc::channel::<OutletStreamItem>(16);
         let (summary_tx, _summary_rx) = tokio::sync::oneshot::channel();
         let request_id: RequestId = [0x99; 16];
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
@@ -4083,7 +4242,7 @@ mod tests {
         let cancel_wake = Arc::new(Notify::new());
         let terminate_wake = Arc::new(Notify::new());
         let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(16);
-        let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamItem>(16);
         let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
         let request_id: RequestId = [0x77; 16];
 
@@ -4143,7 +4302,8 @@ mod tests {
         let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
             .await
             .expect("pump emits synthetic terminal within 2s")
-            .expect("chunk arrives");
+            .expect("chunk arrives")
+            .expect("the operator key signed the synthetic terminal");
         // Crisp invariant for the [0u8;64] placeholder deletion: the
         // synthetic terminal chunk MUST carry a real signature, never
         // the all-zero placeholder. Regression-pin this so a future
@@ -4214,7 +4374,7 @@ mod tests {
         let cancel_wake = Arc::new(Notify::new());
         let terminate_wake = Arc::new(Notify::new());
         let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(16);
-        let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamItem>(16);
         let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
         let request_id: RequestId = [0x99; 16];
 
@@ -4335,7 +4495,7 @@ mod tests {
             let cancel_wake = Arc::new(Notify::new());
             let terminate_wake = Arc::new(Notify::new());
             let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(16);
-            let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+            let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamItem>(16);
             let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
             let request_id: RequestId = [0x55; 16];
 
@@ -4392,7 +4552,8 @@ mod tests {
             let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
                 .await
                 .expect("pump emits synthetic terminal within 2s")
-                .expect("chunk arrives");
+                .expect("chunk arrives")
+                .expect("the operator key signed the synthetic terminal");
             assert_ne!(
                 chunk.sig, [0u8; 64],
                 "sig MUST NOT be all-zero placeholder for reason {reason:?}"
@@ -4447,7 +4608,7 @@ mod tests {
         recheck: Duration,
     ) -> (
         StreamSessionHandle,
-        mpsc::Receiver<OutletStreamChunk>,
+        mpsc::Receiver<OutletStreamItem>,
         tokio::sync::oneshot::Receiver<StreamCloseSummary>,
         tokio::task::JoinHandle<()>,
         mpsc::Sender<OutletStreamItem>,
@@ -4456,7 +4617,7 @@ mod tests {
         let cancel_wake = Arc::new(Notify::new());
         let terminate_wake = Arc::new(Notify::new());
         let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(16);
-        let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamItem>(16);
         let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
         // Set the snapshot recheck cadence on the state so the pump's
         // interval arm fires at the test-controlled period.
@@ -4509,6 +4670,168 @@ mod tests {
         (handle, outer_rx, summary_rx, pump_join, inner_tx)
     }
 
+    /// A [`StreamSigner`] that refuses the `fail_at`th signing attempt
+    /// (1-based) and signs every other attempt under the fixed test key.
+    ///
+    /// A custody backend behaves this way when it refuses one call and serves
+    /// the next, which is the case §5.4.5 "Signature refusal" points at when it
+    /// requires the implementation to read the key's answer rather than
+    /// classify a prior refusal.
+    struct RefuseNthStreamSigner {
+        inner: super::super::signer::InProcessStreamSigner,
+        fail_at: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RefuseNthStreamSigner {
+        fn new(fail_at: usize) -> Self {
+            Self {
+                inner: super::super::signer::InProcessStreamSigner::new(fixed_signing_key()),
+                fail_at,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamSigner for RefuseNthStreamSigner {
+        async fn sign(&self, preimage: &[u8]) -> Result<[u8; 64], StreamSignerError> {
+            use std::sync::atomic::Ordering;
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+            if attempt == self.fail_at {
+                return Err(StreamSignerError::Custody {
+                    category: super::super::signer::StreamSignerCustodyCategory::BackendFault,
+                });
+            }
+            self.inner.sign(preimage).await
+        }
+
+        fn verifying_key(&self) -> &VerifyingKey {
+            self.inner.verifying_key()
+        }
+    }
+
+    /// A [`StreamSigner`] that refuses every call, so a test can drive the
+    /// case where the operator key refuses the refusal terminal too.
+    struct AlwaysRefuseStreamSigner(VerifyingKey);
+
+    #[async_trait::async_trait]
+    impl StreamSigner for AlwaysRefuseStreamSigner {
+        async fn sign(&self, _preimage: &[u8]) -> Result<[u8; 64], StreamSignerError> {
+            Err(StreamSignerError::Custody {
+                category: super::super::signer::StreamSignerCustodyCategory::KeyNotFound,
+            })
+        }
+
+        fn verifying_key(&self) -> &VerifyingKey {
+            &self.0
+        }
+    }
+
+    /// Replaces the session's operator signer, so a test can drive the pump's
+    /// §5.4.5 signature-refusal path.
+    fn set_operator_signer(state: &Arc<RwLock<SharedSessionState>>, signer: Arc<dyn StreamSigner>) {
+        let mut guard = state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.operator_signer = signer;
+    }
+
+    /// §5.4.5 "Signature refusal" at the dispatch pump: when the operator key
+    /// refuses a forwarded chunk but signs the refusal terminal, the receiver
+    /// MUST read that signed terminal — carrying `SCP-OUTLET-6137` and the
+    /// `execution.signing-refused` slug — rather than a closed channel. The
+    /// refused chunk burns no outer sequence number, so the terminal takes the
+    /// slot the refused chunk would have used.
+    #[tokio::test]
+    async fn pump_refused_chunk_closes_on_a_signed_refusal_terminal() {
+        let state = build_test_state();
+        // Attempt 1 is the forwarded `Data` chunk; attempt 2 is the refusal
+        // terminal, which this signer signs.
+        set_operator_signer(&state, Arc::new(RefuseNthStreamSigner::new(1)));
+        let request_id: RequestId = [0x31; 16];
+        let (_handle, mut outer_rx, summary_rx, pump_join, inner_tx) =
+            spawn_test_pump(state, request_id, Duration::from_secs(3_601));
+
+        send_inner_data(&inner_tx, 0).await;
+
+        let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+            .await
+            .expect("pump emits the refusal terminal within 2s")
+            .expect("an item arrives")
+            .expect("the operator key signed the refusal terminal");
+        assert_eq!(
+            chunk.sequence, 0,
+            "the refused chunk burns no sequence number, so the terminal takes slot 0"
+        );
+        assert_ne!(
+            chunk.sig, [0u8; 64],
+            "the refusal terminal carries a real operator signature"
+        );
+        let ChunkPayload::Error {
+            code,
+            message,
+            terminal,
+        } = &chunk.payload
+        else {
+            panic!("expected a terminal Error payload; got {:?}", chunk.payload);
+        };
+        assert!(*terminal);
+        assert_eq!(code, error_codes::CODE_EXECUTION_SIGNING_REFUSED);
+        assert!(
+            message.starts_with(error_codes::SLUG_EXECUTION_SIGNING_REFUSED),
+            "the §5.4.4 slug is the message prefix; got {message:?}"
+        );
+
+        drop(inner_tx);
+        pump_join.await.expect("pump settles");
+        let summary = summary_rx.await.expect("summary published");
+        assert_eq!(
+            summary.billed_count, 0,
+            "a refused chunk is never billed, and the refusal terminal is not a Data chunk"
+        );
+    }
+
+    /// §5.4.5 "Signature refusal" when the key refuses the refusal terminal
+    /// too: the receiver MUST read the typed `ChunkSignatureRefused` as the
+    /// channel's last item, never a bare close and never an unsigned chunk.
+    /// Both of its fields record a distinct refused attempt.
+    #[tokio::test]
+    async fn pump_refused_terminal_hands_the_receiver_the_typed_refusal() {
+        let state = build_test_state();
+        // This case needs BOTH signing attempts refused, which the
+        // nth-attempt signer cannot express.
+        let vk = fixed_signing_key().verifying_key();
+        set_operator_signer(&state, Arc::new(AlwaysRefuseStreamSigner(vk)));
+        let request_id: RequestId = [0x32; 16];
+        let (_handle, mut outer_rx, _summary_rx, pump_join, inner_tx) =
+            spawn_test_pump(state, request_id, Duration::from_secs(3_601));
+
+        send_inner_data(&inner_tx, 0).await;
+
+        let item = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+            .await
+            .expect("pump hands over the typed refusal within 2s")
+            .expect("an item arrives");
+        let refusal = item.expect_err("the key refused both attempts, so no chunk is emitted");
+        let expected = StreamSignerError::Custody {
+            category: super::super::signer::StreamSignerCustodyCategory::KeyNotFound,
+        };
+        assert_eq!(refusal.refused_chunk, expected);
+        assert_eq!(refusal.refused_terminal, expected);
+
+        // The refusal is the channel's last item: nothing follows it.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+                .await
+                .expect("the channel closes within 2s")
+                .is_none(),
+            "the typed refusal is the last item the channel yields"
+        );
+        drop(inner_tx);
+        pump_join.await.expect("pump settles");
+    }
+
     /// F3 lost-wakeup regression: a `terminate_with_error` that lands while
     /// the pump is between iterations (the notification stores a `notify_one`
     /// permit rather than waking an already-parked waiter) is still observed
@@ -4530,7 +4853,8 @@ mod tests {
         let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
             .await
             .expect("pump emits synthetic terminal within 2s")
-            .expect("chunk arrives");
+            .expect("chunk arrives")
+            .expect("the operator key signed the synthetic terminal");
         assert!(chunk.payload.is_terminal());
         pump_join.await.expect("pump settles");
         let summary = summary_rx.await.expect("summary published");
@@ -4588,7 +4912,10 @@ mod tests {
         let mut terminal: Option<ChunkPayload> = None;
         loop {
             match tokio::time::timeout(Duration::from_secs(2), outer_rx.recv()).await {
-                Ok(Some(chunk)) => match chunk.payload {
+                Ok(Some(item)) => match item
+                    .expect("the operator key signed every chunk this pump emitted")
+                    .payload
+                {
                     ChunkPayload::Data { .. } => data_chunks += 1,
                     payload @ ChunkPayload::Error { .. } => {
                         terminal = Some(payload);
@@ -4670,7 +4997,8 @@ mod tests {
         let chunk = tokio::time::timeout(Duration::from_secs(3), outer_rx.recv())
             .await
             .expect("pump emits teardown terminal within recheck cadence")
-            .expect("chunk arrives");
+            .expect("chunk arrives")
+            .expect("the operator key signed the teardown terminal");
         let ChunkPayload::Error {
             code,
             message,
@@ -4712,7 +5040,8 @@ mod tests {
         let chunk = tokio::time::timeout(Duration::from_secs(3), outer_rx.recv())
             .await
             .expect("pump emits revocation terminal within recheck cadence")
-            .expect("chunk arrives");
+            .expect("chunk arrives")
+            .expect("the operator key signed the revocation terminal");
         let ChunkPayload::Error { code, message, .. } = chunk.payload else {
             unreachable!("expected terminal Error chunk");
         };
@@ -4755,7 +5084,8 @@ mod tests {
         let chunk = tokio::time::timeout(Duration::from_secs(5), outer_rx.recv())
             .await
             .expect("revocation terminal arrives well before t=recheck_secs")
-            .expect("chunk arrives");
+            .expect("chunk arrives")
+            .expect("the operator key signed the revocation terminal");
         let ChunkPayload::Error { code, .. } = chunk.payload else {
             unreachable!("expected terminal Error chunk");
         };
@@ -4999,7 +5329,7 @@ mod tests {
     /// Everything a capturing-pump test drives + observes.
     struct CapturingPump {
         handle: StreamSessionHandle,
-        outer_rx: mpsc::Receiver<OutletStreamChunk>,
+        outer_rx: mpsc::Receiver<OutletStreamItem>,
         summary_rx: tokio::sync::oneshot::Receiver<StreamCloseSummary>,
         pump_join: tokio::task::JoinHandle<()>,
         inner_tx: mpsc::Sender<OutletStreamItem>,
@@ -5049,7 +5379,7 @@ mod tests {
         let cancel_wake = Arc::new(Notify::new());
         let terminate_wake = Arc::new(Notify::new());
         let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamItem>(64);
-        let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamChunk>(64);
+        let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamItem>(64);
         let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (settle_tx, settle_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5163,13 +5493,14 @@ mod tests {
 
     /// Drains `outer_rx`, returning `(data_count, terminal_payload)`.
     async fn drain_outer(
-        outer_rx: &mut mpsc::Receiver<OutletStreamChunk>,
+        outer_rx: &mut mpsc::Receiver<OutletStreamItem>,
     ) -> (u32, Option<ChunkPayload>) {
         let mut data = 0u32;
         let mut terminal = None;
-        while let Ok(Some(chunk)) =
+        while let Ok(Some(item)) =
             tokio::time::timeout(Duration::from_secs(5), outer_rx.recv()).await
         {
+            let chunk = item.expect("the operator key signed every chunk this pump emitted");
             let is_terminal = chunk.payload.is_terminal();
             match chunk.payload {
                 ChunkPayload::Data { .. } => data += 1,
@@ -5266,7 +5597,8 @@ mod tests {
             let chunk = tokio::time::timeout(Duration::from_secs(5), pump.outer_rx.recv())
                 .await
                 .expect("data chunk forwarded")
-                .expect("stream open");
+                .expect("stream open")
+                .expect("the operator key signed every forwarded chunk");
             assert!(matches!(chunk.payload, ChunkPayload::Data { .. }));
             assert_eq!(chunk.sequence, seq);
         }
@@ -5301,9 +5633,10 @@ mod tests {
 
         let mut extra_data = 0u32;
         let mut terminal_seq = None;
-        while let Ok(Some(chunk)) =
+        while let Ok(Some(item)) =
             tokio::time::timeout(Duration::from_secs(5), pump.outer_rx.recv()).await
         {
+            let chunk = item.expect("the operator key signed every forwarded chunk");
             if chunk.payload.is_terminal() {
                 terminal_seq = Some(chunk.sequence);
                 break;
@@ -5526,7 +5859,9 @@ mod tests {
         let mut next_grant_at = 32u32;
         loop {
             match tokio::time::timeout(Duration::from_secs(5), pump.outer_rx.recv()).await {
-                Ok(Some(chunk)) => {
+                Ok(Some(item)) => {
+                    let chunk =
+                        item.expect("the operator key signed every chunk this pump emitted");
                     let is_terminal = chunk.payload.is_terminal();
                     match chunk.payload {
                         ChunkPayload::Data { .. } => {
@@ -5736,7 +6071,8 @@ mod tests {
             let chunk = tokio::time::timeout(Duration::from_secs(5), pump.outer_rx.recv())
                 .await
                 .expect("chunk within 5s")
-                .expect("chunk present");
+                .expect("chunk present")
+                .expect("the operator key signed every forwarded chunk");
             assert!(matches!(chunk.payload, ChunkPayload::Data { .. }));
         }
 

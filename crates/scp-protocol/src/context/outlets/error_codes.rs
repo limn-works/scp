@@ -37,13 +37,15 @@
 //! | [`CODE_EXECUTION_STREAM_CAP`] (`SCP-OUTLET-6132`) | `Execution` | `execution.stream-cap-exhausted` | `execution.stream-cap-exhausted` |
 //! | [`CODE_EXECUTION_CREDIT_STALL`] (`SCP-OUTLET-6133`) | `Execution` | `execution.credit-stall` | `execution.credit-stall` |
 //! | [`CODE_EXECUTION_CANCEL_ACK_TIMEOUT`] (`SCP-OUTLET-6135`) | `Execution` | `execution.cancel-ack-timeout` | `execution.cancel-ack-timeout` |
+//! | [`CODE_EXECUTION_SIGNING_REFUSED`] (`SCP-OUTLET-6137`) | `Execution` | `execution.signing-refused` | `execution.signing-refused` |
 //! | [`CODE_OUTPUT_VIOLATION`] (`SCP-OUTLET-6140`) | `Output` | `output.schema-violation` | `output.schema-violation`, `output.too-large`, `output.not-serializable` |
 //! | [`CODE_ECONOMIC_FAULT`] (`SCP-OUTLET-6150`) | `Economic` | `economic.insufficient-funds` | `economic.insufficient-funds`, `economic.adapter-failure`, `economic.pricing-formula-error`, `economic.budget-exceeded`, `economic.escrow-overflow`, `protocol.interface-spam-cost` (cross-class slug, Economic class) |
 //! | [`CODE_TRANSPORT_FAULT`] (`SCP-OUTLET-6160`) | `Transport` | `transport.relay-unavailable` | `transport.relay-unavailable`, `transport.cross-context-bridge-failure`, `transport.rate-limited`, `transport.concurrent-streams-per-invoker`, `transport.concurrent-streams-per-origin-invoker`, `transport.concurrent-streams-per-outlet` |
 //! | [`CODE_GOVERNANCE_FAULT`] (`SCP-OUTLET-6170`) | `Governance` | `governance.outlet-deregistered` | `governance.outlet-deregistered`, `governance.outlet-suspended`, `governance.ceiling-exceeded`, `governance.consequence-active` |
 //!
 //! Codes `SCP-OUTLET-6111`, `SCP-OUTLET-6112`, `SCP-OUTLET-6113`, `SCP-OUTLET-6116..=6119`,
-//! `SCP-OUTLET-6121..=6129`, `SCP-OUTLET-6134`, `SCP-OUTLET-6136..=6139`,
+//! `SCP-OUTLET-6121..=6129`, `SCP-OUTLET-6134`, `SCP-OUTLET-6136`,
+//! `SCP-OUTLET-6138..=6139`,
 //! `SCP-OUTLET-6141..=6149`, `SCP-OUTLET-6151..=6159`, `SCP-OUTLET-6161..=6169`,
 //! `SCP-OUTLET-6171..=6179`, and `SCP-OUTLET-6180..=6199` are **reserved** within
 //! the §5.4.4 6100-6199 sub-block. Reserved codes return [`None`] from every
@@ -188,6 +190,27 @@ pub const CODE_EXECUTION_CREDIT_STALL: &str = "SCP-OUTLET-6133";
 /// slug `execution.cancel-ack-timeout`. See §5.4.4 round-4.
 pub const CODE_EXECUTION_CANCEL_ACK_TIMEOUT: &str = "SCP-OUTLET-6135";
 
+/// `SCP-OUTLET-6137` — Execution-class operator signature refusal.
+///
+/// The operator's signing seam refused a stream chunk — the payload failed
+/// RFC 8785 canonicalization while composing the `SCP-OUTLET-CHUNK-SIG-V1:`
+/// preimage, or the custody backend holding the operator key returned an
+/// error. §5.4.5 ("Signature refusal") forbids emitting a chunk bearing a
+/// signature the operator did not produce, so the pump withholds the refused
+/// chunk and closes the stream on a terminal `Error` carrying this code.
+/// Default (and only) slug `execution.signing-refused`.
+///
+/// The retry policy is `WithBackoff` `1s..30s`, which is why this is a
+/// distinct code rather than a slug under [`CODE_EXECUTION_FAULT`]
+/// (`SCP-OUTLET-6130`, policy `Never`): an operator that emits this terminal
+/// has just signed it, so the key that refused the earlier chunk answered the
+/// very next call. §5.4.4 keys the retry policy on the code, so riding 6130
+/// would tell every caller never to retry a condition the emitter
+/// demonstrated is not permanent — the same reason
+/// [`CODE_EXECUTION_STREAM_CAP`] was split from [`CODE_EXECUTION_CREDIT`].
+/// See §5.4.4 + §5.4.5.
+pub const CODE_EXECUTION_SIGNING_REFUSED: &str = "SCP-OUTLET-6137";
+
 /// `SCP-OUTLET-6140` — Output-class schema / size / redaction violations.
 ///
 /// Default slug `output.schema-violation`. Slugs:
@@ -227,14 +250,14 @@ pub const CODE_GOVERNANCE_FAULT: &str = "SCP-OUTLET-6170";
 /// All allocated codes in the §5.4.4 6100-6199 sub-block, in canonical order.
 ///
 /// The size of this array is exactly the count of distinct codes the registry
-/// allocates (15). The §5.4.4 design constraint is "compact" — `[12, 18]`
+/// allocates (16). The §5.4.4 design constraint is "compact" — `[12, 18]`
 /// codes total. The reserved range `6180-6199` plus the gaps within each
 /// class range (e.g. `6111`, `6134`, etc.) hold zero allocations.
 ///
 /// Used by [`error_code_to_class`] / [`error_code_to_default_slug`] /
 /// [`error_code_to_retry_policy`] to drive the negative branch of every
 /// lookup.
-pub const ALL_CODES: [&str; 15] = [
+pub const ALL_CODES: [&str; 16] = [
     CODE_PROTOCOL_VIOLATION,
     CODE_PROTOCOL_SESSION,
     CODE_AUTHORIZATION_DENIED,
@@ -246,6 +269,7 @@ pub const ALL_CODES: [&str; 15] = [
     CODE_EXECUTION_STREAM_CAP,
     CODE_EXECUTION_CREDIT_STALL,
     CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
+    CODE_EXECUTION_SIGNING_REFUSED,
     CODE_OUTPUT_VIOLATION,
     CODE_ECONOMIC_FAULT,
     CODE_TRANSPORT_FAULT,
@@ -265,7 +289,7 @@ pub const ALL_CODES: [&str; 15] = [
 /// this module, so a new `SLUG_*` constant that is not added here fails to
 /// build green. Every entry MUST resolve through [`slug_to_class`]
 /// ([`tests::all_slugs_resolve_through_slug_to_class`]).
-pub const ALL_SLUGS: [&str; 69] = [
+pub const ALL_SLUGS: [&str; 70] = [
     // Protocol class (6100 + 6101).
     SLUG_PROTOCOL_VIOLATION,
     SLUG_QUERY_COST_VIOLATION,
@@ -321,6 +345,7 @@ pub const ALL_SLUGS: [&str; 69] = [
     SLUG_EXECUTION_STREAM_GAP,
     SLUG_EXECUTION_STREAM_CAP_EXHAUSTED,
     SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
+    SLUG_EXECUTION_SIGNING_REFUSED,
     // Output class (6140).
     SLUG_OUTPUT_SCHEMA_VIOLATION,
     SLUG_OUTPUT_TOO_LARGE,
@@ -512,6 +537,13 @@ pub const SLUG_EXECUTION_STREAM_GAP: &str = "execution.stream-gap";
 pub const SLUG_EXECUTION_STREAM_CAP_EXHAUSTED: &str = "execution.stream-cap-exhausted";
 /// Slug `execution.cancel-ack-timeout` — round-4 cancel-ack timer.
 pub const SLUG_EXECUTION_CANCEL_ACK_TIMEOUT: &str = "execution.cancel-ack-timeout";
+/// Slug `execution.signing-refused` — the operator's signing seam refused a
+/// stream chunk.
+///
+/// The pump withheld that chunk rather than emit a signature the operator
+/// never produced (§5.4.5 "Signature refusal"). Carried by
+/// [`CODE_EXECUTION_SIGNING_REFUSED`].
+pub const SLUG_EXECUTION_SIGNING_REFUSED: &str = "execution.signing-refused";
 
 // --- Output class ---------------------------------------------------------
 
@@ -637,7 +669,8 @@ pub fn error_code_to_class(code: &str) -> Option<OutletErrorClass> {
         | CODE_EXECUTION_CREDIT
         | CODE_EXECUTION_STREAM_CAP
         | CODE_EXECUTION_CREDIT_STALL
-        | CODE_EXECUTION_CANCEL_ACK_TIMEOUT => Some(OutletErrorClass::Execution),
+        | CODE_EXECUTION_CANCEL_ACK_TIMEOUT
+        | CODE_EXECUTION_SIGNING_REFUSED => Some(OutletErrorClass::Execution),
         CODE_OUTPUT_VIOLATION => Some(OutletErrorClass::Output),
         CODE_ECONOMIC_FAULT => Some(OutletErrorClass::Economic),
         CODE_TRANSPORT_FAULT => Some(OutletErrorClass::Transport),
@@ -664,6 +697,7 @@ pub fn error_code_to_default_slug(code: &str) -> Option<&'static str> {
         CODE_EXECUTION_STREAM_CAP => Some(SLUG_EXECUTION_STREAM_CAP_EXHAUSTED),
         CODE_EXECUTION_CREDIT_STALL => Some(SLUG_EXECUTION_CREDIT_STALL),
         CODE_EXECUTION_CANCEL_ACK_TIMEOUT => Some(SLUG_EXECUTION_CANCEL_ACK_TIMEOUT),
+        CODE_EXECUTION_SIGNING_REFUSED => Some(SLUG_EXECUTION_SIGNING_REFUSED),
         CODE_OUTPUT_VIOLATION => Some(SLUG_OUTPUT_SCHEMA_VIOLATION),
         CODE_ECONOMIC_FAULT => Some(SLUG_ECONOMIC_INSUFFICIENT_FUNDS),
         CODE_TRANSPORT_FAULT => Some(SLUG_TRANSPORT_RELAY_UNAVAILABLE),
@@ -692,6 +726,12 @@ pub fn error_code_to_default_slug(code: &str) -> Option<&'static str> {
 ///   (peer is alive but back-pressured).
 /// - Execution cancel-ack-timeout — `Never` (cancel was emitted; the
 ///   stream is gone).
+/// - Execution signing-refused (`SCP-OUTLET-6137`) — `WithBackoff` 1s..30s.
+///   The operator signed the terminal that reports the refusal, so the key
+///   that refused the earlier chunk answered the very next call and the
+///   condition may already have cleared. Backing off rather than retrying
+///   immediately matches the other conditions whose cause is a backend a
+///   caller cannot hurry.
 /// - Economic — `Never` (operator-level intervention required).
 /// - Transport — `WithBackoff` 1s..30s (network/relay flakiness; retry
 ///   makes sense).
@@ -715,12 +755,13 @@ pub fn error_code_to_retry_policy(code: &str) -> Option<RetryPolicy> {
         | CODE_ECONOMIC_FAULT
         | CODE_GOVERNANCE_FAULT => Some(RetryPolicy::Never),
         CODE_EXECUTION_CREDIT => Some(RetryPolicy::Immediate),
-        CODE_EXECUTION_STREAM_CAP | CODE_EXECUTION_CREDIT_STALL | CODE_TRANSPORT_FAULT => {
-            Some(RetryPolicy::WithBackoff {
-                min: Duration::from_secs(1),
-                max: Duration::from_secs(30),
-            })
-        }
+        CODE_EXECUTION_STREAM_CAP
+        | CODE_EXECUTION_CREDIT_STALL
+        | CODE_EXECUTION_SIGNING_REFUSED
+        | CODE_TRANSPORT_FAULT => Some(RetryPolicy::WithBackoff {
+            min: Duration::from_secs(1),
+            max: Duration::from_secs(30),
+        }),
         _ => None,
     }
 }
@@ -833,7 +874,8 @@ pub fn slug_to_class(slug: &str) -> Option<OutletErrorClass> {
         | SLUG_EXECUTION_CREDIT_STALL
         | SLUG_EXECUTION_STREAM_GAP
         | SLUG_EXECUTION_STREAM_CAP_EXHAUSTED
-        | SLUG_EXECUTION_CANCEL_ACK_TIMEOUT => Some(OutletErrorClass::Execution),
+        | SLUG_EXECUTION_CANCEL_ACK_TIMEOUT
+        | SLUG_EXECUTION_SIGNING_REFUSED => Some(OutletErrorClass::Execution),
 
         // Output class
         SLUG_OUTPUT_SCHEMA_VIOLATION | SLUG_OUTPUT_TOO_LARGE | SLUG_OUTPUT_NOT_SERIALIZABLE => {

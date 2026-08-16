@@ -120,6 +120,15 @@ pub mod credentials;
 #[cfg(feature = "resolvers")]
 pub mod outlet_stream_credit;
 
+// Bridge-side rendering of a §5.4.5 chunk-signature refusal (the `Err` arm of
+// `OutletStreamItem`): the §5.4.4 code every bridge attaches and the bounded
+// message it pairs with that code. Shared so the three bridges cannot drift on
+// either, and so the canonicalizer text derived from an executor's payload is
+// dropped in ONE place rather than three. Requires scp-core (behind
+// `resolvers`, which always pulls it in).
+#[cfg(feature = "resolvers")]
+pub mod outlet_stream_refusal;
+
 // Bridge-agnostic pieces of the §5.4.5 cross-context streaming-saga FFI surface
 // (SCP-OUT-047): the per-instance registry value, the chunk serialize/terminal
 // step, and the ADR-056-chokepoint key-bearing truncated-close recovery driver.

@@ -3442,7 +3442,7 @@ fn uniffi_saga_export_wires_binding_chokepoint_and_producer() {
 /// bounded Merkle root; it performs NO per-chunk two-phase commit. Structural
 /// guard on the off-mailbox seal task `run_streaming_saga_seal_task`:
 ///
-/// - the per-chunk pump loop (`while let Some(chunk) = inner_rx.recv().await`)
+/// - the per-chunk pump loop (`while let Some(item) = inner_rx.recv().await`)
 ///   folds each forwarded chunk into B's durable frontier via
 ///   `StreamCaptureAppend` — an O(log n) durable capture, NOT a commit;
 /// - the loop body contains NEITHER `CommitBStreamSettle` NOR `PrepareBStreaming`
@@ -3499,7 +3499,12 @@ fn ac8_streaming_saga_seal_commits_once_no_per_chunk_2pc() {
     // commit fires at stream-close, outside the loop). In-string format
     // placeholders (`{SLUG_…}`) are balanced, so they net-zero the depth count.
     let loop_start = seal_fn
-        .find("while let Some(chunk) = inner_rx.recv().await")
+        // The binder is `item` because the channel carries `OutletStreamItem`
+        // (§5.4.5 "Signature refusal" gives it an `Err` arm the seal task
+        // matches before it holds a chunk). This locator names the loop header
+        // so the brace-matched body below is the loop's; the three assertions
+        // over that body are unchanged.
+        .find("while let Some(item) = inner_rx.recv().await")
         .expect("the seal task must have a per-chunk pump loop");
     let open_rel = seal_fn[loop_start..]
         .find('{')

@@ -823,6 +823,30 @@
       "registration_event_id": "3131313131313131313131313131313131313131313131313131313131313131"
     },
     {
+      "name": "scp-outlet-6137--execution.signing-refused",
+      "code": "SCP-OUTLET-6137",
+      "slug": "execution.signing-refused",
+      "class": "execution",
+      "message": "execution.signing-refused",
+      "retry": {
+        "policy": "with-backoff",
+        "min": {
+          "secs": 1,
+          "nanos": 0
+        },
+        "max": {
+          "secs": 30,
+          "nanos": 0
+        }
+      },
+      "detail": {
+        "shape": "execution-timeout",
+        "elapsed_ms": 1200
+      },
+      "pad_nonce": "45454545454545454545454545454545",
+      "registration_event_id": "4545454545454545454545454545454545454545454545454545454545454545"
+    },
+    {
       "name": "scp-outlet-6140--output.schema-violation",
       "code": "SCP-OUTLET-6140",
       "slug": "output.schema-violation",

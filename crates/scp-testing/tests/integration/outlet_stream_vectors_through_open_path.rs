@@ -270,12 +270,22 @@ async fn drive_vector(vec: &Vector) -> DrainOutcome {
     let mut cancel_sent = false;
 
     loop {
-        let chunk = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let item = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("chunk within 10s");
-        let Some(chunk) = chunk else {
+        let Some(item) = item else {
             break;
         };
+        // The third outcome, distinct from a chunk and from the closed
+        // sentinel: the operator key refused a chunk AND refused the terminal
+        // that would have reported that refusal (§5.4.5 "Signature refusal").
+        // These vectors drive the in-process test signer, which signs every
+        // preimage, so a refusal here means the pump changed behaviour and the
+        // vector's chunk expectations no longer describe what it emits.
+        let chunk = item.expect(
+            "the in-process test signer signs every chunk, so this vector run must not observe a \
+             §5.4.5 signature refusal",
+        );
         let terminal = chunk.payload.is_terminal();
         let idx = i64::try_from(chunks.len()).expect("chunk index fits i64");
         chunks.push(chunk);

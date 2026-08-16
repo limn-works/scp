@@ -11,8 +11,9 @@
 //!
 //! - [`crate::scp::Scp::outlet_stream_open`] — open a stream (Commit-transition:
 //!   returns a `StreamHandleId` PROMPTLY; NEVER blocks until terminal).
-//! - [`crate::scp::Scp::outlet_stream_poll_next`] — drain one chunk
-//!   (`None` == closed).
+//! - [`crate::scp::Scp::outlet_stream_poll_next`] — drain one item: a chunk, a
+//!   thrown `SCP-OUTLET-6137` on a §5.4.5 signature refusal, or `None` once the
+//!   stream has closed.
 //! - [`crate::scp::Scp::outlet_stream_grant_credit`] — apply an invoker-signed
 //!   grant.
 //! - [`crate::scp::Scp::outlet_stream_cancel`] — sign+apply a cancel at the
@@ -79,7 +80,7 @@ use scp_core::context::outlets::stream::{
 };
 use scp_core::context::outlets::{
     AdmissionCaps, CancelIdentity, OpenStreamParams, OpenStreamRejection, OutletExecutor,
-    OutletExecutorError, StreamIdentity, StreamSessionHandle, StreamSigner,
+    OutletExecutorError, OutletStreamItem, StreamIdentity, StreamSessionHandle, StreamSigner,
     StreamSignerCustodyCategory, StreamSignerError, cancel_error_to_code, grant_error_to_code,
 };
 
@@ -125,8 +126,13 @@ pub struct StreamEntry {
     /// method is `async` — the mutex is safe to hold across its `.await`, and it
     /// serializes only the (brief) control-plane ops.
     handle: Arc<tokio::sync::Mutex<StreamSessionHandle>>,
-    /// Detached chunk receiver (data plane). Independent lock from `handle`.
-    receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<OutletStreamChunk>>>,
+    /// Detached item receiver (data plane). Independent lock from `handle`.
+    /// Each item is an [`OutletStreamItem`]: `Ok` carries one operator-signed
+    /// chunk, `Err` carries the [`ChunkSignatureRefused`](scp_core::context::outlets::ChunkSignatureRefused)
+    /// the pump sends when the operator key refused both a chunk and the
+    /// terminal that would have reported that refusal (§5.4.5 "Signature
+    /// refusal").
+    receiver: Arc<tokio::sync::Mutex<mpsc::Receiver<OutletStreamItem>>>,
     /// The invoker DID pinned at open (CRITICAL #1). Every control-plane call
     /// verifies `caller_did == invoker_did`.
     invoker_did: String,
@@ -675,10 +681,11 @@ pub(crate) async fn outlet_stream_open_impl(
 // poll_next
 // ---------------------------------------------------------------------------
 
-/// Drains one chunk from a live stream, awaiting the pump until a chunk arrives
-/// or the stream closes. Returns the JSON-serialized [`OutletStreamChunk`] bytes,
-/// or `None` at the channel-closed sentinel. This is the primitive the Swift /
-/// Kotlin SDK's async iterator wraps.
+/// Drains one item from a live stream, awaiting the pump until an item arrives
+/// or the stream closes. Returns the JSON-serialized [`OutletStreamChunk`]
+/// bytes, throws `SCP-OUTLET-6137` on a §5.4.5 signature refusal, or returns
+/// `None` once the channel has closed. This is the primitive the Swift / Kotlin
+/// SDK's async iterator wraps.
 ///
 /// # Async model (no GIL)
 ///
@@ -696,6 +703,14 @@ pub(crate) async fn outlet_stream_open_impl(
 /// - **Terminal chunk** (`End` / `Error{terminal:true}`) → returned to the caller
 ///   AND the entry is EVICTED immediately, so a caller that reads to terminal but
 ///   never performs the trailing `None`-drain does not leak the registry entry.
+/// - **Signature refusal** (`Err(ChunkSignatureRefused)` — the operator key
+///   refused a chunk AND refused the terminal `Error` chunk that would have
+///   reported that refusal, §5.4.5 "Signature refusal" step 2) → the entry is
+///   evicted and the call THROWS `SCP-OUTLET-6137` carrying
+///   [`signature_refused_message`](scp_ffi_common::outlet_stream_refusal::signature_refused_message).
+///   Never `None`: a caller reading the closed sentinel for a refusal could not
+///   tell a completed stream from an operator that withheld output it refused
+///   to sign.
 /// - **`None`** (channel closed with no terminal chunk — an abnormal close such
 ///   as a pump panic dropping the sender) → the entry is evicted and `None` is
 ///   returned as the terminal sentinel.
@@ -712,25 +727,39 @@ pub(crate) async fn outlet_stream_poll_next_impl(
         };
         Arc::clone(&entry.receiver)
     };
-    let chunk = receiver.lock().await.recv().await;
-    if let Some(chunk) = chunk {
-        // Evict on the TERMINAL chunk so a run-to-terminal-without-draining caller
-        // cannot leak the entry. The pump releases the admission counter + escrow
-        // at the same terminal, so eviction here only reclaims the bridge-side
-        // registry slot.
-        if chunk.payload.is_terminal() {
-            bi.outlet_stream_registry.remove(handle_id);
+    let item = receiver.lock().await.recv().await;
+    match item {
+        Some(Ok(chunk)) => {
+            // Evict on the TERMINAL chunk so a run-to-terminal-without-draining
+            // caller cannot leak the entry. The pump releases the admission
+            // counter + escrow at the same terminal, so eviction here only
+            // reclaims the bridge-side registry slot.
+            if chunk.payload.is_terminal() {
+                bi.outlet_stream_registry.remove(handle_id);
+            }
+            let bytes = serde_json::to_vec(&chunk).map_err(|e| ScpError::Context {
+                msg: format!("failed to serialize stream chunk: {e}"),
+                code: codes::CTX_2001.to_owned(),
+            })?;
+            Ok(Some(bytes))
         }
-        let bytes = serde_json::to_vec(&chunk).map_err(|e| ScpError::Context {
-            msg: format!("failed to serialize stream chunk: {e}"),
-            code: codes::CTX_2001.to_owned(),
-        })?;
-        Ok(Some(bytes))
-    } else {
-        // Abnormal terminal: the pump dropped the sender without a terminal chunk.
-        // Evict so the handle + any residual control state drop with the entry.
-        bi.outlet_stream_registry.remove(handle_id);
-        Ok(None)
+        Some(Err(refusal)) => {
+            // The pump sends this item and returns, so no further item can
+            // arrive on this handle. Evict on the SAME line the terminal and
+            // closed paths evict on, so a refusal leaks no registry entry.
+            bi.outlet_stream_registry.remove(handle_id);
+            Err(ScpError::Outlet {
+                msg: scp_ffi_common::outlet_stream_refusal::signature_refused_message(&refusal),
+                code: scp_ffi_common::outlet_stream_refusal::SIGNATURE_REFUSED_CODE.to_owned(),
+            })
+        }
+        None => {
+            // Abnormal terminal: the pump dropped the sender without a terminal
+            // chunk. Evict so the handle + any residual control state drop with
+            // the entry.
+            bi.outlet_stream_registry.remove(handle_id);
+            Ok(None)
+        }
     }
 }
 
@@ -1988,6 +2017,49 @@ impl Scp {
         self.inner
             .outlet_streaming_saga_registry
             .contains_key(saga_id)
+    }
+
+    /// TEST-ONLY: replaces the chunk receiver of the live stream `handle_id`
+    /// with a closed channel holding one `Err(refusal)` item — byte-for-byte the
+    /// item the dispatch pump sends when the operator key refuses both a chunk
+    /// and the terminal that would have reported that refusal (§5.4.5
+    /// "Signature refusal" step 2). Returns `false` when `handle_id` names no
+    /// live stream.
+    ///
+    /// A test cannot produce that item through the bridge's public surface: the
+    /// pump emits it only when the operator's custody backend fails a signature
+    /// mid-stream, and no bridge export makes custody refuse a chosen call.
+    /// Substituting the receiver leaves the rest of the path real — the live
+    /// registry entry, `outlet_stream_poll_next_impl`, the error it constructs,
+    /// and the eviction it performs.
+    ///
+    /// The sender drops at the end of this call, which closes the channel
+    /// exactly as the pump's return does, so a poll after the refusal reads the
+    /// closed sentinel and not a second item.
+    #[must_use]
+    pub fn arm_test_stream_signature_refusal(
+        &self,
+        handle_id: &str,
+        refusal: scp_core::context::outlets::ChunkSignatureRefused,
+    ) -> bool {
+        let Some(mut entry) = self.inner.outlet_stream_registry.get_mut(handle_id) else {
+            return false;
+        };
+        let (tx, rx) = mpsc::channel(1);
+        // A fresh capacity-1 channel with a live receiver always accepts the
+        // first item, so this send cannot fail.
+        let _ = tx.try_send(Err(refusal));
+        entry.receiver = Arc::new(tokio::sync::Mutex::new(rx));
+        true
+    }
+
+    /// TEST-ONLY: reports whether a same-context stream registry entry for
+    /// `handle_id` is still present — lets a test assert that `poll_next`
+    /// evicted the entry on the signature-refusal path, as it does on the
+    /// terminal-chunk and channel-closed paths.
+    #[must_use]
+    pub fn test_stream_entry_present(&self, handle_id: &str) -> bool {
+        self.inner.outlet_stream_registry.contains_key(handle_id)
     }
 }
 

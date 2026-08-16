@@ -523,7 +523,7 @@ mod streaming_vectors_live {
     /// bridge instance), the shared `bi`, the opened stream `handle_id`, and the
     /// pinned invoker + a stranger DID (for the CRITICAL #1 caller check).
     struct LiveVectorFixture {
-        _scp: Arc<crate::scp::Scp>,
+        scp: Arc<crate::scp::Scp>,
         bi: Arc<UniffiBridgeInstance>,
         handle_id: String,
         invoker: String,
@@ -637,7 +637,7 @@ mod streaming_vectors_live {
         .expect("member invoker opens a live stream");
 
         LiveVectorFixture {
-            _scp: scp,
+            scp,
             bi,
             handle_id,
             invoker,
@@ -792,6 +792,90 @@ mod streaming_vectors_live {
         assert!(
             saw_terminal,
             "the cancelled stream reaches a terminal chunk"
+        );
+    }
+
+    /// §5.4.5 "Signature refusal" step 2: when the operator key refuses a chunk
+    /// AND refuses the terminal `Error` chunk that would have reported that
+    /// refusal, the pump hands its receiver a typed `ChunkSignatureRefused`
+    /// instead of a chunk. `outlet_stream_poll_next_impl` THROWS
+    /// `SCP-OUTLET-6137` for that item and evicts the registry entry. Returning
+    /// the closed sentinel instead would tell an iterating caller the stream
+    /// completed, which is the reading §5.4.5 step 2 exists to prevent.
+    ///
+    /// The refusal is armed on the live stream's receiver rather than produced
+    /// by a failing custody call: no bridge export makes the operator's custody
+    /// backend refuse a chosen signature mid-pump. Everything downstream of the
+    /// item is the production path — the live registry entry, `poll_next`, the
+    /// error it builds, and the eviction it performs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signature_refusal_throws_6137_and_evicts_the_entry() {
+        use scp_core::context::outlets::error_codes::CODE_EXECUTION_SIGNING_REFUSED;
+        use scp_core::context::outlets::{
+            ChunkSignatureRefused, StreamSignerCustodyCategory, StreamSignerError,
+        };
+
+        let handler: OutletHandler = Arc::new(|_input| Ok(serde_json::json!({ "n": 0 })));
+        let fx = open_live_vector_stream("uniffi_vec_signature_refusal", handler).await;
+
+        // The canonicalizer message is derived from the executor's payload, so
+        // this marker must NOT reach the caller's thrown error.
+        let payload_marker = "outlet-payload-fragment-7c3d";
+        assert!(
+            fx.scp.arm_test_stream_signature_refusal(
+                &fx.handle_id,
+                ChunkSignatureRefused {
+                    refused_chunk: StreamSignerError::Custody {
+                        category: StreamSignerCustodyCategory::KeyNotFound,
+                    },
+                    refused_terminal: StreamSignerError::Jcs(format!(
+                        "key must be a string: {payload_marker}"
+                    )),
+                },
+            ),
+            "the live open registered a stream entry to arm"
+        );
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            outlet_stream_poll_next_impl(&fx.bi, &fx.handle_id),
+        )
+        .await
+        .expect("poll_next resolves within 10s (fail fast, don't hang)")
+        .expect_err("a signature refusal throws instead of returning the closed sentinel");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains(CODE_EXECUTION_SIGNING_REFUSED),
+            "the thrown error carries the §5.4.4 signing-refused code: {rendered}"
+        );
+        assert!(
+            rendered.contains(StreamSignerCustodyCategory::KeyNotFound.as_str()),
+            "the message names the custody category the key refused with: {rendered}"
+        );
+        assert!(
+            !rendered.contains(payload_marker),
+            "the canonicalizer's payload-derived text stays out of the message: {rendered}"
+        );
+
+        assert!(
+            !fx.scp.test_stream_entry_present(&fx.handle_id),
+            "the refusal evicted the registry entry, as the terminal and closed \
+             paths do"
+        );
+
+        // The evicted handle now reads as the distinct not-found error the
+        // control plane uses — never `Ok(None)`, which would still look like a
+        // clean close.
+        let after = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            outlet_stream_poll_next_impl(&fx.bi, &fx.handle_id),
+        )
+        .await
+        .expect("poll_next resolves within 10s (fail fast, don't hang)")
+        .expect_err("the evicted handle is a not-found error, not a clean close");
+        assert!(
+            format!("{after}").contains("no active outlet stream"),
+            "the post-refusal poll is the not-found error: {after}"
         );
     }
 }
