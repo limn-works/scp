@@ -829,6 +829,99 @@ mod tests {
         );
     }
 
+    /// The Android adapter's raw-key argument opens a database this adapter wrote.
+    ///
+    /// `AndroidStorage.sqlcipherRawKeyArgument`
+    /// (`bindings/kotlin/scp-kt-android/.../platform/AndroidStorage.kt`) renders a
+    /// 32-byte key as the 67 ASCII bytes `x'<64 hex chars>'` and hands them to
+    /// `sqlite3_key`. This adapter sends the same 67 characters through
+    /// `PRAGMA key = "..."` (see `SqliteStorage::new`). This test writes a value with
+    /// this adapter under a fixed key, then reopens the same file supplying the Android
+    /// adapter's argument for that key, spelled out here as a literal rather than built
+    /// from `hex::encode`, and reads the value back.
+    ///
+    /// `SqlcipherRawKeyArgumentTest` (the Kotlin counterpart, in
+    /// `bindings/kotlin/scp-kt-android/src/test/.../SqlcipherRawKeyArgumentTest.kt`)
+    /// asserts that the Android adapter builds this same literal for this same key. The
+    /// two tests together say that the Android key opens a database this adapter
+    /// created. No unit test runs both halves in one process: the `SQLCipher` library the
+    /// Android adapter links ships Android ABI binaries only, so no host JVM can open an
+    /// encrypted database at all.
+    ///
+    /// Section 17.6 of `.docs/specs/17-persistence-and-storage.md` requires this syntax:
+    /// `SQLCipher` reads an argument of this shape as raw key bytes and reads any other
+    /// argument as a password to PBKDF2-stretch.
+    #[tokio::test]
+    async fn sqlcipher_raw_key_argument_opens_a_database_this_adapter_wrote() {
+        let dir = TempDir::new().unwrap();
+        // The same 32 bytes the Kotlin test uses: 0x00, 0x01, ... 0x1f.
+        let key: [u8; 32] = std::array::from_fn(|i| u8::try_from(i).unwrap());
+        // The same literal the Kotlin test asserts `sqlcipherRawKeyArgument` builds.
+        let android_argument =
+            "x'000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f'";
+
+        let storage = SqliteStorage::new(dir.path(), &key).unwrap();
+        storage.store("cross-adapter", b"payload").await.unwrap();
+        storage.close();
+        drop(storage);
+
+        // Reopen the file the way the Android adapter keys it, applying the same four
+        // cipher pragmas `ScpCipherPragmas` applies in its `postKey` hook.
+        let conn = Connection::open(dir.path().join("scp.db")).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA key = \"{android_argument}\";\n\
+             PRAGMA cipher_page_size = 4096;\n\
+             PRAGMA kdf_iter = 256000;\n\
+             PRAGMA cipher_hmac_algorithm = HMAC_SHA512;\n\
+             PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;"
+        ))
+        .unwrap();
+
+        let value: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM kv WHERE key = ?1",
+                ["cross-adapter"],
+                |row| row.get(0),
+            )
+            .expect("the Android adapter's raw-key argument must open this database");
+        assert_eq!(
+            value, b"payload",
+            "the Android and Rust adapters must derive the same database key from the \
+             same 32 bytes"
+        );
+    }
+
+    /// Dropping the `x'..'` wrapper selects a different database key.
+    ///
+    /// Section 17.6 states that plain-quote syntax "would instead treat the 64 hex
+    /// characters as a passphrase and PBKDF2-stretch them". This test pins that
+    /// consequence: the same 64 hex characters, offered without the wrapper, do not
+    /// open a database keyed with the wrapper. The wrapper is therefore load-bearing
+    /// rather than cosmetic, which is why the Android adapter builds it rather than
+    /// handing `SQLCipher` the derived bytes.
+    #[tokio::test]
+    async fn the_same_hex_without_the_raw_key_wrapper_opens_a_different_database() {
+        let dir = TempDir::new().unwrap();
+        let key: [u8; 32] = std::array::from_fn(|i| u8::try_from(i).unwrap());
+        let hex_digits = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+        let storage = SqliteStorage::new(dir.path(), &key).unwrap();
+        storage.store("cross-adapter", b"payload").await.unwrap();
+        storage.close();
+        drop(storage);
+
+        let conn = Connection::open(dir.path().join("scp.db")).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = '{hex_digits}';"))
+            .ok();
+
+        let result = conn.query_row("SELECT count(*) FROM kv", [], |row| row.get::<_, i64>(0));
+        assert!(
+            result.is_err(),
+            "the hex digits offered as a passphrase must not open a database keyed \
+             with the raw-key argument"
+        );
+    }
+
     #[tokio::test]
     async fn with_passphrase_round_trips_across_reopen() {
         let dir = TempDir::new().unwrap();

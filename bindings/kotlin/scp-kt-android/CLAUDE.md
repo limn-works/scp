@@ -15,7 +15,7 @@ Each platform trait is a Kotlin class that implements a UniFFI-generated callbac
 | `AndroidDeviceAttestation.kt` | `DeviceAttestationProvider` | Play Integrity Standard API | SCP-111 |
 | `AndroidKeyCustody.kt` | `KeyCustodyProvider` | Android Keystore (Ed25519 API 33+, Bouncy Castle fallback) | SCP-110 |
 | `AndroidPushProvider.kt` | `PushProvider` | Firebase Cloud Messaging | SCP-112 |
-| `AndroidStorage.kt` | `StorageProvider` | SQLCipher + TEE-derived AES-256 key | SCP-113 |
+| `AndroidStorage.kt` | `StorageProvider` | SQLCipher + HKDF over a TEE-computed HMAC | SCP-113 |
 | `PlatformAdapter.kt` | Factory | Constructs and injects all four providers | SCP-114 |
 
 ### Lifecycle Integration (`works.limn.scp.android`)
@@ -82,7 +82,23 @@ The Keystore key is an HMAC-SHA-256 key (`KeyProperties.PURPOSE_SIGN` + `setDige
 
 `Hkdf` is shared: `AndroidKeyCustody.derivePseudonymSecret` calls the same object, so the package holds one HKDF implementation.
 
-The Keystore half of this path is invisible to JVM unit tests, which cannot reach the real Android Keystore. `StorageKeyDerivationTest` covers the derivation by calling `AndroidStorage.derivePassphrase` directly; the Keystore key generation and MAC need an instrumented test on a device.
+The Keystore half of this path is invisible to JVM unit tests, which cannot reach the real Android Keystore. `StorageKeyDerivationTest` covers the derivation by calling `AndroidStorage.deriveDatabaseKey` directly; the Keystore key generation and MAC need an instrumented test on a device.
+
+### Hand SQLCipher the key as `x'<64 hex chars>'`, never as the 32 raw bytes
+
+`SQLiteOpenHelper` passes its `byte[]` password straight to `sqlite3_key`. SQLCipher reads that argument as 32 raw key bytes only when it is 67 bytes long, starts `x'`, ends `'`, and holds 64 hex digits between the quotes; it reads every other argument as a password and PBKDF2-stretches it. An earlier revision of `AndroidStorage` passed the 32 derived bytes, so an Android database was keyed with the PBKDF2 output of those bytes and did not open under the key the Apple and Rust adapters derive from the same material. `AndroidStorage.sqlcipherRawKeyArgument` now builds the 67-byte argument, writing hex digits into a `ByteArray` rather than through a `String` so the caller can zero it.
+
+Section 17.6 of `.docs/specs/17-persistence-and-storage.md` states this requirement, and the two sibling adapters send the identical 67 characters through SQL: `crates/scp-platform/src/apple/storage.rs` and `crates/scp-platform/src/sqlite/mod.rs` both execute `PRAGMA key = "x'<hex>'"`.
+
+`ScpCipherPragmas` applies `cipher_page_size`, `kdf_iter`, `cipher_hmac_algorithm`, and `cipher_kdf_algorithm` in its `postKey` hook, matching those two adapters rather than relying on the linked SQLCipher release's defaults.
+
+`openEncryptedDatabase` zeroes the raw-key argument after the open returns. That is sound only because `ScpDatabaseHelper` disables write-ahead logging: without WAL, `SQLiteConnectionPool` caps itself at one connection, which `writableDatabase` has already keyed. Enabling WAL would let the pool key a second connection from the zeroed array.
+
+### No host-JVM test can open a SQLCipher database
+
+`net.zetetic:sqlcipher-android` 4.6.1 ships `jni/arm64-v8a`, `jni/armeabi-v7a`, `jni/x86`, and `jni/x86_64`, and no host-JVM binary, so `System.loadLibrary("sqlcipher")` fails on the host JVM and under Robolectric. `org.xerial:sqlite-jdbc`, which `StorageConformanceTest` uses, carries no cipher codec.
+
+The cross-adapter claim is therefore pinned from both sides against one shared value. `SqlcipherRawKeyArgumentTest` asserts the argument this adapter builds for a fixed 32-byte key, and `sqlcipher_raw_key_argument_opens_a_database_this_adapter_wrote` in `crates/scp-platform/src/sqlite/mod.rs` writes a database with the Rust adapter under that same key and reopens it with that same argument. Change one side and the other must change with it.
 
 ### StorageProvider method names match UniFFI callback interface
 

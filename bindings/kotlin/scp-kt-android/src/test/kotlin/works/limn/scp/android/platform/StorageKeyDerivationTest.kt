@@ -1,6 +1,6 @@
 // StorageKeyDerivationTest.kt — the SQLCipher passphrase derivation (SCP-113)
 //
-// These tests pin AndroidStorage.derivePassphrase to HKDF-SHA-256 with the salt and
+// These tests pin AndroidStorage.deriveDatabaseKey to HKDF-SHA-256 with the salt and
 // info that section 17.6 of .docs/specs/17-persistence-and-storage.md fixes for the
 // SQLCipher key.
 //
@@ -12,7 +12,7 @@
 // second because a fixed-IV GCM ciphertext of a known plaintext changes one output bit
 // per flipped plaintext bit.
 //
-// These tests run on a plain JVM. They call derivePassphrase, which reads only its
+// These tests run on a plain JVM. They call deriveDatabaseKey, which reads only its
 // argument and the constants beside it, so no Android Keystore is required. The Keystore
 // half of getOrCreateStorageKey — generating the HMAC key and computing the TEE MAC —
 // needs an instrumented test on a device.
@@ -37,7 +37,7 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * Tests for [Hkdf] and for [AndroidStorage.derivePassphrase].
+ * Tests for [Hkdf] and for [AndroidStorage.deriveDatabaseKey].
  */
 class StorageKeyDerivationTest {
 
@@ -97,7 +97,7 @@ class StorageKeyDerivationTest {
     }
 
     // -------------------------------------------------------------------
-    // AndroidStorage.derivePassphrase
+    // AndroidStorage.deriveDatabaseKey
     // -------------------------------------------------------------------
 
     @Test
@@ -119,34 +119,34 @@ class StorageKeyDerivationTest {
         okmMac.update(byteArrayOf(0x01))
         val expected = okmMac.doFinal()
 
-        assertArrayEquals(expected, AndroidStorage.derivePassphrase(ikm))
+        assertArrayEquals(expected, AndroidStorage.deriveDatabaseKey(ikm))
     }
 
     @Test
     fun `derivation returns exactly 32 bytes as section 17_6 requires`() {
-        assertEquals(32, AndroidStorage.PASSPHRASE_LENGTH)
-        assertEquals(32, AndroidStorage.derivePassphrase(ByteArray(32) { it.toByte() }).size)
+        assertEquals(32, AndroidStorage.DATABASE_KEY_LENGTH)
+        assertEquals(32, AndroidStorage.deriveDatabaseKey(ByteArray(32) { it.toByte() }).size)
     }
 
     @Test
     fun `derivation returns 32 bytes for an input of any length`() {
-        assertEquals(32, AndroidStorage.derivePassphrase(ByteArray(1)).size)
-        assertEquals(32, AndroidStorage.derivePassphrase(ByteArray(64) { it.toByte() }).size)
+        assertEquals(32, AndroidStorage.deriveDatabaseKey(ByteArray(1)).size)
+        assertEquals(32, AndroidStorage.deriveDatabaseKey(ByteArray(64) { it.toByte() }).size)
     }
 
     @Test
     fun `derivation is deterministic for the same input keying material`() {
         val ikm = ByteArray(32) { (it * 11).toByte() }
         assertArrayEquals(
-            AndroidStorage.derivePassphrase(ikm),
-            AndroidStorage.derivePassphrase(ikm.copyOf()),
+            AndroidStorage.deriveDatabaseKey(ikm),
+            AndroidStorage.deriveDatabaseKey(ikm.copyOf()),
         )
     }
 
     @Test
     fun `distinct input keying material yields distinct passphrases`() {
-        val first = AndroidStorage.derivePassphrase(ByteArray(32) { it.toByte() })
-        val second = AndroidStorage.derivePassphrase(ByteArray(32) { (it + 1).toByte() })
+        val first = AndroidStorage.deriveDatabaseKey(ByteArray(32) { it.toByte() })
+        val second = AndroidStorage.deriveDatabaseKey(ByteArray(32) { (it + 1).toByte() })
         assertFalse(first.contentEquals(second))
     }
 
@@ -158,8 +158,8 @@ class StorageKeyDerivationTest {
         val ikm = ByteArray(32) { (it * 13 + 5).toByte() }
         val flipped = ikm.copyOf().also { it[0] = (it[0].toInt() xor 0x01).toByte() }
 
-        val differingBits = AndroidStorage.derivePassphrase(ikm)
-            .zip(AndroidStorage.derivePassphrase(flipped))
+        val differingBits = AndroidStorage.deriveDatabaseKey(ikm)
+            .zip(AndroidStorage.deriveDatabaseKey(flipped))
             .sumOf { (a, b) -> Integer.bitCount((a.toInt() xor b.toInt()) and 0xFF) }
 
         assertTrue(

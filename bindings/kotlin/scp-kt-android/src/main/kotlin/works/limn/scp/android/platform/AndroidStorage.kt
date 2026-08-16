@@ -4,27 +4,36 @@
 // 32-byte value derived from a TEE-backed HMAC-SHA-256 key in Android Keystore.
 // The Keystore key never leaves the TEE; the TEE computes one HMAC over a fixed
 // label, and HKDF-SHA-256 expands that HMAC output into the 32-byte SQLCipher
-// passphrase. This gives the database a hardware-rooted chain of trust without
+// database key. This gives the database a hardware-rooted chain of trust without
 // requiring SQLCipher itself to understand Android Keystore.
+//
+// SQLCipher receives those 32 bytes through its raw-key syntax `x'<64 hex chars>'`,
+// which section 17.6 of .docs/specs/17-persistence-and-storage.md requires. Handing
+// SQLCipher the 32 raw bytes instead would make SQLCipher read them as a password and
+// PBKDF2-stretch them, so an Android database would then open under different bytes
+// than an Apple or a Rust database derived from the same key.
 //
 // The database file is "scp.db" in the application's noBackupFilesDir directory.
 // This directory is excluded from Android Auto Backup, ensuring that SQLCipher
 // databases protected by TEE-derived keys are not backed up to Google Drive
 // (where the TEE key would not be available to decrypt them).
 // SQLCipher provides transparent full-database encryption — the OS file is
-// unreadable without the derived passphrase.
+// unreadable without the derived database key.
 //
 // Provenance: ADR-027 (Android Platform Adapter), ADR-006 (Platform Abstraction Layer),
 // ADR-025 (Apple Platform Adapter — parallel reference), section 17.6 of
 // .docs/specs/17-persistence-and-storage.md (SQLCipher key derivation — HKDF-SHA-256,
-// 32-byte key, salt SHA-256("SCP-SQLCIPHER-KEY-V1"), info prefix "scp-sqlcipher:").
+// 32-byte key, salt SHA-256("SCP-SQLCIPHER-KEY-V1"), info prefix "scp-sqlcipher:",
+// raw-key syntax x'..', and the four cipher pragmas).
 
 package works.limn.scp.android.platform
 
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import net.zetetic.database.sqlcipher.SQLiteConnection
 import net.zetetic.database.sqlcipher.SQLiteDatabase
+import net.zetetic.database.sqlcipher.SQLiteDatabaseHook
 import net.zetetic.database.sqlcipher.SQLiteOpenHelper
 import java.io.File
 import java.security.GeneralSecurityException
@@ -51,10 +60,36 @@ import javax.crypto.SecretKey
  * 2. The TEE computes `ikm = HMAC-SHA-256(keystore_key, "scp-storage-passphrase")`.
  *    HMAC is deterministic, so the same Keystore key yields the same 32 bytes on every
  *    open. HMAC takes no nonce, so no nonce has to be stored or reused.
- * 3. HKDF-SHA-256 derives the 32-byte SQLCipher passphrase from that `ikm`, under the
+ * 3. HKDF-SHA-256 derives the 32-byte SQLCipher key from that `ikm`, under the
  *    salt and info that section 17.6 of `.docs/specs/17-persistence-and-storage.md`
  *    fixes for the SQLCipher key.
- * 4. SQLCipher uses this 32-byte passphrase for full-database encryption.
+ * 4. [sqlcipherRawKeyArgument] renders those 32 bytes as the ASCII raw-key argument
+ *    `x'<64 hex chars>'`, and [ScpDatabaseHelper] hands that argument to SQLCipher.
+ *    SQLCipher then uses the 32 bytes directly for full-database encryption.
+ *
+ * ## Why the key reaches SQLCipher as `x'..'` rather than as 32 raw bytes
+ *
+ * Section 17.6 requires the raw-key syntax: `derived_key = hex_encode(okm)` is
+ * "passed via raw-key syntax (x'..')", and the SQLCipher-configuration block states
+ * that plain syntax "would instead treat the 64 hex characters as a passphrase and
+ * PBKDF2-stretch them". SQLCipher applies the same rule to the bytes that
+ * `sqlite3_key` receives: a 67-byte argument that starts `x'`, ends `'`, and holds 64
+ * hex characters between them selects raw-key mode; anything else selects PBKDF2.
+ * `SQLiteOpenHelper` passes this class's byte array straight to `sqlite3_key`, so
+ * passing the 32 derived bytes would run PBKDF2 over them and produce a database key
+ * that no other SCP adapter computes.
+ *
+ * The two sibling adapters send the identical argument through SQL instead of through
+ * `sqlite3_key`: `crates/scp-platform/src/apple/storage.rs` and
+ * `crates/scp-platform/src/sqlite/mod.rs` both execute `PRAGMA key = "x'<hex>'"`. The
+ * Rust test `sqlcipher_raw_key_argument_opens_a_database_this_adapter_wrote`, in
+ * `crates/scp-platform/src/sqlite/mod.rs`, opens a database the Rust adapter created
+ * using the byte string this class builds for a fixed key, and `SqlcipherRawKeyArgumentTest`
+ * pins that this class builds that byte string for that key.
+ *
+ * [ScpDatabaseHelper] also applies the four cipher pragmas that section 17.6 lists
+ * beside the key, matching both sibling adapters rather than relying on the
+ * SQLCipher release's built-in defaults.
  *
  * Step 3 is a key derivation, not an encryption. An earlier revision of this file ran
  * AES-GCM over the label under an all-zero IV and truncated the ciphertext to 32 bytes.
@@ -63,24 +98,34 @@ import javax.crypto.SecretKey
  * the primitive that section 17.6 mandates, and it is the primitive
  * [AndroidKeyCustody] already uses for the pseudonym secret; both call [Hkdf].
  *
- * Section 17.6 binds its `info` to a DID. This adapter has no DID: ADR-027 fixes the
- * constructor at `AndroidStorage(context: Context)`, and the database opens before any
- * identity is loaded. The `info` therefore binds the Keystore alias, which names the key
- * this derivation actually roots in, and the TEE key binds the database to the device.
+ * ## The derivation binds a device, not an identity
  *
- * The Keystore key bytes never leave the TEE. The derived passphrase exists in memory
+ * Section 17.6 binds the HKDF input keying material to the `#0` identity key and the
+ * `info` to a DID, so that two identities on one device derive two different database
+ * keys. This adapter does neither: the HMAC input is the constant [DERIVATION_LABEL] and
+ * the `info` is the constant [KEY_ALIAS], so every identity on one device opens one
+ * database under one key. The TEE key still binds that key to the device.
+ *
+ * ADR-027 fixes the constructor at `AndroidStorage(context: Context)`, the database opens
+ * on the first storage call the Rust engine makes, and an identity is created only
+ * afterwards, so this adapter cannot see a DID at open time. Closing that gap changes the
+ * constructor, the `AndroidPlatformAdapter.make` factory, and the point at which an
+ * identity loads relative to the database opening. Story SCP-113 records the criterion as
+ * unmet and names the decision the change waits on.
+ *
+ * The Keystore key bytes never leave the TEE. The derived database key exists in memory
  * only during database open and is not persisted to disk in plaintext.
  *
- * ## Devices holding a passphrase from the AES-GCM revision
+ * ## Devices holding a database key from the AES-GCM revision
  *
  * A device that already ran the AES-GCM revision holds an AES key under
- * [KEY_ALIAS] and a database encrypted under the truncated-ciphertext passphrase.
+ * [KEY_ALIAS] and a database encrypted under the truncated-ciphertext key.
  * That database is unreadable after this change, and SCP is pre-release, so this file
  * ships no migration: `CLAUDE.md` forbids migration code before release.
  * [getOrCreateStorageKey] fails closed on such a device — `Mac.init` rejects an AES key
  * with an `InvalidKeyException`, which surfaces as [ERROR_KEY_DERIVATION_FAILED].
  * Reusing the alias is deliberate: a fresh alias would generate a new HMAC key, derive a
- * working passphrase, and open a new empty database beside the old unreadable one, which
+ * working key, and open a new empty database beside the old unreadable one, which
  * hides the data loss instead of reporting it.
  *
  * ## Thread safety
@@ -109,41 +154,52 @@ class AndroidStorage(private val context: Context) : StorageProvider {
     private fun openEncryptedDatabase(): SQLiteDatabase {
         System.loadLibrary("sqlcipher")
         val encryptionKey = getOrCreateStorageKey()
+        val rawKeyArgument = try {
+            sqlcipherRawKeyArgument(encryptionKey)
+        } finally {
+            // Zero the derived key as soon as the raw-key argument holds it, to limit
+            // the exposure window.
+            encryptionKey.fill(0)
+        }
         try {
-            // The passphrase is passed as byte[] to the SQLiteOpenHelper constructor.
-            // SQLCipher 4.6+ uses the constructor-supplied key for encryption.
-            // The ByteArray source (encryptionKey) is zeroed in the finally block.
-            // The real protection is TEE-backed key derivation — the passphrase is
-            // useless without the Android Keystore key.
+            // SQLiteOpenHelper hands this byte array to sqlite3_key unchanged, and
+            // sqlcipherRawKeyArgument shaped it as x'<64 hex chars>', so SQLCipher reads
+            // it as 32 raw key bytes rather than PBKDF2-stretching it.
             //
             // The database path is computed from noBackupFilesDir so that the
             // encrypted database is excluded from Android Auto Backup. Backed-up
             // databases would be unreadable on a different device because the TEE
-            // key that derived the passphrase is device-bound.
+            // key that derived the database key is device-bound.
             val dbPath = File(context.noBackupFilesDir, DATABASE_NAME).absolutePath
-            val helper = ScpDatabaseHelper(context, dbPath, encryptionKey)
+            val helper = ScpDatabaseHelper(context, dbPath, rawKeyArgument)
             return helper.writableDatabase
         } finally {
             // Zero key material immediately after use to limit exposure window.
-            encryptionKey.fill(0)
+            // SQLiteDatabaseConfiguration keeps a reference to this array and re-reads it
+            // for every connection the pool opens, so zeroing it here is sound only
+            // because ScpDatabaseHelper disables write-ahead logging: without WAL,
+            // SQLiteConnectionPool caps itself at one connection, which writableDatabase
+            // has already opened and keyed. Enabling WAL would let the pool open a second
+            // connection against a zeroed key.
+            rawKeyArgument.fill(0)
         }
     }
 
     /**
      * Retrieves or generates the TEE-backed HMAC-SHA-256 key, then derives the SQLCipher
-     * passphrase from it.
+     * database key from it.
      *
      * The Keystore key is generated on first call and persists in hardware. Subsequent calls
      * retrieve the existing key. HMAC-SHA-256 is deterministic, so a given Keystore key and
      * the fixed [DERIVATION_LABEL] always produce the same input keying material, and
-     * [derivePassphrase] always expands that material to the same 32 bytes.
+     * [deriveDatabaseKey] always expands that material to the same 32 bytes.
      *
      * A device holding the AES key that the earlier AES-GCM revision generated under
      * [KEY_ALIAS] reaches `Mac.init`, which rejects an AES key with an `InvalidKeyException`
      * and therefore fails closed with [ERROR_KEY_DERIVATION_FAILED]. See the class
      * documentation for why this file ships no migration.
      *
-     * @return 32-byte SQLCipher passphrase derived from the TEE key.
+     * @return 32-byte SQLCipher key derived from the TEE key.
      * @throws ScpException with code `SCP-STORAGE-8003` if key derivation fails.
      */
     internal fun getOrCreateStorageKey(): ByteArray {
@@ -170,7 +226,7 @@ class AndroidStorage(private val context: Context) : StorageProvider {
                 .doFinal(DERIVATION_LABEL.toByteArray(Charsets.UTF_8))
 
             try {
-                return derivePassphrase(ikm)
+                return deriveDatabaseKey(ikm)
             } finally {
                 ikm.fill(0) // zeroize the TEE-derived input keying material
             }
@@ -316,7 +372,7 @@ class AndroidStorage(private val context: Context) : StorageProvider {
             prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
         /**
-         * Expands TEE-derived input keying material into the 32-byte SQLCipher passphrase.
+         * Expands TEE-derived input keying material into the 32-byte SQLCipher key.
          *
          * Section 17.6 of `.docs/specs/17-persistence-and-storage.md` fixes this derivation:
          * HKDF-SHA-256 (RFC 5869), salt `SHA-256("SCP-SQLCIPHER-KEY-V1")`, info prefixed
@@ -327,15 +383,54 @@ class AndroidStorage(private val context: Context) : StorageProvider {
          * test can call it without an Android Keystore and pin the derivation to HKDF.
          *
          * @param ikm 32 bytes of input keying material from the TEE.
-         * @return the 32-byte SQLCipher passphrase.
+         * @return the 32-byte SQLCipher key.
          */
-        internal fun derivePassphrase(ikm: ByteArray): ByteArray = Hkdf.sha256(
+        internal fun deriveDatabaseKey(ikm: ByteArray): ByteArray = Hkdf.sha256(
             ikm = ikm,
             salt = MessageDigest.getInstance("SHA-256")
                 .digest(SQLCIPHER_SALT_LABEL.toByteArray(Charsets.UTF_8)),
             info = SQLCIPHER_INFO.toByteArray(Charsets.UTF_8),
-            length = PASSPHRASE_LENGTH,
+            length = DATABASE_KEY_LENGTH,
         )
+
+        /**
+         * Renders a 32-byte SQLCipher key as the ASCII raw-key argument `x'<64 hex>'`.
+         *
+         * Section 17.6 of `.docs/specs/17-persistence-and-storage.md` requires this
+         * syntax: SQLCipher reads an argument of exactly this shape as 32 raw key bytes,
+         * and reads anything else as a password to PBKDF2-stretch. The two sibling
+         * adapters (`crates/scp-platform/src/apple/storage.rs` and
+         * `crates/scp-platform/src/sqlite/mod.rs`) send the same 67 characters to
+         * SQLCipher inside `PRAGMA key = "..."`.
+         *
+         * The hex digits are written straight into a [ByteArray] rather than through a
+         * [String], because [String] holds the key material for as long as the JVM keeps
+         * the object and the caller cannot overwrite it; the caller does overwrite the
+         * returned array.
+         *
+         * @param key the 32-byte SQLCipher key from [deriveDatabaseKey].
+         * @return 67 ASCII bytes: `x`, `'`, 64 lowercase hex digits, `'`.
+         * @throws IllegalArgumentException if [key] is not [DATABASE_KEY_LENGTH] bytes.
+         */
+        internal fun sqlcipherRawKeyArgument(key: ByteArray): ByteArray {
+            require(key.size == DATABASE_KEY_LENGTH) {
+                "SQLCipher raw-key argument needs exactly $DATABASE_KEY_LENGTH key bytes, got ${key.size}"
+            }
+            val argument = ByteArray(RAW_KEY_ARGUMENT_LENGTH)
+            argument[0] = 'x'.code.toByte()
+            argument[1] = '\''.code.toByte()
+            key.forEachIndexed { index, byte ->
+                val value = byte.toInt() and 0xFF
+                argument[2 + index * 2] = hexDigit(value ushr 4)
+                argument[3 + index * 2] = hexDigit(value and 0x0F)
+            }
+            argument[RAW_KEY_ARGUMENT_LENGTH - 1] = '\''.code.toByte()
+            return argument
+        }
+
+        /** Maps a nibble to its lowercase ASCII hex digit. */
+        private fun hexDigit(nibble: Int): Byte =
+            if (nibble < 10) ('0'.code + nibble).toByte() else ('a'.code + nibble - 10).toByte()
 
         /** Android Keystore provider name. */
         private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
@@ -363,16 +458,27 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         internal const val SQLCIPHER_SALT_LABEL = "SCP-SQLCIPHER-KEY-V1"
 
         /**
-         * HKDF info for the SQLCipher passphrase.
+         * HKDF info for the SQLCipher key.
          *
-         * Section 17.6 of the persistence spec writes this as `"scp-sqlcipher:" || did`.
-         * This adapter has no DID at database-open time, so the suffix is [KEY_ALIAS] — the
-         * Keystore key the derivation roots in. See the class documentation.
+         * Section 17.6 of the persistence spec writes this as `"scp-sqlcipher:" || did`,
+         * which binds the database key to one identity. This adapter has no DID at
+         * database-open time, so the suffix is [KEY_ALIAS] — the Keystore key the
+         * derivation roots in — and every identity on the device therefore shares one
+         * database key. See "The derivation binds a device, not an identity" in the class
+         * documentation, and story SCP-113.
          */
         internal const val SQLCIPHER_INFO = "scp-sqlcipher:$KEY_ALIAS"
 
-        /** Length of the derived SQLCipher passphrase in bytes. */
-        internal const val PASSPHRASE_LENGTH = 32
+        /** Length of the derived SQLCipher key in bytes. */
+        internal const val DATABASE_KEY_LENGTH = 32
+
+        /**
+         * Length of the SQLCipher raw-key argument in bytes.
+         *
+         * `x`, `'`, two hex digits per key byte, `'`. SQLCipher selects raw-key mode on
+         * an argument of exactly this length whose characters match that shape.
+         */
+        internal const val RAW_KEY_ARGUMENT_LENGTH = DATABASE_KEY_LENGTH * 2 + 3
 
         /** SQLCipher database file name. */
         internal const val DATABASE_NAME = "scp.db"
@@ -401,6 +507,35 @@ class AndroidStorage(private val context: Context) : StorageProvider {
 }
 
 /**
+ * Applies the four SQLCipher pragmas that section 17.6 of
+ * `.docs/specs/17-persistence-and-storage.md` lists beside the key.
+ *
+ * SQLCipher calls [postKey] after `sqlite3_key` has taken the raw-key argument and
+ * before the connection reads its first page, which is where these pragmas take effect.
+ * The two sibling adapters (`crates/scp-platform/src/apple/storage.rs` and
+ * `crates/scp-platform/src/sqlite/mod.rs`) execute the same four statements in the same
+ * position, immediately after `PRAGMA key`.
+ *
+ * SQLCipher 4 already defaults to these four values, so this object states them rather
+ * than leaving the database's cipher parameters to whichever SQLCipher release the app
+ * links. A release that changed a default would otherwise write a database the Rust and
+ * Apple adapters cannot read.
+ */
+internal class ScpCipherPragmas : SQLiteDatabaseHook {
+
+    override fun preKey(connection: SQLiteConnection) {
+        // The key has not been supplied yet; nothing to configure here.
+    }
+
+    override fun postKey(connection: SQLiteConnection) {
+        connection.execute("PRAGMA cipher_page_size = 4096;", null, null)
+        connection.execute("PRAGMA kdf_iter = 256000;", null, null)
+        connection.execute("PRAGMA cipher_hmac_algorithm = HMAC_SHA512;", null, null)
+        connection.execute("PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;", null, null)
+    }
+}
+
+/**
  * SQLiteOpenHelper for the SCP encrypted key-value database.
  *
  * Creates the `kv` table with `key` as `TEXT PRIMARY KEY` and `value` as `BLOB NOT NULL`,
@@ -410,21 +545,28 @@ class AndroidStorage(private val context: Context) : StorageProvider {
  * The [databasePath] is the full filesystem path to the database file (typically
  * within `noBackupFilesDir`). Passing a full path rather than just a filename
  * overrides SQLiteOpenHelper's default database directory.
+ *
+ * [rawKeyArgument] is the `x'<64 hex chars>'` byte string that
+ * `AndroidStorage.sqlcipherRawKeyArgument` builds. `SQLiteOpenHelper` stores the array
+ * on the connection configuration and passes it to `sqlite3_key` for every connection
+ * the pool opens; write-ahead logging stays disabled below, which caps the pool at one
+ * connection and lets `AndroidStorage.openEncryptedDatabase` zero the array after the
+ * open returns.
  */
 internal class ScpDatabaseHelper(
     context: Context,
     databasePath: String,
-    password: ByteArray,
+    rawKeyArgument: ByteArray,
 ) : SQLiteOpenHelper(
     context,
     databasePath,
-    password,
+    rawKeyArgument,
     null, // cursorFactory
     AndroidStorage.DATABASE_VERSION,
     0, // minimumSupportedVersion
     null, // errorHandler
-    null, // databaseHook
-    false, // enableWriteAheadLogging
+    ScpCipherPragmas(), // databaseHook
+    false, // enableWriteAheadLogging — see the rawKeyArgument note above
 ) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(

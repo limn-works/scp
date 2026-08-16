@@ -31,6 +31,8 @@ Phase 1-5 ADRs
 
 **Status:** Decided
 
+**Amended (2026-08-15) — SQLCipher key derivation is HMAC-into-HKDF, and the key reaches SQLCipher through raw-key syntax:** This ADR originally specified that the Android Keystore key "encrypts a fixed label via AES-GCM to produce a deterministic passphrase for SQLCipher", and its `AndroidStorage.kt` sample encrypted the label `"scp-storage-passphrase"` with AES-GCM under an all-zero initialization vector and truncated the ciphertext to 32 bytes. Under a fixed initialization vector, AES-GCM's keystream depends on the key alone, so that ciphertext was the known label exclusive-ORed with one reusable keystream; an attacker who learns the label learns the keystream, and the truncated ciphertext is therefore not key material. The construction also diverged from section 17.6 of `.docs/specs/17-persistence-and-storage.md`, which fixes the SQLCipher key derivation as HKDF-SHA-256. Separately, the sample handed the derived 32 bytes to SQLCipher as a password, which makes SQLCipher run PBKDF2 over them; section 17.6 requires the raw-key syntax `x'<64 hex chars>'`, and the Apple and Rust adapters use it. Both defects are corrected in the Decision, Rationale, `AndroidStorage.kt` sample, and Implementation checklist below, which now state the shipped design. The AES-GCM derivation and the password-mode key delivery are not permitted alternatives: no Android build may ship either, and no device holding a database from the AES-GCM derivation is migrated, because SCP is pre-release and `CLAUDE.md` forbids migration code before release. `AndroidStorage.getOrCreateStorageKey` fails closed on such a device: it keeps the Keystore alias `scp.storage.key`, and `Mac.init` rejects the AES key the earlier revision left under that alias.
+
 ### Context
 
 SCP's platform adapter layer (ADR-006) abstracts device-specific capabilities behind four traits: `KeyCustody`, `DeviceAttestation`, `Push`, and `Storage`. These traits are exposed as UniFFI callback interfaces (ADR-021), allowing Kotlin implementations to be injected into the Rust engine. The Android adapter implements all four traits using Android's native platform security stack.
@@ -46,7 +48,7 @@ Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-kt-andr
 - **`AndroidKeyCustody.kt`** — `KeyCustodyProvider` implementation using Android Keystore. Ed25519 (`EdDSA`) at API 33+; software Ed25519 fallback (Bouncy Castle) for API 26-32. X25519 wrapping keys always software-managed. TEE-backed by default; StrongBox explicitly opt-out.
 - **`AndroidDeviceAttestation.kt`** — `DeviceAttestationProvider` implementation using Play Integrity Standard API. Standard (server-side, low-latency) preferred over Classic (offline, high-cost) attestation.
 - **`AndroidPushProvider.kt`** — `PushProvider` implementation using Firebase Cloud Messaging. Opaque data-only payload: `{"data": {"scp": "1"}}`. No context ID, sender DID, or message content in any notification payload.
-- **`AndroidStorage.kt`** — `StorageProvider` implementation using SQLCipher. Database encryption key derived from a 32-byte symmetric key stored in Android Keystore (TEE-backed AES-256). Key ID: `scp.storage.key`.
+- **`AndroidStorage.kt`** — `StorageProvider` implementation using SQLCipher. Android Keystore holds a 256-bit HMAC-SHA-256 key (TEE-backed) under the alias `scp.storage.key`. The TEE computes one HMAC over the fixed label `"scp-storage-passphrase"`, HKDF-SHA-256 expands that HMAC output into the 32-byte SQLCipher key under the salt and info that section 17.6 of `.docs/specs/17-persistence-and-storage.md` fixes, and the adapter hands SQLCipher that key through raw-key syntax, `x'<64 hex chars>'`.
 - **`PlatformAdapter.kt`** — `AndroidPlatformAdapter` factory. `AndroidPlatformAdapter.make()` constructs and injects all four providers. Called by the Kotlin SDK's `SCP.create()` when `custody = "platform"`.
 
 **Minimum API level:** API 26 (Android 8.0) for the SDK. API 33 (Android 13) required for hardware-backed Ed25519. Devices on API 26-32 use a software Bouncy Castle Ed25519 key with `CustodyType.Software`.
@@ -64,7 +66,8 @@ Implement the Android platform adapter in Kotlin at `bindings/kotlin/scp-kt-andr
 - **TEE over StrongBox:** StrongBox is present on a fraction of devices and operates orders of magnitude slower than TEE. SCP signs messages during every send operation and during key agreement. StrongBox latency would accumulate visibly in normal usage. The TEE provides hardware isolation with acceptable latency. StrongBox is not offered as an option — "opt-in slowness" is a footgun.
 - **Play Integrity Standard over Classic:** Standard integrity requests return a verdict signed by Google's servers, sufficient for SCP's attestation purpose. Classic attestation (APK certificate chain) requires a dedicated Google Play Developer API call per attestation with stricter rate limits and is designed for offline scenarios SCP does not have. Standard is lower-cost, lower-latency, and simpler.
 - **FCM data-only payload for opacity:** FCM notification payloads visible to the device OS (notification fields) must contain no SCP-meaningful content. A data-only message with `{"scp": "1"}` carries no information except "wake up and pull" — satisfying §10.7. The FCM data payload is not displayed to the user, not logged by the OS notification system, and carries no identifying information.
-- **SQLCipher with TEE-derived key:** SQLCipher provides transparent full-database encryption. The encryption key is a 32-byte AES-256 key generated by Android Keystore (TEE-backed). The Keystore key never leaves the TEE; it encrypts/decrypts the SQLCipher key material via a Keystore-wrapped AES-GCM operation. This gives the database a hardware-rooted chain of trust without requiring SQLCipher itself to understand Android Keystore.
+- **SQLCipher with TEE-derived key:** SQLCipher provides transparent full-database encryption. Android Keystore holds a 256-bit HMAC-SHA-256 key inside the TEE, and the key bytes never leave it. The TEE computes one HMAC over a fixed label, which gives the derivation a hardware-rooted chain of trust without requiring SQLCipher itself to understand Android Keystore. HKDF-SHA-256 then expands that HMAC output into the 32-byte SQLCipher key, because section 17.6 of `.docs/specs/17-persistence-and-storage.md` fixes HKDF-SHA-256 as the derivation for that key and `AndroidKeyCustody` already runs the same primitive for the pseudonym secret. The Keystore key is a signing-purpose key rather than a cipher key: HMAC is deterministic and takes no nonce, so the same Keystore key yields the same 32 bytes on every open with nothing stored beside the database, and Android Keystore's randomized-encryption requirement — which applies to cipher keys and which a fixed initialization vector would have to defeat — does not arise.
+- **The key reaches SQLCipher as raw key material, not as a password:** the adapter renders the 32 derived bytes as `x'<64 hex chars>'` and hands those 67 ASCII bytes to SQLCipher. SQLCipher reads an argument of that shape as 32 raw key bytes and reads any other argument as a password to PBKDF2-stretch. Section 17.6 requires the raw-key syntax, and the Apple adapter (`crates/scp-platform/src/apple/storage.rs`) and the Rust SQLite adapter (`crates/scp-platform/src/sqlite/mod.rs`) both send the same 67 characters through `PRAGMA key`. Passing the derived bytes as a password would key an Android database with the PBKDF2 output of those bytes, so a database written on Android would not open under the key an Apple or Rust adapter derives from the same material.
 - **Private keys never cross the FFI boundary:** All Ed25519 signing and X25519 DH operations happen inside `AndroidKeyCustody.kt`. The Rust engine calls the UniFFI callback interface methods with data to sign and receives signatures back. Raw private key bytes stay inside the Kotlin adapter, inside the Android Keystore TEE.
 - **Kotlin over Rust for Android platform code:** Android Keystore, Play Integrity, and FCM are Java/Kotlin APIs with no Rust bindings. Writing thin Kotlin adapters that call these APIs and satisfy the UniFFI callback interfaces is the correct approach — it uses the idiomatic Android API surface without maintaining a JNI bridge to Rust Android Keystore bindings.
 
@@ -77,7 +80,7 @@ bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/
   AndroidKeyCustody.kt        — KeyCustodyProvider: Android Keystore Ed25519, software fallback
   AndroidDeviceAttestation.kt — DeviceAttestationProvider: Play Integrity Standard API
   AndroidPushProvider.kt      — PushProvider: FCM registration, opaque data payload
-  AndroidStorage.kt           — StorageProvider: SQLCipher + TEE-derived AES-256 key
+  AndroidStorage.kt           — StorageProvider: SQLCipher + HKDF over a TEE-computed HMAC
   PlatformAdapter.kt          — AndroidPlatformAdapter.make() factory, injects all four
 ```
 
@@ -276,21 +279,30 @@ class AndroidPushProvider(private val context: Context) : PushProvider {
 // No "notification" key. No content visible to Android notification shade.
 ```
 
-**`AndroidStorage.kt` — SQLCipher with TEE-derived key:**
+**`AndroidStorage.kt` — SQLCipher keyed by HKDF over a TEE-computed HMAC:**
 
 ```kotlin
 class AndroidStorage(private val context: Context) : StorageProvider {
 
-    private val db: SupportSQLiteDatabase by lazy { openEncryptedDatabase() }
+    private val db: SQLiteDatabase by lazy { openEncryptedDatabase() }
 
-    private fun openEncryptedDatabase(): SupportSQLiteDatabase {
-        val encryptionKey = getOrCreateStorageKey()
-        val factory = SupportFactory(encryptionKey)
-        return Room.databaseBuilder(context, ScpDatabase::class.java, "scp.db")
-            .openHelperFactory(factory)
-            .build()
-            .openHelper
-            .writableDatabase
+    private fun openEncryptedDatabase(): SQLiteDatabase {
+        System.loadLibrary("sqlcipher")
+        val databaseKey = getOrCreateStorageKey()
+        val rawKeyArgument = try {
+            sqlcipherRawKeyArgument(databaseKey)
+        } finally {
+            databaseKey.fill(0)
+        }
+        try {
+            // noBackupFilesDir keeps the database out of Android Auto Backup: the TEE key
+            // that derived this database key is device-bound, so a restored copy would be
+            // unreadable on the target device.
+            val dbPath = File(context.noBackupFilesDir, "scp.db").absolutePath
+            return ScpDatabaseHelper(context, dbPath, rawKeyArgument).writableDatabase
+        } finally {
+            rawKeyArgument.fill(0)
+        }
     }
 
     private fun getOrCreateStorageKey(): ByteArray {
@@ -298,29 +310,44 @@ class AndroidStorage(private val context: Context) : StorageProvider {
         val keyAlias = "scp.storage.key"
 
         if (!keyStore.containsAlias(keyAlias)) {
-            val keySpec = KeyGenParameterSpec.Builder(
-                keyAlias,
-                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-            )
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            val keySpec = KeyGenParameterSpec.Builder(keyAlias, KeyProperties.PURPOSE_SIGN)
+                .setDigests(KeyProperties.DIGEST_SHA256)
                 .setKeySize(256)
                 .setUserAuthenticationRequired(false)  // background access required
                 .build()
-            KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+            KeyGenerator.getInstance("HmacSHA256", "AndroidKeyStore")
                 .apply { init(keySpec) }
                 .generateKey()
         }
 
-        // Derive a 32-byte SQLCipher passphrase by encrypting a fixed label with the Keystore key.
-        // The actual key bytes never leave the TEE — this pattern uses AES-GCM with a deterministic
-        // IV to produce a stable 32-byte value for the SQLCipher passphrase.
+        // The TEE computes one HMAC over the fixed label. The Keystore key bytes never leave
+        // the TEE, and HMAC takes no nonce, so nothing has to be stored beside the database to
+        // reproduce this value on the next open.
         val secretKey = keyStore.getKey(keyAlias, null) as SecretKey
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
-            init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(128, ByteArray(12)))  // fixed IV for determinism
+        val ikm = Mac.getInstance("HmacSHA256")
+            .apply { init(secretKey) }
+            .doFinal("scp-storage-passphrase".toByteArray(Charsets.UTF_8))
+
+        // HKDF-SHA-256 under the salt and info that section 17.6 of
+        // .docs/specs/17-persistence-and-storage.md fixes for the SQLCipher key.
+        try {
+            return Hkdf.sha256(
+                ikm = ikm,
+                salt = MessageDigest.getInstance("SHA-256")
+                    .digest("SCP-SQLCIPHER-KEY-V1".toByteArray(Charsets.UTF_8)),
+                info = "scp-sqlcipher:$keyAlias".toByteArray(Charsets.UTF_8),
+                length = 32,
+            )
+        } finally {
+            ikm.fill(0)
         }
-        return cipher.doFinal("scp-storage-passphrase".toByteArray(Charsets.UTF_8)).take(32).toByteArray()
     }
+
+    // Renders the 32-byte key as the raw-key argument x'<64 hex chars>'. SQLCipher reads an
+    // argument of this shape as raw key bytes; it reads any other argument as a password and
+    // PBKDF2-stretches it, which would key an Android database differently from an Apple or
+    // Rust database derived from the same 32 bytes.
+    private fun sqlcipherRawKeyArgument(key: ByteArray): ByteArray { /* 67 ASCII bytes */ }
 
     override fun store(key: String, data: ByteArray) {
         db.execSQL("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", arrayOf(key, data))
@@ -462,8 +489,9 @@ dependencies {
     - No context ID, sender DID, or message content is present in or extracted from the payload.
 
 11. **`AndroidStorage.store(key, data)` / `retrieve(key)` / `delete(key)` / `listKeys(prefix)` / `deletePrefix(prefix)` / `exists(key)`:**
-    - All operations on SQLCipher database encrypted with a TEE-derived 32-byte AES-256 key.
-    - Storage key is generated in `AndroidKeyStore` under alias `scp.storage.key` with AES-256-GCM, TEE-backed, no user authentication required.
+    - All operations on a SQLCipher database encrypted with the 32-byte key that HKDF-SHA-256 derives from a TEE-computed HMAC.
+    - Storage key is generated in `AndroidKeyStore` under alias `scp.storage.key` as a 256-bit HMAC-SHA-256 signing key, TEE-backed, no user authentication required. The alias is never changed, so a device carrying the AES key that the pre-amendment AES-GCM derivation generated fails closed at `Mac.init` rather than opening a fresh empty database beside the unreadable old one.
+    - The derived key reaches SQLCipher as `x'<64 hex chars>'`, SQLCipher's raw-key syntax, and the connection applies `cipher_page_size = 4096`, `kdf_iter = 256000`, `cipher_hmac_algorithm = HMAC_SHA512`, and `cipher_kdf_algorithm = PBKDF2_HMAC_SHA512`, matching the Apple and Rust adapters.
     - `listKeys(prefix)` returns keys in lexicographic order (required for KeyPackage buffer management and event log range queries).
     - `deletePrefix(prefix)` returns count of deleted keys.
 
@@ -478,6 +506,7 @@ dependencies {
     - Software fallback tests run on API 26-32 emulator — verify `CustodyType.SOFTWARE` reported, valid signatures produced.
     - FCM tests use Firebase Test Lab or mock `FirebaseMessaging` via dependency injection.
     - SQLCipher tests verify database is not readable without the Keystore-derived key (open raw SQLite file, confirm unreadable).
+    - Two host-JVM test classes pin the derivation without an Android Keystore: `StorageKeyDerivationTest` calls `AndroidStorage.deriveDatabaseKey` and checks it against an independent HKDF-SHA-256 computation, and `SqlcipherRawKeyArgumentTest` pins the 67 ASCII bytes `AndroidStorage.sqlcipherRawKeyArgument` builds for a fixed key. `sqlcipher_raw_key_argument_opens_a_database_this_adapter_wrote` in `crates/scp-platform/src/sqlite/mod.rs` writes a database with the Rust adapter under that same key and reopens it with those same bytes, which is what ties the two adapters together. No host-JVM test opens an encrypted database, because `net.zetetic:sqlcipher-android` ships Android ABI binaries only; the Keystore key generation and the TEE MAC need an instrumented test on a device.
 
 14. **Private key isolation:**
     - No Ed25519 private key bytes appear in logs, crash reports, or cross the UniFFI FFI boundary.

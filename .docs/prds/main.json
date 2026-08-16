@@ -6334,23 +6334,31 @@
       "gate": "gate-6",
       "priority": "P2",
       "severity": "major",
-      "status": "done",
+      "status": "in-progress",
       "files": [
-        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidStorage.kt"
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/AndroidStorage.kt",
+        "bindings/kotlin/scp-kt-android/src/main/kotlin/works/limn/scp/android/platform/Hkdf.kt",
+        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/StorageKeyDerivationTest.kt",
+        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/SqlcipherRawKeyArgumentTest.kt",
+        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/AndroidStorageTest.kt",
+        "bindings/kotlin/scp-kt-android/src/test/kotlin/works/limn/scp/android/platform/StorageConformanceTest.kt"
       ],
-      "description": "Implement the Storage platform trait for Android with TEE-backed key derivation for SQLCipher database encryption. The database encryption key must be derived using TEE-backed key derivation, not stored in plaintext. Mirrors ADR-025 Apple adapter storage structure.",
+      "description": "Implement the Storage platform trait for Android over SQLCipher, per section 17.6 of .docs/specs/17-persistence-and-storage.md and ADR-027. Android Keystore holds a TEE-backed HMAC-SHA-256 key; the TEE MACs a label, HKDF-SHA-256 expands that MAC output into the 32-byte SQLCipher key, and the adapter hands SQLCipher that key through raw-key syntax. Mirrors the ADR-025 Apple adapter storage structure. The identity binding section 17.6 requires for the HKDF input and info is the open part of this story and is a decision awaiting the maintainer, tracked in issue 2336.",
       "acceptanceCriteria": [
         "Storage trait implemented for Android matching ADR-025 trait signatures",
-        "SQLCipher database encryption key derived via TEE-backed key derivation",
+        "SQLCipher database encryption key derived via HKDF-SHA-256 over input keying material that a TEE-backed Android Keystore key produces, under salt SHA-256(\"SCP-SQLCIPHER-KEY-V1\") and info prefixed \"scp-sqlcipher:\"",
         "Database encryption key never stored in plaintext on device",
         "Storage operations integrate with Android Keystore for key material",
+        "The derived key reaches SQLCipher through raw-key syntax x'<64 hex chars>', and a test pins the exact bytes against the byte string that opens a database the Rust SqliteStorage adapter wrote",
+        "The HKDF input keying material is the #0 identity key and the HKDF info is \"scp-sqlcipher:\" || did, so two identities on one device derive two different database keys",
         "Unit tests verify encrypted storage round-trip"
       ],
       "actionItems": [
         "Define Android-specific Storage implementation struct",
-        "Implement TEE-backed key derivation for SQLCipher encryption key",
-        "Wire key derivation into SQLCipher database initialization",
+        "Implement HKDF-SHA-256 key derivation over a TEE-computed HMAC for the SQLCipher key",
+        "Wire key derivation into SQLCipher database initialization through raw-key syntax",
         "Ensure encryption key lifecycle follows Android Keystore best practices",
+        "Bind the derivation to the loading identity's DID once issue 2336 is decided",
         "Test storage operations on physical Android device"
       ],
       "blockedBy": [
@@ -6360,24 +6368,36 @@
         "SCP-105",
         "SCP-211"
       ],
+      "blockedByIssues": [
+        2336,
+        2337
+      ],
       "sources": [
         {
           "file": ".docs/adrs/phase-6.md",
           "section": "## ADR-027: Android Platform Adapter"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.6 First-Party Storage Adapters (Client SDK)"
         }
       ],
       "details": {
-        "stubADR": true,
-        "note": "ADR not yet fully written — story derived from expected approach and known constraints",
-        "expectedDecisions": {
-          "sqlCipherKeyDerivation": "TEE-backed key derivation for database encryption key"
-        },
         "references": [
           "§17.8 — Android Keystore",
           "ADR-025 — Apple adapter as parallel reference"
-        ]
+        ],
+        "criteriaStatus": {
+          "Storage trait implemented for Android matching ADR-025 trait signatures": "met",
+          "SQLCipher database encryption key derived via HKDF-SHA-256 over input keying material that a TEE-backed Android Keystore key produces, under salt SHA-256(\"SCP-SQLCIPHER-KEY-V1\") and info prefixed \"scp-sqlcipher:\"": "met — StorageKeyDerivationTest checks AndroidStorage.deriveDatabaseKey against an independent HKDF-SHA-256 computation",
+          "Database encryption key never stored in plaintext on device": "met — the key is re-derived on every open and the holding array is zeroed after the open returns",
+          "Storage operations integrate with Android Keystore for key material": "met",
+          "The derived key reaches SQLCipher through raw-key syntax x'<64 hex chars>', and a test pins the exact bytes against the byte string that opens a database the Rust SqliteStorage adapter wrote": "met — SqlcipherRawKeyArgumentTest pins the bytes, and sqlcipher_raw_key_argument_opens_a_database_this_adapter_wrote in crates/scp-platform/src/sqlite/mod.rs opens a Rust-written database with them",
+          "The HKDF input keying material is the #0 identity key and the HKDF info is \"scp-sqlcipher:\" || did, so two identities on one device derive two different database keys": "NOT met — the HMAC input is the constant label \"scp-storage-passphrase\" and the HKDF info is the constant Keystore alias, so every identity on a device derives one key. Issue 2336 records the analysis and awaits a maintainer decision.",
+          "Unit tests verify encrypted storage round-trip": "NOT met — the round-trip tests in AndroidStorageTest exercise InMemoryStorageProvider rather than an encrypted database, and the module's test tasks never call useJUnitPlatform(), so that JUnit 5 class does not execute at all. Issue 2337 records both."
+        }
       },
-      "result": "AndroidStorage.kt implemented with TEE-backed AES-256 key derivation via Android Keystore. InMemoryStorageProvider for testing. 548-line test suite. Commit 775403b."
+      "result": "AndroidStorage.kt implements the Storage trait over SQLCipher. The original commit 775403b derived the key by encrypting a fixed label with AES-GCM under an all-zero initialization vector and truncating the ciphertext to 32 bytes, and passed the result to SQLCipher as a password; the 2026-08-15 amendment to ADR-027 records both defects. The derivation is now HKDF-SHA-256 over a TEE-computed HMAC, and the key reaches SQLCipher through raw-key syntax. Five of seven acceptance criteria are met; see details.criteriaStatus."
     },
     {
       "id": "SCP-114",

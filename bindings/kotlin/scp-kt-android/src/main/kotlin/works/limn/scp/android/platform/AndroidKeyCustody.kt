@@ -496,7 +496,7 @@ class AndroidKeyCustody internal constructor(
         val privateKeyBytes = privateParams.encoded
         // Hkdf.sha256 matches the Rust `hkdf::Hkdf::<Sha256>` used in
         // `scp-crypto/src/pseudonym.rs::derive_pseudonym_secret`. AndroidStorage
-        // calls the same object to derive the SQLCipher passphrase.
+        // calls the same object to derive the SQLCipher database key.
         val secret = Hkdf.sha256(privateKeyBytes, salt, ByteArray(0), Hkdf.SHA256_OUTPUT_BYTES)
         privateKeyBytes.fill(0) // zeroize private key material
         return secret

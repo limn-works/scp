@@ -1,7 +1,7 @@
 // Hkdf.kt — HKDF-SHA-256 (RFC 5869) for the Android platform adapters
 //
 // AndroidKeyCustody derives the pseudonym secret with HKDF-SHA-256, and
-// AndroidStorage derives the SQLCipher passphrase with HKDF-SHA-256. Both call
+// AndroidStorage derives the SQLCipher database key with HKDF-SHA-256. Both call
 // this object, so the package holds one implementation of the derivation rather
 // than two.
 //
