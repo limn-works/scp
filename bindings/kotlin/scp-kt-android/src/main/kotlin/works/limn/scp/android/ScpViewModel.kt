@@ -8,6 +8,7 @@
 
 package works.limn.scp.android
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import works.limn.scp.bridge.CoroutineBridge
 import kotlinx.coroutines.CancellationException
@@ -161,8 +162,50 @@ abstract class ScpViewModel @JvmOverloads constructor(
         cleanupScope.launch {
             for (ctx in contexts) {
                 runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
-                    .onFailure { failure -> if (failure is CancellationException) throw failure }
+                    .onFailure { failure ->
+                        if (failure is CancellationException) throw failure
+                        onCleanupFailure(ctx, failure)
+                    }
             }
         }
+    }
+
+    /**
+     * Called once per context whose `leave` threw anything other than
+     * [CancellationException].
+     *
+     * A `leave` reaches a runtime that rejects it deliberately, so an SDK that drops such a
+     * rejection tells an app author nothing: `SCP-CTX-2015`, a `PermissionDenied`, and a
+     * fail-closed persist error all reach this point. Override to fail closed, to retry, or
+     * to tell a user that a departure did not land.
+     *
+     * A default body logs at warning level, which is what `.docs/standards/sdk-common.md`
+     * §Cleanup error handling requires: "Errors during cleanup are logged but never
+     * propagated as exceptions — callers must not be penalized for disposing resources."
+     * That standard is why this method returns [Unit] rather than rethrowing, and why
+     * [onCleared] keeps calling `leave` on remaining contexts after one fails.
+     *
+     * Runs on `cleanupDispatcher`, inside a cleanup coroutine, after [onCleared] has already
+     * returned. It must not block that thread, for a reason
+     * `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` states.
+     *
+     * A throw from an override propagates into that cleanup coroutine and stops `leave` calls
+     * for every context after this one, so an override that wants remaining calls attempted
+     * catches its own errors.
+     *
+     * @param context Tracked context whose `leave` failed.
+     * @param cause Throwable that `leave` threw, never a [CancellationException].
+     */
+    protected open fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        Log.w(
+            TAG,
+            "SCP context leave failed during ViewModel cleanup " +
+                "(contextHandle=${context.handle}, identityHandle=${context.identityHandle})",
+            cause,
+        )
+    }
+
+    private companion object {
+        private const val TAG = "ScpViewModel"
     }
 }

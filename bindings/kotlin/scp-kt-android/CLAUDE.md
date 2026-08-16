@@ -140,7 +140,10 @@ abstract class ScpViewModel @JvmOverloads constructor(
         cleanupScope.launch {
             for (ctx in contexts) {
                 runCatching { ctx.bridge.context.leave(ctx.handle, ctx.identityHandle) }
-                    .onFailure { failure -> if (failure is CancellationException) throw failure }
+                    .onFailure { failure ->
+                        if (failure is CancellationException) throw failure
+                        onCleanupFailure(ctx, failure)
+                    }
             }
         }
     }
@@ -152,6 +155,16 @@ abstract class ScpViewModel @JvmOverloads constructor(
 Do not cancel `cleanupScope` after that launch. An earlier revision called `cleanupJob.invokeOnCompletion { cleanupScope.cancel() }`. A `SupervisorJob` whose children have all completed holds no thread, no handle, and no memory to release, and `cleanupDispatcher` belongs to whoever constructed that ViewModel, so that cancellation frees nothing. It does turn every later `cleanupScope.launch` into a silent no-op, which drops `leave` for any context that `trackContext` registers after a first `onCleared` call. `ScpViewModelTest.a context tracked after onCleared is still left by a later onCleared` fails if that cancellation returns.
 
 A Java subclass calls `super()`, so this class keeps a zero-argument JVM constructor. Kotlin emits one because every primary-constructor parameter carries a default; `@JvmOverloads` emits one overload per defaulted parameter. At one parameter `javap` reports an identical constructor set under either rule, so `@JvmOverloads` earns its place only from a second defaulted parameter onward. Adding a parameter without a default removes that zero-argument constructor under both rules, which is why `ScpViewModelTest.ScpViewModel exposes a zero-argument constructor to Java callers` asserts it by reflection.
+
+### Every `leave` failure reaches `onCleanupFailure`
+
+`onCleared()`'s cleanup coroutine calls `protected open fun onCleanupFailure(context: TrackedContext, cause: Throwable)` once per context whose `leave` threw anything other than `CancellationException`. An earlier revision swallowed all of them, so an app author learned nothing when a departure did not land — `SCP-CTX-2015`, a `PermissionDenied`, and a fail-closed persist error are all reachable there, and a runtime raises each deliberately.
+
+A default body logs at warning level through `android.util.Log`, which is what `.docs/standards/sdk-common.md` §Cleanup error handling requires: "Errors during cleanup are logged but never propagated as exceptions — callers must not be penalized for disposing resources." That standard is why this hook returns `Unit` rather than rethrowing, and why remaining departures continue after one fails.
+
+A `CancellationException` never reaches that hook; it propagates, because it reports that this cleanup coroutine was cancelled and a coroutine must never swallow its own cancellation. `ScpViewModelTest.onCleanupFailure receives every leave failure` and `ScpViewModelTest.onCleanupFailure never receives a cancellation` assert both halves.
+
+An override runs on `cleanupDispatcher` after `onCleared()` has already returned, so it must not block that thread. A throw from an override stops `leave` calls for every context after that one.
 
 Tests pass their own `TestDispatcher` as `cleanupDispatcher`, so `advanceUntilIdle()` runs the cleanup coroutine and every `leave` it makes. `ScpViewModelTest` carries a class-level `@Timeout(30s, SEPARATE_THREAD)` so a reintroduced block fails the build rather than hanging the runner.
 

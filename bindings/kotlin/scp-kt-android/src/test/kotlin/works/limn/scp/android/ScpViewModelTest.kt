@@ -90,6 +90,61 @@ class ScpViewModelTest {
         assertTrue(stubBindings.leaveCalledHandles.contains(2L))
     }
 
+    // `.docs/standards/sdk-common.md` §Cleanup error handling requires that a cleanup error be
+    // logged rather than dropped. An earlier revision swallowed every throwable except
+    // CancellationException, so an app author learned nothing when a departure did not land.
+    @Test
+    fun `onCleanupFailure receives every leave failure`() = runTest(testDispatcher) {
+        stubBindings.leaveThrowsForHandle = 1L
+
+        val viewModel = TestScpViewModel(testDispatcher)
+        val ctx1 = TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge)
+        val ctx2 = TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge)
+        viewModel.trackContext(ctx1)
+        viewModel.trackContext(ctx2)
+        advanceUntilIdle()
+
+        viewModel.callOnCleared()
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(ctx1),
+            viewModel.cleanupFailures.map { it.first },
+            "a failing leave must reach onCleanupFailure exactly once, naming its context",
+        )
+        assertTrue(
+            viewModel.cleanupFailures.single().second is ScpLeaveException,
+            "onCleanupFailure must receive whatever leave threw, not a wrapper",
+        )
+        // A reported failure does not stop remaining departures.
+        assertEquals(listOf(1L, 2L), stubBindings.leaveCalledHandles)
+    }
+
+    // A CancellationException reports that this cleanup coroutine was cancelled. Reporting it
+    // through onCleanupFailure would invite an override to swallow its own cancellation.
+    @Test
+    fun `onCleanupFailure never receives a cancellation`() = runTest(testDispatcher) {
+        stubBindings.leaveCancelsForHandle = 1L
+
+        val viewModel = TestScpViewModel(testDispatcher)
+        viewModel.trackContext(TrackedContext(handle = 1L, identityHandle = 1L, bridge = bridge))
+        viewModel.trackContext(TrackedContext(handle = 2L, identityHandle = 2L, bridge = bridge))
+        advanceUntilIdle()
+
+        viewModel.callOnCleared()
+        advanceUntilIdle()
+
+        assertTrue(
+            viewModel.cleanupFailures.isEmpty(),
+            "a cancellation must propagate, never reach onCleanupFailure",
+        )
+        assertEquals(
+            listOf(1L),
+            stubBindings.leaveCalledHandles,
+            "a cancelled cleanup coroutine stops before a second leave",
+        )
+    }
+
     @Test
     fun `untrackContext prevents leave on cleared`() = runTest(testDispatcher) {
         val viewModel = TestScpViewModel(testDispatcher)
@@ -220,6 +275,13 @@ class ScpViewModelTest {
 private class TestScpViewModel(
     cleanupDispatcher: CoroutineDispatcher,
 ) : ScpViewModel(cleanupDispatcher) {
+    /** Every (context, cause) pair that [onCleanupFailure] received, in call order. */
+    val cleanupFailures = mutableListOf<Pair<TrackedContext, Throwable>>()
+
+    override fun onCleanupFailure(context: TrackedContext, cause: Throwable) {
+        cleanupFailures += context to cause
+    }
+
     fun callOnCleared() {
         onCleared()
     }
@@ -233,8 +295,14 @@ private class TestNativeBindings : NativeBindings {
     val leaveCalledHandles = mutableListOf<Long>()
     var leaveThrowsForHandle: Long? = null
 
+    /** Handle whose leave raises a cancellation, standing in for a cancelled cleanup coroutine. */
+    var leaveCancelsForHandle: Long? = null
+
     override fun contextLeave(contextHandle: Long, identityHandle: Long) {
         leaveCalledHandles.add(contextHandle)
+        if (contextHandle == leaveCancelsForHandle) {
+            throw kotlinx.coroutines.CancellationException("cleanup cancelled at handle $contextHandle")
+        }
         if (contextHandle == leaveThrowsForHandle) {
             throw ScpLeaveException("leave failed for handle $contextHandle")
         }
