@@ -41,6 +41,10 @@ PROTECTED_REPO_RELATIVE_PATHS=(
     "scripts/pure-helpers-allowlist.txt"
     "scripts/check-capability-nullifiers.sh"
     "crates/scp-testing/tests/integration/capability_nullifiers.rs"
+    "scripts/check-capability-impl-inventory.sh"
+    "crates/scp-testing/tests/integration/capability_impl_inventory.rs"
+    "ratchet/capability-impl-inventory.json"
+    "scripts/check-shipped-feature-graph.sh"
     "scripts/check-construction-pattern.py"
     "scripts/hooks/pretooluse-enforcement-files.sh"
 )

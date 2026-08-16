@@ -1,0 +1,680 @@
+{
+  "_comment": "Identity ratchet over every `impl` of the seven production-capability traits that spec .docs/specs/17-persistence-and-storage.md §17.17.2 enumerates, over the trait registry those capabilities resolve to, and over the three lists scripts/check-shipped-feature-graph.sh evaluates. The gate is crates/scp-testing/tests/integration/capability_impl_inventory.rs, run by scripts/check-capability-impl-inventory.sh. It FAILS on any difference between the workspace scan and this file: an impl added, an impl removed, a gating that flipped, a change to the registered trait names, or an entry added to or removed from any of the three gate lists. Enforcement is on IDENTITY, never on a total count. A ratchet that recorded how many impls exist is defeated by deleting one implementation and adding another in the same commit, which is the swap this ratchet exists to catch — the same reasoning that moved ratchet/block-in-place-count.json from per-crate aggregates to per-file entries.",
+  "_updated": "2026-08-15 (ADR-062 §Decision 6 G1 step 4 — first freeze). 73 records covering 74 impls: 49 production records, 24 `testing`-gated. 18 registered trait names. Gate lists: artifacts 5, nullifier_control_features 8, permitted_allowlist 36.",
+  "_context": "Three mechanisms guard SCP-CAPSEL-8012, and each keys on a different property. capability_nullifiers.rs keys on the SHAPE of a method body, so a fake that reads a parameter and discards the value evades it. The failure-path tests key on BEHAVIOUR, so they catch a production arm rewritten in place from real to fake. Neither notices a new, plausible-looking fake ADDED alongside the real implementations. This baseline keys on an implementation EXISTING, which a convincing fake cannot evade. The gate reads its trait scope out of the `CAPABILITY_TRAITS` const in crates/scp-testing/tests/integration/capability_nullifiers.rs rather than restating it, so the two mechanisms cannot disagree about which traits are in scope.",
+  "_field_meanings": {
+    "file": "the workspace-relative path of the file that holds the `impl Trait for Type` item",
+    "capability": "the §17.17.2 provider capability the trait expresses, read from `CAPABILITY_TRAITS`",
+    "trait": "the final path segment of the implemented trait",
+    "type": "the implementing type, with every path normalised to its final segment and its generic arguments kept, so a blanket `impl … for Arc<T>` is a different record from `impl … for SqliteStorage` while a `use` statement that shortens a path is not a change",
+    "gating": "`production` or `testing-gated`. `testing-gated` means no build with `test` off and the `testing` feature off can compile this impl, decided by asking whether ANY assignment of the predicate's other atoms makes it true. Sampling one assignment instead mislabels `#[cfg(not(target_arch = \"wasm32\"))]` as gated, and cargo compiles that impl into every build that is not wasm.",
+    "impl_count": "how many impls carry this record. Two impls that agree in every field above are two impls; collapsing them would let a commit delete one without moving the inventory. This multiplicity counts identical copies of ONE identity — it is not the total cardinality the ratchet refuses to key on."
+  },
+  "_no_reachability_field": "No field records whether production code constructs the implementing type. `gating` already answers whether a production build compiles the impl at all, and the compiler decides that. The narrower question has no sound source-side answer: .docs/lessons/ast-gate-checks-definition-not-name-resolution.md states that a source-text gate 'may only assert structural facts about a type's definition', and that verifying a use-site property 'is reimplementing the compiler's name resolution in an AST walker, which is an unbounded arms race and must not be attempted.' An earlier draft carried a `constructed_in_production` boolean; because it matched bare head identifiers, the two distinct `InMemoryRelayQuerier` types shared one flag, and the blanket `Arc<T>` impls read `true` because something in the workspace calls `Arc::new`.",
+  "_how_to_update": "A human reads each difference the gate reports, decides whether the implementation belongs on a production path, and then records that decision here. `scripts/check-capability-impl-inventory.sh --print` prints the workspace's current inventory as the three members below, so the update is a diff a reviewer reads rather than a hundred records transcribed by hand. Printing is not approving: pasting the print output without reading the diff is the bypass this ratchet exists to prevent.",
+  "_gate_lists": "`shipped_feature_graph_lists` freezes what scripts/check-shipped-feature-graph.sh EVALUATES, read from its `--dump-lists` output rather than scraped from its source text. bash and a text reader disagree about what those arrays hold — a `cat` heredoc ends at its terminator while the surrounding command substitution keeps running, so an `echo` after the terminator adds an entry no text reader sees, and a second assignment wins for bash and loses to a first-match reader. `permitted_allowlist` is the set of features a shipped artifact may resolve, and an entry there is where an author who wants a nullifier feature shipped would put it. `nullifier_control_features` holds the positive controls the gate's allowlist-hygiene check runs, so deleting an entry retires a control. `artifacts` names each shipped artifact and the feature configuration the gate resolves it in, so deleting an entry stops gating that artifact and editing a feature string gates it in a configuration it does not ship.",
+  "schema_version": "2.0",
+  "capability_trait_impls": [
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-client-wasm/src/storage.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "JsStorageAdapter"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-client/src/storage.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "MemoryStorage"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-dht/src/dht_client/mod.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "DhtClient",
+      "type": "DisabledDhtClient"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-dht/src/dht_client/mod.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "DhtClient",
+      "type": "InMemoryDhtClient"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-dht/src/dht_client/pkarr_client.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "DhtClient",
+      "type": "PkarrDhtClient"
+    },
+    {
+      "capability": "credential storage",
+      "file": "crates/scp-ffi/common/src/credentials.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "BridgeCredentialStore",
+      "type": "FfiCredentialStore"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-ffi/common/src/dht.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "DhtClient",
+      "type": "FfiDhtClient"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-ffi/common/src/export_verify.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "DidResolver",
+      "type": "StubResolver"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-ffi/common/src/resolvers.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "DidResolver",
+      "type": "BridgeDidResolver"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-ffi/common/src/resolvers.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "DidResolver",
+      "type": "DispatchDidResolver<'_>"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-ffi/common/src/resolvers.rs",
+      "gating": "production",
+      "impl_count": 2,
+      "trait": "DidResolver",
+      "type": "IdentityBackedDidResolver"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-ffi/napi/src/custody.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "KeyCustody",
+      "type": "NapiCallbackKeyCustody"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-ffi/napi/src/custody.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "KeyCustody",
+      "type": "NapiKeyCustody"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-ffi/src/custody.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "KeyCustody",
+      "type": "FfiKeyCustody"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-ffi/src/custody.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "KeyCustody",
+      "type": "PyCallbackKeyCustody"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-ffi/src/runtime.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "StorageProvider"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "KeyCustody",
+      "type": "CallbackKeyCustody"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "KeyCustody",
+      "type": "OpaqueInMemoryKeyCustody"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "KeyCustody",
+      "type": "UniffiKeyCustody"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "KeyCustodyProvider",
+      "type": "ProdLikeCustody"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-ffi/uniffi/src/bridge.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "KeyCustodyProvider",
+      "type": "SignOnlyCustody"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-identity/src/config.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "NoPersistence"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-identity/src/dht.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "DhtClient",
+      "type": "FailingPublishDhtClient"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-identity/src/dht.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "DhtClient",
+      "type": "PublishOrderRecorder"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-identity/src/dht.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "DhtClient",
+      "type": "ResolveFailingDhtClient"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-identity/src/dht.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "SequenceStore",
+      "type": "InMemorySequenceStore"
+    },
+    {
+      "capability": "relay querier",
+      "file": "crates/scp-identity/src/relay_querier.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "MultiRelayQuerier",
+      "type": "RealMultiRelayQuerier<Q>"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-identity/src/republish.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "RelayPublisher",
+      "type": "AlwaysFailRelayPublisher"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-identity/src/republish.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "RelayPublisher",
+      "type": "InMemoryRelayPublisher"
+    },
+    {
+      "capability": "relay querier",
+      "file": "crates/scp-identity/src/resolution.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "RelayQuerier",
+      "type": "InMemoryRelayQuerier"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-identity/src/resolver.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "DhtClient",
+      "type": "DelayedDhtClient"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-identity/src/resolver.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "DidResolver",
+      "type": "DualLayerResolver<R, D, C>"
+    },
+    {
+      "capability": "relay querier",
+      "file": "crates/scp-identity/src/resolver.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "MultiRelayQuerier",
+      "type": "InMemoryRelayQuerier"
+    },
+    {
+      "capability": "relay querier",
+      "file": "crates/scp-identity/src/resolver.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "MultiRelayQuerier",
+      "type": "NoOpRelayQuerier"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-node/src/self_host.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "SequenceStore",
+      "type": "StorageSequenceStore<S>"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/apple/storage.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "AppleStorage"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/encrypted.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "EncryptedStorage",
+      "type": "AppleStorage"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/encrypted.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "EncryptedStorage",
+      "type": "Arc<T>"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/encrypted.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "EncryptedStorage",
+      "type": "SqliteStorage"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/encrypting_adapter.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "EncryptedStorage",
+      "type": "EncryptingAdapter<S>"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/encrypting_adapter.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "EncryptingAdapter<S>"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-platform/src/file.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "KeyCustody",
+      "type": "FileKeyCustody"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/filesystem/mod.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "FilesystemStorage"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/in_memory/storage.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "InMemoryStorage"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-platform/src/sqlite/key_custody.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "KeyCustody",
+      "type": "SqliteKeyCustody"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/sqlite/mod.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "SqliteStorage"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/syncable/mod.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "SyncableStorage<S>"
+    },
+    {
+      "capability": "device attestation",
+      "file": "crates/scp-platform/src/testing/attestation.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "DeviceAttestation",
+      "type": "InMemoryDeviceAttestation"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-platform/src/testing/key_custody.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "KeyCustody",
+      "type": "InMemoryKeyCustody"
+    },
+    {
+      "capability": "key custody (§17.8)",
+      "file": "crates/scp-platform/src/testing/pre_rotation_custody.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "PreRotationCustody",
+      "type": "InMemoryPreRotationCustody"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-platform/src/traits.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "Arc<T>"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-protocol/src/crypto/ucan/validate.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "DidResolver",
+      "type": "InMemoryDidResolver"
+    },
+    {
+      "capability": "credential storage",
+      "file": "crates/scp-runtime/src/bridge/credentials.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "BridgeCredentialStore",
+      "type": "InMemoryCredentialStore"
+    },
+    {
+      "capability": "credential storage",
+      "file": "crates/scp-runtime/src/bridge/credentials.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "DurableCredentialBackend",
+      "type": "ProtocolRepositoryCredentialStore<S>"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-runtime/src/context/economy_logic.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "DidResolver",
+      "type": "KeyResolverDidResolver<'_>"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-runtime/src/context/supervisor/key_package_actor_tests.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "FaultyStorage"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-runtime/src/crypto/mls/attestation_verification.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "DidResolver",
+      "type": "MockResolver"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-runtime/src/crypto/mls/storage.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "StorageProvider",
+      "type": "MlsStorageBridge<S>"
+    },
+    {
+      "capability": "credential storage",
+      "file": "crates/scp-runtime/src/economy/credentials.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "AdapterCredentialStore",
+      "type": "InMemoryCredentialStore"
+    },
+    {
+      "capability": "DID/DHT resolution (§3.10)",
+      "file": "crates/scp-runtime/src/identity/scpid.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "DidResolver",
+      "type": "TestDidResolver"
+    },
+    {
+      "capability": "credential storage",
+      "file": "crates/scp-runtime/src/store/economy.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "AdapterCredentialStore",
+      "type": "ProtocolRepository<S>"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-runtime/src/store/trust.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "AllFaultyStorage"
+    },
+    {
+      "capability": "client storage (§17.6)",
+      "file": "crates/scp-transport/src/native/combined.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "Storage",
+      "type": "CombinedNodeStorage"
+    },
+    {
+      "capability": "relay blob storage (§17.7)",
+      "file": "crates/scp-transport/src/native/combined.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "BlobStorage",
+      "type": "CombinedNodeStorage"
+    },
+    {
+      "capability": "relay blob storage (§17.7)",
+      "file": "crates/scp-transport/src/native/did_slot.rs",
+      "gating": "testing-gated",
+      "impl_count": 1,
+      "trait": "BlobStorage",
+      "type": "FailingGetStorage"
+    },
+    {
+      "capability": "relay blob storage (§17.7)",
+      "file": "crates/scp-transport/src/native/local_cache.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "BlobStorage",
+      "type": "LocalBlobCache<S>"
+    },
+    {
+      "capability": "relay blob storage (§17.7)",
+      "file": "crates/scp-transport/src/native/postgres_blob.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "BlobStorage",
+      "type": "PostgresBlobStore"
+    },
+    {
+      "capability": "relay blob storage (§17.7)",
+      "file": "crates/scp-transport/src/native/redb_blob.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "BlobStorage",
+      "type": "RedbBlobStore"
+    },
+    {
+      "capability": "relay querier",
+      "file": "crates/scp-transport/src/native/relay_querier.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "RelayQuerier",
+      "type": "TransportRelayQuerier"
+    },
+    {
+      "capability": "relay blob storage (§17.7)",
+      "file": "crates/scp-transport/src/native/s3_blob.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "BlobStorage",
+      "type": "S3BlobStore"
+    },
+    {
+      "capability": "relay blob storage (§17.7)",
+      "file": "crates/scp-transport/src/native/sqlite_blob.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "BlobStorage",
+      "type": "SqliteBlobStore"
+    },
+    {
+      "capability": "relay blob storage (§17.7)",
+      "file": "crates/scp-transport/src/native/storage.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "BlobStorage",
+      "type": "BlobStorageBackend"
+    },
+    {
+      "capability": "relay blob storage (§17.7)",
+      "file": "crates/scp-transport/src/native/storage.rs",
+      "gating": "production",
+      "impl_count": 1,
+      "trait": "BlobStorage",
+      "type": "InMemoryBlobStorage"
+    }
+  ],
+  "capability_registry_traits": [
+    "AdapterCredentialStore",
+    "BlobStorage",
+    "BridgeCredentialStore",
+    "DeviceAttestation",
+    "DeviceAttestationProvider",
+    "DhtClient",
+    "DidResolver",
+    "DurableCredentialBackend",
+    "EncryptedStorage",
+    "KeyCustody",
+    "KeyCustodyProvider",
+    "MultiRelayQuerier",
+    "PreRotationCustody",
+    "RelayPublisher",
+    "RelayQuerier",
+    "SequenceStore",
+    "Storage",
+    "StorageProvider"
+  ],
+  "shipped_feature_graph_lists": {
+    "artifacts": [
+      "scp-ffi|--no-default-features --features server",
+      "scp-ffi-napi|--no-default-features --features server",
+      "scp-ffi-uniffi|--no-default-features --features server",
+      "scp-node|",
+      "scp-relay|"
+    ],
+    "nullifier_control_features": [
+      "scp-platform/testing",
+      "scp-dht/testing",
+      "scp-did/testing",
+      "scp-core/testing",
+      "scp-protocol/testing",
+      "scp-runtime/testing",
+      "scp-mls/testing",
+      "scp-testing"
+    ],
+    "permitted_allowlist": [
+      "scp-clock/default",
+      "scp-core/allow_unencrypted_storage",
+      "scp-core/default",
+      "scp-crypto/default",
+      "scp-dht/default",
+      "scp-dht/production-dht",
+      "scp-did/default",
+      "scp-event-log/default",
+      "scp-ffi-common/custody",
+      "scp-ffi-common/default",
+      "scp-ffi-common/resolvers",
+      "scp-identity/default",
+      "scp-identity/production-dht",
+      "scp-mcp/default",
+      "scp-media/default",
+      "scp-mls/default",
+      "scp-node/allow_unencrypted_storage",
+      "scp-node/default",
+      "scp-platform/default",
+      "scp-platform/encrypting",
+      "scp-platform/file",
+      "scp-platform/filesystem",
+      "scp-platform/in-memory-push",
+      "scp-platform/in-memory-storage",
+      "scp-platform/software_platform",
+      "scp-platform/sqlite",
+      "scp-protocol/default",
+      "scp-relay-client/default",
+      "scp-runtime/allow_unencrypted_storage",
+      "scp-runtime/default",
+      "scp-transport/default",
+      "scp-transport/postgres-blob",
+      "scp-transport/redb-blob",
+      "scp-transport/s3-blob",
+      "scp-transport/sqlite-blob",
+      "scp-transport/startup"
+    ]
+  }
+}

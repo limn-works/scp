@@ -147,6 +147,20 @@ SCP-CAPSEL-8012 — the workspace-wide three-conjunct nullifier detector for the
 seven provider capabilities; it covers the UNGATED arms that G1's feature-graph
 proof cannot see, and it carries a pinned true-positive fixture and pinned
 false-positive fixtures that a weakening has to delete visibly),
+check-capability-impl-inventory.sh + capability_impl_inventory.rs +
+ratchet/capability-impl-inventory.json (spec §17.17.2 SCP-CAPSEL-8012 — the
+identity ratchet over every `impl` of those same seven provider capabilities,
+over the trait registry they resolve to, and over the three lists
+check-shipped-feature-graph.sh evaluates. The detector keys on the shape of a
+method body and the failure-path tests key on behaviour, so neither sees a new
+plausible-looking fake ADDED, which is what this ratchet keys on. It records
+each impl's identity, never a total count, because a count is defeated by
+deleting one implementation and adding another in the same commit. It records
+only definition-side facts, per
+.docs/lessons/ast-gate-checks-definition-not-name-resolution.md, and it reads
+the gate's lists from that gate's own `--dump-lists` output rather than scraping
+its source text, because bash and a text reader disagree about what a heredoc
+holds),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

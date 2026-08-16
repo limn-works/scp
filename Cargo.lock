@@ -5698,6 +5698,7 @@ dependencies = [
  "openmls_rust_crypto 0.5.1",
  "openmls_traits 0.5.0",
  "proc-macro2",
+ "quote",
  "rand 0.8.5",
  "rmp-serde",
  "scp-clock",

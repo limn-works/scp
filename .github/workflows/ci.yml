@@ -169,6 +169,27 @@ jobs:
       - name: Real check — workspace-wide three-conjunct scan
         run: bash scripts/check-capability-nullifiers.sh
 
+  # The detector above keys on the shape of a method body, so a fake that reads
+  # a parameter and discards the value evades it. This gate keys on an
+  # implementation existing: the set of `impl`s of the seven §17.17.2 provider
+  # capabilities, the trait registry they resolve to, and the three lists the
+  # prove-absence gate evaluates must all match
+  # ratchet/capability-impl-inventory.json. It records identity rather than a
+  # total count, so a commit that deletes one implementation and adds another
+  # reports one addition and one removal instead of cancelling out.
+  capability-impl-inventory:
+    needs: check-draft
+    name: Capability-impl inventory ratchet (§17.17.2 SCP-CAPSEL-8012)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Self-test — added impl, count-preserving swap, removal, gating flip
+        run: bash scripts/check-capability-impl-inventory.sh --self-test
+      - name: Real check — workspace inventory, registry and gate lists against the baseline
+        run: bash scripts/check-capability-impl-inventory.sh
+
   # ── Cross-layer ──────────────────────────────────────────────────────
   cross-layer:
     needs: check-draft
@@ -1347,6 +1368,8 @@ jobs:
       - no-panic-abort
       - handler-no-panic
       - noop-spelling
+      - capability-nullifiers
+      - capability-impl-inventory
       - saga-gating-granularity
       - deleted-primitives
       - bridge-instance-lifecycle
@@ -1396,6 +1419,8 @@ jobs:
             "${{ needs.no-panic-abort.result }}" \
             "${{ needs.handler-no-panic.result }}" \
             "${{ needs.noop-spelling.result }}" \
+            "${{ needs.capability-nullifiers.result }}" \
+            "${{ needs.capability-impl-inventory.result }}" \
             "${{ needs.saga-gating-granularity.result }}" \
             "${{ needs.deleted-primitives.result }}" \
             "${{ needs.bridge-instance-lifecycle.result }}" \

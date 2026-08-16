@@ -42,8 +42,23 @@
 # the normal + build dependencies that actually compile into the artifact.
 #
 # Usage:
-#   scripts/check-shipped-feature-graph.sh            # gate the real workspace
+#   scripts/check-shipped-feature-graph.sh             # gate the real workspace
 #   scripts/check-shipped-feature-graph.sh --self-test # run the fixture harness only
+#   scripts/check-shipped-feature-graph.sh --dump-lists # print the evaluated lists
+#
+# --dump-lists prints, as `<list-name>\t<entry>` lines, the three lists this
+# script EVALUATES: PERMITTED_ALLOWLIST, NULLIFIER_CONTROL_FEATURES, and
+# ARTIFACTS. `crates/scp-testing/tests/integration/capability_impl_inventory.rs`
+# freezes that output against `ratchet/capability-impl-inventory.json`, so a
+# change to any of the three fails until a human records it.
+#
+# The ratchet consumes this output rather than reading the arrays out of this
+# file's source text, because bash and a text reader disagree about what the
+# arrays hold. A `cat` heredoc ends at its terminator while the surrounding
+# command substitution keeps running, so an `echo` placed after the terminator
+# adds an entry no text reader sees; a second assignment to either name wins for
+# bash and loses to a first-match reader. Printing what the shell evaluated
+# removes the disagreement.
 #
 set -euo pipefail
 
@@ -149,11 +164,29 @@ ARTIFACTS=(
 
 # Nullifier features / crates used ONLY as positive-control fixture inputs and by
 # the allowlist-hygiene self-test. NEVER the gate mechanism.
+#
+# EVERY ENTRY MUST NAME SOMETHING THAT EXISTS. `assert_control_features_resolve`
+# below probes each one with cargo and fails the gate on any that does not
+# resolve. That assertion exists because three entries here —
+# `scp-platform/in-memory-custody`, `scp-platform/in-memory-attestation`, and
+# `scp-platform/in-memory-pre-rotation` — named features `crates/scp-platform`
+# never declared. Their `assert_allowlist_has_no_nullifier` iterations searched
+# the allowlist for a string nothing could ever produce, so each read as a proof
+# and proved nothing. No bypass followed, because `scp-platform/testing` was on
+# the list too and is the real control; the defect was an assertion that could
+# not fail, not a hole an artifact could slip through.
+#
+# The three dead names are deleted rather than repaired, because
+# `scp-platform/testing` is the ONE control that gates all three capabilities.
+# `crates/scp-platform/Cargo.toml` declares `testing` as the gate on the three
+# nullifier doubles (`InMemoryKeyCustody`, `InMemoryDeviceAttestation`,
+# `InMemoryPreRotationCustody`), and `crates/scp-platform/src/lib.rs` puts all
+# three behind one `#[cfg(feature = "testing")] pub mod testing;`. Custody,
+# attestation, and pre-rotation therefore have no separate gating features to
+# name. Listing three dead names alongside the live one told a reader that three
+# separate controls were being proved absent when one control covers all three.
 NULLIFIER_CONTROL_FEATURES=(
   "scp-platform/testing"
-  "scp-platform/in-memory-custody"
-  "scp-platform/in-memory-attestation"
-  "scp-platform/in-memory-pre-rotation"
   "scp-dht/testing"
   "scp-did/testing"
   "scp-core/testing"
@@ -327,6 +360,88 @@ expect() { # <label> <expected: PASS|FAIL> <actual-rc>
   fi
 }
 
+# ---------------------------------------------------------------------------
+# assert_control_features_resolve
+#   Every NULLIFIER_CONTROL_FEATURES entry must name something the workspace
+#   actually declares. An entry spelled `crate/feature` must name a feature that
+#   crate declares; a bare entry must name a workspace crate.
+#
+#   WHY THIS ASSERTION EXISTS. `assert_allowlist_has_no_nullifier` searches the
+#   allowlist for each control entry. An entry naming a feature no crate declares
+#   searches for a string cargo can never emit, so its iteration cannot fail
+#   whatever the allowlist contains. It reads as proof and provides none. Three
+#   such entries sat in this mandatory gate until this assertion was added.
+#
+#   HOW IT PROBES. `cargo tree -p <crate> --features <feature> --depth 0` exits
+#   non-zero with "the package '<crate>' does not contain this feature:
+#   <feature>" when the feature is absent, and exits zero when it is present.
+#   That is cargo answering from the manifest it already resolves, rather than
+#   this script parsing TOML and drifting from what cargo believes.
+# ---------------------------------------------------------------------------
+# control_entry_resolves <entry>
+#   Returns 0 when the entry names a feature the crate declares (for a
+#   `crate/feature` entry) or a workspace crate (for a bare entry), non-zero
+#   otherwise. Factored out as a predicate so the fixture harness can drive it
+#   with a synthetic dead name — see assert_control_resolution_is_load_bearing.
+control_entry_resolves() {
+  local entry="$1" crate feature
+  if [[ "$entry" == */* ]]; then
+    crate="${entry%%/*}"
+    feature="${entry#*/}"
+    cargo tree -e no-dev -p "$crate" --features "$feature" --depth 0 >/dev/null 2>&1
+  else
+    cargo tree -e no-dev -p "$entry" --depth 0 >/dev/null 2>&1
+  fi
+}
+
+# Positive and negative control over control_entry_resolves itself. Every other
+# check in run_fixtures is pinned by an expect PASS/FAIL pair; without one here,
+# an edit that swallowed the exit status would make the resolution check vacuous
+# again — which is the exact defect it was written to fix.
+assert_control_resolution_is_load_bearing() {
+  local rc
+  control_entry_resolves "scp-platform/testing"; rc=$?
+  expect "(control-resolution) a declared feature RESOLVES" "PASS" "$rc"
+  control_entry_resolves "scp-platform/no-such-feature-9000"; rc=$?
+  expect "(control-resolution) an undeclared feature is REJECTED" "FAIL" "$rc"
+  control_entry_resolves "scp-no-such-crate-9000"; rc=$?
+  expect "(control-resolution) an unknown crate is REJECTED" "FAIL" "$rc"
+}
+
+assert_control_features_resolve() {
+  echo ">> fixture: every NULLIFIER_CONTROL_FEATURES entry resolves to a feature or crate the workspace declares — an entry naming nothing makes its allowlist-hygiene iteration unable to fail"
+  local entry crate feature probe rc unresolved=0
+  for entry in "${NULLIFIER_CONTROL_FEATURES[@]}"; do
+    if [[ "$entry" == */* ]]; then
+      crate="${entry%%/*}"
+      feature="${entry#*/}"
+      probe="$(cargo tree -e no-dev -p "$crate" --features "$feature" --depth 0 2>&1)"; rc=$?
+      if [[ "$rc" -ne 0 ]]; then
+        echo "   FAIL — control entry '$entry' names no feature '$crate' declares:"
+        printf '%s\n' "$probe" | sed 's/^/          /'
+        echo "          Delete the entry, or name the feature that actually gates this"
+        echo "          capability. Do NOT rename it to the nearest live feature without"
+        echo "          establishing that the live feature is what the dead name meant."
+        fixture_failures=$((fixture_failures + 1))
+        unresolved=$((unresolved + 1))
+      fi
+    else
+      probe="$(cargo tree -e no-dev -p "$entry" --depth 0 2>&1)"; rc=$?
+      if [[ "$rc" -ne 0 ]]; then
+        echo "   FAIL — control entry '$entry' names no workspace crate:"
+        printf '%s\n' "$probe" | sed 's/^/          /'
+        fixture_failures=$((fixture_failures + 1))
+        unresolved=$((unresolved + 1))
+      fi
+    fi
+  done
+  if [[ "$unresolved" -eq 0 ]]; then
+    echo "   ok   — all ${#NULLIFIER_CONTROL_FEATURES[@]} control entries resolve"
+  else
+    echo "   FAIL — $unresolved of ${#NULLIFIER_CONTROL_FEATURES[@]} control entries name nothing the workspace declares"
+  fi
+}
+
 assert_allowlist_has_no_nullifier() {
   echo ">> fixture: allowlist carries ZERO enumerated control-nullifier features — no NULLIFIER_CONTROL_FEATURES entry (custody/attestation/DHT/did:key/test-harness double) appears (AC7); disclosed allow_unencrypted_storage residue tracked in §Status / #2292"
   local nf
@@ -386,6 +501,8 @@ run_fixtures() {
   resolution_is_nonempty "scp-core/default"; rc=$?
   expect "(empty-guard) non-empty resolved set is ACCEPTED" "PASS" "$rc"
 
+  assert_control_resolution_is_load_bearing
+  assert_control_features_resolve
   assert_allowlist_has_no_nullifier
 
   echo "-------------------------------------------------------------------------------"
@@ -398,7 +515,35 @@ run_fixtures() {
 }
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# dump_lists
+#   Print the three lists this script EVALUATES, one `<list-name>\t<entry>` line
+#   each, after bash has finished evaluating every assignment in the file.
+#
+#   This is the ratchet's input. Reading the arrays out of this file's source
+#   text instead would let bash and the reader disagree — see the --dump-lists
+#   note in the header — so what the shell computed is what gets frozen.
+# ---------------------------------------------------------------------------
+dump_lists() {
+  local entry
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] && printf 'permitted_allowlist\t%s\n' "$entry"
+  done <<< "$PERMITTED_ALLOWLIST"
+  for entry in "${NULLIFIER_CONTROL_FEATURES[@]}"; do
+    printf 'nullifier_control_features\t%s\n' "$entry"
+  done
+  for entry in "${ARTIFACTS[@]}"; do
+    printf 'artifacts\t%s\n' "$entry"
+  done
+}
+
+# ---------------------------------------------------------------------------
 main() {
+  if [[ "${1:-}" == "--dump-lists" ]]; then
+    dump_lists
+    exit 0
+  fi
+
   # Always run the fixture harness first — a broken gate must fail loud before it
   # can pass a real (possibly regressed) tree.
   run_fixtures || exit 1
