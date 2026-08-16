@@ -1,4 +1,4 @@
-# A Green Check That Asserted Nothing: Six Ways CI Reported Success Over Zero Work
+# A Green Check That Asserted Nothing: Seven Ways CI Reported Success Over Zero Work
 
 **Date:** 2026-08-16
 **Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `scripts/check-cross-layer.sh`, `CLAUDE.md` §PRD stories
@@ -10,7 +10,7 @@ fail on the defect it exists to catch, and keep that failure as a test. Every de
 below produced a green check while the work behind it never ran, and every one of them
 had passed review because the check *looked* like it was doing its job.
 
-## The six failure shapes
+## Seven failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when the filter selects no test. The two tests it named
@@ -49,7 +49,22 @@ Write `grep PATTERN >/dev/null` instead, so grep reads its whole input.
 No job in this workflow set a timeout, so one hang burned six runner-hours. Size each
 budget from observed durations (`gh api repos/OWNER/REPO/actions/runs/<id>/jobs`).
 
-**6. A document asserting that CI enforces something no workflow runs.** `CLAUDE.md`
+**6. A fixed budget over an unbounded operator input.** Fixing shape 5 introduced
+this one. Two fuzz jobs pass a `workflow_dispatch` input to
+libFuzzer as `-max_total_time`, which lets an operator set how long each job runs. A
+budget sized for a scheduled run then cancels every dispatch asking for longer, killing
+runs that previously completed. Before adding a ceiling to any job, check whether an
+input decides that job's duration: an input qualifies when a step hands it to something
+that decides how long that step runs. Where one does, bound that input to a closed option
+list *and* size each budget per option — bounding alone forces one loose ceiling onto a
+common scheduled path, and sizing alone leaves an operator able to request an unbounded
+budget. Note two platform facts, both measured rather than assumed: GitHub expressions
+carry no arithmetic, so `seconds / 60 + overhead` cannot be written and a budget must be
+selected per option through `X == 'v' && minutes || …`; and GitHub validates a dispatch
+input against a definition on a default branch, so a new option list cannot be exercised
+from a feature branch.
+
+**7. A document asserting that CI enforces something no workflow runs.** `CLAUDE.md`
 stated "CI enforces this" about `scripts/validate-prd.py`. The only workflow referencing
 that script was `.github/workflows/prd-validate.yml.disabled`, and GitHub never loads a
 file with that suffix. Two rules follow. First, a sentence claiming mechanical enforcement
@@ -64,14 +79,16 @@ the part that never belonged to the category, and leave the deliberate decision 
 
 - `scripts/tests/ci-gate/run-tests.sh` — asserts every job sets a `timeout-minutes`, that
   every job is a dependency of `ci`, that no `cargo test` in the workflow carries a
-  test-name filter, that the four binding test jobs run on a Rust-only change, and that
-  the aggregate rejects a skipped dependency the workflow selected to run.
+  test-name filter, that four binding test jobs run on a Rust-only change, that any job
+  reading a runtime-scaling input sizes its budget from that input and covers every
+  permitted option, and that an aggregate rejects a skipped dependency its condition
+  selected to run.
 - `scripts/tests/cross-layer/run-tests.sh` — plants an FFI export at the first line and at
   the last line of a 155 KB diff, proves the gate finds both, then plants a missing export
   and proves the gate still rejects it.
-- `scripts/tests/prd-validate/run-tests.sh` — plants six violation classes and proves the
-  PRD validator rejects each, and asserts the clean run reports a non-zero story count,
+- `scripts/tests/prd-validate/run-tests.sh` — plants six violation classes and proves that
+  PRD validator rejects each, and asserts a clean run reports a non-zero story count,
   because a validator that walked zero stories would exit 0 as well.
 
-Both harnesses were run against the unfixed code first and failed on exactly the defect
-they describe. A harness that has never failed has not been tested.
+All three harnesses were run against unfixed code first and failed on exactly a defect
+each describes. A harness that has never failed has not been tested.

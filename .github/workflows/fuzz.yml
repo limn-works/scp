@@ -12,6 +12,14 @@ on:
         # unbounded value would hand an operator an unbounded job budget and
         # undo a per-job ceiling entirely. Every option divides evenly by 60, so
         # each computed budget stays a whole number of minutes.
+        #
+        # GitHub validates a dispatch input against a definition on a default
+        # branch, never against whatever branch `--ref` names. Measured: with
+        # this list present on a feature branch but absent from main,
+        # `gh workflow run fuzz.yml --ref <branch> -f fuzz_time=99999` started
+        # run 31963800303 rather than failing. Do not read that as an argument
+        # for adding a redundant runtime check — bounding takes effect on merge,
+        # and scripts/tests/ci-gate fails if this list ever disappears.
         description: "Seconds per target"
         type: choice
         default: "900"
