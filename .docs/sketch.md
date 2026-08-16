@@ -2,7 +2,7 @@
 
 **Status:** Working sketch — interfaces, not implementation
 **Purpose:** Make the protocol tangible through concrete API surfaces and use cases
-**Aligned with:** .docs/specs/ (working draft, February 2026), planning-session-06.md (resolved decisions)
+**Aligned with:** .docs/specs/ (working draft, February 2026)
 
 ---
 

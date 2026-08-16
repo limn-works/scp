@@ -1,22 +1,22 @@
-# WASM UCAN Validation Is Structurally Partial — Document It Accurately
+# Document a partial validation pipeline by what it checks, never by what it claims
 
-> **Resolved (since #1877 slice 1).** The structural partial-validation divergence this lesson warned about has been closed. The WASM bridge `ucan_validate` now delegates to the single shared pipeline `scp_protocol::crypto::ucan::validate::validate_ucan` via an extract-validate-writeback pattern — the same validation logic the native bridges run — rather than a WASM-local reimplementation. Relatedly, the flat `ceiling_strings: HashSet<String>` representation referenced below is **gone**: the ceiling now lives inside the shared `scp_protocol::context::roles::ContextRoleState` (`role_state.ceiling()`), enforced by the shared `CapabilityCeiling::validate_entries`. The rule below remains evergreen; the "current state" descriptions in the lower sections are historical (they describe the pre-convergence implementation).
+**Status: resolved since #1877 slice 1.** That bridge's `ucan_validate` now delegates to one shared pipeline, `scp_protocol::crypto::ucan::validate::validate_ucan`, through an extract-validate-writeback pattern, so it runs identical logic to native bridges rather than a local reimplementation. A flat `ceiling_strings: HashSet<String>` representation described below is gone: a ceiling now lives inside shared `scp_protocol::context::roles::ContextRoleState`, and shared `CapabilityCeiling::validate_entries` enforces it. Everything under "What went wrong" describes a pre-convergence implementation.
 
-**Rule**: When a validation pipeline is partially implemented due to platform constraints, the docstring must accurately describe what IS checked, not claim full validation. False documentation of security properties is worse than no documentation.
+## Rule
 
-**Context (SCP-218)**: The WASM bridge `ucan_validate` docstring claimed "Performs full UCAN validation: signature verification, time bounds checking, delegation chain traversal, attenuation enforcement, nonce replay detection, and capability matching." In reality, the implementation performs: JWT format check, base64/JSON decode, expiry check, capability string match, and revocation check. Missing: Ed25519 signature verification, delegation chain traversal, root issuer check, audience DID validation, attenuation enforcement, ceiling check, nonce replay detection.
+When a platform constraint forces a partially implemented validation pipeline, its docstring states which checks run and which do not. Documentation that claims a security property code never delivers is worse than absent documentation, because a reader who trusts it stops looking.
 
-**Why scp-core validation cannot be used in WASM**: `scp-core` depends on `tokio = { features = ["full"] }` which requires a multi-thread runtime. `wasm32-unknown-unknown` cannot compile this. The WASM bridge must re-implement validation logic using only WASM-compatible crates.
+## What went wrong (SCP-218)
 
-**What full WASM validation requires**:
-- Ed25519 signature verification: requires `JsKeyCustody` wiring (SCP-214 analog for WASM) — WebCrypto API via injected JS callback
-- Nonce replay detection: each `PerContextState` already has `revoked_tokens: HashSet<String>`; a nonce set can be added
-- Audience validation: check `payload["aud"]` against the presenting identity DID (parameter already available)
-- Ceiling check: read the ceiling from the per-context role state (`role_state.ceiling()`). (Historically this described a flat `ceiling_strings: HashSet<String>` field on the per-context state; that field has since been removed — the ceiling now lives inside the shared `ContextRoleState`.)
-- Delegation chain: requires proof token resolution — possible with in-memory HashMap, matching PyO3 bridge pattern
+That bridge's `ucan_validate` docstring claimed "Performs full UCAN validation: signature verification, time bounds checking, delegation chain traversal, attenuation enforcement, nonce replay detection, and capability matching." Its implementation ran five steps: JWT format check, base64/JSON decode, expiry check, capability string match, revocation check. Seven claimed checks never ran — Ed25519 signature verification, delegation chain traversal, root issuer check, audience DID validation, attenuation enforcement, ceiling check, and nonce replay detection.
 
-**Wildcard capability matching bug**: `can_str == "*"` must only match within the correct resource scope. Check `with_str` first, then allow wildcard on `can`. A token granting `scp:ctx:A/*` must not pass validation for `scp:ctx:B/messages:write`.
+That bridge could not reach scp-core validation, because scp-core depended on `tokio` with feature `full`, which needs a multi-thread runtime that `wasm32-unknown-unknown` cannot compile. So it re-implemented validation over wasm-compatible crates, and drifted from a pipeline it claimed to run.
 
-**Missing-exp handling**: `exp` must be treated as optional (non-expiring token) not an error. The UCAN spec and scp-core both allow non-expiring tokens.
+Two narrower defects rode along:
 
-**Lesson**: Story acceptance criteria for WASM bridges that say "calls scp-core X-step pipeline" cannot be met literally. The PRD story must be updated to define the WASM-specific validation scope: which steps are implemented structurally, which are deferred to key custody wiring, which are architectural limitations. Mark deferred steps with `// Stub — see SCP-NNN` referencing the story that will wire them.
+- Wildcard matching compared `can_str == "*"` without first pinning resource scope, so a token granting `scp:ctx:A/*` passed validation for `scp:ctx:B/messages:write`. Correct order checks `with_str` first, then allows a wildcard on `can`.
+- A missing `exp` raised an error, though UCAN and scp-core both treat an absent `exp` as a non-expiring token.
+
+## How to apply
+
+A story acceptance criterion reading "calls scp-core X-step pipeline" cannot be met literally by a bridge that cannot link scp-core. Write that story to name which steps run structurally, which wait on key-custody wiring, and which an architecture forbids outright. Mark each waiting step `// Stub — see SCP-NNN`, pointing at a story that will wire it.
