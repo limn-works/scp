@@ -288,9 +288,20 @@
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 throw StorageError.databaseError(lastErrorMessage())
             }
-            sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
-            value.withUnsafeBytes { ptr in
-                sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(ptr.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            // SQLite reports a failed bind through a return code, and a
+            // statement carrying an unbound parameter still steps to
+            // `SQLITE_DONE` while writing `NULL`. Reading both codes is what
+            // turns such a failure into a thrown error rather than into a row
+            // holding no value.
+            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            guard sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, transient) == SQLITE_OK else {
+                throw StorageError.databaseError(lastErrorMessage())
+            }
+            let valueBindStatus = value.withUnsafeBytes { ptr in
+                sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(ptr.count), transient)
+            }
+            guard valueBindStatus == SQLITE_OK else {
+                throw StorageError.databaseError(lastErrorMessage())
             }
             guard sqlite3_step(stmt) == SQLITE_DONE else {
                 throw StorageError.databaseError(lastErrorMessage())

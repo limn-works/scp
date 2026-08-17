@@ -88,9 +88,14 @@
                     throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                 }
                 let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-                sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, transient)
-                value.withUnsafeBytes { ptr in
+                guard sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, transient) == SQLITE_OK else {
+                    throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
+                }
+                let valueBindStatus = value.withUnsafeBytes { ptr in
                     sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(ptr.count), transient)
+                }
+                guard valueBindStatus == SQLITE_OK else {
+                    throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
                 }
                 guard sqlite3_step(stmt) == SQLITE_DONE else {
                     throw StorageError.databaseError(String(cString: sqlite3_errmsg(db)))
