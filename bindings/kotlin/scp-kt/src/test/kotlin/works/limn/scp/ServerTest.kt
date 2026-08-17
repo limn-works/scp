@@ -179,41 +179,53 @@ class ServerTest {
 
     // MARK: - Shutdown is one suspending path
 
-    // Neither type implements AutoCloseable. A synchronous `close()` can only reach
-    // `shutdown()` by blocking its calling thread on a coroutine whose dispatcher
-    // neither type controls, which is what `.docs/lessons/kotlin/
-    // oncleared-must-not-block-its-caller.md` forbids. Restoring `: AutoCloseable`
-    // on either declaration fails this method.
+    // No type in the §Resource Lifecycle table's Kotlin row implements AutoCloseable.
+    // A synchronous `close()` can only reach `shutdown()` by blocking its calling
+    // thread on a coroutine whose dispatcher these types do not control, which is
+    // what `.docs/standards/sdk-common.md` §"Kotlin: why no `Closeable`" and the
+    // amendment to ADR-028 in `.docs/adrs/phase-6.md` both forbid, and what
+    // `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records failing
+    // twice. Restoring `: AutoCloseable` on any of these declarations fails this
+    // method.
     @Test
-    fun `neither Relay nor Node implements AutoCloseable`() {
-        assertFalse(
-            AutoCloseable::class.java.isAssignableFrom(Relay::class.java),
-            "Relay must expose suspend shutdown() alone, never a blocking close()",
-        )
-        assertFalse(
-            AutoCloseable::class.java.isAssignableFrom(Node::class.java),
-            "Node must expose suspend shutdown() alone, never a blocking close()",
-        )
+    fun `no lifecycle-owning type implements AutoCloseable`() {
+        for (type in listOf(Relay::class.java, Node::class.java, SCP::class.java)) {
+            assertFalse(
+                AutoCloseable::class.java.isAssignableFrom(type),
+                "${type.simpleName} must expose a suspend teardown alone, never a blocking close()",
+            )
+        }
     }
 
-    // Every declared method that stops a Node or a Relay suspends. A non-suspending
+    // Every declared method that stops one of these types suspends. A non-suspending
     // stop method under any name — `close`, `stop`, `dispose` — reintroduces that
     // same blocking shape, so this method matches on behaviour rather than on one
     // interface name. Kotlin compiles a suspend function to a JVM method taking a
     // trailing `kotlin.coroutines.Continuation`, which is how it is recognised here.
+    //
+    // Two JVM-name suffixes are stripped before matching. Kotlin appends `$default`
+    // to the synthetic overload it emits for a defaulted parameter, and appends
+    // `-<hash>` to any method whose signature carries an inline value class —
+    // `SCP.shutdown(bridge, timeout: Duration)` compiles to `shutdown-8Mi8wO0`.
+    // Matching the raw JVM name would silently skip both.
     @Test
-    fun `every stop method on Relay and Node suspends`() {
-        for (type in listOf(Relay::class.java, Node::class.java)) {
+    fun `every stop method on a lifecycle-owning type suspends`() {
+        for (type in listOf(Relay::class.java, Node::class.java, SCP::class.java)) {
             val stopMethods = type.declaredMethods.filter { method ->
-                method.name.substringBefore('$') in setOf("shutdown", "close", "stop", "dispose")
+                method.name.substringBefore('$').substringBefore('-') in
+                    setOf("shutdown", "close", "stop", "dispose")
             }
             assertTrue(
                 stopMethods.isNotEmpty(),
                 "${type.simpleName} must declare a stop method",
             )
             for (method in stopMethods) {
+                // A suspend function carries a `Continuation` parameter. It sits last on the
+                // real method, and second-to-last on the `$default` synthetic (which appends
+                // an int mask and an Object marker), so this asserts presence rather than
+                // position. A genuinely non-suspending stop method carries none at all.
                 assertTrue(
-                    method.parameterTypes.lastOrNull()?.name == "kotlin.coroutines.Continuation",
+                    method.parameterTypes.any { it.name == "kotlin.coroutines.Continuation" },
                     "${type.simpleName}.${method.name} must suspend, so a caller picks its dispatcher",
                 )
             }

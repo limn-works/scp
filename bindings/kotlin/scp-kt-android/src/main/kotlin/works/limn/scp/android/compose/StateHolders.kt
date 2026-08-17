@@ -360,7 +360,8 @@ class ScpHotStreamCoordinator(private val scope: CoroutineScope) {
  * @param key Recomposition key. The subscription restarts if this changes.
  * @param coordinator Orders this mount's [start] after any [onStop] an earlier mount launched
  *   under [key]. A caller constructs it outside composition and shares one instance across every
- *   mount that uses a given key space.
+ *   mount that uses a given key space. The subscription restarts if this changes too, because a
+ *   different coordinator orders a different key space.
  * @param start Suspend factory lambda that creates the [SharedFlow]. Called
  *   once per [key] value. Runs in a coroutine scoped to the Composable.
  * @param onStop Suspend cleanup lambda invoked when the Composable leaves
@@ -377,8 +378,14 @@ fun <T> rememberScpHotStream(
     start: suspend () -> SharedFlow<T>,
     onStop: suspend () -> Unit,
 ): State<SharedFlow<T>?> {
-    val flowState = remember(key) { mutableStateOf<SharedFlow<T>?>(null) }
-    val scope = remember(key) { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
+    // Both remembered values key on `key` AND `coordinator`, matching the
+    // DisposableEffect below. Keying the scope on `key` alone handed a changed
+    // coordinator the scope the previous effect's onDispose had already
+    // cancelled, so `scope.launch` returned an already-cancelled Job, `start`
+    // never ran, and `flowState` kept the previous coordinator's flow — a
+    // subscription nobody was serving, reported as a live one.
+    val flowState = remember(key, coordinator) { mutableStateOf<SharedFlow<T>?>(null) }
+    val scope = remember(key, coordinator) { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
 
     DisposableEffect(key, coordinator) {
         scope.launch {

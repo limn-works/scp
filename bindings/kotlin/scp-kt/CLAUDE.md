@@ -73,9 +73,11 @@ Two-tier streaming architecture per ADR-028:
 
 A bounded wait was rejected as a fix: it still blocks a calling thread, and blocking an Android main thread up to a timeout produces an ANR, so it trades a deadlock for an ANR rather than removing a blocking wait. Write `try { … } finally { relay.shutdown() }` inside a coroutine instead.
 
-`ServerTest.neither Relay nor Node implements AutoCloseable` and `ServerTest.every stop method on Relay and Node suspends` fail if either shape returns. That second method matches on a trailing `kotlin.coroutines.Continuation` parameter, so a non-suspending stop method fails it under any name.
+`SCP` follows the same rule for the same reason, with a further one of its own: `SCP.shutdown(bridge, timeout)` takes a `CoroutineBridge` and a deadline, and a synchronous `close()` could neither obtain that bridge nor honour that deadline.
 
-See `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
+`ServerTest.no lifecycle-owning type implements AutoCloseable` and `ServerTest.every stop method on a lifecycle-owning type suspends` fail if either shape returns to `Relay`, `Node`, or `SCP`. That second method matches on a `kotlin.coroutines.Continuation` parameter, so a non-suspending stop method fails it under any name.
+
+The rule itself lives upstream, where it governs: ADR-028 in `.docs/adrs/phase-6.md` carries the amendment under its `AutoCloseable` rationale bullet, and `.docs/standards/sdk-common.md` carries it under §"Kotlin: why no `Closeable`". See also `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md`.
 
 
 ### detekt TooManyFunctions (threshold: 30)

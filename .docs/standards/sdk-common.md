@@ -411,10 +411,16 @@ SCP objects hold crypto state (MLS groups, key material, WebSocket connections) 
 | Python | `async with` (context manager) | `Context`, `Identity`, transport connections |
 | TypeScript | `using` / `Symbol.dispose` (Explicit Resource Management) | `Context`, `Identity` |
 | Swift | `deinit` + explicit `close()` | `Context`, `Identity` |
-| Kotlin | `use { }` / `Closeable` | `Context`, `Identity` |
+| Kotlin | one `suspend` teardown function, and no `Closeable` — see below | `SCP`, `Relay`, `Node` |
 | Go | `defer ctx.Close()` / `io.Closer` | `Context`, `Identity` |
 | C# | `await using` / `IAsyncDisposable` | `Context`, `Identity` |
 | Java | `try-with-resources` / `AutoCloseable` | `Context`, `Identity` |
+
+### Kotlin: why no `Closeable`
+
+`AutoCloseable.close()` is synchronous and returns `Unit`, so a Kotlin type whose teardown reaches the Rust engine can satisfy it only by blocking its calling thread. Every such teardown routes through `CoroutineBridge.ffiCall`, which suspends on that bridge's injected `ioDispatcher`, and blocking a caller on it fails in two ways this repository has each observed: a caller injecting a `StandardTestDispatcher` parks the one thread that advances that dispatcher's scheduler, so `close()` never returns; and an Android caller blocks a main thread, which produces an ANR. A bounded wait still blocks, and blocking an Android main thread up to a timeout produces an ANR, so it trades a deadlock for an ANR rather than removing a blocking wait.
+
+Each Kotlin type therefore exposes exactly one `suspend` teardown function — `SCP.shutdown(bridge, timeout)`, `Relay.shutdown()`, `Node.shutdown()` — and a caller invokes it from a coroutine. ADR-028 in `.docs/adrs/phase-6.md` carries this amendment and the reasoning behind it; `.docs/lessons/kotlin/oncleared-must-not-block-its-caller.md` records both failures. Every other language in the table above keeps its idiomatic pattern, because none of them must satisfy a synchronous, `Unit`-returning interface method over a suspending call.
 
 ### Lifecycle invariant
 

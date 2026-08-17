@@ -433,6 +433,55 @@ class ScpHotStreamRemountTest {
         assertEquals(listOf(1), subscriptions.unsubscribeIds())
         assertEquals(listOf(2), subscriptions.liveIds())
     }
+
+    /**
+     * A caller who swaps the coordinator while the key stays the same must get a live
+     * subscription from the new coordinator.
+     *
+     * `rememberScpHotStream` remembered its `CoroutineScope` on `key` alone while its
+     * `DisposableEffect` keyed on `key` AND `coordinator`. A coordinator swap therefore ran
+     * `onDispose` — which cancels that scope — and then relaunched `start` into the SAME
+     * cancelled scope, because `key` had not changed. The launch returned an
+     * already-cancelled Job, `start` never ran, and the returned `State` kept the previous
+     * coordinator's flow: a subscription nobody was serving, reported as a live one.
+     */
+    @Test(timeout = DISPOSAL_TIMEOUT_MS)
+    fun `a coordinator swap under one same key opens a subscription on the new coordinator`() {
+        val subscriptions = FakeSubscriptionRegistry()
+        val firstCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val secondCoordinator = ScpHotStreamCoordinator(newCoordinatorScope())
+        val activeCoordinator = MutableStateFlow(firstCoordinator)
+        val eventFlow = MutableSharedFlow<String>()
+
+        composeRule.setContent {
+            val coordinator by activeCoordinator.collectAsStateCompat()
+            rememberScpHotStream(
+                key = "shared-key",
+                coordinator = coordinator,
+                start = {
+                    subscriptions.subscribe()
+                    eventFlow
+                },
+                onStop = { subscriptions.unsubscribeLive() },
+            )
+        }
+
+        composeRule.waitForIdle()
+        awaitCondition("the first coordinator opened no subscription") {
+            subscriptions.subscribeIds() == listOf(1)
+        }
+
+        activeCoordinator.value = secondCoordinator
+        composeRule.waitForIdle()
+
+        awaitCondition("the swapped-in coordinator opened no subscription") {
+            subscriptions.subscribeIds().size == 2
+        }
+        awaitCondition("the swapped-out coordinator's stop released nothing") {
+            subscriptions.unsubscribeIds() == listOf(1)
+        }
+        assertEquals(listOf(2), subscriptions.liveIds())
+    }
 }
 
 /**

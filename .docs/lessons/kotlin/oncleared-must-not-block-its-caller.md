@@ -110,10 +110,17 @@ which is also what agent-first API design asks for. A bounded wait was weighed a
 still blocks a calling thread, and blocking an Android main thread up to a timeout produces an ANR,
 so it trades a deadlock for an ANR rather than removing a blocking wait.
 
-`ServerTest.neither Relay nor Node implements AutoCloseable` fails if that interface returns.
-`ServerTest.every stop method on Relay and Node suspends` matches on a trailing
-`kotlin.coroutines.Continuation` parameter, so a non-suspending stop method fails it under any name
-— `close`, `stop`, or `dispose`.
+That rule is not this lesson's to make. ADR-028 in `.docs/adrs/phase-6.md` originally applied
+`AutoCloseable` / `use { }` to the Kotlin SDK, and `.docs/standards/sdk-common.md` §Resource
+Lifecycle carried it in a per-language table; a lesson file plus a test recording the opposite
+would have left code contradicting the artifacts that govern it. Both artifacts now carry the
+amendment and its reasoning — the ADR under its `AutoCloseable` rationale bullet, the standard
+under §"Kotlin: why no `Closeable`" — and this lesson records the two failures that drove it.
+
+`ServerTest.no lifecycle-owning type implements AutoCloseable` fails if that interface returns to
+`Relay`, `Node`, or `SCP`. `ServerTest.every stop method on a lifecycle-owning type suspends`
+matches on a `kotlin.coroutines.Continuation` parameter, so a non-suspending stop method fails it
+under any name — `close`, `stop`, or `dispose`.
 
 ## Affected files
 
