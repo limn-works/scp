@@ -21,34 +21,67 @@ pub fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey
     (verifying_key, signing_key)
 }
 
-/// Encodes a public key as a canonical `did:dht:z<z-base-32>` test DID.
+/// Encodes a signing key's owner as a canonical `did:dht:z<z-base-32>` test
+/// DID whose payload is `SHA-256(verifying_key)`, never that key itself.
 ///
-/// `tree::verify_event_signature` gates an actor DID through
-/// `scp_did::extract_public_key_from_did`, which accepts `did:key:<hex>` only
-/// under a `testing` feature. Producing a `did:dht` string keeps every test in
-/// this crate on a DID form a shipped build also accepts, so a test never
-/// depends on a testing-only DID method.
+/// Two properties follow, and both matter:
+///
+/// - A verifier recovering a key from a DID string gets `SHA-256(verifying_key)`,
+///   which signs nothing any test holds. A regression toward `#0` — a key every
+///   DID string encodes — therefore fails every test built on these helpers,
+///   rather than passing because a signer's key happens to sit in both places.
+/// - `tree::verify_event_signature` gates an actor DID through
+///   `scp_did::extract_public_key_from_did`, which admits `did:key:<hex>` only
+///   under a `testing` feature. A `did:dht` string keeps every test in this
+///   crate on a DID form a shipped build also admits.
 ///
 /// Returns `DID` (a newtype wrapper) for consistency across callers.
 #[must_use]
 pub fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
-    scp_did::did_dht_from_public_key(verifying_key.as_bytes())
+    scp_did::did_dht_from_public_key(identity_key_for(verifying_key).as_bytes())
 }
 
-/// Identity Key (`#0`) every test DID document carries.
+/// Derives an Identity Key (`#0`) for a signer, deterministically and distinctly
+/// from that signer's own key.
 ///
-/// A test document names an Identity Key that matches no signing key any test
-/// holds, so a verifier reaching for `#0` — a key every DID string encodes —
-/// rejects every signature instead of accepting one. `tree::verify_event_signature`
-/// reads `#active` and `#agent` only, and this constant is what makes a
-/// regression toward `#0` fail a test rather than pass one.
-const UNUSED_IDENTITY_KEY: [u8; 32] = [0xA5; 32];
+/// A seed of `SHA-256(verifying_key)` yields one Ed25519 keypair per signer, so
+/// a `did:dht` string built from it decodes to a curve point a document can
+/// publish as `#0` while no test signs with it.
+#[must_use]
+pub fn identity_key_for(
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> ed25519_dalek::VerifyingKey {
+    let seed: [u8; 32] = Sha256::digest(verifying_key.as_bytes()).into();
+    ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key()
+}
 
 /// Pre-rotation commitment every test DID document publishes.
 ///
 /// `verify_event_signature` reads no service entry, so this value only has to
 /// exist.
 const UNUSED_PRE_ROTATION_COMMITMENT: [u8; 32] = [0x5A; 32];
+
+/// Recovers a DID string's own payload, which [`did_from_pubkey`] derived as
+/// `SHA-256(signing key)`.
+///
+/// A test document publishes that payload as its `#0` Identity Key, so a
+/// document stays self-consistent with a DID string that names it while `#0`
+/// still matches no key any test holds.
+///
+/// # Panics
+///
+/// Panics when `did` is not a `did:dht:z<z-base-32>` string carrying 32 bytes,
+/// which every DID a test helper builds is.
+#[must_use]
+pub fn identity_key_from_did(did: &str) -> [u8; 32] {
+    let suffix = did
+        .strip_prefix("did:dht:z")
+        .expect("a test DID carries a did:dht:z prefix");
+    zbase32::decode(suffix)
+        .expect("a test DID carries a z-base-32 payload")
+        .try_into()
+        .expect("a test DID payload is 32 bytes")
+}
 
 /// Builds a DID document for `did` whose `#active` verification method carries
 /// `active_public_key`.
@@ -63,7 +96,7 @@ pub fn test_did_document(
 ) -> DidDocument {
     DidDocument::new(
         did,
-        &UNUSED_IDENTITY_KEY,
+        &identity_key_from_did(did),
         active_public_key.as_bytes(),
         &UNUSED_PRE_ROTATION_COMMITMENT,
     )
@@ -79,7 +112,7 @@ pub fn test_did_document_with_agent(
 ) -> DidDocument {
     DidDocument::new_with_agent_key(
         did,
-        &UNUSED_IDENTITY_KEY,
+        &identity_key_from_did(did),
         active_public_key.as_bytes(),
         &UNUSED_PRE_ROTATION_COMMITMENT,
         Some(agent_public_key.as_bytes()),

@@ -40,7 +40,7 @@ use crate::republish::RelayPublisher;
 use crate::resolution::verify_relay_record;
 use scp_clock::{Clock, SystemClock};
 use scp_dht::{DhtClient, DhtRecord};
-use scp_did::{DidDocument, decode_multibase_key};
+use scp_did::DidDocument;
 use scp_protocol::envelope::did_record::DidRecordV1;
 
 // ---------------------------------------------------------------------------
@@ -857,8 +857,9 @@ pub fn verifying_key_from_document(
     document: &DidDocument,
     kid: scp_did::SigningKeyId,
 ) -> Option<ed25519_dalek::VerifyingKey> {
-    let vm = document.verification_method_by_fragment(kid.fragment())?;
-    let bytes = decode_multibase_key(&vm.public_key_multibase).ok()?;
+    let bytes = document
+        .signing_key_for(kid, scp_did::VerificationRelationship::Assertion)
+        .ok()?;
     ed25519_dalek::VerifyingKey::from_bytes(&bytes).ok()
 }
 

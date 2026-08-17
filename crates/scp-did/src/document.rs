@@ -34,7 +34,10 @@
 //!
 //! See ADR-003 and ADR-039 in `.docs/adrs/phase-1.md`.
 
+use std::fmt;
+
 use super::attestation::{IdentityLinkServiceEntry, ScpKeyCustodyAttestation};
+use crate::SigningKeyId;
 use serde::{Deserialize, Serialize};
 
 /// Synchronous, wasm-safe errors produced by the DID-document, verification-
@@ -84,6 +87,45 @@ pub enum DidError {
         /// The number of `#agent` VMs found.
         count: usize,
     },
+
+    /// A verification method a caller asked for supplies no usable key.
+    ///
+    /// Covers an absent method, a repeated identifier, a method declaring
+    /// another suite, a method naming another controller, and a method a
+    /// requested verification relationship does not reference.
+    #[error("#{fragment} verification method of {did} is unusable: {reason}")]
+    UnusableVerificationMethod {
+        /// Fragment a caller asked for, without a leading `#`.
+        fragment: String,
+        /// DID whose document a caller read.
+        did: String,
+        /// What disqualified that method.
+        reason: String,
+    },
+}
+
+/// Verification relationship a DID document declares over a key (W3C DID Core
+/// §5.3).
+///
+/// A relationship states what a document authorizes a key to do, so a verifier
+/// names one rather than treating every listed key as usable for every purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VerificationRelationship {
+    /// `assertionMethod` — signing a statement about a subject, which covers
+    /// event-log entries, credentials, attestations, and governance votes.
+    Assertion,
+    /// `authentication` — proving control of a DID to a challenger, which
+    /// covers bridge and service login tokens.
+    Authentication,
+}
+
+impl fmt::Display for VerificationRelationship {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Assertion => "assertionMethod",
+            Self::Authentication => "authentication",
+        })
+    }
 }
 
 /// Custom serde helpers for hex-encoded fixed-size byte arrays.
@@ -445,6 +487,101 @@ impl DidDocument {
     #[must_use]
     pub fn verification_method_id(&self, fragment: &str) -> String {
         format!("{}#{}", self.id, fragment)
+    }
+
+    /// Resolves a public key from a verification method this document
+    /// identifies as `{self.id}#{fragment}`.
+    ///
+    /// Three document facts gate a key, and each one rejects a method a reader
+    /// might otherwise treat as usable:
+    ///
+    /// - a method identifier equal to `{self.id}#{fragment}`, so a method some
+    ///   other DID identifies inside this document supplies nothing (see
+    ///   [`verification_method_by_fragment`](Self::verification_method_by_fragment),
+    ///   which also rejects a repeated identifier);
+    /// - a `type` of [`ED25519_VERIFICATION_KEY_TYPE`], since
+    ///   `publicKeyMultibase` decoding alone cannot separate a signing key from
+    ///   a key-agreement key;
+    /// - a `controller` equal to this document's own DID, since SCP defines no
+    ///   delegation letting another DID sign as this one.
+    ///
+    /// A caller resolving a key for a *signing* purpose calls
+    /// [`signing_key_for`](Self::signing_key_for) instead, which adds a
+    /// verification-relationship check on top of these three.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::UnusableVerificationMethod`] when a method is
+    /// absent, repeated, declares another type, or names another controller,
+    /// and [`DidError::InvalidDidFormat`] when its `publicKeyMultibase` value
+    /// does not decode to a 32-byte Ed25519 curve point.
+    pub fn verification_method_key(&self, fragment: &str) -> Result<[u8; 32], DidError> {
+        let unusable = |reason: String| DidError::UnusableVerificationMethod {
+            fragment: fragment.to_owned(),
+            did: self.id.clone(),
+            reason,
+        };
+
+        let method = self
+            .verification_method_by_fragment(fragment)
+            .ok_or_else(|| unusable("no method carries that identifier exactly once".to_owned()))?;
+
+        if method.method_type != ED25519_VERIFICATION_KEY_TYPE {
+            return Err(unusable(format!(
+                "method declares type {}, not {ED25519_VERIFICATION_KEY_TYPE}",
+                method.method_type
+            )));
+        }
+
+        if method.controller != self.id {
+            return Err(unusable(format!(
+                "method names controller {}, which is not this DID",
+                method.controller
+            )));
+        }
+
+        decode_multibase_key(&method.public_key_multibase)
+    }
+
+    /// Resolves a public key this document authorizes for `relationship`.
+    ///
+    /// Applies every check [`verification_method_key`](Self::verification_method_key)
+    /// applies, then requires a `relationship` array to reference that method.
+    /// W3C DID Core §5.3 makes a verification relationship an authorization
+    /// statement, so an owner withdrawing a reference withdraws that key's
+    /// authority for that purpose while keeping it readable for audit.
+    ///
+    /// A [`SigningKeyId`] argument keeps `#0` out of reach: ADR-039 marks an
+    /// Identity Key as signing no operational action, and §9.7.4 confines it to
+    /// DID document updates plus pre-rotation commitments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::UnusableVerificationMethod`] when a method fails any
+    /// check above or when `relationship` does not reference it, and
+    /// [`DidError::InvalidDidFormat`] when its key does not decode.
+    pub fn signing_key_for(
+        &self,
+        signing_key_id: SigningKeyId,
+        relationship: VerificationRelationship,
+    ) -> Result<[u8; 32], DidError> {
+        let fragment = signing_key_id.fragment();
+        let key = self.verification_method_key(fragment)?;
+        let method_id = self.verification_method_id(fragment);
+        let references = match relationship {
+            VerificationRelationship::Assertion => &self.assertion_method,
+            VerificationRelationship::Authentication => &self.authentication,
+        };
+
+        if !references.contains(&method_id) {
+            return Err(DidError::UnusableVerificationMethod {
+                fragment: fragment.to_owned(),
+                did: self.id.clone(),
+                reason: format!("{relationship} omits {method_id}"),
+            });
+        }
+
+        Ok(key)
     }
 
     /// Returns the `PreRotationCommitment` service, if present.
@@ -974,25 +1111,20 @@ impl DidDocument {
         // Remove `#active` and `#agent` verification methods.
         // Retired entries (`#retired-*`, `#retired-agent-*`) remain.
         //
-        // Exact-fragment match (not `ends_with`) so a hypothetical
-        // future fragment like `#secondary-active` or
-        // `#auxiliary-agent` is not silently swept along with the
-        // operational keys. Today the spec defines only `#0`,
-        // `#active`, `#agent`, `#retired-N`, and `#retired-agent-N`,
-        // so this is forward-compat hardening rather than a bug fix
-        // against current data.
-        self.verification_method.retain(|vm| {
-            let frag = vm.id.rsplit('#').next().unwrap_or("");
-            frag != "active" && frag != "agent"
-        });
-        self.authentication.retain(|reference| {
-            let frag = reference.rsplit('#').next().unwrap_or("");
-            frag != "active" && frag != "agent"
-        });
-        self.assertion_method.retain(|reference| {
-            let frag = reference.rsplit('#').next().unwrap_or("");
-            frag != "active" && frag != "agent"
-        });
+        // Whole-identifier match, matching every other operational-key
+        // method on this type: a migrating document drops both keys
+        // this DID owns, and leaves a method some other DID identifies
+        // where a reader can still audit it. A longer fragment such as
+        // `#secondary-active` survives for that same reason.
+        let active_id = self.verification_method_id("active");
+        let agent_id = self.verification_method_id("agent");
+        let operational = [active_id, agent_id];
+        self.verification_method
+            .retain(|vm| !operational.contains(&vm.id));
+        self.authentication
+            .retain(|reference| !operational.contains(reference));
+        self.assertion_method
+            .retain(|reference| !operational.contains(reference));
     }
 
     // --- Agent key management (ADR-039) ---

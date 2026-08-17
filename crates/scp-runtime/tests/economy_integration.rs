@@ -341,18 +341,14 @@ fn leaf_hash_of(event: &Event) -> [u8; 32] {
 }
 
 /// Creates a test keypair and returns (`did_string`, `signing_key`).
+///
+/// A DID comes from `scp_event_log::test_helpers::did_from_pubkey`, which
+/// builds a canonical `did:dht` string over a derived Identity Key, so
+/// `tree::append` accepts a document `test_did_document` builds for it.
 fn test_keypair() -> (String, ed25519_dalek::SigningKey) {
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
-    let verifying_key = signing_key.verifying_key();
-    let hex: String = verifying_key
-        .as_bytes()
-        .iter()
-        .fold(String::new(), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-    (format!("did:key:{hex}"), signing_key)
+    let did = scp_event_log::test_helpers::did_from_pubkey(&signing_key.verifying_key());
+    (did.to_string(), signing_key)
 }
 
 // ===========================================================================

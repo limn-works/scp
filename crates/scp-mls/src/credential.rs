@@ -9,7 +9,7 @@
 // The DID data model — DID-document types and `SigningKeyId` — comes from the
 // wasm-safe `scp-did` crate, NOT from the tokio-coupled `scp-identity`, keeping
 // `scp-mls` inside the ADR-057 mechanical fence.
-use scp_did::{DidDocument, SigningKeyId, decode_multibase_key};
+use scp_did::{DidDocument, SigningKeyId, VerificationRelationship};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MlsError;
@@ -155,21 +155,14 @@ impl ScpCredential {
     ///   (e.g., `#agent` is absent).
     /// - The public key multibase encoding is invalid or not 32 bytes.
     pub fn resolve_signing_key(&self, did_doc: &DidDocument) -> Result<[u8; 32], MlsError> {
-        let fragment = self.signing_key_id.fragment();
-        let vm = did_doc
-            .verification_method_by_fragment(fragment)
-            .ok_or_else(|| {
+        did_doc
+            .signing_key_for(self.signing_key_id, VerificationRelationship::Assertion)
+            .map_err(|e| {
                 MlsError::InvalidCredential(format!(
-                    "DID document for {} has no #{fragment} verification method",
+                    "DID document for {} supplies no signing key: {e}",
                     self.did
                 ))
-            })?;
-
-        decode_multibase_key(&vm.public_key_multibase).map_err(|e| {
-            MlsError::InvalidCredential(format!(
-                "failed to decode #{fragment} public key from DID document: {e}"
-            ))
-        })
+            })
     }
 }
 
@@ -370,6 +363,7 @@ mod tests {
     }
 
     /// Helper: creates a DID document with `#active` and optionally `#agent` VMs.
+    #[allow(clippy::expect_used)]
     fn test_did_doc(active_key: &[u8; 32], agent_key: Option<&[u8; 32]>) -> DidDocument {
         // Identity key must also decompress to a valid Ed25519 point so
         // any future caller that decodes #0 doesn't trip the curve-point
@@ -380,13 +374,12 @@ mod tests {
         let mut doc = DidDocument::new(TEST_DID, &identity_key, active_key, &commitment);
 
         if let Some(agent_pk) = agent_key {
-            let agent_vm = scp_did::VerificationMethod {
-                id: format!("{TEST_DID}#agent"),
-                method_type: "Ed25519VerificationKey2020".to_owned(),
-                controller: TEST_DID.to_owned(),
-                public_key_multibase: format!("z{}", bs58::encode(agent_pk).into_string()),
-            };
-            doc.verification_method.push(agent_vm);
+            // `add_agent_key` is what production uses, and it references a new
+            // method from `authentication` and `assertionMethod` as well as
+            // adding it. Pushing a bare method would model a document no SCP
+            // constructor produces, and `signing_key_for` rejects one.
+            doc.add_agent_key(agent_pk)
+                .expect("a fresh document names no #agent key");
         }
 
         doc

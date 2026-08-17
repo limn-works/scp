@@ -33,7 +33,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use scp_core::bridge::{BridgeConnector, BridgeStatus};
 use scp_core::store::ProtocolRepository;
-use scp_did::{DidDocument, decode_multibase_key};
+use scp_did::DidDocument;
 use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
 
@@ -586,17 +586,26 @@ fn verify_bridge_jwt(token: &str, lookup: &dyn BridgeLookup) -> Result<BridgeJwt
         },
     );
 
-    let vm = did_doc
-        .verification_method_by_fragment(&fragment)
-        .ok_or_else(|| {
+    // A bridge login token proves control of a DID, so `authentication` gates
+    // it rather than `assertionMethod` (W3C DID Core §5.3). `#0` reaches an
+    // ungated path: an Identity Key certifies a document, and no verification
+    // relationship references it.
+    let pub_key_bytes = scp_did::SigningKeyId::from_fragment(&format!("#{fragment}"))
+        .map_or_else(
+            || did_doc.verification_method_key(&fragment),
+            |signing_key_id| {
+                did_doc.signing_key_for(
+                    signing_key_id,
+                    scp_did::VerificationRelationship::Authentication,
+                )
+            },
+        )
+        .map_err(|e| {
             format!(
-                "DID document for {} has no verification method with fragment #{fragment}",
+                "DID document for {} supplies no key for #{fragment}: {e}",
                 claims.iss
             )
         })?;
-
-    let pub_key_bytes = decode_multibase_key(&vm.public_key_multibase)
-        .map_err(|e| format!("failed to decode public key from DID document: {e}"))?;
 
     let verifying_key = VerifyingKey::from_bytes(&pub_key_bytes)
         .map_err(|e| format!("invalid Ed25519 public key in DID document: {e}"))?;

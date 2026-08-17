@@ -78,15 +78,10 @@ fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
 
 /// Encodes a public key as a test DID (`did:key:<hex>`).
 fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
-    let hex: String = verifying_key
-        .as_bytes()
-        .iter()
-        .fold(String::new(), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-    format!("did:key:{hex}").into()
+    // `scp_event_log::test_helpers::did_from_pubkey` builds a canonical
+    // `did:dht` string over a derived Identity Key, and `tree::append` checks a
+    // document's `#0` against that string, so both sides come from one helper.
+    scp_event_log::test_helpers::did_from_pubkey(verifying_key)
 }
 
 /// Signs an event and returns it with the signature populated.
@@ -361,7 +356,9 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
 
     // -- Step 6: Claim the shadow via identity attestation --
     let (claimant_vk, claimant_sk) = test_keypair();
-    let claimant_did = did_from_pubkey(&claimant_vk);
+    // Shadow-identity claiming recovers a claimant key from a DID string, so a
+    // claimant DID carries that signing key rather than a separate Identity Key.
+    let claimant_did: DID = scp_did::did_dht_from_public_key(claimant_vk.as_bytes());
 
     let attestation = make_identity_attestation(&claimant_did, platform_handle, &claimant_sk);
     let claim_request = make_claim_request(

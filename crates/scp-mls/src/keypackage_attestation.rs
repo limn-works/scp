@@ -1790,12 +1790,11 @@ mod resolution_seam_tests {
         // `#active` is an UNRELATED key — the persona discriminator.
         let mut doc = did_doc_with_active(&fresh_pub());
         if include_agent_vm {
-            doc.verification_method.push(scp_did::VerificationMethod {
-                id: format!("{TEST_DID}#agent"),
-                method_type: "Ed25519VerificationKey2020".to_owned(),
-                controller: TEST_DID.to_owned(),
-                public_key_multibase: format!("z{}", bs58::encode(agent_pub).into_string()),
-            });
+            // `add_agent_key` matches production: it references a new method
+            // from `authentication` and `assertionMethod` as well as adding it,
+            // and `ScpCredential::resolve_signing_key` requires that reference.
+            doc.add_agent_key(&agent_pub)
+                .expect("a fresh document names no #agent key");
         }
         Fx {
             att,

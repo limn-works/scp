@@ -305,13 +305,6 @@ fn kat_did() -> String {
     format!("did:dht:z{}", zbase32::encode(vk.as_bytes()))
 }
 
-/// Identity Key (`#0`) a KAT DID document publishes.
-///
-/// `tree::verify_event_signature` reads `#active` and `#agent` and never `#0`,
-/// so this document names an Identity Key that signs nothing in this test: a
-/// verifier that reached for `#0` would reject every KAT event.
-const KAT_UNUSED_IDENTITY_KEY: [u8; 32] = [0xA5; 32];
-
 /// Pre-rotation commitment a KAT DID document publishes. Event
 /// verification reads no service entry, so this value only has to exist.
 const KAT_UNUSED_PRE_ROTATION_COMMITMENT: [u8; 32] = [0x5A; 32];
@@ -320,9 +313,12 @@ const KAT_UNUSED_PRE_ROTATION_COMMITMENT: [u8; 32] = [0x5A; 32];
 /// `#active` verification method carries a fixed KAT signing key.
 fn kat_did_document() -> scp_did::DidDocument {
     let vk = kat_signing_key().verifying_key();
+    // A `did:dht` string is z-base-32 of an Identity Key, and
+    // `verify_event_signature` checks a document's `#0` against that payload,
+    // so this document publishes exactly what `kat_did()` encodes.
     scp_did::DidDocument::new(
         &kat_did(),
-        &KAT_UNUSED_IDENTITY_KEY,
+        vk.as_bytes(),
         vk.as_bytes(),
         &KAT_UNUSED_PRE_ROTATION_COMMITMENT,
     )

@@ -441,7 +441,16 @@ mod tests {
     // Crypto helpers (imported from shared test helpers)
     // -------------------------------------------------------------------
 
-    use scp_event_log::test_helpers::{did_from_pubkey, test_keypair};
+    use scp_event_log::test_helpers::test_keypair;
+
+    /// Encodes a signing key as a `did:dht` string that key itself derives.
+    ///
+    /// `verify_claim_request_signature` and `verify_attestation_signature`
+    /// recover a claimant key from a DID string, so a test DID here carries a
+    /// signer's own key rather than a separate Identity Key.
+    fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> scp_did::DID {
+        scp_did::did_dht_from_public_key(verifying_key.as_bytes())
+    }
 
     // -------------------------------------------------------------------
     // Helpers

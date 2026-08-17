@@ -23,8 +23,7 @@ use subtle::ConstantTimeEq;
 use super::{Event, EventLog, EventLogError, EventType};
 use scp_crypto::verify_ed25519_signature;
 use scp_did::{
-    DID, DidDocument, ED25519_VERIFICATION_KEY_TYPE, SigningKeyId, decode_multibase_key,
-    extract_public_key_from_did,
+    DID, DidDocument, SigningKeyId, VerificationRelationship, extract_public_key_from_did,
 };
 
 /// The genesis sentinel hash used as `prev_hash` for the first event.
@@ -395,6 +394,9 @@ pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] =
 ///
 /// - `actor_document.id` differs from `event.actor_did`.
 /// - `event.actor_did` is not a canonical, supported DID string.
+/// - A document's `#0` Identity Key derives some DID other than
+///   `event.actor_did`, so that document self-certifies a different identity
+///   (§3.8, §9.6.1).
 /// - A document carries more than one `#agent` verification method, which
 ///   ADR-039's structural constraint tells a verifier to reject.
 /// - A named method declares a type other than
@@ -427,93 +429,84 @@ pub fn verify_event_signature(
         )));
     }
 
-    // Format and canonicality gate on an actor DID string. Discarding a return
-    // value is deliberate: this call supplies no key. It rejects a DID method
-    // this build does not accept, and rejects a non-canonical `did:dht`
-    // z-base-32 payload, so two spellings of one identity cannot address one
-    // actor (§3.8.1, §9.6.1).
-    extract_public_key_from_did(&event.actor_did).map_err(|reason| {
+    // Format and canonicality gate on an actor DID string. It admits a
+    // canonical `did:dht` string, and a `did:key:<hex>` string under a
+    // `testing` feature, so two spellings of one `did:dht` identity cannot
+    // address one actor (§3.8.1, §9.6.1). `did:dht` is what `scp-did`
+    // implements; a `did:web` fallback actor (§3.8) reaches no shipped resolver
+    // in this repository and is rejected here for that reason, not for a
+    // canonicality failure.
+    let did_identity_key = extract_public_key_from_did(&event.actor_did).map_err(|reason| {
         reject(format!(
             "event actor DID is not a canonical, supported DID: {reason}"
         ))
     })?;
+
+    // Self-certification (§3.8, §9.6.1): a `did:dht` string is z-base-32 of an
+    // Identity Key, so a document whose `#0` method carries some other key
+    // describes some other identity, whatever its `id` field claims. A caller
+    // that skipped BEP44 verification hands over a document this check still
+    // rejects, which is one property of a document's origin this crate can
+    // establish on its own.
+    let document_identity_key = actor_document
+        .verification_method_key("0")
+        .map_err(|error| {
+            reject(format!(
+                "#0 key of {} is unusable: {error}",
+                actor_document.id
+            ))
+        })?;
+    if document_identity_key != did_identity_key {
+        return Err(reject(format!(
+            "#0 key of {} derives some other DID, so that document does not describe actor {}",
+            actor_document.id, event.actor_did
+        )));
+    }
 
     actor_document
         .validate_agent_keys()
         .map_err(|reason| reject(format!("actor DID document is malformed: {reason}")))?;
 
     let canonical_hash = compute_event_canonical_hash(event);
-    let mut named_key_count = 0_usize;
-    let mut last_failure = String::new();
+    let mut failures = Vec::with_capacity(ACCEPTED_EVENT_SIGNING_KEY_IDS.len());
+    let mut usable_keys = Vec::with_capacity(ACCEPTED_EVENT_SIGNING_KEY_IDS.len());
 
     for signing_key_id in ACCEPTED_EVENT_SIGNING_KEY_IDS {
-        let fragment = signing_key_id.as_fragment();
-        let Some(method) =
-            actor_document.verification_method_by_fragment(signing_key_id.fragment())
-        else {
-            continue;
-        };
-        named_key_count += 1;
-
-        if method.method_type != ED25519_VERIFICATION_KEY_TYPE {
-            last_failure = format!(
-                "{fragment} method of {} declares type {}, not {ED25519_VERIFICATION_KEY_TYPE}",
-                actor_document.id, method.method_type
-            );
-            continue;
-        }
-
-        if method.controller != actor_document.id {
-            last_failure = format!(
-                "{fragment} method of {} names controller {}, which is not that DID",
-                actor_document.id, method.controller
-            );
-            continue;
-        }
-
-        // W3C DID Core §5.3.3: a key signs an assertion only when
-        // `assertionMethod` references it. An event signature is an assertion,
-        // and `DidDocument::new_with_agent_key` references both operational
-        // methods there, so a missing reference means an owner withdrew signing
-        // authority from that key.
-        if !actor_document.assertion_method.contains(&method.id) {
-            last_failure = format!(
-                "assertionMethod of {} omits {}, so that key signs no assertion",
-                actor_document.id, method.id
-            );
-            continue;
-        }
-
-        let public_key = match decode_multibase_key(&method.public_key_multibase) {
-            Ok(key) => key,
-            Err(error) => {
-                last_failure = format!(
-                    "{fragment} key of {} is undecodable: {error}",
-                    actor_document.id
-                );
-                continue;
-            }
-        };
-
-        match verify_ed25519_signature(&public_key, &canonical_hash, &event.signature) {
-            Ok(()) => return Ok(signing_key_id),
-            Err(error) => {
-                last_failure = format!(
-                    "{fragment} key of {} rejected a signature: {error}",
-                    actor_document.id
-                );
-            }
+        match actor_document.signing_key_for(signing_key_id, VerificationRelationship::Assertion) {
+            Ok(public_key) => usable_keys.push((signing_key_id, public_key)),
+            Err(error) => failures.push(error.to_string()),
         }
     }
 
-    if named_key_count == 0 {
+    // ADR-039 gives `#active` and `#agent` distinct holders — a human and agent
+    // software — so an owner publishing one key under both fragments erases a
+    // distinction a returned `SigningKeyId` reports. Answering `Active` for a
+    // signature agent software produced would attribute an agent's action to a
+    // human, which ADR-039's accountability argument rests on keeping apart.
+    if let [(_, first_key), (_, second_key)] = usable_keys.as_slice()
+        && first_key == second_key
+    {
         return Err(reject(format!(
-            "DID document for {} names no #active or #agent verification method",
+            "DID document for {} publishes one key under both #active and #agent, \
+             so no signature says which holder produced it",
             actor_document.id
         )));
     }
 
-    Err(reject(last_failure))
+    for (signing_key_id, public_key) in usable_keys {
+        match verify_ed25519_signature(&public_key, &canonical_hash, &event.signature) {
+            Ok(()) => return Ok(signing_key_id),
+            Err(error) => failures.push(format!(
+                "{} key of {} rejected a signature: {error}",
+                signing_key_id.as_fragment(),
+                actor_document.id
+            )),
+        }
+    }
+
+    // Report every method a verifier tried, so an operator reading a log sees
+    // why each one failed rather than why a last one did.
+    Err(reject(failures.join("; ")))
 }
 
 /// Verifies signatures across a batch of events a peer supplied during sync
@@ -1400,6 +1393,43 @@ mod tests {
     }
 
     #[test]
+    fn verify_event_signature_rejects_document_whose_identity_key_derives_another_did() {
+        // §3.8 and §9.6.1: a `did:dht` string is z-base-32 of an Identity Key.
+        // A document naming a different `#0` describes a different identity,
+        // and a caller who skipped BEP44 verification supplies exactly that.
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let (foreign_verifying_key, _foreign_signing_key) = test_keypair();
+
+        let mut actor_document = test_did_document(&did, &verifying_key);
+        let identity_id = actor_document.verification_method_id("0");
+        for method in &mut actor_document.verification_method {
+            if method.id == identity_id {
+                method.public_key_multibase = test_did_document(
+                    &did_from_pubkey(&foreign_verifying_key),
+                    &foreign_verifying_key,
+                )
+                .verification_method
+                .iter()
+                .find(|vm| vm.id.ends_with("#0"))
+                .expect("a test document names #0")
+                .public_key_multibase
+                .clone();
+            }
+        }
+
+        let error = verify_event_signature(&genesis_event(&did, &signing_key), &actor_document)
+            .expect_err("a document naming a foreign #0 key describes another identity");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("derives some other DID"),
+                "rejection names a self-certification failure: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn verify_event_signature_rejects_document_describing_another_did() {
         let (verifying_key, signing_key) = test_keypair();
         let did = did_from_pubkey(&verifying_key);
@@ -1438,8 +1468,10 @@ mod tests {
             .expect_err("a document naming no operational key authorizes no event");
         match error {
             EventLogError::InvalidSignature { reason, .. } => assert!(
-                reason.contains("names no #active or #agent"),
-                "rejection names absent methods: {reason}"
+                reason.contains("#active verification method")
+                    && reason.contains("#agent verification method")
+                    && reason.contains("no method carries that identifier"),
+                "rejection names both absent methods: {reason}"
             ),
             other => panic!("expected InvalidSignature, got {other:?}"),
         }
@@ -1470,6 +1502,27 @@ mod tests {
             EventLogError::InvalidSignature { reason, .. } => assert!(
                 reason.contains("malformed"),
                 "rejection names a document defect: {reason}"
+            ),
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_event_signature_rejects_one_key_published_under_both_fragments() {
+        // ADR-039 gives `#active` to a human and `#agent` to agent software. An
+        // owner publishing one key under both fragments makes a returned
+        // `SigningKeyId` report `Active` for work agent software did, which is
+        // exactly what ADR-039's accountability argument rests on separating.
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let actor_document = test_did_document_with_agent(&did, &verifying_key, &verifying_key);
+
+        let error = verify_event_signature(&genesis_event(&did, &signing_key), &actor_document)
+            .expect_err("one key under both fragments identifies no holder");
+        match error {
+            EventLogError::InvalidSignature { reason, .. } => assert!(
+                reason.contains("publishes one key under both"),
+                "rejection names a duplicated key: {reason}"
             ),
             other => panic!("expected InvalidSignature, got {other:?}"),
         }
@@ -1526,6 +1579,7 @@ mod tests {
         let canonical_suffix = canonical
             .strip_prefix("did:dht:z")
             .expect("a test DID carries a did:dht:z prefix");
+        let canonical_payload = crate::test_helpers::identity_key_from_did(&canonical);
         // A 32-byte payload occupies 255 bits of 52 z-base-32 characters, so a
         // final character carries 1 payload bit plus 4 padding bits. Sixteen
         // spellings decode to one key; every spelling except one that
@@ -1541,7 +1595,7 @@ mod tests {
             .find(|candidate_suffix| {
                 candidate_suffix != canonical_suffix
                     && zbase32::decode(candidate_suffix).as_deref()
-                        == Ok(verifying_key.as_bytes().as_slice())
+                        == Ok(canonical_payload.as_slice())
             })
             .expect("z-base-32 padding admits a second spelling of one key");
         let non_canonical = format!("did:dht:z{non_canonical_suffix}");
@@ -1641,7 +1695,7 @@ mod tests {
         let mut actor_document = test_did_document(&did, &verifying_key);
         let decoy = scp_did::VerificationMethod {
             id: format!("{decoy_did}#active"),
-            method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+            method_type: scp_did::ED25519_VERIFICATION_KEY_TYPE.to_owned(),
             controller: decoy_did.to_string(),
             public_key_multibase: actor_document
                 .verification_method
@@ -1685,7 +1739,7 @@ mod tests {
             .expect_err("two #active entries authorize no event");
         match error {
             EventLogError::InvalidSignature { reason, .. } => assert!(
-                reason.contains("names no #active or #agent"),
+                reason.contains("no method carries that identifier"),
                 "rejection reports an unusable method set: {reason}"
             ),
             other => panic!("expected InvalidSignature, got {other:?}"),

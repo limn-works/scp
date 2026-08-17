@@ -62,15 +62,10 @@ fn test_keypair() -> (ed25519_dalek::VerifyingKey, ed25519_dalek::SigningKey) {
 
 /// Encodes a public key as a test DID (`did:key:<hex>`).
 fn did_from_pubkey(verifying_key: &ed25519_dalek::VerifyingKey) -> DID {
-    let hex: String = verifying_key
-        .as_bytes()
-        .iter()
-        .fold(String::new(), |mut acc, b| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        });
-    format!("did:key:{hex}").into()
+    // `scp_event_log::test_helpers::did_from_pubkey` builds a canonical
+    // `did:dht` string over a derived Identity Key, and `tree::append` checks a
+    // document's `#0` against that string, so both sides come from one helper.
+    scp_event_log::test_helpers::did_from_pubkey(verifying_key)
 }
 
 /// Signs an event and returns it with the signature populated.

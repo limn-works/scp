@@ -18,7 +18,6 @@ use scp_core::crypto::ucan::validate::{
 };
 use scp_core::trust::TrustError;
 use scp_core::trust::attestation::DidPublicKeyResolver;
-use scp_did::decode_multibase_key;
 use scp_identity::IdentityError;
 use scp_identity::resolver::ResolvedDidDocument;
 
@@ -470,19 +469,24 @@ impl IdentityBackedDidResolver {
         doc: &ResolvedDidDocument,
         fragment: &str,
     ) -> Result<[u8; 32], ResolutionError> {
-        let vm = doc
-            .document
-            .verification_method_by_fragment(fragment)
-            .ok_or_else(|| {
-                ResolutionError::InvalidDocument(format!(
-                    "verification method '#{fragment}' not found in DID document for {}",
-                    doc.document.id
-                ))
-            })?;
+        // `#active` and `#agent` resolve through an assertion-gated path, so a
+        // method an owner withdrew from `assertionMethod`, declared under
+        // another suite, or handed another controller supplies no key. `#0`
+        // resolves through an ungated path: an Identity Key certifies a
+        // document rather than signing an assertion, so no verification
+        // relationship references it.
+        let key = scp_did::SigningKeyId::from_fragment(&format!("#{fragment}")).map_or_else(
+            || doc.document.verification_method_key(fragment),
+            |signing_key_id| {
+                doc.document
+                    .signing_key_for(signing_key_id, scp_did::VerificationRelationship::Assertion)
+            },
+        );
 
-        decode_multibase_key(&vm.public_key_multibase).map_err(|e| {
+        key.map_err(|e| {
             ResolutionError::InvalidDocument(format!(
-                "failed to decode public key from verification method '#{fragment}': {e}"
+                "verification method '#{fragment}' of {} supplies no key: {e}",
+                doc.document.id
             ))
         })
     }
