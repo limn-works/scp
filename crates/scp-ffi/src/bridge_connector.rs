@@ -298,6 +298,7 @@ pub fn py_bridge_evaluate_trust(
         status: BridgeStatus::Active,
         registration_context: String::new(),
         registered_at: 0,
+        max_shadows: 10_000,
     };
 
     let shadow = ShadowIdentity {
@@ -617,6 +618,7 @@ pub fn py_bridge_seal_shadow_envelope(
         status: BridgeStatus::Active,
         registration_context: context_id.to_string(),
         registered_at: 0,
+        max_shadows: 10_000,
     };
 
     let base_provenance = DataProvenance {

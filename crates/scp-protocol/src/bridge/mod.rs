@@ -73,6 +73,13 @@ pub struct BridgeConnector {
     pub registration_context: ContextId,
     /// Unix timestamp (seconds) when the bridge was registered.
     pub registered_at: u64,
+    /// Governance-configured shadow limit for this bridge (spec §12.2.1).
+    ///
+    /// Approval copies this value from a `RegisterBridge` request, so whichever
+    /// component reads a connector reads the limit governance set. A context
+    /// that approves a bridge at 50 gets a bridge that creates 50 shadows, not
+    /// a registry default.
+    pub max_shadows: u32,
 }
 
 // ---------------------------------------------------------------------------
