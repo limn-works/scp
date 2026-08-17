@@ -91,6 +91,88 @@ pub enum BridgeRegistrationError {
         /// The DID that attempted self-approval.
         did: DID,
     },
+
+    /// A cooperative-mode request omitted `platform_key`, `platform_key_id`,
+    /// or both.
+    ///
+    /// Spec §12.2.1 makes both fields REQUIRED for
+    /// [`BridgeMode::Cooperative`]: a platform sends `platform_key_id` in
+    /// `X-SCP-Platform-Key-Id` on every webhook request and a bridge node
+    /// stores `platform_key` under that identifier (§12.10.2), so a
+    /// cooperative bridge missing either value can never verify a webhook
+    /// signature.
+    #[error(
+        "cooperative bridge {bridge_id} must carry both platform_key and \
+         platform_key_id (spec 12.2.1)"
+    )]
+    MissingCooperativePlatformKey {
+        /// The bridge ID whose request omitted a cooperative-mode field.
+        bridge_id: String,
+    },
+
+    /// `platform_key_id` failed the shape spec §12.2.1 requires.
+    #[error("invalid platform_key_id for bridge {bridge_id}: {reason}")]
+    InvalidPlatformKeyId {
+        /// The bridge ID carrying an unusable key identifier.
+        bridge_id: String,
+        /// Why that identifier is unusable.
+        reason: String,
+    },
+
+    /// A request outside [`BridgeMode::Cooperative`] carried `platform_key`,
+    /// `platform_key_id`, or both.
+    ///
+    /// Spec §12.2.1 leaves both fields absent outside cooperative mode. A
+    /// bridge node reads a webhook signing key only for a cooperative bridge,
+    /// so a key attached to any other mode is never checked, and accepting it
+    /// would tell an operator that a relay-, puppet-, or API-mode bridge
+    /// verifies webhook signatures when nothing does.
+    #[error(
+        "bridge {bridge_id} runs in {mode:?} mode, which carries neither \
+         platform_key nor platform_key_id (spec 12.2.1)"
+    )]
+    PlatformKeyOnNonCooperativeBridge {
+        /// The bridge ID carrying a key outside cooperative mode.
+        bridge_id: String,
+        /// The mode that request asked for.
+        mode: BridgeMode,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// platform_key_id validation
+// ---------------------------------------------------------------------------
+
+/// Maximum byte length spec §12.2.1 allows for `platform_key_id`.
+pub const MAX_PLATFORM_KEY_ID_BYTES: usize = 128;
+
+/// Checks `platform_key_id` against spec §12.2.1: 1–128 bytes of printable
+/// US-ASCII (`0x21`–`0x7E`).
+///
+/// That range keeps a key identifier usable as an HTTP header value and keeps
+/// it free of `0x00`, a byte §12.10.2 reserves as a delimiter inside a signed
+/// webhook payload. A key identifier carrying `0x00` would let two different
+/// (key id, timestamp) pairs produce one signed payload.
+///
+/// # Errors
+///
+/// Returns a reason string naming which rule `key_id` broke.
+pub fn validate_platform_key_id(key_id: &str) -> Result<(), String> {
+    if key_id.is_empty() {
+        return Err("platform_key_id must not be empty".to_owned());
+    }
+    if key_id.len() > MAX_PLATFORM_KEY_ID_BYTES {
+        return Err(format!(
+            "platform_key_id must not exceed {MAX_PLATFORM_KEY_ID_BYTES} bytes, got {}",
+            key_id.len()
+        ));
+    }
+    if let Some(bad) = key_id.bytes().find(|b| !(0x21..=0x7E).contains(b)) {
+        return Err(format!(
+            "platform_key_id must contain only printable US-ASCII (0x21-0x7E), found byte 0x{bad:02x}"
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +247,16 @@ pub struct BridgeRegistrationRequest {
     /// Used to verify webhook request signatures from the platform. Required
     /// for cooperative mode; `None` for non-cooperative modes.
     pub platform_key: Option<[u8; 32]>,
+
+    /// For cooperative mode: the platform's identifier for
+    /// [`platform_key`](Self::platform_key) (spec §12.2.1, §12.10.2).
+    ///
+    /// A platform sends this value in `X-SCP-Platform-Key-Id` on every webhook
+    /// request, a bridge node stores `platform_key` under it, and every
+    /// signature covers it, so it names exactly one bridge instance inside one
+    /// context. Required for cooperative mode; `None` for non-cooperative
+    /// modes. [`validate_platform_key_id`] states the accepted shape.
+    pub platform_key_id: Option<String>,
 
     /// Governance-configured shadow limit for this bridge (spec §12.2.1).
     ///
@@ -352,6 +444,12 @@ impl BridgeRegistry {
 /// Returns [`BridgeRegistrationError::BridgeAlreadyRegistered`] if a
 /// bridge with the same ID already exists (either registered or pending).
 ///
+/// Returns [`BridgeRegistrationError::MissingCooperativePlatformKey`] if a
+/// [`BridgeMode::Cooperative`] request omits `platform_key` or
+/// `platform_key_id`, and
+/// [`BridgeRegistrationError::InvalidPlatformKeyId`] if `platform_key_id`
+/// breaks the shape spec §12.2.1 requires.
+///
 /// See ADR-023 acceptance criterion 2.
 pub fn register_bridge(
     registry: &mut BridgeRegistry,
@@ -362,6 +460,31 @@ pub fn register_bridge(
         return Err(BridgeRegistrationError::ContextMismatch {
             registry_context: registry.context_id.clone(),
             request_context: request.context_id,
+        });
+    }
+
+    // Spec §12.2.1 makes platform_key and platform_key_id REQUIRED for
+    // cooperative mode. A cooperative bridge admitted without both values
+    // reaches a node that can never verify one of its webhook signatures, so
+    // registration fails here rather than producing a bridge no platform can
+    // reach.
+    if request.mode == BridgeMode::Cooperative {
+        let (Some(_), Some(key_id)) = (request.platform_key, request.platform_key_id.as_deref())
+        else {
+            return Err(BridgeRegistrationError::MissingCooperativePlatformKey {
+                bridge_id: request.bridge_id,
+            });
+        };
+        if let Err(reason) = validate_platform_key_id(key_id) {
+            return Err(BridgeRegistrationError::InvalidPlatformKeyId {
+                bridge_id: request.bridge_id,
+                reason,
+            });
+        }
+    } else if request.platform_key.is_some() || request.platform_key_id.is_some() {
+        return Err(BridgeRegistrationError::PlatformKeyOnNonCooperativeBridge {
+            mode: request.mode,
+            bridge_id: request.bridge_id,
         });
     }
 
@@ -403,6 +526,48 @@ pub fn register_bridge(
 }
 
 // ---------------------------------------------------------------------------
+// ApprovedRegistration
+// ---------------------------------------------------------------------------
+
+/// A bridge registration that context governance approved.
+///
+/// [`approve_registration`] is this type's only constructor, so a connector and
+/// a request held together always describe one registration — a caller cannot
+/// pair one bridge's connector with another bridge's request.
+///
+/// A bridge node reads both halves. A connector supplies bridge identity,
+/// operator DID, registration context, and status. A request supplies the
+/// cooperative-mode `platform_key` and `platform_key_id` that §12.10.2 webhook
+/// verification needs, which approval does not copy into a connector.
+#[derive(Debug, Clone)]
+pub struct ApprovedRegistration {
+    /// The connector approval produced.
+    connector: BridgeConnector,
+    /// The request governance approved.
+    request: BridgeRegistrationRequest,
+}
+
+impl ApprovedRegistration {
+    /// Returns the connector approval produced.
+    #[must_use]
+    pub const fn connector(&self) -> &BridgeConnector {
+        &self.connector
+    }
+
+    /// Returns the request governance approved.
+    #[must_use]
+    pub const fn request(&self) -> &BridgeRegistrationRequest {
+        &self.request
+    }
+
+    /// Splits this approval into a connector and a request.
+    #[must_use]
+    pub fn into_parts(self) -> (BridgeConnector, BridgeRegistrationRequest) {
+        (self.connector, self.request)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // approve_registration
 // ---------------------------------------------------------------------------
 
@@ -411,6 +576,12 @@ pub fn register_bridge(
 /// Context governance approves the registration, creating a
 /// [`BridgeConnector`] in [`BridgeStatus::Active`] state. The connector
 /// is added to the registry and becomes visible in context metadata.
+///
+/// Returns an [`ApprovedRegistration`] pairing that connector with the request
+/// governance approved, because a bridge node needs both halves: a connector
+/// names the bridge and its context, and a request carries the cooperative-mode
+/// `platform_key` and `platform_key_id` that §12.10.2 webhook verification
+/// reads.
 ///
 /// # Arguments
 ///
@@ -433,7 +604,7 @@ pub fn approve_registration(
     bridge_id: &str,
     governance_did: &DID,
     timestamp: u64,
-) -> Result<(BridgeConnector, BridgeRegistrationEvent), BridgeRegistrationError> {
+) -> Result<(ApprovedRegistration, BridgeRegistrationEvent), BridgeRegistrationError> {
     // Find and remove the pending request.
     let pos = registry
         .pending_requests
@@ -467,7 +638,7 @@ pub fn approve_registration(
     let event = BridgeRegistrationEvent {
         action: BridgeRegistrationAction::Approved,
         bridge_id: request.bridge_id.clone(),
-        operator_did: request.operator_did,
+        operator_did: request.operator_did.clone(),
         governance_did: governance_did.clone(),
         context_id: registry.context_id.clone(),
         timestamp,
@@ -476,7 +647,7 @@ pub fn approve_registration(
     registry.bridges.push(connector.clone());
     registry.events.push(event.clone());
 
-    Ok((connector, event))
+    Ok((ApprovedRegistration { connector, request }, event))
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +855,7 @@ mod tests {
             self_hosted: false,
             webhook_url: None,
             platform_key: None,
+            platform_key_id: None,
             max_shadows: 10_000,
             metadata: BridgeRegistrationMetadata::default(),
         }
@@ -711,7 +883,7 @@ mod tests {
             1_700_000_001,
         )
         .unwrap();
-        connector
+        connector.into_parts().0
     }
 
     // -------------------------------------------------------------------
@@ -826,7 +998,7 @@ mod tests {
         let request = make_request("bridge-001", CTX_A);
         register_bridge(&mut registry, request).unwrap();
 
-        let (connector, _event) = approve_registration(
+        let (approved, _event) = approve_registration(
             &mut registry,
             "bridge-001",
             &DID::from(GOVERNANCE_DID),
@@ -834,6 +1006,7 @@ mod tests {
         )
         .unwrap();
 
+        let connector = approved.connector();
         assert_eq!(connector.bridge_id, "bridge-001");
         assert_eq!(connector.operator_did, OPERATOR_DID);
         assert_eq!(connector.platform, "discord");
@@ -841,6 +1014,7 @@ mod tests {
         assert_eq!(connector.status, BridgeStatus::Active);
         assert_eq!(connector.registration_context, CTX_A);
         assert_eq!(connector.registered_at, 1_700_000_001);
+        assert_eq!(approved.request().bridge_id, "bridge-001");
     }
 
     #[test]
@@ -1225,6 +1399,7 @@ mod tests {
             self_hosted: false,
             webhook_url: None,
             platform_key: None,
+            platform_key_id: None,
             max_shadows: 10_000,
             metadata: BridgeRegistrationMetadata::default(),
         };
@@ -1283,6 +1458,7 @@ mod tests {
             self_hosted: false,
             webhook_url: None,
             platform_key: None,
+            platform_key_id: None,
             max_shadows: 10_000,
             metadata: BridgeRegistrationMetadata::default(),
         };
@@ -1305,6 +1481,7 @@ mod tests {
             self_hosted: true,
             webhook_url: None,
             platform_key: None,
+            platform_key_id: None,
             max_shadows: 10_000,
             metadata: BridgeRegistrationMetadata::default(),
         };
@@ -1345,6 +1522,7 @@ mod tests {
             self_hosted: true,
             webhook_url: None,
             platform_key: None,
+            platform_key_id: None,
             max_shadows: 10_000,
             metadata: BridgeRegistrationMetadata::default(),
         };
@@ -1368,6 +1546,7 @@ mod tests {
             self_hosted: false,
             webhook_url: None,
             platform_key: None,
+            platform_key_id: None,
             max_shadows: 10_000,
             metadata: BridgeRegistrationMetadata::default(),
         };
@@ -1381,9 +1560,9 @@ mod tests {
         .unwrap();
 
         // Both are active (treated identically).
-        assert_eq!(self_hosted.status, BridgeStatus::Active);
-        assert_eq!(managed.status, BridgeStatus::Active);
-        assert_eq!(self_hosted.mode, managed.mode);
+        assert_eq!(self_hosted.connector().status, BridgeStatus::Active);
+        assert_eq!(managed.connector().status, BridgeStatus::Active);
+        assert_eq!(self_hosted.connector().mode, managed.connector().mode);
     }
 
     // -------------------------------------------------------------------
@@ -1581,6 +1760,7 @@ mod tests {
             self_hosted: true,
             webhook_url: None,
             platform_key: None,
+            platform_key_id: None,
             max_shadows: 10_000,
             metadata: BridgeRegistrationMetadata::default(),
         };
@@ -1697,6 +1877,7 @@ mod tests {
             self_hosted: false,
             webhook_url: None,
             platform_key: None,
+            platform_key_id: None,
             max_shadows: 10_000,
             metadata: BridgeRegistrationMetadata::default(),
         };
@@ -1732,6 +1913,7 @@ mod tests {
             self_hosted: false,
             webhook_url: None,
             platform_key: None,
+            platform_key_id: None,
             max_shadows: 10_000,
             metadata: BridgeRegistrationMetadata::default(),
         };
@@ -1767,6 +1949,7 @@ mod tests {
             self_hosted: false,
             webhook_url: None,
             platform_key: None,
+            platform_key_id: None,
             max_shadows: 10_000,
             metadata: BridgeRegistrationMetadata::default(),
         };
@@ -1823,6 +2006,9 @@ mod tests {
         for (suffix, mode) in &modes {
             let mut registry = BridgeRegistry::new(CTX_A.to_owned());
             let bridge_id = format!("bridge-{suffix}");
+            // Spec 12.2.1 requires a platform key plus its identifier for
+            // cooperative mode and forbids both outside it.
+            let cooperative = *mode == BridgeMode::Cooperative;
             let request = BridgeRegistrationRequest {
                 bridge_id: bridge_id.clone(),
                 operator_did: OPERATOR_DID.into(),
@@ -1832,7 +2018,8 @@ mod tests {
                 requested_at: 1_700_000_000,
                 self_hosted: false,
                 webhook_url: None,
-                platform_key: None,
+                platform_key: cooperative.then_some([7_u8; 32]),
+                platform_key_id: cooperative.then(|| "platform-key-1".to_owned()),
                 max_shadows: 10_000,
                 metadata: BridgeRegistrationMetadata::default(),
             };
@@ -1844,7 +2031,176 @@ mod tests {
                 1_700_000_001,
             )
             .unwrap();
-            assert_eq!(connector.mode, *mode);
+            assert_eq!(connector.connector().mode, *mode);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Cooperative-mode platform key and key identifier (spec 12.2.1)
+    // -------------------------------------------------------------------
+
+    /// Builds a cooperative-mode request, letting a caller vary whichever
+    /// cooperative field a test is about.
+    fn make_cooperative_request(
+        bridge_id: &str,
+        platform_key: Option<[u8; 32]>,
+        platform_key_id: Option<&str>,
+    ) -> BridgeRegistrationRequest {
+        BridgeRegistrationRequest {
+            mode: BridgeMode::Cooperative,
+            webhook_url: Some("https://platform.example.com/hooks".to_owned()),
+            platform_key,
+            platform_key_id: platform_key_id.map(str::to_owned),
+            ..make_request(bridge_id, CTX_A)
+        }
+    }
+
+    #[test]
+    fn cooperative_registration_carrying_key_and_key_id_is_accepted() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        let request = make_cooperative_request("bridge-coop", Some([3_u8; 32]), Some("pk-1"));
+
+        register_bridge(&mut registry, request).unwrap();
+        let (approved, _event) = approve_registration(
+            &mut registry,
+            "bridge-coop",
+            &DID::from(GOVERNANCE_DID),
+            1_700_000_001,
+        )
+        .unwrap();
+
+        assert_eq!(approved.connector().mode, BridgeMode::Cooperative);
+        assert_eq!(approved.request().platform_key, Some([3_u8; 32]));
+        assert_eq!(approved.request().platform_key_id.as_deref(), Some("pk-1"));
+    }
+
+    #[test]
+    fn cooperative_registration_without_key_id_is_rejected() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        let request = make_cooperative_request("bridge-coop", Some([3_u8; 32]), None);
+
+        let err = register_bridge(&mut registry, request).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                BridgeRegistrationError::MissingCooperativePlatformKey { ref bridge_id }
+                    if bridge_id == "bridge-coop"
+            ),
+            "expected MissingCooperativePlatformKey, got {err:?}"
+        );
+        assert!(registry.pending_requests().is_empty());
+    }
+
+    #[test]
+    fn cooperative_registration_without_platform_key_is_rejected() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        let request = make_cooperative_request("bridge-coop", None, Some("pk-1"));
+
+        let err = register_bridge(&mut registry, request).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                BridgeRegistrationError::MissingCooperativePlatformKey { .. }
+            ),
+            "expected MissingCooperativePlatformKey, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cooperative_registration_with_unusable_key_id_is_rejected() {
+        // A NUL byte would make the 12.10.2 signed payload split two ways, a
+        // space would break an HTTP header value, and an empty identifier
+        // names nothing.
+        for bad in ["", "pk 1", "pk\u{0}1", "pk\u{7f}"] {
+            let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+            let request = make_cooperative_request("bridge-coop", Some([3_u8; 32]), Some(bad));
+
+            let err = register_bridge(&mut registry, request).unwrap_err();
+
+            assert!(
+                matches!(
+                    err,
+                    BridgeRegistrationError::MissingCooperativePlatformKey { .. }
+                        | BridgeRegistrationError::InvalidPlatformKeyId { .. }
+                ),
+                "expected a rejection for key id {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_id_longer_than_the_spec_limit_is_rejected() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        let long_id = "k".repeat(MAX_PLATFORM_KEY_ID_BYTES + 1);
+        let request = make_cooperative_request("bridge-coop", Some([3_u8; 32]), Some(&long_id));
+
+        let err = register_bridge(&mut registry, request).unwrap_err();
+
+        assert!(
+            matches!(err, BridgeRegistrationError::InvalidPlatformKeyId { .. }),
+            "expected InvalidPlatformKeyId, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn key_id_at_the_spec_limit_is_accepted() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        let long_id = "k".repeat(MAX_PLATFORM_KEY_ID_BYTES);
+        let request = make_cooperative_request("bridge-coop", Some([3_u8; 32]), Some(&long_id));
+
+        register_bridge(&mut registry, request).unwrap();
+
+        assert_eq!(registry.pending_requests().len(), 1);
+    }
+
+    #[test]
+    fn relay_registration_carrying_a_platform_key_is_rejected() {
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        let request = BridgeRegistrationRequest {
+            platform_key: Some([3_u8; 32]),
+            ..make_request("bridge-relay", CTX_A)
+        };
+
+        let err = register_bridge(&mut registry, request).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                BridgeRegistrationError::PlatformKeyOnNonCooperativeBridge {
+                    mode: BridgeMode::Relay,
+                    ..
+                }
+            ),
+            "expected PlatformKeyOnNonCooperativeBridge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn approval_hands_a_bridge_node_both_the_connector_and_the_request() {
+        // A node needs a connector for bridge identity and a request for the
+        // cooperative-mode key material, and ApprovedRegistration is the only
+        // way to hold one pair, so no caller can mix two registrations.
+        let mut registry = BridgeRegistry::new(CTX_A.to_owned());
+        register_bridge(
+            &mut registry,
+            make_cooperative_request("bridge-coop", Some([9_u8; 32]), Some("pk-9")),
+        )
+        .unwrap();
+
+        let (approved, _event) = approve_registration(
+            &mut registry,
+            "bridge-coop",
+            &DID::from(GOVERNANCE_DID),
+            1_700_000_001,
+        )
+        .unwrap();
+
+        let (connector, request) = approved.into_parts();
+        assert_eq!(connector.bridge_id, request.bridge_id);
+        assert_eq!(connector.operator_did, request.operator_did);
+        assert_eq!(connector.registration_context, request.context_id);
+        assert_eq!(request.platform_key_id.as_deref(), Some("pk-9"));
     }
 }

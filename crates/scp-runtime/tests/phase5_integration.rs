@@ -270,6 +270,7 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
         self_hosted: false,
         webhook_url: None,
         platform_key: None,
+        platform_key_id: None,
         max_shadows: 10_000,
         metadata: scp_protocol::bridge::registration::BridgeRegistrationMetadata::default(),
     };
@@ -280,7 +281,7 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
     assert_eq!(bridge_registry.pending_requests().len(), 1);
 
     // -- Step 3: Governance approves the registration --
-    let (connector, approval_event) = approve_registration(
+    let (approved, approval_event) = approve_registration(
         &mut bridge_registry,
         "bridge-phase5-001",
         &governance_did,
@@ -288,6 +289,7 @@ fn bridge_registration_shadow_creation_provenance_and_claiming() {
     )
     .expect("bridge approval should succeed");
 
+    let connector = approved.into_parts().0;
     assert_eq!(connector.bridge_id, "bridge-phase5-001");
     assert_eq!(connector.platform, "discord");
     assert_eq!(connector.mode, BridgeMode::Relay);
