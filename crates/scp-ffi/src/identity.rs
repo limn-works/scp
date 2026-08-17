@@ -46,7 +46,8 @@ use pyo3::types::{PyDict, PyList};
 // `Clock` brings `SystemClock::now_secs` into scope for one `testing`-gated
 // pre-rotation reveal arm of `py_identity_rotate_key`, this crate's only caller.
 // A shipped build (no `testing`) compiles no user of that trait, so this import
-// carries a matching gate, which keeps such a build warning-free.
+// carries a matching gate, which keeps such a build warning-free — including
+// under `--features extension-module`, the feature set maturin builds with.
 #[cfg(feature = "testing")]
 use scp_clock::Clock;
 use scp_did::DidDocument;
