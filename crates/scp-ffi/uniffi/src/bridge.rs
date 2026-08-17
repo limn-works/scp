@@ -8165,6 +8165,9 @@ pub struct BridgeCredentialResult {
 /// * `mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
 /// * `webhook_url` — For cooperative mode: the platform's webhook receiver URL.
 /// * `platform_key` — For cooperative mode: the platform's Ed25519 public key (32 bytes).
+/// * `platform_key_id` — For cooperative mode: the platform's identifier for
+///   `platform_key`, which that platform sends in `X-SCP-Platform-Key-Id` on a
+///   webhook request and which every webhook signature covers (spec §12.10.2).
 /// * `max_shadows` — Governance-configured shadow limit (default 10,000).
 /// * `metadata_display_name` — Human-readable display name for the bridge.
 /// * `metadata_description` — Free-text description of the bridge.
@@ -8181,7 +8184,11 @@ pub struct BridgeCredentialResult {
 /// `did:{method}:{id}` structure, method not lowercase alphanumeric, or
 /// contains control characters), or if `mode` is not recognized. Returns
 /// `ScpError::Context` if registration or approval fails (including
-/// self-approval).
+/// self-approval), if a cooperative registration omits `platform_key` or
+/// `platform_key_id`, or if a non-cooperative registration carries either one.
+///
+/// Spec §12.2.1 requires both cooperative-mode fields together and forbids
+/// both outside cooperative mode.
 ///
 /// See spec section 12 (Bridge System) and ADR-023.
 #[uniffi::export]
@@ -8194,6 +8201,7 @@ pub fn bridge_register(
     mode: String,
     webhook_url: Option<String>,
     platform_key: Option<Vec<u8>>,
+    platform_key_id: Option<String>,
     max_shadows: Option<u32>,
     metadata_display_name: Option<String>,
     metadata_description: Option<String>,
@@ -8242,6 +8250,7 @@ pub fn bridge_register(
         self_hosted: false,
         webhook_url,
         platform_key: parsed_platform_key,
+        platform_key_id,
         max_shadows: max_shadows.unwrap_or(10_000),
         metadata: scp_core::bridge::registration::BridgeRegistrationMetadata {
             display_name: metadata_display_name.unwrap_or_default(),
@@ -8258,7 +8267,7 @@ pub fn bridge_register(
     })?;
 
     let approver_did: scp_did::DID = governance_did.into();
-    let (connector, _approval_event) = scp_core::bridge::registration::approve_registration(
+    let (approved, _approval_event) = scp_core::bridge::registration::approve_registration(
         &mut registry,
         &bridge_id,
         &approver_did,
@@ -8270,7 +8279,7 @@ pub fn bridge_register(
     })?;
 
     Ok(BridgeRegistrationResult {
-        bridge_id: connector.bridge_id,
+        bridge_id: approved.into_parts().0.bridge_id,
         operator_did,
         platform,
         mode,
@@ -21803,6 +21812,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(result.status, "active");
@@ -21820,6 +21830,7 @@ mod tests {
             "did:key:operator".to_owned(),
             "discord".to_owned(),
             "relay".to_owned(),
+            None,
             None,
             None,
             None,
@@ -21850,6 +21861,7 @@ mod tests {
             "cooperative".to_owned(),
             Some("https://example.com/webhook".to_owned()),
             Some(vec![42u8; 32]),
+            Some("platform-key-1".to_owned()),
             Some(500),
             Some("My Discord Bridge".to_owned()),
             Some("Bridges #general channel".to_owned()),
@@ -21869,6 +21881,7 @@ mod tests {
             "cooperative".to_owned(),
             None,
             Some(vec![42u8; 16]), // wrong length
+            Some("platform-key-1".to_owned()),
             None,
             None,
             None,
