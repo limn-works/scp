@@ -1234,38 +1234,6 @@ mod checkpoint_authenticity_tests {
     const SENDER: &str = "did:example:checkpoint-sender";
     const CONTEXT_ID: &str = "ctx-checkpoint-authenticity";
 
-    /// Event-log provider that accepts every call. This module asserts on
-    /// signature verification, which appends nothing.
-    struct SilentEventLog;
-
-    #[async_trait::async_trait]
-    impl crate::context::builder::ContextEventLogProvider for SilentEventLog {
-        async fn init_event_log(
-            &self,
-            _id: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-
-        async fn append_event(
-            &self,
-            _id: &[u8; 32],
-            _event: scp_event_log::EventType,
-            _actor: &str,
-            _payload: scp_event_log::EventPayload,
-            _timestamp_secs: u64,
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-
-        async fn destroy_event_log(
-            &self,
-            _id: &[u8; 32],
-        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
-            Ok(())
-        }
-    }
-
     /// Builds `ActorDeps` whose `key_resolver` answers with `key` for
     /// `answers_for` and with `None` for the other operational method.
     async fn deps_resolving_only(
@@ -1281,7 +1249,7 @@ mod checkpoint_authenticity_tests {
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
-            Box::new(SilentEventLog);
+            Box::new(super::equivocation_dedup_tests::CountingEventLog::default());
         let key_resolver: scp_protocol::context::governance::KeyResolver =
             Arc::new(move |_: &DID, requested: SigningKeyId| {
                 (requested == answers_for).then_some(key)
@@ -1425,8 +1393,13 @@ mod equivocation_dedup_tests {
     /// assert the dedup gate appends NOTHING to the durable Merkle log —
     /// equivocation alerts are buffer-only (§9.9.3). All other methods are
     /// no-ops.
+    ///
+    /// `pub(super)` so `checkpoint_authenticity_tests` shares it. That module
+    /// reads no count — it asserts on signature verification, which appends
+    /// nothing — and a second no-op provider next to this one would be this
+    /// type minus its counter.
     #[derive(Default)]
-    struct CountingEventLog {
+    pub(super) struct CountingEventLog {
         appends: Arc<AtomicUsize>,
     }
 

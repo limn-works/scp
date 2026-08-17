@@ -333,33 +333,31 @@ pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
     Ok(hasher.finalize().into())
 }
 
-/// Verification methods this crate accepts on an event signature, in trial
-/// order.
-///
-/// **Criterion:** an event signature verifies against an operational signing key
-/// that an actor's own DID document names. [`SigningKeyId::OPERATIONAL`] is that
-/// pair, and its documentation states which fragments the pair excludes and why.
-/// Spec §7.3.1 says an acting agent signs an event, and ADR-039 grants an acting
-/// agent exactly those two operational verification methods.
-///
-/// **Trial order is not role pinning.** An `Event` names no verification
-/// method: ADR-011 acceptance criterion 1 defines it with seven fields and no
-/// `signing_key_id`, and §23.13 paragraph 1 tells a verifier to try each method
-/// `assertionMethod` authorizes and to return the one that verified. A caller
-/// attributing an event to a human holder or to agent software reads that
-/// returned [`SigningKeyId`], which is what ADR-039 gives the two methods
-/// distinct holders for. No `EventType` names an act ADR-039's Category A
-/// reserves to a human — that category covers DID document updates,
-/// pre-rotation commitments, identity migration, and root UCAN issuance — so
-/// Category A is not what a caller reads this value for.
-pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] = SigningKeyId::OPERATIONAL;
-
 /// Verifies an Ed25519 signature on an event against an actor's DID document,
 /// and reports which verification method produced it.
 ///
+/// **Which methods this accepts.** An event signature verifies against an
+/// operational signing key that an actor's own DID document names.
+/// [`SigningKeyId::OPERATIONAL`] is that pair, and its documentation states
+/// which fragments the pair excludes and why. §7.3.1 of the trust spec says an
+/// acting agent signs an event, and ADR-039, the shared-DID human-agent
+/// identity model, grants an acting agent exactly those two operational
+/// verification methods.
+///
+/// **Trial order is not role pinning.** An `Event` names no verification
+/// method: ADR-011 acceptance criterion 1 defines it with seven fields and no
+/// `signing_key_id`, and §23.13 paragraph 1 of the sync spec tells a verifier to
+/// try each method `assertionMethod` authorizes and to return the one that
+/// verified. A caller attributing an event to a human holder or to agent
+/// software reads that returned [`SigningKeyId`], which is what ADR-039 gives
+/// the two methods distinct holders for. No `EventType` names an act ADR-039's
+/// Category A reserves to a human — that category covers DID document updates,
+/// pre-rotation commitments, identity migration, and root UCAN issuance — so
+/// Category A is not what a caller reads this value for.
+///
 /// Reads operational signing keys out of `actor_document`, recomputes a
 /// canonical event hash, and tries each key in
-/// [`ACCEPTED_EVENT_SIGNING_KEY_IDS`] until one verifies. [`append`] calls this
+/// [`SigningKeyId::OPERATIONAL`] until one verifies. [`append`] calls this
 /// for a new event; a caller reconciling events from a remote peer calls it
 /// through [`verify_event_batch`] (§23.13 paragraph 1).
 ///
@@ -504,10 +502,10 @@ pub fn verify_event_signature(
         .map_err(|reason| reject(format!("actor DID document is malformed: {reason}")))?;
 
     let canonical_hash = compute_event_canonical_hash(event);
-    let mut failures = Vec::with_capacity(ACCEPTED_EVENT_SIGNING_KEY_IDS.len());
-    let mut usable_keys = Vec::with_capacity(ACCEPTED_EVENT_SIGNING_KEY_IDS.len());
+    let mut failures = Vec::with_capacity(SigningKeyId::OPERATIONAL.len());
+    let mut usable_keys = Vec::with_capacity(SigningKeyId::OPERATIONAL.len());
 
-    for signing_key_id in ACCEPTED_EVENT_SIGNING_KEY_IDS {
+    for signing_key_id in SigningKeyId::OPERATIONAL {
         match actor_document.signing_key_for(signing_key_id, VerificationRelationship::Assertion) {
             Ok(public_key) => usable_keys.push((signing_key_id, public_key)),
             Err(error) => failures.push(error.to_string()),

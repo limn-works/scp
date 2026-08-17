@@ -205,10 +205,14 @@ pub trait ProofResolver {
 pub struct InMemoryDidResolver {
     /// Map of DID string to 32-byte Ed25519 public key (default / `#active`).
     pub keys: std::collections::HashMap<String, [u8; 32]>,
-    /// Map of `(DID, kid)` to 32-byte Ed25519 public key for specific
-    /// verification methods (e.g., `#agent`). Used by
-    /// [`DidResolver::resolve_public_key_by_kid`] when `kid` is not `#active`.
-    pub kid_keys: std::collections::HashMap<(String, String), [u8; 32]>,
+    /// Map of `(DID, verification method)` to 32-byte Ed25519 public key.
+    /// Used by [`DidResolver::resolve_public_key_by_kid`].
+    ///
+    /// [`SigningKeyId`] rather than a fragment string, because a fragment
+    /// string on the inside of this boundary reopens the vocabulary the
+    /// boundary closed: a fixture writing `"active"` where the resolver probes
+    /// `"#active"` would miss silently and fall through to `keys`.
+    pub kid_keys: std::collections::HashMap<(String, SigningKeyId), [u8; 32]>,
 }
 
 impl InMemoryDidResolver {
@@ -236,8 +240,7 @@ impl DidResolver for InMemoryDidResolver {
         signing_key_id: SigningKeyId,
     ) -> Result<[u8; 32], UcanError> {
         // First check kid_keys for an explicit entry.
-        let fragment = signing_key_id.as_fragment();
-        if let Some(pk) = self.kid_keys.get(&(did.to_owned(), fragment.to_owned())) {
+        if let Some(pk) = self.kid_keys.get(&(did.to_owned(), signing_key_id)) {
             return Ok(*pk);
         }
         // Fall back: `#active` uses the default key.
@@ -245,7 +248,8 @@ impl DidResolver for InMemoryDidResolver {
             return self.resolve_public_key(did);
         }
         Err(UcanError::MalformedToken(format!(
-            "verification method '{fragment}' not found on DID '{did}'"
+            "verification method '{}' not found on DID '{did}'",
+            signing_key_id.as_fragment()
         )))
     }
 }
@@ -1394,12 +1398,17 @@ pub(super) fn verify_signature(
     // header parsed, so no reader here decodes a fragment string (ADR-039,
     // SCP-AB-013). A header naming `#0`, a `#retired-{n}` method, a bare
     // `active`, or a full DID URL failed to parse and never reached this step.
-    let pk_bytes = match token.header.kid {
-        Some(signing_key_id) => {
-            did_resolver.resolve_public_key_by_kid(&token.payload.iss, signing_key_id)?
-        }
-        None => did_resolver.resolve_public_key(&token.payload.iss)?,
-    };
+    //
+    // `signing_key_id()` reads `#active` from a header that carries no `kid`,
+    // and `resolve_public_key_by_kid`'s default implementation routes `#active`
+    // to `resolve_public_key`. Branching here on whether the header carried a
+    // `kid` would state that same default a second time, and the two statements
+    // could drift: `InMemoryDidResolver` answers a `#active` lookup from its
+    // `kid_keys` map before it falls back to its default-key map, so a resolver
+    // holding both would have verified a `kid`-bearing token against one key and
+    // a `kid`-less token against another.
+    let pk_bytes = did_resolver
+        .resolve_public_key_by_kid(&token.payload.iss, token.header.signing_key_id())?;
 
     // Extract signing input from encoded token: everything before the last '.'
     let signing_input = token

@@ -42,18 +42,36 @@ use scp_protocol::crypto::ucan::{Attenuation, UcanError, UcanHeader, UcanPayload
 /// Maximum token lifetime: 24 hours in seconds (spec section 9.5).
 const MAX_EXPIRY_SECS: u64 = 24 * 60 * 60;
 
-/// Validates `key_scope` format: must start with `#` (verification method fragment).
+/// Decodes `key_scope` into the verification method it names.
 ///
-/// Returns `Ok(())` if `key_scope` is `None` or a valid fragment.
-fn validate_key_scope(key_scope: Option<&String>) -> Result<(), UcanError> {
-    if let Some(scope) = key_scope
-        && !scope.starts_with('#')
-    {
-        return Err(UcanError::MalformedToken(format!(
-            "key_scope must be a verification method fragment starting with '#', got: {scope}"
-        )));
-    }
-    Ok(())
+/// Step 5b of the validation pipeline compares `fct.scp_key_scope` against the
+/// `kid` header, and `UcanHeader.kid` is a [`scp_did::SigningKeyId`], so a scope
+/// naming anything outside `#active` and `#agent` matches no header any minter
+/// can produce. This rejects such a scope here rather than returning a signed
+/// token every verifier refuses.
+///
+/// An earlier version admitted any string starting with `#`, so
+/// `key_scope: Some("#0")` minted a token whose header named `#active` — from
+/// the default a missing `kid` carries — and whose facts named `#0`. That token
+/// reported success at mint time and failed at every verifier.
+///
+/// # Errors
+///
+/// Returns [`UcanError::MalformedToken`] when `key_scope` names no operational
+/// verification method.
+fn decode_key_scope(
+    key_scope: Option<&String>,
+) -> Result<Option<scp_did::SigningKeyId>, UcanError> {
+    key_scope.map_or(Ok(None), |scope| {
+        scp_did::SigningKeyId::from_fragment(scope)
+            .map(Some)
+            .ok_or_else(|| {
+                UcanError::MalformedToken(format!(
+                    "key_scope must name an operational verification method \
+                     (\"#active\" or \"#agent\"), got: {scope}"
+                ))
+            })
+    })
 }
 
 /// Rejects self-delegation (iss == aud) without `key_scope` (ADR-039).
@@ -450,7 +468,7 @@ pub async fn mint_ucan(
     custody: &impl KeyCustody,
     clock: &dyn Clock,
 ) -> Result<UcanToken, UcanError> {
-    validate_key_scope(params.key_scope.as_ref())?;
+    let key_scope_id = decode_key_scope(params.key_scope.as_ref())?;
     reject_self_delegation_without_scope(
         params.issuer_did,
         params.audience_did,
@@ -527,23 +545,15 @@ pub async fn mint_ucan(
     // Build header — include kid when signing_key_id or key_scope is present
     // (ADR-039). signing_key_id takes precedence over key_scope for the kid
     // header value.
-    // `key_scope` is a free JSON string an issuer writes into
-    // `fct.scp_key_scope`, and `UcanHeader.kid` is a `SigningKeyId`, so a
-    // scope naming anything outside `#active` and `#agent` writes no `kid`.
-    // Step 5b then rejects the token, because a header carrying no `kid` reads
-    // `#active` and that fragment does not match the scope. That is the
-    // fail-closed direction: an issuer cannot mint a token whose header names a
-    // method the protocol does not admit.
-    let header = params.signing_key_id.map_or_else(
-        || {
-            params
-                .key_scope
-                .as_deref()
-                .and_then(scp_did::SigningKeyId::from_fragment)
-                .map_or_else(UcanHeader::new, UcanHeader::with_kid)
-        },
-        UcanHeader::with_kid,
-    );
+    // `signing_key_id` names the method that signs; `key_scope` names the
+    // method a delegation binds to. `signing_key_id` wins when both are
+    // present. `decode_key_scope` already rejected a scope naming any other
+    // method, so a header this builds and the facts below always name the same
+    // method.
+    let header = params
+        .signing_key_id
+        .or(key_scope_id)
+        .map_or_else(UcanHeader::new, UcanHeader::with_kid);
 
     // Build facts — merge scp_key_scope into existing facts when key_scope
     // is present (ADR-039 acceptance criterion 6).
@@ -718,7 +728,7 @@ pub async fn delegate_ucan(
     custody: &impl KeyCustody,
     clock: &dyn Clock,
 ) -> Result<UcanToken, UcanError> {
-    validate_key_scope(params.key_scope.as_ref())?;
+    let key_scope_id = decode_key_scope(params.key_scope.as_ref())?;
     reject_self_delegation_without_scope(
         params.delegator_did,
         params.delegatee_did,
@@ -795,23 +805,15 @@ pub async fn delegate_ucan(
 
     // Build header — include kid when signing_key_id or key_scope is present
     // (ADR-039). signing_key_id takes precedence.
-    // `key_scope` is a free JSON string an issuer writes into
-    // `fct.scp_key_scope`, and `UcanHeader.kid` is a `SigningKeyId`, so a
-    // scope naming anything outside `#active` and `#agent` writes no `kid`.
-    // Step 5b then rejects the token, because a header carrying no `kid` reads
-    // `#active` and that fragment does not match the scope. That is the
-    // fail-closed direction: an issuer cannot mint a token whose header names a
-    // method the protocol does not admit.
-    let header = params.signing_key_id.map_or_else(
-        || {
-            params
-                .key_scope
-                .as_deref()
-                .and_then(scp_did::SigningKeyId::from_fragment)
-                .map_or_else(UcanHeader::new, UcanHeader::with_kid)
-        },
-        UcanHeader::with_kid,
-    );
+    // `signing_key_id` names the method that signs; `key_scope` names the
+    // method a delegation binds to. `signing_key_id` wins when both are
+    // present. `decode_key_scope` already rejected a scope naming any other
+    // method, so a header this builds and the facts below always name the same
+    // method.
+    let header = params
+        .signing_key_id
+        .or(key_scope_id)
+        .map_or_else(UcanHeader::new, UcanHeader::with_kid);
 
     // Build facts — merge scp_key_scope into existing facts when key_scope
     // is present (ADR-039).
@@ -2713,9 +2715,50 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("'#'")),
-            "key_scope without '#' prefix must be rejected: {err:?}"
+            matches!(err, UcanError::MalformedToken(ref msg)
+                if msg.contains("operational verification method")),
+            "key_scope without a '#' prefix must be rejected: {err:?}"
         );
+    }
+
+    /// A `key_scope` naming a verification method outside `#active` and
+    /// `#agent` is rejected at mint time.
+    ///
+    /// An earlier gate admitted any string starting with `#`, so `"#0"` and
+    /// `"#retired-1"` minted a signed token whose header named `#active` — the
+    /// method a missing `kid` reads — while its facts named the rejected one.
+    /// Step 5b then refused that token at every verifier, so minting reported
+    /// success for a token nothing accepts.
+    #[tokio::test]
+    async fn mint_ucan_rejects_a_key_scope_naming_a_non_operational_method() {
+        let (custody, key_handle, issuer_did) = setup_custody().await;
+        let caps = vec!["messages:write".to_owned()];
+
+        for scope in ["#0", "#retired-1", "#retired-agent-1", "#unknown"] {
+            let params = MintParams {
+                issuer_did: &issuer_did,
+                issuer_key: &key_handle,
+                audience_did: "did:dht:z6MkMember",
+                context_id: "ctx-1",
+                capabilities: &caps,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: vec![],
+                facts: None,
+                key_scope: Some(scope.to_owned()),
+                signing_key_id: None,
+                ceiling: None,
+            };
+
+            let err = mint_ucan(&params, &custody, &scp_clock::SystemClock)
+                .await
+                .expect_err("a key_scope naming a non-operational method must be rejected");
+            assert!(
+                matches!(err, UcanError::MalformedToken(ref msg)
+                    if msg.contains("operational verification method")),
+                "key_scope {scope} must be rejected at mint time: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2765,7 +2808,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, UcanError::MalformedToken(ref msg) if msg.contains("'#'")),
+            matches!(err, UcanError::MalformedToken(ref msg)
+                if msg.contains("operational verification method")),
             "delegate_ucan must reject key_scope without '#' prefix: {err:?}"
         );
     }

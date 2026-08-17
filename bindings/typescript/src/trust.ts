@@ -248,7 +248,6 @@ const SIGNATURE_CHAIN_PREFIXES: readonly string[] = [
   "malformed token: network unavailable",
   "malformed token: DID revoked/downgraded",
   "malformed token: verification method",
-  "malformed token: unrecognized signing key ID",
   "malformed token: z-base-32 decode failed",
   "malformed token: DID public key must be 32 bytes",
   "malformed token: hex decode failed",

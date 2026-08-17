@@ -601,9 +601,8 @@ fn verify_bridge_jwt(
     // `authentication`. `signing_key_for` reads the document's own array, so a
     // key an owner rotated out supplies none: ADR-003, DID creation, item 4a
     // moves both relationship references to the new key and retains the old one
-    // as `#retired-{sequence}` for audit. §9.7.1 check 1 of the security-model
-    // spec states the verifier obligation that follows, and §9.12 makes
-    // rotation the revocation act.
+    // as `#retired-{sequence}` for audit, and §9.12 of the security-model spec
+    // makes that rotation the revocation act.
     //
     // The two steps cover disjoint inputs. Step 7 decides which header values
     // become a `SigningKeyId`; step 8 decides which of the two an owner still

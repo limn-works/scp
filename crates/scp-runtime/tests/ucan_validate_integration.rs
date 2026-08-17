@@ -1558,7 +1558,11 @@ async fn validate_ucan_accepts_self_delegation_with_key_scope() {
     // the default and the kid_keys paths.
     let resolver = InMemoryDidResolver {
         keys: std::iter::once((issuer_did.clone(), pk_bytes)).collect(),
-        kid_keys: std::iter::once(((issuer_did.clone(), "#active".to_owned()), pk_bytes)).collect(),
+        kid_keys: std::iter::once((
+            (issuer_did.clone(), scp_did::SigningKeyId::Active),
+            pk_bytes,
+        ))
+        .collect(),
     };
     let mut nonce_tracker = InMemoryNonceTracker::new();
     let revocation_checker = InMemoryRevocationChecker::new();
@@ -1626,7 +1630,8 @@ async fn validate_ucan_accepts_matching_key_scope() {
     // Register the agent key under the kid_keys resolver.
     let resolver = InMemoryDidResolver {
         keys: std::iter::once((issuer_did.clone(), pk_active)).collect(),
-        kid_keys: std::iter::once(((issuer_did.clone(), "#agent".to_owned()), pk_agent)).collect(),
+        kid_keys: std::iter::once(((issuer_did.clone(), scp_did::SigningKeyId::Agent), pk_agent))
+            .collect(),
     };
     let mut nonce_tracker = InMemoryNonceTracker::new();
     let revocation_checker = InMemoryRevocationChecker::new();
@@ -1687,7 +1692,7 @@ async fn validate_ucan_rejects_mismatched_key_scope() {
     let resolver = InMemoryDidResolver {
         keys: std::iter::once((issuer_did.clone(), pk_active)).collect(),
         kid_keys: std::iter::once((
-            (issuer_did.clone(), "#agent".to_owned()),
+            (issuer_did.clone(), scp_did::SigningKeyId::Agent),
             pk_agent, // Different from the key that actually signed
         ))
         .collect(),
@@ -1805,7 +1810,7 @@ async fn validate_ucan_scoped_ucan_cannot_be_exercised_by_wrong_key() {
     let resolver = InMemoryDidResolver {
         keys: std::iter::once((issuer_did.clone(), pk_active)).collect(),
         kid_keys: std::iter::once((
-            (issuer_did.clone(), "#agent".to_owned()),
+            (issuer_did.clone(), scp_did::SigningKeyId::Agent),
             pk_real_agent, // Different from the key that actually signed
         ))
         .collect(),

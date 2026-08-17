@@ -1618,7 +1618,11 @@ async fn ucan_kid_scope_mismatch_rejected() {
     resolver_keys_with_agent.insert(issuer_did.clone(), issuer_pk);
     let did_resolver_2 = InMemoryDidResolver {
         keys: resolver_keys_with_agent,
-        kid_keys: std::iter::once(((issuer_did.clone(), "#agent".to_owned()), issuer_pk)).collect(),
+        kid_keys: std::iter::once((
+            (issuer_did.clone(), scp_did::SigningKeyId::Agent),
+            issuer_pk,
+        ))
+        .collect(),
     };
     let revocation_checker_2 = InMemoryRevocationChecker::new();
     let proof_resolver_2 = InMemoryProofResolver::new();

@@ -1372,7 +1372,7 @@ Agent key compromise (most common case — agent runtime is less secure than dev
 3. `DidDht::create()` generates an optional fourth keypair for the agent signing key.
 4. `add_agent_key()`, `remove_agent_key()`, `rotate_agent_key()` methods on `DidDocument`.
 5. `ScpCredential` includes `signing_key_id: SigningKeyId` field; serialization round-trips correctly.
-6. `UcanHeader` includes optional `kid: String` field; `MintParams` includes optional `key_scope: String`.
+6. `UcanHeader` includes an optional `kid: Option<SigningKeyId>` field, so a JWT header naming any verification method outside `#active` and `#agent` fails to parse and no reader downstream decodes a fragment string. It serializes as the same `"#active"` / `"#agent"` string a `kid` header carries on the wire. `MintParams` includes an optional `key_scope: Option<String>`, because `fct.scp_key_scope` is a free JSON facts value rather than a header field; a minter decodes it through `SigningKeyId::from_fragment` and rejects a scope naming any other method, so a header and the facts beside it always name the same one.
 7. UCAN validation step 5b: if `fct.scp_key_scope` exists, verify the presenting key matches.
 8. Self-delegation (`iss == aud` with `key_scope`) is explicitly valid.
 9. `MintSpendingParams` uses `{ did, key_scope }` instead of `{ issuer_did, agent_did }`.
