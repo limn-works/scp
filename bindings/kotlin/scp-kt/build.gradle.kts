@@ -89,7 +89,16 @@ detekt {
 //
 // detekt 1.23 deprecated the `build.excludes` YAML key, so the
 // exclusion lives on the Gradle task instead.
+//
+// detekt also declares the whole main source tree as an input, and that tree
+// contains `generateUniffiBindings`' output directory. Gradle rejects a task
+// that reads another task's declared output without an ordering edge, so
+// `./gradlew detekt test` failed with an implicit-dependency validation error
+// once the generated bindings existed on disk. `dependsOn` states the edge
+// Gradle asked for, and it matches the `compileKotlin` edge below: detekt
+// analyses the same regenerated tree the compiler sees.
 tasks.withType<io.gitlab.arturbosch.detekt.Detekt>().configureEach {
+    dependsOn("generateUniffiBindings")
     exclude("**/internal/uniffi/**")
 }
 
@@ -101,6 +110,15 @@ ktlint {
     filter {
         exclude { element -> element.file.path.contains("/internal/uniffi/") }
     }
+}
+
+// Every ktlint task reads the same main source tree detekt reads, so Gradle
+// rejects it for the same missing ordering edge. Name-matching covers the
+// check and format tasks the plugin generates per source set
+// (`runKtlintCheckOverMainSourceSet`, `runKtlintFormatOverTestSourceSet`, and
+// their siblings) without naming each one.
+tasks.matching { it.name.startsWith("runKtlint") }.configureEach {
+    dependsOn("generateUniffiBindings")
 }
 
 // ---------------------------------------------------------------------------

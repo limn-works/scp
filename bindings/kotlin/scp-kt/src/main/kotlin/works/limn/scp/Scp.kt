@@ -1223,6 +1223,32 @@ class SCP internal constructor(
             tags = tags,
         )
 
+    /**
+     * Adds an `#agent` signing key to [identity] (ADR-039).
+     *
+     * UniFFI exports `add_agent_key` as a method on the `Identity` object
+     * rather than on `Scp` (`crates/scp-ffi/uniffi/src/bridge.rs`, `pub async
+     * fn add_agent_key(self: Arc<Self>)`), so this forwarder calls
+     * [uniffi.scp.Identity.addAgentKey] on [identity] instead of routing
+     * through [inner]. ADR-048 §7 states that the Kotlin SDK surfaces a helper
+     * as a method on `SCP` whatever the underlying export's shape is, so the
+     * operation belongs here; [identityResolve] sits here on the same rule
+     * while calling a UniFFI free function. The operation rewrites
+     * [identity]'s own retained custody and DID document and takes no
+     * instance argument, so no handle-affinity check applies to it.
+     *
+     * The method name matches the Python SDK's `SCP.identity_add_agent_key`
+     * and the TypeScript SDK's `SCP.identityAddAgentKey`, and it matches the
+     * `Identity/add_agent_key` row of
+     * `.docs/standards/sdk-capability-matrix.json`.
+     *
+     * @param identity Identity handle from [identityCreate] or [identityLoad].
+     * @return A new identity handle carrying the agent key.
+     * @throws uniffi.scp.ScpException.Identity if [identity] already has an
+     *   agent key, retains no key custody, or the DHT publish fails.
+     */
+    suspend fun identityAddAgentKey(identity: Identity): Identity = identity.addAgentKey()
+
     /** Forwards to [NativeScp.identityAttestDevice] on [inner]. */
     suspend fun identityAttestDevice(identity: Identity): String = inner.identityAttestDevice(identity = identity)
 
@@ -1302,6 +1328,22 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.identityMigrate] on [inner]. */
     suspend fun identityMigrate(identity: Identity): Identity = inner.identityMigrate(identity = identity)
 
+    /**
+     * Removes the `#agent` signing key from [identity] (ADR-039).
+     *
+     * UniFFI exports `remove_agent_key` as a method on the `Identity` object
+     * rather than on `Scp`, so this forwarder calls
+     * [uniffi.scp.Identity.removeAgentKey] on [identity] instead of routing
+     * through [inner]. See [identityAddAgentKey] for why the operation carries
+     * no instance argument.
+     *
+     * @param identity Identity handle from [identityCreate] or [identityLoad].
+     * @return A new identity handle without an agent key.
+     * @throws uniffi.scp.ScpException.Identity if [identity] has no agent key,
+     *   retains no key custody, or the DHT publish fails.
+     */
+    suspend fun identityRemoveAgentKey(identity: Identity): Identity = identity.removeAgentKey()
+
     /** Forwards to [NativeScp.identityRemoveLinkAttestation] on [inner]. */
     fun identityRemoveLinkAttestation(
         did: String,
@@ -1333,6 +1375,22 @@ class SCP internal constructor(
      * [uniffi.scp.identityResolve]. ADR-048 §1 + §7 Kotlin bullet.
      */
     suspend fun identityResolve(did: String): DidDocument = uniffi.scp.identityResolve(did = did)
+
+    /**
+     * Rotates the `#agent` signing key on [identity] (ADR-039).
+     *
+     * UniFFI exports `rotate_agent_key` as a method on the `Identity` object
+     * rather than on `Scp`, so this forwarder calls
+     * [uniffi.scp.Identity.rotateAgentKey] on [identity] instead of routing
+     * through [inner]. See [identityAddAgentKey] for why the operation carries
+     * no instance argument.
+     *
+     * @param identity Identity handle from [identityCreate] or [identityLoad].
+     * @return A new identity handle carrying the replacement agent key.
+     * @throws uniffi.scp.ScpException.Identity if [identity] has no agent key
+     *   to rotate, retains no key custody, or the DHT publish fails.
+     */
+    suspend fun identityRotateAgentKey(identity: Identity): Identity = identity.rotateAgentKey()
 
     /**
      * Routes through the UniFFI-generated free function

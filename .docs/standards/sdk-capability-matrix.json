@@ -1961,71 +1961,101 @@
           "name": "relay_start_in_memory",
           "python": true,
           "typescript": true,
-          "kotlin": true,
-          "swift": true
+          "kotlin": false,
+          "swift": true,
+          "exemptions": {
+            "kotlin": "not implemented in scp-kt: `ServerBindings.relayStartInMemory` is declared and no production class implements `ServerBindings` (the only implementer is `StubServerBindings` in the test source set). scp-kt is a plain JVM library where a relay IS implementable, so this cell records an unwritten implementation, not a platform limit. The Android module scp-kt-android depends on scp-kt and is not a relay or node environment: a phone sits behind carrier CGNAT with no routable address, and Doze plus background-execution limits kill a persistent listener. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later.\" Whoever writes the implementation flips this cell back to true and deletes this exemption."
+          }
         },
         {
           "name": "relay_start_local",
           "python": true,
           "typescript": true,
-          "kotlin": true,
-          "swift": true
+          "kotlin": false,
+          "swift": true,
+          "exemptions": {
+            "kotlin": "not implemented in scp-kt: `ServerBindings.relayStartLocal` is declared and no production class implements `ServerBindings` (the only implementer is `StubServerBindings` in the test source set). scp-kt is a plain JVM library where a relay IS implementable, so this cell records an unwritten implementation, not a platform limit. The Android module scp-kt-android depends on scp-kt and is not a relay or node environment: a phone sits behind carrier CGNAT with no routable address, and Doze plus background-execution limits kill a persistent listener. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later.\" Whoever writes the implementation flips this cell back to true and deletes this exemption."
+          }
         },
         {
           "name": "relay_shutdown",
           "python": true,
           "typescript": true,
-          "kotlin": true,
-          "swift": true
+          "kotlin": false,
+          "swift": true,
+          "exemptions": {
+            "kotlin": "not implemented in scp-kt: `ServerBindings.relayShutdown` is declared and no production class implements `ServerBindings` (the only implementer is `StubServerBindings` in the test source set). scp-kt is a plain JVM library where a relay IS implementable, so this cell records an unwritten implementation, not a platform limit. The Android module scp-kt-android depends on scp-kt and is not a relay or node environment: a phone sits behind carrier CGNAT with no routable address, and Doze plus background-execution limits kill a persistent listener. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later.\" Whoever writes the implementation flips this cell back to true and deletes this exemption."
+          }
         },
         {
           "name": "node_start_in_memory",
           "python": true,
           "typescript": true,
-          "kotlin": true,
-          "swift": true
+          "kotlin": false,
+          "swift": true,
+          "exemptions": {
+            "kotlin": "not implemented in scp-kt: `ServerBindings.nodeStartInMemory` is declared and no production class implements `ServerBindings` (the only implementer is `StubServerBindings` in the test source set). scp-kt is a plain JVM library where a relay IS implementable, so this cell records an unwritten implementation, not a platform limit. The Android module scp-kt-android depends on scp-kt and is not a relay or node environment: a phone sits behind carrier CGNAT with no routable address, and Doze plus background-execution limits kill a persistent listener. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later.\" Whoever writes the implementation flips this cell back to true and deletes this exemption."
+          }
         },
         {
           "name": "node_start_local",
           "python": true,
           "typescript": true,
-          "kotlin": true,
-          "swift": true
+          "kotlin": false,
+          "swift": true,
+          "exemptions": {
+            "kotlin": "not implemented in scp-kt: `ServerBindings.nodeStartLocal` is declared and no production class implements `ServerBindings` (the only implementer is `StubServerBindings` in the test source set). scp-kt is a plain JVM library where a relay IS implementable, so this cell records an unwritten implementation, not a platform limit. The Android module scp-kt-android depends on scp-kt and is not a relay or node environment: a phone sits behind carrier CGNAT with no routable address, and Doze plus background-execution limits kill a persistent listener. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later.\" Whoever writes the implementation flips this cell back to true and deletes this exemption."
+          }
         },
         {
           "name": "node_shutdown",
           "python": true,
           "typescript": true,
-          "kotlin": true,
-          "swift": true
+          "kotlin": false,
+          "swift": true,
+          "exemptions": {
+            "kotlin": "not implemented in scp-kt: `ServerBindings.nodeShutdown` is declared and no production class implements `ServerBindings` (the only implementer is `StubServerBindings` in the test source set). scp-kt is a plain JVM library where a relay IS implementable, so this cell records an unwritten implementation, not a platform limit. The Android module scp-kt-android depends on scp-kt and is not a relay or node environment: a phone sits behind carrier CGNAT with no routable address, and Doze plus background-execution limits kill a persistent listener. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later.\" Whoever writes the implementation flips this cell back to true and deletes this exemption."
+          }
         },
         {
           "name": "node_enable_site_projection",
           "python": true,
           "typescript": true,
-          "kotlin": true,
-          "swift": true
+          "kotlin": false,
+          "swift": true,
+          "exemptions": {
+            "kotlin": "not implemented in scp-kt: `ServerBindings.nodeEnableSiteProjection` is declared and no production class implements `ServerBindings` (the only implementer is `StubServerBindings` in the test source set). scp-kt is a plain JVM library where a relay IS implementable, so this cell records an unwritten implementation, not a platform limit. The Android module scp-kt-android depends on scp-kt and is not a relay or node environment: a phone sits behind carrier CGNAT with no routable address, and Doze plus background-execution limits kill a persistent listener. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later.\" Whoever writes the implementation flips this cell back to true and deletes this exemption."
+          }
         },
         {
           "name": "node_commit_deploy",
           "python": true,
           "typescript": true,
-          "kotlin": true,
-          "swift": true
+          "kotlin": false,
+          "swift": true,
+          "exemptions": {
+            "kotlin": "not implemented in scp-kt: `ServerBindings.nodeCommitDeploy` is declared and no production class implements `ServerBindings` (the only implementer is `StubServerBindings` in the test source set). scp-kt is a plain JVM library where a relay IS implementable, so this cell records an unwritten implementation, not a platform limit. The Android module scp-kt-android depends on scp-kt and is not a relay or node environment: a phone sits behind carrier CGNAT with no routable address, and Doze plus background-execution limits kill a persistent listener. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later.\" Whoever writes the implementation flips this cell back to true and deletes this exemption."
+          }
         },
         {
           "name": "node_rollback_deploy",
           "python": true,
           "typescript": true,
-          "kotlin": true,
-          "swift": true
+          "kotlin": false,
+          "swift": true,
+          "exemptions": {
+            "kotlin": "not implemented in scp-kt: `ServerBindings.nodeRollbackDeploy` is declared and no production class implements `ServerBindings` (the only implementer is `StubServerBindings` in the test source set). scp-kt is a plain JVM library where a relay IS implementable, so this cell records an unwritten implementation, not a platform limit. The Android module scp-kt-android depends on scp-kt and is not a relay or node environment: a phone sits behind carrier CGNAT with no routable address, and Doze plus background-execution limits kill a persistent listener. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later.\" Whoever writes the implementation flips this cell back to true and deletes this exemption."
+          }
         },
         {
           "name": "node_disable_site_projection",
           "python": true,
           "typescript": true,
-          "kotlin": true,
-          "swift": true
+          "kotlin": false,
+          "swift": true,
+          "exemptions": {
+            "kotlin": "not implemented in scp-kt: `ServerBindings.nodeDisableSiteProjection` is declared and no production class implements `ServerBindings` (the only implementer is `StubServerBindings` in the test source set). scp-kt is a plain JVM library where a relay IS implementable, so this cell records an unwritten implementation, not a platform limit. The Android module scp-kt-android depends on scp-kt and is not a relay or node environment: a phone sits behind carrier CGNAT with no routable address, and Doze plus background-execution limits kill a persistent listener. Alec ruled on 2026-08-17: \"let's keep kotlin false but not forever. we can add impls later.\" Whoever writes the implementation flips this cell back to true and deletes this exemption."
+          }
         }
       ]
     },
