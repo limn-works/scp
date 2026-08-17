@@ -45,6 +45,14 @@ def register(
     governance_did: str,
     platform: str,
     mode: BridgeMode | str,
+    *,
+    webhook_url: str | None = None,
+    platform_key: bytes | None = None,
+    platform_key_id: str | None = None,
+    max_shadows: int = 10_000,
+    display_name: str = "",
+    description: str = "",
+    operator_contact: str = "",
 ) -> dict[str, Any]:
     """Register a bridge connector with a context.
 
@@ -61,20 +69,53 @@ def register(
         mode: Bridge mode.  Accepts a :class:`~scp_sdk.types.BridgeMode`
             enum member or a raw string (``"relay"``, ``"puppet"``,
             ``"api"``, or ``"cooperative"``).
+        webhook_url: Cooperative mode only -- the platform's webhook
+            receiver URL (spec 12.2.1).
+        platform_key: Cooperative mode only -- the platform's 32-byte
+            Ed25519 webhook signing key (spec 12.2.1, 12.10.2).
+        platform_key_id: Cooperative mode only -- the platform's identifier
+            for *platform_key*.  The platform sends it in
+            ``X-SCP-Platform-Key-Id`` on every webhook request, and every
+            webhook signature covers it (spec 12.10.2).  Spec 12.2.1 accepts
+            1--128 bytes of printable US-ASCII.
+        max_shadows: Governance-configured shadow limit for this bridge.
+        display_name: Human-readable name for this bridge.
+        description: Free-text description of what this bridge carries.
+        operator_contact: How to reach this bridge's operator.
+
+    Cooperative mode requires *platform_key* and *platform_key_id* together,
+    and every other mode rejects both (spec 12.2.1).  A cooperative bridge
+    registered without both values could never verify a webhook signature.
 
     Returns:
         A dict with ``bridge_id``, ``operator_did``, ``platform``,
         ``mode``, ``status``, ``context_id``.
 
     Raises:
-        ValidationError: If *mode* is not recognized.
-        ContextError: If registration or approval fails (including
-            self-approval).
+        ValidationError: If *mode* is not recognized or *platform_key* is
+            not 32 bytes.
+        ContextError: If registration or approval fails -- self-approval, a
+            cooperative registration missing key material, a non-cooperative
+            registration carrying key material, or an unusable
+            *platform_key_id*.
     """
     bridge = _bridge()
     mode_str = mode.value if isinstance(mode, BridgeMode) else mode
     return dict(
-        bridge.bridge_register(context_id, operator_did, governance_did, platform, mode_str)
+        bridge.bridge_register(
+            context_id,
+            operator_did,
+            governance_did,
+            platform,
+            mode_str,
+            webhook_url,
+            platform_key,
+            platform_key_id,
+            max_shadows,
+            display_name,
+            description,
+            operator_contact,
+        )
     )
 
 
