@@ -67,7 +67,20 @@ RegisterBridge {
 
 1. The bridge operator submits a `RegisterBridge` proposal to the context via the standard governance mechanism (§5.9). The operator MUST be a context member or hold a valid UCAN granting `bridging` capability in the context.
 2. The context's governance model processes the proposal (SingleAdmin: admin approves; Threshold/MajorityVote/Unanimity: members vote).
-3. On approval, the context emits a `BridgeRegistered` event in the Merkle event log containing the full `RegisterBridge` payload, the approving governance action ID, and the assigned `bridge_id` (lowercase hex-encoded SHA-256 of `context_id || operator_did || platform || timestamp`). The result is a 64-character hex string carried as `String` on the wire (see §12.12).
+3. On approval, the context emits a `BridgeRegistered` event in the Merkle event log containing the full `RegisterBridge` payload, the approving governance action ID, and the assigned `bridge_id`. That identifier is the lowercase hex-encoded SHA-256 of a **length-prefixed** concatenation:
+
+   ```
+   u64_be(len(context_id))  || context_id
+   u64_be(len(operator_did)) || operator_did
+   u64_be(len(platform))     || platform
+   u64_be(requested_at)
+   ```
+
+   Every length and the timestamp are eight big-endian bytes. `requested_at` comes from that request, not from approval, because a pending request is keyed on its own identifier before any approval timestamp exists.
+
+   A length prefix is what makes this derivation injective. Concatenating three variable-length strings without one lets two different registrations produce one identifier: context `ctx-a` with operator `bc` and context `ctx-ab` with operator `c` flatten to the same bytes. A bridge identifier decides which context a request acts inside and which operator a token must come from, so two registrations sharing one identifier would let either reach the other's scope. §12.10.2's signed webhook payload separates its segments for the same reason.
+
+   The result is a 64-character hex string carried as `String` on the wire (see §12.12). Submission MUST reject a request whose `bridge_id` differs from that derivation, so one identifier names exactly one registration and no caller picks an identifier that a different context, operator, platform, or request time derives.
 4. The context metadata is republished with the new bridge in the `bridges` structural field (§5.7).
 5. For cooperative mode: the bridge node stores `platform_key` under `platform_key_id`, associated with this bridge instance, and verifies webhook signatures against it (§12.10.2).
 
@@ -739,6 +752,10 @@ The `context.event` generic fallback carries only the variant name so that new `
 The bridge node mediates between the platform's HTTP API and SCP protocol operations. The lifecycle is:
 
 1. **Registration.** A bridge operator registers a bridge with an SCP context via `register_bridge()` (§12.2). That registration carries a platform webhook URL and authentication credentials. Once governance approves it, that operator admits an approved registration into whichever bridge node serves those endpoints, and that node stores three records: an approved `BridgeConnector`, an operator DID document that §12.10.2 bearer-token verification resolves `iss` against, and, for cooperative mode, `platform_key` under `platform_key_id`. A bridge node that holds no such record for a bridge answers `BRIDGE_NOT_AUTHORIZED` (401) to every request naming it, so admission is what turns an approved registration into a bridge a platform can reach.
+
+   **A bridge node MUST decide a lifecycle question from durable storage, not from a cache.** §12.2.1 makes `Revoked` terminal and §12.2.2 step 6 destroys a revoked bridge's signing keys, and both guarantees rest on a node reading a record it already holds. A node that cannot read its bridge registry MUST fail to start rather than serve those endpoints against a record set it knows is incomplete, because an admission decided against an empty view returns a revoked bridge to `Active` and moves one bridge's `platform_key_id` onto a second bridge.
+
+   **A bridge node MUST NOT substitute key material through admission.** Re-admitting a registration a node already holds is how an operator replays after a partial failure or a restart, so it carries a stored lifecycle status forward and changes nothing. A registration that carries different key material under a stored `platform_key_id` is a rotation, and §12.10.2 step 5 routes a rotation through `UpdateBridgePlatformKey`, so admission rejects it.
 2. **Shadow creation.** The bridge node calls `POST /v1/scp/bridge/shadow` to create shadow identities for platform participants as they become relevant to the context.
 3. **Bidirectional message flow.** SCP-to-platform: the bridge operator receives and decrypts SCP messages as an MLS group member, translates them to the platform's native format, and forwards them via the platform's API (§12.10.5). Platform-to-SCP: the platform pushes events via the webhook endpoint, and the bridge node constructs SCP envelopes with bridge provenance (§12.10.4).
 4. **Attestation.** The platform attests to user identities via `POST /v1/scp/bridge/attest`. These attestations strengthen the trust evaluation for cooperative-mode shadows.
@@ -921,6 +938,7 @@ This section tabulates the wire format for all bridge protocol types that cross 
 | `status` | `BridgeStatus` | Yes | Current lifecycle state. |
 | `registration_context` | `String` | Yes | Context ID where the bridge is registered. |
 | `registered_at` | `u64` | Yes | Unix timestamp (seconds). |
+| `max_shadows` | `u32` | Yes | Governance-configured shadow limit, copied from the approved `RegisterBridge` request (§12.2.1). Shadow creation MUST count a bridge's own shadows against this limit rather than against a registry default. |
 
 ### 12.12.2 Bridge Registration
 
@@ -928,7 +946,7 @@ This section tabulates the wire format for all bridge protocol types that cross 
 
 | Field | Type | Required | Semantics |
 |-------|------|----------|-----------|
-| `bridge_id` | `String` | Yes | Proposed bridge identifier. |
+| `bridge_id` | `String` | Yes | Bridge identifier, derived per §12.2.1 step 3 as lowercase hex SHA-256 over a length-prefixed concatenation of `context_id`, `operator_did`, `platform`, and `requested_at`. A request carrying any other value MUST be rejected, so no caller picks an identifier. |
 | `operator_did` | `String` (DID) | Yes | Operator's DID. |
 | `platform` | `String` | Yes | Target platform. |
 | `mode` | `BridgeMode` | Yes | Requested operating mode. |

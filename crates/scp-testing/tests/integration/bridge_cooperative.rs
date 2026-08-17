@@ -49,6 +49,7 @@ fn make_connector(platform: &str, mode: BridgeMode) -> BridgeConnector {
         status: BridgeStatus::Active,
         registration_context: "ctx-reg".to_string(),
         registered_at: 1_700_000_000,
+        max_shadows: 10_000,
     }
 }
 
@@ -149,6 +150,7 @@ async fn bridge_connector_construction() {
         status: BridgeStatus::Active,
         registration_context: "ctx-abc123".to_string(),
         registered_at: 1_700_000_000,
+        max_shadows: 10_000,
     };
 
     assert_eq!(connector.bridge_id, "bridge-construct-001");
