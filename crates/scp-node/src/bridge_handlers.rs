@@ -252,6 +252,29 @@ pub struct AttestResponse {
 /// Default attestation TTL: 24 hours in seconds.
 const ATTESTATION_TTL_SECS: u64 = 86_400;
 
+/// Returns a 400 response carrying spec §12.10.3's `INVALID_REQUEST` code.
+///
+/// Every bridge endpoint reports a malformed request body under that code,
+/// which §12.10.3's error table pairs with HTTP 400. `ApiError::bad_request`
+/// answers `BAD_REQUEST` instead, which no §12.10.3 row defines, so bridge
+/// handlers use this helper.
+fn invalid_request(msg: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: msg.into(),
+            code: "INVALID_REQUEST".to_owned(),
+        }),
+    )
+}
+
+/// Maximum `content` size `POST /v1/scp/bridge/message` accepts, in bytes.
+///
+/// Spec §12.10.4 caps it at 262,144 bytes (256 KiB), matching a relay's default
+/// `max_blob_size` (§10), and requires a bridge node to reject a larger request
+/// before it attempts MLS envelope construction.
+const MAX_MESSAGE_CONTENT_BYTES: usize = 262_144;
+
 /// Maximum size of the processed webhook event ID dedup set (BLACK-302).
 const MAX_PROCESSED_EVENT_IDS: usize = 10_000;
 
@@ -445,10 +468,10 @@ async fn create_shadow_handler(
 ) -> impl IntoResponse {
     // Validate required fields (serde handles presence, but check emptiness).
     if body.platform_handle.is_empty() {
-        return ApiError::bad_request("platform_handle must not be empty").into_response();
+        return invalid_request("platform_handle must not be empty").into_response();
     }
     if body.platform_user_id.is_empty() {
-        return ApiError::bad_request("platform_user_id must not be empty").into_response();
+        return invalid_request("platform_user_id must not be empty").into_response();
     }
 
     let bridge_id = auth_ctx.bridge_id();
@@ -536,21 +559,21 @@ async fn attest_handler(
     Json(body): Json<AttestRequest>,
 ) -> impl IntoResponse {
     if body.platform_handle.is_empty() {
-        return ApiError::bad_request("platform_handle must not be empty").into_response();
+        return invalid_request("platform_handle must not be empty").into_response();
     }
     if body.platform_user_id.is_empty() {
-        return ApiError::bad_request("platform_user_id must not be empty").into_response();
+        return invalid_request("platform_user_id must not be empty").into_response();
     }
     if body.attestation_evidence.evidence_type.is_empty() {
-        return ApiError::bad_request("attestation_evidence.evidence_type must not be empty")
+        return invalid_request("attestation_evidence.evidence_type must not be empty")
             .into_response();
     }
     if body.attestation_evidence.verification_method.is_empty() {
-        return ApiError::bad_request("attestation_evidence.verification_method must not be empty")
+        return invalid_request("attestation_evidence.verification_method must not be empty")
             .into_response();
     }
     if !is_valid_confidence(&body.attestation_evidence.platform_confidence) {
-        return ApiError::bad_request(
+        return invalid_request(
             "attestation_evidence.platform_confidence must be \"high\", \"medium\", or \"low\"",
         )
         .into_response();
@@ -636,13 +659,21 @@ async fn emit_message_handler(
     Json(body): Json<EmitMessageRequest>,
 ) -> impl IntoResponse {
     if body.shadow_id.is_empty() {
-        return ApiError::bad_request("shadow_id must not be empty").into_response();
+        return invalid_request("shadow_id must not be empty").into_response();
     }
     if body.content.is_empty() {
-        return ApiError::bad_request("content must not be empty").into_response();
+        return invalid_request("content must not be empty").into_response();
     }
     if body.content_type.is_empty() {
-        return ApiError::bad_request("content_type must not be empty").into_response();
+        return invalid_request("content_type must not be empty").into_response();
+    }
+    // Spec §12.10.4 states this rejection message verbatim, and requires it
+    // before envelope construction.
+    if body.content.len() > MAX_MESSAGE_CONTENT_BYTES {
+        return invalid_request(format!(
+            "Content exceeds maximum size of {MAX_MESSAGE_CONTENT_BYTES} bytes"
+        ))
+        .into_response();
     }
 
     let context_id = auth_ctx.context_id().to_owned();
@@ -1015,7 +1046,7 @@ async fn webhook_handler(
         );
     }
     if body.event_id.is_empty() {
-        return ApiError::bad_request("event_id must not be empty").into_response();
+        return invalid_request("event_id must not be empty").into_response();
     }
 
     let context_id = webhook_ctx.context_id();
@@ -1576,6 +1607,66 @@ mod tests {
 
         let resp = app.oneshot(req).await.expect("test");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Spec §12.10.4 caps `content` at 262,144 bytes and states a verbatim
+    /// rejection message, and §12.10.3 pairs HTTP 400 with `INVALID_REQUEST`.
+    #[tokio::test]
+    async fn emit_message_over_the_content_limit_returns_invalid_request() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(state);
+        let req = message_request(serde_json::json!({
+            "shadow_id": shadow_id,
+            "content": "x".repeat(MAX_MESSAGE_CONTENT_BYTES + 1),
+            "content_type": "text/plain"
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(resp).await;
+        assert_eq!(body["code"], "INVALID_REQUEST");
+        assert_eq!(
+            body["error"],
+            "Content exceeds maximum size of 262144 bytes"
+        );
+    }
+
+    /// Content at exactly the §12.10.4 limit is accepted.
+    #[tokio::test]
+    async fn emit_message_at_the_content_limit_is_accepted() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(state);
+        let req = message_request(serde_json::json!({
+            "shadow_id": shadow_id,
+            "content": "x".repeat(MAX_MESSAGE_CONTENT_BYTES),
+            "content_type": "text/plain"
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    /// Every bridge 400 carries §12.10.3's `INVALID_REQUEST` code, not the
+    /// `BAD_REQUEST` code `ApiError::bad_request` produces.
+    #[tokio::test]
+    async fn a_malformed_bridge_request_carries_the_spec_error_code() {
+        let state = Arc::new(BridgeState::new());
+        let shadow_id = create_test_shadow(&state).await;
+
+        let app = test_app(state);
+        let req = message_request(serde_json::json!({
+            "shadow_id": shadow_id,
+            "content": "",
+            "content_type": "text/plain"
+        }));
+
+        let resp = app.oneshot(req).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(resp).await["code"], "INVALID_REQUEST");
     }
 
     // -----------------------------------------------------------------------

@@ -1282,6 +1282,13 @@ export function createNativeBridge(scp: SCP): Bridge {
       governanceDid: string,
       platform: string,
       mode: BridgeMode,
+      webhookUrl: string | undefined,
+      platformKey: Uint8Array | undefined,
+      platformKeyId: string | undefined,
+      maxShadows: number | undefined,
+      displayName: string | undefined,
+      description: string | undefined,
+      operatorContact: string | undefined,
     ) {
       // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
       const raw = (
@@ -1291,6 +1298,13 @@ export function createNativeBridge(scp: SCP): Bridge {
           g: string,
           p: string,
           m: BridgeMode,
+          webhookUrl?: string,
+          platformKey?: Uint8Array,
+          platformKeyId?: string,
+          maxShadows?: number,
+          displayName?: string,
+          description?: string,
+          operatorContact?: string,
         ) => {
           bridgeId: string;
           operatorDid: string;
@@ -1299,7 +1313,20 @@ export function createNativeBridge(scp: SCP): Bridge {
           status: string;
           contextId: string;
         }
-      )(contextId, operatorDid, governanceDid, platform, mode);
+      )(
+        contextId,
+        operatorDid,
+        governanceDid,
+        platform,
+        mode,
+        webhookUrl,
+        platformKey,
+        platformKeyId,
+        maxShadows,
+        displayName,
+        description,
+        operatorContact,
+      );
       return {
         bridge_id: raw.bridgeId,
         operator_did: raw.operatorDid,

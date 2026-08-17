@@ -31,7 +31,8 @@ use axum::response::IntoResponse;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
-use scp_core::bridge::{BridgeConnector, BridgeStatus};
+use scp_core::bridge::registration::ApprovedRegistration;
+use scp_core::bridge::{BridgeConnector, BridgeMode, BridgeStatus};
 use scp_core::store::ProtocolRepository;
 use scp_did::{DidDocument, decode_multibase_key};
 use scp_platform::traits::Storage;
@@ -236,6 +237,111 @@ impl WebhookAuthContext {
 }
 
 // ---------------------------------------------------------------------------
+// Bridge admission errors
+// ---------------------------------------------------------------------------
+
+/// Errors a node returns while admitting or retiring a bridge registration.
+///
+/// Spec §12.10.6 step 1 makes admission the step that turns a
+/// governance-approved registration into a bridge a platform can reach, so
+/// every rejection here leaves that bridge unreachable rather than half-wired.
+#[derive(Debug, thiserror::Error)]
+pub enum BridgeAdmissionError {
+    /// A storage read or write failed.
+    #[error("bridge admission storage error: {0}")]
+    Storage(#[from] scp_platform::PlatformError),
+
+    /// The supplied DID document does not belong to the bridge operator.
+    ///
+    /// Bearer-token verification (§12.10.2) resolves a JWT `iss` against a
+    /// stored DID document, so storing a document under one operator's name
+    /// while it carries another operator's keys would admit that other
+    /// operator's tokens.
+    #[error(
+        "operator DID document {document_did} does not match bridge {bridge_id}, \
+         whose operator is {operator_did}"
+    )]
+    OperatorDocumentMismatch {
+        /// The `id` the supplied document carries.
+        document_did: String,
+        /// The bridge being admitted.
+        bridge_id: String,
+        /// The operator that bridge's registration names.
+        operator_did: String,
+    },
+
+    /// A webhook key identifier already names a different bridge.
+    ///
+    /// Spec §12.10.2 platform-key registration step 3 rejects this rebinding,
+    /// because one identifier naming two bridges leaves a node unable to
+    /// decide which context a signed webhook request acts inside.
+    #[error(
+        "webhook key id {key_id} already names bridge {bound_bridge_id}, \
+         so bridge {requesting_bridge_id} cannot claim it"
+    )]
+    WebhookKeyIdBoundElsewhere {
+        /// The contested key identifier.
+        key_id: String,
+        /// The bridge that identifier already names.
+        bound_bridge_id: String,
+        /// The bridge asking for that identifier.
+        requesting_bridge_id: String,
+    },
+
+    /// The named bridge is revoked, and spec §12.2.1 makes `Revoked` terminal.
+    #[error("bridge {bridge_id} is revoked, which spec 12.2.1 makes terminal")]
+    BridgeRevoked {
+        /// The revoked bridge.
+        bridge_id: String,
+    },
+
+    /// A status change named a bridge this node never admitted.
+    #[error("bridge {bridge_id} is not registered on this node")]
+    BridgeNotRegistered {
+        /// The bridge that no stored record names.
+        bridge_id: String,
+    },
+
+    /// A second registration reused an admitted bridge id while naming a
+    /// different operator, context, platform, or mode.
+    ///
+    /// Spec §12.2.1 derives a bridge id from a context, an operator DID, a
+    /// platform, and a timestamp, so one id names one registration. Admitting a
+    /// second registration under that id would hand a stored bridge to a
+    /// different operator or move it into a different context, and every
+    /// handler scopes its work by whatever that stored record names.
+    #[error(
+        "bridge {bridge_id} is already admitted naming operator {stored_operator_did} \
+         in context {stored_context_id}, so a registration naming operator \
+         {incoming_operator_did} in context {incoming_context_id} cannot reuse that id"
+    )]
+    BridgeIdentityChanged {
+        /// The contested bridge id.
+        bridge_id: String,
+        /// The operator this node's stored record names.
+        stored_operator_did: String,
+        /// The context this node's stored record names.
+        stored_context_id: String,
+        /// The operator an incoming registration names.
+        incoming_operator_did: String,
+        /// The context an incoming registration names.
+        incoming_context_id: String,
+    },
+
+    /// A cooperative registration reached admission without key material.
+    ///
+    /// `scp_protocol::bridge::registration::register_bridge` rejects such a
+    /// request, and `ApprovedRegistration` can only hold a request that passed
+    /// it, so this variant reports a broken upstream invariant rather than an
+    /// operator mistake.
+    #[error("cooperative bridge {bridge_id} carries no platform key and key identifier")]
+    CooperativeRegistrationMissingKey {
+        /// The cooperative bridge missing its key material.
+        bridge_id: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // Bridge lookup trait
 // ---------------------------------------------------------------------------
 
@@ -292,11 +398,12 @@ const BRIDGE_AUDIENCE_KEY: &str = "bridge/config/audience";
 /// cache always reflects persistent state.
 ///
 /// At node startup, call [`StorageBridgeLookup::load_from_storage`] to hydrate
-/// the cache from persisted data. Subsequent registrations via
-/// [`register_bridge`](Self::register_bridge),
-/// [`register_did_document`](Self::register_did_document), and
-/// [`register_webhook_key`](Self::register_webhook_key) keep both the cache
-/// and storage in sync.
+/// the cache from persisted data. Afterwards
+/// [`admit_registration`](Self::admit_registration) and
+/// [`set_bridge_status`](Self::set_bridge_status) keep both the cache and
+/// storage in sync, and they are the only two entry points that write a bridge
+/// connector, so every write passes the spec §12.2.1 and §12.10.2 checks those
+/// two methods apply.
 ///
 /// See spec section 12.10.2 (bridge authentication).
 pub struct StorageBridgeLookup<S: Storage> {
@@ -310,9 +417,44 @@ pub struct StorageBridgeLookup<S: Storage> {
     webhook_keys: std::sync::RwLock<HashMap<String, WebhookKeyBinding>>,
     /// The expected JWT audience (node URL).
     audience: String,
+    /// Serializes [`admit_registration`](Self::admit_registration) against
+    /// [`set_bridge_status`](Self::set_bridge_status).
+    ///
+    /// Each of those two methods reads a stored record, decides on it, and then
+    /// writes several records. Running them concurrently for one bridge lets a
+    /// revocation land between an admission's read and its writes, which would
+    /// return a bridge governance revoked to `Active` carrying a freshly stored
+    /// webhook key. Holding this lock across each whole method makes that
+    /// interleaving impossible.
+    lifecycle: tokio::sync::Mutex<()>,
 }
 
 impl<S: Storage> StorageBridgeLookup<S> {
+    /// Reads one cached bridge connector.
+    ///
+    /// [`BridgeLookup::find_bridge`] delegates here, and so does every
+    /// inherent method on this type, which needs a cache read without the
+    /// `'static` bound that trait's implementation carries.
+    fn cached_bridge(&self, bridge_id: &str) -> Option<BridgeConnector> {
+        self.bridges
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(bridge_id)
+            .cloned()
+    }
+
+    /// Reads one cached webhook key binding.
+    ///
+    /// [`BridgeLookup::find_webhook_key`] delegates here, for the same reason
+    /// [`cached_bridge`](Self::cached_bridge) exists.
+    fn cached_webhook_key(&self, key_id: &str) -> Option<WebhookKeyBinding> {
+        self.webhook_keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key_id)
+            .cloned()
+    }
+
     /// Creates a new `StorageBridgeLookup` with an empty cache.
     ///
     /// Call [`load_from_storage`](Self::load_from_storage) after construction
@@ -325,6 +467,7 @@ impl<S: Storage> StorageBridgeLookup<S> {
             did_docs: std::sync::RwLock::new(HashMap::new()),
             webhook_keys: std::sync::RwLock::new(HashMap::new()),
             audience,
+            lifecycle: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -451,12 +594,14 @@ impl<S: Storage> StorageBridgeLookup<S> {
         Ok(())
     }
 
-    /// Registers a bridge connector, persisting to storage and updating the cache.
+    /// Writes a bridge connector to storage and to the cache.
     ///
-    /// # Errors
-    ///
-    /// Returns `Err` if the storage write fails.
-    pub async fn register_bridge(
+    /// [`admit_registration`](Self::admit_registration) and
+    /// [`set_bridge_status`](Self::set_bridge_status) call this after they
+    /// check what spec §12.2.1 and §12.10.2 require, so it stays private: a
+    /// caller reaching it directly would skip an operator-document match, a
+    /// terminal-`Revoked` check, and cooperative key registration.
+    async fn store_connector(
         &self,
         connector: BridgeConnector,
     ) -> Result<(), scp_platform::PlatformError> {
@@ -471,21 +616,153 @@ impl<S: Storage> StorageBridgeLookup<S> {
         Ok(())
     }
 
-    /// Removes a bridge connector by ID.
+    /// Admits a governance-approved bridge registration onto this node.
+    ///
+    /// Spec §12.2.1 step 3 emits a `BridgeRegistered` event once context
+    /// governance approves a `RegisterBridge` proposal, and §12.10.6 step 1
+    /// makes a bridge node store that approval before a platform can reach it.
+    /// This method performs that store, writing three records:
+    ///
+    /// - `operator_document`, which §12.10.2 bearer-token verification resolves
+    ///   a JWT `iss` against;
+    /// - for cooperative mode, `platform_key` under `platform_key_id`, which
+    ///   §12.10.2 webhook verification reads;
+    /// - `connector`, which every bridge handler reads to scope its work.
+    ///
+    /// A connector lands last, so no request reaches a bridge whose operator
+    /// document or webhook key is still missing.
     ///
     /// # Errors
     ///
-    /// Returns `Err` if the storage delete fails.
-    pub async fn deregister_bridge(
+    /// Returns [`BridgeAdmissionError::OperatorDocumentMismatch`] when
+    /// `operator_document` names a DID other than the bridge operator,
+    /// [`BridgeAdmissionError::BridgeRevoked`] when a stored record already
+    /// retired this bridge id, [`BridgeAdmissionError::WebhookKeyIdBoundElsewhere`]
+    /// when another bridge already holds this key identifier,
+    /// [`BridgeAdmissionError::CooperativeRegistrationMissingKey`] when a
+    /// cooperative registration carries no key material, and
+    /// [`BridgeAdmissionError::Storage`] when a storage write fails.
+    pub async fn admit_registration(
+        &self,
+        approved: ApprovedRegistration,
+        operator_document: DidDocument,
+    ) -> Result<(), BridgeAdmissionError> {
+        // Held until this method returns, so no status change interleaves
+        // between the reads below and the writes at the end.
+        let _lifecycle = self.lifecycle.lock().await;
+
+        let (mut connector, request) = approved.into_parts();
+
+        if operator_document.id != connector.operator_did.0 {
+            return Err(BridgeAdmissionError::OperatorDocumentMismatch {
+                document_did: operator_document.id,
+                bridge_id: connector.bridge_id,
+                operator_did: connector.operator_did.to_string(),
+            });
+        }
+
+        // Re-admitting a bridge this node already holds is how an operator
+        // replays a registration after a partial failure or a restart, so it
+        // succeeds — but it changes neither who that bridge belongs to nor what
+        // lifecycle status governance last set.
+        if let Some(existing) = self.cached_bridge(&connector.bridge_id) {
+            // Spec 12.2.1 makes Revoked terminal, and 12.2.2 step 6 already
+            // destroyed that bridge's credentials, so re-admission must not
+            // restore either the record or its webhook key.
+            if existing.status == BridgeStatus::Revoked {
+                return Err(BridgeAdmissionError::BridgeRevoked {
+                    bridge_id: connector.bridge_id,
+                });
+            }
+            if existing.operator_did != connector.operator_did
+                || existing.registration_context != connector.registration_context
+                || existing.platform != connector.platform
+                || existing.mode != connector.mode
+            {
+                return Err(BridgeAdmissionError::BridgeIdentityChanged {
+                    bridge_id: connector.bridge_id,
+                    stored_operator_did: existing.operator_did.to_string(),
+                    stored_context_id: existing.registration_context,
+                    incoming_operator_did: connector.operator_did.to_string(),
+                    incoming_context_id: connector.registration_context,
+                });
+            }
+            // Governance suspends and reactivates through 12.2.2's own actions,
+            // so admission carries a stored status forward rather than
+            // returning a suspended bridge to Active.
+            connector.status = existing.status;
+        }
+
+        // A cooperative registration carries both a platform key and its
+        // identifier, because scp_protocol register_bridge rejects one that
+        // does not and ApprovedRegistration holds only a request that passed
+        // it. Reading both as Options still needs an arm for their absence,
+        // and that arm fails closed rather than admitting a cooperative bridge
+        // whose webhooks nothing could verify.
+        if connector.mode == BridgeMode::Cooperative {
+            let (Some(platform_key), Some(key_id)) =
+                (request.platform_key, request.platform_key_id.as_deref())
+            else {
+                return Err(BridgeAdmissionError::CooperativeRegistrationMissingKey {
+                    bridge_id: connector.bridge_id,
+                });
+            };
+            self.register_webhook_key(key_id, &connector.bridge_id, platform_key)
+                .await?;
+        }
+
+        self.register_did_document(operator_document).await?;
+        self.store_connector(connector).await?;
+        Ok(())
+    }
+
+    /// Moves an admitted bridge to a new lifecycle status.
+    ///
+    /// Spec §12.2.2 drives this from `SuspendBridge`, `ReactivateBridge`, and
+    /// `RevokeBridge` governance actions. Spec §12.2.1 makes `Revoked`
+    /// terminal, so a revoked bridge accepts no further transition, and
+    /// §12.2.2 step 6 destroys a revoked bridge's credentials, so a transition
+    /// to `Revoked` deletes every webhook signing key stored against it. That
+    /// step keeps the connector record itself in `Revoked` status, because
+    /// deleting it would let a re-registration under the same bridge id return
+    /// that bridge to `Active`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeAdmissionError::BridgeNotRegistered`] when no stored
+    /// record names `bridge_id`, [`BridgeAdmissionError::BridgeRevoked`] when
+    /// that record is already revoked, and
+    /// [`BridgeAdmissionError::Storage`] when a storage write fails.
+    pub async fn set_bridge_status(
         &self,
         bridge_id: &str,
-    ) -> Result<(), scp_platform::PlatformError> {
-        let key = format!("{BRIDGE_REGISTRY_PREFIX}{bridge_id}");
-        self.repo.storage().delete(&key).await?;
-        self.bridges
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(bridge_id);
+        status: BridgeStatus,
+    ) -> Result<(), BridgeAdmissionError> {
+        // Held for the same reason `admit_registration` holds it.
+        let _lifecycle = self.lifecycle.lock().await;
+
+        let Some(mut connector) = self.cached_bridge(bridge_id) else {
+            return Err(BridgeAdmissionError::BridgeNotRegistered {
+                bridge_id: bridge_id.to_owned(),
+            });
+        };
+
+        if connector.status == BridgeStatus::Revoked {
+            return Err(BridgeAdmissionError::BridgeRevoked {
+                bridge_id: bridge_id.to_owned(),
+            });
+        }
+
+        let revoking = status == BridgeStatus::Revoked;
+        connector.status = status;
+        self.store_connector(connector).await?;
+
+        if revoking {
+            for key_id in self.webhook_key_ids_for_bridge(bridge_id) {
+                self.deregister_webhook_key(&key_id).await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -518,15 +795,35 @@ impl<S: Storage> StorageBridgeLookup<S> {
     /// carried this key. The webhook middleware resolves that bridge to decide
     /// which context a signed webhook request may touch.
     ///
+    /// Step 3 of that key-registration flow also requires a node to reject a
+    /// key id already stored against a different bridge instance. One
+    /// identifier naming two bridges would leave a node unable to decide which
+    /// context a signed request acts inside, so this method refuses that
+    /// rebinding rather than overwriting a neighbouring bridge's key.
+    /// Re-registering an identifier against its own bridge is allowed, which
+    /// is how a platform replaces key material under one identifier.
+    ///
     /// # Errors
     ///
-    /// Returns `Err` if the storage write fails.
+    /// Returns [`BridgeAdmissionError::WebhookKeyIdBoundElsewhere`] when
+    /// `key_id` already names a different bridge, and
+    /// [`BridgeAdmissionError::Storage`] when the storage write fails.
     pub async fn register_webhook_key(
         &self,
         key_id: &str,
         bridge_id: &str,
         public_key: [u8; 32],
-    ) -> Result<(), scp_platform::PlatformError> {
+    ) -> Result<(), BridgeAdmissionError> {
+        if let Some(existing) = self.cached_webhook_key(key_id)
+            && existing.bridge_id != bridge_id
+        {
+            return Err(BridgeAdmissionError::WebhookKeyIdBoundElsewhere {
+                key_id: key_id.to_owned(),
+                bound_bridge_id: existing.bridge_id,
+                requesting_bridge_id: bridge_id.to_owned(),
+            });
+        }
+
         let binding = WebhookKeyBinding {
             public_key,
             bridge_id: bridge_id.to_owned(),
@@ -540,6 +837,21 @@ impl<S: Storage> StorageBridgeLookup<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key_id.to_owned(), binding);
         Ok(())
+    }
+
+    /// Returns every webhook key identifier stored against `bridge_id`.
+    ///
+    /// Bridge revocation reads this list to destroy a revoked bridge's signing
+    /// keys (spec §12.2.2 step 6).
+    #[must_use]
+    pub fn webhook_key_ids_for_bridge(&self, bridge_id: &str) -> Vec<String> {
+        self.webhook_keys
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, binding)| binding.bridge_id == bridge_id)
+            .map(|(key_id, _)| key_id.clone())
+            .collect()
     }
 
     /// Removes a webhook signing key by ID.
@@ -563,11 +875,7 @@ impl<S: Storage> StorageBridgeLookup<S> {
 
 impl<S: Storage + 'static> BridgeLookup for StorageBridgeLookup<S> {
     fn find_bridge(&self, bridge_id: &str) -> Option<BridgeConnector> {
-        self.bridges
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(bridge_id)
-            .cloned()
+        self.cached_bridge(bridge_id)
     }
 
     fn resolve_did_document(&self, did: &str) -> Option<DidDocument> {
@@ -579,11 +887,7 @@ impl<S: Storage + 'static> BridgeLookup for StorageBridgeLookup<S> {
     }
 
     fn find_webhook_key(&self, key_id: &str) -> Option<WebhookKeyBinding> {
-        self.webhook_keys
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(key_id)
-            .cloned()
+        self.cached_webhook_key(key_id)
     }
 
     fn expected_audience(&self) -> &str {
@@ -936,6 +1240,14 @@ pub fn verify_webhook_signature(
         ));
     }
 
+    // Spec §12.2.1 bounds a registered key identifier to 1-128 bytes of
+    // printable US-ASCII, and §12.10.2 signs a payload whose segments a `0x00`
+    // byte separates. Applying that same rule to the header value keeps the
+    // signed payload splittable exactly one way, and it keeps this function's
+    // rule identical to whatever registration accepted.
+    scp_core::bridge::registration::validate_platform_key_id(key_id)
+        .map_err(|reason| format!("invalid X-SCP-Platform-Key-Id: {reason}"))?;
+
     // Look up the platform's signing key together with the bridge it signs for.
     let binding = lookup
         .find_webhook_key(key_id)
@@ -957,9 +1269,22 @@ pub fn verify_webhook_signature(
     })?;
     let signature = Signature::from_bytes(&sig_array);
 
-    // Build the signed payload: timestamp_bytes || body_bytes per spec §12.10.2.
-    let mut signed_payload = Vec::with_capacity(timestamp_str.len() + body.len());
+    // Build the signed payload per spec §12.10.2:
+    // key_id || 0x00 || timestamp || 0x00 || body.
+    //
+    // A key id decides which registered key this node verifies against, and
+    // each registered key names one bridge inside one context, so a key id
+    // outside this payload would let whoever captures a request signed for one
+    // bridge swap that header and replay it into a second bridge's context
+    // whenever both bridges registered one platform key. Neither segment
+    // before a delimiter carries `0x00`: `validate_platform_key_id` rejects it
+    // in a key id, and a `u64` parse leaves a timestamp holding ASCII digits.
+    let mut signed_payload =
+        Vec::with_capacity(key_id.len() + timestamp_str.len() + body.len() + 2);
+    signed_payload.extend_from_slice(key_id.as_bytes());
+    signed_payload.push(0x00);
     signed_payload.extend_from_slice(timestamp_str.as_bytes());
+    signed_payload.push(0x00);
     signed_payload.extend_from_slice(body);
 
     verifying_key
@@ -1696,9 +2021,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: build the signed payload `timestamp_bytes || body_bytes` per §12.10.2.
-    fn webhook_signed_payload(timestamp: &str, body: &[u8]) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(timestamp.len() + body.len());
+    fn webhook_signed_payload(key_id: &str, timestamp: &str, body: &[u8]) -> Vec<u8> {
+        // Spec 12.10.2: key_id || 0x00 || timestamp || 0x00 || body.
+        let mut payload = Vec::with_capacity(key_id.len() + timestamp.len() + body.len() + 2);
+        payload.extend_from_slice(key_id.as_bytes());
+        payload.push(0x00);
         payload.extend_from_slice(timestamp.as_bytes());
+        payload.push(0x00);
         payload.extend_from_slice(body);
         payload
     }
@@ -1720,7 +2049,7 @@ mod tests {
         let pub_key = *signing_key.verifying_key().as_bytes();
         let body = b"webhook payload content";
         let ts = current_timestamp_str();
-        let signed_payload = webhook_signed_payload(&ts, body);
+        let signed_payload = webhook_signed_payload("platform-key-1", &ts, body);
 
         let signature = signing_key.sign(&signed_payload);
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
@@ -1744,7 +2073,7 @@ mod tests {
         let pub_key = *signing_key.verifying_key().as_bytes();
         let body = b"webhook payload content";
         let ts = current_timestamp_str();
-        let signed_payload = webhook_signed_payload(&ts, body);
+        let signed_payload = webhook_signed_payload("platform-key-1", &ts, body);
 
         // Sign with wrong key.
         let signature = wrong_key.sign(&signed_payload);
@@ -1786,7 +2115,7 @@ mod tests {
         let body = b"original payload";
         let tampered_body = b"tampered payload";
         let ts = current_timestamp_str();
-        let signed_payload = webhook_signed_payload(&ts, body);
+        let signed_payload = webhook_signed_payload("platform-key-1", &ts, body);
 
         let signature = signing_key.sign(&signed_payload);
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
@@ -1839,7 +2168,7 @@ mod tests {
             .as_secs()
             - 600)
             .to_string();
-        let signed_payload = webhook_signed_payload(&stale_ts, body);
+        let signed_payload = webhook_signed_payload("platform-key-1", &stale_ts, body);
         let signature = signing_key.sign(&signed_payload);
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
@@ -1868,7 +2197,7 @@ mod tests {
         let pub_key = *signing_key.verifying_key().as_bytes();
         let body = b"webhook payload content";
         let ts = current_timestamp_str();
-        let signature = signing_key.sign(&webhook_signed_payload(&ts, body));
+        let signature = signing_key.sign(&webhook_signed_payload("platform-key-1", &ts, body));
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
         let mut lookup = TestBridgeLookup::new("https://node.example.com");
@@ -1918,7 +2247,7 @@ mod tests {
         use ed25519_dalek::Signer;
 
         let ts = current_timestamp_str();
-        let signature = signing_key.sign(&webhook_signed_payload(&ts, body.as_bytes()));
+        let signature = signing_key.sign(&webhook_signed_payload(key_id, &ts, body.as_bytes()));
         Request::builder()
             .method("POST")
             .uri("/webhook")
@@ -2036,23 +2365,339 @@ mod tests {
         StorageBridgeLookup::new(repo, "https://node.example.com".to_owned())
     }
 
+    /// Drives one registration through spec 12.2.1 governance approval.
+    ///
+    /// `platform_key` carries `Some((key_id, key))` for a cooperative bridge
+    /// and `None` for a relay bridge, matching what 12.2.1 permits per mode.
+    fn approved_registration(
+        bridge_id: &str,
+        operator_did: &str,
+        context_id: &str,
+        platform_key: Option<(&str, [u8; 32])>,
+    ) -> scp_core::bridge::registration::ApprovedRegistration {
+        use scp_core::bridge::registration::{
+            BridgeRegistrationMetadata, BridgeRegistrationRequest, BridgeRegistry,
+            approve_registration, register_bridge,
+        };
+
+        let mut registry = BridgeRegistry::new(context_id.to_owned());
+        let request = BridgeRegistrationRequest {
+            bridge_id: bridge_id.to_owned(),
+            operator_did: operator_did.into(),
+            platform: "discord".to_owned(),
+            mode: if platform_key.is_some() {
+                BridgeMode::Cooperative
+            } else {
+                BridgeMode::Relay
+            },
+            context_id: context_id.to_owned(),
+            requested_at: 1_700_000_000,
+            self_hosted: false,
+            webhook_url: platform_key
+                .is_some()
+                .then(|| "https://platform.example.com/hooks".to_owned()),
+            platform_key: platform_key.map(|(_, key)| key),
+            platform_key_id: platform_key.map(|(key_id, _)| key_id.to_owned()),
+            max_shadows: 10_000,
+            metadata: BridgeRegistrationMetadata::default(),
+        };
+        register_bridge(&mut registry, request).unwrap();
+        approve_registration(
+            &mut registry,
+            bridge_id,
+            &"did:dht:governance".into(),
+            1_700_000_001,
+        )
+        .unwrap()
+        .0
+    }
+
+    /// Admits one cooperative registration and returns its operator DID.
+    async fn admit_cooperative_bridge(
+        lookup: &StorageBridgeLookup<InMemoryStorage>,
+        bridge_id: &str,
+        context_id: &str,
+        key_id: &str,
+        public_key: [u8; 32],
+    ) -> String {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let operator_did = test_did(&signing_key);
+        let document = test_did_document(&operator_did, &signing_key);
+        lookup
+            .admit_registration(
+                approved_registration(
+                    bridge_id,
+                    &operator_did,
+                    context_id,
+                    Some((key_id, public_key)),
+                ),
+                document,
+            )
+            .await
+            .unwrap();
+        operator_did
+    }
+
     #[tokio::test]
-    async fn storage_lookup_register_and_find_bridge() {
+    async fn admitting_a_registration_stores_bridge_document_and_webhook_key() {
         let lookup = make_storage_lookup();
 
-        let bridge = test_bridge(
-            "bridge-1",
-            "did:dht:operator1",
-            "ctx-1",
-            BridgeStatus::Active,
-        );
-        lookup.register_bridge(bridge.clone()).await.unwrap();
+        let operator_did =
+            admit_cooperative_bridge(&lookup, "bridge-1", "ctx-1", "pk-1", [42u8; 32]).await;
 
-        let found = lookup.find_bridge("bridge-1");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().bridge_id, "bridge-1");
+        let found = lookup.find_bridge("bridge-1").unwrap();
+        assert_eq!(found.bridge_id, "bridge-1");
+        assert_eq!(found.registration_context, "ctx-1");
+        assert_eq!(found.status, BridgeStatus::Active);
+        assert!(lookup.resolve_did_document(&operator_did).is_some());
+        assert_eq!(
+            lookup.find_webhook_key("pk-1"),
+            Some(WebhookKeyBinding {
+                public_key: [42u8; 32],
+                bridge_id: "bridge-1".to_owned(),
+            })
+        );
 
         assert!(lookup.find_bridge("bridge-nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn admitting_a_relay_registration_stores_no_webhook_key() {
+        let lookup = make_storage_lookup();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let operator_did = test_did(&signing_key);
+
+        lookup
+            .admit_registration(
+                approved_registration("bridge-relay", &operator_did, "ctx-1", None),
+                test_did_document(&operator_did, &signing_key),
+            )
+            .await
+            .unwrap();
+
+        assert!(lookup.find_bridge("bridge-relay").is_some());
+        assert!(lookup.webhook_key_ids_for_bridge("bridge-relay").is_empty());
+    }
+
+    #[tokio::test]
+    async fn admitting_a_registration_rejects_a_foreign_operator_document() {
+        let lookup = make_storage_lookup();
+        let operator_key = SigningKey::generate(&mut OsRng);
+        let operator_did = test_did(&operator_key);
+        let stranger_key = SigningKey::generate(&mut OsRng);
+        let stranger_did = test_did(&stranger_key);
+
+        let err = lookup
+            .admit_registration(
+                approved_registration(
+                    "bridge-1",
+                    &operator_did,
+                    "ctx-1",
+                    Some(("pk-1", [7u8; 32])),
+                ),
+                test_did_document(&stranger_did, &stranger_key),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BridgeAdmissionError::OperatorDocumentMismatch { .. }),
+            "expected OperatorDocumentMismatch, got {err}"
+        );
+        // Nothing landed, so no request reaches a half-wired bridge.
+        assert!(lookup.find_bridge("bridge-1").is_none());
+        assert!(lookup.find_webhook_key("pk-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_webhook_key_id_cannot_move_to_a_second_bridge() {
+        let lookup = make_storage_lookup();
+        admit_cooperative_bridge(&lookup, "bridge-first", "ctx-1", "pk-shared", [1u8; 32]).await;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let operator_did = test_did(&signing_key);
+        let err = lookup
+            .admit_registration(
+                approved_registration(
+                    "bridge-second",
+                    &operator_did,
+                    "ctx-2",
+                    Some(("pk-shared", [1u8; 32])),
+                ),
+                test_did_document(&operator_did, &signing_key),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BridgeAdmissionError::WebhookKeyIdBoundElsewhere { .. }),
+            "expected WebhookKeyIdBoundElsewhere, got {err}"
+        );
+        assert_eq!(
+            lookup.find_webhook_key("pk-shared").unwrap().bridge_id,
+            "bridge-first"
+        );
+        assert!(lookup.find_bridge("bridge-second").is_none());
+    }
+
+    #[tokio::test]
+    async fn suspending_and_reactivating_a_bridge_moves_its_status() {
+        let lookup = make_storage_lookup();
+        admit_cooperative_bridge(&lookup, "bridge-1", "ctx-1", "pk-1", [42u8; 32]).await;
+
+        lookup
+            .set_bridge_status("bridge-1", BridgeStatus::Suspended)
+            .await
+            .unwrap();
+        assert_eq!(
+            lookup.find_bridge("bridge-1").unwrap().status,
+            BridgeStatus::Suspended
+        );
+
+        lookup
+            .set_bridge_status("bridge-1", BridgeStatus::Active)
+            .await
+            .unwrap();
+        assert_eq!(
+            lookup.find_bridge("bridge-1").unwrap().status,
+            BridgeStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_a_bridge_destroys_its_webhook_keys_and_is_terminal() {
+        let lookup = make_storage_lookup();
+        admit_cooperative_bridge(&lookup, "bridge-1", "ctx-1", "pk-1", [42u8; 32]).await;
+
+        lookup
+            .set_bridge_status("bridge-1", BridgeStatus::Revoked)
+            .await
+            .unwrap();
+
+        // Spec 12.2.2 step 6 destroys a revoked bridge's credentials.
+        assert!(lookup.find_webhook_key("pk-1").is_none());
+        // Spec 12.2.1 keeps that record so a re-registration cannot revive it.
+        assert_eq!(
+            lookup.find_bridge("bridge-1").unwrap().status,
+            BridgeStatus::Revoked
+        );
+
+        let err = lookup
+            .set_bridge_status("bridge-1", BridgeStatus::Active)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BridgeAdmissionError::BridgeRevoked { .. }),
+            "expected BridgeRevoked, got {err}"
+        );
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let operator_did = test_did(&signing_key);
+        let err = lookup
+            .admit_registration(
+                approved_registration(
+                    "bridge-1",
+                    &operator_did,
+                    "ctx-1",
+                    Some(("pk-2", [9u8; 32])),
+                ),
+                test_did_document(&operator_did, &signing_key),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BridgeAdmissionError::BridgeRevoked { .. }),
+            "expected BridgeRevoked, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_admitting_a_suspended_bridge_leaves_it_suspended() {
+        let lookup = make_storage_lookup();
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let operator_did = test_did(&signing_key);
+        let document = test_did_document(&operator_did, &signing_key);
+        lookup
+            .admit_registration(
+                approved_registration(
+                    "bridge-1",
+                    &operator_did,
+                    "ctx-1",
+                    Some(("pk-1", [42u8; 32])),
+                ),
+                document.clone(),
+            )
+            .await
+            .unwrap();
+        lookup
+            .set_bridge_status("bridge-1", BridgeStatus::Suspended)
+            .await
+            .unwrap();
+
+        // Replaying that same registration must not reactivate a bridge that
+        // spec 12.2.2 governance suspended.
+        lookup
+            .admit_registration(
+                approved_registration(
+                    "bridge-1",
+                    &operator_did,
+                    "ctx-1",
+                    Some(("pk-1", [42u8; 32])),
+                ),
+                document,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            lookup.find_bridge("bridge-1").unwrap().status,
+            BridgeStatus::Suspended
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_operator_cannot_reuse_an_admitted_bridge_id() {
+        let lookup = make_storage_lookup();
+        admit_cooperative_bridge(&lookup, "bridge-1", "ctx-1", "pk-1", [42u8; 32]).await;
+        let stored_operator = lookup.find_bridge("bridge-1").unwrap().operator_did;
+
+        let stranger_key = SigningKey::generate(&mut OsRng);
+        let stranger_did = test_did(&stranger_key);
+        let err = lookup
+            .admit_registration(
+                approved_registration(
+                    "bridge-1",
+                    &stranger_did,
+                    "ctx-2",
+                    Some(("pk-2", [9u8; 32])),
+                ),
+                test_did_document(&stranger_did, &stranger_key),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BridgeAdmissionError::BridgeIdentityChanged { .. }),
+            "expected BridgeIdentityChanged, got {err}"
+        );
+        let stored = lookup.find_bridge("bridge-1").unwrap();
+        assert_eq!(stored.operator_did, stored_operator);
+        assert_eq!(stored.registration_context, "ctx-1");
+    }
+
+    #[tokio::test]
+    async fn setting_status_on_an_unknown_bridge_is_rejected() {
+        let lookup = make_storage_lookup();
+
+        let err = lookup
+            .set_bridge_status("bridge-absent", BridgeStatus::Suspended)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BridgeAdmissionError::BridgeNotRegistered { .. }),
+            "expected BridgeNotRegistered, got {err}"
+        );
     }
 
     #[tokio::test]
@@ -2095,23 +2740,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_lookup_deregister_bridge() {
-        let lookup = make_storage_lookup();
-        let bridge = test_bridge(
-            "bridge-1",
-            "did:dht:operator1",
-            "ctx-1",
-            BridgeStatus::Active,
-        );
-        lookup.register_bridge(bridge).await.unwrap();
-
-        assert!(lookup.find_bridge("bridge-1").is_some());
-
-        lookup.deregister_bridge("bridge-1").await.unwrap();
-        assert!(lookup.find_bridge("bridge-1").is_none());
-    }
-
-    #[tokio::test]
     async fn storage_lookup_deregister_webhook_key() {
         let lookup = make_storage_lookup();
         lookup
@@ -2134,16 +2762,13 @@ mod tests {
 
         let lookup1 =
             StorageBridgeLookup::new(Arc::clone(&repo), "https://node.example.com".to_owned());
-        let bridge = test_bridge("bridge-rt", "did:dht:op", "ctx-rt", BridgeStatus::Active);
-        lookup1.register_bridge(bridge).await.unwrap();
-
         let signing_key = SigningKey::generate(&mut OsRng);
         let did = test_did(&signing_key);
-        let doc = test_did_document(&did, &signing_key);
-        lookup1.register_did_document(doc).await.unwrap();
-
         lookup1
-            .register_webhook_key("wh-key-rt", "bridge-rt", [99u8; 32])
+            .admit_registration(
+                approved_registration("bridge-rt", &did, "ctx-rt", Some(("wh-key-rt", [99u8; 32]))),
+                test_did_document(&did, &signing_key),
+            )
             .await
             .unwrap();
 
@@ -2171,11 +2796,13 @@ mod tests {
 
         let signing_key = SigningKey::generate(&mut OsRng);
         let did = test_did(&signing_key);
-        let doc = test_did_document(&did, &signing_key);
-        lookup.register_did_document(doc).await.unwrap();
-
-        let bridge = test_bridge("bridge-jwt", &did, "ctx-jwt", BridgeStatus::Active);
-        lookup.register_bridge(bridge).await.unwrap();
+        lookup
+            .admit_registration(
+                approved_registration("bridge-jwt", &did, "ctx-jwt", Some(("pk-jwt", [5u8; 32]))),
+                test_did_document(&did, &signing_key),
+            )
+            .await
+            .unwrap();
 
         let now = current_time();
         let claims = BridgeJwtClaims {

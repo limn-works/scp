@@ -148,6 +148,7 @@ export type {
   BridgeCredential,
   BridgeMode,
   BridgeRegistration,
+  BridgeRegistrationOptions,
   BridgeTrustLevel,
   BridgeTrustOptions,
   ShadowIdentity,
