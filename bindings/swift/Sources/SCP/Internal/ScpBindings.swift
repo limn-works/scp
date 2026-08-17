@@ -16719,8 +16719,8 @@ public func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadow
  * * `webhook_url` — For cooperative mode: the platform's webhook receiver URL.
  * * `platform_key` — For cooperative mode: the platform's Ed25519 public key (32 bytes).
  * * `platform_key_id` — For cooperative mode: the platform's identifier for
- *   `platform_key`, which that platform sends in `X-SCP-Platform-Key-Id` on a
- *   webhook request and which every webhook signature covers (spec §12.10.2).
+ * `platform_key`, which that platform sends in `X-SCP-Platform-Key-Id` on a
+ * webhook request and which every webhook signature covers (spec §12.10.2).
  * * `max_shadows` — Governance-configured shadow limit (default 10,000).
  * * `metadata_display_name` — Human-readable display name for the bridge.
  * * `metadata_description` — Free-text description of the bridge.
@@ -16737,7 +16737,11 @@ public func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadow
  * `did:{method}:{id}` structure, method not lowercase alphanumeric, or
  * contains control characters), or if `mode` is not recognized. Returns
  * `ScpError::Context` if registration or approval fails (including
- * self-approval).
+ * self-approval), if a cooperative registration omits `platform_key` or
+ * `platform_key_id`, or if a non-cooperative registration carries either one.
+ *
+ * Spec §12.2.1 requires both cooperative-mode fields together and forbids
+ * both outside cooperative mode.
  *
  * See spec section 12 (Bridge System) and ADR-023.
  */
