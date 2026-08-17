@@ -452,8 +452,9 @@ where
     R: scp_identity::resolver::DidResolver + ?Sized,
 {
     use scp_core::identity::attestation::{
-        IdentityLinkVerifyError, IdentityLinkVerifyInput, SERVICE_TYPE_ATTESTATION_REVOCATIONS,
-        published_signing_keys, verify_identity_link_attestation,
+        IdentityLinkFreshness, IdentityLinkVerifyError, IdentityLinkVerifyInput,
+        SERVICE_TYPE_ATTESTATION_REVOCATIONS, published_signing_keys,
+        verify_identity_link_attestation,
     };
 
     // --- 1. Parse a caller's two strings.
@@ -520,7 +521,25 @@ where
         now_secs,
         reference_proof,
     }) {
-        Ok(_) => {}
+        // §3.5.4 step 5 lowers a stale attestation's trust weight and does not
+        // reject it, so a stale attestation still reaches `Ok(true)` below. A
+        // boolean return carries no weight, so record staleness here: an
+        // operator reading a shipped build's logs learns which verdicts rested
+        // on evidence older than that method's renewal interval.
+        Ok(verified) => {
+            if let IdentityLinkFreshness::Stale {
+                renewal_deadline_secs,
+            } = verified.freshness
+            {
+                tracing::info!(
+                    attestation_id = %attestation.id,
+                    issuer = %attestation.issuer,
+                    renewal_deadline_secs,
+                    "identity link attestation verified with stale evidence (spec §3.5.4 step 5 \
+                     lowers its trust weight rather than rejecting it)"
+                );
+            }
+        }
         // A class 2 proof resource nobody fetched leaves an attestation
         // unverified (§3.5.4 Class 2 step 3), which is not the same claim as
         // "forged". Raise rather than hand a caller a negative result that
