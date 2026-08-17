@@ -857,7 +857,9 @@ fn validate_dht_result(
 /// - that method declares a type other than `Ed25519VerificationKey2020`;
 /// - that method names a controller other than `document`'s own DID;
 /// - `document`'s `assertionMethod` array does not reference that method, which
-///   is what a Layer 1 rotation withdraws (§9.7.4 of the security-model spec);
+///   is what a Layer 1 rotation withdraws — ADR-003, DID creation, item 4a
+///   moves both relationship references to the new key and retains the old one
+///   as `#retired-{sequence}` for audit;
 /// - its `publicKeyMultibase` value does not decode to a valid Ed25519 curve
 ///   point.
 ///
