@@ -1463,7 +1463,24 @@ fn build_core_context_params(
         governance_voters: None,
     };
 
-    build_context_params(&common).map_err(PyRuntimeError::new_err)
+    let mut params = build_context_params(&common).map_err(PyRuntimeError::new_err)?;
+
+    // A caller that supplies no ceiling gets `default_ceiling()`, whose doc
+    // comment states that all FFI bridges apply it "when no explicit ceiling is
+    // provided". The bridge used to apply that default only to a bridge-local
+    // copy while handing `Supervisor::create_context` an EMPTY ceiling, so the
+    // supervisor's admin role held zero capabilities and the two stores answered
+    // "what may this member do" differently. Authorization now reads the
+    // supervisor's ceiling, so the documented default has to reach the
+    // supervisor.
+    if params.ceiling.is_empty() {
+        params.ceiling = scp_core::context::roles::default_ceiling()
+            .iter()
+            .cloned()
+            .collect();
+    }
+
+    Ok(params)
 }
 
 // ---------------------------------------------------------------------------
@@ -2622,12 +2639,9 @@ impl crate::scp::PyScp {
                 });
             }
 
-            // Also update FFI bridge state's role_state for UCAN/outlet capability checks.
-            crate::runtime::with_ffi_state(bi, &context_id, |st| {
-                st.role_state.members.insert(member_did.clone());
-                Ok(())
-            })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            // No bridge-side membership write follows the join: `Supervisor::join_context`
+            // recorded the new member, and every UCAN/outlet capability check reads
+            // that record through `crate::runtime::live_role_state`.
 
             // Bridge: drain events (MemberJoined) from ContextManager's receive
             // buffer and deliver to the FFI receive channel (#332).
@@ -2867,12 +2881,12 @@ impl crate::scp::PyScp {
         // role-state admin (bundle-derived); the joiner is added as a member
         // below.
         //
-        // FLAG-1: the caller no longer supplies a ceiling, so register with the
-        // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`,
-        // so the "detect a duplicate BEFORE consuming the single-use KeyPackage"
-        // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
-        // ceiling is re-synced from the joined handle's signed params AFTER a
-        // successful spawn (see `sync_ceiling_from_params` below).
+        // FLAG-1: the caller supplies no ceiling, and none is stored here. FFI
+        // state holds no ceiling at all; UCAN validation reads the ceiling that
+        // `spawn_actor_from_welcome` took from the creator-signed bundle, through
+        // `crate::runtime::live_ceiling_strings`. The Occupied dedup is keyed on
+        // `context_id`, so the "detect a duplicate BEFORE consuming the single-use
+        // KeyPackage" crash-safety is preserved.
         //
         // Ordering matters for two reasons:
         //   1. `register_ffi_state` hard-errors on an already-registered context
@@ -2883,20 +2897,12 @@ impl crate::scp::PyScp {
         //   2. If the runtime join later fails, we roll THIS state back, so there
         //      is no path where the join commits but bridge state errors, and no
         //      leaked FFI state when the join fails.
-        crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("failed to register context state: {e}"))
-            })?;
-        // Insert the joiner as a member of the freshly-registered role state. On
-        // the (practically unreachable) failure of this insert into state we just
-        // created, roll it back so a failed join leaves nothing behind.
-        if let Err(e) = crate::runtime::with_ffi_state(bi, &sealed.context_id, |st| {
-            st.role_state.members.insert(owning_did.clone());
-            Ok(())
-        }) {
-            crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(PyRuntimeError::new_err(e.to_string()));
-        }
+        crate::runtime::register_ffi_state(bi, &sealed.context_id, &[]).map_err(|e| {
+            PyRuntimeError::new_err(format!("failed to register context state: {e}"))
+        })?;
+        // No bridge-side membership write follows: `spawn_actor_from_welcome`
+        // records the joiner in the supervisor's role state, and every later
+        // capability check reads that record through `live_role_state`.
 
         let owning = scp_did::DID(owning_did.clone());
         let req = scp_core::context::supervisor::WelcomeJoinRequest {
@@ -2925,34 +2931,16 @@ impl crate::scp::PyScp {
                 }
             };
 
-        // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's
-        // signed params, overwriting the default ceiling used for the reversible
-        // precheck. The authoritative ceiling lives in the bundle the creator
-        // signed — never in caller input. This runs AFTER the irreversible
-        // commit; the FFI state was just registered (and not removed on this
-        // success path), so the sync targets a live entry.
+        // FLAG-1: no ceiling copy is written here. `spawn_actor_from_welcome`
+        // stored the ceiling the creator signed into the supervisor's role state,
+        // and UCAN validation reads it through `live_ceiling_strings`, so the
+        // authenticated ceiling reaches every check without a bridge-side copy
+        // that a later governance `ModifyCeiling` would leave stale.
         //
-        // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails
-        // ONLY if a concurrent close/leave removed the just-registered FFI state
-        // in the window since the spawn returned. A close/leave does NOT despawn
-        // the runtime actor, so returning `Err` here without tearing the actor
-        // down would strand a live, orphaned actor for a join that never fully
-        // materialized at the bridge. Compensate with the COMPLETE teardown
-        // (`discard_joined_context`): it removes the actor handle AND destroys
-        // the resident MLS group AND deletes the durable Class-S snapshot the
-        // join persisted — a bare `despawn_actor` would leave the crypto group
-        // and snapshot behind, resurrecting the context on restart and blocking
-        // a fresh re-join. Then purge residual bridge state and surface the
-        // error.
-        if let Err(e) = crate::runtime::sync_ceiling_from_params(
-            bi,
-            &sealed.context_id,
-            &joined.params().ceiling,
-        ) {
-            rt.block_on(sup.discard_joined_context(&sealed.context_id));
-            crate::runtime::remove_context(bi, &sealed.context_id);
-            return Err(PyRuntimeError::new_err(e.to_string()));
-        }
+        // Deleting the copy also retires BLACK-2JF-01's post-irreversible-commit
+        // compensation: the sync that could fail after the irreversible spawn no
+        // longer exists, so no path strands a live actor for a join that never
+        // materialized at the bridge.
 
         // Runtime join committed. Register the context in the known-contexts
         // discovery registry so a Welcome-joined context is surfaced by
@@ -3184,11 +3172,9 @@ impl crate::scp::PyScp {
                 PyRuntimeError::new_err(format!("ContextManager leave_context failed: {e}"))
             })?;
 
-            // Also update FFI bridge state's role_state.
-            let _ = crate::runtime::with_ffi_state(bi, &context_id, |st| {
-                st.role_state.members.remove(identity_did);
-                Ok(())
-            });
+            // No bridge-side membership write follows the leave: `Supervisor::leave_context`
+            // dropped the member, and every UCAN/outlet capability check reads that
+            // record through `crate::runtime::live_role_state`.
 
             // Bridge: drain events (MemberLeft) from ContextManager's receive
             // buffer and deliver BEFORE closing the channel (#332).
@@ -3845,11 +3831,10 @@ impl crate::scp::PyScp {
         let context_id = handle.context_id.clone();
         let handle_state = handle.state.clone();
         let proposal_id = parse_proposal_id(proposal_id_hex)?;
-        let proposal_id_log = hex::encode(proposal_id);
 
         rt.block_on(async move {
             use scp_core::context::actor::commands::{
-                ExecuteGovernanceActionPayload, GovernanceCommand, QueriesCommand,
+                ExecuteGovernanceActionPayload, GovernanceCommand,
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3874,46 +3859,11 @@ impl crate::scp::PyScp {
                     PyRuntimeError::new_err(format!("governance execution failed: {e}"))
                 })?;
 
-            // Re-sync local role state cache from ContextManager after any
-            // governance action that may have modified roles/membership (#560).
-            //
-            // NOTE: Cannot call `sync_role_state_from_manager()` here because that
-            // function uses `rt.block_on()` and we are already inside `rt.block_on()`.
-            // Nested `block_on` panics with "Cannot start a runtime from within a
-            // runtime." Instead, dispatch the role-state query inline.
-            let (rs_tx, rs_rx) = tokio::sync::oneshot::channel();
-            let rs_cmd = QueriesCommand::GetRoleState {
-                context_id: context_id.clone(),
-                reply: rs_tx,
-            };
-            let role_state_lookup = match sup.dispatch_query(rs_cmd).await {
-                Ok(_) => rs_rx.await.ok().and_then(Result::ok).flatten(),
-                Err(_) => None,
-            };
-            match role_state_lookup {
-                Some(new_role_state) => {
-                    if let Err(e) = crate::runtime::with_ffi_state(bi, &context_id, |st| {
-                        st.role_state = new_role_state;
-                        Ok(())
-                    }) {
-                        tracing::warn!(
-                            context_id = %context_id,
-                            proposal_id = %proposal_id_log,
-                            error = %e,
-                            "failed to sync role state after governance action — \
-                             local capability checks may be stale"
-                        );
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        proposal_id = %proposal_id_log,
-                        "failed to sync role state after governance action — \
-                         context not found in ContextManager"
-                    );
-                }
-            }
+            // No role-state copy follows a governance action (#560 closed by
+            // deletion). The action mutated the supervisor's role state, and the
+            // next capability check reads that role state through
+            // `crate::runtime::live_role_state`, so no window exists in which a
+            // bridge copy still grants what the action revoked.
 
             use scp_core::context::state::GovernanceActionResult;
             let result_str = match result {
@@ -4138,8 +4088,6 @@ impl crate::scp::PyScp {
             scp_ffi_common::validate::validate_governance_action_strings(&action)
                 .map_err(|e| PyValueError::new_err(format!("SCP-CTX-2040: {}", e.message)))?;
 
-            let action_name = action.variant_name();
-
             let outcome = sup
                 .propose_governance_action_checked(&context_id, &proposer_did, action, &signing_key)
                 .await
@@ -4149,19 +4097,8 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            // Re-sync local role state cache from ContextManager after any
-            // governance action that may have modified roles/membership (#560).
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    action = action_name,
-                    error = %e,
-                    "failed to sync role state after governance proposal — \
-                     local capability checks may be stale"
-                );
-            }
+            // No role-state copy follows a governance action: the supervisor
+            // holds the mutation and `crate::runtime::live_role_state` reads it.
 
             let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
 
@@ -4246,15 +4183,8 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to sync role state after governance approval"
-                );
-            }
+            // No role-state copy follows a governance action: the supervisor
+            // holds the mutation and `crate::runtime::live_role_state` reads it.
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -4330,15 +4260,8 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to sync role state after governance rejection"
-                );
-            }
+            // No role-state copy follows a governance action: the supervisor
+            // holds the mutation and `crate::runtime::live_role_state` reads it.
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -4390,15 +4313,8 @@ impl crate::scp::PyScp {
                     ))
                 })?;
 
-            if let Err(e) =
-                crate::runtime::sync_role_state_from_manager_async(bi, &context_id).await
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to sync role state after governance withdrawal"
-                );
-            }
+            // No role-state copy follows a governance action: the supervisor
+            // holds the mutation and `crate::runtime::live_role_state` reads it.
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -7559,14 +7475,13 @@ mod tests {
         let (bi, ctx_id) = setup_singleadmin_ctx(creator, "exec-forgery-state");
 
         // Snapshot membership before the forged execute.
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(
-                !st.role_state.members.contains(victim),
-                "victim must not be a member before the forged execute"
-            );
-            Ok(())
-        })
-        .unwrap();
+        assert!(
+            !crate::runtime::live_role_state(&bi, &ctx_id)
+                .unwrap()
+                .members
+                .contains(victim),
+            "victim must not be a member before the forged execute"
+        );
 
         let fabricated = [0x11u8; 32];
         let result = test_dispatch_execute_by_id(&bi, &ctx_id, fabricated);
@@ -7576,15 +7491,13 @@ mod tests {
         );
 
         // Membership must be unchanged: no phantom AddMember took effect.
-        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
-        crate::runtime::with_context(&bi, &ctx_id, |st| {
-            assert!(
-                !st.role_state.members.contains(victim),
-                "rejected forgery must not have added the victim as a member"
-            );
-            Ok(())
-        })
-        .unwrap();
+        assert!(
+            !crate::runtime::live_role_state(&bi, &ctx_id)
+                .unwrap()
+                .members
+                .contains(victim),
+            "rejected forgery must not have added the victim as a member"
+        );
         crate::runtime::remove_context(&bi, &ctx_id);
     }
 
@@ -7642,7 +7555,8 @@ mod tests {
         // not torn down by the failed close.
         crate::runtime::with_context(&bi, &ctx_id, |st| {
             assert_eq!(
-                st.creator_did, creator,
+                st.event_log.context_id(),
+                ctx_id,
                 "FFI bridge state must survive a failed close"
             );
             Ok(())
@@ -8161,7 +8075,6 @@ mod tests {
                 "member",
             ))
             .expect("test_insert_member must record the second member");
-            crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
 
             // Sanity: the context really has multiple members.
             let members = rt.block_on(sup.member_dids(&ctx_id));

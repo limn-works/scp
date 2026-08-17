@@ -301,13 +301,21 @@ fn outlet_register_impl(
         signature: vec![],
     };
 
+    // Read the registrant's authority from the supervisor actor BEFORE taking the
+    // FFI shard lock. `register_outlet` decides whether the registrant holds
+    // `outlet:register`, so it reads the role state the supervisor holds now, not
+    // a bridge copy that a governance action or a membership change could have
+    // left permissive.
+    let role_state = crate::runtime::live_role_state(bi, context_id)?;
+    let creator_did = role_state.creator_did.clone();
+
     // Look up the context runtime and register the outlet.
     let registered_id = crate::runtime::with_context(bi, context_id, |rt| {
         let (registered_id, _event) = scp_core::context::outlets::register_outlet(
             &mut rt.outlet_registry,
-            &rt.role_state,
+            &role_state,
             core_registration,
-            &rt.creator_did.clone(),
+            &creator_did,
         )
         .map_err(|e| ScpPyError::context(format!("outlet registration failed: {e}")))?;
         Ok(registered_id)
@@ -335,6 +343,15 @@ pub(crate) fn validate_outlet_ucan(
 ) -> PyResult<()> {
     let proof_resolver =
         crate::ucan::build_proof_resolver_from_tokens(proof_tokens.map(Vec::as_slice))?;
+
+    // ADR-016 step 8 compares the token's grants against the context's capability
+    // ceiling, and the chain check anchors on the context creator. Both come from
+    // the supervisor actor, read HERE — a bridge copy of either kept granting what
+    // a `ModifyCeiling` governance action had already narrowed, and the streaming
+    // twin (`outlet_stream_open`) reached the supervisor for its own gates, so one
+    // bridge answered one authorization question two ways.
+    let role_state = crate::runtime::live_role_state(bi, context_id)?;
+    let ceiling_strings = role_state.ceiling().to_ucan_string_set();
 
     crate::runtime::with_context(bi, context_id, |rt| {
         // SCP-OUT-014: select the split capability stem from the outlet's
@@ -367,8 +384,8 @@ pub(crate) fn validate_outlet_ucan(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &rt.ceiling_strings,
-            context_creator_did: &rt.creator_did,
+            ceiling: &ceiling_strings,
+            context_creator_did: &role_state.creator_did,
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
@@ -984,17 +1001,15 @@ fn outlet_invoke_cross_context_impl(
     })?;
 
     // Defense-in-depth: check role-state capabilities in the source context
-    // using the kind-appropriate split stem for the target outlet.
-    let source_has_capability = crate::runtime::with_context(bi, source_context_id, |rt| {
-        Ok(
-            scp_core::context::outlets::has_outlet_invocation_capability(
-                &rt.role_state,
-                invoker_did,
-                outlet_id,
-                target_outlet_kind,
-            ),
-        )
-    })?;
+    // using the kind-appropriate split stem for the target outlet. The role state
+    // comes from the source context's supervisor actor, so a capability the
+    // source context revoked stops this call the same turn it stops a stream.
+    let source_has_capability = scp_core::context::outlets::has_outlet_invocation_capability(
+        &crate::runtime::live_role_state(bi, source_context_id)?,
+        invoker_did,
+        outlet_id,
+        target_outlet_kind,
+    );
 
     if !source_has_capability {
         return Err(ScpPyError::ucan(format!(
@@ -1119,18 +1134,22 @@ pub(crate) fn map_saga_error(err: scp_core::context::supervisor::SagaError) -> S
 
 /// Resolves the Active Signing Key the supervisor saga signs under for the
 /// co-resident context `context_id` — the key of the context's owning
-/// identity (`FfiBridgeState.creator_did`), exported via the shared custody
-/// path. The caller and target each resolve to their OWN creator's key so the
-/// receipt (target-signed) and each side's divergence marker (own-signed) are
-/// signed under the correct per-context Active Signing Key (spec §6.2.4
-/// "Signer authorization": the receipt key MUST be the one authorized to act
-/// for `target_context_id`).
+/// identity, read from the supervisor actor's `role_state.creator_did` and
+/// exported via the shared custody path. The caller and target each resolve to
+/// their OWN creator's key so the receipt (target-signed) and each side's
+/// divergence marker (own-signed) are signed under the correct per-context
+/// Active Signing Key (spec §6.2.4 "Signer authorization": the receipt key MUST
+/// be the one authorized to act for `target_context_id`).
+///
+/// The creator DID comes from the supervisor rather than from a bridge copy
+/// because this call chooses the authority a cross-context saga signs as. An
+/// `AdminTransferred` governance action moves that authority, and a bridge copy
+/// would keep signing as the previous holder.
 pub(crate) fn resolve_context_signing_key(
     bi: &PyBridgeInstance,
     context_id: &str,
 ) -> PyResult<ed25519_dalek::SigningKey> {
-    let creator_did =
-        crate::runtime::with_context(bi, context_id, |rt| Ok(rt.creator_did.clone()))?;
+    let creator_did = crate::runtime::live_role_state(bi, context_id)?.creator_did;
     crate::context::resolve_signing_key(bi, &creator_did)
 }
 
@@ -1271,10 +1290,38 @@ fn outlet_invoke_cross_context_saga_impl(
     let asserted_nonce = decode_asserted_nonce(asserted_nonce_hex)?;
     let input_json = py_dict_to_json(input)?;
 
-    // Caller-principal binding (§6.2.4 *Caller authentication*) — BEFORE the
-    // saga runs, so the supervisor never observes an unauthenticated caller.
     let supervisor = crate::runtime::supervisor(bi)?;
     let tokio_rt = crate::runtime()?;
+
+    // Lifecycle gate: both contexts MUST be Active, read from each context's
+    // supervisor actor via `read_context_state`. The streaming twin
+    // (`outlet_streaming_saga_open_impl`) already gated on the same two reads with
+    // the same two codes; this unary sibling did not, so a Closing / Expired /
+    // MigratingOut context refused a streaming saga and admitted a unary one. A
+    // missing actor (`None`) counts as non-active.
+    let caller_state = tokio_rt.block_on(supervisor.read_context_state(caller_context_id));
+    if !matches!(caller_state, Some(scp_core::context::ContextState::Active)) {
+        return Err(ScpPyError::ContextError {
+            message: format!(
+                "cannot start cross-context saga: caller context in {caller_state:?} state"
+            ),
+            code: codes::OUTLET_6010.to_owned(),
+        }
+        .into());
+    }
+    let target_state = tokio_rt.block_on(supervisor.read_context_state(target_context_id));
+    if !matches!(target_state, Some(scp_core::context::ContextState::Active)) {
+        return Err(ScpPyError::ContextError {
+            message: format!(
+                "cannot start cross-context saga: target context in {target_state:?} state"
+            ),
+            code: codes::OUTLET_6011.to_owned(),
+        }
+        .into());
+    }
+
+    // Caller-principal binding (§6.2.4 *Caller authentication*) — BEFORE the
+    // saga runs, so the supervisor never observes an unauthenticated caller.
     enforce_caller_principal_binding(bi, supervisor, tokio_rt, caller_context_id, caller_did)?;
 
     // ----- Chokepoint (ADR-056): id STRING → [u8; 32] ------------------------
@@ -1528,6 +1575,11 @@ fn outlet_session_invoke_impl(
         proof_tokens.as_ref(),
     )?;
 
+    // Read the invoker's capabilities from the supervisor actor. A session
+    // survives across invocations, so the role state that admitted the first call
+    // can lose the capability before the tenth; reading here refuses the tenth.
+    let role_state = crate::runtime::live_role_state(bi, context_id)?;
+
     let output_json = crate::runtime::with_context(bi, context_id, |rt| {
         // Look up session.
         let session = rt
@@ -1560,7 +1612,7 @@ fn outlet_session_invoke_impl(
             .get(&outlet_id)
             .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
         if !scp_core::context::outlets::has_outlet_invocation_capability(
-            &rt.role_state,
+            &role_state,
             invoker_did,
             &outlet_id,
             outlet_kind,
@@ -1693,6 +1745,13 @@ fn outlet_interface_expose_impl(
         None => None,
     };
 
+    // `expose_outlet` decides whether the caller may offer this context's outlet
+    // to another context, reading roles and the creator DID. Both come from the
+    // supervisor actor so an admin transfer or a role change lands before the
+    // offer is minted.
+    let role_state = crate::runtime::live_role_state(bi, context_id)?;
+    let creator_did = role_state.creator_did.clone();
+
     Ok(crate::runtime::with_context(bi, context_id, |rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.to_string(),
@@ -1703,8 +1762,8 @@ fn outlet_interface_expose_impl(
             context_handle.context_id(),
             &outlet_id.to_owned(),
             &target_context_id.to_owned(),
-            &rt.role_state,
-            &rt.creator_did,
+            &role_state,
+            &creator_did,
             &rt.outlet_registry,
             rate_limit,
             None,
@@ -1753,29 +1812,34 @@ fn outlet_interface_accept_impl(
             code: codes::VALID_7041.to_owned(),
         })?;
 
-    Ok(crate::runtime::with_context(bi, context_id, |rt| {
-        let context_handle = scp_core::context::ContextHandle::new(
-            context_id.to_string(),
-            scp_core::context::ContextParams::default(),
-        );
+    // `accept_outlet_interface` decides whether the caller may bind another
+    // context's outlet offer into this context, reading roles and the creator
+    // DID from the supervisor actor.
+    let role_state = crate::runtime::live_role_state(bi, context_id)?;
 
-        scp_core::context::outlets::interface::accept_outlet_interface(
-            context_handle.context_id(),
-            &mut interface,
-            &rt.role_state,
-            &rt.creator_did,
-            None,
-        )
-        .map_err(|e| ScpPyError::ContextError {
-            message: format!("accept_outlet_interface failed: {e}"),
-            code: codes::OUTLET_6032.to_owned(),
-        })?;
+    let context_handle = scp_core::context::ContextHandle::new(
+        context_id.to_string(),
+        scp_core::context::ContextParams::default(),
+    );
 
+    scp_core::context::outlets::interface::accept_outlet_interface(
+        context_handle.context_id(),
+        &mut interface,
+        &role_state,
+        &role_state.creator_did,
+        None,
+    )
+    .map_err(|e| ScpPyError::ContextError {
+        message: format!("accept_outlet_interface failed: {e}"),
+        code: codes::OUTLET_6032.to_owned(),
+    })?;
+
+    Ok(
         serde_json::to_string(&interface).map_err(|e| ScpPyError::ContextError {
             message: format!("failed to serialize OutletInterface: {e}"),
             code: codes::OUTLET_6033.to_owned(),
-        })
-    })?)
+        })?,
+    )
 }
 
 /// Revokes a cross-context outlet interface (§6.2.0.1 step 5).
@@ -2730,8 +2794,13 @@ mod tests {
         let scp = default_scp();
         let bi = &*scp.inner;
 
-        // Register FFI state so the context exists in the runtime registry.
-        crate::runtime::register_ffi_state(bi, &ctx_id, creator_did, &[]).unwrap();
+        // Register FFI state so the context exists in the runtime registry, and
+        // create the context in the supervisor, which is where `outlet_register`
+        // reads the registrant's authority.
+        crate::init_runtime().ok();
+        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::register_ffi_state(bi, &ctx_id, &[]).unwrap();
+        crate::runtime::create_supervisor_context_for_test(bi, &ctx_id, creator_did, &[]);
 
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
@@ -2872,5 +2941,234 @@ mod tests {
             }
             other => panic!("expected SagaBusy, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Every authorization read reaches the supervisor actor
+    //
+    // Each test below makes the supervisor's role state DIFFER from what a
+    // bridge-local copy carried, then asserts the entry point follows the
+    // supervisor. `register_context` receives an EMPTY ceiling argument, and a
+    // bridge copy built from that argument held `default_ceiling()` and named
+    // the registering DID as creator — so a narrower supervisor ceiling, a
+    // supervisor-only member, or an absent supervisor role state each split the
+    // two answers apart. Reverting a call site to the copy fails the test that
+    // covers it.
+    // ------------------------------------------------------------------
+
+    /// Builds a `PyScp` whose context exists in the supervisor with
+    /// `supervisor_ceiling`, and whose FFI state was registered with no ceiling.
+    fn live_scp(
+        prefix: &str,
+        creator: &str,
+        supervisor_ceiling: &[&str],
+    ) -> (crate::scp::PyScp, String) {
+        crate::init_runtime().ok();
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let bi = &*scp.inner;
+        let ctx_id = format!("{prefix}-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_context(bi, &ctx_id, creator, &[]).unwrap();
+        crate::runtime::create_supervisor_context_for_test(
+            bi,
+            &ctx_id,
+            creator,
+            supervisor_ceiling,
+        );
+        (scp, ctx_id)
+    }
+
+    /// Builds a `PyScp` whose context has FFI state but NO supervisor role
+    /// state, so every live read fails closed.
+    fn scp_without_supervisor_context(prefix: &str, creator: &str) -> (crate::scp::PyScp, String) {
+        crate::init_runtime().ok();
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let ctx_id = format!("{prefix}-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_context(&scp.inner, &ctx_id, creator, &[]).unwrap();
+        (scp, ctx_id)
+    }
+
+    /// A registration dict meeting the schema specificity floor.
+    fn registration_dict<'py>(
+        py: Python<'py>,
+        name: &str,
+        operator_did: &str,
+    ) -> Bound<'py, PyDict> {
+        let dict = PyDict::new(py);
+        dict.set_item("name", name).unwrap();
+        dict.set_item("description", "a live-state fixture outlet")
+            .unwrap();
+        dict.set_item("operator_did", operator_did).unwrap();
+        let schema = PyDict::new(py);
+        let input = PyDict::new(py);
+        input.set_item("type", "object").unwrap();
+        let props = PyDict::new(py);
+        let str_type = PyDict::new(py);
+        str_type.set_item("type", "string").unwrap();
+        props.set_item("a", str_type).unwrap();
+        let num_type = PyDict::new(py);
+        num_type.set_item("type", "number").unwrap();
+        props.set_item("b", num_type).unwrap();
+        input.set_item("properties", props).unwrap();
+        schema.set_item("input_schema", input).unwrap();
+        let output = PyDict::new(py);
+        output.set_item("type", "object").unwrap();
+        schema.set_item("output_schema", output).unwrap();
+        dict.set_item("schema", schema).unwrap();
+        dict
+    }
+
+    /// `outlet_register` refuses the creator when the SUPERVISOR ceiling omits
+    /// `outlet:register`, even though a bridge copy would have carried
+    /// `default_ceiling()` — which grants it.
+    #[test]
+    fn outlet_register_refuses_when_the_supervisor_ceiling_omits_outlet_register() {
+        let creator = "did:dht:z6MkRegisterCeilingNarrow";
+        let (scp, ctx_id) = live_scp("outlet-reg-narrow", creator, &["messages:write"]);
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = registration_dict(py, "narrow-ceiling-probe", creator);
+            let err = scp
+                .outlet_register(&ctx_id, &dict.as_borrowed())
+                .expect_err("a ceiling without outlet:register must refuse registration");
+            let message = format!("{err}");
+            assert!(
+                message.contains("OutletRegister"),
+                "the refusal must name the missing capability: {message}"
+            );
+        });
+        crate::runtime::remove_context(&scp.inner, &ctx_id);
+    }
+
+    /// `outlet_register` accepts the creator when the SUPERVISOR ceiling carries
+    /// `outlet:register`, so the narrow-ceiling refusal above is the ceiling
+    /// talking and not a broken fixture.
+    #[test]
+    fn outlet_register_accepts_when_the_supervisor_ceiling_carries_outlet_register() {
+        let creator = "did:dht:z6MkRegisterCeilingWide";
+        let (scp, ctx_id) = live_scp(
+            "outlet-reg-wide",
+            creator,
+            &["messages:write", "outlet:register"],
+        );
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = registration_dict(py, "wide-ceiling-probe", creator);
+            scp.outlet_register(&ctx_id, &dict.as_borrowed())
+                .expect("a ceiling carrying outlet:register must admit registration");
+        });
+        crate::runtime::remove_context(&scp.inner, &ctx_id);
+    }
+
+    /// `validate_outlet_ucan` — the shared gate behind `outlet_invoke`,
+    /// `outlet_session_invoke`, `outlet_invoke_cross_context`, and the two
+    /// streaming opens — reads the ceiling and the creator from the supervisor,
+    /// so a context with no supervisor role state refuses BEFORE it consults the
+    /// bridge-owned outlet registry. A copy-reading gate reported the outlet as
+    /// unregistered instead.
+    #[test]
+    fn validate_outlet_ucan_refuses_without_supervisor_role_state() {
+        let creator = "did:dht:z6MkValidateUcanNoActor";
+        let (scp, ctx_id) = scp_without_supervisor_context("validate-ucan-no-actor", creator);
+
+        let err = validate_outlet_ucan(
+            &scp.inner,
+            &ctx_id,
+            "some-outlet",
+            "not-a-real-token",
+            creator,
+            None,
+        )
+        .expect_err("no supervisor role state must refuse the UCAN gate");
+        let message = format!("{err}");
+        assert!(
+            message.contains("no live supervisor role state"),
+            "the refusal must name the absent supervisor role state: {message}"
+        );
+        crate::runtime::remove_context(&scp.inner, &ctx_id);
+    }
+
+    /// `resolve_context_signing_key` resolves the SUPERVISOR's `creator_did`.
+    /// The fixture registers FFI state under one DID and creates the supervisor
+    /// context under another, so the DID named in the refusal identifies which
+    /// store the resolver read.
+    #[test]
+    fn resolve_context_signing_key_reads_the_supervisor_creator() {
+        crate::init_runtime().ok();
+        let ffi_creator = "did:dht:z6MkSigningKeyFfiCreator";
+        let supervisor_creator = "did:dht:z6MkSigningKeySupervisorCreator";
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let bi = &*scp.inner;
+        let ctx_id = format!("signing-key-{}", uuid::Uuid::new_v4());
+        crate::runtime::register_context(bi, &ctx_id, ffi_creator, &[]).unwrap();
+        crate::runtime::create_supervisor_context_for_test(bi, &ctx_id, supervisor_creator, &[]);
+
+        // Neither DID is custodied on this instance, so the resolver refuses and
+        // names the DID it tried.
+        let err = resolve_context_signing_key(bi, &ctx_id)
+            .expect_err("an uncustodied creator DID must refuse");
+        let message = format!("{err}");
+        assert!(
+            message.contains(supervisor_creator),
+            "the resolver must name the supervisor's creator DID: {message}"
+        );
+        assert!(
+            !message.contains(ffi_creator),
+            "the resolver must not name the DID the bridge was registered under: {message}"
+        );
+        crate::runtime::remove_context(bi, &ctx_id);
+    }
+
+    /// `outlet_interface_expose` reads roles and the creator from the supervisor,
+    /// so a context with no supervisor role state refuses with the live-read
+    /// error rather than the `SCP-OUTLET-6030` a copy-reading path produced.
+    #[test]
+    fn interface_expose_refuses_without_supervisor_role_state() {
+        let creator = "did:dht:z6MkExposeNoActor";
+        let (scp, ctx_id) = scp_without_supervisor_context("expose-no-actor", creator);
+
+        let err = scp
+            .outlet_interface_expose(&ctx_id, "some-outlet", "target-context", None)
+            .expect_err("no supervisor role state must refuse the expose");
+        let message = format!("{err}");
+        assert!(
+            message.contains("no live supervisor role state"),
+            "the refusal must name the absent supervisor role state: {message}"
+        );
+        crate::runtime::remove_context(&scp.inner, &ctx_id);
+    }
+
+    /// `outlet_interface_accept` reads roles and the creator from the supervisor,
+    /// so a context with no supervisor role state refuses with the live-read
+    /// error rather than the `SCP-OUTLET-6032` a copy-reading path produced.
+    #[test]
+    fn interface_accept_refuses_without_supervisor_role_state() {
+        let creator = "did:dht:z6MkAcceptNoActor";
+        let (scp, ctx_id) = scp_without_supervisor_context("accept-no-actor", creator);
+
+        let interface_json = serde_json::json!({
+            "source_context": "some-source",
+            "target_context": ctx_id,
+            "outlet_id": "some-outlet",
+            "rate_limit": null,
+            "inbound_rate_limit": null,
+            "per_caller_rate_limit": null,
+            "approved_by_source": true,
+            "approved_by_target": false,
+            "outbound_policy": null,
+            "inbound_policy": null,
+        })
+        .to_string();
+
+        let err = scp
+            .outlet_interface_accept(&ctx_id, &interface_json)
+            .expect_err("no supervisor role state must refuse the accept");
+        let message = format!("{err}");
+        assert!(
+            message.contains("no live supervisor role state"),
+            "the refusal must name the absent supervisor role state: {message}"
+        );
+        crate::runtime::remove_context(&scp.inner, &ctx_id);
     }
 }
