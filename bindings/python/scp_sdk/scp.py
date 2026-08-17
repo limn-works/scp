@@ -1018,7 +1018,7 @@ class SCP:
         )
 
     async def verify_identity_link_attestation(
-        self, attestation_json: str, issuer_public_key_hex: str
+        self, attestation_json: str, issuer_public_key_hex: str, reference_proof: str
     ) -> Any:
         """Verify an identity link attestation per spec §3.5.4.
 
@@ -1042,18 +1042,25 @@ class SCP:
         check rejects: a bad signature, a revoked or expired attestation, or a
         key an issuer's document publishes at neither fragment.
 
-        Two checks no bridge performs raise instead of returning a verdict, so
-        a caller performs them itself:
+        ``reference_proof`` reports what this caller did about a Class 2
+        (``signed_post`` / ``dns_record``) proof resource, per spec §3.5.4
+        Class 2 step 2. Pass ``"confirmed"`` after fetching the resource
+        ``evidence.proof`` names and finding this issuer's DID in it, which
+        yields ``True`` or ``False``. Pass ``"not_fetched"`` after fetching
+        nothing, which raises ``SCP-IDENT-1062`` for a Class 2 attestation. A
+        Class 1 (``did_control``) attestation ignores this argument. Any other
+        string raises ``SCP-IDENT-1044``.
+
+        Two conditions raise instead of returning a verdict:
 
         - ``SCP-IDENT-1061`` when an issuer's DID document publishes an
           ``AttestationRevocations`` service endpoint. Spec §3.5.2 requires a
           verifier to read that list of revoked attestation IDs regardless of
           an attestation's own ``revocation_status``, and no bridge fetches it.
-        - ``SCP-IDENT-1062`` for a Class 2 (``signed_post`` / ``dns_record``)
-          attestation, whose external proof resource no bridge fetches. Spec
-          §3.5.4 Class 2 step 3 leaves such an attestation unverified and
-          forbids caching a negative result, so ``False`` would be wrong. Every
-          Class 2 attestation raises this code through every SDK today.
+        - ``SCP-IDENT-1062`` for a Class 2 attestation this caller reported as
+          ``"not_fetched"``. Spec §3.5.4 Class 2 step 3 leaves such an
+          attestation unverified and forbids caching a negative result, so
+          ``False`` would be wrong.
 
         Raises ``SCP-IDENT-1044`` when an argument is malformed, and
         ``SCP-IDENT-1060`` when an issuer's DID document cannot be resolved.
@@ -1062,6 +1069,7 @@ class SCP:
             self._native.verify_identity_link_attestation,
             attestation_json,
             issuer_public_key_hex,
+            reference_proof,
         )
 
     # endregion Identity

@@ -192,6 +192,54 @@ pub const LINK_VERIFY_REQUIRES_INSTANCE: &str = "identity link attestation verif
      against a caller-supplied key would return true for an attacker who supplies \
      both that key and that attestation.";
 
+/// Wire value a caller passes to report that it fetched a class 2 proof
+/// resource and found an issuer's DID in that resource (spec §3.5.4 Class 2
+/// step 2).
+pub const REFERENCE_PROOF_CONFIRMED: &str = "confirmed";
+
+/// Wire value a caller passes to report that it fetched no class 2 proof
+/// resource.
+///
+/// Spec §3.5.4 Class 2 step 3 then leaves a class 2 attestation unverified, so
+/// [`verify_link_attestation`] raises
+/// [`LinkVerifyError::ReferenceProofNotFetched`] rather than answering `false`.
+pub const REFERENCE_PROOF_NOT_FETCHED: &str = "not_fetched";
+
+/// Turns a caller's `reference_proof` string into a
+/// [`ReferenceProofOutcome`](scp_core::identity::attestation::ReferenceProofOutcome).
+///
+/// Every bridge passes a caller's string straight through to
+/// [`verify_link_attestation`], which calls this parser, so all four SDKs
+/// accept exactly [`REFERENCE_PROOF_CONFIRMED`] and
+/// [`REFERENCE_PROOF_NOT_FETCHED`] and reject every other string with one
+/// message.
+///
+/// A string rather than a bridge-specific enum type: `signed_post` and
+/// `dns_record` verification already cross all three bridges as strings, and
+/// one shared parser gives `PyO3`, napi-rs, and `UniFFI` an identical
+/// vocabulary without three generated enum types to keep in step.
+///
+/// # Errors
+///
+/// Returns [`LinkVerifyError::MalformedArgument`] for any string other than
+/// those two values, so a typo fails closed instead of selecting a default.
+pub fn parse_reference_proof(
+    value: &str,
+) -> Result<scp_core::identity::attestation::ReferenceProofOutcome, LinkVerifyError> {
+    use scp_core::identity::attestation::ReferenceProofOutcome;
+
+    match value {
+        REFERENCE_PROOF_CONFIRMED => Ok(ReferenceProofOutcome::Confirmed),
+        REFERENCE_PROOF_NOT_FETCHED => Ok(ReferenceProofOutcome::NotFetched),
+        other => Err(LinkVerifyError::MalformedArgument(format!(
+            "reference_proof must read \"{REFERENCE_PROOF_CONFIRMED}\" when a caller fetched a \
+             class 2 proof resource and found this issuer's DID in it (spec §3.5.4 Class 2 \
+             step 2), or \"{REFERENCE_PROOF_NOT_FETCHED}\" when a caller fetched nothing; got \
+             {other:?}"
+        ))),
+    }
+}
+
 /// Why [`verify_link_attestation`] could not return a verdict.
 ///
 /// Every variant reports a condition under which no verdict is honest, so a
@@ -346,27 +394,27 @@ impl std::error::Error for LinkVerifyError {}
 ///
 /// # What a caller still owes
 ///
-/// Step 3 above and a class 2 proof fetch (§3.5.4 Class 2 step 2) both raise a
-/// typed error rather than returning a verdict, because neither a fetch of an
-/// issuer's revocation list nor a fetch of a post URL or DNS TXT record happens
-/// here. A caller performs those fetches and decides.
+/// Step 3 above raises a typed error rather than returning a verdict, because
+/// no fetch of an issuer's revocation list happens here. A caller performs that
+/// fetch and decides.
 ///
-/// # A class 2 attestation is unverifiable through any SDK today
+/// # How a caller verifies a class 2 attestation
 ///
-/// This function passes
-/// [`ReferenceProofOutcome::NotFetched`](scp_core::identity::attestation::ReferenceProofOutcome::NotFetched)
-/// unconditionally, so
-/// [`ReferenceProofOutcome::Confirmed`](scp_core::identity::attestation::ReferenceProofOutcome::Confirmed)
-/// is unreachable from all three bridges. Reaching it needs a third argument on
-/// each bridge method carrying a caller's fetch outcome, and adding one breaks
-/// `bindings/typescript/src/scp.ts`, `bindings/swift/`, and
-/// `bindings/kotlin/`. So a `signed_post` or `dns_record` attestation returns
-/// [`LinkVerifyError::ReferenceProofNotFetched`] through every SDK — Python,
-/// TypeScript, Swift, and Kotlin alike — and no SDK caller can obtain a `true`
-/// for one. A caller that needs a class 2 verdict fetches that proof resource
-/// itself and reads
-/// [`verify_identity_link_attestation`](scp_core::identity::attestation::verify_identity_link_attestation)
-/// directly from Rust.
+/// `reference_proof` carries a caller's own class 2 fetch outcome (§3.5.4
+/// Class 2 step 2), which [`parse_reference_proof`] turns into a
+/// [`ReferenceProofOutcome`](scp_core::identity::attestation::ReferenceProofOutcome).
+/// A caller that fetched the resource `evidence.proof` names, and found an
+/// issuer's DID in that resource, passes [`REFERENCE_PROOF_CONFIRMED`] and
+/// receives a `true` or a `false`. A caller that fetched nothing passes
+/// [`REFERENCE_PROOF_NOT_FETCHED`] and receives
+/// [`LinkVerifyError::ReferenceProofNotFetched`], because §3.5.4 Class 2 step 3
+/// leaves such an attestation unverified and forbids caching a negative result.
+/// Every bridge takes this argument, so Python, TypeScript, Swift, and Kotlin
+/// callers all reach a class 2 verdict.
+///
+/// A class 1 (`did_control`) attestation ignores `reference_proof`: §3.5.4
+/// Class 1 verification reads a signature and a DID document, and fetches no
+/// external resource.
 ///
 /// # Why `issuer_public_key_hex` is checked against a document
 ///
@@ -398,14 +446,14 @@ pub async fn verify_link_attestation<R>(
     resolver: &R,
     attestation_json: &str,
     issuer_public_key_hex: &str,
+    reference_proof: &str,
 ) -> Result<bool, LinkVerifyError>
 where
     R: scp_identity::resolver::DidResolver + ?Sized,
 {
     use scp_core::identity::attestation::{
-        IdentityLinkVerifyError, IdentityLinkVerifyInput, ReferenceProofOutcome,
-        SERVICE_TYPE_ATTESTATION_REVOCATIONS, published_signing_keys,
-        verify_identity_link_attestation,
+        IdentityLinkVerifyError, IdentityLinkVerifyInput, SERVICE_TYPE_ATTESTATION_REVOCATIONS,
+        published_signing_keys, verify_identity_link_attestation,
     };
 
     // --- 1. Parse a caller's two strings.
@@ -422,6 +470,7 @@ where
             key_bytes.len()
         ))
     })?;
+    let reference_proof = parse_reference_proof(reference_proof)?;
     let issuer: &str = (*attestation.issuer).as_ref();
 
     // --- 2. Resolve an issuer's DID document (§3.5.4 step 1).
@@ -469,7 +518,7 @@ where
         attestation: &attestation,
         issuer_document,
         now_secs,
-        reference_proof: ReferenceProofOutcome::NotFetched,
+        reference_proof,
     }) {
         Ok(_) => {}
         // A class 2 proof resource nobody fetched leaves an attestation
@@ -585,9 +634,10 @@ mod link_verification_tests {
         resolver: &FixedResolver,
         attestation: &IdentityLinkAttestation,
         key_hex: &str,
+        reference_proof: &str,
     ) -> Result<bool, LinkVerifyError> {
         let json = serde_json::to_string(attestation).unwrap();
-        block_on_verify(resolver, &json, key_hex)
+        block_on_verify(resolver, &json, key_hex, reference_proof)
     }
 
     /// Drives the async shared flow to completion on this thread. `FixedResolver`
@@ -596,6 +646,7 @@ mod link_verification_tests {
         resolver: &FixedResolver,
         attestation_json: &str,
         key_hex: &str,
+        reference_proof: &str,
     ) -> Result<bool, LinkVerifyError> {
         use std::future::Future;
         use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -610,7 +661,7 @@ mod link_verification_tests {
         // entry dereferences it.
         let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
         let mut cx = Context::from_waker(&waker);
-        let future = verify_link_attestation(resolver, attestation_json, key_hex);
+        let future = verify_link_attestation(resolver, attestation_json, key_hex, reference_proof);
         let mut future = std::pin::pin!(future);
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(result) => result,
@@ -630,7 +681,15 @@ mod link_verification_tests {
             None,
         )));
         let key_hex = hex::encode(active.verifying_key().to_bytes());
-        assert!(run(&resolver, &attestation, &key_hex).unwrap());
+        assert!(
+            run(
+                &resolver,
+                &attestation,
+                &key_hex,
+                REFERENCE_PROOF_NOT_FETCHED
+            )
+            .unwrap()
+        );
     }
 
     /// GitHub issue #2335 finding 2 regression pin, in the shape that finding
@@ -664,7 +723,15 @@ mod link_verification_tests {
             None,
         )));
         let attacker_hex = hex::encode(attacker.verifying_key().to_bytes());
-        assert!(!run(&resolver, &forged, &attacker_hex).unwrap());
+        assert!(
+            !run(
+                &resolver,
+                &forged,
+                &attacker_hex,
+                REFERENCE_PROOF_NOT_FETCHED
+            )
+            .unwrap()
+        );
     }
 
     /// An `#agent` key signed, and a caller named that issuer's `#active` key.
@@ -684,7 +751,13 @@ mod link_verification_tests {
         )));
         let active_hex = hex::encode(active.verifying_key().to_bytes());
         assert!(
-            run(&resolver, &attestation, &active_hex).unwrap(),
+            run(
+                &resolver,
+                &attestation,
+                &active_hex,
+                REFERENCE_PROOF_NOT_FETCHED
+            )
+            .unwrap(),
             "an #agent-signed attestation presented with a published #active key must verify"
         );
     }
@@ -700,7 +773,15 @@ mod link_verification_tests {
             None,
         )));
         let key_hex = hex::encode(active.verifying_key().to_bytes());
-        assert!(!run(&resolver, &attestation, &key_hex).unwrap());
+        assert!(
+            !run(
+                &resolver,
+                &attestation,
+                &key_hex,
+                REFERENCE_PROOF_NOT_FETCHED
+            )
+            .unwrap()
+        );
     }
 
     /// Spec §3.5.2 requires a verifier to read an issuer's
@@ -719,7 +800,12 @@ mod link_verification_tests {
         let resolver = FixedResolver(Some(doc));
         let key_hex = hex::encode(active.verifying_key().to_bytes());
 
-        match run(&resolver, &attestation, &key_hex) {
+        match run(
+            &resolver,
+            &attestation,
+            &key_hex,
+            REFERENCE_PROOF_NOT_FETCHED,
+        ) {
             Err(LinkVerifyError::RevocationListUnread { issuer, endpoint }) => {
                 assert_eq!(issuer, DID);
                 assert_eq!(
@@ -729,7 +815,13 @@ mod link_verification_tests {
             }
             other => panic!("expected RevocationListUnread, got {other:?}"),
         }
-        let err = run(&resolver, &attestation, &key_hex).unwrap_err();
+        let err = run(
+            &resolver,
+            &attestation,
+            &key_hex,
+            REFERENCE_PROOF_NOT_FETCHED,
+        )
+        .unwrap_err();
         assert_eq!(err.error_code(), crate::error_codes::IDENT_1061);
     }
 
@@ -747,14 +839,87 @@ mod link_verification_tests {
         )));
         let key_hex = hex::encode(active.verifying_key().to_bytes());
 
-        match run(&resolver, &attestation, &key_hex) {
+        match run(
+            &resolver,
+            &attestation,
+            &key_hex,
+            REFERENCE_PROOF_NOT_FETCHED,
+        ) {
             Err(LinkVerifyError::ReferenceProofNotFetched { method, .. }) => {
                 assert_eq!(method, "dns_record");
             }
             other => panic!("expected ReferenceProofNotFetched, got {other:?}"),
         }
-        let err = run(&resolver, &attestation, &key_hex).unwrap_err();
+        let err = run(
+            &resolver,
+            &attestation,
+            &key_hex,
+            REFERENCE_PROOF_NOT_FETCHED,
+        )
+        .unwrap_err();
         assert_eq!(err.error_code(), crate::error_codes::IDENT_1062);
+    }
+
+    /// A caller that fetched a class 2 proof resource, and found an issuer's
+    /// DID in it, reports [`REFERENCE_PROOF_CONFIRMED`] and receives a verdict.
+    /// Before `reference_proof` reached this flow, every class 2 attestation
+    /// raised `SCP-IDENT-1062` through all four SDKs, so no SDK caller could
+    /// obtain a `true` for one. Reverting `reference_proof` to a hardcoded
+    /// `NotFetched` turns this assertion into that same error.
+    #[test]
+    fn a_confirmed_reference_proof_verifies_a_class_2_attestation() {
+        let active = signing_key(0xAA);
+        let attestation = mint(DID, &active, "dns_record");
+        let resolver = FixedResolver(Some(document(
+            DID,
+            &active.verifying_key().to_bytes(),
+            None,
+        )));
+        let key_hex = hex::encode(active.verifying_key().to_bytes());
+
+        assert!(
+            run(&resolver, &attestation, &key_hex, REFERENCE_PROOF_CONFIRMED).unwrap(),
+            "a class 2 attestation whose proof a caller confirmed must verify"
+        );
+    }
+
+    /// A confirmed class 2 proof reports one fetch outcome; it does not stand
+    /// in for a signature. A tampered class 2 attestation stays rejected.
+    #[test]
+    fn a_confirmed_reference_proof_still_rejects_a_tampered_class_2_attestation() {
+        let active = signing_key(0xAA);
+        let mut attestation = mint(DID, &active, "dns_record");
+        attestation.claim.platform_handle = "mallory".to_owned();
+        let resolver = FixedResolver(Some(document(
+            DID,
+            &active.verifying_key().to_bytes(),
+            None,
+        )));
+        let key_hex = hex::encode(active.verifying_key().to_bytes());
+
+        assert!(
+            !run(&resolver, &attestation, &key_hex, REFERENCE_PROOF_CONFIRMED).unwrap(),
+            "a confirmed proof fetch must not excuse a broken signature"
+        );
+    }
+
+    /// A `reference_proof` string outside the two admissible values selects no
+    /// default. It raises `SCP-IDENT-1044`, so a caller who misspells
+    /// `confirmed` never receives a silent `not_fetched` verdict.
+    #[test]
+    fn an_unknown_reference_proof_value_fails_closed() {
+        let active = signing_key(0xAA);
+        let attestation = mint(DID, &active, "oauth");
+        let resolver = FixedResolver(Some(document(
+            DID,
+            &active.verifying_key().to_bytes(),
+            None,
+        )));
+        let key_hex = hex::encode(active.verifying_key().to_bytes());
+
+        let err = run(&resolver, &attestation, &key_hex, "Confirmed").unwrap_err();
+        assert!(matches!(err, LinkVerifyError::MalformedArgument(_)));
+        assert_eq!(err.error_code(), crate::error_codes::IDENT_1044);
     }
 
     #[test]
@@ -764,7 +929,13 @@ mod link_verification_tests {
         let resolver = FixedResolver(None);
         let key_hex = hex::encode(active.verifying_key().to_bytes());
 
-        let err = run(&resolver, &attestation, &key_hex).unwrap_err();
+        let err = run(
+            &resolver,
+            &attestation,
+            &key_hex,
+            REFERENCE_PROOF_NOT_FETCHED,
+        )
+        .unwrap_err();
         assert!(matches!(err, LinkVerifyError::IssuerDocumentMissing { .. }));
         assert_eq!(err.error_code(), crate::error_codes::IDENT_1060);
     }
@@ -772,16 +943,22 @@ mod link_verification_tests {
     #[test]
     fn raises_on_a_malformed_argument() {
         let resolver = FixedResolver(None);
-        let err = block_on_verify(&resolver, "not json", &"00".repeat(32)).unwrap_err();
+        let err = block_on_verify(
+            &resolver,
+            "not json",
+            &"00".repeat(32),
+            REFERENCE_PROOF_NOT_FETCHED,
+        )
+        .unwrap_err();
         assert!(matches!(err, LinkVerifyError::MalformedArgument(_)));
         assert_eq!(err.error_code(), crate::error_codes::IDENT_1044);
 
         let attestation = mint(DID, &signing_key(0xAA), "oauth");
         let json = serde_json::to_string(&attestation).unwrap();
-        let err = block_on_verify(&resolver, &json, "zz").unwrap_err();
+        let err = block_on_verify(&resolver, &json, "zz", REFERENCE_PROOF_NOT_FETCHED).unwrap_err();
         assert_eq!(err.error_code(), crate::error_codes::IDENT_1044);
 
-        let err = block_on_verify(&resolver, &json, "00").unwrap_err();
+        let err = block_on_verify(&resolver, &json, "00", REFERENCE_PROOF_NOT_FETCHED).unwrap_err();
         assert_eq!(err.error_code(), crate::error_codes::IDENT_1044);
     }
 

@@ -4334,8 +4334,9 @@ pub async fn identity_verify_device_attestation(
 pub fn identity_verify_link_attestation(
     attestation_json: String,
     issuer_public_key_hex: String,
+    reference_proof: String,
 ) -> Result<bool, ScpError> {
-    let _ = (attestation_json, issuer_public_key_hex);
+    let _ = (attestation_json, issuer_public_key_hex, reference_proof);
     Err(ScpError::Identity {
         msg: scp_ffi_common::attestation::LINK_VERIFY_REQUIRES_INSTANCE.to_owned(),
         code: codes::IDENT_1060.to_owned(),
@@ -10058,6 +10059,14 @@ impl Scp {
     ///   a caller asserts belongs to this issuer. This method checks that
     ///   assertion against an issuer's resolved DID document; it never uses
     ///   this key as a substitute for that document.
+    /// * `reference_proof` — What this caller did about a class 2
+    ///   (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
+    ///   step 2. `"confirmed"` reports that this caller fetched the resource
+    ///   `evidence.proof` names and found this issuer's DID in it, which yields
+    ///   a `true` or a `false`. `"not_fetched"` reports that this caller
+    ///   fetched nothing, which raises `SCP-IDENT-1062` for a class 2
+    ///   attestation. A class 1 (`did_control`) attestation ignores this
+    ///   argument. Any other string raises `SCP-IDENT-1044`.
     ///
     /// # Returns
     ///
@@ -10081,6 +10090,7 @@ impl Scp {
         &self,
         attestation_json: String,
         issuer_public_key_hex: String,
+        reference_proof: String,
     ) -> Result<bool, ScpError> {
         use scp_ffi_common::attestation::LinkVerifyError;
 
@@ -10113,6 +10123,7 @@ impl Scp {
             &*resolver,
             &attestation_json,
             &issuer_public_key_hex,
+            &reference_proof,
         )
         .await
         .map_err(|e| to_scp(&e))
@@ -25781,8 +25792,12 @@ mod tests {
     /// caller-supplied attestation.
     #[test]
     fn module_scope_link_verification_declines_fail_closed() {
-        let err = identity_verify_link_attestation("{}".to_owned(), "00".repeat(32))
-            .expect_err("module-scope verification must decline");
+        let err = identity_verify_link_attestation(
+            "{}".to_owned(),
+            "00".repeat(32),
+            scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+        )
+        .expect_err("module-scope verification must decline");
         let msg = err.to_string();
         assert!(
             msg.contains(codes::IDENT_1060),
@@ -25797,7 +25812,11 @@ mod tests {
     fn per_instance_link_verification_rejects_malformed_arguments() {
         let scp = scp_test();
         let err = runtime()
-            .block_on(scp.identity_verify_link_attestation("not json".to_owned(), "00".repeat(32)))
+            .block_on(scp.identity_verify_link_attestation(
+                "not json".to_owned(),
+                "00".repeat(32),
+                scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+            ))
             .expect_err("malformed JSON must raise");
         let msg = err.to_string();
         assert!(
@@ -25860,7 +25879,11 @@ mod tests {
         runtime().block_on(async {
             let (scp, attestation_json, active_hex) = minted_link_attestation().await;
             let verified = scp
-                .identity_verify_link_attestation(attestation_json, active_hex)
+                .identity_verify_link_attestation(
+                    attestation_json,
+                    active_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+                )
                 .await
                 .expect("verification of a freshly minted attestation must not error");
             assert!(
@@ -25915,7 +25938,11 @@ mod tests {
             );
 
             let verified = scp
-                .identity_verify_link_attestation(forged_json, attacker_hex)
+                .identity_verify_link_attestation(
+                    forged_json,
+                    attacker_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+                )
                 .await
                 .expect("verification of a forgery must not error");
             assert!(

@@ -653,7 +653,7 @@ class SCP:
     def identity_rotate_key(self, identity: Any) -> Any: ...
     def remove_identity_link_attestation(self, did: Any, attestation_id: Any) -> Any: ...
     def verify_identity_link_attestation(
-        self, attestation_json: str, issuer_public_key_hex: str
+        self, attestation_json: str, issuer_public_key_hex: str, reference_proof: str
     ) -> bool: ...
 
     # -- MCP --
@@ -984,7 +984,7 @@ def identity_verify_device_attestation(_did: str, token_base64: str) -> bool: ..
 # document names no identity-link verification operation. It sits here because
 # it kept a Python-visible name that predates GitHub issue #2335 finding 2.
 def py_verify_identity_link_attestation(
-    attestation_json: str, issuer_public_key_hex: str
+    attestation_json: str, issuer_public_key_hex: str, reference_proof: str
 ) -> bool: ...
 
 # -- provenance (pure helpers, ADR-048 §1) --

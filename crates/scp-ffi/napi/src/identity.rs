@@ -2114,6 +2114,7 @@ mod tests {
         let err = crate::scp::identity_verify_link_attestation(
             "{\"not\":\"an attestation\"}".to_owned(),
             "00".repeat(32),
+            scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
         )
         .expect_err("module-scope verification must decline");
         let msg = err.to_string();
@@ -2157,7 +2158,11 @@ mod tests {
         rt.block_on(async {
             let (scp, _did, attestation_json, active_hex) = minted_link_attestation().await;
             let verified = scp
-                .identity_verify_link_attestation(attestation_json, active_hex)
+                .identity_verify_link_attestation(
+                    attestation_json,
+                    active_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+                )
                 .await
                 .expect("verification of a freshly minted attestation must not error");
             assert!(
@@ -2213,7 +2218,11 @@ mod tests {
             );
 
             let verified = scp
-                .identity_verify_link_attestation(forged_json, attacker_hex)
+                .identity_verify_link_attestation(
+                    forged_json,
+                    attacker_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+                )
                 .await
                 .expect("verification of a forgery must not error");
             assert!(
@@ -2235,7 +2244,11 @@ mod tests {
                 "tampering must change the attestation JSON"
             );
             let verified = scp
-                .identity_verify_link_attestation(tampered, active_hex)
+                .identity_verify_link_attestation(
+                    tampered,
+                    active_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED.to_owned(),
+                )
                 .await
                 .expect("verification of a tampered attestation must not error");
             assert!(

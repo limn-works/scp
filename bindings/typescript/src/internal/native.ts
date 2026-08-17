@@ -1722,16 +1722,20 @@ export function createNativeBridge(scp: SCP): Bridge {
     async identityVerifyLinkAttestation(
       attestationJson: string,
       issuerPublicKeyHex: string,
+      referenceProof: string,
     ): Promise<boolean> {
       // Per-instance `Scp` method — route through `native`. Spec §3.5.4 step 1
       // resolves an issuer's DID document before any signature check, which
       // needs this instance's resolver. A module-level free function of the
       // same name still exists and now declines with `SCP-IDENT-1060`, because
       // it reaches no bridge instance (GitHub issue #2335 finding 2).
-      return (native.identityVerifyLinkAttestation as (j: string, k: string) => Promise<boolean>)(
-        attestationJson,
-        issuerPublicKeyHex,
-      );
+      return (
+        native.identityVerifyLinkAttestation as (
+          j: string,
+          k: string,
+          r: string,
+        ) => Promise<boolean>
+      )(attestationJson, issuerPublicKeyHex, referenceProof);
     },
 
     // Recovery and custody migration (#632, spec §9.12)

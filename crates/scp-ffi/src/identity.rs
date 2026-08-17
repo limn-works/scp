@@ -1014,6 +1014,8 @@ pub fn identity_verify_device_attestation(_did: &str, token_base64: &str) -> PyR
 ///
 /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
 /// * `issuer_public_key_hex` — Hex-encoded Ed25519 public key of an issuer.
+/// * `reference_proof` — `"confirmed"` or `"not_fetched"`, matching the
+///   per-instance method's third argument.
 ///
 /// # Errors
 ///
@@ -1023,8 +1025,9 @@ pub fn identity_verify_device_attestation(_did: &str, token_base64: &str) -> PyR
 pub fn verify_identity_link_attestation(
     attestation_json: &str,
     issuer_public_key_hex: &str,
+    reference_proof: &str,
 ) -> PyResult<bool> {
-    let _ = (attestation_json, issuer_public_key_hex);
+    let _ = (attestation_json, issuer_public_key_hex, reference_proof);
     Err(PyErr::from(ScpPyError::identity_with_code(
         scp_ffi_common::attestation::LINK_VERIFY_REQUIRES_INSTANCE.to_owned(),
         scp_ffi_common::error_codes::IDENT_1060,
@@ -1661,6 +1664,14 @@ impl crate::scp::PyScp {
     ///   this key as a substitute for that document. A caller who names a key
     ///   that document publishes at neither `#active` nor `#agent` receives
     ///   `False`.
+    /// * `reference_proof` — What this caller did about a class 2
+    ///   (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
+    ///   step 2. `"confirmed"` reports that this caller fetched the resource
+    ///   `evidence.proof` names and found this issuer's DID in it, which yields
+    ///   a `True` or a `False`. `"not_fetched"` reports that this caller
+    ///   fetched nothing, which raises `SCP-IDENT-1062` for a class 2
+    ///   attestation. A class 1 (`did_control`) attestation ignores this
+    ///   argument. Any other string raises `SCP-IDENT-1044`.
     ///
     /// # Returns
     ///
@@ -1687,6 +1698,7 @@ impl crate::scp::PyScp {
         py: Python<'_>,
         attestation_json: &str,
         issuer_public_key_hex: &str,
+        reference_proof: &str,
     ) -> PyResult<bool> {
         use scp_ffi_common::attestation::LinkVerifyError;
 
@@ -1699,6 +1711,7 @@ impl crate::scp::PyScp {
         let bi = Arc::clone(&self.inner);
         let attestation_json = attestation_json.to_owned();
         let issuer_public_key_hex = issuer_public_key_hex.to_owned();
+        let reference_proof = reference_proof.to_owned();
 
         py.allow_threads(move || -> Result<bool, ScpPyError> {
             ensure_did_resolver_initialized_on(&bi, rt.handle().clone())?;
@@ -1710,6 +1723,7 @@ impl crate::scp::PyScp {
                 &*resolver,
                 &attestation_json,
                 &issuer_public_key_hex,
+                &reference_proof,
             ))
             .map_err(|e| to_py(&e))
         })
@@ -2933,8 +2947,12 @@ mod tests {
     fn module_scope_link_verification_declines_fail_closed() {
         setup();
         Python::with_gil(|_py| {
-            let err = verify_identity_link_attestation("{}", &"00".repeat(32))
-                .expect_err("module-scope verification must decline");
+            let err = verify_identity_link_attestation(
+                "{}",
+                &"00".repeat(32),
+                scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED,
+            )
+            .expect_err("module-scope verification must decline");
             let msg = err.to_string();
             assert!(
                 msg.contains(scp_ffi_common::error_codes::IDENT_1060),
@@ -2952,7 +2970,12 @@ mod tests {
         let scp = default_scp();
         Python::with_gil(|py| {
             let err = scp
-                .verify_identity_link_attestation(py, "not json", &"00".repeat(32))
+                .verify_identity_link_attestation(
+                    py,
+                    "not json",
+                    &"00".repeat(32),
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED,
+                )
                 .expect_err("malformed JSON must raise");
             let msg = err.to_string();
             assert!(
@@ -3003,7 +3026,12 @@ mod tests {
         Python::with_gil(|py| {
             let (scp, attestation_json, active_hex) = minted_link_attestation(py);
             let verified = scp
-                .verify_identity_link_attestation(py, &attestation_json, &active_hex)
+                .verify_identity_link_attestation(
+                    py,
+                    &attestation_json,
+                    &active_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED,
+                )
                 .expect("verification of a freshly minted attestation must not raise");
             assert!(
                 verified,
@@ -3058,7 +3086,12 @@ mod tests {
             );
 
             let verified = scp
-                .verify_identity_link_attestation(py, &forged_json, &attacker_hex)
+                .verify_identity_link_attestation(
+                    py,
+                    &forged_json,
+                    &attacker_hex,
+                    scp_ffi_common::attestation::REFERENCE_PROOF_NOT_FETCHED,
+                )
                 .expect("verification of a forgery must not raise");
             assert!(
                 !verified,
