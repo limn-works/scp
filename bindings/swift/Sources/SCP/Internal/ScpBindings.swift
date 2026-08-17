@@ -16359,6 +16359,9 @@ public func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadow
  * * `mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
  * * `webhook_url` — For cooperative mode: the platform's webhook receiver URL.
  * * `platform_key` — For cooperative mode: the platform's Ed25519 public key (32 bytes).
+ * * `platform_key_id` — For cooperative mode: the platform's identifier for
+ *   `platform_key`, which that platform sends in `X-SCP-Platform-Key-Id` on a
+ *   webhook request and which every webhook signature covers (spec §12.10.2).
  * * `max_shadows` — Governance-configured shadow limit (default 10,000).
  * * `metadata_display_name` — Human-readable display name for the bridge.
  * * `metadata_description` — Free-text description of the bridge.
@@ -16379,7 +16382,7 @@ public func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadow
  *
  * See spec section 12 (Bridge System) and ADR-023.
  */
-public func bridgeRegister(contextId: String, operatorDid: String, governanceDid: String, platform: String, mode: String, webhookUrl: String?, platformKey: Data?, maxShadows: UInt32?, metadataDisplayName: String?, metadataDescription: String?, metadataOperatorContact: String?)throws  -> BridgeRegistrationResult  {
+public func bridgeRegister(contextId: String, operatorDid: String, governanceDid: String, platform: String, mode: String, webhookUrl: String?, platformKey: Data?, platformKeyId: String?, maxShadows: UInt32?, metadataDisplayName: String?, metadataDescription: String?, metadataOperatorContact: String?)throws  -> BridgeRegistrationResult  {
     return try  FfiConverterTypeBridgeRegistrationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_bridge_register(
         FfiConverterString.lower(contextId),
@@ -16389,6 +16392,7 @@ public func bridgeRegister(contextId: String, operatorDid: String, governanceDid
         FfiConverterString.lower(mode),
         FfiConverterOptionString.lower(webhookUrl),
         FfiConverterOptionData.lower(platformKey),
+        FfiConverterOptionString.lower(platformKeyId),
         FfiConverterOptionUInt32.lower(maxShadows),
         FfiConverterOptionString.lower(metadataDisplayName),
         FfiConverterOptionString.lower(metadataDescription),
@@ -17167,7 +17171,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_evaluate_trust() != 16710) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 24353) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 27950) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_open_key() != 24667) {

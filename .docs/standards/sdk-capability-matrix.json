@@ -1873,7 +1873,8 @@
           "swift": true,
           "exemptions": {
             "typescript": "bridge_register is an internal Bridge interface method (bridgeRegister on the internal Bridge interface in bindings/typescript/src/internal/bridge.ts); it is not exposed as a named public SDK function — registration is handled at the FFI layer directly via the NAPI addon"
-          }
+          },
+          "notes": "Spec §12.2.1 RegisterBridge carries platform_key_id beside platform_key, and every wrapper passes both: Python scp_sdk.bridge_register (keyword-only webhook_url / platform_key / platform_key_id / max_shadows / display_name / description / operator_contact), TypeScript bridgeRegister(..., BridgeRegistrationOptions), Kotlin BridgeConnectorBridge.register(BridgeRegistrationParams), Swift bridgeRegister(..., platformKeyId:...) on the generated UniFFI surface. Cooperative mode requires platform_key and platform_key_id together and every other mode rejects both (scp_protocol register_bridge returns MissingCooperativePlatformKey / PlatformKeyOnNonCooperativeBridge / InvalidPlatformKeyId). A node stores that key under that identifier through ApplicationNode::register_bridge, and §12.10.2 webhook signatures cover the identifier."
         },
         {
           "name": "evaluate_trust",

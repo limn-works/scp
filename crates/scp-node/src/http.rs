@@ -831,7 +831,7 @@ impl<S: Storage + Send + Sync + 'static> ApplicationNode<S> {
 /// would reach every context's shadows.
 ///
 /// See spec section 12.10.2.
-pub(crate) fn build_bridge_routers(
+pub fn build_bridge_routers(
     bridge_state: &Arc<crate::bridge_handlers::BridgeState>,
     bridge_lookup: Option<&Arc<dyn crate::bridge_auth::BridgeLookup>>,
 ) -> (Router, Router) {
