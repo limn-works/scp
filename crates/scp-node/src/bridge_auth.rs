@@ -585,7 +585,12 @@ fn verify_bridge_jwt(
     //
     // §12.10.2 of the bridge-connector spec sends a bridge login token through
     // the DID-authentication verification procedure of §3.11.4 of the identity
-    // spec, whose steps 7 and 8 run here in that order.
+    // spec, which a platform applies without skipping a step. `signing_key_for`
+    // runs step 6's three document facts — a `{document.id}#{fragment}`
+    // identifier carried exactly once, an `Ed25519VerificationKey2020` type, and
+    // this document's own DID as controller — before either step named below
+    // reads anything. Steps 7 and 8 decide which verification method, and run
+    // here in that order.
     //
     // Step 7 reads the `kid` header whole and admits exactly two values,
     // `"#active"` and `"#agent"`, which is what §12.10.2 states the header
