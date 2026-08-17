@@ -197,6 +197,23 @@ pub enum SigningKeyId {
 }
 
 impl SigningKeyId {
+    /// Both operational signing keys ADR-039 grants an acting agent, in the
+    /// order a verifier tries them.
+    ///
+    /// A verifier reaches for this when the record it checks names no
+    /// verification method of its own — an `Event` and a `ConsistencyCheckpoint`
+    /// each carry seven fields and no `signing_key_id`, so §23.13 paragraph 1
+    /// and §23.12 item 1 of the sync spec both tell a verifier to try each
+    /// method a relationship authorizes and to accept whichever one verifies.
+    ///
+    /// `#0` is absent: ADR-039's key-property table marks an Identity Key
+    /// "Signs operational actions: No", and §9.7.4 of the security-model spec
+    /// confines it to DID document updates plus pre-rotation commitments. A
+    /// `#retired-{n}` fragment is absent because this enum has two variants,
+    /// which is what keeps a rotated key out of every path that takes a
+    /// `SigningKeyId`.
+    pub const OPERATIONAL: [Self; 2] = [Self::Active, Self::Agent];
+
     /// Returns the full DID document fragment reference (e.g., `"#active"` or `"#agent"`).
     ///
     /// This is the canonical string representation used in serialization,

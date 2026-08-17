@@ -184,13 +184,11 @@
         {
           "name": "verify_attestation",
           "python": false,
-          "typescript": false,
+          "typescript": true,
           "kotlin": true,
-          "swift": false,
+          "swift": true,
           "exemptions": {
-            "python": "bridge does not export verify_link_attestation",
-            "typescript": "bridge does not export verify_link_attestation",
-            "swift": "UniFFI bridge does not export verify_link_attestation"
+            "python": "PyO3 bridge exports no identity_verify_link_attestation, so scp_sdk offers no wrapper. The NAPI bridge exports it (crates/scp-ffi/napi/src/identity.rs), wrapped by SCP.identityVerifyLinkAttestation in bindings/typescript/src/scp.ts; the UniFFI bridge exports it (crates/scp-ffi/uniffi/src/bridge.rs), wrapped by Identity.verifyLinkAttestation in bindings/swift/Sources/SCP/Identity.swift. CLAUDE.md names PyO3 the 100% coverage target, so this cell is a gap in the reference bridge rather than a decision."
           }
         }
       ]

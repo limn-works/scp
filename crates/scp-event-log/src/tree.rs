@@ -337,21 +337,10 @@ pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
 /// order.
 ///
 /// **Criterion:** an event signature verifies against an operational signing key
-/// that an actor's own DID document names — `#active` (a human's Active Signing
-/// Key) or `#agent` (an agent's Signing Key). Spec §7.3.1 says an acting agent
-/// signs an event, and ADR-039 grants an acting agent exactly those two
-/// operational verification methods.
-///
-/// Two fragment families stay out of this list:
-///
-/// - `#0`, an Identity Key. ADR-039's key-property table marks it "Signs
-///   operational actions: No", and §9.7.4 confines it to DID document updates
-///   plus pre-rotation commitments. Recovering a key from a DID string yields
-///   precisely that key, which is what this list replaces.
-/// - `#retired-{n}` and `#retired-agent-{n}`, fragments that
-///   [`DidDocument::retire_active_key`] and [`DidDocument::rotate_agent_key`]
-///   assign on rotation. A document keeps them so a reader can audit rotation
-///   history; accepting one would let a rotated key sign forever.
+/// that an actor's own DID document names. [`SigningKeyId::OPERATIONAL`] is that
+/// pair, and its documentation states which fragments the pair excludes and why.
+/// Spec §7.3.1 says an acting agent signs an event, and ADR-039 grants an acting
+/// agent exactly those two operational verification methods.
 ///
 /// **Trial order is not role pinning.** An `Event` names no verification
 /// method: ADR-011 acceptance criterion 1 defines it with seven fields and no
@@ -363,8 +352,7 @@ pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
 /// reserves to a human — that category covers DID document updates,
 /// pre-rotation commitments, identity migration, and root UCAN issuance — so
 /// Category A is not what a caller reads this value for.
-pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] =
-    [SigningKeyId::Active, SigningKeyId::Agent];
+pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] = SigningKeyId::OPERATIONAL;
 
 /// Verifies an Ed25519 signature on an event against an actor's DID document,
 /// and reports which verification method produced it.

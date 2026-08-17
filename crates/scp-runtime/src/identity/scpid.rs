@@ -330,6 +330,24 @@ pub async fn scpid_verify(
 
     let doc = &did_result.document;
 
+    // A resolver answers with a document, and step 11 authenticates the caller
+    // as the holder of a method on `response.did`, so the two have to name one
+    // identity. `signing_key_for` reads `{doc.id}#{fragment}` — it cannot check
+    // which DID a caller asked for — and the code this replaced built its
+    // identifier from `response.did`, which tied them implicitly. This states
+    // the tie.
+    //
+    // A shipped resolver already makes a mismatch unreachable: `verify_relay_record`
+    // checks a BEP44 signature against the key the requested DID encodes, and
+    // `verify_self_certification` requires `{doc.id}#0` to carry that same key.
+    // This check does not depend on either one running.
+    if doc.id != response.did {
+        return Err(ScpIdError::DidResolutionFailed(format!(
+            "resolved DID document describes {}, not the DID {} a caller authenticated as",
+            doc.id, response.did
+        )));
+    }
+
     // Steps 6, 7, and 8 in one call to the crate that owns a DID document.
     //
     // `signing_key_for` reads a key out of `doc` under four document facts, and
@@ -349,15 +367,27 @@ pub async fn scpid_verify(
     //   decides it and no runtime check adds anything.
     // - Step 8 requires `doc.authentication` to reference that method.
     //
-    // A failure of any one is `KeyNotAuthorized`, the error §3.11.4 assigns
-    // step 7 and step 8, and the error this function already returned when
-    // step 6 found no method.
+    // Error mapping follows §3.11.4's table, which this function's previous
+    // hand-rolled steps already followed: a method a document does not
+    // authorize is `KEY_NOT_AUTHORIZED`, and a `publicKeyMultibase` value that
+    // does not decode means the document itself is unreadable, which is
+    // `DID_RESOLUTION_FAILED`. `signing_key_for` separates the two —
+    // `UnusableVerificationMethod` for the authorization facts,
+    // `InvalidDidFormat` for a decode failure — so no distinction an operator
+    // reads in a server-side log collapses here. §3.11.4's error-response
+    // guidance still tells a relying party to return one generic failure to an
+    // untrusted client rather than either code.
     let public_key_bytes = doc
         .signing_key_for(
             response.signing_key_id,
             VerificationRelationship::Authentication,
         )
-        .map_err(|_| ScpIdError::KeyNotAuthorized)?;
+        .map_err(|error| match error {
+            scp_did::DidError::UnusableVerificationMethod { .. } => ScpIdError::KeyNotAuthorized,
+            other => {
+                ScpIdError::DidResolutionFailed(format!("failed to decode public key: {other}"))
+            }
+        })?;
 
     // Step 9: Reconstruct the canonical hash (same construction as scpid_sign).
     let hash = canonical_hash(
@@ -1387,6 +1417,65 @@ mod tests {
         assert!(
             matches!(result, Err(ScpIdError::KeyNotAuthorized)),
             "a method another DID controls must supply no key, got: {result:?}"
+        );
+    }
+
+    /// A resolver answering with a document that describes another DID is
+    /// rejected, so authentication cannot report a caller as the holder of a
+    /// method on one DID while reading a method on another.
+    #[tokio::test]
+    async fn test_scpid_verify_rejects_a_document_describing_another_did() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
+        let (response, mut doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        // Rename the document and every method it identifies, so each method
+        // still carries its own controller and only `doc.id` differs from the
+        // DID a caller authenticated as.
+        let other_did = "did:dht:z6MkSomeoneElse";
+        for vm in &mut doc.verification_method {
+            vm.id = vm.id.replace(did, other_did);
+            vm.controller = other_did.to_owned();
+        }
+        doc.authentication = doc
+            .authentication
+            .iter()
+            .map(|reference| reference.replace(did, other_did))
+            .collect();
+        doc.id = other_did.to_owned();
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::DidResolutionFailed(_))),
+            "a document describing another DID must not authenticate, got: {result:?}"
+        );
+    }
+
+    /// A `publicKeyMultibase` value that does not decode reports
+    /// `DID_RESOLUTION_FAILED` rather than `KEY_NOT_AUTHORIZED`, because the
+    /// document is unreadable rather than the method unauthorized. §3.11.4's
+    /// error table separates the two, and an operator reads that separation in
+    /// a server-side log.
+    #[tokio::test]
+    async fn test_scpid_verify_reports_a_decode_failure_as_a_resolution_failure() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
+        let (response, mut doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        let active_id = format!("{did}#active");
+        for vm in &mut doc.verification_method {
+            if vm.id == active_id {
+                // A multibase value that carries no `z` base58btc prefix.
+                vm.public_key_multibase = "not-multibase".to_owned();
+            }
+        }
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::DidResolutionFailed(_))),
+            "an undecodable key must report a resolution failure, got: {result:?}"
         );
     }
 

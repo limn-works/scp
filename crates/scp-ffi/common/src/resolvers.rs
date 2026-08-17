@@ -608,27 +608,12 @@ impl DidResolver for IdentityBackedDidResolver {
             .map_err(CoreUcanError::from)
     }
 
-    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], CoreUcanError> {
-        debug!(did = %did, kid = %kid, "resolving DID public key via identity layer");
-
-        // Decode `kid` through the one canonical fragment decoder, which admits
-        // `#active` and `#agent` and nothing else (ADR-039 §UCAN Impact names
-        // those two as the verification methods a `kid` header identifies).
-        //
-        // This narrows what THIS function accepts. Earlier code stripped a
-        // leading `#`, so a bare `active` resolved here while
-        // `enforce_ucan_category_a` and the `DidResolver` default implementation
-        // both rejected it — one `kid` value, three answers. The `#`-prefixed
-        // spelling is the one `SigningKeyId::as_fragment` emits and the one a
-        // UCAN header carries, so every reader of that header now agrees.
-        // `resolve_export_verifying_key` passed a bare `active` and was the one
-        // caller this narrowing broke.
-        let signing_key_id = scp_did::SigningKeyId::from_fragment(kid).ok_or_else(|| {
-            CoreUcanError::MalformedToken(format!(
-                "UCAN kid '{kid}' is not a known verification method \
-                 (expected \"#active\" or \"#agent\") for DID '{did}'"
-            ))
-        })?;
+    fn resolve_public_key_by_kid(
+        &self,
+        did: &str,
+        signing_key_id: scp_did::SigningKeyId,
+    ) -> Result<[u8; 32], CoreUcanError> {
+        debug!(did = %did, kid = %signing_key_id.as_fragment(), "resolving DID public key via identity layer");
 
         let resolved = self.resolve_sync(did).map_err(CoreUcanError::from)?;
         self.check_sequence(did, resolved.seq)
@@ -715,10 +700,14 @@ impl DidResolver for DispatchDidResolver<'_> {
         }
     }
 
-    fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], CoreUcanError> {
+    fn resolve_public_key_by_kid(
+        &self,
+        did: &str,
+        signing_key_id: scp_did::SigningKeyId,
+    ) -> Result<[u8; 32], CoreUcanError> {
         match self {
-            Self::Identity(r) => DidResolver::resolve_public_key_by_kid(*r, did, kid),
-            Self::Bridge(r) => r.resolve_public_key_by_kid(did, kid),
+            Self::Identity(r) => DidResolver::resolve_public_key_by_kid(*r, did, signing_key_id),
+            Self::Bridge(r) => r.resolve_public_key_by_kid(did, signing_key_id),
         }
     }
 }
@@ -1168,17 +1157,28 @@ mod tests {
         )
     }
 
-    /// A `kid` naming a rotated-out `#retired-1` method resolves no key, even
-    /// though that method keeps this document's controller and the Ed25519
-    /// suite. Reverting the `SigningKeyId` gate on `resolve_public_key_by_kid`
-    /// makes this test fail.
+    /// A rotated-out `#retired-1` method and the `#0` Identity Key are both
+    /// unreachable through this resolver, and the reason is the parameter type:
+    /// `resolve_public_key_by_kid` takes a `SigningKeyId`, whose two variants
+    /// name `#active` and `#agent`. Neither fragment can be expressed, so no
+    /// runtime check rejects them and no test can call for one.
+    ///
+    /// What this test pins instead is that neither key is what `#active`
+    /// resolves to after a rotation, so a caller asking for the one reachable
+    /// operational method never receives either.
+    ///
+    /// `verify_signature` in `scp_protocol::crypto::ucan::validate` decodes a
+    /// wire `kid` into that `SigningKeyId`, and its own tests cover a `kid`
+    /// header naming `#retired-1` or `#0`.
     #[test]
-    fn retired_kid_resolves_no_key() {
-        let (resolved_doc, rotated_out_key, _new_active_key) = document_with_a_rotated_key();
+    fn neither_a_rotated_key_nor_an_identity_key_is_what_active_resolves_to() {
+        let (resolved_doc, rotated_out_key, new_active_key) = document_with_a_rotated_key();
         let did = resolved_doc.document.id.clone();
+        let identity_key = resolved_doc.document.identity_key().unwrap();
 
-        // The document still carries the rotated-out method, so this test
-        // exercises a rejection rather than an absence.
+        // The document still publishes the rotated-out method, so this test
+        // reads a document that could supply the wrong key rather than one that
+        // lacks it.
         assert_eq!(
             resolved_doc
                 .document
@@ -1189,43 +1189,16 @@ mod tests {
         );
 
         let resolver = make_identity_resolver_returning(resolved_doc);
-        let result = DidResolver::resolve_public_key_by_kid(&resolver, &did, "#retired-1");
-        assert!(
-            result.is_err(),
-            "a rotated-out verification method must resolve no key, got {result:?}"
-        );
+        let resolved_active = DidResolver::resolve_public_key(&resolver, &did).unwrap();
 
-        // And the key it would have supplied is the one an owner rotated out.
+        assert_eq!(resolved_active, new_active_key);
         assert_ne!(
-            rotated_out_key,
-            DidResolver::resolve_public_key(&resolver, &did).unwrap(),
-            "the rotated-out key must not be what #active resolves to"
+            resolved_active, rotated_out_key,
+            "a rotated-out key must not be what #active resolves to"
         );
-    }
-
-    /// A `kid` naming the Identity Key resolves no key: ADR-039's key-property
-    /// table marks `#0` as signing no operational action, and no verification
-    /// relationship references it. Reverting the `SigningKeyId` gate on
-    /// `resolve_public_key_by_kid` makes this test fail.
-    #[test]
-    fn identity_key_kid_resolves_no_key() {
-        let (resolved_doc, _rotated_out_key, _new_active_key) = document_with_a_rotated_key();
-        let did = resolved_doc.document.id.clone();
-        let identity_key = resolved_doc.document.identity_key().unwrap();
-
-        let resolver = make_identity_resolver_returning(resolved_doc);
-        for kid in ["#0", "0"] {
-            let result = DidResolver::resolve_public_key_by_kid(&resolver, &did, kid);
-            assert!(
-                result.is_err(),
-                "kid {kid} must resolve no key, got {result:?}"
-            );
-        }
-
         assert_ne!(
-            identity_key,
-            DidResolver::resolve_public_key(&resolver, &did).unwrap(),
-            "the Identity Key must not be what #active resolves to"
+            resolved_active, identity_key,
+            "an Identity Key must not be what #active resolves to"
         );
     }
 
@@ -1253,20 +1226,24 @@ mod tests {
         );
     }
 
-    /// A `kid` naming `#active` resolves no key once an owner withdraws that
-    /// method from `assertionMethod`, which is the relationship a UCAN
-    /// signature reads. Deleting the relationship check makes this test fail.
+    /// `#active` resolves no key once an owner withdraws that method from
+    /// `assertionMethod`, which is the relationship a UCAN signature reads.
+    /// This is the gate that revokes a rotated key, because `retire_active_key`
+    /// rebuilds both relationship arrays and leaves the retired method out of
+    /// them. Deleting the relationship check makes this test fail.
     #[test]
-    fn active_kid_withdrawn_from_assertion_method_resolves_no_key() {
+    fn active_withdrawn_from_assertion_method_resolves_no_key() {
         let (mut resolved_doc, _rotated_out_key, _new_active_key) = document_with_a_rotated_key();
         resolved_doc.document.assertion_method.clear();
         let did = resolved_doc.document.id.clone();
 
         let resolver = make_identity_resolver_returning(resolved_doc);
-        let result = DidResolver::resolve_public_key_by_kid(&resolver, &did, "#active");
+        let error =
+            DidResolver::resolve_public_key_by_kid(&resolver, &did, scp_did::SigningKeyId::Active)
+                .expect_err("a method absent from assertionMethod must resolve no key");
         assert!(
-            result.is_err(),
-            "a method absent from assertionMethod must resolve no key, got {result:?}"
+            error.to_string().contains("assertionMethod omits"),
+            "expected an assertionMethod-relationship rejection, got: {error}"
         );
     }
 

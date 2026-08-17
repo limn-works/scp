@@ -813,7 +813,7 @@ fn verify_remote_checkpoint_authenticity(
     // Trying only `#active` rejected every checkpoint agent software signed,
     // which §23.12 item 1 has always admitted.
     let mut failures = Vec::with_capacity(2);
-    for signing_key_id in [scp_did::SigningKeyId::Active, scp_did::SigningKeyId::Agent] {
+    for signing_key_id in scp_did::SigningKeyId::OPERATIONAL {
         let Some(sender_pk) = (deps.key_resolver)(&remote.sender_did, signing_key_id) else {
             failures.push(format!(
                 "{} names no usable key on the document of checkpoint sender {}",
@@ -1211,6 +1211,189 @@ pub async fn register_local_did(supervisor: &crate::context::supervisor::Supervi
 pub async fn is_local_did(supervisor: &crate::context::supervisor::Supervisor, did: &DID) -> bool {
     // Lock-free read (ADR-049 §Decision 12).
     supervisor.local_dids_ref().load().contains(did)
+}
+
+#[cfg(test)]
+mod checkpoint_authenticity_tests {
+    //! Which verification method verifies a `ConsistencyCheckpoint` signature.
+    //!
+    //! §23.12 item 1 of the sync spec admits `#active` or `#agent`, because a
+    //! `ConsistencyCheckpoint` carries seven fields and none names a
+    //! verification method. Earlier code resolved `#active` alone, so a
+    //! checkpoint agent software signed was rejected.
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::sync::Arc;
+
+    use scp_did::{DID, SigningKeyId};
+
+    use super::{ContextError, verify_remote_checkpoint_authenticity};
+    use crate::context::actor::deps::ActorDeps;
+    use crate::context::supervisor::supervisor::Supervisor;
+
+    const SENDER: &str = "did:example:checkpoint-sender";
+    const CONTEXT_ID: &str = "ctx-checkpoint-authenticity";
+
+    /// Event-log provider that accepts every call. This module asserts on
+    /// signature verification, which appends nothing.
+    struct SilentEventLog;
+
+    #[async_trait::async_trait]
+    impl crate::context::builder::ContextEventLogProvider for SilentEventLog {
+        async fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: scp_event_log::EventType,
+            _actor: &str,
+            _payload: scp_event_log::EventPayload,
+            _timestamp_secs: u64,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+
+        async fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Builds `ActorDeps` whose `key_resolver` answers with `key` for
+    /// `answers_for` and with `None` for the other operational method.
+    async fn deps_resolving_only(
+        answers_for: SigningKeyId,
+        key: ed25519_dalek::VerifyingKey,
+    ) -> ActorDeps {
+        use scp_platform::in_memory::InMemoryStorage;
+
+        let crypto = Arc::new(crate::crypto::mls::provider::NodeMlsFactory::new(
+            SENDER.to_owned(),
+            Arc::new(scp_clock::SystemClock),
+        ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(SilentEventLog);
+        let key_resolver: scp_protocol::context::governance::KeyResolver =
+            Arc::new(move |_: &DID, requested: SigningKeyId| {
+                (requested == answers_for).then_some(key)
+            });
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+
+        let supervisor = Supervisor::with_providers(
+            crypto,
+            transport,
+            event_log,
+            key_resolver,
+            None,
+            None,
+            None,
+            None,
+            mls_storage,
+        );
+        supervisor
+            .build_actor_deps(&DID(SENDER.to_owned()))
+            .await
+            .expect("build_actor_deps")
+    }
+
+    /// Signs a checkpoint over its canonical hash, exactly as
+    /// `generate_checkpoint` does.
+    fn signed_checkpoint(
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+        use ed25519_dalek::Signer;
+
+        let mut checkpoint = scp_event_log::checkpoint::ConsistencyCheckpoint {
+            context_id: CONTEXT_ID.to_owned(),
+            sender_did: DID(SENDER.to_owned()),
+            event_count: 7,
+            merkle_root: [4u8; 32],
+            epoch: Some(3),
+            timestamp: 1_700_000_000,
+            signature: Vec::new(),
+        };
+        let canonical = scp_event_log::checkpoint::compute_checkpoint_canonical_hash(
+            &checkpoint.context_id,
+            &checkpoint.sender_did,
+            checkpoint.event_count,
+            &checkpoint.merkle_root,
+            checkpoint.epoch,
+            checkpoint.timestamp,
+        );
+        checkpoint.signature = signing_key.sign(&canonical).to_bytes().to_vec();
+        checkpoint
+    }
+
+    /// A checkpoint an `#agent` key signed verifies. Resolving `#active`
+    /// alone rejected it.
+    #[tokio::test]
+    async fn an_agent_signed_checkpoint_verifies() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let deps = deps_resolving_only(SigningKeyId::Agent, signing_key.verifying_key()).await;
+        let checkpoint = signed_checkpoint(&signing_key);
+
+        verify_remote_checkpoint_authenticity(true, &deps, CONTEXT_ID, &checkpoint)
+            .expect("an #agent-signed checkpoint must verify");
+    }
+
+    /// A checkpoint an `#active` key signed still verifies, so the `#agent`
+    /// arm did not displace the first method a verifier tries.
+    #[tokio::test]
+    async fn an_active_signed_checkpoint_verifies() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
+        let deps = deps_resolving_only(SigningKeyId::Active, signing_key.verifying_key()).await;
+        let checkpoint = signed_checkpoint(&signing_key);
+
+        verify_remote_checkpoint_authenticity(true, &deps, CONTEXT_ID, &checkpoint)
+            .expect("an #active-signed checkpoint must verify");
+    }
+
+    /// A checkpoint signed by a key the sender's document does not publish is
+    /// rejected, and the rejection names every method a verifier tried.
+    #[tokio::test]
+    async fn a_checkpoint_signed_by_an_unpublished_key_is_rejected() {
+        let published = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let forged = ed25519_dalek::SigningKey::from_bytes(&[14u8; 32]);
+        let deps = deps_resolving_only(SigningKeyId::Active, published.verifying_key()).await;
+        let checkpoint = signed_checkpoint(&forged);
+
+        let error = verify_remote_checkpoint_authenticity(true, &deps, CONTEXT_ID, &checkpoint)
+            .expect_err("a checkpoint signed by an unpublished key must not verify");
+        let message = error.to_string();
+        assert!(
+            message.contains("#active") && message.contains("#agent"),
+            "a rejection must name every method tried, got: {message}"
+        );
+    }
+
+    /// A sender the roster does not carry is rejected before any key resolves.
+    #[tokio::test]
+    async fn a_checkpoint_from_a_non_member_is_rejected() {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[15u8; 32]);
+        let deps = deps_resolving_only(SigningKeyId::Active, signing_key.verifying_key()).await;
+        let checkpoint = signed_checkpoint(&signing_key);
+
+        let error = verify_remote_checkpoint_authenticity(false, &deps, CONTEXT_ID, &checkpoint)
+            .expect_err("a non-member's checkpoint must not verify");
+        assert!(
+            matches!(error, ContextError::MemberNotFound(_)),
+            "expected a membership rejection, got: {error:?}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -127,19 +127,30 @@ where
         did: did.to_owned(),
     })?;
 
-    // `as_fragment` emits the `#`-prefixed spelling — `"#active"`, `"#agent"` —
-    // which is the one form a `kid` header carries (ADR-039 §UCAN Impact) and
-    // the one form `SigningKeyId::from_fragment` decodes. Passing a bare
-    // `"active"` reached a resolver that stripped a leading `#` and reached the
-    // `DidResolver` default implementation, which recognizes only the literal
-    // `"#active"`, so two resolvers answered one call differently.
-    let key_bytes = resolver
-        .resolve_public_key_by_kid(did, SigningKeyId::Active.as_fragment())
-        .or_else(|_| resolver.resolve_public_key_by_kid(did, SigningKeyId::Agent.as_fragment()))
-        .map_err(|e| ExportVerifyError::ResolutionFailed {
-            did: did.to_owned(),
-            detail: e.to_string(),
-        })?;
+    // `SigningKeyId` rather than a fragment string. This call passed a bare
+    // `"active"` while one resolver stripped a leading `#`, one compared against
+    // the literal `"#active"`, and this module's test stub stripped one too, so
+    // three decoders answered one call differently and every import of a remote
+    // creator's snapshot failed closed the day one of them stopped stripping.
+    // The enum carries the value across the boundary now, so no decoder exists
+    // to disagree.
+    let mut key_bytes = None;
+    let mut failures = Vec::with_capacity(SigningKeyId::OPERATIONAL.len());
+    for signing_key_id in SigningKeyId::OPERATIONAL {
+        match resolver.resolve_public_key_by_kid(did, signing_key_id) {
+            Ok(bytes) => {
+                key_bytes = Some(bytes);
+                break;
+            }
+            Err(error) => failures.push(format!("{}: {error}", signing_key_id.as_fragment())),
+        }
+    }
+    // Report every method tried, so an operator reading a log sees why each one
+    // failed rather than why a last one did.
+    let key_bytes = key_bytes.ok_or_else(|| ExportVerifyError::ResolutionFailed {
+        did: did.to_owned(),
+        detail: failures.join("; "),
+    })?;
 
     VerifyingKey::from_bytes(&key_bytes).map_err(|e| ExportVerifyError::InvalidKey {
         did: did.to_owned(),
@@ -188,12 +199,17 @@ mod tests {
         // `SigningKeyId::from_fragment` decodes. This stub answers exactly
         // "#active", so a helper that reverted to a bare "active" would fail
         // every test below rather than resolve a key.
-        fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], UcanError> {
-            if kid == SigningKeyId::Active.as_fragment() {
+        fn resolve_public_key_by_kid(
+            &self,
+            did: &str,
+            signing_key_id: SigningKeyId,
+        ) -> Result<[u8; 32], UcanError> {
+            if signing_key_id == SigningKeyId::Active {
                 self.resolve_public_key(did)
             } else {
                 Err(UcanError::MalformedToken(format!(
-                    "no '{kid}' key for {did}"
+                    "no '{}' key for {did}",
+                    signing_key_id.as_fragment()
                 )))
             }
         }

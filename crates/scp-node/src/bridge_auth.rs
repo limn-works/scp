@@ -583,55 +583,45 @@ fn verify_bridge_jwt(
 
     // Step 5: Extract the signing public key.
     //
-    // Use the `kid` header if present (strip the DID prefix if included),
-    // otherwise default to `#active` (the Human Signing Key per ADR-039).
-    // Extract fragment from kid header. kid may be a full DID URL like
-    // "did:dht:z6Mk...#active", just the fragment like "#active", or bare "active".
-    // Default to "active" (the Human Signing Key per ADR-039) when kid is absent.
-    let fragment = header.kid.as_ref().map_or_else(
-        || "active".to_owned(),
-        |kid| {
-            kid.strip_prefix('#').map_or_else(
-                || {
-                    kid.rsplit_once('#')
-                        .map_or_else(|| kid.clone(), |(_, f)| (*f).to_owned())
-                },
-                str::to_owned,
-            )
-        },
-    );
-
     // §12.10.2 of the bridge-connector spec sends a bridge login token through
     // the DID-authentication verification procedure of §3.11.4 of the identity
     // spec, whose steps 7 and 8 run here in that order.
     //
-    // Step 7 admits `#active` and `#agent` and rejects every other value with
-    // `KEY_NOT_AUTHORIZED`. `SigningKeyId::from_fragment` decodes that admitted
-    // set, and `SigningKeyId` has exactly those two variants, so an Identity
-    // Key (`#0`) and a `#retired-{n}` fragment stop here and never reach a
-    // document.
+    // Step 7 reads the `kid` header whole and admits exactly two values,
+    // `"#active"` and `"#agent"`, which is what §12.10.2 states the header
+    // carries. `SigningKeyId::from_fragment` decodes that pair and nothing
+    // else, so an Identity Key (`#0`), a `#retired-{n}` fragment, a bare
+    // `active`, and a full DID URL such as `did:dht:zOTHER#active` all stop
+    // here and reach no document. An earlier version normalized those spellings
+    // to a bare fragment before applying step 7, which admitted a `kid` naming
+    // another DID entirely. A header a token omits names `#active`, the Human
+    // Signing Key ADR-039 assigns a human.
     //
     // Step 8 requires this document to reference that method under
     // `authentication`. `signing_key_for` reads the document's own array, so a
-    // key an owner withdrew from `authentication` on rotation (§9.7.4 of the
-    // security-model spec) supplies no key.
+    // key an owner rotated out supplies none. §9.7.1 check 1 of the
+    // security-model spec states the same rule for a KeyPackage attestation,
+    // and §9.12 makes rotation the revocation act.
     //
-    // The two gates cover disjoint inputs rather than one gate re-checking the
-    // other: step 7 decides which fragment strings `SigningKeyId` can carry,
-    // and step 8 decides which of the two an owner still authorizes. Step 8 is
-    // the one that reads a fact a document declares, so it revokes a key an
-    // owner rotated out. Step 7 is what a fragment a document publishes but
-    // ADR-039 forbids from signing runs into.
+    // The two steps cover disjoint inputs. Step 7 decides which header values
+    // become a `SigningKeyId`; step 8 decides which of the two an owner still
+    // authorizes. Step 8 reads a fact a document declares, so it is what
+    // revokes a rotated key.
     //
     // `authentication` rather than `assertionMethod` (W3C DID Core §5.3),
     // because a bridge login token proves control of a DID to this node rather
     // than asserting a statement about a subject.
-    let signing_key_id = SigningKeyId::from_fragment(&format!("#{fragment}")).ok_or_else(|| {
-        format!(
-            "JWT kid names verification method #{fragment}, which is not an \
-                 operational signing key (expected #active or #agent)"
-        )
-    })?;
+    let signing_key_id = header
+        .kid
+        .as_deref()
+        .map_or(Some(SigningKeyId::Active), SigningKeyId::from_fragment)
+        .ok_or_else(|| {
+            format!(
+                "JWT kid header {:?} is not an operational signing key \
+                 (expected \"#active\" or \"#agent\")",
+                header.kid.as_deref().unwrap_or_default()
+            )
+        })?;
     let pub_key_bytes = did_doc
         .signing_key_for(
             signing_key_id,
@@ -639,8 +629,9 @@ fn verify_bridge_jwt(
         )
         .map_err(|e| {
             format!(
-                "DID document for {} supplies no key for #{fragment}: {e}",
-                claims.iss
+                "DID document for {} supplies no key for {}: {e}",
+                claims.iss,
+                signing_key_id.as_fragment()
             )
         })?;
 
@@ -1742,9 +1733,47 @@ mod tests {
         });
     }
 
+    /// A `kid` naming another DID's `#active` is rejected outright.
+    ///
+    /// §12.10.2 of the bridge-connector spec says the `kid` header names
+    /// `#active` or `#agent`, so a header carrying a DID at all is another
+    /// value the platform rejects. An earlier version split on the last `#`
+    /// and kept the suffix, so `did:dht:zOTHER#active` normalized to `active`
+    /// and passed step 7. Nothing was forgeable through it — this function
+    /// resolves the document `claims.iss` names, never the one a `kid` names —
+    /// but the code accepted a value the spec it cites rejects.
+    #[test]
+    fn reject_bridge_jwt_whose_kid_names_another_did() {
+        let active_key = SigningKey::generate(&mut OsRng);
+        let did = test_did(&active_key);
+        let doc = test_did_document(&did, &active_key);
+
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.did_docs.push((did.clone(), doc));
+
+        let claims = test_claims(&did);
+        for kid in [
+            format!("{did}#active"),
+            "did:dht:z6MkSomeoneElse#active".to_owned(),
+            "did:dht:z6MkSomeoneElse#agent".to_owned(),
+        ] {
+            let token = jwt_with_kid(&claims, &active_key, &kid);
+            let error = verify_bridge_jwt(&token, &lookup)
+                .err()
+                .unwrap_or_else(|| panic!("kid {kid} carries a DID and must not authenticate"));
+            assert!(
+                error.contains("is not an operational signing key"),
+                "kid {kid} must be rejected for carrying more than a fragment, got: {error}"
+            );
+        }
+    }
+
     /// A JWT signed by a rotated-out `#retired-1` key is rejected, even though
     /// that method carries this document's controller and the Ed25519 suite.
-    /// Reverting the relationship check makes this test fail.
+    ///
+    /// `SigningKeyId` cannot carry that fragment, so step 7 rejects it before
+    /// any document is read. Widening `SigningKeyId::from_fragment` makes this
+    /// test fail.
     #[test]
     fn reject_bridge_jwt_signed_by_a_retired_key() {
         let active_key = SigningKey::generate(&mut OsRng);
@@ -1774,9 +1803,12 @@ mod tests {
     }
 
     /// A JWT signed by an Identity Key is rejected. ADR-039's key-property
-    /// table marks `#0` "Signs operational actions: No", and no verification
-    /// relationship references it. Reverting the relationship check makes this
-    /// test fail.
+    /// table marks `#0` "Signs operational actions: No".
+    ///
+    /// `SigningKeyId` cannot carry that fragment either, so step 7 rejects it
+    /// before any document is read, and the `authentication` array — which
+    /// references no `#0` on any document a constructor builds — never has to.
+    /// Widening `SigningKeyId::from_fragment` makes this test fail.
     #[test]
     fn reject_bridge_jwt_signed_by_an_identity_key() {
         let active_key = SigningKey::generate(&mut OsRng);
@@ -1816,16 +1848,13 @@ mod tests {
         lookup.did_docs.push((did.clone(), doc));
 
         let claims = test_claims(&did);
-        for kid in ["#active", "active"] {
-            let token = jwt_with_kid(&claims, &active_key, kid);
-            let error = verify_bridge_jwt(&token, &lookup).err().unwrap_or_else(|| {
-                panic!("kid {kid} is absent from authentication and must not authenticate")
-            });
-            assert!(
-                error.contains("authentication omits"),
-                "kid {kid} must be rejected for an authentication array that omits it, got: {error}"
-            );
-        }
+        let token = jwt_with_kid(&claims, &active_key, "#active");
+        let error = verify_bridge_jwt(&token, &lookup)
+            .expect_err("#active is absent from authentication and must not authenticate");
+        assert!(
+            error.contains("authentication omits"),
+            "expected an authentication-relationship rejection, got: {error}"
+        );
 
         // A token carrying no `kid` defaults to `#active` and takes the same
         // rejection, so an attacker gains nothing by omitting a header.
@@ -1876,13 +1905,11 @@ mod tests {
         lookup.did_docs.push((did.clone(), doc));
 
         let claims = test_claims(&did);
-        for kid in ["#active", "active", &format!("{did}#active")] {
-            let token = jwt_with_kid(&claims, &active_key, kid);
-            let (verified, signing_key_id) = verify_bridge_jwt(&token, &lookup)
-                .unwrap_or_else(|e| panic!("kid {kid} names an authenticating #active: {e}"));
-            assert_eq!(verified.iss, did);
-            assert_eq!(signing_key_id, SigningKeyId::Active);
-        }
+        let token = jwt_with_kid(&claims, &active_key, "#active");
+        let (verified, signing_key_id) = verify_bridge_jwt(&token, &lookup)
+            .expect("a kid of #active names an authenticating method");
+        assert_eq!(verified.iss, did);
+        assert_eq!(signing_key_id, SigningKeyId::Active);
     }
 
     /// A JWT signed by an `#agent` that `authentication` references verifies,

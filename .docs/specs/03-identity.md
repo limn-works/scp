@@ -1352,7 +1352,13 @@ A service that wants to accept SCP DID authentication without running SCP softwa
 
 1. **DID resolution.** Use any `did:dht` resolver library. The DID document is a BEP44 signed mutable item on Mainline DHT. Libraries: `did-dht` (Rust), `@decentralized-identity/did-dht` (JS), or raw BEP44 lookups via any DHT client. For SCPID verification, DID documents MUST be cached for no more than 300 seconds. The general §3.10.4 caching policy (24h/7d) does NOT apply to SCPID verification — authentication requires current key state.
 
-2. **DID document parsing.** The document is W3C DID Core JSON (§18.2.2A). Extract the `verificationMethod` array and `authentication` relationship. Match `signing_key_id` to a verification method, confirm it appears in `authentication`, extract `publicKeyMultibase`. Decoding: strip the `z` prefix (multibase indicator for base58btc), base58btc-decode the remainder to get the raw 32-byte Ed25519 public key.
+2. **DID document parsing.** The document is W3C DID Core JSON (§18.2.2A). Extract the `verificationMethod` array and the `authentication` relationship, then apply §3.11.4 steps 6 through 8 in full — a relying party that skips a check accepts a key the protocol does not authorize:
+   - exactly one `verificationMethod` entry carries the id `{document.id}#{fragment}`, where `fragment` is `signing_key_id` without its leading `#`. Reject a repeated id: W3C DID Core §5.3.1 requires uniqueness, so array position MUST NOT decide which key verifies;
+   - that entry declares `"type": "Ed25519VerificationKey2020"`. Decoding `publicKeyMultibase` alone cannot separate an Ed25519 signing key from an X25519 key-agreement key;
+   - that entry names `document.id` as its `controller`. SCP defines no delegation letting another DID sign as this one;
+   - `signing_key_id` is `#active` or `#agent`, and the `authentication` array references `{document.id}#{fragment}`.
+
+   Decoding the key: strip the `z` prefix (multibase indicator for base58btc), base58btc-decode the remainder to get the raw 32-byte Ed25519 public key.
 
 3. **Signature verification.** Reconstruct `signed_bytes` per §3.11.3: concatenate the domain separator `"SCP-DID-AUTH-V1:"`, length-prefixed `did`, length-prefixed `signing_key_id`, raw 32-byte `nonce`, length-prefixed `audience`, and 8-byte big-endian `signed_at`. Compute SHA-256 of the concatenation. Verify the Ed25519 signature (PureEdDSA, RFC 8032 §5.1.6) over the resulting 32-byte hash. Standard libraries: `ring`, `ed25519-dalek` (Rust), `tweetnacl` (JS), `pynacl` (Python), `Crypto.Sign` (Swift).
 
