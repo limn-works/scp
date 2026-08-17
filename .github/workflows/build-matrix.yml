@@ -72,6 +72,7 @@ jobs:
 
       - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
@@ -80,11 +81,13 @@ jobs:
       # Compile coverage for this target across `default-members`. Its outputs
       # are not uploaded: a later `cargo test` step rewrites them.
       - name: Build all crates
+        shell: bash
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Run tests (native targets only)
         if: >-
           matrix.target != 'aarch64-unknown-linux-gnu'
+        shell: bash
         run: cargo test --workspace --release --target ${{ matrix.target }} --features scp-core/testing,scp-runtime/saga-witness-test-mint
 
       # Builds every uploaded binary, one package per invocation, into a target
@@ -99,7 +102,15 @@ jobs:
       # `target/` would ship whatever ran last rather than a release build.
       # `.github/workflows/release.yml` Authenticode-signs every DLL in this
       # artifact, so a signature would otherwise cover a test-featured binary.
+      #
+      # `shell: bash` is load-bearing on runner windows-latest, where GitHub
+      # runs a `run:` script under PowerShell unless a step names a shell.
+      # PowerShell parses neither `for pkg in …; do` nor `done`, so this step
+      # failed before its first `cargo build`, job rust for target
+      # x86_64-pc-windows-msvc uploaded no artifact, and job sign-windows in
+      # .github/workflows/release.yml found no DLL to Authenticode-sign.
       - name: Build shipped bridge artifacts (one package per invocation)
+        shell: bash
         run: |
           for pkg in scp-core scp-ffi scp-ffi-napi scp-ffi-uniffi; do
             cargo build --release --target ${{ matrix.target }} \
@@ -235,16 +246,19 @@ jobs:
 
       - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Build NAPI addon
+        shell: bash
         run: cargo build -p scp-ffi-napi --release --target ${{ matrix.target }}
 
       - name: Stage index.node (Unix)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
           mkdir -p napi-out
           LIB=$(find "target/${{ matrix.target }}/release" -maxdepth 1 \( -name "libscp_ffi_napi.dylib" -o -name "libscp_ffi_napi.so" \) | head -1)
@@ -478,6 +492,7 @@ jobs:
 
       - name: Install cross-compilation tools (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
@@ -486,6 +501,7 @@ jobs:
       # cbindgen crate will be added in a future story; for now build the
       # cdylib from scp-ffi-uniffi which already produces a C-compatible .so
       - name: Build cdylib
+        shell: bash
         run: cargo build --release --target ${{ matrix.target }} -p scp-ffi-uniffi
 
       - name: Upload C ABI artifacts
