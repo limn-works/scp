@@ -22,8 +22,8 @@ use std::sync::Mutex;
 
 use scp_clock::Clock;
 use scp_core::discovery::addressing::{
-    AddressResolution, AddressType, AddressingError, HandleQuerier, HandleTarget, LayerUnavailable,
-    ResolutionLayer, ResolutionPath, TrustLevel,
+    AddressResolution, AddressResolutionOutcome, AddressType, AddressingError, HandleQuerier,
+    HandleTarget, LayerUnavailable, ResolutionLayer, ResolutionPath, TrustLevel,
 };
 use scp_core::discovery::handles::{
     HandleEntry, HandleLookupParams, HandleRegistry, HandleTypeFilter,
@@ -128,6 +128,39 @@ pub fn address_resolution_to_json(resolution: &AddressResolution) -> serde_json:
     }
 }
 
+/// Converts one [`LayerUnavailable`] into a JSON value.
+#[must_use]
+pub fn layer_unavailable_to_json(unavailable: &LayerUnavailable) -> serde_json::Value {
+    serde_json::json!({
+        "layer": resolution_layer_name(&unavailable.layer),
+        "reason": unavailable.reason,
+    })
+}
+
+/// Converts an [`AddressResolutionOutcome`] into the JSON object every bridge
+/// returns from `address_resolve`.
+///
+/// The object holds `resolutions` and `unavailable_layers`. A caller reads
+/// `unavailable_layers` to learn which layers this deployment never queried,
+/// which §22.8.2 of `.docs/specs/22-human-readable-addressing.md` makes
+/// load-bearing: results rank by trust level, so an unqueried higher-trust
+/// layer may hold a binding that outranks every binding in `resolutions`.
+#[must_use]
+pub fn address_resolution_outcome_to_json(outcome: &AddressResolutionOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "resolutions": outcome
+            .resolutions
+            .iter()
+            .map(address_resolution_to_json)
+            .collect::<Vec<_>>(),
+        "unavailable_layers": outcome
+            .unavailable_layers
+            .iter()
+            .map(layer_unavailable_to_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// Converts a [`TrustLevel`] into a JSON value.
 #[must_use]
 pub fn trust_level_to_json(trust_level: &TrustLevel) -> serde_json::Value {
@@ -146,16 +179,23 @@ pub fn trust_level_to_json(trust_level: &TrustLevel) -> serde_json::Value {
     }
 }
 
-/// Converts a [`ResolutionPath`] into a JSON value.
+/// Names a [`ResolutionLayer`] for JSON, so a resolution path and an
+/// unavailable layer spell one layer the same way.
 #[must_use]
-pub fn resolution_path_to_json(path: &ResolutionPath) -> serde_json::Value {
-    let layer = match path.layer {
+pub const fn resolution_layer_name(layer: &ResolutionLayer) -> &'static str {
+    match layer {
         ResolutionLayer::Petname => "Petname",
         ResolutionLayer::HandleRegistry => "HandleRegistry",
         ResolutionLayer::Attestation => "Attestation",
         ResolutionLayer::Domain => "Domain",
         ResolutionLayer::MultiLayerCorroborated => "MultiLayerCorroborated",
-    };
+    }
+}
+
+/// Converts a [`ResolutionPath`] into a JSON value.
+#[must_use]
+pub fn resolution_path_to_json(path: &ResolutionPath) -> serde_json::Value {
+    let layer = resolution_layer_name(&path.layer);
     serde_json::json!({
         "layer": layer,
         "source": path.source,
@@ -561,6 +601,114 @@ mod tests {
             assert_eq!(json["source"], "src");
             assert_eq!(json["source_id"], "id");
             assert_eq!(json["resolved_at"], 42);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // JSON serialization: address_resolution_outcome_to_json
+    // -----------------------------------------------------------------------
+
+    /// Every bridge returns this object from `address_resolve`, so a caller in
+    /// Python, TypeScript, Swift or Kotlin can separate "the attestation layer
+    /// held no binding" from "nobody queried the attestation layer".
+    #[test]
+    fn address_resolution_outcome_to_json_carries_both_keys() {
+        let outcome = AddressResolutionOutcome {
+            resolutions: vec![AddressResolution::Identity {
+                did: scp_did::DID::from("did:dht:zAlice"),
+                trust_level: TrustLevel::HandleRegistryVerified,
+                resolution_path: ResolutionPath {
+                    layer: ResolutionLayer::HandleRegistry,
+                    source: "cooking-community".to_owned(),
+                    source_id: Some("ctx-cooking".to_owned()),
+                    resolved_at: 1_700_000_000,
+                },
+            }],
+            unavailable_layers: vec![
+                LayerUnavailable {
+                    layer: ResolutionLayer::Attestation,
+                    reason: "this bridge invokes no attestation_lookup outlet".to_owned(),
+                },
+                LayerUnavailable {
+                    layer: ResolutionLayer::Domain,
+                    reason: "this bridge performs no .well-known/scp fetch".to_owned(),
+                },
+            ],
+        };
+
+        let json = address_resolution_outcome_to_json(&outcome);
+
+        let resolutions = json["resolutions"]
+            .as_array()
+            .expect("resolutions must serialize as an array");
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0]["did"], "did:dht:zAlice");
+
+        let unavailable = json["unavailable_layers"]
+            .as_array()
+            .expect("unavailable_layers must serialize as an array");
+        assert_eq!(unavailable.len(), 2);
+        assert_eq!(unavailable[0]["layer"], "Attestation");
+        assert_eq!(
+            unavailable[0]["reason"],
+            "this bridge invokes no attestation_lookup outlet"
+        );
+        assert_eq!(unavailable[1]["layer"], "Domain");
+        assert_eq!(
+            unavailable[1]["reason"],
+            "this bridge performs no .well-known/scp fetch"
+        );
+    }
+
+    /// A resolution that queried every layer still carries the key, holding an
+    /// empty array, so a caller reads one shape whatever happened.
+    #[test]
+    fn address_resolution_outcome_to_json_keeps_the_key_when_every_layer_answered() {
+        let outcome = AddressResolutionOutcome {
+            resolutions: Vec::new(),
+            unavailable_layers: Vec::new(),
+        };
+
+        let json = address_resolution_outcome_to_json(&outcome);
+
+        assert!(
+            json["unavailable_layers"].is_array(),
+            "unavailable_layers must be present even when empty"
+        );
+        assert_eq!(
+            json["unavailable_layers"]
+                .as_array()
+                .expect("checked above")
+                .len(),
+            0
+        );
+    }
+
+    /// One layer spells the same in a resolution path and in an unavailable
+    /// layer, so a caller matches one set of names.
+    #[test]
+    fn layer_unavailable_to_json_uses_the_resolution_path_layer_names() {
+        for layer in [
+            ResolutionLayer::Petname,
+            ResolutionLayer::HandleRegistry,
+            ResolutionLayer::Attestation,
+            ResolutionLayer::Domain,
+            ResolutionLayer::MultiLayerCorroborated,
+        ] {
+            let path = ResolutionPath {
+                layer: layer.clone(),
+                source: "src".to_owned(),
+                source_id: None,
+                resolved_at: 42,
+            };
+            let unavailable = LayerUnavailable {
+                layer,
+                reason: "nobody queried it".to_owned(),
+            };
+            assert_eq!(
+                resolution_path_to_json(&path)["layer"],
+                layer_unavailable_to_json(&unavailable)["layer"]
+            );
         }
     }
 

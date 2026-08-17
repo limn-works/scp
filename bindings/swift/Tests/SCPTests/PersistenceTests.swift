@@ -87,7 +87,7 @@ final class PersistenceTests: XCTestCase {
     }
 
     /// Construction with a wrong key must surface a validation error
-    /// (SCP-VALID-7005) rather than silently succeeding with an empty
+    /// (SCP-STORAGE-8001) rather than silently succeeding with an empty
     /// in-memory instance — guards against silent downgrade where the
     /// caller would lose access to persisted state. The `UniFFI` bridge
     /// surfaces the `SQLCipher` key-mismatch as `ScpError` rather than

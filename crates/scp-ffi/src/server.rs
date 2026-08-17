@@ -1044,17 +1044,20 @@ mod tests {
         );
 
         let cd_result = rt().block_on(inner.commit_deploy("dispatch-ctx", "deploy-abc"));
-        // `RunningNode::commit_deploy` returns how many assets it committed.
         // Code above projected this context, which holds no staged blob, so
-        // dispatch must reach this node and report zero assets — never that
-        // "not projected" error `commit_deploy_on_unprojected_context_returns_error`
-        // pins. An earlier assertion read `is_ok() || is_err()`, which every
-        // value satisfies.
-        let committed =
-            cd_result.expect("commit_deploy must reach a projected context rather than erroring");
-        assert_eq!(
-            committed, 0,
-            "no asset was staged under deploy-abc, so no asset may be committed"
+        // §18.11.11 of `.docs/specs/18-addressability-and-deployment.md` makes
+        // this an empty deploy, which fails. Dispatch reached this node, which
+        // the error text proves: an unprojected context reports "not
+        // projected" instead, as
+        // `commit_deploy_on_unprojected_context_returns_error` pins. An
+        // earlier assertion read `is_ok() || is_err()`, which every value
+        // satisfies.
+        let message = cd_result
+            .expect_err("an empty deploy fails rather than swapping in an empty path index")
+            .to_string();
+        assert!(
+            message.contains("matched no staged asset"),
+            "dispatch must reach the projected context and refuse the empty deploy: {message}"
         );
 
         // disable

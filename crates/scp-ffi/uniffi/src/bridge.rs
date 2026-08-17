@@ -18507,6 +18507,11 @@ impl Scp {
     // ----- Address resolution -----
 
     /// Per-instance equivalent of the free-function `address_resolve`.
+    ///
+    /// Returns a JSON object with two keys: `resolutions` holds the
+    /// `AddressResolution` objects sorted by trust level, and
+    /// `unavailable_layers` names each layer this build could not query,
+    /// with the reason.
     pub fn address_resolve(
         &self,
         owner_did: String,
@@ -18560,7 +18565,7 @@ impl Scp {
         };
 
         let handle = tokio::runtime::Handle::current();
-        let results = tokio::task::block_in_place(|| {
+        let outcome = tokio::task::block_in_place(|| {
             handle.block_on(async {
                 let mut resolver = scp_core::discovery::AddressResolver::new();
                 let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
@@ -18581,11 +18586,11 @@ impl Scp {
             })
         })?;
 
-        let json_results: Vec<serde_json::Value> = results
-            .iter()
-            .map(petname_helpers::address_resolution_to_json)
-            .collect();
-        serde_json::to_string(&json_results).map_err(|e| ScpError::Validation {
+        // §22.8.2 ranks results by trust level, so a caller reads
+        // `unavailable_layers` to learn which higher-trust layers this build
+        // never queried. Returning the resolution array alone would hide that.
+        let json_outcome = petname_helpers::address_resolution_outcome_to_json(&outcome);
+        serde_json::to_string(&json_outcome).map_err(|e| ScpError::Validation {
             msg: format!("failed to serialize address resolution results: {e}"),
             code: codes::VALID_7092.to_owned(),
         })

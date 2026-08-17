@@ -189,6 +189,42 @@ pub struct LayerUnavailable {
     pub reason: String,
 }
 
+/// What one address resolution found, plus which layers never answered.
+///
+/// A caller reads `resolutions` to learn which bindings resolution found, and
+/// reads `unavailable_layers` to learn which layers this deployment could not
+/// query. A resolution that found one `HandleRegistry` binding while the
+/// attestation layer and the domain layer went unqueried carries a different
+/// meaning from one that found the same binding after every layer answered:
+/// in the first case a higher-trust layer may hold a different binding that
+/// nobody looked for. §22.8.2 of
+/// `.docs/specs/22-human-readable-addressing.md` ranks results by trust level,
+/// so a caller that cannot see which higher-trust layers went unqueried cannot
+/// tell whether the top-ranked result is the best binding or only the best
+/// binding somebody looked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressResolutionOutcome {
+    /// Bindings that resolution found, sorted by trust rank (highest first).
+    ///
+    /// Never empty: resolution returns [`AddressingError::NotFound`] or
+    /// [`AddressingError::LayersUnavailable`] instead of an empty vector.
+    pub resolutions: Vec<AddressResolution>,
+    /// Layers that answered [`LayerUnavailable`] rather than a result vector,
+    /// each layer recorded once however many times resolution queried it.
+    ///
+    /// Empty when every layer resolution consulted answered.
+    pub unavailable_layers: Vec<LayerUnavailable>,
+}
+
+impl AddressResolutionOutcome {
+    /// Returns `true` when every layer resolution consulted answered, so no
+    /// binding escaped the search for want of a capability.
+    #[must_use]
+    pub const fn every_layer_answered(&self) -> bool {
+        self.unavailable_layers.is_empty()
+    }
+}
+
 /// Renders every unavailable layer into one comma-separated sentence for
 /// [`AddressingError::LayersUnavailable`].
 fn describe_layers(layers: &[LayerUnavailable]) -> String {

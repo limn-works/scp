@@ -971,6 +971,8 @@ A deploy is a set of content-addressed messages published under a shared `deploy
    - Stores the deploy manifest as a special blob (enables recovery on restart).
    - Atomically swaps the `current_deploy_id` pointer via `ArcSwap`.
 
+   **Empty deploy:** a commit whose scan matches no blob under `deploy_id` MUST fail with an error naming that `deploy_id`, MUST NOT store a manifest, and MUST leave the `current_deploy_id` pointer and the deploy history unchanged. A scan matches no blob when the publish phase never ran, when every published blob expired via TTL, or when a caller passed a `deploy_id` that no publish used — and in each case the node holds no evidence that an operator meant to empty the site. Swapping in an empty `PathIndex` would answer 404 for every path a previous deploy served, which is why the commit fails instead. An operator who means to stop serving a context calls `disable_broadcast_projection()`.
+
 3. **Concurrent reads:** HTTP handlers read `current_deploy_id` via `ArcSwap::load()` — lock-free. No contention with publish or commit operations.
 
 4. **Deploy retention:** Double-buffer — current + previous deploy indexes kept in memory. Previous available for in-flight request draining. Configurable retention count (default 2) for multi-version rollback. Rollback only works within blob TTL window.

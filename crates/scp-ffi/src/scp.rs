@@ -213,8 +213,14 @@ impl PyScp {
                 .into());
             }
         };
-        let bi = PyBridgeInstance::with_storage_py(cfg)
-            .map_err(|e| ScpPyError::validation(e.to_string()))?;
+        // FAIL CLOSED (spec §17.6): a failed durable-backend open raises
+        // `ValidationError` carrying `SCP-STORAGE-8001`, the code the NAPI and
+        // `UniFFI` bridges raise for this same failure.
+        let bi =
+            PyBridgeInstance::with_storage_py(cfg).map_err(|e| ScpPyError::ValidationError {
+                message: e.to_string(),
+                code: scp_ffi_common::error_codes::STORAGE_8001.to_owned(),
+            })?;
         Ok(Self {
             inner: Arc::new(bi),
         })

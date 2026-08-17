@@ -11,6 +11,7 @@ package works.limn.scp
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import works.limn.scp.bridge.CoroutineBridge
 
@@ -189,7 +190,10 @@ interface DiscoveryBindings {
 
     // Address resolution (§22.8)
 
-    /** Resolves an address via multi-path resolution. Returns JSON array. */
+    /**
+     * Resolves an address via multi-path resolution. Returns a JSON object
+     * with `resolutions` and `unavailable_layers`.
+     */
     fun addressResolve(
         ownerDid: String,
         address: String,
@@ -540,20 +544,61 @@ class DiscoveryBridge internal constructor(
      * @param ownerDid DID of the identity whose petname map to consult.
      * @param address The address string to resolve.
      * @param knownContextsJson Optional JSON object mapping context IDs to names.
-     * @return List of parsed AddressResolution JSON elements.
+     * @return Resolutions found, paired with every layer this build could not query.
      */
     suspend fun addressResolve(
         ownerDid: String,
         address: String,
         knownContextsJson: String? = null,
-    ): List<JsonElement> {
+    ): AddressResolutionOutcome {
         val json =
             bridge.ffiCall {
                 bindings.addressResolve(ownerDid, address, knownContextsJson)
             }
-        return Json.parseToJsonElement(json).jsonArray.toList()
+        val outcome = Json.parseToJsonElement(json).jsonObject
+        return AddressResolutionOutcome(
+            resolutions = outcome.getValue("resolutions").jsonArray.toList(),
+            unavailableLayers =
+                outcome.getValue("unavailable_layers").jsonArray.map { entry ->
+                    val fields = entry.jsonObject
+                    UnavailableResolutionLayer(
+                        layer = fields.getValue("layer").jsonPrimitive.content,
+                        reason = fields.getValue("reason").jsonPrimitive.content,
+                    )
+                },
+        )
     }
 }
+
+/**
+ * One address resolution: the bindings it found, and the layers nobody queried.
+ *
+ * Spec section 22.8.2 ranks [resolutions] by trust level, so a caller reads
+ * [unavailableLayers] before acting on the first entry: a layer that never
+ * answered may hold a binding that outranks every binding in [resolutions].
+ *
+ * @property resolutions AddressResolution JSON elements, highest trust first.
+ * @property unavailableLayers Layers this build could not query, each once.
+ */
+data class AddressResolutionOutcome(
+    val resolutions: List<JsonElement>,
+    val unavailableLayers: List<UnavailableResolutionLayer>,
+) {
+    /** True when every layer resolution consulted answered. */
+    val everyLayerAnswered: Boolean get() = unavailableLayers.isEmpty()
+}
+
+/**
+ * A resolution layer this build cannot query at all.
+ *
+ * @property layer Layer name: `Petname`, `HandleRegistry`, `Attestation`, `Domain`,
+ *   or `MultiLayerCorroborated`.
+ * @property reason Why this build reaches no such layer.
+ */
+data class UnavailableResolutionLayer(
+    val layer: String,
+    val reason: String,
+)
 
 /** Parses a JSON string containing an array of strings into a `List<String>`. */
 private fun parseJsonStringArray(json: String): List<String> =

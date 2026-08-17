@@ -120,8 +120,9 @@ def test_sqlite_rejects_mismatched_key() -> None:
     silently lose access to persisted state. After commit
     ``9fa80e13c`` (`fix(ffi): propagate SqliteStorage::new failure
     from with_storage`) the bridge surfaces the `SQLCipher` key
-    mismatch as a ``ValidationError`` (``SCP-VALID-7005``) rather than
-    silently returning an in-memory instance.
+    mismatch as a ``ValidationError`` (``SCP-STORAGE-8001``) rather than
+    silently returning an in-memory instance. All three bridges report
+    that one code for a failed durable-backend open.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         scp1 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": _SQLITE_KEY})

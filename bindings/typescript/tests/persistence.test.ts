@@ -138,16 +138,18 @@ describeNapi("SCP with SQLite storage (#1549 PR 3)", () => {
       await scp1.shutdown(1);
 
       // Second open with a WRONG key. FAIL CLOSED (spec §17.6): the NAPI
-      // bridge surfaces the SQLCipher key-mismatch as a `SCP-VALID-7005`
+      // bridge surfaces the SQLCipher key-mismatch as a `SCP-STORAGE-8001`
       // validation error rather than silently returning an in-memory
-      // instance. The original encrypted DB must survive the failed
+      // instance. All three bridges report that one code for a failed
+      // durable-backend open, so a caller reads the same code whichever
+      // binding raised it. The original encrypted DB must survive the failed
       // attempt so the next correct-key open still works.
       const wrongKey = new Uint8Array(32).fill(0x11);
       expect(() => {
         new SCP({
           storage: { type: "sqlite", path: dir, key: wrongKey },
         });
-      }).toThrow(/SCP-VALID-7005/);
+      }).toThrow(/SCP-STORAGE-8001/);
 
       // Third open with the correct key — must still succeed, proving
       // the failed mismatched-key attempt did not corrupt or truncate

@@ -187,9 +187,16 @@ impl std::error::Error for StorageInitError {}
 impl From<StorageInitError> for crate::ScpError {
     fn from(err: StorageInitError) -> Self {
         match err {
-            StorageInitError::SqliteOpen { .. } => Self::Context {
+            // A rejected key, an unwritable directory and a held advisory lock
+            // are all caller-supplied selections this bridge could not honour,
+            // which `SCP-STORAGE-8001` names. The `PyO3` and NAPI bridges
+            // report the same code for the same failure, so a caller reading a
+            // code learns the same thing whichever binding raised it. Reporting
+            // `SCP-CTX-2000` here said "context error" for a storage-selection
+            // failure that no context took part in.
+            StorageInitError::SqliteOpen { .. } => Self::Validation {
                 msg: err.to_string(),
-                code: codes::CTX_2000.to_owned(),
+                code: codes::STORAGE_8001.to_owned(),
             },
         }
     }

@@ -1062,6 +1062,18 @@ pub const VALID_7403: &str = "SCP-VALID-7403";
 /// runtime with this code. No bridge silently defaults to in-memory.
 pub const STORAGE_8000: &str = "SCP-STORAGE-8000";
 
+/// The selected durable storage backend failed to open.
+///
+/// Returned when `SqliteStorage::new` or `SqliteStorage::with_passphrase`
+/// rejects the caller's selection: a wrong key or passphrase on an existing
+/// `SQLCipher` database, a directory the process cannot write, a corrupt
+/// file, a salt-sidecar fail-closed condition, or a second handle against a
+/// database another `SCP` instance already holds an advisory lock on.
+/// Spec §17.6 makes this terminal — no bridge downgrades to in-memory
+/// storage after it. All three bridges report this one code, so a caller
+/// reading a code learns the same thing whichever binding raised it.
+pub const STORAGE_8001: &str = "SCP-STORAGE-8001";
+
 // -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)
 // -------------------------------------------------------------------------

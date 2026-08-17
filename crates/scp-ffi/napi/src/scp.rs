@@ -276,7 +276,7 @@ impl Scp {
         let bi = NapiBridgeInstance::with_storage_napi(storage).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: e.to_string(),
-                code: codes::VALID_7005.to_owned(),
+                code: codes::STORAGE_8001.to_owned(),
             })
         })?;
         Ok(Self {
@@ -1917,6 +1917,11 @@ impl Scp {
     }
 
     /// Per-instance equivalent of `address_resolve` (spec §22.8).
+    ///
+    /// Returns a JSON object with two keys: `resolutions` holds the
+    /// `AddressResolution` objects sorted by trust level, and
+    /// `unavailable_layers` names each layer this build could not query,
+    /// with the reason.
     #[napi(js_name = "addressResolve")]
     pub async fn address_resolve(
         &self,
@@ -1925,7 +1930,7 @@ impl Scp {
         known_contexts_json: Option<String>,
     ) -> napi::Result<String> {
         use scp_ffi_common::petname_helpers::{
-            LocalHandleQuerier, address_resolution_to_json, known_contexts_from_scope_registries,
+            LocalHandleQuerier, known_contexts_from_scope_registries,
         };
 
         if owner_did.is_empty() {
@@ -1969,7 +1974,7 @@ impl Scp {
         };
         let mut resolver = scp_core::discovery::AddressResolver::new();
         let querier = LocalHandleQuerier::new(core);
-        let results = resolver
+        let outcome = resolver
             .resolve(
                 &address,
                 &petname_map,
@@ -1986,9 +1991,12 @@ impl Scp {
                         .to_owned(),
                 })
             })?;
-        let json_results: Vec<serde_json::Value> =
-            results.iter().map(address_resolution_to_json).collect();
-        serde_json::to_string(&json_results).map_err(|e| {
+        // §22.8.2 ranks results by trust level, so a caller reads
+        // `unavailable_layers` to learn which higher-trust layers this build
+        // never queried. Returning the resolution array alone would hide that.
+        let json_outcome =
+            scp_ffi_common::petname_helpers::address_resolution_outcome_to_json(&outcome);
+        serde_json::to_string(&json_outcome).map_err(|e| {
             NapiError::from(ScpNapiError::Validation {
                 message: format!("failed to serialize address resolution results: {e}"),
                 code: codes::VALID_7092.to_owned(),
