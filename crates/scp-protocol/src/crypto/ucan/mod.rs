@@ -268,13 +268,21 @@ pub struct UcanHeader {
     pub typ: String,
     /// UCAN specification version. Always `"0.10.0"`.
     pub ucv: String,
-    /// Optional Key ID per RFC 7515 (ADR-039). Identifies which verification
-    /// method on the issuer's DID document signed this token. Values are
-    /// verification method fragment identifiers: `"#active"` for the human
-    /// signing key, `"#agent"` for the agent signing key. When absent,
-    /// verifiers default to `#active`.
+    /// Optional Key ID per RFC 7515 (ADR-039, the shared-DID human-agent
+    /// identity model). Names which verification method on the issuer's DID
+    /// document signed this token. When absent, a verifier reads `#active`,
+    /// the Human Signing Key.
+    ///
+    /// [`SigningKeyId`](scp_did::SigningKeyId) rather than a `String`, so
+    /// deserializing a JWT header is the single place a `kid` fragment decodes.
+    /// `SigningKeyId`'s `Deserialize` routes through
+    /// [`SigningKeyId::from_fragment`](scp_did::SigningKeyId::from_fragment),
+    /// which admits `"#active"` and `"#agent"` and rejects every other value,
+    /// so a header naming `#0` or a `#retired-{n}` method fails to parse and no
+    /// downstream reader has to reject it. Four readers used to decode this
+    /// field, and two of them disagreed with the other two.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kid: Option<String>,
+    pub kid: Option<scp_did::SigningKeyId>,
 }
 
 impl UcanHeader {
@@ -293,33 +301,31 @@ impl UcanHeader {
         }
     }
 
-    /// Creates a new UCAN header with a Key ID (ADR-039).
-    ///
-    /// The `kid` identifies which verification method on the issuer's DID
-    /// document signed this token (e.g., `"#active"` or `"#agent"`).
+    /// Creates a new UCAN header naming the verification method that signed
+    /// this token (ADR-039, the shared-DID human-agent identity model).
     #[must_use]
-    pub fn with_kid(kid: impl Into<String>) -> Self {
+    pub fn with_kid(kid: scp_did::SigningKeyId) -> Self {
         Self {
             alg: "EdDSA".to_owned(),
             typ: "JWT".to_owned(),
             ucv: "0.10.0".to_owned(),
-            kid: Some(kid.into()),
+            kid: Some(kid),
         }
     }
 
-    /// Returns the `SigningKeyId` corresponding to this header's `kid` field.
+    /// Returns the verification method this header names, reading `#active`
+    /// when the header carries no `kid`.
     ///
-    /// Returns `SigningKeyId::Active` when `kid` is `None` or `"#active"`,
-    /// `SigningKeyId::Agent` when `kid` is `"#agent"`.
-    ///
-    /// Unknown `kid` values default to `SigningKeyId::Active` for backward
-    /// compatibility (fail-open on identification, fail-closed on enforcement).
+    /// A header that named some other verification method failed to
+    /// deserialize, so this function chooses between two values rather than
+    /// deciding what an unrecognized fragment means. An earlier version read a
+    /// `String` and mapped every unrecognized value to `#active`, which is the
+    /// opposite of what
+    /// [`SigningKeyId::from_fragment`](scp_did::SigningKeyId::from_fragment)
+    /// does.
     #[must_use]
     pub fn signing_key_id(&self) -> scp_did::SigningKeyId {
-        match self.kid.as_deref() {
-            Some("#agent") => scp_did::SigningKeyId::Agent,
-            _ => scp_did::SigningKeyId::Active,
-        }
+        self.kid.unwrap_or(scp_did::SigningKeyId::Active)
     }
 
     /// Validates that the header fields match the expected SCP UCAN values.
@@ -512,16 +518,16 @@ mod tests {
 
     #[test]
     fn ucan_header_with_kid_sets_kid() {
-        let header = UcanHeader::with_kid("#agent".to_owned());
+        let header = UcanHeader::with_kid(scp_did::SigningKeyId::Agent);
         assert_eq!(header.alg, "EdDSA");
         assert_eq!(header.typ, "JWT");
         assert_eq!(header.ucv, "0.10.0");
-        assert_eq!(header.kid, Some("#agent".to_owned()));
+        assert_eq!(header.kid, Some(scp_did::SigningKeyId::Agent));
     }
 
     #[test]
     fn ucan_header_with_kid_validates_successfully() {
-        let header = UcanHeader::with_kid("#active".to_owned());
+        let header = UcanHeader::with_kid(scp_did::SigningKeyId::Active);
         assert!(header.validate().is_ok());
     }
 
@@ -537,7 +543,7 @@ mod tests {
 
     #[test]
     fn ucan_header_kid_included_in_json_when_present() {
-        let header = UcanHeader::with_kid("#agent".to_owned());
+        let header = UcanHeader::with_kid(scp_did::SigningKeyId::Agent);
         let json = serde_json::to_string(&header).unwrap();
         assert!(
             json.contains(r##""kid":"#agent""##),
@@ -547,7 +553,7 @@ mod tests {
 
     #[test]
     fn ucan_header_with_kid_serialization_roundtrip() {
-        let header = UcanHeader::with_kid("#agent".to_owned());
+        let header = UcanHeader::with_kid(scp_did::SigningKeyId::Agent);
         let json = serde_json::to_string(&header).unwrap();
         let deserialized: UcanHeader = serde_json::from_str(&json).unwrap();
         assert_eq!(header, deserialized);

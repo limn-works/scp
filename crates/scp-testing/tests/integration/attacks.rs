@@ -1555,7 +1555,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         .unwrap();
 
     // Tamper: set kid to "#agent" while fct still says "#active".
-    token.header.kid = Some("#agent".to_owned());
+    token.header.kid = Some(scp_did::SigningKeyId::Agent);
 
     let mut resolver_keys = HashMap::new();
     resolver_keys.insert(issuer_did.clone(), issuer_pk);

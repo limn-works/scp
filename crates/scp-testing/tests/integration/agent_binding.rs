@@ -122,7 +122,7 @@ async fn self_delegation_ucan_with_key_scope() {
 
     // Verify kid in header matches the key scope.
     assert_eq!(
-        token.header.kid.as_deref(),
+        token.header.kid.map(|kid| kid.as_fragment()),
         Some("#agent"),
         "kid must be set to #agent for key scope delegation"
     );
@@ -192,7 +192,10 @@ async fn key_scope_mismatch_fails() {
         .expect("mint should succeed");
 
     // The kid should be #agent (from signing_key_id).
-    assert_eq!(token.header.kid.as_deref(), Some("#agent"));
+    assert_eq!(
+        token.header.kid.map(|kid| kid.as_fragment()),
+        Some("#agent")
+    );
 
     // But the scp_key_scope should be #active (from key_scope).
     let fct = token.payload.fct.as_ref().expect("facts");
@@ -201,7 +204,7 @@ async fn key_scope_mismatch_fails() {
 
     // The kid and scope disagree — this token would fail validation step 5b.
     assert_ne!(
-        token.header.kid.as_deref().unwrap_or("#active"),
+        token.header.signing_key_id().as_fragment(),
         scope.as_str().unwrap_or(""),
         "kid and scp_key_scope must disagree to demonstrate the mismatch"
     );

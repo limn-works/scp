@@ -527,14 +527,22 @@ pub async fn mint_ucan(
     // Build header — include kid when signing_key_id or key_scope is present
     // (ADR-039). signing_key_id takes precedence over key_scope for the kid
     // header value.
-    let header = params.signing_key_id.as_ref().map_or_else(
+    // `key_scope` is a free JSON string an issuer writes into
+    // `fct.scp_key_scope`, and `UcanHeader.kid` is a `SigningKeyId`, so a
+    // scope naming anything outside `#active` and `#agent` writes no `kid`.
+    // Step 5b then rejects the token, because a header carrying no `kid` reads
+    // `#active` and that fragment does not match the scope. That is the
+    // fail-closed direction: an issuer cannot mint a token whose header names a
+    // method the protocol does not admit.
+    let header = params.signing_key_id.map_or_else(
         || {
             params
                 .key_scope
-                .as_ref()
-                .map_or_else(UcanHeader::new, |scope| UcanHeader::with_kid(scope.clone()))
+                .as_deref()
+                .and_then(scp_did::SigningKeyId::from_fragment)
+                .map_or_else(UcanHeader::new, UcanHeader::with_kid)
         },
-        |signing_key_id| UcanHeader::with_kid(signing_key_id.as_fragment().to_owned()),
+        UcanHeader::with_kid,
     );
 
     // Build facts — merge scp_key_scope into existing facts when key_scope
@@ -787,14 +795,22 @@ pub async fn delegate_ucan(
 
     // Build header — include kid when signing_key_id or key_scope is present
     // (ADR-039). signing_key_id takes precedence.
-    let header = params.signing_key_id.as_ref().map_or_else(
+    // `key_scope` is a free JSON string an issuer writes into
+    // `fct.scp_key_scope`, and `UcanHeader.kid` is a `SigningKeyId`, so a
+    // scope naming anything outside `#active` and `#agent` writes no `kid`.
+    // Step 5b then rejects the token, because a header carrying no `kid` reads
+    // `#active` and that fragment does not match the scope. That is the
+    // fail-closed direction: an issuer cannot mint a token whose header names a
+    // method the protocol does not admit.
+    let header = params.signing_key_id.map_or_else(
         || {
             params
                 .key_scope
-                .as_ref()
-                .map_or_else(UcanHeader::new, |scope| UcanHeader::with_kid(scope.clone()))
+                .as_deref()
+                .and_then(scp_did::SigningKeyId::from_fragment)
+                .map_or_else(UcanHeader::new, UcanHeader::with_kid)
         },
-        |signing_key_id| UcanHeader::with_kid(signing_key_id.as_fragment().to_owned()),
+        UcanHeader::with_kid,
     );
 
     // Build facts — merge scp_key_scope into existing facts when key_scope
@@ -2254,7 +2270,7 @@ mod tests {
         // Header must have kid="#agent".
         assert_eq!(
             token.header.kid,
-            Some("#agent".to_owned()),
+            Some(scp_did::SigningKeyId::Agent),
             "kid must be #agent"
         );
 
@@ -2297,7 +2313,7 @@ mod tests {
 
         assert_eq!(
             token.header.kid,
-            Some("#active".to_owned()),
+            Some(scp_did::SigningKeyId::Active),
             "kid must be #active"
         );
 
@@ -2342,7 +2358,7 @@ mod tests {
         // Verify self-delegation fields.
         assert_eq!(token.payload.iss, issuer_did);
         assert_eq!(token.payload.aud, issuer_did);
-        assert_eq!(token.header.kid, Some("#agent".to_owned()));
+        assert_eq!(token.header.kid, Some(scp_did::SigningKeyId::Agent));
 
         let fct = token.payload.fct.as_ref().expect("fct must be present");
         assert_eq!(
@@ -2465,7 +2481,7 @@ mod tests {
         // Parse header.
         let header_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
         let parsed_header: UcanHeader = serde_json::from_slice(&header_bytes).unwrap();
-        assert_eq!(parsed_header.kid, Some("#agent".to_owned()));
+        assert_eq!(parsed_header.kid, Some(scp_did::SigningKeyId::Agent));
         assert_eq!(parsed_header.alg, "EdDSA");
         assert_eq!(parsed_header.typ, "JWT");
         assert_eq!(parsed_header.ucv, "0.10.0");
@@ -2887,7 +2903,7 @@ mod tests {
         // Header must have kid="#agent" from signing_key_id.
         assert_eq!(
             token.header.kid,
-            Some("#agent".to_owned()),
+            Some(scp_did::SigningKeyId::Agent),
             "signing_key_id=Agent must set kid=#agent in header"
         );
     }
@@ -2919,7 +2935,7 @@ mod tests {
         // Header must have kid="#active" from signing_key_id.
         assert_eq!(
             token.header.kid,
-            Some("#active".to_owned()),
+            Some(scp_did::SigningKeyId::Active),
             "signing_key_id=Active must set kid=#active in header"
         );
     }
@@ -2954,7 +2970,7 @@ mod tests {
         // kid header comes from signing_key_id, not key_scope.
         assert_eq!(
             token.header.kid,
-            Some("#agent".to_owned()),
+            Some(scp_did::SigningKeyId::Agent),
             "signing_key_id must take precedence over key_scope for kid"
         );
 

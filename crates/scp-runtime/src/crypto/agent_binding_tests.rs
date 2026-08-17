@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(token.payload.iss, token.payload.aud);
 
         // Verify the kid header is set from key_scope.
-        assert_eq!(token.header.kid.as_deref(), Some("#agent"));
+        assert_eq!(token.header.kid, Some(scp_did::SigningKeyId::Agent));
     }
 
     // -----------------------------------------------------------------------

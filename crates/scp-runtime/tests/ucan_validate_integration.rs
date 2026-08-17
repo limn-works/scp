@@ -1621,7 +1621,7 @@ async fn validate_ucan_accepts_matching_key_scope() {
         .unwrap();
 
     // kid should be "#agent" in the header.
-    assert_eq!(token.header.kid, Some("#agent".to_owned()));
+    assert_eq!(token.header.kid, Some(scp_did::SigningKeyId::Agent));
 
     // Register the agent key under the kid_keys resolver.
     let resolver = InMemoryDidResolver {
