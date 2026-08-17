@@ -39,7 +39,7 @@ use http_body_util::BodyExt;
 use scp_core::bridge::BridgeMode;
 use scp_core::bridge::registration::{
     ApprovedRegistration, BridgeRegistrationMetadata, BridgeRegistrationRequest, BridgeRegistry,
-    approve_registration, register_bridge,
+    approve_registration, derive_bridge_id, register_bridge,
 };
 use scp_did::{DidDocument, VerificationMethod};
 use scp_node::ApplicationNode;
@@ -94,16 +94,32 @@ fn rand_seed() -> [u8; 32] {
     seed
 }
 
+/// Maps a seed a test names a bridge by onto a request timestamp.
+///
+/// Spec §12.2.1 step 3 derives a bridge id from context, operator, platform,
+/// and request time, so two bridges a test distinguishes need two request times.
+fn seed_requested_at(seed: &str) -> u64 {
+    let digest = seed
+        .bytes()
+        .fold(0_u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b.into()));
+    1_700_000_000 + digest % 100_000
+}
+
 /// Runs one registration through spec §12.2.1 governance approval.
+///
+/// `seed` names a bridge; §12.2.1 step 3 derives its id, and a caller reads
+/// that id back through `ApprovedRegistration::connector`.
 fn approved(
-    bridge_id: &str,
+    seed: &str,
     operator_did: &str,
     context_id: &str,
     platform_key: Option<(&str, [u8; 32])>,
 ) -> ApprovedRegistration {
+    let requested_at = seed_requested_at(seed);
+    let bridge_id = derive_bridge_id(context_id, operator_did, "discord", requested_at);
     let mut registry = BridgeRegistry::new(context_id.to_owned());
     let request = BridgeRegistrationRequest {
-        bridge_id: bridge_id.to_owned(),
+        bridge_id: bridge_id.clone(),
         operator_did: operator_did.into(),
         platform: "discord".to_owned(),
         mode: if platform_key.is_some() {
@@ -112,7 +128,7 @@ fn approved(
             BridgeMode::Relay
         },
         context_id: context_id.to_owned(),
-        requested_at: 1_700_000_000,
+        requested_at,
         self_hosted: false,
         webhook_url: platform_key
             .is_some()
@@ -125,12 +141,17 @@ fn approved(
     register_bridge(&mut registry, request).unwrap();
     approve_registration(
         &mut registry,
-        bridge_id,
+        &bridge_id,
         &"did:dht:z6MkGovernance".into(),
         1_700_000_001,
     )
     .unwrap()
     .0
+}
+
+/// Returns the bridge id spec §12.2.1 step 3 derives for `seed`.
+fn bridge_id_for(seed: &str, operator_did: &str, context_id: &str) -> String {
+    derive_bridge_id(context_id, operator_did, "discord", seed_requested_at(seed))
 }
 
 /// Mounts a node's bridge endpoints exactly as `serve()` mounts them.
@@ -258,7 +279,8 @@ async fn body_text(resp: axum::response::Response) -> String {
 async fn a_registration_admitted_through_a_node_turns_401_into_200() {
     let node = ApplicationNode::dev(0).await.unwrap();
     let operator = Operator::generate();
-    let token = bearer(&operator, "bridge-alpha", "ctx-alpha");
+    let bridge_id = bridge_id_for("bridge-alpha", &operator.did, "ctx-alpha");
+    let token = bearer(&operator, &bridge_id, "ctx-alpha");
 
     let before = bridge_app(&node)
         .oneshot(status_request(&token))
@@ -292,7 +314,7 @@ async fn a_registration_admitted_through_a_node_turns_401_into_200() {
         "a bridge registered through ApplicationNode::register_bridge must be served"
     );
     let body = body_text(after).await;
-    assert!(body.contains("bridge-alpha"), "status body: {body}");
+    assert!(body.contains(&bridge_id), "status body: {body}");
     assert!(
         body.contains("\"status\":\"Active\""),
         "status body: {body}"
@@ -319,9 +341,10 @@ async fn suspending_then_revoking_a_bridge_closes_its_endpoints() {
     )
     .await
     .unwrap();
-    let token = bearer(&operator, "bridge-alpha", "ctx-alpha");
+    let bridge_id = bridge_id_for("bridge-alpha", &operator.did, "ctx-alpha");
+    let token = bearer(&operator, &bridge_id, "ctx-alpha");
 
-    node.set_bridge_status("bridge-alpha", BridgeStatus::Suspended)
+    node.set_bridge_status(&bridge_id, BridgeStatus::Suspended)
         .await
         .unwrap();
     let suspended = bridge_app(&node)
@@ -331,7 +354,7 @@ async fn suspending_then_revoking_a_bridge_closes_its_endpoints() {
     assert_eq!(suspended.status(), StatusCode::FORBIDDEN);
     assert!(body_text(suspended).await.contains("BRIDGE_SUSPENDED"));
 
-    node.set_bridge_status("bridge-alpha", BridgeStatus::Revoked)
+    node.set_bridge_status(&bridge_id, BridgeStatus::Revoked)
         .await
         .unwrap();
     let revoked = bridge_app(&node)
@@ -383,8 +406,16 @@ async fn one_bridge_cannot_touch_a_second_bridges_shadow() {
     .await
     .unwrap();
 
-    let alpha_token = bearer(&alpha, "bridge-alpha", "ctx-alpha");
-    let beta_token = bearer(&beta, "bridge-beta", "ctx-beta");
+    let alpha_token = bearer(
+        &alpha,
+        &bridge_id_for("bridge-alpha", &alpha.did, "ctx-alpha"),
+        "ctx-alpha",
+    );
+    let beta_token = bearer(
+        &beta,
+        &bridge_id_for("bridge-beta", &beta.did, "ctx-beta"),
+        "ctx-beta",
+    );
 
     // Alpha creates a shadow inside its own context.
     let created = bridge_app(&node)

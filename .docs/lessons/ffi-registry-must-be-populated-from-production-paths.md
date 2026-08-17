@@ -64,10 +64,18 @@ Two things generalize from this second occurrence:
    error, nothing panics, and every negative test still passes. Ask instead which production
    call makes an authorized request succeed, and require a test that performs it.
 
-The fix made `admit_registration` the one entry point that writes a connector, made
-`ApplicationNode::register_bridge` its production caller, and added
-`crates/scp-node/tests/bridge_registration_wiring.rs`, whose first test requires 401 before that
-call and 200 after it.
+The fix made `admit_registration` the one entry point that writes a connector and gave it two
+production callers: `ApplicationNode::register_bridge`, which an embedder calls, and
+`ApplicationNode::admit_bridge_registrations`, which the shipped `scp-node` binary calls at
+startup when `SCP_NODE_BRIDGE_REGISTRATIONS` names a file of operator-supplied approvals.
+`crates/scp-node/tests/bridge_registration_wiring.rs` requires 401 before that call and 200
+after it.
+
+A third lesson came out of a review of that first fix. Moving a writer from `#[cfg(test)]` to a
+`pub` method is not the same as wiring it: a public method whose only callers are tests leaves a
+shipped binary in the same state the original defect described. Ask which shipped entry point —
+a binary's `main`, a request handler, a startup sequence — reaches that writer, and name it.
+"Callable from outside the crate" is not an answer.
 
 ## Related
 

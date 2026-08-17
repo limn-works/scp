@@ -1008,6 +1008,34 @@ async fn run_node_with<
         }
     };
 
+    // Spec §12.10.6 step 1: admit whatever bridge registrations this operator
+    // approved, before serving any bridge endpoint. Without this call a node
+    // holds no registration, so every `/v1/scp/bridge/*` request answers
+    // `BRIDGE_NOT_AUTHORIZED` (401) and every per-bridge scope rule behind that
+    // 401 never runs. An operator who bridges nothing sets no path and this
+    // node serves those endpoints against an empty registry, which is the same
+    // honest 401.
+    if let Ok(path) = env::var("SCP_NODE_BRIDGE_REGISTRATIONS") {
+        match node
+            .admit_bridge_registrations(std::path::Path::new(&path))
+            .await
+        {
+            Ok(count) => tracing::info!(
+                count,
+                path = %path,
+                "admitted bridge registrations from an operator-supplied file"
+            ),
+            Err(e) => {
+                // A registration an operator meant to admit and a node refused
+                // leaves that bridge unreachable, and serving on regardless
+                // would hide that from an operator until a platform reported a
+                // 401. Fail the node instead.
+                tracing::error!(error = %e, path = %path, "bridge registration admission failed");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // The BEP44 sequence counter was bootstrapped inside the builder ahead of
     // the startup publish (SCP-RELAYRES-004), so `Node::start` above already
     // published at the correct next sequence — no post-build seq step here.

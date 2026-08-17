@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bridge_admission;
 pub mod bridge_auth;
 pub mod bridge_handlers;
 pub mod config;
@@ -596,6 +597,44 @@ impl<S: Storage> ApplicationNode<S> {
             .admit_registration(approved, operator_document)
             .await
             .map_err(bridge_admission_to_node_error)
+    }
+
+    /// Admits every governance-approved registration an operator wrote to
+    /// `path`, and returns how many bridges this call admitted.
+    ///
+    /// Spec §12.10.6 step 1 makes admission the step that turns approvals into
+    /// reachable bridges, and this is what the `scp-node` binary calls at
+    /// startup when `SCP_NODE_BRIDGE_REGISTRATIONS` names a file. Each record
+    /// rebuilds its own [`ApprovedRegistration`] through `scp_protocol`
+    /// `register_bridge` and `approve_registration`, so every §12.2.1 rule
+    /// applies before this node stores anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeError::InvalidConfig`] when the file cannot be read or
+    /// parsed, or when a record fails a §12.2.1 rule, and whatever
+    /// [`register_bridge`](Self::register_bridge) returns for a record that
+    /// reaches admission and is refused there. Nothing is admitted after a
+    /// failure, so an operator fixes a record and reruns.
+    pub async fn admit_bridge_registrations(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<usize, NodeError> {
+        let records = crate::bridge_admission::load_admission_records(path)
+            .map_err(|e| NodeError::InvalidConfig(e.to_string()))?;
+
+        let mut admitted = 0_usize;
+        for record in records {
+            let approved = record
+                .rebuild_approval()
+                .map_err(|e| NodeError::InvalidConfig(e.to_string()))?;
+            let bridge_id = approved.connector().bridge_id.clone();
+            self.register_bridge(approved, record.operator_document)
+                .await?;
+            tracing::info!(bridge_id = %bridge_id, "admitted a bridge registration");
+            admitted += 1;
+        }
+        Ok(admitted)
     }
 
     /// Moves an admitted bridge to a new lifecycle status.
@@ -3357,9 +3396,16 @@ pub(crate) async fn build_domain_inner<D: DidMethod + 'static, S: Storage + 'sta
         Arc::clone(&storage),
         format!("https://{domain}"),
     ));
-    if let Err(e) = bridge_lookup.load_from_storage().await {
-        tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
-    }
+    // A node that cannot read its own bridge registry must not start serving
+    // bridge endpoints. Starting with an empty cache over populated storage
+    // makes every §12.10.2 authentication decision from a record set that is
+    // missing whatever storage holds, which returns a revoked bridge to
+    // `Active` on its next admission and moves one bridge's webhook key
+    // identifier onto another bridge.
+    bridge_lookup
+        .load_from_storage()
+        .await
+        .map_err(|e| NodeError::Storage(format!("failed to load bridge registry: {e}")))?;
     // One object serves two roles: `NodeState` reads it through
     // `dyn BridgeLookup` to authenticate a request, and `ApplicationNode`
     // keeps a typed handle so `register_bridge` writes into that same store.
@@ -3734,9 +3780,16 @@ pub(crate) async fn build_no_domain_inner<D: DidMethod + 'static, S: Storage + '
         Arc::clone(&storage),
         live_state.get().relay_url,
     ));
-    if let Err(e) = bridge_lookup.load_from_storage().await {
-        tracing::warn!(error = %e, "failed to load bridge auth cache from storage — starting with empty cache");
-    }
+    // A node that cannot read its own bridge registry must not start serving
+    // bridge endpoints. Starting with an empty cache over populated storage
+    // makes every §12.10.2 authentication decision from a record set that is
+    // missing whatever storage holds, which returns a revoked bridge to
+    // `Active` on its next admission and moves one bridge's webhook key
+    // identifier onto another bridge.
+    bridge_lookup
+        .load_from_storage()
+        .await
+        .map_err(|e| NodeError::Storage(format!("failed to load bridge registry: {e}")))?;
     // One object serves two roles: `NodeState` reads it through
     // `dyn BridgeLookup` to authenticate a request, and `ApplicationNode`
     // keeps a typed handle so `register_bridge` writes into that same store.
