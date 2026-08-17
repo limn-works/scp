@@ -1078,6 +1078,14 @@ impl Scp {
     ///   a caller asserts belongs to this issuer. This method checks that
     ///   assertion against an issuer's resolved DID document; it never uses
     ///   this key as a substitute for that document.
+    /// * `reference_proof` — What this caller did about a class 2
+    ///   (`signed_post` / `dns_record`) proof resource, per spec §3.5.4 Class 2
+    ///   step 2. `"confirmed"` reports that this caller fetched the resource
+    ///   `evidence.proof` names and found this issuer's DID in it, which yields
+    ///   a `true` or a `false`. `"not_fetched"` reports that this caller
+    ///   fetched nothing, which raises `SCP-IDENT-1062` for a class 2
+    ///   attestation. A class 1 (`did_control`) attestation ignores this
+    ///   argument. Any other string raises `SCP-IDENT-1044`.
     ///
     /// # Returns
     ///
@@ -1102,6 +1110,7 @@ impl Scp {
         &self,
         attestation_json: String,
         issuer_public_key_hex: String,
+        reference_proof: String,
     ) -> napi::Result<bool> {
         use scp_ffi_common::attestation::LinkVerifyError;
 
@@ -1142,6 +1151,7 @@ impl Scp {
             &*resolver,
             &attestation_json,
             &issuer_public_key_hex,
+            &reference_proof,
         )
         .await
         .map_err(|e| to_napi(&e))
@@ -4985,8 +4995,9 @@ impl Scp {
 pub fn identity_verify_link_attestation(
     attestation_json: String,
     issuer_public_key_hex: String,
+    reference_proof: String,
 ) -> napi::Result<bool> {
-    let _ = (attestation_json, issuer_public_key_hex);
+    let _ = (attestation_json, issuer_public_key_hex, reference_proof);
     Err(NapiError::from(ScpNapiError::Identity {
         message: scp_ffi_common::attestation::LINK_VERIFY_REQUIRES_INSTANCE.to_owned(),
         code: codes::IDENT_1060.to_owned(),

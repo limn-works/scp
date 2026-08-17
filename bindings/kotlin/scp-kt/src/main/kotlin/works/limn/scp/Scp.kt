@@ -1349,17 +1349,37 @@ class SCP internal constructor(
         )
 
     /**
-     * Routes through the UniFFI-generated free function
-     * [uniffi.scp.identityVerifyLinkAttestation]. ADR-048 §1 + §7
-     * Kotlin bullet.
+     * Verifies an identity link attestation per spec §3.5.4.
+     *
+     * Forwards to [NativeScp.identityVerifyLinkAttestation] on [inner], which
+     * resolves an issuer's DID document through this instance's resolver
+     * before any signature check (§3.5.4 step 1). GitHub issue #2335 finding 2
+     * recorded the earlier route through the UniFFI free function
+     * [uniffi.scp.identityVerifyLinkAttestation], which reaches no bridge
+     * instance and now declines with `SCP-IDENT-1060`.
+     *
+     * [issuerPublicKeyHex] states which key a caller believes belongs to this
+     * issuer; this method checks that statement against an issuer's resolved
+     * document rather than trusting it.
+     *
+     * [referenceProof] reports what this caller did about a class 2
+     * (`signed_post` / `dns_record`) proof resource, per §3.5.4 Class 2 step 2.
+     * `"confirmed"` reports that this caller fetched the resource
+     * `evidence.proof` names and found this issuer's DID in it, which yields a
+     * `true` or a `false`. `"not_fetched"` reports that this caller fetched
+     * nothing, which raises `SCP-IDENT-1062` for a class 2 attestation. A
+     * class 1 (`did_control`) attestation ignores this argument. Any other
+     * string raises `SCP-IDENT-1044`.
      */
-    fun identityVerifyLinkAttestation(
+    suspend fun identityVerifyLinkAttestation(
         attestationJson: String,
         issuerPublicKeyHex: String,
+        referenceProof: String,
     ): Boolean =
-        uniffi.scp.identityVerifyLinkAttestation(
+        inner.identityVerifyLinkAttestation(
             attestationJson = attestationJson,
             issuerPublicKeyHex = issuerPublicKeyHex,
+            referenceProof = referenceProof,
         )
 
     /** Forwards to [NativeScp.isLocalDid] on [inner]. */

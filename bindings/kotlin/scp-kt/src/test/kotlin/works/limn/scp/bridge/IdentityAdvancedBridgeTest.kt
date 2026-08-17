@@ -169,6 +169,7 @@ class StubIdentityAdvancedBindings : IdentityAdvancedBindings {
     override fun identityVerifyLinkAttestation(
         attestationJson: String,
         issuerPublicKeyHex: String,
+        referenceProof: String,
     ): Boolean = true
 }
 

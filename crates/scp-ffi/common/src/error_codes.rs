@@ -341,7 +341,9 @@ pub const IDENT_1061: &str = "SCP-IDENT-1061";
 ///
 /// Spec §3.5.4 Class 2 step 2 has a verifier fetch a `signed_post` URL or query
 /// a `dns_record` TXT record and confirm an issuer's DID appears in it. No
-/// bridge performs that fetch. Spec §3.5.4 Class 2 step 3 then states the
+/// bridge performs that fetch, so each bridge's verify method takes a
+/// `reference_proof` argument naming what a caller did about it. This code
+/// reports the `"not_fetched"` case: spec §3.5.4 Class 2 step 3 states the
 /// attestation "is unverified. Treat as if the attestation does not exist for
 /// trust evaluation. Do not cache a negative result." Answering `false` would
 /// hand a caller exactly that negative result, and a caller reads `false` on
@@ -350,8 +352,10 @@ pub const IDENT_1061: &str = "SCP-IDENT-1061";
 ///
 /// A caller that meets this code performs that fetch itself — HTTP GET for
 /// `signed_post`, DNS TXT lookup of `_scp-verify.<domain>` for `dns_record` —
-/// confirms an issuer's DID appears in what it fetched, and treats a failed or
-/// absent fetch as "not yet verified" rather than caching a rejection.
+/// confirms an issuer's DID appears in what it fetched, and calls again with
+/// `reference_proof` reading `"confirmed"`, which yields a verdict. A caller
+/// whose fetch failed or found nothing keeps `"not_fetched"` and treats this
+/// code as "not yet verified" rather than caching a rejection.
 ///
 /// Distinct from [`IDENT_1060`] and [`IDENT_1061`]: a signature already
 /// verified under a key an issuer's DID document publishes, so what remains

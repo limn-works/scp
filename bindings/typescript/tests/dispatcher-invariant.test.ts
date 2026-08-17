@@ -446,11 +446,11 @@ describe("dispatcher invariant (ADR-048 §1 + §7)", () => {
       // carries that operation. A module-level free fn of that same JS name
       // remains exported and DECLINES with `SCP-IDENT-1060`, because phase D
       // (#1695) deleted every process-wide default bridge instance and it
-      // therefore reaches no resolver. Keeping that declining export is what
-      // lets Swift, Kotlin, and scp.ts keep compiling against a name whose
-      // route to a per-instance method those wrappers have yet to take
-      // (GitHub issue #2335 finding 2). native.ts routes through a class
-      // method; scp.ts still routes through that declining free fn.
+      // therefore reaches no resolver. Every SDK wrapper — scp.ts, native.ts,
+      // Swift, and Kotlin — now routes through that per-instance class method,
+      // and that declining free fn stays exported so a caller who reached it
+      // by name receives SCP-IDENT-1060 rather than a silent verify-valid
+      // (GitHub issue #2335 finding 2).
       //
       // ADR-048 authorizes neither half of this overlap: searching
       // .docs/adrs/ADR-048-scp-multi-instance.md for `verify_link_attestation`

@@ -197,19 +197,27 @@ interface IdentityAdvancedBindings {
     ): Boolean
 
     /**
-     * Verifies the Ed25519 signature on an identity link attestation.
+     * Verifies an identity link attestation per spec §3.5.4.
      *
-     * The issuer's public key cannot be reliably extracted from the DID string
-     * because attestations are signed with `#active` or `#agent` keys
-     * (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+     * A verifier resolves an issuer's DID document and takes a signing key
+     * from it (§3.5.4 step 1), because attestations are signed with `#active`
+     * or `#agent` keys (spec section 3.5.2), not the `#0` identity key
+     * embedded in a DID. [issuerPublicKeyHex] states which key a caller
+     * believes belongs to this issuer, and a verifier checks that statement
+     * against an issuer's resolved document rather than trusting it.
      *
      * @param attestationJson JSON string of the attestation.
      * @param issuerPublicKeyHex Hex-encoded Ed25519 public key of the issuer.
+     * @param referenceProof `"confirmed"` when this caller fetched the class 2
+     *   proof resource `evidence.proof` names and found this issuer's DID in
+     *   it (§3.5.4 Class 2 step 2), `"not_fetched"` when this caller fetched
+     *   nothing. A class 1 (`did_control`) attestation ignores this argument.
      * @return true if valid.
      */
     fun identityVerifyLinkAttestation(
         attestationJson: String,
         issuerPublicKeyHex: String,
+        referenceProof: String,
     ): Boolean
 }
 
@@ -462,21 +470,35 @@ class IdentityAdvancedBridge internal constructor(
         bridge.ffiCall { bindings.identityRemoveLinkAttestation(did, attestationId) }
 
     /**
-     * Verifies the Ed25519 signature on an identity link attestation.
+     * Verifies an identity link attestation per spec §3.5.4.
      *
-     * The issuer's public key cannot be reliably extracted from the DID string
-     * because attestations are signed with `#active` or `#agent` keys
-     * (spec section 3.5.2), not the `#0` identity key embedded in the DID.
+     * A verifier resolves an issuer's DID document and takes a signing key
+     * from it (§3.5.4 step 1), because attestations are signed with `#active`
+     * or `#agent` keys (spec section 3.5.2), not the `#0` identity key
+     * embedded in a DID. [issuerPublicKeyHex] states which key a caller
+     * believes belongs to this issuer, and a verifier checks that statement
+     * against an issuer's resolved document rather than trusting it.
      *
      * @param attestationJson JSON string of the attestation.
      * @param issuerPublicKeyHex Hex-encoded Ed25519 public key of the issuer.
+     * @param referenceProof `"confirmed"` when this caller fetched the class 2
+     *   proof resource `evidence.proof` names and found this issuer's DID in
+     *   it (§3.5.4 Class 2 step 2), `"not_fetched"` when this caller fetched
+     *   nothing. A class 1 (`did_control`) attestation ignores this argument.
      * @return true if valid.
      */
     suspend fun verifyLinkAttestation(
         attestationJson: String,
         issuerPublicKeyHex: String,
+        referenceProof: String,
     ): Boolean =
-        bridge.ffiCall { bindings.identityVerifyLinkAttestation(attestationJson, issuerPublicKeyHex) }
+        bridge.ffiCall {
+            bindings.identityVerifyLinkAttestation(
+                attestationJson,
+                issuerPublicKeyHex,
+                referenceProof,
+            )
+        }
 }
 
 // ---------------------------------------------------------------------------

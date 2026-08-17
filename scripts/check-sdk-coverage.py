@@ -131,13 +131,14 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     },
     # Identity-link attestation verification (spec §3.5.4). Each SDK names this
     # operation after its own bridge surface, so no bare `verify_attestation`
-    # symbol exists in any of them. Python's wrapper reaches the per-instance
-    # PyO3 method that resolves an issuer's DID document (GitHub issue #2335
-    # finding 2); Kotlin's wrapper still reaches a declining module-scope free
-    # function, which its matrix row records.
+    # symbol exists in any of them. Every wrapper reaches the per-instance
+    # bridge method that resolves an issuer's DID document before any signature
+    # check (GitHub issue #2335 finding 2).
     ("Identity", "verify_attestation"): {
         "python": ["verify_identity_link_attestation"],
-        "kotlin": ["verifyLinkAttestation"],
+        "typescript": ["identityVerifyLinkAttestation"],
+        "kotlin": ["identityVerifyLinkAttestation", "verifyLinkAttestation"],
+        "swift": ["identityVerifyLinkAttestation", "verifyLinkAttestation"],
     },
     # Outlets streaming control plane (SCP-OUT-038): the grant/cancel methods
     # live on the InvocationHandle returned by the single public invoke() verb,

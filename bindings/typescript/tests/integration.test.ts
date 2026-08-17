@@ -972,7 +972,7 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       );
     });
 
-    it("scp.identityVerifyLinkAttestation declines while it routes to a module-level free fn", async () => {
+    it("scp.identityVerifyLinkAttestation verifies through this instance's resolver", async () => {
       const identity = await scp.identityCreate("in_memory");
       const attestationJson = await scp.identityCreateLinkAttestation(
         identity.did,
@@ -984,23 +984,54 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // GitHub issue #2335 finding 2: spec §3.5.4 step 1 resolves an issuer's
       // DID document and takes a signing key from it, so a key a caller
       // supplies is an assertion to check rather than a source of truth.
-      // Checking it needs a per-instance DID resolver, and a module-level NAPI
-      // free fn reaches no bridge instance (phase D, #1695, deleted every
-      // process-wide default bridge instance). That free fn therefore declines
-      // with SCP-IDENT-1060, and this SCP method still routes to it.
+      // Checking it needs a per-instance DID resolver, so this SCP method
+      // routes to the NAPI `Scp` class method rather than to a module-level
+      // free fn, which reaches no bridge instance and declines with
+      // SCP-IDENT-1060.
       //
-      // A per-instance route already exists: the NAPI `Scp` class exports
-      // `identityVerifyLinkAttestation`, and `internal/native.ts` calls it.
-      // Pointing `SCP.identityVerifyLinkAttestation` at that route needs an
-      // edit to bindings/typescript/src/scp.ts.
+      // An all-zero key is a key no DID document publishes, so this call
+      // reaches a real §3.5.4 decision rather than the SCP-IDENT-1060 an
+      // instance-less route returns. Whichever way that decision lands —
+      // `false` for an unpublished key, or a raise naming a §3.5.4 condition —
+      // SCP-IDENT-1060 no longer appears.
+      let verifyErr: unknown;
+      let verified: boolean | undefined;
+      try {
+        verified = await scp.identityVerifyLinkAttestation(
+          attestationJson,
+          "00".repeat(32),
+          "confirmed",
+        );
+      } catch (e) {
+        verifyErr = e;
+      }
+      if (verifyErr !== undefined) {
+        expect((verifyErr as Error).message).not.toContain("SCP-IDENT-1060");
+      } else {
+        expect(verified).toBe(false);
+      }
+    });
+
+    it("scp.identityVerifyLinkAttestation rejects an unknown referenceProof value", async () => {
+      const identity = await scp.identityCreate("in_memory");
+      const attestationJson = await scp.identityCreateLinkAttestation(
+        identity.did,
+        "github.com",
+        "dave",
+        "https://example.com/proof-dave",
+        "dns_record",
+      );
+      // A `referenceProof` outside "confirmed" and "not_fetched" selects no
+      // default: one shared parser in scp-ffi-common raises SCP-IDENT-1044,
+      // so a typo never lands a caller on a silent "not_fetched" verdict.
       let verifyErr: unknown;
       try {
-        await scp.identityVerifyLinkAttestation(attestationJson, "00".repeat(32));
+        await scp.identityVerifyLinkAttestation(attestationJson, "00".repeat(32), "Confirmed");
       } catch (e) {
         verifyErr = e;
       }
       expect(verifyErr).toBeInstanceOf(Error);
-      expect((verifyErr as Error).message).toContain("SCP-IDENT-1060");
+      expect((verifyErr as Error).message).toContain("SCP-IDENT-1044");
     });
   });
 
