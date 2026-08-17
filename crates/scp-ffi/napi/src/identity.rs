@@ -119,6 +119,30 @@ pub(crate) fn no_pre_rotation_backend() -> ScpNapiError {
     }
 }
 
+/// Maps a shared [`FileCustodyError`] onto this bridge's error type.
+///
+/// An unset environment variable is something the caller sets, so it surfaces
+/// as a validation error naming that variable. A rejected key file is
+/// something the caller restores, so it surfaces as an identity error. The
+/// `PyO3` reference bridge splits its `"file"` path the same way.
+///
+/// [`FileCustodyError`]: scp_ffi_common::custody_file::FileCustodyError
+pub(crate) fn file_custody_error(
+    error: &scp_ffi_common::custody_file::FileCustodyError,
+) -> ScpNapiError {
+    use scp_ffi_common::custody_file::FileCustodyError as E;
+    match error {
+        E::HomeUnset | E::PassphraseUnset => ScpNapiError::Validation {
+            message: error.to_string(),
+            code: codes::VALID_7001.to_owned(),
+        },
+        E::DirectoryCreate { .. } | E::Open { .. } => ScpNapiError::Identity {
+            message: error.to_string(),
+            code: codes::IDENT_1008.to_owned(),
+        },
+    }
+}
+
 /// Builds a [`DidDht`] over the process-shared DHT client, for **minting**
 /// (`create`) and **resolution** alike.
 ///

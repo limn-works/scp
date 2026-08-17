@@ -578,6 +578,22 @@ pub struct FileKeyCustody {
     file_write_lock: StdMutex<()>,
 }
 
+/// Prints the key file's path and nothing else.
+///
+/// A derived `Debug` would print `derived_key` and `mac_key`, which is why
+/// this impl is written by hand: a caller who logs a custody object, or a
+/// bridge whose handle type derives `Debug`, must not thereby write key
+/// material into a log.
+impl std::fmt::Debug for FileKeyCustody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileKeyCustody")
+            .field("path", &self.path)
+            .field("derived_key", &"[redacted]")
+            .field("mac_key", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
 impl FileKeyCustody {
     /// Opens an existing key file or creates a new one at `path`.
     ///
@@ -765,16 +781,46 @@ impl FileKeyCustody {
     }
 
     /// Decrypts a key entry from the file at the given entry index.
+    ///
+    /// Checks `entry_index` against `data` before it slices. A caller reaches
+    /// an out-of-range index whenever the handle map outlives the entry it
+    /// names: an operator restores an older copy of the key file, that copy
+    /// carries a valid HMAC and a smaller entry count, [`verify_file`] accepts
+    /// it, and a handle minted against the longer file then names an entry the
+    /// restored file does not hold. Slicing on that index panics, and AES-GCM
+    /// authentication cannot prevent it because authentication reads the bytes
+    /// the slice already produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::CustodyError`] when `entry_index` names an
+    /// entry outside `data`, and when AES-256-GCM rejects the entry.
     fn decrypt_entry(
         &self,
         data: &[u8],
         entry_index: usize,
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, PlatformError> {
-        let offset = HEADER_SIZE + entry_index * ENTRY_SIZE;
+        let out_of_range = || {
+            PlatformError::CustodyError(format!(
+                "key entry {entry_index} lies outside this key file: the file holds \
+                 {} bytes, which is {} entries — restore the key file this handle was \
+                 minted against",
+                data.len(),
+                data.len().saturating_sub(HEADER_SIZE) / ENTRY_SIZE
+            ))
+        };
+
+        let offset = entry_index
+            .checked_mul(ENTRY_SIZE)
+            .and_then(|entries_len| HEADER_SIZE.checked_add(entries_len))
+            .ok_or_else(out_of_range)?;
         // Skip key_type byte (1 byte).
         let nonce_start = offset + 1;
         let ct_start = nonce_start + NONCE_LEN;
         let ct_end = ct_start + KEY_LEN + TAG_LEN;
+        if ct_end > data.len() {
+            return Err(out_of_range());
+        }
 
         let nonce = Nonce::from_slice(&data[nonce_start..ct_start]);
         let ciphertext_and_tag = &data[ct_start..ct_end];
@@ -804,9 +850,13 @@ impl FileKeyCustody {
     /// Every read path — `sign`, `public_key`, `dh_agree`, `destroy_key`,
     /// `append_entry`, and key import — goes through here, so a writer who
     /// modifies a file between construction and a later call gets detected on
-    /// that call. Authenticating here also keeps every entry-offset slice in
-    /// bounds, because a verified length equals `HEADER_SIZE + count *
-    /// ENTRY_SIZE` exactly.
+    /// that call. A verified length equals `HEADER_SIZE + count * ENTRY_SIZE`
+    /// exactly, so every offset below `count` sits inside the returned bytes.
+    /// That says nothing about an index at or above `count`: an operator who
+    /// restores an older copy of the same key file hands this function a
+    /// shorter file that still carries a valid HMAC, and a handle minted
+    /// against the longer file then names an entry this file does not hold.
+    /// [`Self::decrypt_entry`] range-checks its own index for that reason.
     ///
     /// # Errors
     ///
@@ -1957,6 +2007,58 @@ mod tests {
             custody2.public_key(&rh3).await.unwrap().as_bytes(),
             pk3.as_bytes()
         );
+    }
+
+    /// A handle that outlives the entry it names must produce a typed error,
+    /// not a panic.
+    ///
+    /// An operator reaches this state by restoring an older copy of the key
+    /// file: that copy carries its own valid HMAC and a smaller entry count,
+    /// `verify_file` accepts it, and a handle minted against the longer file
+    /// then names an entry the restored file does not hold. `decrypt_entry`
+    /// sliced on that index before it range-checked, so the slice panicked
+    /// inside a library call. AES-GCM authentication cannot prevent that,
+    /// because authentication reads bytes the slice already produced.
+    #[tokio::test]
+    async fn read_of_a_handle_beyond_a_restored_shorter_file_errors_rather_than_panics() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.scp");
+        let passphrase = "rollback-passphrase";
+
+        // One key, then a snapshot of the file holding exactly that one key.
+        let custody = FileKeyCustody::new(&path, passphrase).unwrap();
+        let first = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let one_entry_snapshot = std::fs::read(&path).unwrap();
+
+        // A second key, whose handle names entry index 1.
+        let second = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        custody
+            .public_key(&second)
+            .await
+            .expect("the second key reads back before the rollback");
+
+        // Restore the snapshot. It authenticates: its HMAC covers its own
+        // one-entry body, so `verify_file` accepts it.
+        std::fs::write(&path, &one_entry_snapshot).unwrap();
+
+        let error = custody
+            .public_key(&second)
+            .await
+            .expect_err("a handle naming an entry the restored file lacks must error");
+        let PlatformError::CustodyError(message) = error else {
+            panic!("an out-of-range entry must surface as CustodyError");
+        };
+        assert!(
+            message.contains("lies outside this key file"),
+            "the error must name the out-of-range entry: {message}"
+        );
+
+        // The entry the restored file does hold still reads back, so the
+        // range check rejects one handle rather than the whole file.
+        custody
+            .public_key(&first)
+            .await
+            .expect("the surviving entry still decrypts after the rollback");
     }
 
     /// Importing the same Ed25519 seed twice must return the existing

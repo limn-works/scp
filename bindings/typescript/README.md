@@ -14,6 +14,14 @@ bun add @limn-works/scp-ts
 
 ## Quick Start
 
+Set `SCP_KEY_PASSPHRASE` before you run this. `"file"` custody protects
+`$HOME/.scp/keys.bin` with that passphrase and reads it from the environment;
+without it `identityCreate` throws `ValidationError`.
+
+```bash
+export SCP_KEY_PASSPHRASE='a passphrase you keep'
+```
+
 ```typescript
 import { SCP } from "@limn-works/scp-ts";
 
@@ -23,14 +31,20 @@ const scp = new SCP({ storage: { type: "in_memory" } });
 
 // Create a cryptographic identity (DID). Name a custody backend too —
 // `identityCreate` has no default either (spec §17.17.1, SCP-CAPSEL-8000).
-const identity = await scp.identityCreate("platform");
+// `"file"` encrypts $HOME/.scp/keys.bin under SCP_KEY_PASSPHRASE (Argon2id +
+// AES-256-GCM, spec §17.8), so this process owns its keys with no injected
+// provider. `"platform"` and `"software"` instead require a
+// KeyCustodyProvider you wire through `identityCreateWithCustody`.
+const identity = await scp.identityCreate("file");
 console.log(`DID: ${identity.did}`);
 
-// Create an encrypted context.
+// Create an encrypted context. The ceiling bounds every capability any member
+// of this context can ever hold, so it must carry `context:close` for the
+// `contextClose` call below to pass its capability check.
 const ctx = await scp.contextCreate(
   identity,
   JSON.stringify({
-    ceiling: ["messages:read", "messages:write"],
+    ceiling: ["messages:read", "messages:write", "context:close"],
     memoryScope: "ephemeral",
     governance: "single_admin",
     ttl: 3600,
@@ -45,14 +59,43 @@ await scp.contextSend(
   null,
 );
 
-// Receive messages on a subscription callback.
-await scp.contextSubscribe(ctx._rawHandle, identity.did, (msg) => {
-  console.log(msg);
-});
-
 await scp.contextClose(ctx._rawHandle, identity.did);
 await scp.shutdown(5);
 ```
+
+Receiving messages needs a relay, because a subscription reads what a relay
+holds. Call `transportConnect` before `contextSubscribe`, or
+`contextSubscribe` throws `TransportError` with `SCP-TRANS-5010`:
+
+```typescript
+await scp.transportConnect("ws://127.0.0.1:9000");
+await scp.contextSubscribe(ctx._rawHandle, identity.did, (msg) => {
+  console.log(msg);
+});
+```
+
+### One call this SDK answers closed today
+
+`identityCreate` commits a pre-rotation commitment at creation, which spec
+§9.7.4.1 §3 makes mandatory. No production `PreRotationCustody` backend exists
+yet, so an addon published from npm answers every `identityCreate` call —
+whichever custody you name — with:
+
+```
+[SCP-IDENT-1059] no production pre-rotation custody backend available
+```
+
+That is the protocol failing closed rather than minting a test-only stand-in
+(`.docs/adrs/ADR-062-capability-injection.md` §Decision 6). Issue #1729 and RFC
+#2130 track the real backend. To run the quick start above before that backend
+lands, build the addon from source with the `testing` feature:
+
+```bash
+cargo build -p scp-ffi-napi --release --features testing
+```
+
+`tests/readme-quickstart.test.ts` runs the block above verbatim, so this README
+stops drifting from what runs.
 
 ## Runtime Support
 

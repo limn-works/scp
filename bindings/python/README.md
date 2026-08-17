@@ -12,6 +12,14 @@ pip install scp-python
 
 ## Quick Start
 
+Set `SCP_KEY_PASSPHRASE` before you run this. `CustodyType.FILE` protects
+`$HOME/.scp/keys.bin` with that passphrase and reads it from the environment;
+without it `identity_create` raises `ValidationError`.
+
+```sh
+export SCP_KEY_PASSPHRASE='a passphrase you keep'
+```
+
 ```python
 import asyncio
 
@@ -25,17 +33,21 @@ async def main():
 
     # Create a cryptographic identity (DID). Name a custody backend too —
     # `identity_create` has no default either (spec §17.17.1,
-    # SCP-CAPSEL-8000). `CustodyType.FILE` stores keys encrypted at rest.
+    # SCP-CAPSEL-8000). `CustodyType.FILE` encrypts $HOME/.scp/keys.bin under
+    # SCP_KEY_PASSPHRASE (Argon2id + AES-256-GCM, spec §17.8).
     identity = await scp.identity_create(CustodyType.FILE)
     print(f"DID: {identity.did}")
 
-    # Create an encrypted context.
+    # Create an encrypted context. The ceiling bounds every capability any
+    # member of this context can ever hold, so it must carry `context:close`
+    # for the `context_close` call below to pass its capability check.
     ctx = await scp.context_create(
         identity.did,
         {
             "ceiling": [
                 Capability.MESSAGES_READ.value,
                 Capability.MESSAGES_WRITE.value,
+                Capability.CONTEXT_CLOSE.value,
             ],
             "memory_scope": MemoryScope.EPHEMERAL.value,
             "ttl": 3600,
@@ -51,6 +63,30 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### One call this SDK answers closed today
+
+`identity_create` commits a pre-rotation commitment at creation, which spec
+§9.7.4.1 §3 makes mandatory. No production `PreRotationCustody` backend exists
+yet, so a wheel published from PyPI answers every `identity_create` call —
+whichever custody you name — with:
+
+```
+[SCP-IDENT-1059] no production pre-rotation custody backend available
+```
+
+That is the protocol failing closed rather than minting a test-only stand-in
+(`.docs/adrs/ADR-062-capability-injection.md` §Decision 6). Issue #1729 and RFC
+#2130 track the real backend. To run the quick start above before that backend
+lands, build this SDK from source with the `testing` feature:
+
+```sh
+cd bindings/python
+maturin develop --features scp-core/testing,testing
+```
+
+`tests/test_readme_quickstart.py` runs the block above verbatim, so this README
+stops drifting from what runs.
 
 ## Requirements
 

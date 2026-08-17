@@ -32,12 +32,23 @@ testing = [
     "scp-dht/testing",
     "scp-node?/testing",
 ]
-# Shared callback-custody byte/string parsing helpers (custody_parse module).
-# Requires only scp-platform for the typed return values (KeyHandle,
-# PseudonymKeypair, PublicKey, PlatformError). Deliberately NOT folded into
-# `resolvers`: these are pure byte/string ops far lighter than the resolver
-# stack.
-custody = ["dep:scp-platform"]
+# Shared callback-custody byte/string parsing helpers (custody_parse module)
+# plus the shared `"file"` custody opener (custody_file module). Requires
+# scp-platform for the typed return values (KeyHandle, PseudonymKeypair,
+# PublicKey, PlatformError) and for `FileKeyCustody` itself, which
+# `scp-platform/file` compiles. `file` is a real production key backend
+# (Argon2id + AES-256-GCM, spec §17.8), not a nullifier: it is what a desktop
+# or server process uses where no platform key store exists. Deliberately NOT
+# folded into `resolvers`: the parsing helpers are pure byte/string ops far
+# lighter than the resolver stack.
+#
+# `scp-platform?/file` uses the `?` form deliberately: the plain
+# `scp-platform/file` form makes Cargo mint an implicit feature literally named
+# `scp-platform`, which the ADR-062 §Decision 6 prove-absence gate reads as a
+# non-allowlisted feature on a shipped artifact. `dep:scp-platform` on the same
+# line already enables the dependency, so `?` adds `file` without minting that
+# name.
+custody = ["dep:scp-platform", "scp-platform?/file"]
 # Shared relay/node startup code for FFI bridges that need to spawn servers.
 # Requires scp-transport (relay), scp-node (application node), scp-platform, and
 # tokio. Storage uses the durability-only in-memory-storage feature of

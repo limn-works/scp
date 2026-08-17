@@ -203,10 +203,11 @@ function parseGovernanceActionResult(raw: string): GovernanceActionResult {
 function requireCustodySelection(custody: unknown): void {
   if (typeof custody !== "string" || custody.trim() === "") {
     throw new IdentityError(
-      'custody selection is required: pass "platform" or "software" and wire a ' +
-        "KeyCustodyProvider through SCP.identityCreateWithCustody, or pass " +
-        '"in_memory" on a build carrying a testing feature. There is no ' +
-        "default custody backend.",
+      'custody selection is required: pass "file" to hold keys in an encrypted ' +
+        "file this process owns ($HOME/.scp/keys.bin under SCP_KEY_PASSPHRASE), " +
+        'pass "platform" or "software" and wire a KeyCustodyProvider through ' +
+        'SCP.identityCreateWithCustody, or pass "in_memory" on a build carrying ' +
+        "a testing feature. There is no default custody backend.",
       "SCP-IDENT-1060",
     );
   }

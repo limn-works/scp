@@ -518,6 +518,93 @@ impl Scp {
                 }
                 .into())
             }
+            // Encrypted file-backed custody, matching the `PyO3` reference
+            // bridge's `"file"` path: a Node process on a desktop or a server
+            // holds its own keys in `$HOME/.scp/keys.bin` under
+            // `SCP_KEY_PASSPHRASE` (Argon2id + AES-256-GCM, spec §17.8).
+            // Unlike `"platform"`, this needs no injected provider, which is
+            // what makes it reachable from a quick start.
+            "file" => {
+                if testing_seed_bytes.is_some() {
+                    return Err(NapiError::from(ScpNapiError::Validation {
+                        message: "`testing_seed` parameter is only valid for custody=\"in_memory\""
+                            .to_owned(),
+                        code: codes::VALID_7009.to_owned(),
+                    }));
+                }
+                // Open the key file first, so a caller who set no
+                // `SCP_KEY_PASSPHRASE` reads that rather than a pre-rotation
+                // message they cannot act on. The `PyO3` reference bridge
+                // orders its `"file"` path the same way.
+                let file_custody = scp_ffi_common::custody_file::open_default_file_custody()
+                    .map_err(|e| NapiError::from(crate::identity::file_custody_error(&e)))?;
+                let key_custody =
+                    Arc::new(crate::custody::NapiKeyCustody::File(Box::new(file_custody)));
+
+                // Pre-rotation is mandatory at creation (spec §9.7.4.1 §3),
+                // and the only `PreRotationCustody` implementation is the
+                // test-harness nullifier, so a shipped build fails closed here
+                // rather than minting it (ADR-062 §Decision 6). The `PyO3`
+                // reference bridge answers its `"file"` path the same way.
+                #[cfg(not(feature = "testing"))]
+                {
+                    let _ = key_custody;
+                    Err(NapiError::from(crate::identity::no_pre_rotation_backend()))
+                }
+
+                #[cfg(feature = "testing")]
+                {
+                    let pre_rotation_custody =
+                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                    let dht = crate::identity::shared_did_method()?;
+                    let (scp_identity, document, pre_rotation_handle) = dht
+                        .create(&*key_custody, pre_rotation_custody.as_ref())
+                        .await
+                        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+                    let verifying_key_hex = crate::identity::identity_verifying_key_hex(
+                        &key_custody,
+                        &scp_identity.identity_key,
+                    )
+                    .await;
+
+                    crate::runtime::register_identity(
+                        bi,
+                        &scp_identity.did,
+                        crate::runtime::NapiIdentityEntry {
+                            identity: scp_identity.clone(),
+                            custody: Arc::clone(&key_custody),
+                            document: document.clone(),
+                            identity_link_attestations: Vec::new(),
+                            pre_rotation_handle,
+                            pre_rotation_custody,
+                        },
+                    );
+
+                    crate::identity::publish_to_shared_dht_for(
+                        &scp_identity,
+                        &document,
+                        &key_custody,
+                    )
+                    .await;
+
+                    let handle = crate::identity::NapiIdentity {
+                        inner: Arc::new(NapiIdentityInner {
+                            did: scp_identity.did.clone(),
+                            custody_type: "file".to_owned(),
+                            scp_identity: Some(scp_identity),
+                            in_memory_custody: Some(key_custody),
+                            document: Some(document),
+                            bi: Arc::clone(&self.inner),
+                            verifying_key_hex,
+                            instance_id: bi.instance_id(),
+                            rotation_event_json: None,
+                        }),
+                    };
+                    crate::increment_handle_count();
+                    Ok(handle)
+                }
+            }
             "platform" | "software" => {
                 if testing_seed_bytes.is_some() {
                     return Err(NapiError::from(ScpNapiError::Validation {
@@ -531,7 +618,8 @@ impl Scp {
                         "custody type {custody:?} requires a wired platform \
                          KeyCustodyProvider — use the KeyCustodyProvider callback \
                          interface to inject Secure Enclave (iOS) or Android \
-                         Keystore (Android) backed custody"
+                         Keystore (Android) backed custody, or name \"file\" custody \
+                         to hold keys in an encrypted file this process owns"
                     ),
                     code: codes::IDENT_1003.to_owned(),
                 }
