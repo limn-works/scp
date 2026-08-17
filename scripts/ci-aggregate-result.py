@@ -25,8 +25,10 @@ Inputs:
 Exit 0: every dependency that was supposed to run reported success.
 Exit 1: a dependency failed, was cancelled, or skipped when it was supposed to
         run; or a workflow and this aggregate disagree about a job list.
-Exit 2: a workflow carries an `if:` expression this evaluator cannot read.
-        Teach this evaluator that construct — do NOT silence a job.
+Exit 2: a workflow carries an `if:` expression this evaluator cannot read, or
+        that expression names a `changes` output that job never published.
+        Teach this evaluator a new construct, or correct a stale output name —
+        do NOT silence a job.
 """
 
 from __future__ import annotations
@@ -62,7 +64,16 @@ def resolve_operand(token: str, outputs: dict[str, str], event_name: str) -> str
         return event_name
     prefix = "needs.changes.outputs."
     if token.startswith(prefix):
-        return str(outputs.get(token[len(prefix) :], ""))
+        key = token[len(prefix) :]
+        if key not in outputs:
+            # A missing key is a typo or a renamed filter, and returning ""
+            # for it would compare unequal to every literal, which silently
+            # holds a job at `skipped` under a green aggregate forever.
+            raise Unreadable(
+                f"filter output {key!r}, which `{FILTER_JOB}` did not publish "
+                f"(it published {sorted(outputs)})"
+            )
+        return str(outputs[key])
     raise Unreadable(f"operand {token!r}")
 
 
@@ -154,8 +165,10 @@ def main() -> int:
         except Unreadable as unreadable:
             print(
                 f"::error::{job_id}: this gate cannot read its `if:` condition ({unreadable}). "
-                "Add that construct to scripts/ci-aggregate-result.py — a condition this gate "
-                "cannot read is a job whose skip it cannot judge."
+                "A condition this gate cannot read is a job whose skip it cannot judge, so "
+                "either teach scripts/ci-aggregate-result.py a construct it does not implement, "
+                f"or correct a `{FILTER_JOB}` output name this condition names and that job "
+                "does not publish."
             )
             return 2
         if result in ("failure", "cancelled"):

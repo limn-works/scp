@@ -1553,10 +1553,14 @@ jobs:
   # ── CI workflow self-test ───────────────────────────────────────────
   # A `ci` gate below decides every merge, so logic deciding it gets its own
   # tests. scripts/tests/ci-gate/run-tests.sh feeds synthetic dependency
-  # results to scripts/ci-aggregate-result.py and asserts each verdict, and it
-  # asserts two structural properties of this workflow that no single run
-  # can demonstrate: every job carries a timeout-minutes, and every job is a
-  # dependency of `ci`.
+  # results to scripts/ci-aggregate-result.py and asserts each verdict against
+  # a table of its own naming which jobs a scenario selects, never against that
+  # script's reading of an `if:` condition. It also asserts four structural
+  # properties of these workflows that no single run can demonstrate: every job
+  # carries a timeout-minutes, every job is a dependency of `ci`, every
+  # `dtolnay/rust-toolchain` step names a ref that action publishes, and an
+  # `if:` naming a filter output `changes` never published stops that gate
+  # rather than holding a job at `skipped`.
   ci-workflow-selftest:
     needs: check-draft
     name: CI workflow / self-test

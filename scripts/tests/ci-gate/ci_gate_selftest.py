@@ -21,13 +21,25 @@ nothing:
                `-max_total_time`, so an operator sets how long they run. A
                budget fixed above a scheduled run cancelled every dispatch
                asking for longer, killing a run that previously completed.
+  filter-key   An aggregate read an absent `needs.changes.outputs.<key>` as "",
+               which compares unequal to every literal, so one renamed filter
+               held a job at `skipped` forever under a green required check.
+  action-ref   fuzz.yml named `dtolnay/rust-toolchain@nightly-2026-05-03`, a
+               ref that action's repository does not publish, so every
+               scheduled fuzz run failed in about six seconds and every timeout
+               budget this file checks on that workflow guarded nothing.
+
+Assertions over an aggregate's verdict read which jobs a scenario selects out
+of SCENARIOS below, never out of the aggregate itself. Six of them once built
+that expectation by calling `evaluate` in scripts/ci-aggregate-result.py, the
+same function whose verdict they then judged, so each one agreed with that
+function however it behaved.
 
 Run: python3 scripts/tests/ci-gate/ci_gate_selftest.py
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import re
@@ -35,6 +47,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 
@@ -99,6 +112,111 @@ VALUE_FLAGS = {
     "--filter-expr",
     "--filterset",
     "-P",
+}
+
+# CRITERION: a `uses:` ref names a branch or a tag that action's own repository
+# publishes. A ref naming anything else fails a run in about six seconds with
+# "Unable to resolve action", and a job that never starts enforces nothing.
+#
+# dtolnay/rust-toolchain publishes seven named branches and one tag per
+# released Rust version (`git ls-remote --heads --tags
+# https://github.com/dtolnay/rust-toolchain`, read 2026-08-16). It takes a
+# date-pinned nightly through `with: toolchain:`, never through its ref, so
+# `@nightly-2026-05-03` resolves to nothing.
+TOOLCHAIN_ACTION = "dtolnay/rust-toolchain"
+TOOLCHAIN_REFS = {"stable", "beta", "nightly", "master", "clippy", "miri", "comment"}
+TOOLCHAIN_VERSION_TAG = re.compile(r"^1\.\d+(\.\d+)?$")
+
+# A date-pinned nightly names a toolchain no other date matches, so two
+# workflows pinning two different dates compile the fuzz crate against two
+# compilers — and a build check passing under one says nothing about a fuzz run
+# under the other.
+DATE_PINNED_NIGHTLY = re.compile(r"^nightly-\d{4}-\d{2}-\d{2}$")
+
+# Names a filter output out of an `if:` expression, so a check below can drop
+# one published output and watch an aggregate refuse to guess at it.
+FILTER_REFERENCE = re.compile(r"needs\.changes\.outputs\.([\w-]+)")
+
+
+class Scenario(NamedTuple):
+    """One set of `changes` filter outputs, one event, and what each runs."""
+
+    name: str
+    filters: dict[str, str]
+    event: str
+    runs: dict[str, bool]
+
+
+# CRITERION: SCENARIOS below, and nothing in scripts/ci-aggregate-result.py,
+# states which jobs a scenario selects. `runs` answers that question for every
+# job ci.yml gives an `if:` condition; a job carrying no `if:` condition always
+# runs, which main() reads out of ci.yml rather than restating here. A check in
+# main() requires each scenario's `runs` to name exactly whichever jobs carry an
+# `if:` condition, so adding a conditional job to ci.yml fails this self-test
+# until someone records that job's answer.
+RUST_ONLY = {
+    "rust": "true",
+    "python": "false",
+    "typescript": "false",
+    "typescript-wasm": "false",
+    "scaffold-typescript-web": "false",
+    "kotlin": "false",
+    "swift": "false",
+    "fuzz": "false",
+}
+DOCS_ONLY = dict.fromkeys(RUST_ONLY, "false")
+
+# Jobs a `changes` filter output selects. cross-layer reads an event rather
+# than a filter, so each scenario states cross-layer for itself.
+RUST_ONLY_RUNS = {
+    "bridge-parity": True,
+    "bridge-parity-kotlin": True,
+    "bridge-parity-swift": True,
+    "fuzz-build": False,
+    "kotlin-lint": False,
+    "kotlin-test": True,
+    "python-lint": False,
+    "python-test": True,
+    "rust-build-pyo3-production": True,
+    "rust-build-uniffi-production": True,
+    "rust-clippy": True,
+    "rust-deny": True,
+    "rust-doc": True,
+    "rust-fmt": True,
+    "rust-test-napi-production": True,
+    "scaffold-typescript-web-check": False,
+    "swift-build-test": True,
+    "swift-lint": False,
+    "typescript-check": True,
+    "typescript-wasm-check": False,
+}
+DOCS_ONLY_RUNS = dict.fromkeys(RUST_ONLY_RUNS, False)
+
+SCENARIOS = {
+    "rust-only, pull_request": Scenario(
+        name="rust-only, pull_request",
+        filters=RUST_ONLY,
+        event="pull_request",
+        runs=RUST_ONLY_RUNS | {"cross-layer": True},
+    ),
+    "docs-only, pull_request": Scenario(
+        name="docs-only, pull_request",
+        filters=DOCS_ONLY,
+        event="pull_request",
+        runs=DOCS_ONLY_RUNS | {"cross-layer": True},
+    ),
+    "docs-only, push": Scenario(
+        name="docs-only, push",
+        filters=DOCS_ONLY,
+        event="push",
+        runs=DOCS_ONLY_RUNS | {"cross-layer": False},
+    ),
+    "rust-only, merge_group": Scenario(
+        name="rust-only, merge_group",
+        filters=RUST_ONLY,
+        event="merge_group",
+        runs=RUST_ONLY_RUNS | {"cross-layer": False},
+    ),
 }
 
 failures: list[str] = []
@@ -230,13 +348,6 @@ def check_scaling_input_sizes_budget(label, job, budget) -> None:
         )
 
 
-def load_aggregate():
-    spec = importlib.util.spec_from_file_location("ci_aggregate_result", AGGREGATE)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def run_aggregate(needs: dict, event_name: str) -> tuple[int, str]:
     env = dict(os.environ, NEEDS_JSON=json.dumps(needs), GITHUB_EVENT_NAME=event_name)
     proc = subprocess.run(
@@ -250,41 +361,92 @@ def run_aggregate(needs: dict, event_name: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
-def build_needs(
-    jobs: dict, outputs: dict[str, str], event_name: str, aggregate
-) -> dict:
-    """Every dependency reports whatever result its own `if:` condition implies."""
+def build_needs(jobs: dict, scenario: Scenario) -> dict:
+    """Report a result per dependency, taking SCENARIOS as ground truth.
+
+    A job carrying an `if:` condition reports `success` when this scenario's
+    `runs` says that condition selects it, and `skipped` when it says
+    otherwise. A job carrying no `if:` condition always runs, so it reports
+    `success`. Nothing here consults scripts/ci-aggregate-result.py, which is
+    what lets an assertion over that script's verdict fail when that script
+    reads a condition wrongly.
+    """
     needs = {}
     for job_id in set(jobs) - {"ci"}:
         if job_id == "check-draft":
             needs[job_id] = {"result": "success"}
             continue
         if job_id == "changes":
-            needs[job_id] = {"result": "success", "outputs": outputs}
+            needs[job_id] = {"result": "success", "outputs": scenario.filters}
             continue
-        condition = jobs[job_id].get("if")
-        runs = (
-            True
-            if condition is None
-            else aggregate.evaluate(str(condition), outputs, event_name)
-        )
+        runs = scenario.runs.get(job_id, True)
         needs[job_id] = {"result": "success" if runs else "skipped"}
     return needs
+
+
+def check_scenario_table_covers(jobs: dict) -> None:
+    """Each scenario answers for exactly whichever jobs carry an `if:`."""
+    conditional = {
+        job_id
+        for job_id, job in jobs.items()
+        if job.get("if") is not None and job_id not in ("ci", "changes", "check-draft")
+    }
+    for scenario in SCENARIOS.values():
+        check(
+            f"{scenario.name} answers for every conditional job",
+            set(scenario.runs) == conditional,
+            f"unanswered {sorted(conditional - set(scenario.runs))}, "
+            f"unknown {sorted(set(scenario.runs) - conditional)}",
+        )
+
+
+def check_toolchain_refs(path: Path, doc: dict) -> None:
+    """Every rust-toolchain `uses:` names a ref that action publishes."""
+    for job_id, job in sorted(doc["jobs"].items()):
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            uses = step.get("uses") or ""
+            if not uses.startswith(f"{TOOLCHAIN_ACTION}@"):
+                continue
+            ref = uses.split("@", 1)[1]
+            check(
+                f"{path.name}:{job_id} names a published {TOOLCHAIN_ACTION} ref",
+                ref in TOOLCHAIN_REFS or bool(TOOLCHAIN_VERSION_TAG.match(ref)),
+                f"{uses} — that repository publishes {sorted(TOOLCHAIN_REFS)} and a tag "
+                f"per released Rust version; pass a date-pinned nightly through "
+                f"`with: toolchain:` on `@master` instead",
+            )
+
+
+def collect_pinned_nightlies(doc: dict) -> set[str]:
+    """Return every date-pinned nightly a workflow's steps request."""
+    pinned = set()
+    for job in doc["jobs"].values():
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            requested = str((step.get("with") or {}).get("toolchain", ""))
+            if DATE_PINNED_NIGHTLY.match(requested):
+                pinned.add(requested)
+    return pinned
 
 
 def main() -> int:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     jobs = workflow["jobs"]
-    aggregate = load_aggregate()
+    documents = [
+        (path, yaml.safe_load(path.read_text()))
+        for path in sorted((REPO / ".github/workflows").glob("*.yml"))
+    ]
 
     print("timeout — every job in every workflow bounds its own runtime")
-    for path in sorted((REPO / ".github/workflows").glob("*.yml")):
+    for path, doc in documents:
         ceiling = (
             MAX_TIMEOUT_MINUTES
             if path == WORKFLOW
             else MAX_TIMEOUT_MINUTES_OTHER_WORKFLOWS
         )
-        doc = yaml.safe_load(path.read_text())
         dispatch_inputs = dispatch_input_specs(doc)
         for job_id, job in sorted(doc["jobs"].items()):
             if "uses" in job:
@@ -303,6 +465,23 @@ def main() -> int:
                 )
             check_scaling_input_sizes_budget(label, job, budget)
 
+    print("action-ref — every rust-toolchain `uses:` names a ref that resolves")
+    for path, doc in documents:
+        check_toolchain_refs(path, doc)
+    requested = {
+        name: pinned
+        for name, pinned in (
+            (path.name, collect_pinned_nightlies(doc)) for path, doc in documents
+        )
+        if pinned
+    }
+    check(
+        "every workflow pinning a nightly by date pins one date",
+        len({date for pinned in requested.values() for date in pinned}) <= 1,
+        f"{requested} — a fuzz build check under one nightly says nothing about a "
+        f"fuzz run under another",
+    )
+
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
     declared = set(jobs["ci"]["needs"])
@@ -310,6 +489,16 @@ def main() -> int:
         "`ci` depends on every job a workflow defines",
         defined == declared,
         f"missing {sorted(defined - declared)}, unknown {sorted(declared - defined)}",
+    )
+    check_scenario_table_covers(jobs)
+    check(
+        "every scenario supplies whichever filter outputs `changes` publishes",
+        all(
+            set(scenario.filters) == set(jobs["changes"]["outputs"])
+            for scenario in SCENARIOS.values()
+        ),
+        f"`changes` publishes {sorted(jobs['changes']['outputs'])}, scenarios supply "
+        f"{sorted(RUST_ONLY)}",
     )
 
     print(
@@ -336,118 +525,143 @@ def main() -> int:
                         "when a selection is empty",
                     )
 
-    rust_only = {
-        "rust": "true",
-        "python": "false",
-        "typescript": "false",
-        "typescript-wasm": "false",
-        "scaffold-typescript-web": "false",
-        "kotlin": "false",
-        "swift": "false",
-        "fuzz": "false",
-    }
-    docs_only = dict.fromkeys(rust_only, "false")
+    rust_pr = SCENARIOS["rust-only, pull_request"]
+    docs_pr = SCENARIOS["docs-only, pull_request"]
+    docs_push = SCENARIOS["docs-only, push"]
+    rust_merge = SCENARIOS["rust-only, merge_group"]
 
     print("rust-fanout — a Rust-only change runs binding test jobs")
+    # SCENARIOS says each job below runs on a Rust-only change, so reporting it
+    # `skipped` must reach an aggregate as one named failure. Narrowing that
+    # job's `if:` in ci.yml back to its own binding directory makes an aggregate
+    # accept that skip, which drops this assertion's exit code to 0.
     for job_id in (
         "python-test",
         "typescript-check",
         "kotlin-test",
         "swift-build-test",
     ):
-        condition = str(jobs[job_id].get("if"))
+        needs = build_needs(jobs, rust_pr)
+        needs[job_id]["result"] = "skipped"
+        code, out = run_aggregate(needs, rust_pr.event)
         check(
-            f"{job_id} runs when only crates/ changed",
-            aggregate.evaluate(condition, rust_only, "pull_request"),
-            f"if: {condition}",
+            f"{job_id} skipped on a Rust-only change -> exit 1 naming it",
+            code == 1 and job_id in out,
+            out,
         )
 
     print("skip — an aggregate separates a skipped dependency from a passing one")
 
-    needs = build_needs(jobs, rust_only, "pull_request", aggregate)
-    code, out = run_aggregate(needs, "pull_request")
+    needs = build_needs(jobs, rust_pr)
+    code, out = run_aggregate(needs, rust_pr.event)
     check("Rust-only change, every selected job passed -> exit 0", code == 0, out)
 
-    needs = build_needs(jobs, rust_only, "pull_request", aggregate)
-    for job_id in (
-        "python-test",
-        "typescript-check",
-        "kotlin-test",
-        "swift-build-test",
-    ):
-        needs[job_id]["result"] = "skipped"
-    code, out = run_aggregate(needs, "pull_request")
-    check("Rust-only change, four binding jobs skipped -> exit 1", code == 1, out)
-    for job_id in (
-        "python-test",
-        "typescript-check",
-        "kotlin-test",
-        "swift-build-test",
-    ):
-        check(f"  and a failure names {job_id}", job_id in out, out)
-
-    needs = build_needs(jobs, docs_only, "pull_request", aggregate)
-    code, out = run_aggregate(needs, "pull_request")
+    needs = build_needs(jobs, docs_pr)
+    code, out = run_aggregate(needs, docs_pr.event)
     check("docs-only change, filtered jobs skipped -> exit 0", code == 0, out)
 
-    needs = build_needs(jobs, docs_only, "pull_request", aggregate)
+    needs = build_needs(jobs, docs_pr)
     needs["error-codes"]["result"] = "skipped"
-    code, out = run_aggregate(needs, "pull_request")
+    code, out = run_aggregate(needs, docs_pr.event)
     check("an unconditional job skipped -> exit 1", code == 1, out)
 
-    needs = build_needs(jobs, docs_only, "pull_request", aggregate)
+    needs = build_needs(jobs, docs_pr)
     needs["shipped-feature-graph"]["result"] = "failure"
-    code, out = run_aggregate(needs, "pull_request")
+    code, out = run_aggregate(needs, docs_pr.event)
     check("a job failed -> exit 1", code == 1, out)
 
-    needs = build_needs(jobs, docs_only, "pull_request", aggregate)
+    needs = build_needs(jobs, docs_pr)
     needs["rust-test"]["result"] = "cancelled"
-    code, out = run_aggregate(needs, "pull_request")
+    code, out = run_aggregate(needs, docs_pr.event)
     check("a job was cancelled -> exit 1", code == 1, out)
 
-    needs = build_needs(jobs, rust_only, "pull_request", aggregate)
+    # A job whose condition did not select it still ran, and still failed. Both
+    # assertions below name a job SCENARIOS says a docs-only change skips, so
+    # only an aggregate's `failure`/`cancelled` branch can reject them — the
+    # branch judging a selected job cannot.
+    needs = build_needs(jobs, docs_pr)
+    needs["python-test"]["result"] = "failure"
+    code, out = run_aggregate(needs, docs_pr.event)
+    check("an unselected job failed -> exit 1", code == 1 and "python-test" in out, out)
+
+    needs = build_needs(jobs, docs_pr)
+    needs["python-test"]["result"] = "cancelled"
+    code, out = run_aggregate(needs, docs_pr.event)
+    check(
+        "an unselected job was cancelled -> exit 1",
+        code == 1 and "python-test" in out,
+        out,
+    )
+
+    needs = build_needs(jobs, rust_pr)
     needs["changes"] = {"result": "failure", "outputs": {}}
     for job_id in ("rust-clippy", "rust-fmt", "python-test", "typescript-check"):
         needs[job_id]["result"] = "skipped"
-    code, out = run_aggregate(needs, "pull_request")
+    code, out = run_aggregate(needs, rust_pr.event)
     check("a filter job failed and its dependants skipped -> exit 1", code == 1, out)
 
-    needs = build_needs(jobs, docs_only, "push", aggregate)
-    code, out = run_aggregate(needs, "push")
+    needs = build_needs(jobs, docs_push)
+    code, out = run_aggregate(needs, docs_push.event)
     check("push event, a pull-request-only job skipped -> exit 0", code == 0, out)
 
     # merge_group names whichever event a merge queue runs, so it gates every
     # merge. cross-layer skips there because it diffs against a pull request's
     # base branch, and no other job may.
-    needs = build_needs(jobs, rust_only, "merge_group", aggregate)
-    code, out = run_aggregate(needs, "merge_group")
+    needs = build_needs(jobs, rust_merge)
+    code, out = run_aggregate(needs, rust_merge.event)
     check("merge_group event, a Rust change -> exit 0", code == 0, out)
 
-    needs = build_needs(jobs, rust_only, "merge_group", aggregate)
+    needs = build_needs(jobs, rust_merge)
     needs["rust-test"]["result"] = "skipped"
-    code, out = run_aggregate(needs, "merge_group")
+    code, out = run_aggregate(needs, rust_merge.event)
     check("merge_group event, a workspace test job skipped -> exit 1", code == 1, out)
 
-    needs = build_needs(jobs, docs_only, "pull_request", aggregate)
+    needs = build_needs(jobs, docs_pr)
     needs["cross-layer"]["result"] = "skipped"
-    code, out = run_aggregate(needs, "pull_request")
+    code, out = run_aggregate(needs, docs_pr.event)
     check(
         "pull_request event, a pull-request-only job skipped -> exit 1",
         code == 1,
         out,
     )
 
-    needs = build_needs(jobs, docs_only, "pull_request", aggregate)
+    needs = build_needs(jobs, docs_pr)
     for entry in needs.values():
         entry["result"] = "skipped"
-    needs["changes"]["outputs"] = docs_only
-    code, out = run_aggregate(needs, "pull_request")
+    needs["changes"]["outputs"] = dict(docs_pr.filters)
+    code, out = run_aggregate(needs, docs_pr.event)
     check("draft pull request, every job skipped -> exit 0", code == 0, out)
 
-    needs = build_needs(jobs, docs_only, "pull_request", aggregate)
+    needs = build_needs(jobs, docs_pr)
     needs.pop("wasm-test")
-    code, out = run_aggregate(needs, "pull_request")
+    code, out = run_aggregate(needs, docs_pr.event)
     check("a job missing from a dependency list -> exit 1", code == 1, out)
+
+    print("filter-key — an `if:` naming an unpublished filter output stops a gate")
+    referenced = {
+        match.group(1)
+        for job in jobs.values()
+        for match in FILTER_REFERENCE.finditer(str(job.get("if") or ""))
+    }
+    check(
+        "every `if:` names a filter output `changes` declares",
+        referenced <= set(jobs["changes"]["outputs"]),
+        f"undeclared {sorted(referenced - set(jobs['changes']['outputs']))}",
+    )
+    # A renamed or misspelled filter leaves `changes` publishing every key but
+    # one. Reading that absent key as "" would compare unequal to 'true', hold
+    # every job whose condition names it at `skipped`, and report exit 0.
+    for key in sorted(referenced & set(rust_pr.filters)):
+        needs = build_needs(jobs, rust_pr)
+        needs["changes"]["outputs"] = {
+            name: value for name, value in rust_pr.filters.items() if name != key
+        }
+        code, out = run_aggregate(needs, rust_pr.event)
+        check(
+            f"`changes` published no {key!r} output -> exit 2",
+            code == 2 and key in out,
+            f"exit {code}: {out}",
+        )
 
     print(f"\n{checks - len(failures)} of {checks} assertions passed")
     if failures:
