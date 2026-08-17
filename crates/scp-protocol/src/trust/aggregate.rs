@@ -88,7 +88,13 @@ pub trait TrustProtocolRepository: Send + Sync {
 
     /// Retrieves the revocation list state for a context.
     ///
-    /// Returns a map of attestation ID to revocation status (true = revoked).
+    /// Returns a map whose key [`revocation_list_key`] builds from an issuer DID
+    /// plus an attestation id, and whose value reports whether that issuer
+    /// revoked that attestation (true = revoked). A caller MUST build every key
+    /// it reads or writes with [`revocation_list_key`]; a bare attestation id is
+    /// not a key, because §7.4.1 of
+    /// `.docs/specs/07-trust-validation-and-capabilities.md` binds
+    /// `Attestation.id` to no issuer.
     ///
     /// # Errors
     ///
@@ -97,7 +103,10 @@ pub trait TrustProtocolRepository: Send + Sync {
 
     /// Stores revocation list state for a context.
     ///
-    /// Replaces the existing revocation state for the context.
+    /// REPLACES the existing revocation state for the context, so a caller uses
+    /// this only when it owns the whole map. A caller that learned about
+    /// individual revocations uses [`add_revocations`](Self::add_revocations)
+    /// instead. Every key in `state` comes from [`revocation_list_key`].
     ///
     /// # Errors
     ///
@@ -107,6 +116,27 @@ pub trait TrustProtocolRepository: Send + Sync {
         context_id: &str,
         state: &HashMap<String, bool>,
     ) -> Result<(), TrustError>;
+
+    /// Marks each key in `keys` revoked for a context, leaving every key this
+    /// call does not name as it was.
+    ///
+    /// Each key comes from [`revocation_list_key`]. Passing an empty slice
+    /// writes nothing.
+    ///
+    /// SECURITY (lost update). An implementation MUST NOT lose a revocation that
+    /// a concurrent caller on the same context recorded. Reading a whole map,
+    /// inserting into a local copy, and writing that copy back does lose one:
+    /// two callers that both read `{}` and then write `{p}` and `{q}` leave one
+    /// of `p` and `q` durable and drop the other, and a dropped revocation means
+    /// a revoked attestation counts again. An implementation therefore either
+    /// holds one lock across its own read and write (which serializes callers
+    /// inside one process only), or writes each key independently so no write
+    /// carries a stale copy of another key (which holds across processes too).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustError`] if the store write fails.
+    fn add_revocations(&self, context_id: &str, keys: &[String]) -> Result<(), TrustError>;
 
     /// Retrieves persisted challenge results for a subject DID within a
     /// context.
@@ -133,28 +163,67 @@ pub trait TrustProtocolRepository: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Revocation list key
+// ---------------------------------------------------------------------------
+
+/// Builds the key under which a context's persisted revocation list records one
+/// issuer's revocation of one attestation id.
+///
+/// SECURITY (cross-issuer suppression, issue #2335 finding 13). §7.4.1 of
+/// `.docs/specs/07-trust-validation-and-capabilities.md` describes
+/// `Attestation.id` as a UUID v4 that an issuer chooses, and states no rule
+/// deriving that id from its issuer, so two issuers can carry one id. A
+/// revocation list keyed on an id alone therefore lets an attacker suppress an
+/// honest issuer's attestation: the attacker mints a fresh DID at no cost
+/// (`IdentityDidPublicKeyResolver` reads a public key out of a DID string, so no
+/// publication gates it), signs an attestation that carries the honest issuer's
+/// id and revokes itself, and a consumer that ingests that record drops every
+/// later copy of the honest issuer's attestation. Keying on issuer DID plus id
+/// confines a revocation to the issuer who signed it.
+///
+/// The issuer's byte length precedes the issuer, so two distinct
+/// `(issuer, attestation_id)` pairs never produce one key: a reader recovers the
+/// issuer boundary from that leading length, and no character a caller embeds in
+/// either field moves that boundary. A separator alone would not hold, because a
+/// caller chooses both an issuer DID and an attestation id and could embed the
+/// separator in either one.
+#[must_use]
+pub fn revocation_list_key(issuer: &DID, attestation_id: &str) -> String {
+    let issuer: &str = issuer.as_ref();
+    format!("{}:{issuer}:{attestation_id}", issuer.len())
+}
+
+// ---------------------------------------------------------------------------
 // RevocationMapChecker
 // ---------------------------------------------------------------------------
 
 /// [`AttestationRevocationChecker`] backed by a context's persisted revocation
-/// list — an `attestation_id -> revoked` map from
-/// [`TrustProtocolRepository::get_revocation_state`].
+/// list — an `issuer + attestation_id -> revoked` map from
+/// [`TrustProtocolRepository::get_revocation_state`], whose keys
+/// [`revocation_list_key`] builds.
 ///
 /// Used by [`AttestationCache::get_verified_attestations`] so the READ path
 /// enforces context revocation, not only the ingest path: a cached attestation
 /// that is later context-revoked is dropped on read (even while still inside its
 /// cache TTL) rather than continuing to inflate trust until TTL expiry.
 struct RevocationMapChecker<'a> {
-    /// `attestation_id -> revoked` for the context.
+    /// `revocation_list_key(issuer, attestation_id) -> revoked` for the context.
     revoked: &'a HashMap<String, bool>,
 }
 
 impl AttestationRevocationChecker for RevocationMapChecker<'_> {
-    fn check_revocation(&self, attestation_id: &str, _issuer: &scp_did::DID) -> Option<u64> {
-        // The list stores only a boolean per id (no timestamp); report `0` as the
-        // revocation time when listed. That value only populates a dropped-entry
-        // log line, not a user-facing field.
-        if self.revoked.get(attestation_id).copied().unwrap_or(false) {
+    fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64> {
+        // The list stores only a boolean per key (no timestamp); report `0` as
+        // the revocation time when listed. That value only populates a
+        // dropped-entry log line, not a user-facing field. The key carries the
+        // issuer, so one issuer's revocation never reaches another issuer's
+        // attestation that carries the same id.
+        if self
+            .revoked
+            .get(&revocation_list_key(issuer, attestation_id))
+            .copied()
+            .unwrap_or(false)
+        {
             Some(0)
         } else {
             None
@@ -752,6 +821,23 @@ mod tests {
             Ok(())
         }
 
+        fn add_revocations(&self, context_id: &str, keys: &[String]) -> Result<(), TrustError> {
+            // One guard covers the lookup and the inserts, so a concurrent
+            // caller on this context cannot drop what this call adds.
+            let mut store = self
+                .revocations
+                .lock()
+                .map_err(|_| TrustError::InvalidEventData {
+                    sequence: 0,
+                    reason: "lock poisoned".to_owned(),
+                })?;
+            let entry = store.entry(context_id.to_owned()).or_default();
+            for key in keys {
+                entry.insert(key.clone(), true);
+            }
+            Ok(())
+        }
+
         fn get_challenge_results(
             &self,
             context_id: &str,
@@ -899,19 +985,20 @@ mod tests {
 
     /// Runs `aggregate_trust_input` for subject `did:key:alice` over a
     /// single-event log and returns the threshold counts it produced, so each
-    /// threshold assertion exercises the shipped caller path. `revoked_ids`
-    /// names the attestation IDs the context has revoked.
+    /// threshold assertion exercises the shipped caller path. Each entry of
+    /// `revoked` names one revocation as `(issuer DID, attestation id)`, which
+    /// is what [`revocation_list_key`] turns into a revocation-list key.
     fn threshold_counts_via_aggregate(
         resolver: &TestResolver,
         requirements: &HashMap<AttestationType, ThresholdRequirement>,
         attestor_sets: &HashMap<AttestationType, Vec<AttestorInfo>>,
-        revoked_ids: &[&str],
+        revoked: &[(&str, &str)],
     ) -> HashMap<AttestationType, (u32, u32)> {
         let store = InMemoryTrustStore::new();
-        if !revoked_ids.is_empty() {
-            let state: HashMap<String, bool> = revoked_ids
+        if !revoked.is_empty() {
+            let state: HashMap<String, bool> = revoked
                 .iter()
-                .map(|id| ((*id).to_owned(), true))
+                .map(|(issuer, id)| (revocation_list_key(&DID::from(*issuer), id), true))
                 .collect();
             store.store_revocation_state("ctx-1", &state).unwrap();
         }
@@ -1110,16 +1197,51 @@ mod tests {
     fn store_persists_and_retrieves_revocation_state() {
         let store = InMemoryTrustStore::new();
 
+        let issuer = DID::from("did:key:issuer");
+        let revoked_key = revocation_list_key(&issuer, "att-1");
+        let active_key = revocation_list_key(&issuer, "att-2");
+
         let mut state = HashMap::new();
-        state.insert("att-1".to_owned(), true);
-        state.insert("att-2".to_owned(), false);
+        state.insert(revoked_key.clone(), true);
+        state.insert(active_key.clone(), false);
 
         store.store_revocation_state("ctx-1", &state).unwrap();
 
         let retrieved = store.get_revocation_state("ctx-1").unwrap();
         assert_eq!(retrieved.len(), 2);
-        assert_eq!(retrieved.get("att-1"), Some(&true));
-        assert_eq!(retrieved.get("att-2"), Some(&false));
+        assert_eq!(retrieved.get(&revoked_key), Some(&true));
+        assert_eq!(retrieved.get(&active_key), Some(&false));
+    }
+
+    /// SECURITY (key injectivity, issue #2335 finding 13). A caller chooses both
+    /// an issuer DID and an attestation id, so a key built from those two fields
+    /// must map distinct pairs to distinct keys. The leading issuer length is
+    /// what delivers that: a caller who embeds the `:` separator in either field
+    /// cannot move the issuer boundary, so it cannot make its own pair collide
+    /// with another issuer's pair and reach that issuer's attestations.
+    #[test]
+    fn revocation_list_keys_separate_issuer_from_attestation_id() {
+        // Embedding the separator inside an id must not reproduce another
+        // issuer's key.
+        let forged = revocation_list_key(&DID::from("did:key:m"), "did:key:h:att-1");
+        let honest = revocation_list_key(&DID::from("did:key:m:did:key:h"), "att-1");
+        assert_ne!(
+            forged, honest,
+            "a separator a caller embeds must not collide two distinct issuer/id pairs"
+        );
+
+        // Same issuer and same id yield one key, so a lookup finds what a write
+        // recorded.
+        assert_eq!(
+            revocation_list_key(&DID::from("did:key:h"), "att-1"),
+            revocation_list_key(&DID::from("did:key:h"), "att-1"),
+        );
+
+        // One id under two issuers yields two keys.
+        assert_ne!(
+            revocation_list_key(&DID::from("did:key:h"), "att-1"),
+            revocation_list_key(&DID::from("did:key:m"), "att-1"),
+        );
     }
 
     #[test]
@@ -1817,10 +1939,51 @@ mod tests {
             &resolver,
             &requirements,
             &attestor_sets,
-            &["att-revoked"],
+            &[("did:key:a", "att-revoked")],
         );
         let (met, _) = counts.get(&AttestationType::Endorsement).unwrap();
         assert_eq!(*met, 0, "a context-revoked endorsement must stop counting");
+    }
+
+    /// SECURITY (issuer-scoped revocation, issue #2335 finding 13, threshold
+    /// path). A revocation that a DIFFERENT issuer signed leaves an endorsement
+    /// counting toward its threshold. §7.4.1 of
+    /// `.docs/specs/07-trust-validation-and-capabilities.md` binds
+    /// `Attestation.id` to no issuer, so a revocation list keyed on an id alone
+    /// would let anyone who learns an id drive an endorsement's threshold count
+    /// to zero by signing a self-revoking attestation carrying that id. The test
+    /// above pins the same-issuer case, so the two together separate scoping
+    /// from a checker that reports nothing.
+    #[test]
+    fn a_foreign_issuers_revocation_leaves_a_threshold_count_intact() {
+        let mut resolver = TestResolver::new();
+        let attestor = signed_attestor(
+            &mut resolver,
+            "did:key:a",
+            "did:key:alice",
+            AttestationType::Endorsement,
+            "att-shared-id",
+        );
+
+        let mut requirements = HashMap::new();
+        requirements.insert(
+            AttestationType::Endorsement,
+            ThresholdRequirement::new(1, 1, 0.5),
+        );
+        let mut attestor_sets = HashMap::new();
+        attestor_sets.insert(AttestationType::Endorsement, vec![attestor]);
+
+        let counts = threshold_counts_via_aggregate(
+            &resolver,
+            &requirements,
+            &attestor_sets,
+            &[("did:key:attacker", "att-shared-id")],
+        );
+        let (met, _) = counts.get(&AttestationType::Endorsement).unwrap();
+        assert_eq!(
+            *met, 1,
+            "a revocation another issuer signed must not stop this endorsement counting"
+        );
     }
 
     // -----------------------------------------------------------------------

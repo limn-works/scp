@@ -53,8 +53,8 @@ use scp_clock::Clock;
 
 use super::AttestationType;
 use super::attestation::{
-    AttestorInfo, DidPublicKeyResolver, ThresholdCheckInput, ThresholdRequirement,
-    check_threshold_attestation,
+    AttestationRevocationChecker, AttestorInfo, DidPublicKeyResolver, ThresholdCheckInput,
+    ThresholdRequirement, check_threshold_attestation,
 };
 
 // ---------------------------------------------------------------------------
@@ -757,6 +757,19 @@ pub struct EndorsementEvidence<'a> {
     /// values from one source: `current_time` weights signal freshness, and
     /// this clock decides attestation expiry.
     pub clock: &'a dyn Clock,
+
+    /// Answers whether an issuer revoked an endorsement, and reaches
+    /// `check_threshold_attestation` so a revoked endorsement stops counting
+    /// toward endorsement independence.
+    ///
+    /// SECURITY (one rule, one answer). `aggregate_trust_input` builds a checker
+    /// from a context's persisted revocation list before it computes threshold
+    /// counts, and both paths call `check_threshold_attestation`. A caller that
+    /// passes `None` here therefore gives one endorsement two answers: revoked
+    /// on the aggregation path, and still counting on this Sybil path. Pass the
+    /// same checker a context's revocation list backs. `None` states that a
+    /// caller holds no revocation list at all, which is the only case it covers.
+    pub revocation_checker: Option<&'a dyn AttestationRevocationChecker>,
 }
 
 /// Evaluates a DID's trust signals against a context's Sybil resistance policy.
@@ -917,7 +930,7 @@ fn check_endorsement_independence(
             requirement: threshold,
             resolver: evidence.resolver,
             clock: evidence.clock,
-            revocation_checker: None,
+            revocation_checker: evidence.revocation_checker,
         });
         if !result.met {
             let count_ok = result.valid_count >= result.required_count;
@@ -1056,6 +1069,22 @@ mod tests {
                 attestors,
                 resolver: &self.resolver,
                 clock: &self.clock,
+                revocation_checker: None,
+            }
+        }
+
+        /// Same evidence, plus a revocation checker, so a test can observe a
+        /// revoked endorsement dropping out of an independence check.
+        fn evidence_with_revocations<'a>(
+            &'a self,
+            attestors: &'a [AttestorInfo],
+            checker: &'a dyn AttestationRevocationChecker,
+        ) -> EndorsementEvidence<'a> {
+            EndorsementEvidence {
+                attestors,
+                resolver: &self.resolver,
+                clock: &self.clock,
+                revocation_checker: Some(checker),
             }
         }
     }
@@ -2346,6 +2375,84 @@ mod tests {
         assert!(
             result.is_ok(),
             "min_strength=0 with independent attestors should pass: {result:?}"
+        );
+    }
+
+    /// Revokes exactly one `(issuer, attestation id)` pair, matching the
+    /// issuer-scoping requirement on [`AttestationRevocationChecker`].
+    struct RevokesOneEndorsement {
+        issuer: DID,
+        attestation_id: String,
+    }
+
+    impl AttestationRevocationChecker for RevokesOneEndorsement {
+        fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64> {
+            if attestation_id == self.attestation_id && *issuer == self.issuer {
+                Some(1)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// SECURITY (one rule, one answer — issue #2335 bug-catcher item 10).
+    /// `aggregate_trust_input` hands `check_threshold_attestation` a checker
+    /// built from a context's revocation list, so a revoked endorsement stops
+    /// counting toward a threshold there. This Sybil path calls the same
+    /// function, so a revoked endorsement must stop counting toward endorsement
+    /// independence too. The control assertion (the same attestors, no checker)
+    /// proves the three endorsements otherwise satisfy the requirement, so the
+    /// failure below is attributable to the revocation alone.
+    #[test]
+    fn a_revoked_endorsement_stops_counting_toward_endorsement_independence() {
+        let assessment = make_deep_assessment(now());
+        let attestors = make_independent_attestors(now());
+
+        let mut policy = ContextSybilPolicy::casual();
+        policy.required_signals = vec![RequiredSignal {
+            category: TrustSignalCategory::Endorsement,
+            min_strength: 0,
+            max_age_secs: 365 * 24 * 3600,
+            // Every one of the three endorsements is needed, so losing one
+            // fails the requirement.
+            threshold_requirement: Some(ThresholdRequirement::new(3, 3, 0.5)),
+        }];
+
+        let harness = EndorsementHarness::new();
+
+        // Control: all three endorsements count while nothing revokes them.
+        let unrevoked = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence(&attestors)),
+        );
+        assert!(
+            unrevoked.is_ok(),
+            "three independent endorsements satisfy a 3-of-3 requirement: {unrevoked:?}"
+        );
+
+        // One endorser's own endorsement is revoked, so two remain.
+        let revoked_attestation = attestors[0]
+            .attestation
+            .as_ref()
+            .expect("the harness builds every attestor with an attestation");
+        let checker = RevokesOneEndorsement {
+            issuer: revoked_attestation.issuer.clone(),
+            attestation_id: revoked_attestation.id.clone(),
+        };
+        let result = evaluate_sybil_resistance(
+            &assessment,
+            &policy,
+            now(),
+            Some(&harness.evidence_with_revocations(&attestors, &checker)),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(SybilResistanceError::EndorsementIndependenceInsufficient { .. })
+            ),
+            "a revoked endorsement must not count toward endorsement independence: {result:?}"
         );
     }
 }

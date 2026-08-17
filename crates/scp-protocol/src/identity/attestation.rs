@@ -700,6 +700,81 @@ pub const SIGNING_FRAGMENT_ACTIVE: &str = "active";
 /// its human under a shared DID (ADR-039 §agent key).
 pub const SIGNING_FRAGMENT_AGENT: &str = "agent";
 
+/// Clock-skew tolerance for an identity link attestation's own timestamps: 300
+/// seconds (5 minutes).
+///
+/// Spec §9.14 states: "Clock skew tolerance: 5 minutes. Messages with
+/// timestamps more than 5 minutes in the future are rejected." Two constants
+/// already carry that bound —
+/// [`MAX_ATTESTATION_KEY_RESOLUTION_STALENESS`](https://docs.rs/scp-mls)
+/// in `scp_mls::keypackage_attestation` (§9.18.7) and the §9.8.2 UCAN nonce
+/// freshness tolerance — so this one follows both.
+///
+/// [`verify_identity_link_attestation`] applies it to `issued_at` and to
+/// `evidence.verified_at`, because an identity link attestation is a
+/// self-attestation: `validate_structure` requires `issuer == subject`, and
+/// both timestamps sit inside the signed preimage, so an attester chooses
+/// them. Without this bound an attester stamps `verified_at` far in the
+/// future,
+/// [`AttestationEvidence::is_expired`] saturates its subtraction to 0, and
+/// §3.5.4 step 5 reads that evidence as fresh for as long as the attestation
+/// exists.
+pub const MAX_IDENTITY_LINK_CLOCK_SKEW_SECS: u64 = 300;
+
+/// DID document service type that publishes an issuer's attestation revocation
+/// list (spec §18.2.2, registry row `AttestationRevocations`).
+///
+/// Spec §3.5.2 makes a fetch of this endpoint part of a revocation check:
+/// "Verifiers check revocation by resolving the issuer's DID document and
+/// looking for an `AttestationRevocations` service endpoint (§18.2.2). The
+/// endpoint returns a list of revoked attestation IDs." Spec §3.5.4 lists no
+/// such fetch, so [`verify_identity_link_attestation`] does not perform one and
+/// its caller decides what an unread list means. A caller that grants trust
+/// without reading a list an issuer published would grant trust to an
+/// attestation that issuer revoked.
+pub const SERVICE_TYPE_ATTESTATION_REVOCATIONS: &str = "AttestationRevocations";
+
+/// Collects every Ed25519 key an issuer's DID document publishes for signing an
+/// identity link attestation.
+///
+/// Spec §3.5.2 admits two fragments — `#active` and `#agent` — and §18.2.2A
+/// binds a verification method to its `controller`, so a method some other DID
+/// controls does not authorize its key to speak for `issuer`. A method whose
+/// `publicKeyMultibase` does not decode to 32 Ed25519 bytes is skipped, because
+/// no such key can verify an Ed25519 signature.
+///
+/// Returns pairs of a fragment name ([`SIGNING_FRAGMENT_ACTIVE`] or
+/// [`SIGNING_FRAGMENT_AGENT`]) and that fragment's 32-byte key, in that
+/// fragment order. An empty result means `document` publishes no key that may
+/// sign for `issuer`.
+///
+/// [`verify_identity_link_attestation`] calls this function for §3.5.4 step 1,
+/// and a caller that must decide whether some other key belongs to `issuer`
+/// calls it rather than re-deriving a fragment list.
+#[must_use]
+pub fn published_signing_keys(
+    document: &scp_did::DidDocument,
+    issuer: &str,
+) -> Vec<(&'static str, [u8; 32])> {
+    let mut keys: Vec<(&'static str, [u8; 32])> = Vec::with_capacity(2);
+    for fragment in [SIGNING_FRAGMENT_ACTIVE, SIGNING_FRAGMENT_AGENT] {
+        let Some(method) = document.verification_method_by_fragment(fragment) else {
+            continue;
+        };
+        // §18.2.2A binds a verification method to its controller. A document
+        // that lists a method controlled by someone else does not authorize
+        // that key to speak for this issuer.
+        if method.controller != issuer {
+            continue;
+        }
+        let Ok(key) = scp_did::decode_multibase_key(&method.public_key_multibase) else {
+            continue;
+        };
+        keys.push((fragment, key));
+    }
+    keys
+}
+
 /// What a consumer did about a Class 2 (Reference) proof resource before
 /// calling [`verify_identity_link_attestation`].
 ///
@@ -820,6 +895,41 @@ pub enum IdentityLinkVerifyError {
         now_secs: u64,
     },
 
+    /// `issued_at` is dated more than
+    /// [`MAX_IDENTITY_LINK_CLOCK_SKEW_SECS`] beyond a verifier's clock. §9.14
+    /// rejects a timestamp more than 5 minutes in the future, and an attester
+    /// signs its own `issued_at`, so accepting one would let an attester
+    /// postpone every deadline this function checks.
+    #[error("attestation is dated {issued_at}, more than {skew_secs}s beyond now ({now_secs})")]
+    IssuedInFuture {
+        /// `issued_at` an attestation carries.
+        issued_at: u64,
+        /// Timestamp a caller supplied.
+        now_secs: u64,
+        /// Bound this check applied.
+        skew_secs: u64,
+    },
+
+    /// `evidence.verified_at` is dated more than
+    /// [`MAX_IDENTITY_LINK_CLOCK_SKEW_SECS`] beyond a verifier's clock.
+    /// [`AttestationEvidence::is_expired`] subtracts `verified_at` from a
+    /// verifier's clock with a saturating subtraction, so a future-dated
+    /// `verified_at` yields 0 elapsed seconds and reads
+    /// [`IdentityLinkFreshness::Fresh`] permanently. Rejecting it keeps §3.5.4
+    /// step 5 able to degrade a stale attestation.
+    #[error(
+        "attestation evidence is dated {verified_at}, more than {skew_secs}s beyond now \
+         ({now_secs})"
+    )]
+    EvidenceVerifiedInFuture {
+        /// `evidence.verified_at` an attestation carries.
+        verified_at: u64,
+        /// Timestamp a caller supplied.
+        now_secs: u64,
+        /// Bound this check applied.
+        skew_secs: u64,
+    },
+
     /// A Class 2 (Reference) attestation reached this function with
     /// [`ReferenceProofOutcome::NotFetched`]. §3.5.0 states that an unverified
     /// Reference attestation is equivalent to no attestation, so a caller that
@@ -884,9 +994,12 @@ pub struct IdentityLinkVerifyInput<'a> {
 /// 5. **Revocation (§3.5.4 step 3)** — `revocation_status` must read `Active`.
 /// 6. **Expiry (§3.5.4 step 4)** — `expires_at`, when present, must not have
 ///    passed.
-/// 7. **Class 2 proof (§3.5.4 Class 2 steps 2–3)** — a `SignedPost` or
+/// 7. **Future-dated timestamps (§9.14)** — `issued_at` and
+///    `evidence.verified_at` must not sit more than
+///    [`MAX_IDENTITY_LINK_CLOCK_SKEW_SECS`] beyond `now_secs`.
+/// 8. **Class 2 proof (§3.5.4 Class 2 steps 2–3)** — a `SignedPost` or
 ///    `DnsRecord` attestation needs [`ReferenceProofOutcome::Confirmed`].
-/// 8. **Freshness (§3.5.4 step 5)** — evidence older than a method's renewal
+/// 9. **Freshness (§3.5.4 step 5)** — evidence older than a method's renewal
 ///    interval yields [`IdentityLinkFreshness::Stale`], which is a degraded
 ///    pass, not a rejection.
 ///
@@ -894,6 +1007,18 @@ pub struct IdentityLinkVerifyInput<'a> {
 /// pass, and step 1's `issuer == subject` rule is checked inside
 /// `validate_structure`, so this function returns success rather than asking a
 /// caller for a further decision.
+///
+/// # What this function does not check
+///
+/// Spec §3.5.2 adds one revocation check that §3.5.4's numbered steps omit: a
+/// verifier reads an [`SERVICE_TYPE_ATTESTATION_REVOCATIONS`] service endpoint
+/// on an issuer's DID document and rejects an attestation whose `id` that
+/// endpoint lists. Reading that endpoint is a network fetch, which this pure
+/// function cannot perform, and §3.5.2 states that a signed
+/// `revocation_status` "does NOT prevent replay of the original `Active`-signed
+/// version". So check 5 above (`revocation_status`) is defense in depth rather
+/// than a complete revocation check, and a caller that resolves an issuer's
+/// document decides what an unread revocation list means for a verdict.
 ///
 /// # Errors
 ///
@@ -922,25 +1047,7 @@ pub fn verify_identity_link_attestation(
     }
 
     // --- 3. Signing keys published by an issuer's document (§3.5.4 step 1).
-    let mut candidates: Vec<(&'static str, [u8; 32])> = Vec::with_capacity(2);
-    for fragment in [SIGNING_FRAGMENT_ACTIVE, SIGNING_FRAGMENT_AGENT] {
-        let Some(method) = input
-            .issuer_document
-            .verification_method_by_fragment(fragment)
-        else {
-            continue;
-        };
-        // §18.2.2A binds a verification method to its controller. A document
-        // that lists a method controlled by someone else does not authorize
-        // that key to speak for this issuer.
-        if method.controller != issuer_str {
-            continue;
-        }
-        let Ok(key) = scp_did::decode_multibase_key(&method.public_key_multibase) else {
-            continue;
-        };
-        candidates.push((fragment, key));
-    }
+    let candidates = published_signing_keys(input.issuer_document, issuer_str);
     if candidates.is_empty() {
         return Err(IdentityLinkVerifyError::SigningKeyNotPublished {
             issuer: issuer_str.to_owned(),
@@ -973,7 +1080,29 @@ pub fn verify_identity_link_attestation(
         });
     }
 
-    // --- 7. Class 2 proof resource (§3.5.4 Class 2 steps 2–3).
+    // --- 7. Future-dated timestamps (§9.14 clock-skew tolerance).
+    // An identity link attestation is a self-attestation — `validate_structure`
+    // requires `issuer == subject` — and both timestamps sit inside the signed
+    // preimage, so an attester picks them. A future `verified_at` saturates
+    // `AttestationEvidence::is_expired` to 0 elapsed seconds, which would make
+    // check 9 below read `Fresh` for as long as the attestation exists.
+    let skew_secs = MAX_IDENTITY_LINK_CLOCK_SKEW_SECS;
+    if attestation.issued_at > input.now_secs.saturating_add(skew_secs) {
+        return Err(IdentityLinkVerifyError::IssuedInFuture {
+            issued_at: attestation.issued_at,
+            now_secs: input.now_secs,
+            skew_secs,
+        });
+    }
+    if attestation.evidence.verified_at > input.now_secs.saturating_add(skew_secs) {
+        return Err(IdentityLinkVerifyError::EvidenceVerifiedInFuture {
+            verified_at: attestation.evidence.verified_at,
+            now_secs: input.now_secs,
+            skew_secs,
+        });
+    }
+
+    // --- 8. Class 2 proof resource (§3.5.4 Class 2 steps 2–3).
     if attestation.evidence.method.attestation_class() == AttestationClass::Reference
         && input.reference_proof == ReferenceProofOutcome::NotFetched
     {
@@ -982,7 +1111,7 @@ pub fn verify_identity_link_attestation(
         });
     }
 
-    // --- 8. Freshness (§3.5.4 step 5) — degrade, never reject.
+    // --- 9. Freshness (§3.5.4 step 5) — degrade, never reject.
     let freshness = if attestation.needs_renewal(input.now_secs) {
         IdentityLinkFreshness::Stale {
             renewal_deadline_secs: attestation.renewal_deadline_secs(),
@@ -2110,5 +2239,143 @@ mod tests {
             run_seam(&attestation, &doc, SEAM_NOW),
             Err(IdentityLinkVerifyError::StructurallyInvalid(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // §9.14 clock-skew bound on self-asserted timestamps
+    // -----------------------------------------------------------------------
+
+    /// Re-signs `attestation` under `sk`, so a test that edits a signed field
+    /// still reaches the check it targets rather than tripping check 4.
+    fn resign(attestation: &mut IdentityLinkAttestation, sk: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        attestation.signature = Vec::new();
+        let canonical = attestation.canonical_signing_bytes().unwrap();
+        attestation.signature = sk.sign(&canonical).to_bytes().to_vec();
+    }
+
+    #[test]
+    fn seam_rejects_an_attestation_issued_beyond_the_clock_skew_bound() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        // Move `issued_at` one second past the bound, and recompute `id`,
+        // which `validate_structure` derives from `issued_at`.
+        attestation.issued_at = SEAM_NOW + MAX_IDENTITY_LINK_CLOCK_SKEW_SECS + 1;
+        attestation.id = IdentityLinkAttestation::compute_id(
+            &attestation.issuer,
+            &attestation.claim.platform,
+            &attestation.claim.platform_handle,
+            attestation.issued_at,
+        );
+        resign(&mut attestation, &sk);
+
+        match run_seam(&attestation, &doc, SEAM_NOW) {
+            Err(IdentityLinkVerifyError::IssuedInFuture {
+                issued_at,
+                now_secs,
+                skew_secs,
+            }) => {
+                assert_eq!(issued_at, SEAM_NOW + MAX_IDENTITY_LINK_CLOCK_SKEW_SECS + 1);
+                assert_eq!(now_secs, SEAM_NOW);
+                assert_eq!(skew_secs, MAX_IDENTITY_LINK_CLOCK_SKEW_SECS);
+            }
+            other => panic!("expected IssuedInFuture, got {other:?}"),
+        }
+    }
+
+    /// Without this rejection an attester stamps `verified_at` far ahead,
+    /// [`AttestationEvidence::is_expired`] saturates its subtraction to zero,
+    /// and §3.5.4 step 5 reads that evidence as fresh forever.
+    #[test]
+    fn seam_rejects_evidence_verified_beyond_the_clock_skew_bound() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        let far_future = SEAM_NOW + 10 * 365 * 24 * 3600;
+        attestation.evidence.verified_at = far_future;
+        resign(&mut attestation, &sk);
+
+        // Pin the defect this check closes: freshness alone reads `Fresh`.
+        assert!(
+            !attestation.needs_renewal(SEAM_NOW),
+            "a saturating subtraction reads future-dated evidence as fresh, which is why \
+             the seam must reject it outright"
+        );
+
+        match run_seam(&attestation, &doc, SEAM_NOW) {
+            Err(IdentityLinkVerifyError::EvidenceVerifiedInFuture {
+                verified_at,
+                now_secs,
+                skew_secs,
+            }) => {
+                assert_eq!(verified_at, far_future);
+                assert_eq!(now_secs, SEAM_NOW);
+                assert_eq!(skew_secs, MAX_IDENTITY_LINK_CLOCK_SKEW_SECS);
+            }
+            other => panic!("expected EvidenceVerifiedInFuture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seam_accepts_a_timestamp_inside_the_clock_skew_bound() {
+        let sk = test_signing_key(0xAA);
+        let mut attestation = make_signed_attestation(&sk);
+        let doc = seam_document(
+            (*attestation.issuer).as_ref(),
+            &sk.verifying_key().to_bytes(),
+            None,
+        );
+
+        attestation.evidence.verified_at = SEAM_NOW + MAX_IDENTITY_LINK_CLOCK_SKEW_SECS;
+        resign(&mut attestation, &sk);
+
+        run_seam(&attestation, &doc, SEAM_NOW)
+            .expect("a timestamp exactly at the skew bound is inside it");
+    }
+
+    // -----------------------------------------------------------------------
+    // published_signing_keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn published_signing_keys_reports_both_admissible_fragments() {
+        let active = test_signing_key(0xAA).verifying_key().to_bytes();
+        let agent = test_signing_key(0xBB).verifying_key().to_bytes();
+        let did_str = "did:dht:z6MkPublishedKeys";
+        let doc = seam_document(did_str, &active, Some(&agent));
+
+        let keys = published_signing_keys(&doc, did_str);
+        assert_eq!(
+            keys,
+            vec![
+                (SIGNING_FRAGMENT_ACTIVE, active),
+                (SIGNING_FRAGMENT_AGENT, agent),
+            ],
+            "§3.5.2 admits both #active and #agent, in that order"
+        );
+    }
+
+    #[test]
+    fn published_signing_keys_skips_a_method_another_did_controls() {
+        let active = test_signing_key(0xAA).verifying_key().to_bytes();
+        let did_str = "did:dht:z6MkControllerCheck";
+        let doc = seam_document(did_str, &active, None);
+
+        assert!(
+            published_signing_keys(&doc, "did:dht:z6MkSomebodyElse").is_empty(),
+            "§18.2.2A binds a verification method to its controller, so a document \
+             authorizes no key for a DID it does not name"
+        );
     }
 }

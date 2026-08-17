@@ -185,10 +185,14 @@ pub struct TrustInput {
    - Warning count -> role demotion.
    - Returns list of triggered consequences with the triggering evidence.
 
-7. **`check_threshold_attestation(attestation_type, attestors, requirement) -> ThresholdResult`**
-   - Counts attestations of the given type from the attestor set.
+7. **`check_threshold_attestation(&ThresholdCheckInput) -> ThresholdResult`**
+   - `ThresholdCheckInput` carries an attestation type, an attestor set, a threshold requirement, a subject DID, a `DidPublicKeyResolver`, a `Clock`, and an optional external revocation checker.
+   - Admits an attestor only when that attestor's carried attestation answers a required type, names a given subject, names that attestor as its own issuer, and passes `verify_attestation_with_revocation`.
+   - Deduplicates admitted attestors by DID, per spec §7.3.5 rule 1: "Attestors MUST have distinct DIDs. Multiple attestations from the same DID count as one attestation regardless of quantity." Deduplication runs after verification, so a rejected duplicate never consumes a slot.
    - Verifies independence: shared context memberships and mutual endorsements reduce independence score.
    - Returns whether the N-of-M threshold is met with sufficient independence.
+
+   A prior revision of this ADR recorded three positional parameters — `(attestation_type, attestors, requirement)` — which admitted no subject, no issuer binding, and no signature check. Spec §7.3.5 rule 1 states distinct DIDs as REQUIRED, and that signature could not satisfy that rule, so N copies of one attestor yielded a full count and a maximum independence score. GitHub issue #2335 finding 9 recorded that gap; a named-field record above replaces those three parameters so no call path can skip a rule.
 
 8. **`check_attestation_freshness(attestation) -> FreshnessStatus`**
    - Evaluates renewal interval. Stale attestations (past renewal interval but not expired) are degraded, not revoked.

@@ -19,9 +19,15 @@
 //! - [`ActionCategory`] — Classification of a protocol action (Category A or B).
 //! - [`CustodyViolationType`] — Enumeration of unambiguous violation categories.
 //! - [`ScpCustodyViolationAttestation`] — Permanent, append-only violation record.
+//! - [`VerifiedCustodyViolation`] — A violation record whose verifier signature
+//!   this process checked.
 //! - [`CounterAttestation`] — Counter-evidence for reputation restoration.
+//! - [`VerifiedCounterAttestation`] — A counter-attestation whose subject
+//!   signature this process checked.
 //! - [`CustodyViolationError`] — Validation errors for custody violation types.
 //! - [`CustodyViolationResult`] — Result of a Category A enforcement check.
+//! - [`CategoryARejection`] — What a verification point returns when it rejects
+//!   a Category A action, carrying the record ADR-039 layer 3 requires it to log.
 //! - [`ViolationStore`] — Trait for custody violation storage (append-only).
 //! - [`InMemoryViolationStore`] — In-memory implementation for testing.
 //!
@@ -31,16 +37,24 @@
 //! Ed25519 signature over a §9.5.1 canonical hash under its own domain
 //! separator ([`CUSTODY_VIOLATION_DOMAIN`], [`COUNTER_ATTESTATION_DOMAIN`]).
 //! Spec section §9.5.2 of `.docs/specs/09-security-model.md` fixes both field
-//! layouts, and spec section §9.18.2 registers both separators. Each hash covers
+//! layouts, spec section §9.18.2 registers both separators, and spec section
+//! §25.25 of `.docs/specs/25-test-vectors.md` pins one known-answer preimage,
+//! hash, and signature for each (Vector 38 and Vector 39). Each hash covers
 //! every field of its record except that record's own signature.
 //!
-//! A caller resolves a signer's Ed25519 public key from a DID document and
-//! calls [`ScpCustodyViolationAttestation::verify_verifier_signature`] or
-//! [`CounterAttestation::verify_signature`]. Both functions perform no DID
-//! resolution and no clock read, so both stay wasm-safe and each caller decides
-//! which key it trusts. [`ScpCustodyViolationAttestation::validate`] and
-//! [`CounterAttestation::validate`] check field shape only: a caller that runs
-//! validation without running verification learns nothing about who signed.
+//! A caller resolves a signer's Ed25519 public key from a DID document and calls
+//! [`VerifiedCustodyViolation::verify`] or [`VerifiedCounterAttestation::verify`].
+//! Both constructors perform no DID resolution and no clock read, so both stay
+//! wasm-safe and each caller decides which key it trusts. Only those two
+//! constructors produce the two verified types, and [`ViolationStore`] accepts
+//! nothing else, so a store cannot hold a record whose signature no party
+//! checked.
+//!
+//! [`ScpCustodyViolationAttestation::validate_field_shape`] and
+//! [`CounterAttestation::validate_field_shape`] check field shape and establish
+//! nothing about who signed. Their names say so, and their return type is not a
+//! verified record, so a caller cannot mistake shape validation for
+//! authenticity.
 //!
 //! # Action Classification
 //!
@@ -274,17 +288,18 @@ pub struct ScpCustodyViolationAttestation {
     /// canonical hash under [`CUSTODY_VIOLATION_DOMAIN`] that covers every other
     /// field of this record.
     ///
-    /// [`verify_verifier_signature`](ScpCustodyViolationAttestation::verify_verifier_signature)
-    /// rebuilds that hash and checks `verifier_signature` against a
-    /// caller-supplied Ed25519 public key. A caller that resolves that key from
-    /// `verifier_did`'s current DID document and runs that check establishes
-    /// that whoever holds `verifier_did`'s key wrote exactly these bytes. That
-    /// check establishes nothing about whether a recorded violation occurred,
-    /// because `verifier_did` alone chose what to write.
+    /// [`VerifiedCustodyViolation::verify`] rebuilds that hash and checks
+    /// `verifier_signature` against a caller-supplied Ed25519 public key. A
+    /// caller that resolves that key from `verifier_did`'s current DID document
+    /// and runs that check establishes that whoever holds `verifier_did`'s key
+    /// wrote exactly these bytes. That check establishes nothing about whether a
+    /// recorded violation occurred, because `verifier_did` alone chose what to
+    /// write.
     ///
-    /// [`validate`](ScpCustodyViolationAttestation::validate) checks only that
-    /// `verifier_signature` is non-empty, so a caller that skips
-    /// `verify_verifier_signature` learns nothing about who wrote a record.
+    /// [`validate_field_shape`](ScpCustodyViolationAttestation::validate_field_shape)
+    /// checks only that `verifier_signature` is non-empty, so a caller that skips
+    /// [`VerifiedCustodyViolation::verify`] learns nothing about who wrote a
+    /// record.
     pub verifier_signature: Vec<u8>,
     /// DID of the verifier who detected and logged this violation.
     pub verifier_did: DID,
@@ -337,6 +352,39 @@ pub enum CustodyViolationError {
     SignatureVerificationFailed {
         /// What `scp_crypto::verify_ed25519_signature` reported.
         reason: String,
+    },
+
+    /// A counter-attestation's `violation_reference` does not equal the signing
+    /// hash of the violation record a caller offered it against.
+    ///
+    /// Spec section §9.5.2 of `.docs/specs/09-security-model.md` derives
+    /// `violation_reference` from that signing hash, so a mismatch means this
+    /// counter-claim answers a different record, or answers no record.
+    #[error(
+        "counter-attestation references a different violation record: \
+         expected {expected}, found {found}"
+    )]
+    ViolationReferenceMismatch {
+        /// Lowercase hex of the signing hash of the offered violation record.
+        expected: String,
+        /// Lowercase hex of the reference the counter-attestation carries.
+        found: String,
+    },
+
+    /// A counter-attestation names a different subject than the violation record
+    /// a caller offered it against.
+    ///
+    /// Spec section §9.5.2 of `.docs/specs/09-security-model.md` requires both
+    /// `subject_did` values to match, so that one subject cannot contest a record
+    /// naming another subject.
+    #[error(
+        "counter-attestation subject {counter_subject} does not match violation subject {violation_subject}"
+    )]
+    SubjectMismatch {
+        /// The `subject_did` the counter-attestation carries.
+        counter_subject: String,
+        /// The `subject_did` the violation record carries.
+        violation_subject: String,
     },
 }
 
@@ -431,13 +479,20 @@ impl CustodyViolationType {
 }
 
 impl ScpCustodyViolationAttestation {
-    /// Validates that all fields are well-formed.
+    /// Checks that every field of this record has a well-formed shape, and
+    /// establishes nothing about who signed it.
+    ///
+    /// This method reads no key, recomputes no hash, and checks no signature. A
+    /// caller that wants to know who wrote a record calls
+    /// [`VerifiedCustodyViolation::verify`] with a key it resolved from
+    /// `verifier_did`'s DID document, and [`ViolationStore`] accepts only the
+    /// [`VerifiedCustodyViolation`] that constructor returns.
     ///
     /// # Errors
     ///
     /// Returns [`CustodyViolationError`] if the violation evidence is invalid
     /// or the verifier signature is empty.
-    pub fn validate(&self) -> Result<(), CustodyViolationError> {
+    pub fn validate_field_shape(&self) -> Result<(), CustodyViolationError> {
         self.violation.validate()?;
         if self.verifier_signature.is_empty() {
             return Err(CustodyViolationError::EmptyVerifierSignature);
@@ -445,7 +500,11 @@ impl ScpCustodyViolationAttestation {
         Ok(())
     }
 
-    /// Creates a new custody violation attestation, validating all fields.
+    /// Creates a new custody violation attestation, checking every field's shape.
+    ///
+    /// Shape is all this constructor checks. It performs no signature
+    /// verification, so holding the value it returns establishes nothing about
+    /// who signed the record.
     ///
     /// # Errors
     ///
@@ -487,6 +546,16 @@ impl ScpCustodyViolationAttestation {
     /// human-agent identity model (`.docs/adrs/phase-1.md`), enforcement-stack
     /// layer 4 names a detecting verifier as that signer.
     ///
+    /// Spec section §9.5.2 also derives a [`CounterAttestation`]'s
+    /// `violation_reference` from this same 32-byte value, so a subject that
+    /// contests this record carries these bytes and a verifier recomputes them.
+    /// [`CounterAttestation::referencing`] computes that field from a record
+    /// rather than accepting an identifier a caller invented, and
+    /// [`VerifiedCounterAttestation::answers`] rechecks it.
+    ///
+    /// §25.25 Vector 38 of `.docs/specs/25-test-vectors.md` pins one
+    /// known-answer preimage and its hash.
+    ///
     /// # Errors
     ///
     /// Returns [`CustodyViolationError::CanonicalEncodingFailed`] when a
@@ -512,25 +581,12 @@ impl ScpCustodyViolationAttestation {
     /// also uses: `scp_crypto::verify_ed25519_signature`, which calls
     /// `ed25519_dalek::VerifyingKey::verify_strict`.
     ///
-    /// A caller resolves `verifier_public_key` from `verifier_did`'s current DID
-    /// document. ADR-039, shared-DID human-agent identity model
-    /// (`.docs/adrs/phase-1.md`), names `#active` and `#agent` as both
-    /// verification methods a verifier may sign with. This function performs no
-    /// DID resolution and no clock read, so it stays wasm-safe and each caller
-    /// chooses which key it trusts.
-    ///
-    /// Passing this check establishes that whoever holds `verifier_public_key`
-    /// signed exactly those field bytes this record now carries. Passing it
-    /// establishes nothing about whether `subject_did` committed a recorded
-    /// violation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CustodyViolationError::CanonicalEncodingFailed`] when
-    /// [`signing_hash`](Self::signing_hash) cannot encode a preimage, and
-    /// [`CustodyViolationError::SignatureVerificationFailed`] when
-    /// `verifier_signature` does not verify against `verifier_public_key`.
-    pub fn verify_verifier_signature(
+    /// Module-private on purpose. [`VerifiedCustodyViolation::verify`] is the
+    /// only public entry point, so a caller that runs this check receives a
+    /// [`VerifiedCustodyViolation`] and cannot hold a bare
+    /// `ScpCustodyViolationAttestation` that it believes some party
+    /// authenticated.
+    fn verify_verifier_signature(
         &self,
         verifier_public_key: &[u8],
     ) -> Result<(), CustodyViolationError> {
@@ -550,6 +606,86 @@ impl ScpCustodyViolationAttestation {
 }
 
 // ---------------------------------------------------------------------------
+// VerifiedCustodyViolation (issue #2335 finding 11)
+// ---------------------------------------------------------------------------
+
+/// A [`ScpCustodyViolationAttestation`] whose `verifier_signature` this process
+/// checked against an Ed25519 public key the caller supplied.
+///
+/// [`verify`](Self::verify) is the only constructor, so a value of this type
+/// carries a fact a bare [`ScpCustodyViolationAttestation`] never carries:
+/// whoever holds the key that caller supplied signed exactly the field bytes
+/// this record now carries. [`ViolationStore::log_violation`] accepts this type
+/// and rejects the bare record, so an append-only store of permanent accusations
+/// holds nothing that no party authenticated.
+///
+/// This type implements `Serialize` and does not implement `Deserialize`, so a
+/// verified record cannot arrive from the wire: a process that reads a record
+/// off the wire deserializes [`ScpCustodyViolationAttestation`] and runs
+/// [`verify`](Self::verify) itself.
+///
+/// Holding this type establishes nothing about whether the recorded violation
+/// occurred: ADR-039, shared-DID human-agent identity model
+/// (`.docs/adrs/phase-1.md`), enforcement-stack layer 4 lets one verifier write
+/// a record about a subject who never consented, and that verifier alone chose
+/// what to write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifiedCustodyViolation(ScpCustodyViolationAttestation);
+
+impl VerifiedCustodyViolation {
+    /// Checks `record`'s field shape, then checks `record.verifier_signature`
+    /// against `verifier_public_key` over the §9.5.1 canonical hash
+    /// [`ScpCustodyViolationAttestation::signing_hash`] builds.
+    ///
+    /// A caller resolves `verifier_public_key` from `record.verifier_did`'s
+    /// current DID document. ADR-039, shared-DID human-agent identity model
+    /// (`.docs/adrs/phase-1.md`), names `#active` and `#agent` as both
+    /// verification methods a verifier may sign with. This constructor performs
+    /// no DID resolution and no clock read, so it stays wasm-safe and each caller
+    /// chooses which key it trusts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`CustodyViolationError`] that
+    /// [`ScpCustodyViolationAttestation::validate_field_shape`] reports for a
+    /// malformed field, [`CustodyViolationError::CanonicalEncodingFailed`] when
+    /// the preimage cannot be encoded, and
+    /// [`CustodyViolationError::SignatureVerificationFailed`] when
+    /// `verifier_signature` does not verify against `verifier_public_key`.
+    pub fn verify(
+        record: ScpCustodyViolationAttestation,
+        verifier_public_key: &[u8],
+    ) -> Result<Self, CustodyViolationError> {
+        record.validate_field_shape()?;
+        record.verify_verifier_signature(verifier_public_key)?;
+        Ok(Self(record))
+    }
+
+    /// Borrows the record this value verified.
+    #[must_use]
+    pub const fn record(&self) -> &ScpCustodyViolationAttestation {
+        &self.0
+    }
+
+    /// Returns the record this value verified, dropping the verified marker.
+    #[must_use]
+    pub fn into_record(self) -> ScpCustodyViolationAttestation {
+        self.0
+    }
+
+    /// Returns the 32-byte reference a [`CounterAttestation`] carries to name
+    /// this record, per spec section §9.5.2's derivation rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CustodyViolationError::CanonicalEncodingFailed`] when
+    /// [`ScpCustodyViolationAttestation::signing_hash`] cannot encode a preimage.
+    pub fn reference(&self) -> Result<[u8; 32], CustodyViolationError> {
+        self.0.signing_hash()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CounterAttestation (AB-019)
 // ---------------------------------------------------------------------------
 
@@ -565,10 +701,22 @@ impl ScpCustodyViolationAttestation {
 pub struct CounterAttestation {
     /// DID of the identity providing counter-evidence.
     pub subject_did: DID,
-    /// Reference to the specific violation being contested. This should be
-    /// a content-addressable identifier (e.g., hash of the violation record)
-    /// that uniquely identifies the violation.
-    pub violation_reference: String,
+    /// The 32-byte identifier of the violation record this counter-claim
+    /// contests.
+    ///
+    /// Spec section §9.5.2 of `.docs/specs/09-security-model.md` derives this
+    /// field: it equals
+    /// [`ScpCustodyViolationAttestation::signing_hash`] of the contested record,
+    /// which is `SHA-256(CUSTODY_VIOLATION_DOMAIN || fields 1..7)`. Any other
+    /// 32-byte value names no record.
+    ///
+    /// [`referencing`](CounterAttestation::referencing) computes this field from
+    /// a violation record rather than accepting an identifier a caller invented,
+    /// and [`VerifiedCounterAttestation::answers`] recomputes it from the record
+    /// a verifier holds and rejects a mismatch. Those two checks are why this
+    /// field is 32 bytes rather than a free-form string: two verifiers reach one
+    /// answer to "does this counter-claim answer this record".
+    pub violation_reference: [u8; 32],
     /// Human-readable explanation of the counter-claim.
     pub explanation: String,
     /// Unix timestamp (seconds) when the counter-attestation was published.
@@ -591,23 +739,28 @@ pub struct CounterAttestation {
     /// establishes agent authorization and establishes nothing about human
     /// involvement.
     ///
-    /// [`validate`](CounterAttestation::validate) checks only that `signature`
-    /// is non-empty.
+    /// [`validate_field_shape`](CounterAttestation::validate_field_shape) checks
+    /// only that `signature` is non-empty.
     pub signature: Vec<u8>,
 }
 
 impl CounterAttestation {
-    /// Validates that all fields are well-formed.
+    /// Checks that every field of this record has a well-formed shape, and
+    /// establishes nothing about who signed it.
+    ///
+    /// This method reads no key, recomputes no hash, and checks no signature. A
+    /// caller that wants to know who wrote a counter-claim calls
+    /// [`VerifiedCounterAttestation::verify`] with a key it resolved from
+    /// `subject_did`'s DID document. This method also cannot tell whether
+    /// `violation_reference` names a record that exists; only
+    /// [`VerifiedCounterAttestation::answers`] answers that, and it needs the
+    /// record.
     ///
     /// # Errors
     ///
-    /// Returns [`CustodyViolationError`] if any required field is empty.
-    pub const fn validate(&self) -> Result<(), CustodyViolationError> {
-        if self.violation_reference.is_empty() {
-            return Err(CustodyViolationError::EmptyField {
-                field: "violation_reference",
-            });
-        }
+    /// Returns [`CustodyViolationError`] if `explanation` or `signature` is
+    /// empty.
+    pub const fn validate_field_shape(&self) -> Result<(), CustodyViolationError> {
         if self.explanation.is_empty() {
             return Err(CustodyViolationError::EmptyField {
                 field: "explanation",
@@ -619,41 +772,44 @@ impl CounterAttestation {
         Ok(())
     }
 
-    /// Creates a new counter-attestation, validating all fields.
+    /// Creates a counter-attestation against `violation`, deriving both
+    /// `subject_did` and `violation_reference` from that record.
+    ///
+    /// This is the only constructor, and it takes a violation record rather than
+    /// a caller-chosen reference, so an author cannot publish a counter-claim
+    /// against a record it does not hold. Spec section §9.5.2 of
+    /// `.docs/specs/09-security-model.md` states that derivation:
+    /// `violation_reference` equals
+    /// [`ScpCustodyViolationAttestation::signing_hash`] of `violation`, and both
+    /// records name one `subject_did`.
+    ///
+    /// `signature` is an Ed25519 signature by `violation.subject_did`'s `#active`
+    /// verification method over [`signing_hash`](Self::signing_hash) of the value
+    /// this constructor returns. An author builds the value, reads that hash,
+    /// signs it, and writes the result back into `signature`; the round-trip in
+    /// this module's tests shows that sequence.
     ///
     /// # Errors
     ///
-    /// Returns [`CustodyViolationError`] if:
-    /// - The violation reference is empty
-    /// - The explanation is empty
-    /// - The signature is empty
-    pub fn new(
-        subject_did: DID,
-        violation_reference: String,
+    /// Returns [`CustodyViolationError::CanonicalEncodingFailed`] when
+    /// `violation`'s preimage cannot be encoded, and
+    /// [`CustodyViolationError::EmptyField`] when `explanation` or `signature` is
+    /// empty.
+    pub fn referencing(
+        violation: &ScpCustodyViolationAttestation,
         explanation: String,
         timestamp: u64,
         signature: Vec<u8>,
     ) -> Result<Self, CustodyViolationError> {
-        if violation_reference.is_empty() {
-            return Err(CustodyViolationError::EmptyField {
-                field: "violation_reference",
-            });
-        }
-        if explanation.is_empty() {
-            return Err(CustodyViolationError::EmptyField {
-                field: "explanation",
-            });
-        }
-        if signature.is_empty() {
-            return Err(CustodyViolationError::EmptyField { field: "signature" });
-        }
-        Ok(Self {
-            subject_did,
-            violation_reference,
+        let counter = Self {
+            subject_did: violation.subject_did.clone(),
+            violation_reference: violation.signing_hash()?,
             explanation,
             timestamp,
             signature,
-        })
+        };
+        counter.validate_field_shape()?;
+        Ok(counter)
     }
 
     /// Returns the 32-byte §9.5.1 canonical signing hash for this record:
@@ -667,7 +823,9 @@ impl CounterAttestation {
     /// or backdates `timestamp` moves this hash and invalidates a signature
     /// taken over an earlier value.
     ///
-    /// A signer signs these 32 bytes and nothing else.
+    /// A signer signs these 32 bytes and nothing else. §25.25 Vector 39 of
+    /// `.docs/specs/25-test-vectors.md` pins one known-answer preimage and its
+    /// hash.
     ///
     /// # Errors
     ///
@@ -679,7 +837,7 @@ impl CounterAttestation {
             COUNTER_ATTESTATION_DOMAIN,
             &[
                 CanonicalField::VarBytes(self.subject_did.0.as_bytes()),
-                CanonicalField::VarBytes(self.violation_reference.as_bytes()),
+                CanonicalField::Fixed32(&self.violation_reference),
                 CanonicalField::VarBytes(self.explanation.as_bytes()),
                 CanonicalField::U64(self.timestamp),
             ],
@@ -695,24 +853,112 @@ impl CounterAttestation {
     /// also uses: `scp_crypto::verify_ed25519_signature`, which calls
     /// `ed25519_dalek::VerifyingKey::verify_strict`.
     ///
-    /// Each caller chooses which verification method it resolves from
-    /// `subject_did`'s current DID document, and that choice decides what
-    /// passing this check establishes. ADR-039, shared-DID human-agent identity
-    /// model (`.docs/adrs/phase-1.md`), acceptance criterion 18 assigns a
-    /// counter-claim signature to `#active`, so a caller enforcing that
-    /// assignment resolves `#active` and passes only that key. This function
-    /// performs no DID resolution and no clock read, so it stays wasm-safe.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CustodyViolationError::CanonicalEncodingFailed`] when
-    /// [`signing_hash`](Self::signing_hash) cannot encode a preimage, and
-    /// [`CustodyViolationError::SignatureVerificationFailed`] when `signature`
-    /// does not verify against `subject_public_key`.
-    pub fn verify_signature(&self, subject_public_key: &[u8]) -> Result<(), CustodyViolationError> {
+    /// Module-private on purpose. [`VerifiedCounterAttestation::verify`] is the
+    /// only public entry point, so a caller that runs this check receives a
+    /// [`VerifiedCounterAttestation`] and cannot hold a bare
+    /// `CounterAttestation` that it believes some party authenticated.
+    fn verify_signature(&self, subject_public_key: &[u8]) -> Result<(), CustodyViolationError> {
         let hash = self.signing_hash()?;
         verify_ed25519_signature(subject_public_key, &hash, &self.signature)
             .map_err(|reason| CustodyViolationError::SignatureVerificationFailed { reason })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VerifiedCounterAttestation (issue #2335 finding 11)
+// ---------------------------------------------------------------------------
+
+/// A [`CounterAttestation`] whose `signature` this process checked against an
+/// Ed25519 public key the caller supplied.
+///
+/// [`verify`](Self::verify) is the only constructor, so a value of this type
+/// carries a fact a bare [`CounterAttestation`] never carries: whoever holds the
+/// key that caller supplied signed exactly the field bytes this counter-claim
+/// now carries. [`ViolationStore::log_counter_attestation`] accepts this type
+/// and rejects the bare record.
+///
+/// This type implements `Serialize` and does not implement `Deserialize`, so a
+/// verified counter-claim cannot arrive from the wire.
+///
+/// ADR-039, shared-DID human-agent identity model (`.docs/adrs/phase-1.md`),
+/// acceptance criterion 18 assigns a counter-claim signature to `#active`. This
+/// type records that a signature verified, not which verification method the
+/// caller resolved, so a caller that wants criterion 18 resolves `#active` and
+/// passes only that key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VerifiedCounterAttestation(CounterAttestation);
+
+impl VerifiedCounterAttestation {
+    /// Checks `record`'s field shape, then checks `record.signature` against
+    /// `subject_public_key` over the §9.5.1 canonical hash
+    /// [`CounterAttestation::signing_hash`] builds.
+    ///
+    /// This constructor performs no DID resolution and no clock read, so it
+    /// stays wasm-safe. It does not check that `record.violation_reference`
+    /// names a record that exists, because a counter-claim reaches a verifier
+    /// that may not hold the contested record; [`answers`](Self::answers) makes
+    /// that check once a verifier holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`CustodyViolationError`] that
+    /// [`CounterAttestation::validate_field_shape`] reports for a malformed
+    /// field, [`CustodyViolationError::CanonicalEncodingFailed`] when the
+    /// preimage cannot be encoded, and
+    /// [`CustodyViolationError::SignatureVerificationFailed`] when `signature`
+    /// does not verify against `subject_public_key`.
+    pub fn verify(
+        record: CounterAttestation,
+        subject_public_key: &[u8],
+    ) -> Result<Self, CustodyViolationError> {
+        record.validate_field_shape()?;
+        record.verify_signature(subject_public_key)?;
+        Ok(Self(record))
+    }
+
+    /// Borrows the record this value verified.
+    #[must_use]
+    pub const fn record(&self) -> &CounterAttestation {
+        &self.0
+    }
+
+    /// Returns the record this value verified, dropping the verified marker.
+    #[must_use]
+    pub fn into_record(self) -> CounterAttestation {
+        self.0
+    }
+
+    /// Checks that this counter-claim answers `violation`, running both checks
+    /// spec section §9.5.2 of `.docs/specs/09-security-model.md` requires:
+    /// `violation_reference` equals `violation`'s signing hash, and both records
+    /// name one `subject_did`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CustodyViolationError::ViolationReferenceMismatch`] when this
+    /// counter-claim references a different record,
+    /// [`CustodyViolationError::SubjectMismatch`] when the two records name
+    /// different subjects, and
+    /// [`CustodyViolationError::CanonicalEncodingFailed`] when `violation`'s
+    /// preimage cannot be encoded.
+    pub fn answers(
+        &self,
+        violation: &VerifiedCustodyViolation,
+    ) -> Result<(), CustodyViolationError> {
+        let expected = violation.reference()?;
+        if self.0.violation_reference != expected {
+            return Err(CustodyViolationError::ViolationReferenceMismatch {
+                expected: hex::encode(expected),
+                found: hex::encode(self.0.violation_reference),
+            });
+        }
+        if self.0.subject_did != violation.record().subject_did {
+            return Err(CustodyViolationError::SubjectMismatch {
+                counter_subject: self.0.subject_did.0.clone(),
+                violation_subject: violation.record().subject_did.0.clone(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -781,7 +1027,9 @@ impl<'de> Deserialize<'de> for ScpCustodyViolationAttestation {
             verifier_signature: helper.verifier_signature,
             verifier_did: helper.verifier_did,
         };
-        value.validate().map_err(serde::de::Error::custom)?;
+        value
+            .validate_field_shape()
+            .map_err(serde::de::Error::custom)?;
         Ok(value)
     }
 }
@@ -791,7 +1039,7 @@ impl<'de> Deserialize<'de> for CounterAttestation {
         #[derive(Deserialize)]
         struct Helper {
             subject_did: DID,
-            violation_reference: String,
+            violation_reference: [u8; 32],
             explanation: String,
             timestamp: u64,
             signature: Vec<u8>,
@@ -805,7 +1053,9 @@ impl<'de> Deserialize<'de> for CounterAttestation {
             timestamp: helper.timestamp,
             signature: helper.signature,
         };
-        value.validate().map_err(serde::de::Error::custom)?;
+        value
+            .validate_field_shape()
+            .map_err(serde::de::Error::custom)?;
         Ok(value)
     }
 }
@@ -855,7 +1105,11 @@ impl CustodyViolationResult {
     /// enforcement-stack layer 3 requires a verification point to both reject a
     /// Category A action signed by `#agent` and record it; this method produces
     /// the record from the rejection, so the two cannot disagree about which
-    /// signature was seen.
+    /// signature was seen. `CategoryARejection::from` calls this method, which
+    /// is how both shipped verification points — `enforce_inner_envelope_category_a`
+    /// and
+    /// [`enforce_sender_key_category_a`](crate::crypto::sender_keys::key_protocol_verify::enforce_sender_key_category_a)
+    /// — hand a record to their callers.
     ///
     /// # Errors
     ///
@@ -871,6 +1125,112 @@ impl CustodyViolationResult {
         };
         violation.validate()?;
         Ok(violation)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CategoryARejection (ADR-039 enforcement-stack layer 3)
+// ---------------------------------------------------------------------------
+
+/// What a verification point returns when it rejects a Category A action that
+/// `#agent` signed.
+///
+/// ADR-039, shared-DID human-agent identity model (`.docs/adrs/phase-1.md`),
+/// enforcement-stack layer 3 states that a conformant verifier both rejects such
+/// an action and logs it as a custody violation. This type carries both halves:
+/// `error_message` is the rejection a caller surfaces, and the
+/// [`Recorded`](Self::Recorded) variant carries the
+/// [`CustodyViolationType::CategoryAViolation`] a caller logs, holding the
+/// signature bytes that verification point observed.
+///
+/// The two variants split on one condition: whether the observed evidence forms
+/// a conformant record. A verification point that observed no signature bytes
+/// still rejects the action, and this type reports why no record accompanies
+/// that rejection rather than inventing evidence.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CategoryARejection {
+    /// The verification point rejected the action and built the record ADR-039
+    /// layer 3 requires it to log.
+    #[error("{error_message}")]
+    Recorded {
+        /// Human-readable description of the rejected action.
+        error_message: String,
+        /// The DID whose `#agent` key signed the rejected action.
+        violator_did: String,
+        /// The record a caller logs, carrying the observed signature bytes as
+        /// `signature_evidence`.
+        violation: CustodyViolationType,
+    },
+
+    /// The verification point rejected the action, and the evidence it observed
+    /// does not form a conformant record.
+    ///
+    /// [`CustodyViolationType::validate`] reports why. A verification point that
+    /// saw an empty signature reaches this variant, and a caller that logs
+    /// violations records nothing for this rejection rather than recording
+    /// invented evidence.
+    #[error("{error_message}; no conformant violation record: {reason}")]
+    EvidenceUnusable {
+        /// Human-readable description of the rejected action.
+        error_message: String,
+        /// The DID whose `#agent` key signed the rejected action.
+        violator_did: String,
+        /// What [`CustodyViolationType::validate`] reported.
+        reason: CustodyViolationError,
+    },
+}
+
+impl CategoryARejection {
+    /// Returns the human-readable description of the rejected action.
+    #[must_use]
+    pub fn error_message(&self) -> &str {
+        match self {
+            Self::Recorded { error_message, .. } | Self::EvidenceUnusable { error_message, .. } => {
+                error_message
+            }
+        }
+    }
+
+    /// Returns the DID whose `#agent` key signed the rejected action.
+    #[must_use]
+    pub fn violator_did(&self) -> &str {
+        match self {
+            Self::Recorded { violator_did, .. } | Self::EvidenceUnusable { violator_did, .. } => {
+                violator_did
+            }
+        }
+    }
+
+    /// Borrows the record a caller logs, or returns `None` when the observed
+    /// evidence does not form a conformant record.
+    #[must_use]
+    pub const fn recorded_violation(&self) -> Option<&CustodyViolationType> {
+        match self {
+            Self::Recorded { violation, .. } => Some(violation),
+            Self::EvidenceUnusable { .. } => None,
+        }
+    }
+}
+
+impl From<CustodyViolationResult> for CategoryARejection {
+    /// Moves the observed signature bytes out of a
+    /// [`CustodyViolationResult`] and into the
+    /// [`CustodyViolationType::CategoryAViolation`] a caller logs.
+    fn from(result: CustodyViolationResult) -> Self {
+        let error_message = result.error_message.clone();
+        let violator_did = result.violator_did.clone();
+        match result.into_category_a_violation() {
+            Ok(violation) => Self::Recorded {
+                error_message,
+                violator_did,
+                violation,
+            },
+            Err(reason) => Self::EvidenceUnusable {
+                error_message,
+                violator_did,
+                reason,
+            },
+        }
     }
 }
 
@@ -892,8 +1252,10 @@ impl CustodyViolationResult {
 /// * `action_description` — Human-readable description for the attestation.
 /// * `evidence_signature` — The signature bytes the verification point observed
 ///   on the action. A rejection carries these bytes through to
-///   [`CustodyViolationResult::signature_evidence`], so a caller that logs the
-///   violation records the signature it saw.
+///   [`CustodyViolationResult::signature_evidence`], and
+///   `CategoryARejection::from` moves them into the
+///   [`CustodyViolationType::CategoryAViolation`] a caller logs, so a caller
+///   records the signature it saw rather than a value it invented.
 ///
 /// # Errors
 ///
@@ -933,43 +1295,46 @@ pub fn enforce_category_a(
 /// logged, it cannot be deleted or modified. Counter-attestations augment
 /// but never remove violations.
 ///
+/// Both logging methods take a verified record, so an implementation stores
+/// nothing whose signature no party checked. A caller that holds a bare
+/// [`ScpCustodyViolationAttestation`] reaches these methods only by resolving a
+/// key and calling [`VerifiedCustodyViolation::verify`].
+///
 /// See ADR-039 acceptance criteria 17-18.
 pub trait ViolationStore {
-    /// Log a custody violation attestation.
-    ///
-    /// Validates the attestation before storing.
+    /// Log a custody violation attestation whose verifier signature a caller
+    /// already checked.
     ///
     /// # Errors
     ///
-    /// Returns [`CustodyViolationError`] if the attestation fails structural
-    /// validation.
+    /// Returns [`CustodyViolationError`] if an implementation rejects the
+    /// record.
     fn log_violation(
         &mut self,
-        attestation: ScpCustodyViolationAttestation,
+        attestation: VerifiedCustodyViolation,
     ) -> Result<(), CustodyViolationError>;
 
-    /// Log a counter-attestation against a previously recorded violation.
-    ///
-    /// Validates the counter-attestation before storing.
+    /// Log a counter-attestation whose subject signature a caller already
+    /// checked, against a previously recorded violation.
     ///
     /// # Errors
     ///
-    /// Returns [`CustodyViolationError`] if the counter-attestation fails
-    /// structural validation.
+    /// Returns [`CustodyViolationError`] if an implementation rejects the
+    /// record.
     fn log_counter_attestation(
         &mut self,
-        counter: CounterAttestation,
+        counter: VerifiedCounterAttestation,
     ) -> Result<(), CustodyViolationError>;
 
     /// Retrieve all violation attestations for a DID.
     ///
     /// Returns an empty vec if no violations have been recorded for the DID.
-    fn get_violations_for_did(&self, did: &DID) -> Vec<&ScpCustodyViolationAttestation>;
+    fn get_violations_for_did(&self, did: &DID) -> Vec<&VerifiedCustodyViolation>;
 
     /// Retrieve all counter-attestations for a DID.
     ///
     /// Returns counter-attestations where `subject_did` matches the given DID.
-    fn get_counter_attestations_for_did(&self, did: &DID) -> Vec<&CounterAttestation>;
+    fn get_counter_attestations_for_did(&self, did: &DID) -> Vec<&VerifiedCounterAttestation>;
 }
 
 // ---------------------------------------------------------------------------
@@ -983,10 +1348,10 @@ pub trait ViolationStore {
 #[derive(Debug, Default)]
 pub struct InMemoryViolationStore {
     /// Violations keyed by subject DID.
-    violations: HashMap<DID, Vec<ScpCustodyViolationAttestation>>,
+    violations: HashMap<DID, Vec<VerifiedCustodyViolation>>,
 
     /// Counter-attestations keyed by subject DID.
-    counter_attestations: HashMap<DID, Vec<CounterAttestation>>,
+    counter_attestations: HashMap<DID, Vec<VerifiedCounterAttestation>>,
 }
 
 impl InMemoryViolationStore {
@@ -1000,20 +1365,18 @@ impl InMemoryViolationStore {
 impl ViolationStore for InMemoryViolationStore {
     fn log_violation(
         &mut self,
-        attestation: ScpCustodyViolationAttestation,
+        attestation: VerifiedCustodyViolation,
     ) -> Result<(), CustodyViolationError> {
-        attestation.validate()?;
-        let did = attestation.subject_did.clone();
+        let did = attestation.record().subject_did.clone();
         self.violations.entry(did).or_default().push(attestation);
         Ok(())
     }
 
     fn log_counter_attestation(
         &mut self,
-        counter: CounterAttestation,
+        counter: VerifiedCounterAttestation,
     ) -> Result<(), CustodyViolationError> {
-        counter.validate()?;
-        let did = counter.subject_did.clone();
+        let did = counter.record().subject_did.clone();
         self.counter_attestations
             .entry(did)
             .or_default()
@@ -1021,14 +1384,14 @@ impl ViolationStore for InMemoryViolationStore {
         Ok(())
     }
 
-    fn get_violations_for_did(&self, did: &DID) -> Vec<&ScpCustodyViolationAttestation> {
+    fn get_violations_for_did(&self, did: &DID) -> Vec<&VerifiedCustodyViolation> {
         self.violations
             .get(did)
             .map(|v| v.iter().collect())
             .unwrap_or_default()
     }
 
-    fn get_counter_attestations_for_did(&self, did: &DID) -> Vec<&CounterAttestation> {
+    fn get_counter_attestations_for_did(&self, did: &DID) -> Vec<&VerifiedCounterAttestation> {
         self.counter_attestations
             .get(did)
             .map(|v| v.iter().collect())
@@ -1494,46 +1857,57 @@ mod tests {
     // CounterAttestation (AB-019)
     // -------------------------------------------------------------------
 
+    /// Builds an unsigned violation record naming `subject`, for tests that need
+    /// something to reference.
+    fn sample_violation(subject: &str) -> ScpCustodyViolationAttestation {
+        ScpCustodyViolationAttestation {
+            subject_did: test_did(subject),
+            timestamp: 1_700_000_000,
+            violation: sample_category_a_violation(),
+            verifier_signature: vec![0u8; 64],
+            verifier_did: test_did("verifier"),
+        }
+    }
+
     #[test]
-    fn counter_attestation_new_valid() {
-        let ca = CounterAttestation::new(
-            test_did("subject"),
-            "sha256:abc123".to_string(),
+    fn counter_attestation_referencing_derives_subject_and_reference() {
+        let violation = sample_violation("subject");
+        let ca = CounterAttestation::referencing(
+            &violation,
             "Key was rotated before the violation timestamp".to_string(),
             1_700_001_000,
             vec![0xAA, 0xBB, 0xCC],
         )
         .unwrap();
 
-        assert_eq!(ca.subject_did, test_did("subject"));
-        assert_eq!(ca.violation_reference, "sha256:abc123");
+        assert_eq!(ca.subject_did, violation.subject_did);
+        assert_eq!(ca.violation_reference, violation.signing_hash().unwrap());
         assert_eq!(ca.timestamp, 1_700_001_000);
     }
 
+    /// Two violation records that differ in one recorded fact produce two
+    /// references, so one counter-claim cannot answer both.
     #[test]
-    fn counter_attestation_rejects_empty_violation_reference() {
-        let err = CounterAttestation::new(
-            test_did("subject"),
-            String::new(),
-            "explanation".to_string(),
-            1_700_001_000,
-            vec![0x01],
-        )
-        .unwrap_err();
+    fn counter_attestation_reference_separates_two_violations() {
+        let first = sample_violation("subject");
+        let mut second = first.clone();
+        second.timestamp += 1;
 
-        assert!(matches!(
-            err,
-            CustodyViolationError::EmptyField {
-                field: "violation_reference"
-            }
-        ));
+        let counter_first =
+            CounterAttestation::referencing(&first, "answer".to_string(), 1, vec![0x01]).unwrap();
+        let counter_second =
+            CounterAttestation::referencing(&second, "answer".to_string(), 1, vec![0x01]).unwrap();
+
+        assert_ne!(
+            counter_first.violation_reference,
+            counter_second.violation_reference
+        );
     }
 
     #[test]
     fn counter_attestation_rejects_empty_explanation() {
-        let err = CounterAttestation::new(
-            test_did("subject"),
-            "sha256:abc123".to_string(),
+        let err = CounterAttestation::referencing(
+            &sample_violation("subject"),
             String::new(),
             1_700_001_000,
             vec![0x01],
@@ -1550,9 +1924,8 @@ mod tests {
 
     #[test]
     fn counter_attestation_rejects_empty_signature() {
-        let err = CounterAttestation::new(
-            test_did("subject"),
-            "sha256:abc123".to_string(),
+        let err = CounterAttestation::referencing(
+            &sample_violation("subject"),
             "explanation".to_string(),
             1_700_001_000,
             vec![],
@@ -1567,9 +1940,8 @@ mod tests {
 
     #[test]
     fn counter_attestation_serialize_roundtrip() {
-        let ca = CounterAttestation::new(
-            test_did("subject"),
-            "sha256:abc123".to_string(),
+        let ca = CounterAttestation::referencing(
+            &sample_violation("subject"),
             "Key was rotated before the violation timestamp".to_string(),
             1_700_001_000,
             vec![0xAA, 0xBB, 0xCC],
@@ -1579,38 +1951,6 @@ mod tests {
         let json = serde_json::to_string(&ca).unwrap();
         let back: CounterAttestation = serde_json::from_str(&json).unwrap();
         assert_eq!(ca, back);
-    }
-
-    #[test]
-    fn counter_attestation_references_specific_violation() {
-        let violation = ScpCustodyViolationAttestation::new(
-            test_did("alice"),
-            1_700_000_000,
-            sample_category_a_violation(),
-            vec![0x01, 0x02],
-            test_did("verifier"),
-        )
-        .unwrap();
-
-        let reference = format!(
-            "{}:{}:{}",
-            violation.violation_kind(),
-            violation.subject_did.0,
-            violation.timestamp
-        );
-
-        let counter = CounterAttestation::new(
-            test_did("alice"),
-            reference.clone(),
-            "Agent key was compromised; rotated immediately after detection".to_string(),
-            1_700_001_000,
-            vec![0xAA, 0xBB],
-        )
-        .unwrap();
-
-        assert_eq!(counter.violation_reference, reference);
-        assert_eq!(counter.subject_did, violation.subject_did);
-        assert!(counter.timestamp > violation.timestamp);
     }
 
     // -------------------------------------------------------------------
@@ -1681,7 +2021,7 @@ mod tests {
     fn deser_counter_attestation_rejects_empty_explanation() {
         let json = serde_json::json!({
             "subject_did": "did:dht:subject",
-            "violation_reference": "sha256:abc123",
+            "violation_reference": vec![0u8; 32],
             "explanation": "",
             "timestamp": 1_700_001_000,
             "signature": [0xAA, 0xBB]
@@ -1712,8 +2052,11 @@ mod tests {
     // ViolationStore tests (AB-019)
     // -------------------------------------------------------------------
 
-    fn make_test_violation(subject: &str, action: &str) -> ScpCustodyViolationAttestation {
-        ScpCustodyViolationAttestation {
+    /// Builds a violation record naming `subject`, signs it with the verifier
+    /// key, and returns the [`VerifiedCustodyViolation`] a store accepts.
+    fn make_test_violation(subject: &str, action: &str) -> VerifiedCustodyViolation {
+        let key = test_signing_key(21);
+        let mut record = ScpCustodyViolationAttestation {
             subject_did: DID(subject.to_string()),
             timestamp: 1_700_000_000,
             violation: CustodyViolationType::CategoryAViolation {
@@ -1721,19 +2064,33 @@ mod tests {
                 signer_key_id: SigningKeyId::Agent,
                 signature_evidence: vec![0xDE, 0xAD],
             },
-            verifier_signature: vec![0xAA, 0xBB],
+            verifier_signature: vec![0u8; 64],
             verifier_did: DID("did:dht:verifier".to_string()),
-        }
+        };
+        record.verifier_signature = key
+            .sign(&record.signing_hash().unwrap())
+            .to_bytes()
+            .to_vec();
+        VerifiedCustodyViolation::verify(record, key.verifying_key().as_bytes()).unwrap()
     }
 
-    fn make_test_counter(subject: &str, violation_ref: &str) -> CounterAttestation {
-        CounterAttestation {
-            subject_did: DID(subject.to_string()),
-            violation_reference: violation_ref.to_string(),
-            explanation: "key rotated, incident resolved".to_string(),
-            timestamp: 1_700_001_000,
-            signature: vec![0xCC, 0xDD],
-        }
+    /// Builds a counter-attestation against `violation`, signs it with the
+    /// subject key, and returns the [`VerifiedCounterAttestation`] a store
+    /// accepts.
+    fn make_test_counter(violation: &VerifiedCustodyViolation) -> VerifiedCounterAttestation {
+        let key = test_signing_key(22);
+        let mut counter = CounterAttestation::referencing(
+            violation.record(),
+            "key rotated, incident resolved".to_string(),
+            1_700_001_000,
+            vec![0u8; 64],
+        )
+        .unwrap();
+        counter.signature = key
+            .sign(&counter.signing_hash().unwrap())
+            .to_bytes()
+            .to_vec();
+        VerifiedCounterAttestation::verify(counter, key.verifying_key().as_bytes()).unwrap()
     }
 
     #[test]
@@ -1747,7 +2104,7 @@ mod tests {
         let results = store.get_violations_for_did(&did);
         assert_eq!(results.len(), 1);
         assert!(matches!(
-            &results[0].violation,
+            &results[0].record().violation,
             CustodyViolationType::CategoryAViolation { action, .. }
                 if action == "did_document_update"
         ));
@@ -1778,17 +2135,19 @@ mod tests {
     fn violation_store_counter_attestation() {
         let mut store = InMemoryViolationStore::new();
 
-        store
-            .log_violation(make_test_violation("did:dht:alice", "did_document_update"))
-            .unwrap();
-
-        let counter = make_test_counter("did:dht:alice", "violation-hash-abc");
+        let violation = make_test_violation("did:dht:alice", "did_document_update");
+        let expected_reference = violation.reference().unwrap();
+        let counter = make_test_counter(&violation);
+        counter
+            .answers(&violation)
+            .expect("a counter-claim built from this record answers it");
+        store.log_violation(violation).unwrap();
         store.log_counter_attestation(counter).unwrap();
 
         let alice_did = DID("did:dht:alice".to_string());
         let counters = store.get_counter_attestations_for_did(&alice_did);
         assert_eq!(counters.len(), 1);
-        assert_eq!(counters[0].violation_reference, "violation-hash-abc");
+        assert_eq!(counters[0].record().violation_reference, expected_reference);
     }
 
     #[test]
@@ -1818,12 +2177,12 @@ mod tests {
         // Both violations preserved in order.
         let violations = store.get_violations_for_did(&alice_did);
         assert!(matches!(
-            &violations[0].violation,
+            &violations[0].record().violation,
             CustodyViolationType::CategoryAViolation { action, .. }
                 if action == "did_document_update"
         ));
         assert!(matches!(
-            &violations[1].violation,
+            &violations[1].record().violation,
             CustodyViolationType::CategoryAViolation { action, .. }
                 if action == "pre_rotation"
         ));
@@ -1862,15 +2221,16 @@ mod tests {
         att
     }
 
-    /// Builds a counter-attestation and signs it with `key`.
+    /// Builds a counter-attestation against [`sample_violation`] and signs it
+    /// with `key`.
     fn signed_counter(key: &SigningKey) -> CounterAttestation {
-        let mut counter = CounterAttestation {
-            subject_did: test_did("subject"),
-            violation_reference: "sha256:abc123".to_string(),
-            explanation: "agent key was compromised and rotated".to_string(),
-            timestamp: 1_700_001_000,
-            signature: vec![0u8; 64],
-        };
+        let mut counter = CounterAttestation::referencing(
+            &sample_violation("subject"),
+            "agent key was compromised and rotated".to_string(),
+            1_700_001_000,
+            vec![0u8; 64],
+        )
+        .unwrap();
         counter.signature = key
             .sign(&counter.signing_hash().unwrap())
             .to_bytes()
@@ -2067,7 +2427,7 @@ mod tests {
     fn counter_signature_rejects_tampered_violation_reference() {
         let key = test_signing_key(11);
         let mut counter = signed_counter(&key);
-        counter.violation_reference = "sha256:def456".to_string();
+        counter.violation_reference = [0xAB; 32];
 
         assert!(
             counter
@@ -2119,74 +2479,248 @@ mod tests {
         assert_eq!(COUNTER_ATTESTATION_DOMAIN, "SCP-COUNTER-ATTESTATION-V1:");
     }
 
-    /// Rebuilds the violation signing hash from the literal separator bytes and
-    /// the §9.5.2 field encoding, independently of
-    /// [`crate::crypto::canonical::canonical_hash`], and pins the resulting hex.
-    #[test]
-    fn violation_signing_hash_known_answer() {
-        let att = ScpCustodyViolationAttestation {
-            subject_did: DID("did:dht:subject".to_string()),
+    // -------------------------------------------------------------------
+    // §25.25 cross-implementation vectors (Vector 38, Vector 39)
+    //
+    // `.docs/specs/25-test-vectors.md` §25.25 states both vectors. Each test
+    // below rebuilds the preimage from the literal separator bytes and the
+    // §9.5.2 field encoding, independently of
+    // `crate::crypto::canonical::canonical_hash`, then pins the spec's hex.
+    // -------------------------------------------------------------------
+
+    /// §25.2 reference Ed25519 seed (RFC 8032 §7.1 Test Vector 1). Vector 38's
+    /// verifier signs with this key.
+    const VECTOR_REF_SEED: [u8; 32] =
+        hex_literal_32("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+
+    /// §25.2 secondary Ed25519 seed (RFC 8032 §7.1 Test Vector 2). Vector 39's
+    /// subject signs with this key, which §25.9 Vector 20 also assigns to
+    /// `#active`.
+    const VECTOR_SECONDARY_SEED: [u8; 32] =
+        hex_literal_32("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+
+    /// §25.2 tertiary Ed25519 seed (RFC 8032 §7.1 Test Vector 3). Vector 38's
+    /// `signature_evidence` comes from this key, which §25.9 Vector 20 also
+    /// assigns to `#agent`.
+    const VECTOR_TERTIARY_SEED: [u8; 32] =
+        hex_literal_32("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7");
+
+    /// Decodes a 64-character hex string into 32 bytes at compile time, so a
+    /// seed constant carries no runtime fallible conversion.
+    const fn hex_literal_32(s: &str) -> [u8; 32] {
+        let bytes = s.as_bytes();
+        assert!(bytes.len() == 64, "expected 64 hex characters");
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            out[i] = hex_nibble(bytes[i * 2]) << 4 | hex_nibble(bytes[i * 2 + 1]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Decodes one lowercase hex digit.
+    const fn hex_nibble(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("expected a lowercase hex digit"),
+        }
+    }
+
+    /// Rebuilds §25.25 Vector 38: the violation record its verifier signs.
+    fn vector_38() -> ScpCustodyViolationAttestation {
+        let agent_key = SigningKey::from_bytes(&VECTOR_TERTIARY_SEED);
+        let verifier_key = SigningKey::from_bytes(&VECTOR_REF_SEED);
+
+        let mut record = ScpCustodyViolationAttestation {
+            subject_did: DID("did:dht:z6MkCustodySubject".to_string()),
             timestamp: 1_700_000_000,
             violation: CustodyViolationType::CategoryAViolation {
                 action: "did_document_update".to_string(),
                 signer_key_id: SigningKeyId::Agent,
-                signature_evidence: vec![0xDE, 0xAD, 0xBE, 0xEF],
+                signature_evidence: agent_key.sign(b"did_document_update").to_bytes().to_vec(),
             },
             verifier_signature: vec![0u8; 64],
-            verifier_did: DID("did:dht:verifier".to_string()),
+            verifier_did: DID("did:dht:z6MkCustodyVerifier".to_string()),
         };
+        record.verifier_signature = verifier_key
+            .sign(&record.signing_hash().unwrap())
+            .to_bytes()
+            .to_vec();
+        record
+    }
 
-        let mut h = Sha256::new();
-        h.update(b"SCP-CUSTODY-VIOLATION-V1:");
-        h.update(15u32.to_be_bytes()); // len("did:dht:subject")
-        h.update(b"did:dht:subject");
-        h.update(1_700_000_000u64.to_be_bytes());
-        h.update([0x00u8]); // CategoryAViolation discriminator
-        h.update(19u32.to_be_bytes()); // len("did_document_update")
-        h.update(b"did_document_update");
-        h.update(6u32.to_be_bytes()); // len("#agent")
-        h.update(b"#agent");
-        h.update(4u32.to_be_bytes()); // len(signature_evidence)
-        h.update([0xDE, 0xAD, 0xBE, 0xEF]);
-        h.update(16u32.to_be_bytes()); // len("did:dht:verifier")
-        h.update(b"did:dht:verifier");
-        let expected: [u8; 32] = h.finalize().into();
+    /// Rebuilds §25.25 Vector 39: the counter-attestation Vector 38's subject
+    /// signs against Vector 38.
+    fn vector_39() -> CounterAttestation {
+        let subject_key = SigningKey::from_bytes(&VECTOR_SECONDARY_SEED);
+        let mut counter = CounterAttestation::referencing(
+            &vector_38(),
+            "agent key compromised; rotated and republished".to_string(),
+            1_700_003_600,
+            vec![0u8; 64],
+        )
+        .unwrap();
+        counter.signature = subject_key
+            .sign(&counter.signing_hash().unwrap())
+            .to_bytes()
+            .to_vec();
+        counter
+    }
 
-        assert_eq!(att.signing_hash().unwrap(), expected);
+    /// The Vector 38 `signature_evidence` bytes the spec prints.
+    #[test]
+    fn vector_38_evidence_matches_spec() {
+        let evidence = SigningKey::from_bytes(&VECTOR_TERTIARY_SEED)
+            .sign(b"did_document_update")
+            .to_bytes();
         assert_eq!(
-            hex::encode(expected),
-            "6f83b1abd686f68b2fb9668e37e7712f296ca8a777bd3ae1e97a9f3109da906f"
+            hex::encode(evidence),
+            "c901da4cd2687a2115f83025f7a9e0db28269558848e88cf98c8714e8f50eaaf\
+             7c6f1c757d5a26b471a67b58d5f32d081e6de274031b0d128165c77fe8d9f60b"
         );
     }
 
-    /// Rebuilds the counter-attestation signing hash from the literal separator
-    /// bytes and the §9.5.2 field encoding, and pins the resulting hex.
+    /// Rebuilds the Vector 38 preimage byte-for-byte and pins its SHA-256.
     #[test]
-    fn counter_signing_hash_known_answer() {
-        let counter = CounterAttestation {
-            subject_did: DID("did:dht:subject".to_string()),
-            violation_reference: "sha256:abc123".to_string(),
-            explanation: "key rotated".to_string(),
-            timestamp: 1_700_001_000,
-            signature: vec![0u8; 64],
-        };
+    fn vector_38_signing_hash_matches_spec() {
+        let record = vector_38();
+        let evidence = SigningKey::from_bytes(&VECTOR_TERTIARY_SEED)
+            .sign(b"did_document_update")
+            .to_bytes();
 
-        let mut h = Sha256::new();
-        h.update(b"SCP-COUNTER-ATTESTATION-V1:");
-        h.update(15u32.to_be_bytes()); // len("did:dht:subject")
-        h.update(b"did:dht:subject");
-        h.update(13u32.to_be_bytes()); // len("sha256:abc123")
-        h.update(b"sha256:abc123");
-        h.update(11u32.to_be_bytes()); // len("key rotated")
-        h.update(b"key rotated");
-        h.update(1_700_001_000u64.to_be_bytes());
-        let expected: [u8; 32] = h.finalize().into();
+        let mut preimage: Vec<u8> = Vec::new();
+        preimage.extend_from_slice(b"SCP-CUSTODY-VIOLATION-V1:");
+        preimage.extend_from_slice(&26u32.to_be_bytes()); // len("did:dht:z6MkCustodySubject")
+        preimage.extend_from_slice(b"did:dht:z6MkCustodySubject");
+        preimage.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+        preimage.push(0x00); // CategoryAViolation discriminator
+        preimage.extend_from_slice(&19u32.to_be_bytes()); // len("did_document_update")
+        preimage.extend_from_slice(b"did_document_update");
+        preimage.extend_from_slice(&6u32.to_be_bytes()); // len("#agent")
+        preimage.extend_from_slice(b"#agent");
+        preimage.extend_from_slice(&64u32.to_be_bytes()); // len(signature_evidence)
+        preimage.extend_from_slice(&evidence);
+        preimage.extend_from_slice(&27u32.to_be_bytes()); // len("did:dht:z6MkCustodyVerifier")
+        preimage.extend_from_slice(b"did:dht:z6MkCustodyVerifier");
 
+        assert_eq!(
+            preimage.len(),
+            196,
+            "§25.25 Vector 38 preimage is 196 bytes"
+        );
+        assert_eq!(
+            hex::encode(&preimage),
+            "5343502d435553544f44592d56494f4c4154494f4e2d56313a\
+             0000001a6469643a6468743a7a364d6b437573746f64795375626a656374\
+             000000006553f100\
+             00\
+             000000136469645f646f63756d656e745f757064617465\
+             00000006236167656e74\
+             00000040\
+             c901da4cd2687a2115f83025f7a9e0db28269558848e88cf98c8714e8f50eaaf\
+             7c6f1c757d5a26b471a67b58d5f32d081e6de274031b0d128165c77fe8d9f60b\
+             0000001b6469643a6468743a7a364d6b437573746f64795665726966696572"
+        );
+
+        let expected: [u8; 32] = Sha256::digest(&preimage).into();
+        assert_eq!(record.signing_hash().unwrap(), expected);
+        assert_eq!(
+            hex::encode(expected),
+            "f71802b4a211df2a354484e410e0a16ce4865b9fdbeed4e6a6eaaf930838725a"
+        );
+    }
+
+    /// Pins the Vector 38 Ed25519 signature and checks it verifies under the
+    /// §25.2 reference key.
+    #[test]
+    fn vector_38_signature_matches_spec() {
+        let record = vector_38();
+        assert_eq!(
+            hex::encode(&record.verifier_signature),
+            "47feb109689697fe4a515e5e1b31e4ced02940e9a32d6ac2d4dbc5fec6294b59\
+             7580dedfe98a0ffefb78123c3df81c6c6a1a8ebe0a22bcdc84f2910ce871560b"
+        );
+        let verifier_key = SigningKey::from_bytes(&VECTOR_REF_SEED);
+        VerifiedCustodyViolation::verify(record, verifier_key.verifying_key().as_bytes())
+            .expect("§25.25 Vector 38 verifies under the §25.2 reference key");
+    }
+
+    /// Rebuilds the Vector 39 preimage byte-for-byte and pins its SHA-256. Field
+    /// 2 is the Vector 38 canonical hash, written as 32 raw bytes with no length
+    /// prefix.
+    #[test]
+    fn vector_39_signing_hash_matches_spec() {
+        let counter = vector_39();
+        let reference = vector_38().signing_hash().unwrap();
+
+        let mut preimage: Vec<u8> = Vec::new();
+        preimage.extend_from_slice(b"SCP-COUNTER-ATTESTATION-V1:");
+        preimage.extend_from_slice(&26u32.to_be_bytes()); // len("did:dht:z6MkCustodySubject")
+        preimage.extend_from_slice(b"did:dht:z6MkCustodySubject");
+        preimage.extend_from_slice(&reference); // 32 bytes, no length prefix
+        preimage.extend_from_slice(&46u32.to_be_bytes()); // len(explanation)
+        preimage.extend_from_slice(b"agent key compromised; rotated and republished");
+        preimage.extend_from_slice(&1_700_003_600u64.to_be_bytes());
+
+        assert_eq!(
+            preimage.len(),
+            147,
+            "§25.25 Vector 39 preimage is 147 bytes"
+        );
+        assert_eq!(
+            hex::encode(&preimage),
+            "5343502d434f554e5445522d4154544553544154494f4e2d56313a\
+             0000001a6469643a6468743a7a364d6b437573746f64795375626a656374\
+             f71802b4a211df2a354484e410e0a16ce4865b9fdbeed4e6a6eaaf930838725a\
+             0000002e6167656e74206b657920636f6d70726f6d697365643b20726f746174656420616e642072657075626c6973686564\
+             000000006553ff10"
+        );
+
+        let expected: [u8; 32] = Sha256::digest(&preimage).into();
         assert_eq!(counter.signing_hash().unwrap(), expected);
         assert_eq!(
             hex::encode(expected),
-            "49f87b64b1d023944eaef1c6a34de07d0c32ef92d601d79fa51a07a7d55c7fbc"
+            "7e12cde18598a11b6c270d756029e437d546c2231731f2b2add6ef41c1eb5af1"
         );
+    }
+
+    /// Pins the Vector 39 Ed25519 signature, checks it verifies under the §25.2
+    /// secondary key, and checks that the same signature fails under the
+    /// tertiary key — which is how §9.5.2 enforces ADR-039 acceptance criterion
+    /// 18 without a `signing_key_id` field inside the signed record.
+    #[test]
+    fn vector_39_signature_matches_spec_and_rejects_the_agent_key() {
+        let counter = vector_39();
+        assert_eq!(
+            hex::encode(&counter.signature),
+            "c58f24edf7ffbea6cdf5a5bace97c4a49ca45a0f6338e0a75699b30c0d119176\
+             2e07358be3084195f94365dc539b3047802b5ef27778a4807b13050474d31500"
+        );
+
+        let agent_key = SigningKey::from_bytes(&VECTOR_TERTIARY_SEED);
+        assert!(
+            VerifiedCounterAttestation::verify(
+                counter.clone(),
+                agent_key.verifying_key().as_bytes()
+            )
+            .is_err(),
+            "a counter-claim signed by #active must not verify under #agent"
+        );
+
+        let subject_key = SigningKey::from_bytes(&VECTOR_SECONDARY_SEED);
+        let verified =
+            VerifiedCounterAttestation::verify(counter, subject_key.verifying_key().as_bytes())
+                .expect("§25.25 Vector 39 verifies under the §25.2 secondary key");
+
+        let verifier_key = SigningKey::from_bytes(&VECTOR_REF_SEED);
+        let violation =
+            VerifiedCustodyViolation::verify(vector_38(), verifier_key.verifying_key().as_bytes())
+                .unwrap();
+        verified
+            .answers(&violation)
+            .expect("§25.25 Vector 39 answers §25.25 Vector 38");
     }
 
     /// A signature taken over one record type's preimage does not verify over
@@ -2259,6 +2793,262 @@ mod tests {
                 panic!("enforce_category_a must produce a CategoryAViolation")
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // CategoryARejection (ADR-039 enforcement-stack layer 3)
+    // -------------------------------------------------------------------
+
+    /// A rejection carrying observed evidence builds the record layer 3 requires,
+    /// and that record holds the evidence bytes rather than a placeholder.
+    #[test]
+    fn rejection_carries_observed_evidence_into_a_record() {
+        let evidence = [0xAB; 64];
+        let rejection: CategoryARejection = enforce_category_a(
+            SigningKeyId::Agent,
+            ActionCategory::CategoryA,
+            "did:dht:alice",
+            "add verification method",
+            &evidence,
+        )
+        .unwrap_err()
+        .into();
+
+        assert_eq!(rejection.violator_did(), "did:dht:alice");
+        assert!(
+            rejection
+                .error_message()
+                .contains("Category A action rejected")
+        );
+        match rejection.recorded_violation() {
+            Some(CustodyViolationType::CategoryAViolation {
+                action,
+                signer_key_id,
+                signature_evidence,
+            }) => {
+                assert_eq!(action, "add verification method");
+                assert_eq!(*signer_key_id, SigningKeyId::Agent);
+                assert_eq!(signature_evidence.as_slice(), evidence.as_slice());
+            }
+            other => panic!("expected a recorded CategoryAViolation, got {other:?}"),
+        }
+    }
+
+    /// A rejection carrying no evidence still rejects, reports why no record
+    /// accompanies it, and invents no evidence.
+    #[test]
+    fn rejection_without_evidence_reports_why_it_recorded_nothing() {
+        let rejection: CategoryARejection = enforce_category_a(
+            SigningKeyId::Agent,
+            ActionCategory::CategoryA,
+            "did:dht:alice",
+            "add verification method",
+            &[],
+        )
+        .unwrap_err()
+        .into();
+
+        assert!(rejection.recorded_violation().is_none());
+        assert!(matches!(
+            rejection,
+            CategoryARejection::EvidenceUnusable {
+                reason: CustodyViolationError::EmptyEvidence {
+                    field: "signature_evidence"
+                },
+                ..
+            }
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // VerifiedCustodyViolation / VerifiedCounterAttestation
+    // -------------------------------------------------------------------
+
+    /// Verification is the only way to build a verified record, and it returns
+    /// the record it checked.
+    #[test]
+    fn verified_violation_wraps_the_record_it_checked() {
+        let key = test_signing_key(7);
+        let record = signed_violation(&key, sample_category_a_violation());
+        let verified =
+            VerifiedCustodyViolation::verify(record.clone(), key.verifying_key().as_bytes())
+                .expect("a freshly signed record verifies against its own signer");
+
+        assert_eq!(verified.record(), &record);
+        assert_eq!(
+            verified.reference().unwrap(),
+            record.signing_hash().unwrap()
+        );
+        assert_eq!(verified.into_record(), record);
+    }
+
+    /// A record whose signature came from another key produces no verified
+    /// value, so no store accepts it.
+    #[test]
+    fn verified_violation_rejects_a_wrong_key() {
+        let signer = test_signing_key(7);
+        let other = test_signing_key(8);
+        let record = signed_violation(&signer, sample_category_a_violation());
+
+        let err =
+            VerifiedCustodyViolation::verify(record, other.verifying_key().as_bytes()).unwrap_err();
+        assert!(matches!(
+            err,
+            CustodyViolationError::SignatureVerificationFailed { .. }
+        ));
+    }
+
+    /// A record whose fields a party altered after signing produces no verified
+    /// value.
+    #[test]
+    fn verified_violation_rejects_a_tampered_record() {
+        let key = test_signing_key(7);
+        let mut record = signed_violation(&key, sample_category_a_violation());
+        record.subject_did = test_did("mallory");
+
+        assert!(VerifiedCustodyViolation::verify(record, key.verifying_key().as_bytes()).is_err());
+    }
+
+    /// Shape validation runs before signature verification, so a malformed
+    /// record reports its malformed field.
+    #[test]
+    fn verified_violation_rejects_an_empty_signature_before_checking_it() {
+        let record = ScpCustodyViolationAttestation {
+            verifier_signature: Vec::new(),
+            ..sample_violation("subject")
+        };
+        let key = test_signing_key(7);
+
+        assert!(matches!(
+            VerifiedCustodyViolation::verify(record, key.verifying_key().as_bytes()).unwrap_err(),
+            CustodyViolationError::EmptyVerifierSignature
+        ));
+    }
+
+    #[test]
+    fn verified_counter_wraps_the_record_it_checked() {
+        let key = test_signing_key(11);
+        let counter = signed_counter(&key);
+        let verified =
+            VerifiedCounterAttestation::verify(counter.clone(), key.verifying_key().as_bytes())
+                .expect("a freshly signed counter-claim verifies against its own signer");
+
+        assert_eq!(verified.record(), &counter);
+        assert_eq!(verified.into_record(), counter);
+    }
+
+    #[test]
+    fn verified_counter_rejects_a_wrong_key() {
+        let signer = test_signing_key(11);
+        let other = test_signing_key(12);
+        let counter = signed_counter(&signer);
+
+        assert!(
+            VerifiedCounterAttestation::verify(counter, other.verifying_key().as_bytes()).is_err()
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // violation_reference binding (spec §9.5.2 derivation rule)
+    // -------------------------------------------------------------------
+
+    /// Signs `violation` with `verifier_key` and returns the verified value.
+    fn verified_violation_for(
+        verifier_key: &SigningKey,
+        subject: &str,
+    ) -> VerifiedCustodyViolation {
+        let mut record = sample_violation(subject);
+        record.verifier_signature = verifier_key
+            .sign(&record.signing_hash().unwrap())
+            .to_bytes()
+            .to_vec();
+        VerifiedCustodyViolation::verify(record, verifier_key.verifying_key().as_bytes()).unwrap()
+    }
+
+    /// Signs a counter-claim against `violation` with `subject_key`.
+    fn verified_counter_for(
+        subject_key: &SigningKey,
+        violation: &VerifiedCustodyViolation,
+    ) -> VerifiedCounterAttestation {
+        let mut counter = CounterAttestation::referencing(
+            violation.record(),
+            "agent key rotated".to_string(),
+            1_700_001_000,
+            vec![0u8; 64],
+        )
+        .unwrap();
+        counter.signature = subject_key
+            .sign(&counter.signing_hash().unwrap())
+            .to_bytes()
+            .to_vec();
+        VerifiedCounterAttestation::verify(counter, subject_key.verifying_key().as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn counter_answers_the_record_it_references() {
+        let verifier = test_signing_key(31);
+        let subject = test_signing_key(32);
+        let violation = verified_violation_for(&verifier, "subject");
+        let counter = verified_counter_for(&subject, &violation);
+
+        counter
+            .answers(&violation)
+            .expect("a counter-claim built from this record answers it");
+    }
+
+    /// A counter-claim built against one record does not answer a record whose
+    /// recorded facts differ, because the reference covers every such fact.
+    #[test]
+    fn counter_does_not_answer_a_different_record() {
+        let verifier = test_signing_key(31);
+        let subject = test_signing_key(32);
+        let first = verified_violation_for(&verifier, "subject");
+        let counter = verified_counter_for(&subject, &first);
+
+        let mut other_record = first.record().clone();
+        other_record.timestamp += 1;
+        other_record.verifier_signature = verifier
+            .sign(&other_record.signing_hash().unwrap())
+            .to_bytes()
+            .to_vec();
+        let other =
+            VerifiedCustodyViolation::verify(other_record, verifier.verifying_key().as_bytes())
+                .unwrap();
+
+        assert!(matches!(
+            counter.answers(&other).unwrap_err(),
+            CustodyViolationError::ViolationReferenceMismatch { .. }
+        ));
+    }
+
+    /// One subject cannot answer a record naming another subject, even when it
+    /// copies that record's reference.
+    #[test]
+    fn counter_does_not_answer_a_record_naming_another_subject() {
+        let verifier = test_signing_key(31);
+        let mallory = test_signing_key(33);
+        let violation = verified_violation_for(&verifier, "alice");
+
+        let mut counter = CounterAttestation::referencing(
+            violation.record(),
+            "not my agent key".to_string(),
+            1_700_001_000,
+            vec![0u8; 64],
+        )
+        .unwrap();
+        counter.subject_did = test_did("mallory");
+        counter.signature = mallory
+            .sign(&counter.signing_hash().unwrap())
+            .to_bytes()
+            .to_vec();
+        let mallory_counter =
+            VerifiedCounterAttestation::verify(counter, mallory.verifying_key().as_bytes())
+                .unwrap();
+
+        assert!(matches!(
+            mallory_counter.answers(&violation).unwrap_err(),
+            CustodyViolationError::SubjectMismatch { .. }
+        ));
     }
 
     /// A verification point that observed no signature bytes cannot mint a

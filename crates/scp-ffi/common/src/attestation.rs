@@ -1,15 +1,21 @@
-//! Shared identity link attestation construction for FFI bridges.
+//! Shared identity link attestation construction and verification for FFI
+//! bridges.
 //!
 //! All FFI bridges (`PyO3`, napi-rs, `UniFFI`) create identity link
 //! attestations with identical logic: parse verification method, compute the
 //! attestation ID, build the unsigned struct, validate structure, and compute
-//! canonical signing bytes. This module extracts that shared pipeline so each
-//! bridge only needs to handle custody access, signing, and storage — the
+//! canonical signing bytes. [`build_unsigned_attestation`] holds that pipeline
+//! so each bridge only handles custody access, signing, and storage — the
 //! bridge-specific parts.
+//!
+//! All three bridges also verify identity link attestations with identical
+//! logic. [`verify_link_attestation`] holds that flow, and each bridge supplies
+//! only its own per-instance DID resolver and maps [`LinkVerifyError`] onto its
+//! own error type.
 //!
 //! Gated behind the `resolvers` feature.
 //!
-//! See spec §3.5.1, §3.5.2.
+//! See spec §3.5.1, §3.5.2, §3.5.4.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -186,138 +192,608 @@ pub const LINK_VERIFY_REQUIRES_INSTANCE: &str = "identity link attestation verif
      against a caller-supplied key would return true for an attacker who supplies \
      both that key and that attestation.";
 
-/// Why [`parse_link_attestation`] rejected a caller's two strings.
+/// Why [`verify_link_attestation`] could not return a verdict.
 ///
-/// Each bridge maps this to its own error type, all under
-/// [`IDENT_1044`](crate::error_codes::IDENT_1044) — a malformed argument, not
-/// a verification verdict.
+/// Every variant reports a condition under which no verdict is honest, so a
+/// bridge raises this error rather than answering `false`. A `false` on this
+/// surface reads as "this attestation is forged", and none of these conditions
+/// establishes that.
+///
+/// [`Self::error_code`] gives each variant its `SCP-IDENT-` code, so each
+/// bridge maps a variant onto its own error type by reading two fields rather
+/// than by repeating a match.
 #[derive(Debug)]
-pub enum LinkVerifyInputError {
-    /// `attestation_json` did not parse as an [`IdentityLinkAttestation`].
-    MalformedJson(String),
-    /// `issuer_public_key_hex` did not decode as hexadecimal.
-    MalformedKeyHex(String),
-    /// `issuer_public_key_hex` decoded to a length other than 32 bytes.
-    KeyWrongLength(usize),
+pub enum LinkVerifyError {
+    /// A caller's `attestation_json` did not parse as an
+    /// [`IdentityLinkAttestation`], or a caller's `issuer_public_key_hex` did
+    /// not decode to 32 Ed25519 bytes. Carries a message naming which string
+    /// failed and why.
+    MalformedArgument(String),
+
+    /// A bridge instance holds no DID resolver, so it cannot perform §3.5.4
+    /// step 1. See [`LINK_VERIFY_REQUIRES_INSTANCE`] for why a module-level
+    /// free function always meets this condition.
+    ResolverUnavailable,
+
+    /// A resolver reported a fault while resolving an issuer's DID document
+    /// (§3.5.4 step 1).
+    IssuerResolutionFailed {
+        /// DID an attestation names as its issuer.
+        issuer: String,
+        /// Message a resolver reported.
+        detail: String,
+    },
+
+    /// A resolver found no DID document for an issuer (§3.5.4 step 1).
+    IssuerDocumentMissing {
+        /// DID an attestation names as its issuer.
+        issuer: String,
+    },
+
+    /// This host's clock reads a time before the Unix epoch, so §3.5.4 steps 4
+    /// and 5 have no `now_secs` to compare against.
+    ClockBeforeEpoch,
+
+    /// An issuer's resolved DID document publishes an
+    /// [`AttestationRevocations`](scp_core::identity::attestation::SERVICE_TYPE_ATTESTATION_REVOCATIONS)
+    /// service endpoint, and no bridge fetches one. See
+    /// [`IDENT_1061`](crate::error_codes::IDENT_1061).
+    RevocationListUnread {
+        /// DID an attestation names as its issuer.
+        issuer: String,
+        /// `serviceEndpoint` value that issuer published, so a caller fetches
+        /// it without resolving that document again.
+        endpoint: String,
+    },
+
+    /// A class 2 (Reference) attestation's external proof resource went
+    /// unfetched. See [`IDENT_1062`](crate::error_codes::IDENT_1062).
+    ReferenceProofNotFetched {
+        /// Wire-format name of a verification method (§3.5.2): `signed_post`
+        /// or `dns_record`.
+        method: &'static str,
+        /// `evidence.proof` a caller fetches for itself — a post URL for
+        /// `signed_post`, a domain for `dns_record`.
+        proof: String,
+    },
 }
 
-impl fmt::Display for LinkVerifyInputError {
+impl LinkVerifyError {
+    /// Returns the `SCP-IDENT-` code a bridge reports for this variant.
+    #[must_use]
+    pub const fn error_code(&self) -> &'static str {
+        match self {
+            Self::MalformedArgument(_) => crate::error_codes::IDENT_1044,
+            Self::ResolverUnavailable
+            | Self::IssuerResolutionFailed { .. }
+            | Self::IssuerDocumentMissing { .. }
+            | Self::ClockBeforeEpoch => crate::error_codes::IDENT_1060,
+            Self::RevocationListUnread { .. } => crate::error_codes::IDENT_1061,
+            Self::ReferenceProofNotFetched { .. } => crate::error_codes::IDENT_1062,
+        }
+    }
+}
+
+impl fmt::Display for LinkVerifyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MalformedJson(e) => write!(f, "failed to parse attestation JSON: {e}"),
-            Self::MalformedKeyHex(e) => write!(f, "invalid issuer_public_key_hex: {e}"),
-            Self::KeyWrongLength(len) => write!(
+            Self::MalformedArgument(detail) => write!(f, "{detail}"),
+            Self::ResolverUnavailable => {
+                write!(f, "{LINK_VERIFY_REQUIRES_INSTANCE}")
+            }
+            Self::IssuerResolutionFailed { issuer, detail } => write!(
                 f,
-                "issuer_public_key_hex must decode to 32 Ed25519 bytes, got {len}"
+                "identity link attestation verification could not resolve issuer {issuer} \
+                 (spec §3.5.4 step 1): {detail}"
+            ),
+            Self::IssuerDocumentMissing { issuer } => write!(
+                f,
+                "identity link attestation verification found no DID document for issuer \
+                 {issuer} (spec §3.5.4 step 1)"
+            ),
+            Self::ClockBeforeEpoch => write!(
+                f,
+                "identity link attestation verification read a system clock before the Unix \
+                 epoch, so spec §3.5.4 steps 4 and 5 have no current time to compare against"
+            ),
+            Self::RevocationListUnread { issuer, endpoint } => write!(
+                f,
+                "identity link attestation verification cannot check revocation: issuer \
+                 {issuer} publishes an AttestationRevocations service endpoint at {endpoint}, \
+                 spec §3.5.2 requires a verifier to read that list of revoked attestation IDs \
+                 regardless of an attestation's own revocation_status, and no SCP bridge \
+                 fetches it. Fetch that endpoint and check whether it lists this attestation's \
+                 id before granting trust."
+            ),
+            Self::ReferenceProofNotFetched { method, proof } => write!(
+                f,
+                "identity link attestation carries class 2 (reference) verification method \
+                 {method}, whose proof resource {proof} no SCP bridge fetches. Spec §3.5.4 \
+                 Class 2 step 3 leaves such an attestation unverified and forbids caching a \
+                 negative result, so this is not a rejection. Fetch that resource, confirm the \
+                 issuer's DID appears in it, and decide."
             ),
         }
     }
 }
 
-impl std::error::Error for LinkVerifyInputError {}
+impl std::error::Error for LinkVerifyError {}
 
-/// A caller's two strings, parsed and ready for §3.5.4 verification.
-pub struct ParsedLinkAttestation {
-    /// Attestation a caller presented.
-    pub attestation: IdentityLinkAttestation,
-    /// Ed25519 public key a caller names as the one that signed. §3.5.4 step 1
-    /// takes a signing key from an issuer's resolved DID document, so this key
-    /// is a caller's *assertion about* that document, checked against it — never
-    /// a substitute for it.
-    pub expected_signing_key: [u8; 32],
-}
-
-impl ParsedLinkAttestation {
-    /// Returns an issuer DID string a bridge must resolve for §3.5.4 step 1.
-    #[must_use]
-    pub fn issuer_did(&self) -> &str {
-        (*self.attestation.issuer).as_ref()
-    }
-}
-
-/// Parses a caller's `attestation_json` and `issuer_public_key_hex`.
+/// Runs spec §3.5.4 identity-link verification against a DID document this
+/// function resolves through `resolver`.
+///
+/// One flow serves all three bridges (`PyO3`, napi-rs, `UniFFI`). Each bridge
+/// supplies its own per-instance resolver — the one genuinely per-bridge part —
+/// and maps [`LinkVerifyError`] onto its own error type through
+/// [`LinkVerifyError::error_code`].
+///
+/// # What runs, step by step
+///
+/// 1. Parse `attestation_json` into an [`IdentityLinkAttestation`] and decode
+///    `issuer_public_key_hex` into 32 Ed25519 bytes.
+/// 2. Resolve `attestation.issuer` through `resolver` (§3.5.4 step 1).
+/// 3. Reject, fail closed, when that document publishes an
+///    `AttestationRevocations` service endpoint (§3.5.2 revocation check).
+/// 4. Run
+///    [`verify_identity_link_attestation`](scp_core::identity::attestation::verify_identity_link_attestation):
+///    structural validation, document-to-issuer binding, signature under an
+///    `#active` or `#agent` key that document publishes under an issuer's
+///    control (§3.5.4 steps 1–2), `revocation_status` (step 3), `expires_at`
+///    (step 4), and evidence freshness (step 5, which degrades rather than
+///    rejects).
+/// 5. Check that `issuer_public_key_hex` names a key that same document
+///    publishes at `#active` or `#agent` under an issuer's control.
+///
+/// # What a caller still owes
+///
+/// Step 3 above and a class 2 proof fetch (§3.5.4 Class 2 step 2) both raise a
+/// typed error rather than returning a verdict, because neither a fetch of an
+/// issuer's revocation list nor a fetch of a post URL or DNS TXT record happens
+/// here. A caller performs those fetches and decides.
+///
+/// # A class 2 attestation is unverifiable through any SDK today
+///
+/// This function passes
+/// [`ReferenceProofOutcome::NotFetched`](scp_core::identity::attestation::ReferenceProofOutcome::NotFetched)
+/// unconditionally, so
+/// [`ReferenceProofOutcome::Confirmed`](scp_core::identity::attestation::ReferenceProofOutcome::Confirmed)
+/// is unreachable from all three bridges. Reaching it needs a third argument on
+/// each bridge method carrying a caller's fetch outcome, and adding one breaks
+/// `bindings/typescript/src/scp.ts`, `bindings/swift/`, and
+/// `bindings/kotlin/`. So a `signed_post` or `dns_record` attestation returns
+/// [`LinkVerifyError::ReferenceProofNotFetched`] through every SDK — Python,
+/// TypeScript, Swift, and Kotlin alike — and no SDK caller can obtain a `true`
+/// for one. A caller that needs a class 2 verdict fetches that proof resource
+/// itself and reads
+/// [`verify_identity_link_attestation`](scp_core::identity::attestation::verify_identity_link_attestation)
+/// directly from Rust.
+///
+/// # Why `issuer_public_key_hex` is checked against a document
+///
+/// GitHub issue #2335 finding 2 recorded each bridge calling
+/// `attestation.verify_signature(&caller_key)` and returning that boolean, so
+/// an attacker who supplied both an attestation and a key received `true`.
+/// §3.5.4 step 1 takes a signing key from an issuer's resolved DID document, so
+/// a key a caller supplies is an assertion this function checks against that
+/// document rather than a source of truth. Step 5 above holds a caller to that
+/// assertion without asking a caller to know which of two admissible fragments
+/// signed: an attestation an `#agent` key signed, presented by a caller naming
+/// that issuer's `#active` key, verifies, while an attacker's unpublished key
+/// does not.
+///
+/// # Returns
+///
+/// `true` when steps 4 and 5 both pass. `false` when a §3.5.4 check rejects —
+/// a bad signature, a revoked or expired attestation, or a key an issuer's
+/// document does not publish. Every `false` reaches `tracing` at `info` level
+/// with its reason, because a boolean return carries none.
 ///
 /// # Errors
 ///
-/// Returns [`LinkVerifyInputError`] when either string is malformed, or when a
-/// decoded key is not 32 bytes long.
-pub fn parse_link_attestation(
+/// Returns [`LinkVerifyError`] for every condition under which no verdict is
+/// honest: a malformed argument, an absent resolver, an unresolvable issuer, a
+/// clock before the Unix epoch, an unread revocation list, and an unfetched
+/// class 2 proof resource.
+pub async fn verify_link_attestation<R>(
+    resolver: &R,
     attestation_json: &str,
     issuer_public_key_hex: &str,
-) -> Result<ParsedLinkAttestation, LinkVerifyInputError> {
-    let attestation: IdentityLinkAttestation = serde_json::from_str(attestation_json)
-        .map_err(|e| LinkVerifyInputError::MalformedJson(e.to_string()))?;
-
-    let key_bytes = hex::decode(issuer_public_key_hex)
-        .map_err(|e| LinkVerifyInputError::MalformedKeyHex(e.to_string()))?;
-    let expected_signing_key: [u8; 32] = key_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| LinkVerifyInputError::KeyWrongLength(key_bytes.len()))?;
-
-    Ok(ParsedLinkAttestation {
-        attestation,
-        expected_signing_key,
-    })
-}
-
-/// Decides whether an attestation passes spec §3.5.4 against a DID document a
-/// bridge resolved for its issuer.
-///
-/// Delegates every check to the pure, wasm-safe
-/// [`verify_identity_link_attestation`](scp_core::identity::attestation::verify_identity_link_attestation)
-/// seam, then applies one further rule this boolean surface needs: a key a
-/// caller named must be a key that actually verified. A caller that names an
-/// `#active` key for an attestation an `#agent` key signed learns `false`,
-/// because answering `true` would confirm a claim about a key that signed
-/// nothing.
-///
-/// A Class 2 (Reference) attestation — `signed_post` or `dns_record` — reaches
-/// [`ReferenceProofOutcome::NotFetched`], because no bridge fetches a profile
-/// page or queries a DNS TXT record. §3.5.0 states that an unverified Reference
-/// attestation is equivalent to no attestation, so such an attestation returns
-/// `false` here and a caller performs that fetch itself.
-///
-/// Every rejection reason reaches `tracing` at `info` level, because a boolean
-/// return cannot carry one.
-#[must_use]
-pub fn decide_link_attestation(
-    parsed: &ParsedLinkAttestation,
-    issuer_document: &scp_did::DidDocument,
-    now_secs: u64,
-) -> bool {
+) -> Result<bool, LinkVerifyError>
+where
+    R: scp_identity::resolver::DidResolver + ?Sized,
+{
     use scp_core::identity::attestation::{
-        IdentityLinkVerifyInput, ReferenceProofOutcome, verify_identity_link_attestation,
+        IdentityLinkVerifyError, IdentityLinkVerifyInput, ReferenceProofOutcome,
+        SERVICE_TYPE_ATTESTATION_REVOCATIONS, published_signing_keys,
+        verify_identity_link_attestation,
     };
 
-    let verified = match verify_identity_link_attestation(&IdentityLinkVerifyInput {
-        attestation: &parsed.attestation,
+    // --- 1. Parse a caller's two strings.
+    let attestation: IdentityLinkAttestation =
+        serde_json::from_str(attestation_json).map_err(|e| {
+            LinkVerifyError::MalformedArgument(format!("failed to parse attestation JSON: {e}"))
+        })?;
+    let key_bytes = hex::decode(issuer_public_key_hex).map_err(|e| {
+        LinkVerifyError::MalformedArgument(format!("invalid issuer_public_key_hex: {e}"))
+    })?;
+    let caller_key: [u8; 32] = key_bytes.as_slice().try_into().map_err(|_| {
+        LinkVerifyError::MalformedArgument(format!(
+            "issuer_public_key_hex must decode to 32 Ed25519 bytes, got {}",
+            key_bytes.len()
+        ))
+    })?;
+    let issuer: &str = (*attestation.issuer).as_ref();
+
+    // --- 2. Resolve an issuer's DID document (§3.5.4 step 1).
+    let issuer_document = resolver
+        .resolve(issuer)
+        .await
+        .map_err(|e| LinkVerifyError::IssuerResolutionFailed {
+            issuer: issuer.to_owned(),
+            detail: e.to_string(),
+        })?
+        .ok_or_else(|| LinkVerifyError::IssuerDocumentMissing {
+            issuer: issuer.to_owned(),
+        })?;
+    let issuer_document = &issuer_document.document;
+
+    // --- 3. Revocation list an issuer published (§3.5.2 revocation check).
+    // Fail closed BEFORE any verdict: §3.5.2 requires this check "ALWAYS
+    // required regardless of `revocation_status` value", and no bridge fetches
+    // the endpoint. No shipped writer publishes such a service entry today, so
+    // this rejects nothing that exists; it stops a future publisher from being
+    // silently ignored.
+    if let Some(service) = issuer_document
+        .service
+        .iter()
+        .find(|s| s.service_type == SERVICE_TYPE_ATTESTATION_REVOCATIONS)
+    {
+        return Err(LinkVerifyError::RevocationListUnread {
+            issuer: issuer.to_owned(),
+            endpoint: service.service_endpoint.clone(),
+        });
+    }
+
+    // --- 4. Every §3.5.4 check a pure function can perform.
+    //
+    // Read a clock fallibly. `scp_clock::SystemClock::now_secs` panics on a
+    // clock before the Unix epoch, and `scp-clock` exports no fallible read
+    // (`scp_clock::now_secs` and `scp_clock::ClockError` are both private), so
+    // this reads `SystemTime` directly — matching what
+    // `build_unsigned_attestation` above already does.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| LinkVerifyError::ClockBeforeEpoch)?
+        .as_secs();
+    match verify_identity_link_attestation(&IdentityLinkVerifyInput {
+        attestation: &attestation,
         issuer_document,
         now_secs,
         reference_proof: ReferenceProofOutcome::NotFetched,
     }) {
-        Ok(verified) => verified,
+        Ok(_) => {}
+        // A class 2 proof resource nobody fetched leaves an attestation
+        // unverified (§3.5.4 Class 2 step 3), which is not the same claim as
+        // "forged". Raise rather than hand a caller a negative result that
+        // §3.5.4 forbids caching.
+        Err(IdentityLinkVerifyError::ReferenceProofUnverified { method }) => {
+            return Err(LinkVerifyError::ReferenceProofNotFetched {
+                method,
+                proof: attestation.evidence.proof.clone(),
+            });
+        }
         Err(reason) => {
             tracing::info!(
-                attestation_id = %parsed.attestation.id,
-                issuer = %parsed.attestation.issuer,
+                attestation_id = %attestation.id,
+                issuer = %attestation.issuer,
                 %reason,
                 "identity link attestation rejected (spec §3.5.4)"
             );
-            return false;
+            return Ok(false);
         }
-    };
-
-    if verified.signing_public_key != parsed.expected_signing_key {
-        tracing::info!(
-            attestation_id = %parsed.attestation.id,
-            issuer = %parsed.attestation.issuer,
-            verified_fragment = verified.signing_key_fragment,
-            "identity link attestation verified under a different verification method \
-             than a caller named, so a caller's assertion about which key signed is false"
-        );
-        return false;
     }
 
-    true
+    // --- 5. A caller's assertion about which key signed, checked against that
+    // same document. §3.5.2 admits both `#active` and `#agent`, and an
+    // attestation carries no field naming which fragment signed, so requiring a
+    // caller to name the exact signing key would reject an honest caller who
+    // named the other admissible fragment.
+    if !published_signing_keys(issuer_document, issuer)
+        .iter()
+        .any(|(_, key)| *key == caller_key)
+    {
+        tracing::info!(
+            attestation_id = %attestation.id,
+            issuer = %attestation.issuer,
+            "identity link attestation rejected: issuer_public_key_hex names a key the \
+             issuer's DID document publishes at neither #active nor #agent (spec §3.5.4 step 1)"
+        );
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod link_verification_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use scp_core::identity::attestation::SERVICE_TYPE_ATTESTATION_REVOCATIONS;
+    use scp_identity::resolver::{ResolutionSource, ResolvedDidDocument};
+
+    /// Resolver that answers with one document a test supplies, or with
+    /// nothing.
+    struct FixedResolver(Option<scp_did::DidDocument>);
+
+    impl scp_identity::resolver::DidResolver for FixedResolver {
+        async fn resolve(
+            &self,
+            _did: &str,
+        ) -> Result<Option<ResolvedDidDocument>, scp_identity::IdentityError> {
+            Ok(self.0.clone().map(|document| ResolvedDidDocument {
+                document,
+                seq: 1,
+                source: ResolutionSource::MainlineDht,
+            }))
+        }
+    }
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Mints a signed attestation under `signer`, naming `did_str` as issuer
+    /// and subject, with `method` as its verification method.
+    fn mint(did_str: &str, signer: &SigningKey, method: &str) -> IdentityLinkAttestation {
+        let built = build_unsigned_attestation(
+            did_str,
+            "github.com".to_owned(),
+            "alice".to_owned(),
+            r#"{"type":"oauth_verified","provider":"github.com","subject_id":"12345","verified_at":1700000000}"#.to_owned(),
+            method,
+            Some("12345".to_owned()),
+        )
+        .expect("building an unsigned attestation must succeed");
+        let mut attestation = built.attestation;
+        attestation.signature = signer.sign(&built.canonical_bytes).to_bytes().to_vec();
+        attestation
+    }
+
+    /// Builds a DID document for `did_str` publishing `active` at `#active`,
+    /// and `agent` at `#agent` when supplied.
+    fn document(
+        did_str: &str,
+        active: &[u8; 32],
+        agent: Option<&[u8; 32]>,
+    ) -> scp_did::DidDocument {
+        let identity_key = signing_key(0x11).verifying_key().to_bytes();
+        scp_did::DidDocument::new_with_agent_key(
+            did_str,
+            &identity_key,
+            active,
+            &[0u8; 32],
+            agent.map(<[u8; 32]>::as_slice),
+        )
+    }
+
+    fn run(
+        resolver: &FixedResolver,
+        attestation: &IdentityLinkAttestation,
+        key_hex: &str,
+    ) -> Result<bool, LinkVerifyError> {
+        let json = serde_json::to_string(attestation).unwrap();
+        block_on_verify(resolver, &json, key_hex)
+    }
+
+    /// Drives the async shared flow to completion on this thread. `FixedResolver`
+    /// never yields, so one poll of a pinned future always completes it.
+    fn block_on_verify(
+        resolver: &FixedResolver,
+        attestation_json: &str,
+        key_hex: &str,
+    ) -> Result<bool, LinkVerifyError> {
+        use std::future::Future;
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(std::ptr::null(), &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        // SAFETY: every vtable entry is a no-op over a null data pointer, so no
+        // entry dereferences it.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let future = verify_link_attestation(resolver, attestation_json, key_hex);
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("FixedResolver never yields, so this future must complete"),
+        }
+    }
+
+    const DID: &str = "did:dht:z6MkSharedVerifyFlow";
+
+    #[test]
+    fn accepts_a_key_the_document_publishes_at_active() {
+        let active = signing_key(0xAA);
+        let attestation = mint(DID, &active, "oauth");
+        let resolver = FixedResolver(Some(document(
+            DID,
+            &active.verifying_key().to_bytes(),
+            None,
+        )));
+        let key_hex = hex::encode(active.verifying_key().to_bytes());
+        assert!(run(&resolver, &attestation, &key_hex).unwrap());
+    }
+
+    /// GitHub issue #2335 finding 2 regression pin, in the shape that finding
+    /// names: an attacker supplies BOTH an attestation and the key that signs
+    /// it, keeping an honest issuer's DID in the `issuer` field.
+    ///
+    /// A verifier that calls `attestation.verify_signature(caller_key)` and
+    /// returns that boolean answers `true` here. Taking a signing key from an
+    /// issuer's resolved DID document instead answers `false`. Passing a key
+    /// nobody signed with does NOT exhibit that gap — a signature check
+    /// rejects it either way — so this test forges rather than mutating a key.
+    #[test]
+    fn rejects_an_attacker_supplied_key_and_attestation() {
+        let honest = signing_key(0xAA);
+        let attacker = signing_key(0x07);
+        let mut forged = mint(DID, &honest, "oauth");
+        forged.signature = Vec::new();
+        let canonical = forged.canonical_signing_bytes().unwrap();
+        forged.signature = attacker.sign(&canonical).to_bytes().to_vec();
+
+        assert!(
+            forged
+                .verify_signature(&attacker.verifying_key().to_bytes())
+                .is_ok(),
+            "the forgery must verify under an attacker's own key, or this test exercises nothing"
+        );
+
+        let resolver = FixedResolver(Some(document(
+            DID,
+            &honest.verifying_key().to_bytes(),
+            None,
+        )));
+        let attacker_hex = hex::encode(attacker.verifying_key().to_bytes());
+        assert!(!run(&resolver, &forged, &attacker_hex).unwrap());
+    }
+
+    /// An `#agent` key signed, and a caller named that issuer's `#active` key.
+    /// An attestation carries no field naming which fragment signed, so a
+    /// caller cannot know; requiring an exact match returned `false` for an
+    /// honest caller. A caller's key now has to be one that document
+    /// publishes, which keeps an attacker's key failing.
+    #[test]
+    fn accepts_a_published_sibling_fragment_key() {
+        let active = signing_key(0xAA);
+        let agent = signing_key(0xBB);
+        let attestation = mint(DID, &agent, "oauth");
+        let resolver = FixedResolver(Some(document(
+            DID,
+            &active.verifying_key().to_bytes(),
+            Some(&agent.verifying_key().to_bytes()),
+        )));
+        let active_hex = hex::encode(active.verifying_key().to_bytes());
+        assert!(
+            run(&resolver, &attestation, &active_hex).unwrap(),
+            "an #agent-signed attestation presented with a published #active key must verify"
+        );
+    }
+
+    #[test]
+    fn rejects_a_tampered_attestation() {
+        let active = signing_key(0xAA);
+        let mut attestation = mint(DID, &active, "oauth");
+        attestation.claim.platform_handle = "mallory".to_owned();
+        let resolver = FixedResolver(Some(document(
+            DID,
+            &active.verifying_key().to_bytes(),
+            None,
+        )));
+        let key_hex = hex::encode(active.verifying_key().to_bytes());
+        assert!(!run(&resolver, &attestation, &key_hex).unwrap());
+    }
+
+    /// Spec §3.5.2 requires a verifier to read an issuer's
+    /// `AttestationRevocations` endpoint, and no bridge fetches one, so a
+    /// document publishing one yields a typed error rather than a verdict.
+    #[test]
+    fn fails_closed_when_an_issuer_publishes_a_revocation_endpoint() {
+        let active = signing_key(0xAA);
+        let attestation = mint(DID, &active, "oauth");
+        let mut doc = document(DID, &active.verifying_key().to_bytes(), None);
+        doc.service.push(scp_did::Service {
+            id: format!("{DID}#scp-attestation-revocations"),
+            service_type: SERVICE_TYPE_ATTESTATION_REVOCATIONS.to_owned(),
+            service_endpoint: "https://relay.example.com/scp/v1/revocations/alice".to_owned(),
+        });
+        let resolver = FixedResolver(Some(doc));
+        let key_hex = hex::encode(active.verifying_key().to_bytes());
+
+        match run(&resolver, &attestation, &key_hex) {
+            Err(LinkVerifyError::RevocationListUnread { issuer, endpoint }) => {
+                assert_eq!(issuer, DID);
+                assert_eq!(
+                    endpoint,
+                    "https://relay.example.com/scp/v1/revocations/alice"
+                );
+            }
+            other => panic!("expected RevocationListUnread, got {other:?}"),
+        }
+        let err = run(&resolver, &attestation, &key_hex).unwrap_err();
+        assert_eq!(err.error_code(), crate::error_codes::IDENT_1061);
+    }
+
+    /// Spec §3.5.4 Class 2 step 3 forbids caching a negative result for an
+    /// unfetched reference proof, and `false` on this surface is exactly that
+    /// negative result, so a class 2 attestation raises instead.
+    #[test]
+    fn raises_rather_than_reporting_false_for_an_unfetched_reference_proof() {
+        let active = signing_key(0xAA);
+        let attestation = mint(DID, &active, "dns_record");
+        let resolver = FixedResolver(Some(document(
+            DID,
+            &active.verifying_key().to_bytes(),
+            None,
+        )));
+        let key_hex = hex::encode(active.verifying_key().to_bytes());
+
+        match run(&resolver, &attestation, &key_hex) {
+            Err(LinkVerifyError::ReferenceProofNotFetched { method, .. }) => {
+                assert_eq!(method, "dns_record");
+            }
+            other => panic!("expected ReferenceProofNotFetched, got {other:?}"),
+        }
+        let err = run(&resolver, &attestation, &key_hex).unwrap_err();
+        assert_eq!(err.error_code(), crate::error_codes::IDENT_1062);
+    }
+
+    #[test]
+    fn raises_when_an_issuer_has_no_document() {
+        let active = signing_key(0xAA);
+        let attestation = mint(DID, &active, "oauth");
+        let resolver = FixedResolver(None);
+        let key_hex = hex::encode(active.verifying_key().to_bytes());
+
+        let err = run(&resolver, &attestation, &key_hex).unwrap_err();
+        assert!(matches!(err, LinkVerifyError::IssuerDocumentMissing { .. }));
+        assert_eq!(err.error_code(), crate::error_codes::IDENT_1060);
+    }
+
+    #[test]
+    fn raises_on_a_malformed_argument() {
+        let resolver = FixedResolver(None);
+        let err = block_on_verify(&resolver, "not json", &"00".repeat(32)).unwrap_err();
+        assert!(matches!(err, LinkVerifyError::MalformedArgument(_)));
+        assert_eq!(err.error_code(), crate::error_codes::IDENT_1044);
+
+        let attestation = mint(DID, &signing_key(0xAA), "oauth");
+        let json = serde_json::to_string(&attestation).unwrap();
+        let err = block_on_verify(&resolver, &json, "zz").unwrap_err();
+        assert_eq!(err.error_code(), crate::error_codes::IDENT_1044);
+
+        let err = block_on_verify(&resolver, &json, "00").unwrap_err();
+        assert_eq!(err.error_code(), crate::error_codes::IDENT_1044);
+    }
+
+    #[test]
+    fn an_absent_resolver_carries_the_precondition_code() {
+        assert_eq!(
+            LinkVerifyError::ResolverUnavailable.error_code(),
+            crate::error_codes::IDENT_1060
+        );
+        assert_eq!(
+            LinkVerifyError::ResolverUnavailable.to_string(),
+            LINK_VERIFY_REQUIRES_INSTANCE
+        );
+    }
 }
