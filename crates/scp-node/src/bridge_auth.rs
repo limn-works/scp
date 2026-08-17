@@ -33,7 +33,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use scp_core::bridge::{BridgeConnector, BridgeStatus};
 use scp_core::store::ProtocolRepository;
-use scp_did::DidDocument;
+use scp_did::{DidDocument, SigningKeyId};
 use scp_platform::traits::Storage;
 use serde::{Deserialize, Serialize};
 
@@ -155,6 +155,16 @@ pub struct BridgeJwtClaims {
 pub struct BridgeAuthContext {
     /// The verified JWT claims.
     pub claims: BridgeJwtClaims,
+
+    /// The verification method whose key verified this token — `#active` for a
+    /// human operator, `#agent` for agent software.
+    ///
+    /// §3.11.4 of the identity spec lets a relying party read this value for an
+    /// authorization decision, and ADR-039 gives the two methods distinct
+    /// holders, so a handler gating an action ADR-039 reserves to a human
+    /// requires [`SigningKeyId::Active`] rather than treating every
+    /// authenticated caller alike.
+    pub signing_key_id: SigningKeyId,
 
     /// The resolved bridge connector from the registry.
     pub bridge: BridgeConnector,
@@ -527,7 +537,10 @@ fn decode_jwt_segment(segment: &str) -> Result<Vec<u8>, String> {
 /// # Errors
 ///
 /// Returns a human-readable error string if any check fails.
-fn verify_bridge_jwt(token: &str, lookup: &dyn BridgeLookup) -> Result<BridgeJwtClaims, String> {
+fn verify_bridge_jwt(
+    token: &str,
+    lookup: &dyn BridgeLookup,
+) -> Result<(BridgeJwtClaims, SigningKeyId), String> {
     // Step 1: Split into three segments.
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -588,33 +601,37 @@ fn verify_bridge_jwt(token: &str, lookup: &dyn BridgeLookup) -> Result<BridgeJwt
         },
     );
 
-    // Two gates decide which key verifies this token, and §3.11.4 of the
-    // identity spec states both for a DID-authentication response:
+    // §12.10.2 of the bridge-connector spec sends a bridge login token through
+    // the DID-authentication verification procedure of §3.11.4 of the identity
+    // spec, whose steps 7 and 8 run here in that order.
     //
-    // - Step 7 admits `#active` and `#agent` and rejects every other value with
-    //   `KEY_NOT_AUTHORIZED`. `SigningKeyId::from_fragment` is the one decoder
-    //   for that admitted set, and its enum has exactly those two variants, so
-    //   an Identity Key (`#0`) and a `#retired-{n}` fragment both fail here.
-    // - Step 8 requires the DID document to list that method under
-    //   `authentication`. `signing_key_for` reads the document's own array, so
-    //   a key an owner withdrew from `authentication` — which
-    //   `DidDocument::retire_active_key` does to every key it rotates out —
-    //   supplies nothing, whatever fragment names it.
+    // Step 7 admits `#active` and `#agent` and rejects every other value with
+    // `KEY_NOT_AUTHORIZED`. `SigningKeyId::from_fragment` decodes that admitted
+    // set, and `SigningKeyId` has exactly those two variants, so an Identity
+    // Key (`#0`) and a `#retired-{n}` fragment stop here and never reach a
+    // document.
     //
-    // Step 8 is the load-bearing gate: it reads a fact a document declares, so
-    // it rejects a withdrawn key under any spelling, present or future. Step 7
-    // is a second, independent closed set on top of it.
+    // Step 8 requires this document to reference that method under
+    // `authentication`. `signing_key_for` reads the document's own array, so a
+    // key an owner withdrew from `authentication` on rotation (§9.7.4 of the
+    // security-model spec) supplies no key.
+    //
+    // The two gates cover disjoint inputs rather than one gate re-checking the
+    // other: step 7 decides which fragment strings `SigningKeyId` can carry,
+    // and step 8 decides which of the two an owner still authorizes. Step 8 is
+    // the one that reads a fact a document declares, so it revokes a key an
+    // owner rotated out. Step 7 is what a fragment a document publishes but
+    // ADR-039 forbids from signing runs into.
     //
     // `authentication` rather than `assertionMethod` (W3C DID Core §5.3),
     // because a bridge login token proves control of a DID to this node rather
     // than asserting a statement about a subject.
-    let signing_key_id =
-        scp_did::SigningKeyId::from_fragment(&format!("#{fragment}")).ok_or_else(|| {
-            format!(
-                "JWT kid names verification method #{fragment}, which is not an \
+    let signing_key_id = SigningKeyId::from_fragment(&format!("#{fragment}")).ok_or_else(|| {
+        format!(
+            "JWT kid names verification method #{fragment}, which is not an \
                  operational signing key (expected #active or #agent)"
-            )
-        })?;
+        )
+    })?;
     let pub_key_bytes = did_doc
         .signing_key_for(
             signing_key_id,
@@ -682,7 +699,7 @@ fn verify_bridge_jwt(token: &str, lookup: &dyn BridgeLookup) -> Result<BridgeJwt
         ));
     }
 
-    Ok(claims)
+    Ok((claims, signing_key_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -727,8 +744,8 @@ pub async fn bridge_auth_middleware<L: BridgeLookup>(
     };
 
     // Verify the JWT.
-    let claims = match verify_bridge_jwt(token, lookup.as_ref()) {
-        Ok(claims) => claims,
+    let (claims, signing_key_id) = match verify_bridge_jwt(token, lookup.as_ref()) {
+        Ok(verified) => verified,
         Err(msg) => {
             return bridge_not_authorized(msg).into_response();
         }
@@ -769,7 +786,11 @@ pub async fn bridge_auth_middleware<L: BridgeLookup>(
     }
 
     // Insert the auth context for downstream handlers.
-    let auth_ctx = BridgeAuthContext { claims, bridge };
+    let auth_ctx = BridgeAuthContext {
+        claims,
+        signing_key_id,
+        bridge,
+    };
     req.extensions_mut().insert(auth_ctx);
 
     next.run(req).await.into_response()
@@ -802,8 +823,8 @@ pub async fn bridge_auth_middleware_dyn(
     };
 
     // Verify the JWT.
-    let claims = match verify_bridge_jwt(token, lookup.as_ref()) {
-        Ok(claims) => claims,
+    let (claims, signing_key_id) = match verify_bridge_jwt(token, lookup.as_ref()) {
+        Ok(verified) => verified,
         Err(msg) => {
             return bridge_not_authorized(msg).into_response();
         }
@@ -844,7 +865,11 @@ pub async fn bridge_auth_middleware_dyn(
     }
 
     // Insert the auth context for downstream handlers.
-    let auth_ctx = BridgeAuthContext { claims, bridge };
+    let auth_ctx = BridgeAuthContext {
+        claims,
+        signing_key_id,
+        bridge,
+    };
     req.extensions_mut().insert(auth_ctx);
 
     next.run(req).await.into_response()
@@ -1288,10 +1313,15 @@ mod tests {
             .did_docs
             .push((did.clone(), test_did_document(&did, &signing_key)));
 
-        let verified = verify_bridge_jwt(&token, &lookup).unwrap();
+        let (verified, signing_key_id) = verify_bridge_jwt(&token, &lookup).unwrap();
         assert_eq!(verified.iss, did);
         assert_eq!(verified.scp_bridge_id, "bridge-test-001");
         assert_eq!(verified.scp_context_id, "ctx-test-001");
+        assert_eq!(
+            signing_key_id,
+            SigningKeyId::Active,
+            "a token carrying no kid defaults to #active, and verification reports that"
+        );
     }
 
     #[test]
@@ -1733,10 +1763,12 @@ mod tests {
             format!("{did}#retired-1"),
         ] {
             let token = jwt_with_kid(&claims, &retired_key, &kid);
-            let result = verify_bridge_jwt(&token, &lookup);
+            let error = verify_bridge_jwt(&token, &lookup).err().unwrap_or_else(|| {
+                panic!("kid {kid} names a rotated-out key and must not authenticate")
+            });
             assert!(
-                result.is_err(),
-                "kid {kid} names a rotated-out key and must not authenticate, got {result:?}"
+                error.contains("not an operational signing key"),
+                "kid {kid} must be rejected for naming a non-operational method, got: {error}"
             );
         }
     }
@@ -1759,18 +1791,20 @@ mod tests {
         let claims = test_claims(&did);
         for kid in ["#0".to_owned(), "0".to_owned(), format!("{did}#0")] {
             let token = jwt_with_kid(&claims, &identity_key, &kid);
-            let result = verify_bridge_jwt(&token, &lookup);
+            let error = verify_bridge_jwt(&token, &lookup).err().unwrap_or_else(|| {
+                panic!("kid {kid} names an Identity Key and must not authenticate")
+            });
             assert!(
-                result.is_err(),
-                "kid {kid} names an Identity Key and must not authenticate, got {result:?}"
+                error.contains("not an operational signing key"),
+                "kid {kid} must be rejected for naming a non-operational method, got: {error}"
             );
         }
     }
 
     /// A JWT signed by `#active` is rejected once an owner withdraws `#active`
     /// from `authentication`, which is §3.11.4 step 8 of the identity spec.
-    /// This is the check that rejects a withdrawn key under any fragment
-    /// spelling, so deleting it makes this test fail.
+    /// This is the gate that revokes a key an owner rotated out, so deleting it
+    /// makes this test fail.
     #[test]
     fn reject_bridge_jwt_when_authentication_omits_the_named_method() {
         let active_key = SigningKey::generate(&mut OsRng);
@@ -1784,25 +1818,54 @@ mod tests {
         let claims = test_claims(&did);
         for kid in ["#active", "active"] {
             let token = jwt_with_kid(&claims, &active_key, kid);
-            let result = verify_bridge_jwt(&token, &lookup);
+            let error = verify_bridge_jwt(&token, &lookup).err().unwrap_or_else(|| {
+                panic!("kid {kid} is absent from authentication and must not authenticate")
+            });
             assert!(
-                result.is_err(),
-                "kid {kid} is absent from authentication and must not authenticate, got {result:?}"
+                error.contains("authentication omits"),
+                "kid {kid} must be rejected for an authentication array that omits it, got: {error}"
             );
         }
 
         // A token carrying no `kid` defaults to `#active` and takes the same
         // rejection, so an attacker gains nothing by omitting a header.
         let token = create_bridge_jwt(&claims, &active_key).unwrap();
+        let error = verify_bridge_jwt(&token, &lookup)
+            .expect_err("a kid-less token defaults to #active and must take the same rejection");
         assert!(
-            verify_bridge_jwt(&token, &lookup).is_err(),
-            "a kid-less token defaults to #active and must take the same rejection"
+            error.contains("authentication omits"),
+            "a kid-less token must take the relationship rejection, got: {error}"
+        );
+    }
+
+    /// An `#agent` a document publishes but withdraws from `authentication`
+    /// resolves no key, so the relationship gate covers both operational
+    /// methods rather than `#active` alone.
+    #[test]
+    fn reject_bridge_jwt_when_authentication_omits_the_agent_method() {
+        let active_key = SigningKey::generate(&mut OsRng);
+        let agent_key = SigningKey::generate(&mut OsRng);
+        let did = test_did(&active_key);
+        let mut doc = test_did_document(&did, &active_key);
+        push_unreferenced_method(&mut doc, "agent", &agent_key);
+
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.did_docs.push((did.clone(), doc));
+
+        let claims = test_claims(&did);
+        let token = jwt_with_kid(&claims, &agent_key, "#agent");
+        let error = verify_bridge_jwt(&token, &lookup)
+            .expect_err("an #agent absent from authentication must not authenticate");
+        assert!(
+            error.contains("authentication omits"),
+            "expected an authentication-relationship rejection, got: {error}"
         );
     }
 
     /// A JWT signed by `#active` verifies while `authentication` references
-    /// `#active`, which shows the three rejections above come from a document
-    /// fact rather than from a broken test fixture.
+    /// `#active`, which shows the rejections above come from a document fact
+    /// rather than from a broken test fixture, and verification reports which
+    /// verification method produced the signature.
     #[test]
     fn accept_bridge_jwt_signed_by_an_authenticating_active_key() {
         let active_key = SigningKey::generate(&mut OsRng);
@@ -1813,17 +1876,40 @@ mod tests {
         lookup.did_docs.push((did.clone(), doc));
 
         let claims = test_claims(&did);
-        for kid in ["#active", "active", "#agent"] {
+        for kid in ["#active", "active", &format!("{did}#active")] {
             let token = jwt_with_kid(&claims, &active_key, kid);
-            let verified = verify_bridge_jwt(&token, &lookup);
-            if kid == "#agent" {
-                // The document publishes no `#agent` method, so a claim to
-                // have signed with one resolves nothing.
-                assert!(verified.is_err(), "#agent is absent from this document");
-            } else {
-                assert_eq!(verified.unwrap().iss, did);
-            }
+            let (verified, signing_key_id) = verify_bridge_jwt(&token, &lookup)
+                .unwrap_or_else(|e| panic!("kid {kid} names an authenticating #active: {e}"));
+            assert_eq!(verified.iss, did);
+            assert_eq!(signing_key_id, SigningKeyId::Active);
         }
+    }
+
+    /// A JWT signed by an `#agent` that `authentication` references verifies,
+    /// and verification reports `#agent` rather than `#active`, so a handler
+    /// gating an action ADR-039 reserves to a human can tell them apart.
+    #[test]
+    fn accept_bridge_jwt_signed_by_an_authenticating_agent_key() {
+        let active_key = SigningKey::generate(&mut OsRng);
+        let agent_key = SigningKey::generate(&mut OsRng);
+        let did = test_did(&active_key);
+        let mut doc = test_did_document(&did, &active_key);
+        push_unreferenced_method(&mut doc, "agent", &agent_key);
+        doc.authentication.push(format!("{did}#agent"));
+
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.did_docs.push((did.clone(), doc));
+
+        let claims = test_claims(&did);
+        let token = jwt_with_kid(&claims, &agent_key, "#agent");
+        let (verified, signing_key_id) = verify_bridge_jwt(&token, &lookup)
+            .expect("an #agent that authentication references must authenticate");
+        assert_eq!(verified.iss, did);
+        assert_eq!(
+            signing_key_id,
+            SigningKeyId::Agent,
+            "verification must report the method that produced the signature"
+        );
     }
 
     #[test]
@@ -2126,8 +2212,9 @@ mod tests {
         };
 
         let token = create_bridge_jwt(&claims, &signing_key).unwrap();
-        let verified = verify_bridge_jwt(&token, &lookup).unwrap();
+        let (verified, signing_key_id) = verify_bridge_jwt(&token, &lookup).unwrap();
         assert_eq!(verified.iss, did);
         assert_eq!(verified.scp_bridge_id, "bridge-jwt");
+        assert_eq!(signing_key_id, SigningKeyId::Active);
     }
 }

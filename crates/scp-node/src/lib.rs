@@ -2684,7 +2684,7 @@ async fn validate_persisted_custody<K: KeyCustody>(
                 "persisted identity key handle not found in custody: {e}"
             ))
         })?;
-    verify_vm_match(&persisted.document, "#0", &identity_pub, "identity key")?;
+    verify_vm_match(&persisted.document, "0", &identity_pub, "identity key")?;
 
     // Re-derive the self-certifying DID from the #0 identity key and confirm it
     // matches the persisted DID string. The did:dht identifier is
@@ -2717,7 +2717,7 @@ async fn validate_persisted_custody<K: KeyCustody>(
         })?;
     verify_vm_match(
         &persisted.document,
-        "#active",
+        "active",
         &active_pub,
         "active signing key",
     )?;
@@ -2731,7 +2731,7 @@ async fn validate_persisted_custody<K: KeyCustody>(
         })?;
         verify_vm_match(
             &persisted.document,
-            "#agent",
+            "agent",
             &agent_pub,
             "agent signing key",
         )?;
@@ -2740,31 +2740,47 @@ async fn validate_persisted_custody<K: KeyCustody>(
     Ok(())
 }
 
-/// Checks that a custody-derived public key matches the corresponding
-/// verification method in the DID document.
+/// Checks that a custody-derived public key matches the verification method
+/// this document identifies as `{document.id}#{fragment}`.
 ///
-/// `vm_suffix` is the fragment suffix to search for (e.g. `"#0"`, `"#active"`,
-/// `"#agent"`). If the VM is not found in the document, this is a no-op (the
-/// VM may not exist for optional keys like `#agent`).
+/// `fragment` is a bare fragment name — `"0"`, `"active"`, or `"agent"`.
+/// Matching runs on a whole identifier through
+/// [`DidDocument::verification_method_by_fragment`], so a method some other DID
+/// identifies inside this document matches nothing, a longer fragment ending in
+/// a requested one (`#retired-1#active`) matches nothing, and a repeated
+/// identifier matches nothing either — W3C DID Core §5.3.1 requires an
+/// identifier to be unique, so array position must not decide which method a
+/// custody key is compared against.
+///
+/// An absent method is a mismatch rather than a pass. A caller reaches this
+/// function only after custody answered with a public key for that slot, and a
+/// document describing an identity whose custody holds a key it never published
+/// is a corrupt persisted record. Every constructor publishes `#0` and
+/// `#active`, and `add_agent_key` publishes `#agent` for the one caller that
+/// passes `"agent"`.
 fn verify_vm_match(
     document: &DidDocument,
-    vm_suffix: &str,
+    fragment: &str,
     public_key: &scp_platform::traits::PublicKey,
     label: &str,
 ) -> Result<(), NodeError> {
-    if let Some(vm) = document
-        .verification_method
-        .iter()
-        .find(|vm| vm.id.ends_with(vm_suffix))
-    {
-        let expected_multibase = format!("z{}", bs58::encode(public_key.as_bytes()).into_string());
-        if vm.public_key_multibase != expected_multibase {
-            return Err(NodeError::Storage(format!(
-                "custody {label} does not match DID document {vm_suffix} verification method \
-                 (custody: {expected_multibase}, document: {})",
-                vm.public_key_multibase
-            )));
-        }
+    let vm = document
+        .verification_method_by_fragment(fragment)
+        .ok_or_else(|| {
+            NodeError::Storage(format!(
+                "custody holds a {label}, and DID document {} carries no method identified \
+                 exactly once as {}#{fragment}",
+                document.id, document.id
+            ))
+        })?;
+
+    let expected_multibase = format!("z{}", bs58::encode(public_key.as_bytes()).into_string());
+    if vm.public_key_multibase != expected_multibase {
+        return Err(NodeError::Storage(format!(
+            "custody {label} does not match DID document #{fragment} verification method \
+             (custody: {expected_multibase}, document: {})",
+            vm.public_key_multibase
+        )));
     }
     Ok(())
 }
@@ -4005,6 +4021,104 @@ mod tests {
                  pre-rotation nullifier was minted on a shipped-config persist create path!"
             ),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_vm_match — which method a custody key is compared against
+    // -----------------------------------------------------------------------
+
+    /// Builds a DID document publishing `#0` and `#active` over two distinct
+    /// keys, plus the pre-rotation commitment `DidDocument::new` requires.
+    fn document_for_vm_match() -> (DidDocument, scp_platform::traits::PublicKey) {
+        let identity_key = [3u8; 32];
+        let active_key = [5u8; 32];
+        let did = scp_did::did_dht_from_public_key(&identity_key);
+        let document = DidDocument::new(&did, &identity_key, &active_key, &[7u8; 32]);
+        (
+            document,
+            scp_platform::traits::PublicKey::new(active_key.to_vec()),
+        )
+    }
+
+    /// A method some other DID identifies inside this document is not the
+    /// method a custody key is compared against. A suffix match accepted it.
+    #[test]
+    fn verify_vm_match_rejects_a_method_another_did_identifies() {
+        let (mut document, active_public) = document_for_vm_match();
+        let own_active = document.verification_method_id("active");
+        document
+            .verification_method
+            .retain(|vm| vm.id != own_active);
+        document
+            .verification_method
+            .push(scp_did::VerificationMethod {
+                id: "did:dht:zSomeoneElse#active".to_owned(),
+                method_type: scp_did::ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+                controller: "did:dht:zSomeoneElse".to_owned(),
+                public_key_multibase: format!(
+                    "z{}",
+                    bs58::encode(active_public.as_bytes()).into_string()
+                ),
+            });
+
+        let error = verify_vm_match(&document, "active", &active_public, "active signing key")
+            .expect_err("a foreign method must not answer for this document's #active");
+        assert!(
+            error.to_string().contains("carries no method identified"),
+            "expected an absent-method rejection, got: {error}"
+        );
+    }
+
+    /// A longer fragment ending in a requested one is a different method.
+    #[test]
+    fn verify_vm_match_rejects_a_longer_fragment_ending_in_the_requested_one() {
+        let (mut document, active_public) = document_for_vm_match();
+        let own_active = document.verification_method_id("active");
+        for vm in &mut document.verification_method {
+            if vm.id == own_active {
+                vm.id = document_id_with_fragment(&document.id, "retired-1#active");
+            }
+        }
+
+        let error = verify_vm_match(&document, "active", &active_public, "active signing key")
+            .expect_err("#retired-1#active must not answer for #active");
+        assert!(
+            error.to_string().contains("carries no method identified"),
+            "expected an absent-method rejection, got: {error}"
+        );
+    }
+
+    /// An absent method is a mismatch. Passing silently let a persisted record
+    /// whose document never published a key custody holds load without
+    /// complaint.
+    #[test]
+    fn verify_vm_match_rejects_an_absent_method() {
+        let (mut document, active_public) = document_for_vm_match();
+        let own_active = document.verification_method_id("active");
+        document
+            .verification_method
+            .retain(|vm| vm.id != own_active);
+
+        let error = verify_vm_match(&document, "active", &active_public, "active signing key")
+            .expect_err("an absent method must fail rather than pass");
+        assert!(
+            error.to_string().contains("carries no method identified"),
+            "expected an absent-method rejection, got: {error}"
+        );
+    }
+
+    /// A matching method passes, so the three rejections above cannot come
+    /// from a broken fixture.
+    #[test]
+    fn verify_vm_match_accepts_a_matching_method() {
+        let (document, active_public) = document_for_vm_match();
+        verify_vm_match(&document, "active", &active_public, "active signing key")
+            .expect("the document's own #active matches the custody key");
+    }
+
+    /// Builds `{did}#{fragment}` without borrowing `document` mutably twice.
+    fn document_id_with_fragment(did: &str, fragment: &str) -> String {
+        format!("{did}#{fragment}")
     }
 
     /// Mock TLS provider that succeeds with a self-signed certificate.

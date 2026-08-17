@@ -1177,7 +1177,18 @@ The relying party verifies a response:
       300 seconds or cached with valid TTL. Stale documents MUST trigger
       a fresh resolution.
 6. Extract the public key for signing_key_id from the DID document's
-   verificationMethod array.
+   verificationMethod array. A verification method supplies a key only
+   when all three of these hold; reject with KEY_NOT_AUTHORIZED otherwise:
+   a. Exactly one entry carries the id "{document.id}#{fragment}". A method
+      some other DID identifies inside the document supplies nothing, and
+      neither does a repeated identifier — W3C DID Core §5.3.1 requires a
+      verification method id to be unique within a document, so array
+      position MUST NOT decide which key verifies.
+   b. That entry declares type "Ed25519VerificationKey2020". Decoding
+      publicKeyMultibase alone cannot separate an Ed25519 signing key from
+      an X25519 key-agreement key.
+   c. That entry names the document's own DID as its controller. SCP defines
+      no delegation letting another DID sign as this one.
 7. Confirm signing_key_id is one of "#active" or "#agent". Reject any
    other value with KEY_NOT_AUTHORIZED.
 8. Confirm signing_key_id is listed in the DID document's "authentication"

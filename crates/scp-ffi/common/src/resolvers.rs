@@ -463,14 +463,29 @@ impl IdentityBackedDidResolver {
     /// Extracts the public key a resolved DID document authorizes for signing
     /// an assertion under `signing_key_id`.
     ///
-    /// A UCAN and an identity attestation are both statements a signer asserts
-    /// about a subject, so `assertionMethod` is the verification relationship
-    /// that authorizes a key here (W3C DID Core §5.3.3). A document that
-    /// withdrew a method from `assertionMethod` — which
+    /// `assertionMethod` gates this function. A document that withdrew a method
+    /// from `assertionMethod` — which
     /// [`DidDocument::retire_active_key`](scp_did::DidDocument::retire_active_key)
-    /// does to every key it rotates out — supplies no key through this
-    /// function, so a rotated key stops verifying as soon as an owner
-    /// publishes the document that retired it.
+    /// does to every key it rotates out — supplies no key here, so a rotated
+    /// key stops verifying as soon as an owner publishes the document that
+    /// retired it.
+    ///
+    /// **No artifact names a relationship for a UCAN signature, so this crate
+    /// chose one.** ADR-039's UCAN Impact section says a `kid` header names
+    /// which verification method signed a token, per RFC 7515, and names no
+    /// relationship; §7.3.1 of the trust spec names none either. W3C DID Core
+    /// §5.3.4 defines `capabilityInvocation` and §5.3.5 defines
+    /// `capabilityDelegation`, and a UCAN does one of those two things, so a
+    /// reader has grounds to call `assertionMethod` the wrong choice. The cost
+    /// of the choice is concrete: an owner who withdraws a key from
+    /// `assertionMethod` to stop it delegating capabilities also stops it
+    /// signing event-log leaves, governance votes, checkpoints, and `KeyPackage`
+    /// attestations, because `DidDocument` carries no `capabilityInvocation`
+    /// or `capabilityDelegation` array to separate those powers. Settling this
+    /// means amending §7.3.1 of the trust spec or ADR-039's UCAN Impact
+    /// section, and deciding there whether `DidDocument` gains those two
+    /// arrays. Until that lands, this comment states a code decision rather
+    /// than a protocol rule.
     ///
     /// A [`SigningKeyId`](scp_did::SigningKeyId) argument, rather than a
     /// fragment string, keeps the admitted set closed at two operational
@@ -599,9 +614,15 @@ impl DidResolver for IdentityBackedDidResolver {
         // Decode `kid` through the one canonical fragment decoder, which admits
         // `#active` and `#agent` and nothing else (ADR-039 §UCAN Impact names
         // those two as the verification methods a `kid` header identifies).
-        // `enforce_ucan_category_a` and `validate_key_scope` read the same
-        // `#`-prefixed spelling out of the same header, so this step neither
-        // widens nor narrows what the rest of the pipeline reads.
+        //
+        // This narrows what THIS function accepts. Earlier code stripped a
+        // leading `#`, so a bare `active` resolved here while
+        // `enforce_ucan_category_a` and the `DidResolver` default implementation
+        // both rejected it — one `kid` value, three answers. The `#`-prefixed
+        // spelling is the one `SigningKeyId::as_fragment` emits and the one a
+        // UCAN header carries, so every reader of that header now agrees.
+        // `resolve_export_verifying_key` passed a bare `active` and was the one
+        // caller this narrowing broke.
         let signing_key_id = scp_did::SigningKeyId::from_fragment(kid).ok_or_else(|| {
             CoreUcanError::MalformedToken(format!(
                 "UCAN kid '{kid}' is not a known verification method \
@@ -1205,6 +1226,30 @@ mod tests {
             identity_key,
             DidResolver::resolve_public_key(&resolver, &did).unwrap(),
             "the Identity Key must not be what #active resolves to"
+        );
+    }
+
+    /// `resolve_export_verifying_key` resolves a remote creator's key through
+    /// this resolver, so the two must agree on how a `kid` is spelled.
+    ///
+    /// Its own tests drive a stub resolver, and a stub that accepts a spelling
+    /// this resolver rejects reports success while a shipped import fails
+    /// closed. This test pairs the production caller with the production
+    /// resolver, so a spelling disagreement between them fails here.
+    #[test]
+    fn export_verifying_key_resolves_through_this_resolver() {
+        let (resolved_doc, _rotated_out_key, new_active_key) = document_with_a_rotated_key();
+        let did = resolved_doc.document.id.clone();
+
+        let resolver = make_identity_resolver_returning(resolved_doc);
+        let key =
+            crate::export_verify::resolve_export_verifying_key(Some(&resolver), |_| None, &did)
+                .expect("a remote creator's #active key resolves for export verification");
+
+        assert_eq!(
+            key.to_bytes(),
+            new_active_key,
+            "export verification must read the key #active names after rotation"
         );
     }
 

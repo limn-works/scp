@@ -209,12 +209,6 @@ impl SigningKeyId {
         }
     }
 
-    /// Alias for [`as_fragment`](Self::as_fragment).
-    #[must_use]
-    pub const fn fragment_ref(&self) -> &'static str {
-        self.as_fragment()
-    }
-
     /// Returns the bare fragment name without the `#` prefix (e.g., `"active"` or `"agent"`).
     #[must_use]
     pub const fn fragment(&self) -> &'static str {
@@ -303,12 +297,6 @@ mod tests {
     fn signing_key_id_fragment() {
         assert_eq!(SigningKeyId::Active.fragment(), "active");
         assert_eq!(SigningKeyId::Agent.fragment(), "agent");
-    }
-
-    #[test]
-    fn signing_key_id_fragment_ref() {
-        assert_eq!(SigningKeyId::Active.fragment_ref(), "#active");
-        assert_eq!(SigningKeyId::Agent.fragment_ref(), "#agent");
     }
 
     #[test]

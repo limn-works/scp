@@ -28,6 +28,7 @@
 use ed25519_dalek::VerifyingKey;
 
 use scp_core::crypto::ucan::validate::DidResolver;
+use scp_did::SigningKeyId;
 
 /// Failure modes for [`resolve_export_verifying_key`].
 ///
@@ -126,9 +127,15 @@ where
         did: did.to_owned(),
     })?;
 
+    // `as_fragment` emits the `#`-prefixed spelling — `"#active"`, `"#agent"` —
+    // which is the one form a `kid` header carries (ADR-039 §UCAN Impact) and
+    // the one form `SigningKeyId::from_fragment` decodes. Passing a bare
+    // `"active"` reached a resolver that stripped a leading `#` and reached the
+    // `DidResolver` default implementation, which recognizes only the literal
+    // `"#active"`, so two resolvers answered one call differently.
     let key_bytes = resolver
-        .resolve_public_key_by_kid(did, "active")
-        .or_else(|_| resolver.resolve_public_key_by_kid(did, "agent"))
+        .resolve_public_key_by_kid(did, SigningKeyId::Active.as_fragment())
+        .or_else(|_| resolver.resolve_public_key_by_kid(did, SigningKeyId::Agent.as_fragment()))
         .map_err(|e| ExportVerifyError::ResolutionFailed {
             did: did.to_owned(),
             detail: e.to_string(),
@@ -176,17 +183,17 @@ mod tests {
                 .ok_or_else(|| UcanError::MalformedToken(format!("no key for {did}")))
         }
 
-        // The helper queries `kid` = "active" / "agent" (no leading '#'),
-        // mirroring the production `IdentityBackedDidResolver`, which strips a
-        // leading '#'. The default trait impl only recognizes the literal
-        // "#active", so the stub resolves the `active` fragment explicitly.
+        // The helper queries `kid` = "#active" then "#agent", the spelling
+        // `SigningKeyId::as_fragment` emits and the only spelling
+        // `SigningKeyId::from_fragment` decodes. This stub answers exactly
+        // "#active", so a helper that reverted to a bare "active" would fail
+        // every test below rather than resolve a key.
         fn resolve_public_key_by_kid(&self, did: &str, kid: &str) -> Result<[u8; 32], UcanError> {
-            let fragment = kid.strip_prefix('#').unwrap_or(kid);
-            if fragment == "active" {
+            if kid == SigningKeyId::Active.as_fragment() {
                 self.resolve_public_key(did)
             } else {
                 Err(UcanError::MalformedToken(format!(
-                    "no '{fragment}' key for {did}"
+                    "no '{kid}' key for {did}"
                 )))
             }
         }

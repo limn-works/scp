@@ -355,7 +355,14 @@ The JWT payload contains:
 }
 ```
 
-The platform verifies the JWT signature against the operator's DID document (§3.2). Token lifetime SHOULD NOT exceed 1 hour. The platform MAY cache resolved DID documents with TTL.
+The platform verifies the JWT signature against a key the operator's DID document authorizes, following the verification procedure §3.11.4 of the identity spec states for a DID-authentication response. A bridge login token proves control of a DID to the platform, so `authentication` is the verification relationship that governs it, and the platform applies §3.11.4 steps 7 and 8 in that order:
+
+- Step 7 — the JWT `kid` header names `#active` or `#agent`. The platform MUST reject every other value with `KEY_NOT_AUTHORIZED`, including `#0`, which ADR-039's key-property table marks as signing no operational action, and including any `#retired-{n}` method a Layer 1 rotation assigned. A token carrying no `kid` header names `#active`.
+- Step 8 — the operator's DID document MUST reference that method under `authentication`. The platform MUST reject a token whose named method that array omits. §9.7.4 of the security-model spec removes a rotated key from `authentication`, so this step is what stops a rotated key from authenticating.
+
+The platform MAY read which of the two methods verified for an authorization decision, per §3.11.4 step 11: ADR-039 gives `#active` to a human operator and `#agent` to agent software, so a platform gating an action ADR-039 reserves to a human requires `#active`.
+
+Token lifetime SHOULD NOT exceed 1 hour. The platform MAY cache resolved DID documents with TTL, bounded by the 300-second freshness requirement of §3.11.4 step 5c.
 
 **JWT signing algorithm.** The JWT `alg` header MUST be `EdDSA` (RFC 8037) using Ed25519, consistent with the protocol's key infrastructure. SDKs MUST reject JWTs with any other algorithm.
 

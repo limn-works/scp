@@ -356,9 +356,13 @@ pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
 /// **Trial order is not role pinning.** An `Event` names no verification
 /// method: ADR-011 acceptance criterion 1 defines it with seven fields and no
 /// `signing_key_id`, and §23.13 paragraph 1 tells a verifier to try each method
-/// `assertionMethod` authorizes and to report which one verified. A caller
-/// needing role-level policy (ADR-039 Category A) reads that returned
-/// [`SigningKeyId`].
+/// `assertionMethod` authorizes and to return the one that verified. A caller
+/// attributing an event to a human holder or to agent software reads that
+/// returned [`SigningKeyId`], which is what ADR-039 gives the two methods
+/// distinct holders for. No `EventType` names an act ADR-039's Category A
+/// reserves to a human — that category covers DID document updates,
+/// pre-rotation commitments, identity migration, and root UCAN issuance — so
+/// Category A is not what a caller reads this value for.
 pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] =
     [SigningKeyId::Active, SigningKeyId::Agent];
 
@@ -371,12 +375,12 @@ pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] =
 /// for a new event; a caller reconciling events from a remote peer calls it
 /// through [`verify_event_batch`] (§23.13 paragraph 1).
 ///
-/// # No shipped path verifies an event signature, and what blocks one
+/// # No shipped path verifies an event signature, and two questions block one
 ///
 /// [`append`] has zero callers outside test code, so no shipped path reaches
-/// this function. That is not an oversight a caller can fix on its own: every
-/// shipped writer emits an event whose `signature` field is empty, so a verifier
-/// wired in today would reject every honest event.
+/// this function. Every shipped writer emits an event whose `signature` field
+/// is empty, so a caller who wired a verifier in today would reject every
+/// honest event.
 ///
 /// Two shipped paths append an event another party produced, and both go
 /// through [`append_unsigned_event`], which runs no signature check:
@@ -384,8 +388,9 @@ pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] =
 /// - `scp_client::PerContextState::replay_event`, which
 ///   `ScpClient::join_context_encrypted` drives over a `prior_event_log` stream
 ///   an adder transported. That crate's own append path writes an empty
-///   `signature`, because it does not thread an on-device signing key into a
-///   leaf; that key arrives with the leaf-signing custody slice ADR-057 names.
+///   `signature`, because ADR-057, the in-browser client, records that a
+///   browser holds no identity signing key — only an ephemeral MLS
+///   `SignatureKeyPair` in wasm.
 /// - `scp_runtime::context::export_import`, which replays a snapshot an exporter
 ///   produced. It authenticates that snapshot as a whole — a full-snapshot
 ///   Ed25519 signature (§23.16.8) plus a constant-time compare of the
@@ -393,10 +398,24 @@ pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] =
 ///   it trusts one exporter rather than each named actor.
 ///
 /// §23.13 paragraph 1 requires per-event verification during reconciliation, so
-/// a production caller belongs on the first path once a shipped writer signs a
-/// leaf. The ordering constraint runs one way: leaf signing lands first, then
-/// `join_context_encrypted` resolves one DID document per distinct actor and
-/// hands them to [`verify_event_batch`].
+/// a production caller belongs on the first path. Two questions stand in front
+/// of that caller, and neither is answered in any artifact:
+///
+/// 1. **Which party's signature does a mirrored leaf carry?** §23.13 paragraph
+///    1 says the claimed actor's, and ADR-057 says a per-leaf committer
+///    signature. A `MemberJoined` leaf that every member records has one actor
+///    and one committer, and they are different parties for every member except
+///    the committer.
+/// 2. **Can a per-member signature sit in the leaf preimage at all?**
+///    [`leaf_hash`] hashes the whole event including `signature`, while
+///    [`compute_event_canonical_hash`] excludes it. §7.3.1 requires honest
+///    members to hold byte-identical leaf preimages for one event, because the
+///    §9.9.3 equivocation test compares roots at equal event counts. Two members
+///    that each signed their own copy of one logical event would hold different
+///    leaves and read as equivocating.
+///
+/// A human settles both before a signing scheme lands; this crate does not
+/// choose an answer.
 ///
 /// # Why a document rather than a DID string
 ///

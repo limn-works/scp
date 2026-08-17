@@ -802,20 +802,42 @@ fn verify_remote_checkpoint_authenticity(
         )));
     }
 
-    // Consistency checkpoints are sent under `#active` (ADR-039); resolve the
-    // human signing key to verify the checkpoint signature.
-    let sender_pk = (deps.key_resolver)(&remote.sender_did, scp_did::SigningKeyId::Active)
-        .ok_or_else(|| {
-            ContextError::CryptoFailed(format!(
-                "cannot resolve public key for checkpoint sender {}",
+    // A `ConsistencyCheckpoint` carries no field naming which verification
+    // method signed it, so §23.12 item 1 of the sync spec tells a verifier to
+    // try each operational signing key ADR-039 grants an acting agent —
+    // `#active`, then `#agent` — and to accept the checkpoint when either one
+    // verifies. `key_resolver` reads a key out of the sender's DID document
+    // under `assertionMethod`, so a method an owner withdrew on rotation
+    // supplies nothing and a rotated key stops verifying.
+    //
+    // Trying only `#active` rejected every checkpoint agent software signed,
+    // which §23.12 item 1 has always admitted.
+    let mut failures = Vec::with_capacity(2);
+    for signing_key_id in [scp_did::SigningKeyId::Active, scp_did::SigningKeyId::Agent] {
+        let Some(sender_pk) = (deps.key_resolver)(&remote.sender_did, signing_key_id) else {
+            failures.push(format!(
+                "{} names no usable key on the document of checkpoint sender {}",
+                signing_key_id.as_fragment(),
                 remote.sender_did
-            ))
-        })?;
-    scp_event_log::checkpoint::verify_checkpoint_signature(remote, &sender_pk).map_err(|reason| {
-        ContextError::CryptoFailed(format!(
-            "checkpoint signature verification failed: {reason}"
-        ))
-    })
+            ));
+            continue;
+        };
+        match scp_event_log::checkpoint::verify_checkpoint_signature(remote, &sender_pk) {
+            Ok(()) => return Ok(()),
+            Err(reason) => failures.push(format!(
+                "{} key of {} rejected a checkpoint signature: {reason}",
+                signing_key_id.as_fragment(),
+                remote.sender_did
+            )),
+        }
+    }
+
+    // Report every method tried, so an operator reading a log sees why each one
+    // failed rather than why a last one did.
+    Err(ContextError::CryptoFailed(format!(
+        "checkpoint signature verification failed: {}",
+        failures.join("; ")
+    )))
 }
 
 /// Verify-and-classify CORE of [`compare_remote_checkpoint`]: runs the

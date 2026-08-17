@@ -509,11 +509,21 @@ impl DidDocument {
     /// A caller resolving a key that must verify a signature calls
     /// [`signing_key_for`](Self::signing_key_for), which takes a
     /// [`SigningKeyId`] and a [`VerificationRelationship`] and reads the
-    /// document's own relationship array. This crate exposes no way to resolve
-    /// a key by arbitrary fragment string, because every such call site
-    /// eventually asked a document for a key it never authorized: a rotated
-    /// `#retired-{n}` method keeps its type and its controller, so type and
-    /// controller alone admit a key an owner already withdrew.
+    /// document's own relationship array. This function and `signing_key_for`
+    /// are the two ways this type resolves a key, and each pins its fragment,
+    /// because both call sites that took a fragment string asked a document for
+    /// a key it never authorized: a rotated `#retired-{n}` method keeps its
+    /// type and its controller, so type and controller alone admit a key an
+    /// owner already withdrew.
+    ///
+    /// A caller can still read [`verification_method`](Self::verification_method)
+    /// directly and decode a [`publicKeyMultibase`](VerificationMethod::public_key_multibase)
+    /// value with [`decode_multibase_key`], which is how a serializer and a
+    /// custody-consistency check reach a method. Neither of those two
+    /// operations verifies a signature. A caller that composes them to verify
+    /// one gets no relationship check and none of the three facts below, so a
+    /// reviewer treats that composition as the defect this pair of methods
+    /// exists to prevent.
     ///
     /// # Errors
     ///

@@ -15,7 +15,7 @@ use rand::RngCore;
 use subtle::ConstantTimeEq;
 
 use scp_crypto::verify_ed25519_signature;
-use scp_did::{SigningKeyId, decode_multibase_key};
+use scp_did::{SigningKeyId, VerificationRelationship};
 use scp_identity::resolver::DidResolver;
 use scp_platform::traits::{KeyCustody, KeyHandle};
 use scp_protocol::crypto::canonical::{CanonicalField, canonical_hash};
@@ -330,34 +330,34 @@ pub async fn scpid_verify(
 
     let doc = &did_result.document;
 
-    // Step 6: Extract public key from verification methods.
-    // The fragment in `signing_key_id` includes the `#` prefix (e.g., "#active").
-    // DID document verification method IDs are full URIs: "did:dht:z...#active".
-    let fragment = response.signing_key_id.as_fragment();
-    let expected_vm_id = format!("{}{fragment}", response.did);
-
-    let vm = doc
-        .verification_method
-        .iter()
-        .find(|vm| vm.id == expected_vm_id)
-        .ok_or(ScpIdError::KeyNotAuthorized)?;
-
-    let public_key_bytes = decode_multibase_key(&vm.public_key_multibase).map_err(|e| {
-        ScpIdError::DidResolutionFailed(format!("failed to decode public key: {e}"))
-    })?;
-
-    // Step 7: Confirm signing_key_id is #active or #agent.
-    // The SigningKeyId enum is already constrained to these two variants at the
-    // type level, but we verify defensively for correctness.
-    match response.signing_key_id {
-        SigningKeyId::Active | SigningKeyId::Agent => {}
-    }
-
-    // Step 8: Confirm signing_key_id is in the authentication relationship.
-    // Authentication entries are full DID URI + fragment: "did:dht:z...#active".
-    if !doc.authentication.contains(&expected_vm_id) {
-        return Err(ScpIdError::KeyNotAuthorized);
-    }
+    // Steps 6, 7, and 8 in one call to the crate that owns a DID document.
+    //
+    // `signing_key_for` reads a key out of `doc` under four document facts, and
+    // the last two are the ones this function used to check by hand:
+    //
+    // - Step 6 extracts a key from the method `{doc.id}#{fragment}` names. Two
+    //   facts this function did not check ride along: a `type` of
+    //   `Ed25519VerificationKey2020`, since decoding `publicKeyMultibase` alone
+    //   cannot separate a signing key from a key-agreement key, and a
+    //   `controller` equal to the document's own DID, since SCP defines no
+    //   delegation letting another DID sign as this one. A repeated identifier
+    //   supplies nothing either, because W3C DID Core §5.3.1 requires an
+    //   identifier to be unique and array position must never decide which key
+    //   verifies. This function selected the first of two matches.
+    // - Step 7 admits `#active` and `#agent` and rejects every other value.
+    //   `SigningKeyId` has exactly those two variants, so `response`'s own type
+    //   decides it and no runtime check adds anything.
+    // - Step 8 requires `doc.authentication` to reference that method.
+    //
+    // A failure of any one is `KeyNotAuthorized`, the error §3.11.4 assigns
+    // step 7 and step 8, and the error this function already returned when
+    // step 6 found no method.
+    let public_key_bytes = doc
+        .signing_key_for(
+            response.signing_key_id,
+            VerificationRelationship::Authentication,
+        )
+        .map_err(|_| ScpIdError::KeyNotAuthorized)?;
 
     // Step 9: Reconstruct the canonical hash (same construction as scpid_sign).
     let hash = canonical_hash(
@@ -1335,6 +1335,88 @@ mod tests {
         assert!(
             matches!(result, Err(ScpIdError::KeyNotAuthorized)),
             "expected KeyNotAuthorized when VM not found, got: {result:?}"
+        );
+    }
+
+    /// A method declaring a key-agreement suite supplies no signing key.
+    ///
+    /// Decoding `publicKeyMultibase` alone cannot tell an Ed25519 signing key
+    /// from an X25519 key-agreement key, so step 6 reads `type`. This function
+    /// read no `type` before it delegated to `signing_key_for`.
+    #[tokio::test]
+    async fn test_scpid_verify_rejects_a_method_declaring_another_suite() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
+        let (response, mut doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        let active_id = format!("{did}#active");
+        for vm in &mut doc.verification_method {
+            if vm.id == active_id {
+                vm.method_type = "X25519KeyAgreementKey2020".to_owned();
+            }
+        }
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::KeyNotAuthorized)),
+            "a key-agreement method must supply no signing key, got: {result:?}"
+        );
+    }
+
+    /// A method naming another DID as controller supplies no key.
+    ///
+    /// SCP defines no delegation letting another DID sign as this one, so step
+    /// 6 reads `controller`. This function read no `controller` before it
+    /// delegated to `signing_key_for`.
+    #[tokio::test]
+    async fn test_scpid_verify_rejects_a_method_another_did_controls() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
+        let (response, mut doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        let active_id = format!("{did}#active");
+        for vm in &mut doc.verification_method {
+            if vm.id == active_id {
+                vm.controller = "did:dht:z6MkSomeoneElse".to_owned();
+            }
+        }
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::KeyNotAuthorized)),
+            "a method another DID controls must supply no key, got: {result:?}"
+        );
+    }
+
+    /// A document carrying two methods under one identifier supplies no key.
+    ///
+    /// W3C DID Core §5.3.1 requires an identifier to be unique in a document,
+    /// so array position must never decide which key verifies. This function
+    /// selected the first of two matches before it delegated to
+    /// `signing_key_for`, so an attacker who prepended a decoy `#active`
+    /// entry chose the verifying key.
+    #[tokio::test]
+    async fn test_scpid_verify_rejects_a_repeated_identifier() {
+        let did = "did:dht:z6MkTest";
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
+        let (response, mut doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
+
+        let active_id = format!("{did}#active");
+        let decoy = doc
+            .verification_method
+            .iter()
+            .find(|vm| vm.id == active_id)
+            .cloned()
+            .expect("the signed document publishes #active");
+        doc.verification_method.insert(0, decoy);
+
+        let resolver = TestDidResolver::with_document(doc);
+        let result = scpid_verify(&resolver, &response, &challenge).await;
+        assert!(
+            matches!(result, Err(ScpIdError::KeyNotAuthorized)),
+            "a repeated identifier must supply no key, got: {result:?}"
         );
     }
 
