@@ -28,6 +28,9 @@ nothing:
                ref that action's repository does not publish, so every
                scheduled fuzz run failed in about six seconds and every timeout
                budget this file checks on that workflow guarded nothing.
+  win-shell    A job whose matrix selects windows-latest ran a `run:` script
+               that declared no `shell:`, so GitHub read one script text as
+               PowerShell on that leg and as bash on every other leg.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -419,6 +422,60 @@ def check_toolchain_refs(path: Path, doc: dict) -> None:
             )
 
 
+def job_runner_images(job: dict) -> set[str]:
+    """Return every runner image a job can land on, matrix entries included."""
+    images = {str(job.get("runs-on", ""))}
+    matrix = (job.get("strategy") or {}).get("matrix") or {}
+    if isinstance(matrix, dict):
+        for key, value in matrix.items():
+            if key == "include" and isinstance(value, list):
+                for entry in value:
+                    if isinstance(entry, dict):
+                        images |= {
+                            str(entry[name])
+                            for name in ("runner", "os")
+                            if name in entry
+                        }
+            elif isinstance(value, list):
+                images |= {str(item) for item in value}
+    return images
+
+
+def check_windows_shell(path: Path, doc: dict) -> None:
+    """Every `run:` step a Windows runner can execute declares its shell.
+
+    CRITERION: a step carries a `shell:` key, or its job or its workflow sets
+    `defaults.run.shell`. GitHub reads an undeclared `run:` script as PowerShell
+    on a Windows image and as bash on every other image, so one script text
+    means two languages across one matrix.
+
+    This states a shape a step must carry. Reading a script and guessing which
+    shell its syntax needs would be a denylist that never closes, and a POSIX
+    `for pkg in …; do` loop in job rust of build-matrix.yml is the case that
+    prompted this check: it failed target x86_64-pc-windows-msvc before its
+    first `cargo build`, so that leg uploaded no artifact and job sign-windows
+    in release.yml found no DLL to Authenticode-sign.
+    """
+    workflow_shell = ((doc.get("defaults") or {}).get("run") or {}).get("shell")
+    for job_id, job in sorted(doc["jobs"].items()):
+        if "uses" in job:
+            continue
+        if not any("windows" in image.lower() for image in job_runner_images(job)):
+            continue
+        job_shell = ((job.get("defaults") or {}).get("run") or {}).get("shell")
+        for index, step in enumerate(job.get("steps") or []):
+            if not isinstance(step, dict) or step.get("run") is None:
+                continue
+            name = step.get("name") or f"step {index}"
+            check(
+                f"{path.name}:{job_id} declares a shell for {name!r}",
+                bool(step.get("shell") or job_shell or workflow_shell),
+                "a matrix places this job on a Windows runner, where GitHub reads an "
+                "undeclared `run:` script as PowerShell and reads that same script as "
+                "bash on every other leg",
+            )
+
+
 def collect_pinned_nightlies(doc: dict) -> set[str]:
     """Return every date-pinned nightly a workflow's steps request."""
     pinned = set()
@@ -481,6 +538,10 @@ def main() -> int:
         f"{requested} — a fuzz build check under one nightly says nothing about a "
         f"fuzz run under another",
     )
+
+    print("win-shell — every `run:` step a Windows runner can execute names a shell")
+    for path, doc in documents:
+        check_windows_shell(path, doc)
 
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
