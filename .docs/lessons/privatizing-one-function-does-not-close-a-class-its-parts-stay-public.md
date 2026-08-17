@@ -20,7 +20,9 @@ than it: `verification_method_by_fragment` reads neither type nor controller.
 `scp_runtime::identity::scpid::scpid_verify` — the SCP-ID sign-in verifier all three FFI
 bridges export — was already doing that composition in production, keyed on a
 caller-supplied DID rather than the document's own `id`, with `.find()` returning the first
-of two identical identifiers.
+of two identical identifiers. A later commit routed it through `signing_key_for`, so the
+composition is gone from that call site; the four public items that compose into it are
+still public, and nothing mechanical stops a new caller from writing it again.
 
 **Problem**: Privatization removes one name. It removes a capability only when the parts
 that reconstruct that name are also unreachable. A reviewer who checks `grep -c "pub fn

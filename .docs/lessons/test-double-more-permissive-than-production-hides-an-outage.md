@@ -38,10 +38,14 @@ it.
 - **Do not normalize at the callee when a type can carry the value.** `strip_prefix('#')`
   inside a resolver is a callee absorbing a caller's spelling. Passing `SigningKeyId` rather
   than `&str` removes the spelling from the interface, and the compiler then finds every
-  caller.
+  caller. That is what the fix eventually did, in two steps: first the trait parameter became
+  `SigningKeyId`, then `UcanHeader.kid` did, so serde decodes a `kid` once at JWT header parse
+  and no other reader decodes at all. Narrowing one resolver's accepted set had left four
+  readers of one wire string, two of which disagreed with the other two.
 - **When you narrow what a function accepts, grep every call site for the inputs you just
   removed.** The commit that introduced `from_fragment` here narrowed one function's accepted
-  set and did not sweep its callers for the bare-fragment spelling.
+  set and did not sweep its callers for the bare-fragment spelling. A type change makes that
+  sweep the compiler's job instead of a reviewer's.
 
 Related: `.docs/lessons/mock-test-must-not-invert-real-bridge-behavior.md` (a double that
 encodes the opposite semantics), `.docs/lessons/did-string-key-verifies-no-content-signature.md`
