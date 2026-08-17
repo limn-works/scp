@@ -1737,6 +1737,42 @@ pub fn live_role_state(
     })
 }
 
+/// Reads a context's lifecycle state from that context's supervisor actor.
+///
+/// Every `PyO3` entry point that gates on a lifecycle state reads through this
+/// function. [`PyContextHandle`](crate::context::PyContextHandle) carries a
+/// `state` string, and that string records the last transition THIS bridge
+/// observed: a TTL expiry the supervisor applied on its own timer, a close
+/// another member initiated, a migration that tombstoned the context, and an
+/// actor the watchdog poisoned all leave that string reading `"active"`. A gate
+/// reading that string therefore admits an operation into a context the
+/// supervisor had already stopped serving. The handle's `state` getter stays a
+/// cached snapshot, because its documented contract says so; a gate does not.
+///
+/// Fails closed. A context whose supervisor reports no state — an unknown
+/// context, or one whose mailbox does not answer — yields
+/// [`ScpPyError::ContextError`], so no caller passes a gate on an absent
+/// answer.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` when the supervisor is unavailable, when
+/// the tokio bridge fails (see [`block_on_supervisor_query`]), or when the
+/// supervisor reports no state for `context_id`.
+pub fn live_context_state(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<scp_core::context::ContextState, ScpPyError> {
+    let sup = Arc::clone(supervisor(bi)?);
+    let ctx = context_id.to_owned();
+    block_on_supervisor_query(async move { sup.read_context_state(&ctx).await })?.ok_or_else(|| {
+        ScpPyError::context(format!(
+            "context '{context_id}' has no live supervisor state — refusing to run a \
+             lifecycle-gated operation against a context no actor serves"
+        ))
+    })
+}
+
 /// Reads a context's capability ceiling from that context's supervisor actor,
 /// normalized to the `{resource}:{action}` UCAN capability names that ADR-016
 /// step 8 compares a token's grants against.
