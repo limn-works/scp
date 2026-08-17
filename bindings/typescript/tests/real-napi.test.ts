@@ -1622,7 +1622,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
           "slack",
           mode,
           cooperative ? "https://platform.example.com/hooks" : undefined,
-          cooperative ? Buffer.alloc(32, 7) : undefined,
+          cooperative ? new Array(32).fill(7) : undefined,
           cooperative ? "platform-key-1" : undefined,
         );
         expect(reg.status).toBe("active");
@@ -1638,7 +1638,7 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
           "slack",
           "cooperative",
           "https://platform.example.com/hooks",
-          Buffer.alloc(32, 7),
+          new Array(32).fill(7),
         ),
       ).toThrow(/platform_key/);
     });
