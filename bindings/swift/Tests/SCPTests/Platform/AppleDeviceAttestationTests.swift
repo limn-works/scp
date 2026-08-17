@@ -15,6 +15,9 @@
 // 3. Concurrent first calls to `attest` generate one App Attest key, because
 //    `resolveKeyId` reads a stored key ID and publishes its generation task
 //    inside one critical section.
+// 4. Concurrent calls reach Apple's App Attest service one at a time, and a
+//    second `attest` therefore keeps the key a first `attest` got attested
+//    rather than reading a stale attestation record and discarding that key.
 //
 // Four clauses ADR-025 states, in `.docs/adrs/phase-5.md`:
 //
@@ -25,10 +28,9 @@
 //    `x5c` is an array of at least two byte strings that each parse as a DER
 //    X.509 certificate, element 0 is a credential certificate and element 1 is
 //    an Apple App Attest intermediate certificate, and `receipt` is a byte
-//    string. `readCertificateChain` decides two distinct certificates whose
-//    element 0 names element 1 by subject name, and leaves which authority
-//    element 1 belongs to for an SCP relay; cases below test what that method
-//    decides, not what a relay decides.
+//    string. `readCertificateChain` evaluates those certificates as a
+//    certification path anchored at Apple's App Attest root certificate, and
+//    requires that path to start with element 0 and element 1.
 // 4. `authData` is a byte string of at least 87 bytes: bytes 0 through 31
 //    hold a relying-party ID hash and equal SHA-256 of an app's App ID, byte
 //    32 holds flags, bytes 33 through 36 hold a sign counter, bytes 37 through
@@ -45,6 +47,7 @@
     import DeviceCheck
     import Foundation
     @testable import SCP
+    import Security
     import Testing
 
     // MARK: - Test doubles
@@ -227,6 +230,101 @@
         }
     }
 
+    /// A `DCAppAttestService` that answers each call after a delay and records
+    /// how many calls were outstanding at once.
+    ///
+    /// Apple's App Attest service answers `attestKey` and `generateAssertion`
+    /// over a round trip to Apple, so two calls a caller starts close together
+    /// are outstanding at once unless something serializes them. Answering
+    /// after a delay reproduces that window, and counting outstanding calls is
+    /// what lets a case state whether `AppleDeviceAttestation` closed it.
+    private final class OverlapDetectingAppAttestService: DCAppAttestService, @unchecked Sendable {
+        /// A key ID `generateKey` hands back.
+        static let generatedKeyId = "overlap-detecting-key-id"
+
+        /// What Apple returns for each of three `DCError.invalidKey` conditions.
+        static let invalidKeyError = NSError(
+            domain: DCErrorDomain,
+            code: DCError.invalidKey.rawValue,
+            userInfo: nil
+        )
+
+        /// One scripted answer: what to hand back, and how long to wait first.
+        struct Answer {
+            let result: Result<Data, Error>
+            let delay: TimeInterval
+        }
+
+        private let lock = NSLock()
+        private var attestScript: [Answer]
+        private var assertScript: [Answer]
+        private var outstandingCalls = 0
+        private var peakOutstandingCalls = 0
+
+        /// Most calls this double had outstanding at one moment.
+        var peakConcurrency: Int {
+            lock.withLock { peakOutstandingCalls }
+        }
+
+        init(attestScript: [Answer], assertScript: [Answer]) {
+            self.attestScript = attestScript
+            self.assertScript = assertScript
+            super.init()
+        }
+
+        override var isSupported: Bool {
+            true
+        }
+
+        override func generateKey(completionHandler: @escaping (String?, Error?) -> Void) {
+            completionHandler(Self.generatedKeyId, nil)
+        }
+
+        override func attestKey(
+            _: String,
+            clientDataHash _: Data,
+            completionHandler: @escaping (Data?, Error?) -> Void
+        ) {
+            answer(from: \.attestScript, to: completionHandler)
+        }
+
+        override func generateAssertion(
+            _: String,
+            clientDataHash _: Data,
+            completionHandler: @escaping (Data?, Error?) -> Void
+        ) {
+            answer(from: \.assertScript, to: completionHandler)
+        }
+
+        /// Take a script's next answer, keeping its last answer in place, and
+        /// deliver it after that answer's delay.
+        private func answer(
+            from script: ReferenceWritableKeyPath<OverlapDetectingAppAttestService, [Answer]>,
+            to completionHandler: @escaping (Data?, Error?) -> Void
+        ) {
+            let next: Answer = lock.withLock {
+                outstandingCalls += 1
+                peakOutstandingCalls = max(peakOutstandingCalls, outstandingCalls)
+                guard let first = self[keyPath: script].first else {
+                    return Answer(result: .failure(Self.invalidKeyError), delay: 0)
+                }
+                if self[keyPath: script].count > 1 {
+                    self[keyPath: script].removeFirst()
+                }
+                return first
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + next.delay) { [self] in
+                lock.withLock { outstandingCalls -= 1 }
+                switch next.result {
+                case let .success(data):
+                    completionHandler(data, nil)
+                case let .failure(error):
+                    completionHandler(nil, error)
+                }
+            }
+        }
+    }
+
     /// A `UserDefaults` that keeps every value in memory.
     ///
     /// `AppleDeviceAttestation` reads, writes, and removes one string key, so
@@ -284,59 +382,152 @@
         /// A 32-byte credential ID. Clause 4 constrains no byte of it.
         static let credentialId = [UInt8](repeating: 0x5C, count: 32)
 
-        /// A P-256 certificate in DER form, standing in for an App Attest
-        /// credential certificate. `intermediateCertificate` issued it, so its
-        /// issuer name equals that certificate's subject name, which is what
-        /// clause 3 requires of element 0 of `x5c`.
+        /// A self-signed P-256 root CA certificate in DER form, standing in for
+        /// Apple's App Attest root certificate.
         ///
-        /// Which certification authority element 1 belongs to stays outside
-        /// `verify(token:)`. An SCP relay decides whether a chain reaches
-        /// Apple's App Attest root.
-        static let credentialCertificate = der(
+        /// Clause 3 requires an `x5c` chain to terminate at Apple's App Attest
+        /// root, and Apple holds that root's private key, so no test can build
+        /// a chain Apple signed. Every `verify` case that expects `true`
+        /// therefore hands `AppleDeviceAttestation` this certificate as its one
+        /// anchor and builds chains beneath it. Cases in
+        /// `AppAttestAppleAnchorTests` hand it no anchor, which binds it to
+        /// Apple's root and pins what a production caller gets.
+        static let testRootCertificate = der(
             """
-            MIIBmDCCAT6gAwIBAgIUaqvd+exYmYSALlFVQ/W0O2uFQAEwCgYIKoZIzj0EAwIwKjEoMCYGA1UE
-            AwwfU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZTAgFw0yNjA4MTYxNjAwMjJaGA8yMTI2
-            MDcyMzE2MDAyMlowKDEmMCQGA1UEAwwdU0NQIEFwcEF0dGVzdCBUZXN0IENyZWRlbnRpYWwwWTAT
-            BgcqhkjOPQIBBggqhkjOPQMBBwNCAAQOQ8ei3oFlCZE+Lp6aQV+67h6D8A1UHWenpFK6oM+kMsOf
-            w1kuvOnVCX6dPdVa8MH+zbPBntYm3btEN5gAZYjzo0IwQDAdBgNVHQ4EFgQUnVR1Sv2Fh0JTW/1r
-            riMF1nn/WIEwHwYDVR0jBBgwFoAUhc+NPUBeXkD6U7Roxriq9NNpi+AwCgYIKoZIzj0EAwIDSAAw
-            RQIhANy3qzCL6l/7kTxQytH6MivRZVjwuj5K1257x0whAu0EAiARri/mndaidpfhN1szKhbF8FYn
-            SXA7MCtxCCiCmPGWGQ==
+            MIIBsDCCAVegAwIBAgIUEpz+gnPq8BUXG9o06kMmMqbyqtswCgYIKoZIzj0EAwIwJTEjMCEGA1UEAw
+            waU0NQIEFwcEF0dGVzdCBUZXN0IFJvb3QgQ0EwIBcNMjYwODE3MDM0NjMwWhgPMjEyNjA3MjQwMzQ2
+            MzBaMCUxIzAhBgNVBAMMGlNDUCBBcHBBdHRlc3QgVGVzdCBSb290IENBMFkwEwYHKoZIzj0CAQYIKo
+            ZIzj0DAQcDQgAEZfm4GNde5LEPL6FZhUdmh6abr2NH+TB37bVtjw5uBM68LGSnS1P+IBzVkOY8wgHo
+            gu3E73x2NO8fe84Xsu/WQKNjMGEwHQYDVR0OBBYEFK0nJNceI7oHbymj/JEP7Codr7uTMB8GA1UdIw
+            QYMBaAFK0nJNceI7oHbymj/JEP7Codr7uTMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEG
+            MAoGCCqGSM49BAMCA0cAMEQCID9beOLHDTp1d83GLcWKVa3DOgnZ4RTvDHvKHyZxsixrAiBLPxfsXW
+            GkerYZlDr8YdZl4SGnyB17rOyJ3dsk8FRq5A==
             """
         )
 
-        /// A self-signed P-256 CA certificate in DER form, standing in for an
-        /// Apple App Attest intermediate certificate. It issued
-        /// `credentialCertificate`.
+        /// A P-256 certificate in DER form, standing in for an App Attest
+        /// credential certificate. `intermediateCertificate` issued it, and
+        /// `testRootCertificate` issued that one, so element 0 of `x5c` heads a
+        /// path terminating at the anchor these cases inject.
+        static let credentialCertificate = der(
+            """
+            MIIBtzCCAVygAwIBAgIUKzq+jlxAiO0QFWbiw3dcNbYq/QkwCgYIKoZIzj0EAwIwKjEoMCYGA1UEAw
+            wfU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZTAgFw0yNjA4MTcwMzQ2MzdaGA8yMTI2MDcy
+            NDAzNDYzN1owKDEmMCQGA1UEAwwdU0NQIEFwcEF0dGVzdCBUZXN0IENyZWRlbnRpYWwwWTATBgcqhk
+            jOPQIBBggqhkjOPQMBBwNCAAS/MYXK3xIppZN/w0mpygVLeAawSBwQXTNJMCnjun6KXebSEX32+Tq1
+            ADYk97sKgiuBcZxYcWEIUh1jenJnIqQQo2AwXjAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgD
+            AdBgNVHQ4EFgQU+jxydDE6rguMUTwVLqPfxzU557cwHwYDVR0jBBgwFoAUb73SBIsV2BQv1QeKzoiA
+            TKBeYsUwCgYIKoZIzj0EAwIDSQAwRgIhAOpNoqafHHTYjXPHHM6kVI6Kfg0aHqOy3z0KkimW3Z55Ai
+            EAhMQon7aDotLnphdZ3IXjwxRmb4DoVbbM1qWThgFQKME=
+            """
+        )
+
+        /// A P-256 CA certificate in DER form, standing in for an Apple App
+        /// Attest intermediate certificate. `testRootCertificate` issued it,
+        /// and it issued `credentialCertificate`.
         static let intermediateCertificate = der(
             """
-            MIIBqzCCAVGgAwIBAgIUBoSfz3ohRs4uQwLxpOgtSK5iKoswCgYIKoZIzj0EAwIwKjEoMCYGA1UE
-            AwwfU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZTAgFw0yNjA4MTYxNjAwMjJaGA8yMTI2
-            MDcyMzE2MDAyMlowKjEoMCYGA1UEAwwfU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZTBZ
-            MBMGByqGSM49AgEGCCqGSM49AwEHA0IABLCFR8VwPEdorNei7Sy+3XFYqhHOaTLPuoazLFC21QKz
-            XuE0zNL3fk+Q7J/ZzkewmKrAriXOZTrmFFRoMJWsVQGjUzBRMB0GA1UdDgQWBBSFz409QF5eQPpT
-            tGjGuKr002mL4DAfBgNVHSMEGDAWgBSFz409QF5eQPpTtGjGuKr002mL4DAPBgNVHRMBAf8EBTAD
-            AQH/MAoGCCqGSM49BAMCA0gAMEUCIA++aHRExYw6JSqFxZG4dV6CBQqCLYkcGYGr8mcGCFE8AiEA
-            9kzA+7bOXbfHds/deoZU063YywGSGsfz7z0vvPAKhrI=
+            MIIBuDCCAV+gAwIBAgIUS9iGZBUof14MT+Byg6YxKYYX18UwCgYIKoZIzj0EAwIwJTEjMCEGA1UEAw
+            waU0NQIEFwcEF0dGVzdCBUZXN0IFJvb3QgQ0EwIBcNMjYwODE3MDM0NjM0WhgPMjEyNjA3MjQwMzQ2
+            MzRaMCoxKDAmBgNVBAMMH1NDUCBBcHBBdHRlc3QgVGVzdCBJbnRlcm1lZGlhdGUwWTATBgcqhkjOPQ
+            IBBggqhkjOPQMBBwNCAARKVbivGu3og+j+DO971GB6hWFyqXVXqXXItUwjlW6eluk89Hajxk3BZVxV
+            x/ypx0jqmzaIxLjvD1hWwYmlKzUZo2YwZDASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAw
+            IBBjAdBgNVHQ4EFgQUb73SBIsV2BQv1QeKzoiATKBeYsUwHwYDVR0jBBgwFoAUrSck1x4jugdvKaP8
+            kQ/sKh2vu5MwCgYIKoZIzj0EAwIDRwAwRAIgTZ4ov4tnBH4JdHTIKA2g9T/OM8GtTV/bD1ktQFLJNS
+            ACIEc4Lq1tDjauQaxKqihn7/sQsmaA6qrgihEhqvdthTna
+            """
+        )
+
+        /// A second credential certificate in DER form, which
+        /// `rotatedIntermediateCertificate` issued.
+        ///
+        /// Apple replaces its App Attest intermediate certificate on its own
+        /// schedule. This pair, sharing `testRootCertificate` with
+        /// `credentialCertificate` and carrying a different subject name, a
+        /// different serial number, and a different public key, stands for a
+        /// chain Apple signed after such a replacement.
+        static let rotatedCredentialCertificate = der(
+            """
+            MIIBvDCCAWKgAwIBAgIUWMSrcbu2EaYH4fuYy9PvTitAYg8wCgYIKoZIzj0EAwIwLTErMCkGA1UEAw
+            wiU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZSBHMjAgFw0yNjA4MTcwMzQ3MDBaGA8yMTI2
+            MDcyNDAzNDcwMFowKzEpMCcGA1UEAwwgU0NQIEFwcEF0dGVzdCBUZXN0IENyZWRlbnRpYWwgRzIwWT
+            ATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATM8mH4eqBAfpU65IrimyCz7IDIHOYn+2lEiYQYG3eGCZMO
+            EjhE6lzCxuYek8W33xJO+QOtDZc2cuSMQiQ3QwVco2AwXjAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/w
+            QEAwIHgDAdBgNVHQ4EFgQUw+TvHe0B8vDvprIoeRT+Ztjy0NwwHwYDVR0jBBgwFoAUpAPjjE32T3ap
+            bnttMXmv+kLPvicwCgYIKoZIzj0EAwIDSAAwRQIhAM5eWObLS8wK6QmYbKQOeQcROqw2hPsc8oicCq
+            Cx4fw3AiBSOalFR/JR+ogpAIcx94iyNZj+8ib+LVVd0HTq46CyQQ==
+            """
+        )
+
+        /// A second intermediate certificate in DER form, which
+        /// `testRootCertificate` issued and which issued
+        /// `rotatedCredentialCertificate`.
+        static let rotatedIntermediateCertificate = der(
+            """
+            MIIBvDCCAWKgAwIBAgIUS9iGZBUof14MT+Byg6YxKYYX18YwCgYIKoZIzj0EAwIwJTEjMCEGA1UEAw
+            waU0NQIEFwcEF0dGVzdCBUZXN0IFJvb3QgQ0EwIBcNMjYwODE3MDM0NzAwWhgPMjEyNjA3MjQwMzQ3
+            MDBaMC0xKzApBgNVBAMMIlNDUCBBcHBBdHRlc3QgVGVzdCBJbnRlcm1lZGlhdGUgRzIwWTATBgcqhk
+            jOPQIBBggqhkjOPQMBBwNCAAQO7KxZFjoiqXPP22ENJJLwM6oklMRuodZ45Bq6mhnu/4+KyJtYVoLX
+            LAqPUhDSM1HwxvBXx9vzuPg/j9hFGuuMo2YwZDASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/w
+            QEAwIBBjAdBgNVHQ4EFgQUpAPjjE32T3apbnttMXmv+kLPvicwHwYDVR0jBBgwFoAUrSck1x4jugdv
+            KaP8kQ/sKh2vu5MwCgYIKoZIzj0EAwIDSAAwRQIhAOfOe+roM7/b7eUvXSHmJEZusAmAzNPNUTYQo0
+            wkn7rLAiAWvBhfNJDwjU9x8GGTy5WU2TOfq6611QL4rCKqcIRpDQ==
+            """
+        )
+
+        /// A credential certificate in DER form that a certification authority
+        /// outside this test PKI issued.
+        ///
+        /// `rogueRootCertificate` issued it, so the pair forms a complete,
+        /// internally valid, self-signed chain, and clause 3 rejects it because
+        /// that chain terminates at neither Apple's App Attest root nor
+        /// `testRootCertificate`.
+        static let rogueCredentialCertificate = der(
+            """
+            MIIBrDCCAVGgAwIBAgIUWnuEIm3DdOZvuwgScd3qhoZndO4wCgYIKoZIzj0EAwIwIjEgMB4GA1UEAw
+            wXUm9ndWUgQXBwQXR0ZXN0IFJvb3QgQ0EwIBcNMjYwODE3MDM0NzA2WhgPMjEyNjA3MjQwMzQ3MDZa
+            MCUxIzAhBgNVBAMMGlJvZ3VlIEFwcEF0dGVzdCBDcmVkZW50aWFsMFkwEwYHKoZIzj0CAQYIKoZIzj
+            0DAQcDQgAEpnFWKAT1yzc2r6taBOn1g4Xj01CUEQOkugC8TQuBYS8KWiB14AiR+oYZeGRiUIm957WK
+            59bG60zZc/V/TdgNDaNgMF4wDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0OBBYEFG
+            XWGCyk8Nj5pYzkGhg1pWLXCayuMB8GA1UdIwQYMBaAFGMTcDZcysG7zt/0h9rfSzJ9O3d5MAoGCCqG
+            SM49BAMCA0kAMEYCIQDPsKOd1H2j6e1Fq0rtVGYmfwNyKwNe/R8bxn3QYxLyUAIhAJ9zIpumNczT+y
+            1m2P7qRmVXjfJwDb9ohQKng4BA/Wkg
+            """
+        )
+
+        /// A self-signed root CA certificate in DER form that issued
+        /// `rogueCredentialCertificate`. Anyone can mint this pair with
+        /// `openssl`, which is what makes a chain reaching no pinned anchor
+        /// worthless.
+        static let rogueRootCertificate = der(
+            """
+            MIIBrDCCAVGgAwIBAgIUOSgC3kN3IKkt3Rlv1JzWQGvU1pswCgYIKoZIzj0EAwIwIjEgMB4GA1UEAw
+            wXUm9ndWUgQXBwQXR0ZXN0IFJvb3QgQ0EwIBcNMjYwODE3MDM0NzA2WhgPMjEyNjA3MjQwMzQ3MDZa
+            MCIxIDAeBgNVBAMMF1JvZ3VlIEFwcEF0dGVzdCBSb290IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQ
+            cDQgAEG62S2jEXFb3O79kahwU/Iu/hY4YcU6HM2qFv0SQ3Cqh6B+mDjQF8ewEd4EWzsEQ7KUb8hlGu
+            1qgQ/VolvPA3n6NjMGEwHQYDVR0OBBYEFGMTcDZcysG7zt/0h9rfSzJ9O3d5MB8GA1UdIwQYMBaAFG
+            MTcDZcysG7zt/0h9rfSzJ9O3d5MA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqG
+            SM49BAMCA0kAMEYCIQDpgHs71+2st0jWJlKyZtyqks2IHcPpsOJYqS8Yqt39sgIhAIetDP+DK0CCZb
+            uzO/fxBbACNaJvpEmdgzzHeYcxLkjs
             """
         )
 
         /// `credentialCertificate` with one byte changed: its issuer name's
         /// first `RelativeDistinguishedName` carries tag `SEQUENCE` where X.501
         /// requires `SET`. Every enclosing length stays valid, so
-        /// `SecCertificateCreateWithData` still parses it, while
-        /// `SecCertificateCopyNormalizedIssuerSequence` returns nil for it —
-        /// which is a branch `readCertificateChain` fails closed on.
+        /// `SecCertificateCreateWithData` still parses it, while the issuer
+        /// name it presents matches no certificate's subject name, so no path
+        /// builds from it.
         static let retaggedIssuerCertificate = der(
             """
-            MIIBmDCCAT6gAwIBAgIUaqvd+exYmYSALlFVQ/W0O2uFQAEwCgYIKoZIzj0EAwIwKjAoMCYGA1UE
-            AwwfU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZTAgFw0yNjA4MTYxNjAwMjJaGA8yMTI2
-            MDcyMzE2MDAyMlowKDEmMCQGA1UEAwwdU0NQIEFwcEF0dGVzdCBUZXN0IENyZWRlbnRpYWwwWTAT
-            BgcqhkjOPQIBBggqhkjOPQMBBwNCAAQOQ8ei3oFlCZE+Lp6aQV+67h6D8A1UHWenpFK6oM+kMsOf
-            w1kuvOnVCX6dPdVa8MH+zbPBntYm3btEN5gAZYjzo0IwQDAdBgNVHQ4EFgQUnVR1Sv2Fh0JTW/1r
-            riMF1nn/WIEwHwYDVR0jBBgwFoAUhc+NPUBeXkD6U7Roxriq9NNpi+AwCgYIKoZIzj0EAwIDSAAw
-            RQIhANy3qzCL6l/7kTxQytH6MivRZVjwuj5K1257x0whAu0EAiARri/mndaidpfhN1szKhbF8FYn
-            SXA7MCtxCCiCmPGWGQ==
+            MIIBtzCCAVygAwIBAgIUKzq+jlxAiO0QFWbiw3dcNbYq/QkwCgYIKoZIzj0EAwIwKjAoMCYGA1UEAw
+            wfU0NQIEFwcEF0dGVzdCBUZXN0IEludGVybWVkaWF0ZTAgFw0yNjA4MTcwMzQ2MzdaGA8yMTI2MDcy
+            NDAzNDYzN1owKDEmMCQGA1UEAwwdU0NQIEFwcEF0dGVzdCBUZXN0IENyZWRlbnRpYWwwWTATBgcqhk
+            jOPQIBBggqhkjOPQMBBwNCAAS/MYXK3xIppZN/w0mpygVLeAawSBwQXTNJMCnjun6KXebSEX32+Tq1
+            ADYk97sKgiuBcZxYcWEIUh1jenJnIqQQo2AwXjAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgD
+            AdBgNVHQ4EFgQU+jxydDE6rguMUTwVLqPfxzU557cwHwYDVR0jBBgwFoAUb73SBIsV2BQv1QeKzoiA
+            TKBeYsUwCgYIKoZIzj0EAwIDSQAwRgIhAOpNoqafHHTYjXPHHM6kVI6Kfg0aHqOy3z0KkimW3Z55Ai
+            EAhMQon7aDotLnphdZ3IXjwxRmb4DoVbbM1qWThgFQKME=
             """
         )
 
@@ -345,14 +536,14 @@
         /// either position of a two-element `x5c`.
         static let unrelatedCertificate = der(
             """
-            MIIBpDCCAUugAwIBAgIUXUwOxX/jZnCGvEIsev4suB/T1+AwCgYIKoZIzj0EAwIwJzElMCMGA1UE
-            AwwcU0NQIEFwcEF0dGVzdCBUZXN0IFVucmVsYXRlZDAgFw0yNjA4MTYxNjAwMjJaGA8yMTI2MDcy
-            MzE2MDAyMlowJzElMCMGA1UEAwwcU0NQIEFwcEF0dGVzdCBUZXN0IFVucmVsYXRlZDBZMBMGByqG
-            SM49AgEGCCqGSM49AwEHA0IABBgdZ2UJilP8TlRzMkS8rSdP+LfA6s48yIT/7ibqCOReWQ3HfdYU
-            3y9Zl/timyOCuyMxwiP2I6LwCpWD89Nfog+jUzBRMB0GA1UdDgQWBBQOSVOdgm1GyX08bBRipu/R
-            vDykKjAfBgNVHSMEGDAWgBQOSVOdgm1GyX08bBRipu/RvDykKjAPBgNVHRMBAf8EBTADAQH/MAoG
-            CCqGSM49BAMCA0cAMEQCIHsAmmvJ63Y9coR1rm7koMDTIlm6CKfWqnnWsKn2vB5VAiB/Ih+wj+Ob
-            E9uIhsiI38DjpMDeyQ6tSz/nftMmVyfcAg==
+            MIIBpTCCAUugAwIBAgIUSLm1aEHWNWGCQZ8CCnQQyAQRTkowCgYIKoZIzj0EAwIwJzElMCMGA1UEAw
+            wcU0NQIEFwcEF0dGVzdCBUZXN0IFVucmVsYXRlZDAgFw0yNjA4MTcwMzQ3MDZaGA8yMTI2MDcyNDAz
+            NDcwNlowJzElMCMGA1UEAwwcU0NQIEFwcEF0dGVzdCBUZXN0IFVucmVsYXRlZDBZMBMGByqGSM49Ag
+            EGCCqGSM49AwEHA0IABFhAjHcHSmkbzTYFYLfMK0j4F3Wp8S3nB47IjZ+uOuuJru712fx5Vij0KTKZ
+            qFZZIVXzeQEBUgOTsdysUyEpAJyjUzBRMB0GA1UdDgQWBBQ4kKM+o13HHCOPHr6vnc//zo/+dDAfBg
+            NVHSMEGDAWgBQ4kKM+o13HHCOPHr6vnc//zo/+dDAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMC
+            A0gAMEUCIQDFwXKEgRsS9bP37jI/0p+CYo22oSMQF8dcUDFAF1c7ugIgZ2+K9jRZr8bRQy+bx3Vyjb
+            x3j0ChnPjemSO+gTZcz9Q=
             """
         )
 
@@ -363,6 +554,16 @@
                 return []
             }
             return [UInt8](data)
+        }
+
+        /// `testRootCertificate` as one anchor array, which every `verify` case
+        /// expecting `true` injects into `AppleDeviceAttestation`.
+        static func testAnchors() -> [SecCertificate] {
+            guard let certificate = SecCertificateCreateWithData(
+                nil,
+                Data(testRootCertificate) as CFData
+            ) else { return [] }
+            return [certificate]
         }
 
         /// SHA-256 of an App ID, which clause 4 requires bytes 0 through 31 of
@@ -472,7 +673,29 @@
     }
 
     /// Build an adapter whose App Attest service reports itself unavailable.
-    private func makeUnsupportedAdapter() -> AttestationHarness {
+    ///
+    /// - Parameter anchorCertificates: Certificates `verify(token:)` anchors an
+    ///   `x5c` chain at. This defaults to `CBORFixture.testAnchors()`, because
+    ///   Apple holds its App Attest root's private key and no test can build a
+    ///   chain that root signed. `makeAppleAnchoredAdapter()` builds the
+    ///   adapter a production caller gets.
+    private func makeUnsupportedAdapter(
+        anchorCertificates: [SecCertificate] = CBORFixture.testAnchors()
+    ) -> AttestationHarness {
+        let defaults = InMemoryUserDefaults()
+        let adapter = AppleDeviceAttestation(
+            appId: CBORFixture.appId,
+            service: UnsupportedAppAttestService(),
+            defaults: defaults,
+            anchorCertificates: anchorCertificates
+        )
+        return AttestationHarness(adapter: adapter, defaults: defaults)
+    }
+
+    /// Build an adapter carrying whichever anchor `AppleDeviceAttestation`
+    /// binds when a caller passes none, which is Apple's App Attest root
+    /// certificate.
+    private func makeAppleAnchoredAdapter() -> AttestationHarness {
         let defaults = InMemoryUserDefaults()
         let adapter = AppleDeviceAttestation(
             appId: CBORFixture.appId,
@@ -859,6 +1082,124 @@
         }
     }
 
+    // MARK: - App Attest call ordering
+
+    /// Cases that pin what happens when two callers reach App Attest at once.
+    ///
+    /// `classify(_:keyId:operation:)` maps `DCError.invalidKey` onto three
+    /// conditions by reading whether this adapter recorded an attestation for a
+    /// key, and it discards that key for one of those three. That record
+    /// describes App Attest's state only while no other App Attest call is
+    /// outstanding, so `AppleDeviceAttestation` runs those calls one at a time.
+    /// Each case below states one consequence of that ordering.
+    struct AppAttestCallOrderingTests {
+        private static let keyIdStorageKey = "dev.limn.scp.appAttest.keyId"
+        private static let attestedKeyIdStorageKey = "dev.limn.scp.appAttest.attestedKeyId"
+
+        @Test("a second attest racing a first keeps the key that first attest got attested")
+        func concurrentAttestKeepsAttestedKey() async {
+            // Apple answers a first `attestKey` with an attestation after a
+            // round trip, and answers a second one — for a key it already
+            // attested — with `DCError.invalidKey`. A second caller that reads
+            // this adapter's attestation record before a first caller writes it
+            // takes the rejected-key row and deletes a live Secure Enclave key.
+            let defaults = InMemoryUserDefaults()
+            let service = OverlapDetectingAppAttestService(
+                attestScript: [
+                    .init(result: .success(Data([0xA1, 0xA2])), delay: 0.20),
+                    .init(result: .failure(OverlapDetectingAppAttestService.invalidKeyError), delay: 0)
+                ],
+                assertScript: [
+                    .init(result: .success(Data([0xB1])), delay: 0)
+                ]
+            )
+            let adapter = AppleDeviceAttestation(
+                appId: CBORFixture.appId,
+                service: service,
+                defaults: defaults
+            )
+
+            async let first = adapter.attest(challenge: Data([0x01]), deviceId: Data([0x02]))
+            // Let a first caller reach `attestKey` before a second caller
+            // starts, so a second caller takes a second scripted answer.
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            async let second = adapter.attest(challenge: Data([0x03]), deviceId: Data([0x04]))
+
+            let firstOutcome = try? await first
+            var secondError: AttestationError?
+            do {
+                let token = try await second
+                Issue.record("a second attest returned \(token.count) bytes instead of throwing")
+            } catch let error as AttestationError {
+                secondError = error
+            } catch {
+                Issue.record("a second attest threw \(error), which is no AttestationError")
+            }
+
+            #expect(firstOutcome == Data([0xA1, 0xA2]))
+            #expect(
+                defaults.string(forKey: Self.keyIdStorageKey)
+                    == OverlapDetectingAppAttestService.generatedKeyId,
+                "a racing attest discarded a key Apple had attested"
+            )
+            #expect(
+                defaults.string(forKey: Self.attestedKeyIdStorageKey)
+                    == OverlapDetectingAppAttestService.generatedKeyId
+            )
+            guard case .keyAlreadyAttested = secondError else {
+                Issue.record(
+                    """
+                    a second attest threw \(String(describing: secondError)) \
+                    instead of AttestationError.keyAlreadyAttested
+                    """
+                )
+                return
+            }
+        }
+
+        @Test("App Attest sees one outstanding call at a time")
+        func appAttestCallsNeverOverlap() async {
+            // `peakConcurrency` counts calls this double had outstanding at
+            // once. Six callers starting together drive it above one for an
+            // adapter that hands every caller straight to App Attest.
+            let defaults = InMemoryUserDefaults()
+            let service = OverlapDetectingAppAttestService(
+                attestScript: [.init(result: .success(Data([0xA1])), delay: 0.05)],
+                assertScript: [.init(result: .success(Data([0xB1])), delay: 0.05)]
+            )
+            let adapter = AppleDeviceAttestation(
+                appId: CBORFixture.appId,
+                service: service,
+                defaults: defaults
+            )
+
+            // One attestation first, so every assertion below finds a stored
+            // key ID rather than throwing `keyNotFound` before it calls out.
+            _ = try? await adapter.attest(challenge: Data([0x00]), deviceId: Data([0x01]))
+
+            await withTaskGroup(of: Void.self) { group in
+                for caller in 0 ..< 3 {
+                    group.addTask {
+                        _ = try? await adapter.attest(
+                            challenge: Data([UInt8(caller)]),
+                            deviceId: Data([0x02])
+                        )
+                    }
+                    group.addTask {
+                        _ = try? await adapter.assertRequest(
+                            requestHash: Data(repeating: UInt8(caller), count: 32)
+                        )
+                    }
+                }
+            }
+
+            #expect(
+                service.peakConcurrency == 1,
+                "App Attest saw \(service.peakConcurrency) outstanding calls at once"
+            )
+        }
+    }
+
     // MARK: - verify(token:) acceptance tests
 
     struct AppAttestVerifyAcceptanceTests {
@@ -941,7 +1282,8 @@
             let foreignAdapter = AppleDeviceAttestation(
                 appId: CBORFixture.foreignAppId,
                 service: UnsupportedAppAttestService(),
-                defaults: InMemoryUserDefaults()
+                defaults: InMemoryUserDefaults(),
+                anchorCertificates: CBORFixture.testAnchors()
             )
 
             let token = CBORFixture.attestationObject(
@@ -1301,14 +1643,16 @@
             #expect(adapter.verify(token: token) == false)
         }
 
-        @Test("verify rejects an x5c that repeats one self-signed certificate twice")
+        @Test("verify rejects an x5c that repeats one certificate twice")
         func verifyRejectsDuplicatedCertificate() {
             let harness = makeAdapter()
             let adapter = harness.adapter
 
-            // A self-signed certificate names itself in its own issuer field,
-            // so a pair of copies satisfies issuer-to-subject equality without
-            // carrying two certificates. Clause 3 assigns two certificates.
+            // Clause 3 assigns a credential certificate to position 0 and an
+            // intermediate certificate to position 1, so a path whose leaf and
+            // whose next certificate are one certificate fills neither
+            // position. An intermediate carries `CA:TRUE`, so a path
+            // evaluation rejects it as a leaf as well.
             let token = CBORFixture.attestationObject(
                 attestationStatementValue: CBORFixture.attestationStatement(
                     certificates: [
@@ -1339,11 +1683,14 @@
             #expect(adapter.verify(token: token) == false)
         }
 
-        @Test("verify rejects a credential certificate whose issuer name resists normalization")
-        func verifyRejectsUnnormalizableIssuerName() {
+        @Test("verify rejects a credential certificate carrying a malformed issuer name")
+        func verifyRejectsMalformedIssuerName() {
             let harness = makeAdapter()
             let adapter = harness.adapter
 
+            // `retaggedIssuerCertificate` still parses, and its issuer name
+            // matches no certificate's subject name, so a path evaluation
+            // builds no path from it to an anchor.
             let token = CBORFixture.attestationObject(
                 attestationStatementValue: CBORFixture.attestationStatement(
                     certificates: [
@@ -1355,7 +1702,7 @@
             #expect(adapter.verify(token: token) == false)
         }
 
-        @Test("verify rejects an x5c whose element 0 names no issuer in element 1")
+        @Test("verify rejects an x5c whose element 1 issued no element 0")
         func verifyRejectsUnlinkedCertificateChain() {
             let harness = makeAdapter()
             let adapter = harness.adapter
@@ -1376,6 +1723,11 @@
             let harness = makeAdapter()
             let adapter = harness.adapter
 
+            // `SecTrustCreateWithCertificates` reads its first argument as one
+            // leaf plus a bag of helper certificates, so a reversed pair still
+            // builds a path — one running from the intermediate to the anchor.
+            // Comparing that path's first two certificates against elements 0
+            // and 1 is what rejects this pair.
             let token = CBORFixture.attestationObject(
                 attestationStatementValue: CBORFixture.attestationStatement(
                     certificates: [
@@ -1543,6 +1895,123 @@
                 authenticatorDataValue: CBORFixture.text("authenticator data as text")
             )
             #expect(adapter.verify(token: token) == false)
+        }
+    }
+
+    // MARK: - verify(token:) trust-anchor tests, clause 3
+
+    /// Cases that pin which certification authority clause 3 requires, and that
+    /// pin how `verify(token:)` reaches that decision.
+    ///
+    /// Clause 3 of acceptance criterion 3 in ADR-025 states that element 1 of
+    /// `x5c` is an Apple App Attest intermediate certificate. `readCertificateChain`
+    /// decides that by evaluating `x5c` as a certification path anchored at
+    /// Apple's App Attest root certificate, which is a certificate this binary
+    /// carries. Two properties follow, and both get a case here: a chain nobody
+    /// at Apple signed fails however well-formed the rest of the token is, and
+    /// a chain carrying an intermediate Apple issued later still passes.
+    struct AppAttestAppleAnchorTests {
+        @Test("verify rejects a token whose x5c is a self-signed chain")
+        func verifyRejectsSelfSignedChain() {
+            // A self-signed chain is what an attacker mints with two `openssl`
+            // commands: one root that signs itself, and one credential
+            // certificate that root issues. Every other clause of criterion 3
+            // holds for this token, so clause 3's anchor is what rejects it.
+            let token = CBORFixture.attestationObject(
+                attestationStatementValue: CBORFixture.attestationStatement(
+                    certificates: [
+                        CBORFixture.rogueCredentialCertificate,
+                        CBORFixture.rogueRootCertificate
+                    ]
+                )
+            )
+
+            #expect(makeAppleAnchoredAdapter().adapter.verify(token: token) == false)
+            #expect(makeUnsupportedAdapter().adapter.verify(token: token) == false)
+        }
+
+        @Test("verify rejects a chain reaching a root Apple did not sign")
+        func verifyRejectsChainOutsideAppleAuthority() {
+            // This chain is the one every accepting case in this file uses, and
+            // `testRootCertificate` anchors it. An adapter carrying Apple's
+            // root instead rejects it, which is what makes those accepting
+            // cases evidence about structure rather than evidence about
+            // authority.
+            let harness = makeAppleAnchoredAdapter()
+
+            #expect(harness.adapter.verify(token: CBORFixture.attestationObject()) == false)
+        }
+
+        @Test("verify accepts a chain carrying a replacement intermediate its root signed")
+        func verifyAcceptsRotatedIntermediate() {
+            // Apple replaces its App Attest intermediate certificate on its own
+            // schedule. Anchoring at a root accepts whichever intermediate that
+            // root signed, and this case fails for an implementation that
+            // compares element 1 against a stored intermediate by name, by
+            // public key, or by fingerprint.
+            let harness = makeUnsupportedAdapter()
+
+            let token = CBORFixture.attestationObject(
+                attestationStatementValue: CBORFixture.attestationStatement(
+                    certificates: [
+                        CBORFixture.rotatedCredentialCertificate,
+                        CBORFixture.rotatedIntermediateCertificate
+                    ]
+                )
+            )
+            #expect(harness.adapter.verify(token: token) == true)
+        }
+
+        @Test("verify rejects a credential certificate its stated intermediate did not issue")
+        func verifyRejectsCrossedIntermediate() {
+            // Both certificates here reach `testRootCertificate`, and neither
+            // issued the other, so a check that only walked each certificate to
+            // an anchor would accept this pair. Clause 3 assigns positions, and
+            // an evaluated path that starts with element 0 and element 1 is
+            // what rejects it.
+            let harness = makeUnsupportedAdapter()
+
+            let token = CBORFixture.attestationObject(
+                attestationStatementValue: CBORFixture.attestationStatement(
+                    certificates: [
+                        CBORFixture.credentialCertificate,
+                        CBORFixture.rotatedIntermediateCertificate
+                    ]
+                )
+            )
+            #expect(harness.adapter.verify(token: token) == false)
+        }
+
+        @Test("an adapter carrying no anchor accepts no chain")
+        func emptyAnchorSetAcceptsNothing() {
+            // `AppAttestAnchor.appleAppAttestRoot()` returns an empty array if
+            // its bytes ever stop parsing, and this case pins what
+            // `verify(token:)` does with such an array: it rejects a chain that
+            // an anchor would otherwise accept, rather than skipping the
+            // evaluation.
+            let harness = makeUnsupportedAdapter(anchorCertificates: [])
+
+            #expect(harness.adapter.verify(token: CBORFixture.attestationObject()) == false)
+        }
+
+        @Test("this binary carries Apple's App Attest root certificate")
+        func appleAnchorParsesAndNamesApple() throws {
+            let anchors = AppAttestAnchor.appleAppAttestRoot()
+            #expect(anchors.count == 1)
+            let certificate = try #require(anchors.first)
+
+            // Apple publishes this certificate as
+            // `Apple_App_Attestation_Root_CA.pem` at
+            // https://www.apple.com/certificateauthority/private/, and SHA-256
+            // of its DER encoding is the digest below.
+            let der = SecCertificateCopyData(certificate) as Data
+            let digest = Data(SHA256.hash(data: der))
+                .map { String(format: "%02x", $0) }
+                .joined()
+            #expect(digest == "1cb9823ba28ba6ad2d33a006941de2ae4f513ef1d4e831b9f7e0fa7b6242c932")
+
+            let summary = SecCertificateCopySubjectSummary(certificate) as String?
+            #expect(summary == "Apple App Attestation Root CA")
         }
     }
 

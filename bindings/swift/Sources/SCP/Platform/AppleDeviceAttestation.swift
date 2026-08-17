@@ -147,6 +147,10 @@
         private let lock: NSLock
         private var generationTask: Task<String, Error>?
 
+        /// Runs one App Attest call at a time, so `classify(_:keyId:operation:)`
+        /// reads an attestation record no other call is concurrently writing.
+        private let callSerializer: AppAttestCallSerializer
+
         /// `SHA-256` of an App ID this adapter attests for.
         ///
         /// Clause 4 of acceptance criterion 3 in ADR-025 requires bytes 0
@@ -154,6 +158,14 @@
         /// App ID, so `verify(token:)` compares those bytes against this
         /// digest.
         private let relyingPartyIdHash: Data
+
+        /// Certificates `verify(token:)` anchors an `x5c` chain at.
+        ///
+        /// Clause 3 of acceptance criterion 3 in ADR-025 requires an `x5c`
+        /// chain to terminate at Apple's App Attest root certificate, so the
+        /// public initializer binds this property to that one certificate and
+        /// `verify(token:)` trusts nothing else.
+        private let anchorCertificates: [SecCertificate]
 
         /// Whether this instance is running in hardware-backed mode.
         ///
@@ -190,18 +202,34 @@
             service = DCAppAttestService.shared
             defaults = UserDefaults.standard
             lock = NSLock()
+            callSerializer = AppAttestCallSerializer()
             relyingPartyIdHash = Data(SHA256.hash(data: Data(appId.utf8)))
+            anchorCertificates = AppAttestAnchor.appleAppAttestRoot()
         }
 
         /// Testing initializer that accepts injected dependencies.
         ///
-        /// Used in unit tests to supply a mock `DCAppAttestService` subclass and
-        /// an in-memory `UserDefaults` suite.
-        init(appId: String, service: DCAppAttestService, defaults: UserDefaults) {
+        /// Used in unit tests to supply a mock `DCAppAttestService` subclass, an
+        /// in-memory `UserDefaults` suite, and a certificate a test chain
+        /// terminates at.
+        ///
+        /// - Parameter anchorCertificates: Certificates `verify(token:)`
+        ///   anchors an `x5c` chain at. This parameter exists because no test
+        ///   can produce a chain Apple's App Attest root signed, and it takes
+        ///   Apple's root by default, so a test that passes no anchor exercises
+        ///   the same certificates the public initializer binds.
+        init(
+            appId: String,
+            service: DCAppAttestService,
+            defaults: UserDefaults,
+            anchorCertificates: [SecCertificate] = AppAttestAnchor.appleAppAttestRoot()
+        ) {
             self.service = service
             self.defaults = defaults
             lock = NSLock()
+            callSerializer = AppAttestCallSerializer()
             relyingPartyIdHash = Data(SHA256.hash(data: Data(appId.utf8)))
+            self.anchorCertificates = anchorCertificates
         }
 
         // MARK: - DeviceAttestationProvider
@@ -247,28 +275,47 @@
             let keyId = try await resolveKeyId()
             let clientDataHash = computeClientDataHash(challenge: challenge, deviceId: deviceId)
 
-            return try await withCheckedThrowingContinuation { continuation in
+            let outcome = await callSerializer.run { [weak self] () -> Result<Data, AttestationError> in
+                guard let self else { return .failure(.internalError("self was deallocated")) }
+                return await self.requestAttestation(keyId: keyId, clientDataHash: clientDataHash)
+            }
+            return try outcome.get()
+        }
+
+        /// Call `attestKey(_:clientDataHash:)` once and translate its answer.
+        ///
+        /// A caller reaches this method through `callSerializer`, which is what
+        /// keeps `classify(_:keyId:operation:)` from reading an attestation
+        /// record that another App Attest call is concurrently writing.
+        private func requestAttestation(
+            keyId: String,
+            clientDataHash: Data
+        ) async -> Result<Data, AttestationError> {
+            await withCheckedContinuation { continuation in
                 service.attestKey(keyId, clientDataHash: clientDataHash) { [weak self] attestation, error in
                     if let error {
                         guard let self else {
-                            continuation.resume(throwing: AttestationError.internalError("self was deallocated"))
+                            continuation.resume(returning: .failure(.internalError("self was deallocated")))
                             return
                         }
-                        continuation.resume(throwing: self.classify(
+                        continuation.resume(returning: .failure(self.classify(
                             error,
                             keyId: keyId,
                             operation: .attestation
-                        ))
+                        )))
                     } else if let attestation {
                         // Apple attests one key once, so recording which key it
                         // attested is what tells a later `DCError.invalidKey`
-                        // from `attestKey` apart from a rejected key.
+                        // from `attestKey` apart from a rejected key. This write
+                        // precedes this continuation's resume, and a serialized
+                        // successor starts only after that resume, so a
+                        // successor's `classify` reads this write.
                         self?.markKeyAttested(keyId)
-                        continuation.resume(returning: attestation)
+                        continuation.resume(returning: .success(attestation))
                     } else {
-                        continuation.resume(throwing: AttestationError.internalError(
+                        continuation.resume(returning: .failure(.internalError(
                             "attestKey returned neither attestation nor error"
-                        ))
+                        )))
                     }
                 }
             }
@@ -307,24 +354,41 @@
                 throw AttestationError.keyNotFound
             }
 
-            return try await withCheckedThrowingContinuation { continuation in
+            let outcome = await callSerializer.run { [weak self] () -> Result<Data, AttestationError> in
+                guard let self else { return .failure(.internalError("self was deallocated")) }
+                return await self.requestAssertion(keyId: keyId, requestHash: requestHash)
+            }
+            return try outcome.get()
+        }
+
+        /// Call `generateAssertion(_:clientDataHash:)` once and translate its
+        /// answer.
+        ///
+        /// A caller reaches this method through `callSerializer`, which is what
+        /// keeps `classify(_:keyId:operation:)` from reading an attestation
+        /// record that another App Attest call is concurrently writing.
+        private func requestAssertion(
+            keyId: String,
+            requestHash: Data
+        ) async -> Result<Data, AttestationError> {
+            await withCheckedContinuation { continuation in
                 service.generateAssertion(keyId, clientDataHash: requestHash) { [weak self] assertion, error in
                     if let error {
                         guard let self else {
-                            continuation.resume(throwing: AttestationError.internalError("self was deallocated"))
+                            continuation.resume(returning: .failure(.internalError("self was deallocated")))
                             return
                         }
-                        continuation.resume(throwing: self.classify(
+                        continuation.resume(returning: .failure(self.classify(
                             error,
                             keyId: keyId,
                             operation: .assertion
-                        ))
+                        )))
                     } else if let assertion {
-                        continuation.resume(returning: assertion)
+                        continuation.resume(returning: .success(assertion))
                     } else {
-                        continuation.resume(throwing: AttestationError.internalError(
+                        continuation.resume(returning: .failure(.internalError(
                             "generateAssertion returned neither assertion nor error"
-                        ))
+                        )))
                     }
                 }
             }
@@ -362,6 +426,17 @@
         /// | `attestKey` | no | service rejected it | discarded |
         /// | `generateAssertion` | no | unattested key | kept |
         /// | `generateAssertion` | yes | service rejected it | discarded |
+        ///
+        /// **What makes an attestation record a sound input.** This table reads
+        /// a record `markKeyAttested(_:)` writes when `attestKey` succeeds, and
+        /// that record describes the key App Attest holds only while no other
+        /// App Attest call for that key is outstanding. Two concurrent
+        /// `attest` calls without that guarantee lose a live key: one call
+        /// succeeds and records an attestation, the other reads that record
+        /// before the first wrote it, reads row `attestKey`/no, and discards a
+        /// key Apple had just attested. `callSerializer` runs one App Attest
+        /// call at a time, so every read here follows every write a preceding
+        /// call made.
         ///
         /// **One ambiguity this table leaves standing.** A device restored from
         /// a backup can carry a recorded attestation for a key its Secure
@@ -411,12 +486,12 @@
 
         // MARK: - Token verification (client-side)
 
-        /// Decide whether `token` is a structurally well-formed Apple App Attest
-        /// attestation object.
+        /// Decide whether `token` is an Apple App Attest attestation object this
+        /// app's App Attest key produced.
         ///
         /// **Criterion this method applies:** acceptance criterion 3 of ADR-025
         /// in `.docs/adrs/phase-5.md`, whose four clauses
-        /// `AppAttestAttestationObject.isWellFormed(_:relyingPartyIdHash:)`
+        /// `AppAttestAttestationObject.isWellFormed(_:relyingPartyIdHash:anchorCertificates:)`
         /// states in code:
         ///
         /// 1. `token` decodes as one complete CBOR map whose key set is
@@ -425,11 +500,10 @@
         /// 3. `attStmt` holds a CBOR map whose key set is exactly `x5c`,
         ///    `receipt`, where `x5c` holds an array of at least two byte
         ///    strings that each parse as a DER X.509 certificate, and `receipt`
-        ///    holds a byte string. Clause 3 also assigns positions: element 0
-        ///    is a credential certificate and element 1 is an Apple App Attest
-        ///    intermediate certificate. `readCertificateChain` documents which
-        ///    part of that assignment it decides and which part it leaves to an
-        ///    SCP relay.
+        ///    holds a byte string. Those certificates evaluate as a
+        ///    certification path that terminates at Apple's App Attest root
+        ///    certificate, whose leaf is element 0 and whose next certificate
+        ///    is element 1.
         /// 4. `authData` holds a byte string of at least 87 bytes whose first
         ///    32 bytes equal `SHA-256` of an App ID this adapter was
         ///    initialized with, whose bytes 37 through 52 equal one of two App
@@ -437,17 +511,22 @@
         ///
         /// A token that fails any clause makes this method return `false`.
         ///
-        /// **What this method does not decide:** it checks no signature, it
-        /// checks no certificate chain, and it checks no challenge binding. An
-        /// SCP relay performs those checks by calling Apple's App Attest
-        /// attestation endpoint. A `true` result here means a relay received
-        /// something worth checking, never that a relay will accept it.
+        /// **What this method does not decide:** it checks no receipt, it reads
+        /// no nonce out of the credential certificate, and it therefore binds
+        /// `token` to no challenge. An SCP relay performs those three checks. A
+        /// `true` result here means Apple issued the certificate that signed
+        /// this attestation for this app, never that this attestation answers
+        /// the challenge a relay issued.
         ///
         /// - Parameter token: Raw attestation bytes to validate.
         /// - Returns: `true` when `token` satisfies all four clauses above,
         ///   `false` for every other input.
         public func verify(token: Data) -> Bool {
-            AppAttestAttestationObject.isWellFormed(token, relyingPartyIdHash: relyingPartyIdHash)
+            AppAttestAttestationObject.isWellFormed(
+                token,
+                relyingPartyIdHash: relyingPartyIdHash,
+                anchorCertificates: anchorCertificates
+            )
         }
 
         // MARK: - Private helpers
@@ -639,6 +718,108 @@
     }
 
     // ---------------------------------------------------------------------------
+    // App Attest call serialization
+    // ---------------------------------------------------------------------------
+
+    /// Runs App Attest calls one at a time, in arrival order.
+    ///
+    /// **Why serialization, rather than a lock around one read:**
+    /// `AppleDeviceAttestation.classify(_:keyId:operation:)` maps one Apple
+    /// error code, `DCError.invalidKey`, onto three conditions by reading
+    /// whether this adapter recorded an attestation for a key, and it discards
+    /// that key for one of those three. A second App Attest call running
+    /// alongside a first reads that record while the first call's completion
+    /// handler is still deciding what to write into it, so a call that Apple
+    /// answered "already attested" reads "not attested", takes the rejected-key
+    /// row, and deletes a Secure Enclave key Apple had just attested. Holding a
+    /// lock across the read alone changes nothing, because the two calls are
+    /// still in flight at once and the record is genuinely stale rather than
+    /// torn. Running one call at a time is what makes each read follow the
+    /// preceding call's write.
+    ///
+    /// `run(_:)` chains each caller's work onto whatever work this serializer
+    /// last accepted, and it publishes that chaining inside actor isolation, so
+    /// two callers that arrive together take distinct positions in one order
+    /// rather than both reading an empty tail.
+    private actor AppAttestCallSerializer {
+        /// Work this serializer last accepted, which the next caller waits for.
+        private var tail: Task<Void, Never>?
+
+        /// Run `body` after every call this serializer already accepted, and
+        /// return what `body` returned.
+        ///
+        /// - Parameter body: One App Attest call, together with whatever it
+        ///   writes into this adapter's stored key state.
+        func run<Outcome: Sendable>(_ body: @Sendable @escaping () async -> Outcome) async -> Outcome {
+            let predecessor = tail
+            let work = Task<Outcome, Never> {
+                await predecessor?.value
+                return await body()
+            }
+            tail = Task { _ = await work.value }
+            return await work.value
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Apple's App Attest trust anchor
+    // ---------------------------------------------------------------------------
+
+    /// Carries Apple's App Attest root certificate, which clause 3 of
+    /// acceptance criterion 3 in ADR-025 requires an `x5c` chain to terminate
+    /// at.
+    ///
+    /// Apple publishes this certificate at
+    /// `https://www.apple.com/certificateauthority/private/` as
+    /// `Apple_App_Attestation_Root_CA.pem`, and its article "Validating Apps
+    /// That Connect to Your Server" instructs a verifier to "verify that the
+    /// x5c array contains the intermediate and leaf certificates for App
+    /// Attest, starting from the credential certificate in the first data
+    /// buffer in the array (credcert). Verify the validity of the certificates
+    /// using Apple's App Attest root certificate."
+    ///
+    /// This enum carries that root and no intermediate certificate. Apple
+    /// signs and replaces its App Attest intermediate on its own schedule, so
+    /// a copy of one intermediate would start rejecting genuine attestations
+    /// the day Apple issued a replacement, while a root that expires in 2045
+    /// keeps accepting whichever intermediate Apple signed.
+    enum AppAttestAnchor {
+        /// DER bytes of Apple's App Attest root certificate, base64-encoded.
+        ///
+        /// `SHA-256` of those DER bytes is
+        /// `1cb9823ba28ba6ad2d33a006941de2ae4f513ef1d4e831b9f7e0fa7b6242c932`,
+        /// its subject and issuer both read
+        /// `CN=Apple App Attestation Root CA, O=Apple Inc., ST=California`, and
+        /// it carries serial number `0BF3BE0EF1CDD2E0FB8C6E721F621798` and a
+        /// P-384 public key.
+        private static let appleAppAttestRootBase64 = """
+        MIICITCCAaegAwIBAgIQC/O+DvHN0uD7jG5yH2IXmDAKBggqhkjOPQQDAzBSMSYwJAYDVQQDDB
+        1BcHBsZSBBcHAgQXR0ZXN0YXRpb24gUm9vdCBDQTETMBEGA1UECgwKQXBwbGUgSW5jLjETMBEG
+        A1UECAwKQ2FsaWZvcm5pYTAeFw0yMDAzMTgxODMyNTNaFw00NTAzMTUwMDAwMDBaMFIxJjAkBg
+        NVBAMMHUFwcGxlIEFwcCBBdHRlc3RhdGlvbiBSb290IENBMRMwEQYDVQQKDApBcHBsZSBJbmMu
+        MRMwEQYDVQQIDApDYWxpZm9ybmlhMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAERTHhmLW07ATaFQ
+        IEVwTtT4dyctdhNbJhFs/Ii2FdCgAHGbpphY3+d8qjuDngIN3WVhQUBHAoMeQ/cLiP1sOUtgjq
+        K9auYen1mMEvRq9Sk3Jm5X8U62H+xTD3FE9TgS41o0IwQDAPBgNVHRMBAf8EBTADAQH/MB0GA1
+        UdDgQWBBSskRBTM72+aEH/pwyp5frq5eWKoTAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwMD
+        aAAwZQIwQgFGnByvsiVbpTKwSga0kP0e8EeDS4+sQmTvb7vn53O5+FRXgeLhpJ06ysC5PrOyAj
+        EAp5U4xDgEgllF7En3VcE3iexZZtKeYnpqtijVoyFraWVIyd/dganmrduC1bmTBGwD
+        """
+
+        /// Apple's App Attest root certificate, as one array a caller hands to
+        /// `SecTrustSetAnchorCertificates`.
+        ///
+        /// - Returns: One certificate, or an empty array when these bytes fail
+        ///   to parse. An empty anchor array makes every chain evaluation fail,
+        ///   so `verify(token:)` rejects every token rather than accepting an
+        ///   unanchored chain.
+        static func appleAppAttestRoot() -> [SecCertificate] {
+            guard let der = Data(base64Encoded: appleAppAttestRootBase64, options: .ignoreUnknownCharacters),
+                  let certificate = SecCertificateCreateWithData(nil, der as CFData) else { return [] }
+            return [certificate]
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // App Attest attestation-object structure
     // ---------------------------------------------------------------------------
 
@@ -650,13 +831,13 @@
     /// holding `fmt`, `attStmt`, and `authData`, where `fmt` holds text
     /// `"apple-appattest"`.
     ///
-    /// `isWellFormed(_:relyingPartyIdHash:)` applies four clauses of acceptance
-    /// criterion 3 in ADR-025, `.docs/adrs/phase-5.md`. Each clause names which
-    /// values it permits, so an accepted set stays closed by construction
-    /// rather than by a list of rejected spellings. A token Apple did not
-    /// produce fails this check unless someone rebuilt a whole
-    /// attestation-object structure for this app's App ID, and even then an SCP
-    /// relay rejects it because it carries no Apple signature.
+    /// `isWellFormed(_:relyingPartyIdHash:anchorCertificates:)` applies four
+    /// clauses of acceptance criterion 3 in ADR-025, `.docs/adrs/phase-5.md`.
+    /// Each clause names which values it permits, so an accepted set stays
+    /// closed by construction rather than by a list of rejected spellings.
+    /// Clause 3 anchors the `x5c` chain at Apple's App Attest root certificate,
+    /// so a token whose certificates Apple did not issue fails this check
+    /// however faithfully someone rebuilt the rest of the structure.
     enum AppAttestAttestationObject {
         /// Three keys an App Attest attestation object carries, and only three
         /// keys clause 1 accepts.
@@ -677,7 +858,9 @@
         private static let appleAttestationFormat = "apple-appattest"
 
         /// Fewest certificates clause 3 accepts in `x5c`: a credential
-        /// certificate and an Apple App Attest intermediate certificate.
+        /// certificate and an Apple App Attest intermediate certificate. An
+        /// evaluated path adds one anchor to those two, so a path clause 3
+        /// accepts holds more certificates than this count.
         private static let minimumCertificateCount = 2
 
         /// Shortest authenticator data clause 4 accepts: a 32-byte
@@ -718,11 +901,18 @@
         ///   - relyingPartyIdHash: `SHA-256` of an App ID a caller attests for,
         ///     which clause 4 requires bytes 0 through 31 of authenticator data
         ///     to equal.
+        ///   - anchorCertificates: Certificates clause 3 requires an `x5c`
+        ///     chain to terminate at. A caller running in production passes
+        ///     Apple's App Attest root certificate.
         /// - Returns: `true` only for a complete, correctly keyed,
         ///   definite-length CBOR attestation object whose attestation
         ///   statement and authenticator data satisfy clauses 3 and 4; `false`
         ///   for every other input.
-        static func isWellFormed(_ token: Data, relyingPartyIdHash: Data) -> Bool {
+        static func isWellFormed(
+            _ token: Data,
+            relyingPartyIdHash: Data,
+            anchorCertificates: [SecCertificate]
+        ) -> Bool {
             var reader = CBORReader(token)
             guard let entryCount = reader.readMapHeader(),
                   entryCount == Key.allCases.count else { return false }
@@ -737,7 +927,8 @@
                       readValue(
                           for: key,
                           from: &reader,
-                          relyingPartyIdHash: relyingPartyIdHash
+                          relyingPartyIdHash: relyingPartyIdHash,
+                          anchorCertificates: anchorCertificates
                       ) else { return false }
             }
 
@@ -749,13 +940,14 @@
         private static func readValue(
             for key: Key,
             from reader: inout CBORReader,
-            relyingPartyIdHash: Data
+            relyingPartyIdHash: Data,
+            anchorCertificates: [SecCertificate]
         ) -> Bool {
             switch key {
             case .format:
                 return reader.readTextString() == appleAttestationFormat
             case .attestationStatement:
-                return readAttestationStatement(from: &reader)
+                return readAttestationStatement(from: &reader, anchorCertificates: anchorCertificates)
             case .authenticatorData:
                 return readAuthenticatorData(from: &reader, relyingPartyIdHash: relyingPartyIdHash)
             }
@@ -763,7 +955,10 @@
 
         /// Apply clause 3 to an `attStmt` value: a CBOR map whose key set is
         /// exactly `x5c` and `receipt`.
-        private static func readAttestationStatement(from reader: inout CBORReader) -> Bool {
+        private static func readAttestationStatement(
+            from reader: inout CBORReader,
+            anchorCertificates: [SecCertificate]
+        ) -> Bool {
             guard let entryCount = reader.readMapHeader(),
                   entryCount == StatementKey.allCases.count else { return false }
 
@@ -772,7 +967,11 @@
                 guard let name = reader.readTextString(),
                       let key = StatementKey(rawValue: name),
                       seenKeys.insert(key).inserted,
-                      readStatementValue(for: key, from: &reader) else { return false }
+                      readStatementValue(
+                          for: key,
+                          from: &reader,
+                          anchorCertificates: anchorCertificates
+                      ) else { return false }
             }
             return true
         }
@@ -781,11 +980,12 @@
         /// value satisfies a constraint clause 3 puts on that key.
         private static func readStatementValue(
             for key: StatementKey,
-            from reader: inout CBORReader
+            from reader: inout CBORReader,
+            anchorCertificates: [SecCertificate]
         ) -> Bool {
             switch key {
             case .certificateChain:
-                return readCertificateChain(from: &reader)
+                return readCertificateChain(from: &reader, anchorCertificates: anchorCertificates)
             case .receipt:
                 return reader.readByteString() != nil
             }
@@ -793,59 +993,85 @@
 
         /// Apply clause 3 to an `x5c` value.
         ///
-        /// **What clause 3 states**, quoting ADR-025 word for word: "`x5c` is
-        /// an array of at least two byte strings, each of which parses as a
-        /// DER-encoded X.509 certificate; the first is the credential
-        /// certificate and the second is the Apple App Attest intermediate
-        /// certificate."
+        /// **The criterion this method applies:** every element parses as a
+        /// DER X.509 certificate, there are at least two of them, and those
+        /// certificates evaluate as a certification path that terminates at one
+        /// certificate in `anchorCertificates`, whose leaf is element 0 and
+        /// whose next certificate is element 1. A production caller passes
+        /// Apple's App Attest root certificate as the one anchor, so a chain
+        /// reaching `true` here is a chain Apple signed.
         ///
-        /// **What this method decides**, which is narrower than that sentence:
-        /// an array of at least two elements, each parsing as a DER X.509
-        /// certificate, whose element 0 and element 1 carry different bytes and
-        /// whose element 0 names element 1 by its subject name in its own
-        /// issuer field. Those three conditions are evidence that positions
-        /// hold what clause 3 assigns them; they are not a test of which
-        /// certification authority element 1 belongs to. Nothing here reads
-        /// Apple's name, Apple's public key, or Apple's fingerprint, so a chain
-        /// built from certificates Apple never issued reaches this method's
-        /// `true`. An SCP relay decides authority by calling Apple's App Attest
-        /// attestation endpoint, which walks a chain to Apple's App Attest
-        /// root, and ADR-025 assigns that decision to a relay.
+        /// **Why an evaluated path decides positions.**
+        /// `SecTrustCreateWithCertificates` reads its first argument as one
+        /// leaf plus a bag of certificates that help build a path, so passing
+        /// `x5c` in a different order still builds a path and the array alone
+        /// therefore decides no positions. `SecTrustCopyCertificateChain`
+        /// returns the path the evaluation built, ordered from leaf to anchor,
+        /// so comparing its first two entries against `x5c` elements 0 and 1
+        /// decides the assignment clause 3 makes. A path shorter than three
+        /// certificates puts an anchor at position 1, which clause 3 assigns to
+        /// an intermediate, so this method requires three.
         ///
-        /// **One fragility a reader should know about:** normalized-name
-        /// equality compares DER bytes after Apple's normalization, which
-        /// uppercases a `PrintableString` and leaves a `UTF8String` alone. Two
-        /// certificates carrying one common name in two different string
-        /// encodings therefore compare unequal. RFC 5280 §4.1.2.4 requires an
-        /// issuer field to match its issuer's subject field, so a chain Apple
-        /// issues today compares equal.
-        private static func readCertificateChain(from reader: inout CBORReader) -> Bool {
+        /// **What this method reads about Apple's intermediate certificate:**
+        /// nothing but the signature Apple's root put on it. It compares no
+        /// name, no public key, and no fingerprint against a stored copy, so
+        /// Apple can rotate that intermediate and every chain carrying a
+        /// replacement Apple signed still reaches `true`.
+        ///
+        /// **Where this evaluation gets its inputs:** `anchorCertificates`
+        /// holds bytes this binary carries, and this method forbids network
+        /// fetching during the evaluation, so it reaches no relay and no
+        /// network.
+        private static func readCertificateChain(
+            from reader: inout CBORReader,
+            anchorCertificates: [SecCertificate]
+        ) -> Bool {
             guard let certificateCount = reader.readArrayHeader(),
                   certificateCount >= minimumCertificateCount else { return false }
 
-            guard let credentialDer = reader.readByteString(),
-                  let credential = parseCertificate(credentialDer),
-                  let issuerDer = reader.readByteString(),
-                  let issuer = parseCertificate(issuerDer) else { return false }
-
-            // Clause 3 requires every element to parse as a certificate, so
-            // elements past position 1 parse too, even though position decides
-            // nothing about them.
-            for _ in minimumCertificateCount ..< certificateCount {
+            var chain: [SecCertificate] = []
+            chain.reserveCapacity(certificateCount)
+            for _ in 0 ..< certificateCount {
                 guard let der = reader.readByteString(),
-                      parseCertificate(der) != nil else { return false }
+                      let certificate = parseCertificate(der) else { return false }
+                chain.append(certificate)
             }
 
-            // Clause 3 assigns two certificates to positions 0 and 1. One
-            // self-signed certificate repeated twice satisfies issuer-name
-            // equality trivially, because its own issuer field equals its own
-            // subject field, so rejecting an equal pair keeps that pair out.
-            guard !credentialDer.elementsEqual(issuerDer) else { return false }
+            return chainTerminatesAtAnchor(chain, anchorCertificates: anchorCertificates)
+        }
 
-            guard let credentialIssuerName = SecCertificateCopyNormalizedIssuerSequence(credential),
-                  let issuerSubjectName = SecCertificateCopyNormalizedSubjectSequence(issuer)
-            else { return false }
-            return CFEqual(credentialIssuerName, issuerSubjectName)
+        /// Evaluate `chain` against `anchorCertificates` and report whether the
+        /// path it builds starts with `chain[0]` and `chain[1]`.
+        private static func chainTerminatesAtAnchor(
+            _ chain: [SecCertificate],
+            anchorCertificates: [SecCertificate]
+        ) -> Bool {
+            guard chain.count >= minimumCertificateCount else { return false }
+
+            var trust: SecTrust?
+            // A basic X.509 policy checks signatures, validity dates, and basic
+            // constraints along a path. An App Attest credential certificate
+            // authenticates a device rather than a TLS server, so no
+            // server-authentication policy applies to it.
+            guard SecTrustCreateWithCertificates(
+                chain as CFArray,
+                SecPolicyCreateBasicX509(),
+                &trust
+            ) == errSecSuccess, let trust else { return false }
+
+            guard SecTrustSetAnchorCertificates(trust, anchorCertificates as CFArray) == errSecSuccess,
+                  // Trust `anchorCertificates` and nothing else, so a
+                  // certificate a user or an administrator installed on this
+                  // device cannot anchor an App Attest chain.
+                  SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess,
+                  // Fetch no issuer certificate and no revocation list, so this
+                  // evaluation reads only bytes `chain` and this binary carry.
+                  SecTrustSetNetworkFetchAllowed(trust, false) == errSecSuccess,
+                  SecTrustEvaluateWithError(trust, nil) else { return false }
+
+            guard let evaluated = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
+                  evaluated.count > minimumCertificateCount else { return false }
+            return CFEqual(evaluated[0], chain[0]) && CFEqual(evaluated[1], chain[1])
         }
 
         /// Parse `der` as a DER-encoded X.509 certificate, or report `nil`.
@@ -853,7 +1079,8 @@
         /// `SecCertificateCreateWithData` returns `nil` for bytes that are not
         /// a DER X.509 certificate, so it decides clause 3's certificate
         /// requirement by parsing rather than by matching a byte prefix. It
-        /// builds no trust evaluation and checks no signature.
+        /// builds no trust evaluation and checks no signature;
+        /// `chainTerminatesAtAnchor(_:anchorCertificates:)` checks both.
         private static func parseCertificate(_ der: ArraySlice<UInt8>) -> SecCertificate? {
             SecCertificateCreateWithData(nil, Data(der) as CFData)
         }
