@@ -67,14 +67,14 @@ pub struct BridgeState {
     /// Platform identity attestations, keyed by attestation ID.
     pub attestations: RwLock<HashMap<String, StoredAttestation>>,
 
-    /// Deleted shadows, keyed by `(context_id, shadow_id)` (historical actions
-    /// remain in event log).
+    /// Deleted shadows, keyed by `(context_id, bridge_id, shadow_id)`
+    /// (historical actions remain in event log).
     ///
-    /// The context ID is part of the key so a bridge authenticated for one
-    /// context cannot learn, through the idempotent 204 that a delete returns
-    /// for an already-deleted shadow, that a shadow was deleted in another
-    /// context.
-    pub deleted_shadows: RwLock<HashSet<(String, String)>>,
+    /// Context ID and bridge ID are both part of the key so no caller learns,
+    /// through the idempotent 204 that a delete returns for an already-deleted
+    /// shadow, that a second bridge retired a shadow — whether that bridge sits
+    /// in another context or shares this one.
+    pub deleted_shadows: RwLock<HashSet<(String, String, String)>>,
 
     /// Webhook event IDs already processed, keyed by `(bridge_id, event_id)`
     /// (deduplication).
@@ -387,11 +387,43 @@ const VALID_EVENT_TYPES: &[&str] = &[
 // Handler
 // ---------------------------------------------------------------------------
 
+/// Escapes a segment so a colon-joined composite ID maps one identifier pair to
+/// one string.
+///
+/// A bare `format!("{a}:{b}")` is not injective: bridge `acme:pro` with platform
+/// user `u1` and bridge `acme` with platform user `pro:u1` both produce
+/// `acme:pro:u1`. Escaping `%` first and then `:` removes every colon from each
+/// segment, so a colon in the joined string only ever separates segments and no
+/// two distinct pairs collide. A bridge operator picks its own
+/// `platform_user_id` values, and a registrant picks its own bridge ID, so both
+/// segments carry attacker-chosen text and both need escaping.
+fn escape_id_segment(segment: &str) -> String {
+    segment.replace('%', "%25").replace(':', "%3A")
+}
+
 /// Derives a deterministic shadow ID from bridge and platform user IDs.
 ///
-/// The shadow ID is scoped to the bridge to prevent cross-bridge collisions.
+/// The shadow ID is scoped to the bridge to prevent cross-bridge collisions,
+/// and [`escape_id_segment`] keeps that scoping injective.
 fn derive_shadow_id(bridge_id: &str, platform_user_id: &str) -> String {
-    format!("shadow:{bridge_id}:{platform_user_id}")
+    format!(
+        "shadow:{}:{}",
+        escape_id_segment(bridge_id),
+        escape_id_segment(platform_user_id)
+    )
+}
+
+/// Derives a deterministic attestation ID from bridge and platform user IDs.
+///
+/// Uses the same injective join as [`derive_shadow_id`], so one bridge cannot
+/// overwrite a second bridge's attestation by choosing a `platform_user_id`
+/// that reproduces that bridge's composite key.
+fn derive_attestation_id(bridge_id: &str, platform_user_id: &str) -> String {
+    format!(
+        "attest:{}:{}",
+        escape_id_segment(bridge_id),
+        escape_id_segment(platform_user_id)
+    )
 }
 
 /// Handler for `POST /v1/scp/bridge/shadow`.
@@ -525,7 +557,7 @@ async fn attest_handler(
     }
 
     let bridge_id = auth_ctx.bridge_id();
-    let attestation_id = format!("attest:{bridge_id}:{}", body.platform_user_id);
+    let attestation_id = derive_attestation_id(bridge_id, &body.platform_user_id);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -619,12 +651,19 @@ async fn emit_message_handler(
     let registries = bridge_state.registries.read().await;
     let deleted = bridge_state.deleted_shadows.read().await;
 
-    // Check if shadow was deleted in this context.
-    if deleted.contains(&(context_id.clone(), body.shadow_id.clone())) {
-        return ApiError::not_found("SHADOW_NOT_FOUND: shadow has been deleted").into_response();
-    }
-
-    let shadow_info = find_scoped_shadow(&registries, &context_id, bridge_id, &body.shadow_id);
+    // A shadow this bridge retired and a shadow this bridge never owned both
+    // resolve to `None`, and both answer with one identical body, so a response
+    // never tells a caller which of those two situations it hit.
+    let retired = deleted.contains(&(
+        context_id.clone(),
+        bridge_id.to_owned(),
+        body.shadow_id.clone(),
+    ));
+    let shadow_info = if retired {
+        None
+    } else {
+        find_scoped_shadow(&registries, &context_id, bridge_id, &body.shadow_id)
+    };
     drop(registries);
     drop(deleted);
 
@@ -716,7 +755,11 @@ async fn status_handler(
     if let Some(registry) = registries.get(context_id) {
         for shadow in registry.shadows() {
             let out_of_scope = shadow.bridge_id != bridge_id;
-            let removed = deleted.contains(&(context_id.to_owned(), shadow.shadow_id.clone()));
+            let removed = deleted.contains(&(
+                context_id.to_owned(),
+                bridge_id.to_owned(),
+                shadow.shadow_id.clone(),
+            ));
             if out_of_scope || removed {
                 continue;
             }
@@ -790,8 +833,9 @@ async fn delete_shadow_handler(
     let deleted = bridge_state.deleted_shadows.read().await;
 
     // Idempotent: a shadow this bridge already deleted in this context
-    // returns 204.
-    if deleted.contains(&(context_id.clone(), shadow_id.clone())) {
+    // returns 204. Matching on this bridge's own ID keeps a second bridge from
+    // reading that 204 as proof that this bridge retired that shadow.
+    if deleted.contains(&(context_id.clone(), bridge_id.to_owned(), shadow_id.clone())) {
         return StatusCode::NO_CONTENT.into_response();
     }
     drop(deleted);
@@ -822,11 +866,11 @@ async fn delete_shadow_handler(
                     .into_response();
             }
 
-            bridge_state
-                .deleted_shadows
-                .write()
-                .await
-                .insert((context_id, shadow_id));
+            bridge_state.deleted_shadows.write().await.insert((
+                context_id,
+                bridge_id.to_owned(),
+                shadow_id,
+            ));
 
             StatusCode::NO_CONTENT.into_response()
         }
@@ -921,11 +965,11 @@ async fn process_webhook_event(
                     return Some("shadow not found for user_departed".to_owned());
                 }
 
-                bridge_state
-                    .deleted_shadows
-                    .write()
-                    .await
-                    .insert((context_id.to_owned(), shadow_id.to_owned()));
+                bridge_state.deleted_shadows.write().await.insert((
+                    context_id.to_owned(),
+                    bridge_id.to_owned(),
+                    shadow_id.to_owned(),
+                ));
                 dispatch = true;
             }
         }
@@ -1741,7 +1785,11 @@ mod tests {
 
         // Verify shadow was deleted in the authenticated context.
         let deleted = state.deleted_shadows.read().await;
-        assert!(deleted.contains(&("ctx-test-001".to_owned(), shadow_id)));
+        assert!(deleted.contains(&(
+            "ctx-test-001".to_owned(),
+            "bridge-test-001".to_owned(),
+            shadow_id
+        )));
     }
 
     #[tokio::test]
@@ -2402,6 +2450,203 @@ mod tests {
             attestations.len(),
             2,
             "one bridge's attestation must not overwrite another's"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Composite-identifier injectivity and oracle tests
+    //
+    // A colon-joined composite ID built from two attacker-chosen segments is
+    // not injective: bridge `acme:pro` with platform user `u1` and bridge
+    // `acme` with platform user `pro:u1` both flatten to `acme:pro:u1`.
+    // `escape_id_segment` removes every colon from each segment, so a colon in
+    // a composite ID only ever separates segments.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn escaping_makes_a_composite_shadow_id_injective() {
+        // A bridge ID carrying a colon and a platform user ID carrying that
+        // same colon on its other side must not flatten to one string.
+        assert_ne!(
+            derive_shadow_id("acme:pro", "u1"),
+            derive_shadow_id("acme", "pro:u1")
+        );
+        // A percent sign is escaped first, so a segment cannot spell an escape
+        // sequence that reintroduces a colon.
+        assert_ne!(
+            derive_shadow_id("acme%3Apro", "u1"),
+            derive_shadow_id("acme:pro", "u1")
+        );
+    }
+
+    #[test]
+    fn escaping_makes_a_composite_attestation_id_injective() {
+        assert_ne!(
+            derive_attestation_id("acme:pro", "u1"),
+            derive_attestation_id("acme", "pro:u1")
+        );
+        assert_ne!(
+            derive_attestation_id("acme%3Apro", "u1"),
+            derive_attestation_id("acme:pro", "u1")
+        );
+    }
+
+    #[tokio::test]
+    async fn attest_cannot_overwrite_another_bridges_record_by_id_collision() {
+        let state = Arc::new(BridgeState::new());
+
+        // Bridge `acme` attests platform user `pro:u1` in its own context.
+        let victim = test_app_for(Arc::clone(&state), "acme", "ctx-1");
+        let mut body = valid_attest_body();
+        body["platform_user_id"] = serde_json::json!("pro:u1");
+        body["platform_handle"] = serde_json::json!("@honest");
+        let resp = victim.oneshot(attest_request(body)).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let victim_id = response_json(resp).await["attestation_id"]
+            .as_str()
+            .expect("attestation_id")
+            .to_owned();
+
+        // Bridge `acme:pro` attests platform user `u1` in a second context.
+        // Before escaping, both records keyed to `attest:acme:pro:u1`.
+        let attacker = test_app_for(Arc::clone(&state), "acme:pro", "ctx-2");
+        let mut body = valid_attest_body();
+        body["platform_user_id"] = serde_json::json!("u1");
+        body["platform_handle"] = serde_json::json!("@attacker");
+        let resp = attacker.oneshot(attest_request(body)).await.expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let attacker_id = response_json(resp).await["attestation_id"]
+            .as_str()
+            .expect("attestation_id")
+            .to_owned();
+
+        assert_ne!(
+            victim_id, attacker_id,
+            "two bridges must not derive one attestation ID"
+        );
+
+        let attestations = state.attestations.read().await;
+        assert_eq!(attestations.len(), 2);
+        let victim_record = attestations.get(&victim_id).expect("victim record");
+        assert_eq!(
+            victim_record.platform_handle, "@honest",
+            "a second bridge must not overwrite this record"
+        );
+        assert_eq!(victim_record.bridge_id, "acme");
+    }
+
+    #[tokio::test]
+    async fn shadow_creation_cannot_squat_another_bridges_derived_id() {
+        let state = Arc::new(BridgeState::new());
+
+        // Bridge `acme:pro` creates platform user `u1` in a shared context.
+        let first_bridge = test_app_for(Arc::clone(&state), "acme:pro", "ctx-1");
+        let resp = first_bridge
+            .oneshot(create_request(serde_json::json!({
+                "platform_handle": "@squat",
+                "platform_user_id": "u1",
+            })))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let squatted = response_json(resp).await["shadow_id"]
+            .as_str()
+            .expect("shadow_id")
+            .to_owned();
+
+        // Bridge `acme` creating platform user `pro:u1` in that same context
+        // derives a different ID, so it succeeds.
+        let victim = test_app_for(Arc::clone(&state), "acme", "ctx-1");
+        let resp = victim
+            .oneshot(create_request(serde_json::json!({
+                "platform_handle": "@honest",
+                "platform_user_id": "pro:u1",
+            })))
+            .await
+            .expect("test");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a second bridge must not be able to deny this bridge its own shadow ID"
+        );
+        let honest = response_json(resp).await["shadow_id"]
+            .as_str()
+            .expect("shadow_id")
+            .to_owned();
+        assert_ne!(squatted, honest);
+    }
+
+    #[tokio::test]
+    async fn delete_idempotency_does_not_reveal_another_bridges_deletion() {
+        let (state, shadow_a, _shadow_b) = shared_context_state().await;
+
+        // Bridge A retires its own shadow inside a context bridge B shares.
+        let app_a = test_app_for(Arc::clone(&state), "bridge-a", "ctx-shared");
+        let resp = app_a
+            .oneshot(delete_shadow_request(&shadow_a))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Bridge B probing that shadow ID gets 404, not the 204 that would
+        // tell it bridge A retired that shadow.
+        let app_b = test_app_for(Arc::clone(&state), "bridge-b", "ctx-shared");
+        let resp = app_b
+            .oneshot(delete_shadow_request(&shadow_a))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // A shadow ID nobody ever created answers identically.
+        let app_b = test_app_for(state, "bridge-b", "ctx-shared");
+        let resp = app_b
+            .oneshot(delete_shadow_request("shadow:bridge-a:never"))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn emit_message_answers_identically_for_a_retired_and_an_unknown_shadow() {
+        let (state, shadow_a, _shadow_b) = shared_context_state().await;
+
+        let app_a = test_app_for(Arc::clone(&state), "bridge-a", "ctx-shared");
+        let resp = app_a
+            .oneshot(delete_shadow_request(&shadow_a))
+            .await
+            .expect("test");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Bridge A naming its own retired shadow.
+        let app_a = test_app_for(Arc::clone(&state), "bridge-a", "ctx-shared");
+        let retired = app_a
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": shadow_a,
+                "content": "probe",
+                "content_type": "text/plain",
+            })))
+            .await
+            .expect("test");
+        assert_eq!(retired.status(), StatusCode::NOT_FOUND);
+        let retired_body = response_json(retired).await;
+
+        // Bridge A naming a shadow that never existed.
+        let app_a = test_app_for(state, "bridge-a", "ctx-shared");
+        let unknown = app_a
+            .oneshot(message_request(serde_json::json!({
+                "shadow_id": "shadow:bridge-a:never",
+                "content": "probe",
+                "content_type": "text/plain",
+            })))
+            .await
+            .expect("test");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let unknown_body = response_json(unknown).await;
+
+        assert_eq!(
+            retired_body, unknown_body,
+            "a retired shadow and an unknown shadow must answer identically, \
+             so a response never confirms that a shadow once existed"
         );
     }
 }
