@@ -134,10 +134,16 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
     # symbol exists in any of them. Every wrapper reaches the per-instance
     # bridge method that resolves an issuer's DID document before any signature
     # check (GitHub issue #2335 finding 2).
+    #
+    # Kotlin lists `identityVerifyLinkAttestation` alone. Kotlin also carries
+    # `IdentityAdvancedBridge.verifyLinkAttestation`, which calls whatever
+    # `IdentityAdvancedBindings` implementation a consumer injects and therefore
+    # reaches no bridge instance of its own; admitting that name here would let
+    # this cell rest on a symbol that performs no §3.5.4 step 1.
     ("Identity", "verify_attestation"): {
         "python": ["verify_identity_link_attestation"],
         "typescript": ["identityVerifyLinkAttestation"],
-        "kotlin": ["identityVerifyLinkAttestation", "verifyLinkAttestation"],
+        "kotlin": ["identityVerifyLinkAttestation"],
         "swift": ["identityVerifyLinkAttestation", "verifyLinkAttestation"],
     },
     # Outlets streaming control plane (SCP-OUT-038): the grant/cancel methods

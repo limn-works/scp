@@ -320,3 +320,56 @@ class TestNanInfinityGuards:
     def test_parse_finite_int_rejects_float(self) -> None:
         with pytest.raises(ValidationError, match="SCP-VALID-7005"):
             _parse_finite_int(1.5, "verified_at")
+
+
+class TestScpVerifyLinkAttestationForwarding:
+    """`SCP.verify_identity_link_attestation` forwards all three arguments.
+
+    Spec §3.5.4 step 1 resolves an issuer's DID document before any signature
+    check, which needs this instance's resolver, so the SDK method routes to the
+    per-instance PyO3 method rather than to the module-scope free function that
+    declines with ``SCP-IDENT-1060``. `reference_proof` carries the caller's own
+    Class 2 fetch outcome (§3.5.4 Class 2 step 2), so dropping it would send
+    every Class 2 attestation to ``SCP-IDENT-1062``.
+    """
+
+    def test_forwards_attestation_key_and_reference_proof(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native.verify_identity_link_attestation.return_value = True
+
+        result = asyncio.run(
+            SCP.verify_identity_link_attestation(
+                scp,
+                '{"id":"att-1"}',
+                "00" * 32,
+                "confirmed",
+            )
+        )
+
+        assert result is True
+        attestation_json, key_hex, reference_proof = (
+            scp._native.verify_identity_link_attestation.call_args[0]
+        )
+        assert attestation_json == '{"id":"att-1"}'
+        assert key_hex == "00" * 32
+        assert reference_proof == "confirmed"
+
+    def test_not_fetched_reaches_the_bridge_unchanged(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native.verify_identity_link_attestation.return_value = False
+
+        asyncio.run(
+            SCP.verify_identity_link_attestation(
+                scp,
+                '{"id":"att-2"}',
+                "11" * 32,
+                "not_fetched",
+            )
+        )
+
+        _, _, reference_proof = scp._native.verify_identity_link_attestation.call_args[0]
+        assert reference_proof == "not_fetched"
