@@ -518,7 +518,9 @@ fn decode_jwt_segment(segment: &str) -> Result<Vec<u8>, String> {
 /// 2. Validates the header (`alg` must be `EdDSA`).
 /// 3. Deserializes the claims payload.
 /// 4. Resolves the issuer's DID document.
-/// 5. Extracts the signing public key from the DID document.
+/// 5. Extracts the public key that document authorizes for `authentication`
+///    under the verification method the `kid` header names (§3.11.4 steps 7
+///    and 8 of the identity spec).
 /// 6. Verifies the Ed25519 signature over `header.payload`.
 /// 7. Validates temporal claims (`iat`, `exp`, max lifetime).
 ///
@@ -586,19 +588,37 @@ fn verify_bridge_jwt(token: &str, lookup: &dyn BridgeLookup) -> Result<BridgeJwt
         },
     );
 
-    // A bridge login token proves control of a DID, so `authentication` gates
-    // it rather than `assertionMethod` (W3C DID Core §5.3). `#0` reaches an
-    // ungated path: an Identity Key certifies a document, and no verification
-    // relationship references it.
-    let pub_key_bytes = scp_did::SigningKeyId::from_fragment(&format!("#{fragment}"))
-        .map_or_else(
-            || did_doc.verification_method_key(&fragment),
-            |signing_key_id| {
-                did_doc.signing_key_for(
-                    signing_key_id,
-                    scp_did::VerificationRelationship::Authentication,
-                )
-            },
+    // Two gates decide which key verifies this token, and §3.11.4 of the
+    // identity spec states both for a DID-authentication response:
+    //
+    // - Step 7 admits `#active` and `#agent` and rejects every other value with
+    //   `KEY_NOT_AUTHORIZED`. `SigningKeyId::from_fragment` is the one decoder
+    //   for that admitted set, and its enum has exactly those two variants, so
+    //   an Identity Key (`#0`) and a `#retired-{n}` fragment both fail here.
+    // - Step 8 requires the DID document to list that method under
+    //   `authentication`. `signing_key_for` reads the document's own array, so
+    //   a key an owner withdrew from `authentication` — which
+    //   `DidDocument::retire_active_key` does to every key it rotates out —
+    //   supplies nothing, whatever fragment names it.
+    //
+    // Step 8 is the load-bearing gate: it reads a fact a document declares, so
+    // it rejects a withdrawn key under any spelling, present or future. Step 7
+    // is a second, independent closed set on top of it.
+    //
+    // `authentication` rather than `assertionMethod` (W3C DID Core §5.3),
+    // because a bridge login token proves control of a DID to this node rather
+    // than asserting a statement about a subject.
+    let signing_key_id =
+        scp_did::SigningKeyId::from_fragment(&format!("#{fragment}")).ok_or_else(|| {
+            format!(
+                "JWT kid names verification method #{fragment}, which is not an \
+                 operational signing key (expected #active or #agent)"
+            )
+        })?;
+    let pub_key_bytes = did_doc
+        .signing_key_for(
+            signing_key_id,
+            scp_did::VerificationRelationship::Authentication,
         )
         .map_err(|e| {
             format!(
@@ -1651,6 +1671,159 @@ mod tests {
             .unwrap()
             .as_secs()
             .to_string()
+    }
+
+    // -----------------------------------------------------------------------
+    // Bridge login JWT — which verification method a DID document authorizes
+    // -----------------------------------------------------------------------
+
+    /// Signs `claims` and stamps `kid` into a JWT header.
+    ///
+    /// `create_bridge_jwt` writes no `kid`, so a test naming a verification
+    /// method builds a header here instead.
+    fn jwt_with_kid(claims: &BridgeJwtClaims, signing_key: &SigningKey, kid: &str) -> String {
+        use ed25519_dalek::Signer;
+
+        let header = serde_json::json!({ "alg": JWT_ALG_EDDSA, "typ": JWT_TYP, "kid": kid });
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signing_key.sign(signing_input.as_bytes()).to_bytes());
+        format!("{header_b64}.{payload_b64}.{sig_b64}")
+    }
+
+    /// Adds a verification method under `fragment` carrying `signing_key`,
+    /// this document's own DID as controller, and the Ed25519 suite — the
+    /// three facts a resolver checks before it reads a relationship.
+    ///
+    /// It adds no relationship reference, which is what
+    /// `DidDocument::retire_active_key` leaves behind for a rotated key and
+    /// what `DidDocument::new` leaves for an Identity Key.
+    fn push_unreferenced_method(doc: &mut DidDocument, fragment: &str, signing_key: &SigningKey) {
+        let multibase = format!(
+            "z{}",
+            bs58::encode(signing_key.verifying_key().as_bytes()).into_string()
+        );
+        doc.verification_method.push(VerificationMethod {
+            id: format!("{}#{fragment}", doc.id),
+            method_type: "Ed25519VerificationKey2020".to_owned(),
+            controller: doc.id.clone(),
+            public_key_multibase: multibase,
+        });
+    }
+
+    /// A JWT signed by a rotated-out `#retired-1` key is rejected, even though
+    /// that method carries this document's controller and the Ed25519 suite.
+    /// Reverting the relationship check makes this test fail.
+    #[test]
+    fn reject_bridge_jwt_signed_by_a_retired_key() {
+        let active_key = SigningKey::generate(&mut OsRng);
+        let retired_key = SigningKey::generate(&mut OsRng);
+        let did = test_did(&active_key);
+        let mut doc = test_did_document(&did, &active_key);
+        push_unreferenced_method(&mut doc, "retired-1", &retired_key);
+
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.did_docs.push((did.clone(), doc));
+
+        let claims = test_claims(&did);
+        for kid in [
+            "#retired-1".to_owned(),
+            "retired-1".to_owned(),
+            format!("{did}#retired-1"),
+        ] {
+            let token = jwt_with_kid(&claims, &retired_key, &kid);
+            let result = verify_bridge_jwt(&token, &lookup);
+            assert!(
+                result.is_err(),
+                "kid {kid} names a rotated-out key and must not authenticate, got {result:?}"
+            );
+        }
+    }
+
+    /// A JWT signed by an Identity Key is rejected. ADR-039's key-property
+    /// table marks `#0` "Signs operational actions: No", and no verification
+    /// relationship references it. Reverting the relationship check makes this
+    /// test fail.
+    #[test]
+    fn reject_bridge_jwt_signed_by_an_identity_key() {
+        let active_key = SigningKey::generate(&mut OsRng);
+        let identity_key = SigningKey::generate(&mut OsRng);
+        let did = test_did(&active_key);
+        let mut doc = test_did_document(&did, &active_key);
+        push_unreferenced_method(&mut doc, "0", &identity_key);
+
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.did_docs.push((did.clone(), doc));
+
+        let claims = test_claims(&did);
+        for kid in ["#0".to_owned(), "0".to_owned(), format!("{did}#0")] {
+            let token = jwt_with_kid(&claims, &identity_key, &kid);
+            let result = verify_bridge_jwt(&token, &lookup);
+            assert!(
+                result.is_err(),
+                "kid {kid} names an Identity Key and must not authenticate, got {result:?}"
+            );
+        }
+    }
+
+    /// A JWT signed by `#active` is rejected once an owner withdraws `#active`
+    /// from `authentication`, which is §3.11.4 step 8 of the identity spec.
+    /// This is the check that rejects a withdrawn key under any fragment
+    /// spelling, so deleting it makes this test fail.
+    #[test]
+    fn reject_bridge_jwt_when_authentication_omits_the_named_method() {
+        let active_key = SigningKey::generate(&mut OsRng);
+        let did = test_did(&active_key);
+        let mut doc = test_did_document(&did, &active_key);
+        doc.authentication.clear();
+
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.did_docs.push((did.clone(), doc));
+
+        let claims = test_claims(&did);
+        for kid in ["#active", "active"] {
+            let token = jwt_with_kid(&claims, &active_key, kid);
+            let result = verify_bridge_jwt(&token, &lookup);
+            assert!(
+                result.is_err(),
+                "kid {kid} is absent from authentication and must not authenticate, got {result:?}"
+            );
+        }
+
+        // A token carrying no `kid` defaults to `#active` and takes the same
+        // rejection, so an attacker gains nothing by omitting a header.
+        let token = create_bridge_jwt(&claims, &active_key).unwrap();
+        assert!(
+            verify_bridge_jwt(&token, &lookup).is_err(),
+            "a kid-less token defaults to #active and must take the same rejection"
+        );
+    }
+
+    /// A JWT signed by `#active` verifies while `authentication` references
+    /// `#active`, which shows the three rejections above come from a document
+    /// fact rather than from a broken test fixture.
+    #[test]
+    fn accept_bridge_jwt_signed_by_an_authenticating_active_key() {
+        let active_key = SigningKey::generate(&mut OsRng);
+        let did = test_did(&active_key);
+        let doc = test_did_document(&did, &active_key);
+
+        let mut lookup = TestBridgeLookup::new("https://node.example.com");
+        lookup.did_docs.push((did.clone(), doc));
+
+        let claims = test_claims(&did);
+        for kid in ["#active", "active", "#agent"] {
+            let token = jwt_with_kid(&claims, &active_key, kid);
+            let verified = verify_bridge_jwt(&token, &lookup);
+            if kid == "#agent" {
+                // The document publishes no `#agent` method, so a claim to
+                // have signed with one resolves nothing.
+                assert!(verified.is_err(), "#agent is absent from this document");
+            } else {
+                assert_eq!(verified.unwrap().iss, did);
+            }
+        }
     }
 
     #[test]

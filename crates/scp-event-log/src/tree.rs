@@ -162,10 +162,17 @@ pub fn append(
 ///   `crates/scp-runtime/src/context/{export_import,builder}.rs` — snapshot
 ///   replay, where each leaf arrives already committed
 /// - UCAN-state and outlet event-log surfaces across all three FFI bridges
+/// - `PerContextState::replay_event` in `crates/scp-client/src/context.rs`,
+///   which `ScpClient::join_context_encrypted` drives over an event stream an
+///   adder transported — an event another party produced, appended without a
+///   signature check
 /// - Test code
 ///
 /// Nothing in this repository calls [`append`] outside test code, so no shipped
-/// path verifies an event signature today.
+/// path verifies an event signature today. [`verify_event_signature`] states
+/// what blocks a shipped caller: every shipped writer emits an empty
+/// `signature`, so a verifier wired in ahead of leaf signing would reject every
+/// honest event.
 ///
 /// # Migration plan
 ///
@@ -346,13 +353,12 @@ pub fn leaf_hash(event: &Event) -> Result<[u8; 32], EventLogError> {
 ///   assign on rotation. A document keeps them so a reader can audit rotation
 ///   history; accepting one would let a rotated key sign forever.
 ///
-/// **Trial order is not role pinning.** Spec §23.13 paragraph 1 tells a verifier
-/// to resolve one public key named by a `signing_key_id` field on `Event`, and
-/// ADR-011 acceptance criterion 1 defines `Event` with seven fields and no such
-/// field. Those two artifacts disagree, so no code here pins one role without
-/// deciding an open upstream question. Until a human settles it, this crate
-/// accepts either operational key and reports which one verified, so a caller
-/// needing role-level policy (ADR-039 Category A) can apply it.
+/// **Trial order is not role pinning.** An `Event` names no verification
+/// method: ADR-011 acceptance criterion 1 defines it with seven fields and no
+/// `signing_key_id`, and §23.13 paragraph 1 tells a verifier to try each method
+/// `assertionMethod` authorizes and to report which one verified. A caller
+/// needing role-level policy (ADR-039 Category A) reads that returned
+/// [`SigningKeyId`].
 pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] =
     [SigningKeyId::Active, SigningKeyId::Agent];
 
@@ -363,10 +369,34 @@ pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] =
 /// canonical event hash, and tries each key in
 /// [`ACCEPTED_EVENT_SIGNING_KEY_IDS`] until one verifies. [`append`] calls this
 /// for a new event; a caller reconciling events from a remote peer calls it
-/// through [`verify_event_batch`] (§23.13 paragraph 1). No caller in this
-/// repository performs that reconciliation yet — every event a shipped path
-/// appends today goes through [`append_unsigned_event`], which carries an empty
-/// signature and runs no signature check.
+/// through [`verify_event_batch`] (§23.13 paragraph 1).
+///
+/// # No shipped path verifies an event signature, and what blocks one
+///
+/// [`append`] has zero callers outside test code, so no shipped path reaches
+/// this function. That is not an oversight a caller can fix on its own: every
+/// shipped writer emits an event whose `signature` field is empty, so a verifier
+/// wired in today would reject every honest event.
+///
+/// Two shipped paths append an event another party produced, and both go
+/// through [`append_unsigned_event`], which runs no signature check:
+///
+/// - `scp_client::PerContextState::replay_event`, which
+///   `ScpClient::join_context_encrypted` drives over a `prior_event_log` stream
+///   an adder transported. That crate's own append path writes an empty
+///   `signature`, because it does not thread an on-device signing key into a
+///   leaf; that key arrives with the leaf-signing custody slice ADR-057 names.
+/// - `scp_runtime::context::export_import`, which replays a snapshot an exporter
+///   produced. It authenticates that snapshot as a whole — a full-snapshot
+///   Ed25519 signature (§23.16.8) plus a constant-time compare of the
+///   recomputed Merkle root against the signed root — rather than per event, so
+///   it trusts one exporter rather than each named actor.
+///
+/// §23.13 paragraph 1 requires per-event verification during reconciliation, so
+/// a production caller belongs on the first path once a shipped writer signs a
+/// leaf. The ordering constraint runs one way: leaf signing lands first, then
+/// `join_context_encrypted` resolves one DID document per distinct actor and
+/// hands them to [`verify_event_batch`].
 ///
 /// # Why a document rather than a DID string
 ///
@@ -400,7 +430,8 @@ pub const ACCEPTED_EVENT_SIGNING_KEY_IDS: [SigningKeyId; 2] =
 /// - A document carries more than one `#agent` verification method, which
 ///   ADR-039's structural constraint tells a verifier to reject.
 /// - A named method declares a type other than
-///   [`ED25519_VERIFICATION_KEY_TYPE`], names a controller other than an actor,
+///   [`ED25519_VERIFICATION_KEY_TYPE`](scp_did::ED25519_VERIFICATION_KEY_TYPE),
+///   names a controller other than an actor,
 ///   or is absent from `assertionMethod`, so a document never authorized it to
 ///   sign an assertion.
 /// - A document names neither `#active` nor `#agent`.
@@ -448,14 +479,12 @@ pub fn verify_event_signature(
     // that skipped BEP44 verification hands over a document this check still
     // rejects, which is one property of a document's origin this crate can
     // establish on its own.
-    let document_identity_key = actor_document
-        .verification_method_key("0")
-        .map_err(|error| {
-            reject(format!(
-                "#0 key of {} is unusable: {error}",
-                actor_document.id
-            ))
-        })?;
+    let document_identity_key = actor_document.identity_key().map_err(|error| {
+        reject(format!(
+            "#0 key of {} is unusable: {error}",
+            actor_document.id
+        ))
+    })?;
     if document_identity_key != did_identity_key {
         return Err(reject(format!(
             "#0 key of {} derives some other DID, so that document does not describe actor {}",

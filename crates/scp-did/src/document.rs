@@ -293,6 +293,12 @@ const ED25519_CONTEXT: &str = "https://w3id.org/security/suites/ed25519-2020/v1"
 /// suite never supplies an Ed25519 signature key.
 pub const ED25519_VERIFICATION_KEY_TYPE: &str = "Ed25519VerificationKey2020";
 
+/// Fragment naming the Identity Key verification method (ADR-039).
+///
+/// A `did:dht` string is z-base-32 of this key, which is what lets a reader
+/// check a document against the DID it claims to describe.
+const IDENTITY_KEY_FRAGMENT: &str = "0";
+
 /// The service type string for `SCPRelay` entries (§18.2.1).
 const SCP_RELAY_SERVICE_TYPE: &str = "SCPRelay";
 
@@ -489,11 +495,51 @@ impl DidDocument {
         format!("{}#{}", self.id, fragment)
     }
 
-    /// Resolves a public key from a verification method this document
-    /// identifies as `{self.id}#{fragment}`.
+    /// Resolves the Identity Key this document publishes as `{self.id}#0`.
     ///
-    /// Three document facts gate a key, and each one rejects a method a reader
-    /// might otherwise treat as usable:
+    /// A reader calls this to check what a document *is*, never to authorize
+    /// what a signer *did*: a `did:dht` string is z-base-32 of an Identity Key
+    /// (§3.8 and §9.6.1 of the identity spec), so comparing this key against
+    /// that string tells a reader whether a document describes the identity it
+    /// claims. ADR-039's key-property table marks `#0` "Signs operational
+    /// actions: No", and §9.7.4 confines it to DID document updates plus
+    /// pre-rotation commitments, so no signature-verification path resolves a
+    /// key through this function.
+    ///
+    /// A caller resolving a key that must verify a signature calls
+    /// [`signing_key_for`](Self::signing_key_for), which takes a
+    /// [`SigningKeyId`] and a [`VerificationRelationship`] and reads the
+    /// document's own relationship array. This crate exposes no way to resolve
+    /// a key by arbitrary fragment string, because every such call site
+    /// eventually asked a document for a key it never authorized: a rotated
+    /// `#retired-{n}` method keeps its type and its controller, so type and
+    /// controller alone admit a key an owner already withdrew.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DidError::UnusableVerificationMethod`] when `#0` is absent,
+    /// repeated, declares a type other than [`ED25519_VERIFICATION_KEY_TYPE`],
+    /// or names a controller other than this document's own DID, and
+    /// [`DidError::InvalidDidFormat`] when its `publicKeyMultibase` value does
+    /// not decode to a 32-byte Ed25519 curve point.
+    pub fn identity_key(&self) -> Result<[u8; 32], DidError> {
+        self.verification_method_key(IDENTITY_KEY_FRAGMENT)
+    }
+
+    /// Resolves a public key from a verification method this document
+    /// identifies as `{self.id}#{fragment}`, checking three document facts and
+    /// no verification relationship.
+    ///
+    /// Private, because a relationship-free lookup by arbitrary fragment
+    /// answers with a key a document never authorized for anything. The two
+    /// public callers each fix the fragment and add their own gate:
+    /// [`identity_key`](Self::identity_key) pins `#0` and treats the answer as
+    /// a document fact rather than as an authorization, and
+    /// [`signing_key_for`](Self::signing_key_for) pins a
+    /// [`SigningKeyId`] and then requires a relationship array to reference the
+    /// method.
+    ///
+    /// The three facts:
     ///
     /// - a method identifier equal to `{self.id}#{fragment}`, so a method some
     ///   other DID identifies inside this document supplies nothing (see
@@ -504,18 +550,7 @@ impl DidDocument {
     ///   a key-agreement key;
     /// - a `controller` equal to this document's own DID, since SCP defines no
     ///   delegation letting another DID sign as this one.
-    ///
-    /// A caller resolving a key for a *signing* purpose calls
-    /// [`signing_key_for`](Self::signing_key_for) instead, which adds a
-    /// verification-relationship check on top of these three.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DidError::UnusableVerificationMethod`] when a method is
-    /// absent, repeated, declares another type, or names another controller,
-    /// and [`DidError::InvalidDidFormat`] when its `publicKeyMultibase` value
-    /// does not decode to a 32-byte Ed25519 curve point.
-    pub fn verification_method_key(&self, fragment: &str) -> Result<[u8; 32], DidError> {
+    fn verification_method_key(&self, fragment: &str) -> Result<[u8; 32], DidError> {
         let unusable = |reason: String| DidError::UnusableVerificationMethod {
             fragment: fragment.to_owned(),
             did: self.id.clone(),
@@ -545,11 +580,14 @@ impl DidDocument {
 
     /// Resolves a public key this document authorizes for `relationship`.
     ///
-    /// Applies every check [`verification_method_key`](Self::verification_method_key)
-    /// applies, then requires a `relationship` array to reference that method.
-    /// W3C DID Core §5.3 makes a verification relationship an authorization
-    /// statement, so an owner withdrawing a reference withdraws that key's
-    /// authority for that purpose while keeping it readable for audit.
+    /// Checks three document facts — an identifier equal to
+    /// `{self.id}#{fragment}` carried exactly once, a `type` of
+    /// [`ED25519_VERIFICATION_KEY_TYPE`], and a `controller` equal to this
+    /// document's own DID — then requires a `relationship` array to reference
+    /// that method. W3C DID Core §5.3 makes a verification relationship an
+    /// authorization statement, so an owner withdrawing a reference withdraws
+    /// that key's authority for that purpose while keeping it readable for
+    /// audit.
     ///
     /// A [`SigningKeyId`] argument keeps `#0` out of reach: ADR-039 marks an
     /// Identity Key as signing no operational action, and §9.7.4 confines it to
