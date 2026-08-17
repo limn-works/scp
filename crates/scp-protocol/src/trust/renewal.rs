@@ -96,6 +96,13 @@ pub enum RenewalError {
 /// updated. Because `renewed_at` is excluded from `canonical_attestation_bytes`,
 /// the existing signature remains valid -- no re-signing is needed.
 ///
+/// `revocation_checker` reaches [`verify_attestation`] step 5. A caller holding
+/// a context's persisted revocation list passes a
+/// [`RevocationMapChecker`](crate::trust::aggregate::RevocationMapChecker) over
+/// it, so an attestation that context revoked cannot renew. A caller holding no
+/// list passes `None` and thereby records, at its own call site, that it
+/// consulted none.
+///
 /// # Errors
 ///
 /// - [`RenewalError::NotRenewable`] if `renewal_interval` is `None`.

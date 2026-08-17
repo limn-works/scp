@@ -14,6 +14,7 @@ Operating notes:
 
 ## Review findings by branch or feature
 
+- [Revocation list across writer and reader](revocation-two-path-key-space.md) — `revocation_list_key` is injective, but the attestation cache is keyed on a bare id, so a free DID overwrites an honest issuer's cache slot; `trust_verify_attestation` reads the list and never writes it; whole-list load per verification
 - [PR #2366 attestation fail-closed](pr2366-attestation-fail-closed.md) — six surviving fail-open inputs after issue #2335 findings 2/9/11/13; revocation-list poisoning via an unscoped attestation id; DID document rollback; declared-independence inflation
 - [Crypto, economy, persona surfaces](surfaces-crypto-economy-persona.md) — PR #1606 sender-key AAD; consequence `WarningCount` weaponization; ADR-039 persona binding sound but every production resolver returns `None`; TS SDK seam tree-shaken; sdk-coverage gate accepts a type name as runtime proof
 - [HTTP and transport surfaces](surfaces-http-and-transport.md) — PR #195 bridge-secret plaintext, blob existence oracle; commit 8873a54 `owner_id` collision, WASM `Send`/`Sync` unsoundness, cover-traffic budget oracle
@@ -49,6 +50,11 @@ Operating notes:
 - **A gate that iterates only over what already exists.** A call-invariant rule
   keyed on a caller name reports nothing when that caller is deleted, so it
   cannot detect a removal.
+- **A test store whose key is finer than the production store's key.** A guard
+  test that partitions on `(a, b, c)` while every shipped store partitions on
+  `(a, b)` cannot observe the collision it claims to forbid. Compare the test
+  double's key tuple against the production store's before crediting a scoping
+  guarantee.
 - **An alias list widened until a fail-closed stub satisfies a symmetry check.**
   Adding a declining stub's name to a canonical operation's alias list weakens
   that assertion rather than widening its coverage.

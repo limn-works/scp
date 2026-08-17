@@ -553,9 +553,11 @@ pub fn py_check_capability_requirements(
 /// agent-level evaluation.
 ///
 /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
-/// as a JSON string. Uses the `BridgeInstance` storage provider for persistent
-/// trust data when initialized (trust data survives across calls and restarts);
-/// falls back to an ephemeral in-memory store otherwise.
+/// as a JSON string. Reads and writes trust data through this instance's
+/// configured storage provider, so cached attestations, revocation lists, and
+/// challenge results survive across calls and restarts. An instance that holds
+/// no storage provider raises rather than aggregating against an ephemeral
+/// store nobody configured.
 ///
 /// # Errors
 ///
@@ -667,11 +669,14 @@ fn aggregate_trust_input_impl(
 
 /// Dispatches `populate_and_aggregate` to the active storage backend.
 ///
-/// If the `BridgeInstance` storage provider is initialized, builds a
-/// `ProtocolRepositoryTrustBridge` over the concrete storage backend
-/// (`InMemoryEncrypted` or `Sqlite`) so cached attestations, revocation
-/// states, and challenge results survive process restarts.
-/// Otherwise falls back to an ephemeral in-memory store.
+/// Builds a `ProtocolRepositoryTrustBridge` over this instance's concrete
+/// storage backend (`InMemoryEncrypted` or `Sqlite`), so cached attestations,
+/// revocation lists, and challenge results survive process restarts.
+///
+/// An instance holding no storage provider raises `SCP-VALID-7005`. An earlier
+/// version fell back to an ephemeral `InMemoryFfiTrustStore`, which sent a
+/// `SCP({storage: sqlite})` caller's aggregation into an empty store that
+/// caller never configured, and reported success.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_with_storage(
     bi: &PyBridgeInstance,

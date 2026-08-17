@@ -199,7 +199,9 @@ pub fn revocation_list_key(issuer: &DID, attestation_id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// [`AttestationRevocationChecker`] backed by a context's persisted revocation
-/// list — an `issuer + attestation_id -> revoked` map from
+/// list.
+///
+/// That list is an `issuer + attestation_id -> revoked` map from
 /// [`TrustProtocolRepository::get_revocation_state`], whose keys
 /// [`revocation_list_key`] builds.
 ///
@@ -207,9 +209,22 @@ pub fn revocation_list_key(issuer: &DID, attestation_id: &str) -> String {
 /// enforces context revocation, not only the ingest path: a cached attestation
 /// that is later context-revoked is dropped on read (even while still inside its
 /// cache TTL) rather than continuing to inflate trust until TTL expiry.
-struct RevocationMapChecker<'a> {
+///
+/// SECURITY (one lookup rule, not two). Every path that answers step 5 of
+/// [`verify_attestation`] from a persisted revocation list constructs THIS
+/// type: the read path here, the FFI ingest path, and each bridge's
+/// `trust_verify_attestation` op through
+/// `scp_ffi_common::trust_store::verify_attestation_in_context`. A second copy
+/// of this body in another crate would let one path's default, or one path's
+/// key, drift from another's while both compiled and every test passed, and a
+/// reader consulting a different rule from a writer is the defect
+/// [`revocation_list_key`] exists to prevent.
+pub struct RevocationMapChecker<'a> {
     /// `revocation_list_key(issuer, attestation_id) -> revoked` for the context.
-    revoked: &'a HashMap<String, bool>,
+    ///
+    /// A caller builds every key it inserts with [`revocation_list_key`]; a bare
+    /// attestation id is not a key.
+    pub revoked: &'a HashMap<String, bool>,
 }
 
 impl AttestationRevocationChecker for RevocationMapChecker<'_> {
