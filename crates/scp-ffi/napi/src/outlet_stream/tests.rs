@@ -243,7 +243,7 @@ async fn live_poll_next_drains_to_terminal() {
 
     // Context owned by the creator; ceiling admits the Action outlet stem.
     let params = serde_json::json!({
-        "ceiling": ["outlet:call:*", "messages:read", "messages:write", "governance:propose"],
+        "ceiling": ["outlet:register", "outlet:call:*", "messages:read", "messages:write", "governance:propose"],
         "governance": "single_admin",
         "memoryScope": "ephemeral",
     })
@@ -886,7 +886,7 @@ mod streaming_vectors_live {
         seed_owner_document_into_resolver(&creator_identity, &resolver_dht).await;
 
         let params = serde_json::json!({
-            "ceiling": ["outlet:call:*", "messages:read", "messages:write", "governance:propose"],
+            "ceiling": ["outlet:register", "outlet:call:*", "messages:read", "messages:write", "governance:propose"],
             "governance": "single_admin",
             "memoryScope": "ephemeral",
         })

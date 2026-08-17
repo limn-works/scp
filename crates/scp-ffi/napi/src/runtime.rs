@@ -1596,17 +1596,20 @@ where
 /// Per-context UCAN validation state (NAPI bridge).
 ///
 /// Wraps [`scp_ffi_common::bridge_runtime::UcanContextStateCore`] with
-/// NAPI-specific fields for outlet management and role state. The core
-/// fields (revocation list, nonce tracker, ceiling, creator DID, event log)
-/// are shared with the `UniFFI` bridge (#1447).
-/// This struct holds NO role state. Membership, role assignments, per-member
-/// capabilities, suspensions, and the capability ceiling belong to the
-/// per-context supervisor actor, and every bridge gate reads them through
-/// [`live_role_state`] / [`live_ceiling_strings`]. The bridge cached a
-/// `ContextRoleState` clone until a remote governance action proved the clone
-/// could not be kept current: five LOCAL governance call sites re-synced it and
-/// no remote path invalidated it, so a `RemoveMember` another participant
-/// committed left every bridge gate authorizing the removed member.
+/// NAPI-specific fields for outlet management. The core fields (revocation
+/// list, nonce tracker, creator DID, event log) are shared with the `UniFFI`
+/// bridge (#1447).
+/// This struct holds NO role state and NO capability ceiling. Membership, role
+/// assignments, per-member capabilities, suspensions, and the capability
+/// ceiling belong to the per-context supervisor actor, and every bridge gate
+/// reads them through [`live_role_state`] / [`live_ceiling_strings`]. The
+/// bridge cached a `ContextRoleState` clone until a remote governance action
+/// proved the clone could not be kept current: five LOCAL governance call sites
+/// re-synced it and no remote path invalidated it, so a `RemoveMember` another
+/// participant committed left every bridge gate authorizing the removed member.
+/// The bridge cached a ceiling string set for the same span, which a
+/// `ModifyCeiling` another participant committed left admitting a capability
+/// that context already forbade.
 pub struct UcanContextState {
     /// Core UCAN validation state shared with `UniFFI` bridge.
     pub core: scp_ffi_common::bridge_runtime::UcanContextStateCore,
@@ -1630,84 +1633,27 @@ pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanCon
     bi.ucan_registry.as_ref()
 }
 
-/// Builds a fresh [`UcanContextState`] for a context, validating the caller's
-/// ceiling entries (§5.3.1.1) before normalizing them into the UCAN ceiling
-/// string set.
+/// Builds a fresh [`UcanContextState`] for a context.
 ///
 /// Shared by [`ensure_registered`] (lazy, idempotent — the UCAN-op path) and
 /// [`register_ffi_state`] (eager, fail-closed — the Welcome-join path) so the
 /// two cannot drift in how they construct per-context FFI state.
 ///
-/// Builds no role state: membership, roles, and the enforced ceiling belong to
-/// the per-context supervisor actor, which every gate reads through
-/// [`live_role_state`] and [`live_ceiling_strings`].
-///
-/// # Errors
-///
-/// Returns `ScpNapiError::Validation` if a ceiling entry violates the §5.3.1.1
-/// grammar.
-fn build_ucan_context_state(
-    context_id: &str,
-    creator_did: &str,
-    user_ceiling: &[String],
-) -> Result<UcanContextState, ScpNapiError> {
-    let ceiling_strings = if user_ceiling.is_empty() {
-        scp_core::context::roles::default_ceiling()
-            .iter()
-            .map(scp_core::context::roles::Capability::ucan_capability_name)
-            .collect::<HashSet<String>>()
-    } else {
-        // Ceiling-entry grammar enforcement (spec §5.3.1.1) on each user entry
-        // BEFORE it is normalized into the UCAN ceiling string set. Validate the
-        // PARSED enum (`Capability::new(entry).validate_as_ceiling_entry()`) — NOT
-        // the raw string — so the validation checks EXACTLY the capability that
-        // gets enforced. `Capability::new` strips a `custom:` prefix: the raw
-        // string `"custom:payments"` has one colon (would pass a raw-string check)
-        // but parses to `Custom("payments")`, whose enforced form
-        // (`ucan_capability_name` → `payments:payments`) corresponds to a no-colon
-        // custom that `validate_as_ceiling_entry` REJECTS. Routing through the
-        // parsed enum keeps the raw-string validation and the enforced parse in
-        // agreement on one canonical form (BLACK-003), and still rejects a
-        // no-colon `payments` that would otherwise be widened to `payments:*`.
-        for entry in user_ceiling {
-            // Fail-closed: a malformed capability string (deleted legacy
-            // outlet-invoke / pre-rename outlet-invoke stems, invalid §5.4.2.1
-            // outlet suffix) parses to `None` and is rejected at the FFI
-            // boundary rather than silently dropped.
-            let cap = scp_core::context::roles::Capability::new(entry).ok_or_else(|| {
-                ScpNapiError::Validation {
-                    message: format!(
-                        "invalid capability {entry:?} in ceiling (fails §5.4.2.1 parser) (use \"outlet:call:*\" for actions, \"outlet:query:*\" for reads)"
-                    ),
-                    code: codes::VALID_7000.to_owned(),
-                }
-            })?;
-            cap.validate_as_ceiling_entry()
-                .map_err(|e| ScpNapiError::Validation {
-                    message: e.to_string(),
-                    code: codes::VALID_7000.to_owned(),
-                })?;
-        }
-        user_ceiling
-            .iter()
-            .filter_map(|s| {
-                scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
-            })
-            .collect::<HashSet<String>>()
-    };
-
-    Ok(UcanContextState {
+/// Builds no role state and no capability ceiling: membership, roles, and the
+/// enforced ceiling belong to the per-context supervisor actor, which every gate
+/// reads through [`live_role_state`] and [`live_ceiling_strings`].
+fn build_ucan_context_state(context_id: &str, creator_did: &str) -> UcanContextState {
+    UcanContextState {
         core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
             revocation_list: RevocationList::new(context_id.to_owned()),
             nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
             creator_did: creator_did.to_owned(),
             event_log: EventLog::new(context_id.to_owned()),
         },
         outlet_registry: OutletRegistry::new(),
         outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
-    })
+    }
 }
 
 /// Eagerly registers per-context FFI (UCAN validation) state for a
@@ -1729,12 +1675,11 @@ fn build_ucan_context_state(
 /// # Errors
 ///
 /// Returns `ScpNapiError::Context` if the context's FFI state is already
-/// registered, plus the errors of [`build_ucan_context_state`].
+/// registered.
 pub fn register_ffi_state(
     bi: &NapiBridgeInstance,
     context_id: &str,
     creator_did: &str,
-    user_ceiling: &[String],
 ) -> Result<(), ScpNapiError> {
     use dashmap::mapref::entry::Entry;
 
@@ -1744,8 +1689,7 @@ pub fn register_ffi_state(
             code: codes::CTX_2023.to_owned(),
         }),
         Entry::Vacant(vacant) => {
-            let state = build_ucan_context_state(context_id, creator_did, user_ceiling)?;
-            vacant.insert(state);
+            vacant.insert(build_ucan_context_state(context_id, creator_did));
             Ok(())
         }
     }
@@ -1756,7 +1700,8 @@ pub fn register_ffi_state(
 ///
 /// If the context is already registered, this is a no-op. Otherwise, creates
 /// UCAN state from the `NapiContextHandle` metadata via
-/// [`build_ucan_context_state`].
+/// [`build_ucan_context_state`]. Reads no ceiling off the handle: every gate
+/// that authorizes from a ceiling reads [`live_ceiling_strings`].
 ///
 /// # Errors
 ///
@@ -1772,7 +1717,7 @@ pub fn ensure_registered(
         return Ok(());
     }
 
-    let state = build_ucan_context_state(&context_id, &handle.creator_did(), &handle.ceiling())?;
+    let state = build_ucan_context_state(&context_id, &handle.creator_did());
     map.entry(context_id).or_insert(state);
     Ok(())
 }
@@ -1912,40 +1857,6 @@ pub async fn live_context_state_str(
         .to_owned())
 }
 
-/// Re-syncs the `UcanContextState.core.ceiling_strings` for a context from the
-/// AUTHENTICATED context params carried by a joined
-/// [`ContextHandle`](scp_core::context::ContextHandle).
-///
-/// Peer of [`sync_role_state_from_manager`] (which syncs role state); this syncs
-/// the UCAN/outlet capability-check ceiling string set. Used by
-/// [`crate::context::context_join_from_welcome_on`]: the joiner no longer
-/// supplies a ceiling, so the FFI state is registered with the DEFAULT ceiling as
-/// a reversible precheck, then this overwrites it with the ceiling AUTHENTICATED
-/// by the joined MLS group's signed context binding. The ceiling entries are
-/// normalized to their enforced UCAN capability-name form (`{resource}:{action}`),
-/// matching the set [`build_ucan_context_state`] builds on the create path.
-/// Mirrors the `PyO3` reference bridge's `sync_ceiling_from_params`.
-///
-/// # Errors
-///
-/// Returns `ScpNapiError::Context` if the context's FFI state is not registered
-/// (unreachable on the join success path — the state was just registered and not
-/// removed).
-pub fn sync_ceiling_from_params(
-    bi: &NapiBridgeInstance,
-    context_id: &str,
-    ceiling: &[scp_core::context::roles::Capability],
-) -> Result<(), ScpNapiError> {
-    let ceiling_strings: HashSet<String> = ceiling
-        .iter()
-        .map(scp_core::context::roles::Capability::ucan_capability_name)
-        .collect();
-    with_context(bi, context_id, |st| {
-        st.core.ceiling_strings = ceiling_strings;
-        Ok(())
-    })
-}
-
 /// Registers an outlet handler for an outlet in a context.
 ///
 /// The handler will be called when the outlet is invoked. The outlet must already
@@ -2012,25 +1923,8 @@ pub fn query_trust_event_counts(
 pub fn register_test_context(bi: &NapiBridgeInstance, context_id: &str, creator_did: &str) {
     let map = ucan_registry(bi);
 
-    let ceiling_strings = scp_core::context::roles::default_ceiling()
-        .iter()
-        .map(scp_core::context::roles::Capability::ucan_capability_name)
-        .collect::<HashSet<String>>();
-
-    let state = UcanContextState {
-        core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
-            event_log: EventLog::new(context_id.to_owned()),
-            revocation_list: RevocationList::new(context_id.to_owned()),
-            nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-            ceiling_strings,
-            creator_did: creator_did.to_owned(),
-        },
-        outlet_registry: OutletRegistry::new(),
-        outlet_handlers: HashMap::new(),
-        session_store: SessionStore::new(),
-    };
-
-    map.entry(context_id.to_owned()).or_insert(state);
+    map.entry(context_id.to_owned())
+        .or_insert_with(|| build_ucan_context_state(context_id, creator_did));
 }
 
 // ---------------------------------------------------------------------------

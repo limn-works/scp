@@ -492,7 +492,8 @@ pub(crate) async fn outlet_stream_open_impl(
         &ucan_token,
         &caller_did,
         proof_tokens.as_ref(),
-    )?;
+    )
+    .await?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
     // narrowed `nb` — mirrors `outlet_invoke`. `ucan_cid` keys the owned Class-S
@@ -1295,7 +1296,8 @@ pub(crate) async fn outlet_streaming_saga_open_impl(
         &ucan_token,
         &caller_did,
         proof_tokens.as_ref(),
-    )?;
+    )
+    .await?;
 
     // §7.3.8 effective-caveat resolution from the VALIDATED invocation UCAN's
     // narrowed `nb`. `ucan_cid` keys the owned Class-S counters and anchors the

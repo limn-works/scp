@@ -307,6 +307,14 @@ impl crate::scp::PyScp {
         // Build proof resolver from optional proof tokens.
         let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
 
+        // Step 8 (ceiling containment) and the root-issuer check both decide
+        // authorization, so read the ceiling and the context creator DID from
+        // the per-context supervisor actor. A governance `ModifyCeiling` that
+        // narrowed the ceiling refuses the very next validation.
+        let live_role_state = crate::runtime::live_role_state(bi, context_id)?;
+        let live_ceiling = live_role_state.ceiling().to_ucan_string_set();
+        let live_creator_did = live_role_state.creator_did;
+
         // Execute the full 11-step validation pipeline within the context runtime.
         // Use production DID resolver when available (#311), fallback to string-only.
         crate::runtime::with_context(bi, context_id, |rt| {
@@ -325,8 +333,8 @@ impl crate::scp::PyScp {
                 nonce_tracker: &mut nonce_adapter,
                 revocation_checker: &revocation_checker,
                 proof_resolver: &proof_resolver,
-                ceiling: &rt.ceiling_strings,
-                context_creator_did: &rt.creator_did,
+                ceiling: &live_ceiling,
+                context_creator_did: &live_creator_did,
                 presenting_agent_did: agent_did,
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
@@ -441,6 +449,14 @@ impl crate::scp::PyScp {
         // Build proof resolver from optional proof tokens.
         let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
 
+        // The evaluation reports step 8 (ceiling containment) and the root-issuer
+        // check, so it reads the ceiling and the context creator DID from the
+        // per-context supervisor actor. A diagnostic answered from a bridge copy
+        // would report a stage as passing that the enforcing call refuses.
+        let live_role_state = crate::runtime::live_role_state(bi, context_id)?;
+        let live_ceiling = live_role_state.ceiling().to_ucan_string_set();
+        let live_creator_did = live_role_state.creator_did;
+
         // Run the read-only evaluation pipeline within the context runtime.
         // evaluate_ucan takes `&ValidationContext` and never records the nonce,
         // so a read-only probe of the nonce tracker suffices.
@@ -460,8 +476,8 @@ impl crate::scp::PyScp {
                 nonce_tracker: &mut nonce_adapter,
                 revocation_checker: &revocation_checker,
                 proof_resolver: &proof_resolver,
-                ceiling: &rt.ceiling_strings,
-                context_creator_did: &rt.creator_did,
+                ceiling: &live_ceiling,
+                context_creator_did: &live_creator_did,
                 presenting_agent_did: agent_did,
                 clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                 clock: &scp_clock::SystemClock,
@@ -533,14 +549,16 @@ impl crate::scp::PyScp {
         let context_id_owned = context_id.to_owned();
         let _nonce = scp_core::crypto::ucan::nonce::generate_nonce(&scp_clock::SystemClock);
 
+        // Mint-time ceiling enforcement (#339) decides which capabilities the
+        // token may carry, so read the ceiling from the per-context supervisor
+        // actor. Read it OUTSIDE `with_identity`: that closure runs sync over a
+        // DashMap entry and already drives async work through `rt.block_on`, and
+        // a live read nested inside it would stack a second `block_on`.
+        let ceiling_strings = crate::runtime::live_ceiling_strings(bi, context_id)?;
+
         // Mint using real scp_core::mint_ucan with Ed25519 signing via
         // the retained KeyCustody. See SCP-214 criterion 7.
         let token = crate::runtime::with_identity(bi, &creator_did, |entry| {
-            // Get the ceiling from the context runtime for mint-time enforcement (#339).
-            let ceiling_strings = crate::runtime::with_context(bi, &context_id_owned, |rt| {
-                Ok(rt.ceiling_strings.clone())
-            })?;
-
             let params = MintParams {
                 issuer_did: &creator_did,
                 issuer_key: &entry.identity.active_signing_key,
@@ -659,9 +677,11 @@ impl crate::scp::PyScp {
 
         let rt = crate::runtime()?;
 
-        // Get the ceiling from the context runtime for delegation-time enforcement (#339).
-        let ceiling_strings =
-            crate::runtime::with_context(bi, context_id, |rt| Ok(rt.ceiling_strings.clone()))?;
+        // Delegation-time ceiling enforcement (#339) decides which capabilities
+        // the delegated token may carry, so read the ceiling from the per-context
+        // supervisor actor. A governance `ModifyCeiling` that narrowed the
+        // ceiling refuses the very next delegation.
+        let ceiling_strings = crate::runtime::live_ceiling_strings(bi, context_id)?;
 
         let token = crate::runtime::with_identity(bi, delegator_did, |entry| {
             let params = DelegateParams {

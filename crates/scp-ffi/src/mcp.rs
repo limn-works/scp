@@ -659,20 +659,18 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
-        // Look up the agent's role assignment in the context's role state.
-        // Silently returns None if the bridge has been dropped — matches the
-        // "unknown context" fallback semantics of this trait method.
+        // Look up the agent's role assignment in the context's AUTHORITATIVE role
+        // state, held by the per-context supervisor actor. A governance
+        // `ChangeRole` another participant committed is visible here on the very
+        // next call. Returns None if the bridge has been dropped or the
+        // supervisor holds no actor — matching the "unknown context" fallback
+        // semantics of this trait method.
         let bi = self.upgrade_bi().ok()?;
-        crate::runtime::with_context(&bi, context_id, |rt| {
-            let role = rt
-                .role_state
-                .assignments
-                .get(&self.agent_did)
-                .map(|assignment| assignment.role_name.clone());
-            Ok(role)
-        })
-        .ok()
-        .flatten()
+        crate::runtime::live_role_state(&bi, context_id)
+            .ok()?
+            .assignments
+            .get(&self.agent_did)
+            .map(|assignment| assignment.role_name.clone())
     }
 
     fn agent_did(&self) -> &str {
@@ -720,6 +718,16 @@ impl ContextProvider for FfiBridgeProvider {
         // outlet_call:{outlet_name}/outlet_call:* for Action outlets
         // (SCP-OUT-014, §5.4.2) — for this context.
         // See spec §6.2, §8, ADR-016, and issue #319.
+        // Step 8 (ceiling containment), the root-issuer check, and the
+        // defense-in-depth role-state check below all decide authorization, so
+        // read the AUTHORITATIVE role state once from the per-context supervisor
+        // actor. A `RemoveMember` or `ModifyCeiling` another participant
+        // committed refuses the very next MCP outlet invocation.
+        let live_role_state =
+            crate::runtime::live_role_state(&bi, context_id).map_err(|e| format!("{e}"))?;
+        let live_ceiling = live_role_state.ceiling().to_ucan_string_set();
+        let live_creator_did = live_role_state.creator_did.clone();
+
         if let Some(ref token) = self.agent_ucan_token {
             // Build proof resolver from optional proof tokens (supports delegated UCANs).
             let proof_resolver =
@@ -756,8 +764,8 @@ impl ContextProvider for FfiBridgeProvider {
                     nonce_tracker: &mut nonce_adapter,
                     revocation_checker: &revocation_checker,
                     proof_resolver: &proof_resolver,
-                    ceiling: &rt.ceiling_strings,
-                    context_creator_did: &rt.creator_did,
+                    ceiling: &live_ceiling,
+                    context_creator_did: &live_creator_did,
                     presenting_agent_did: &self.agent_did,
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
@@ -815,7 +823,7 @@ impl ContextProvider for FfiBridgeProvider {
                 .get(outlet_name)
                 .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
             if scp_core::context::outlets::invoke::has_outlet_invocation_capability(
-                &rt.role_state,
+                &live_role_state,
                 &self.agent_did,
                 outlet_name,
                 outlet_kind,
@@ -1149,31 +1157,31 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn context_members(&self, context_id: &str) -> Vec<MemberInfo> {
-        // Returns empty if the bridge has been dropped — matches the
-        // "unknown context" fallback semantics of this trait method.
+        // Reports the AUTHORITATIVE membership held by the per-context supervisor
+        // actor, so a member another participant removed disappears from this
+        // listing on the very next call. Returns empty if the bridge has been
+        // dropped or the supervisor holds no actor — matching the "unknown
+        // context" fallback semantics of this trait method.
         let Ok(bi) = self.upgrade_bi() else {
             return Vec::new();
         };
-        crate::runtime::with_context(&bi, context_id, |rt| {
-            let members = rt
-                .role_state
-                .members
-                .iter()
-                .map(|did| {
-                    let role = rt
-                        .role_state
-                        .assignments
-                        .get(did)
-                        .map_or_else(|| "member".to_owned(), |a| a.role_name.clone());
-                    MemberInfo {
-                        did: did.clone(),
-                        role,
-                    }
-                })
-                .collect();
-            Ok(members)
-        })
-        .unwrap_or_default()
+        let Ok(role_state) = crate::runtime::live_role_state(&bi, context_id) else {
+            return Vec::new();
+        };
+        role_state
+            .members
+            .iter()
+            .map(|did| {
+                let role = role_state
+                    .assignments
+                    .get(did)
+                    .map_or_else(|| "member".to_owned(), |a| a.role_name.clone());
+                MemberInfo {
+                    did: did.clone(),
+                    role,
+                }
+            })
+            .collect()
     }
 
     fn context_events(&self, context_id: &str) -> serde_json::Value {
@@ -2019,17 +2027,19 @@ impl crate::scp::PyScp {
             }
             dict.set_item("relay_active", relay_active)?;
 
-            // Enrich with creator DID and member count from runtime state.
-            if let Ok(info) = crate::runtime::with_context(bi, ctx_id, |rt| {
-                Ok((
-                    rt.creator_did.clone(),
-                    rt.role_state.members.len(),
-                    rt.outlet_registry.len(),
-                ))
-            }) {
-                dict.set_item("creator_did", info.0)?;
-                dict.set_item("member_count", info.1)?;
-                dict.set_item("outlet_count", info.2)?;
+            // Enrich with the creator DID and outlet count from bridge state, and
+            // the member count from the per-context supervisor actor, which owns
+            // membership. A discovery listing built from a bridge copy would
+            // report a count that a removal already invalidated.
+            if let (Ok(bridge_info), Ok(role_state)) = (
+                crate::runtime::with_context(bi, ctx_id, |rt| {
+                    Ok((rt.creator_did.clone(), rt.outlet_registry.len()))
+                }),
+                crate::runtime::live_role_state(bi, ctx_id),
+            ) {
+                dict.set_item("creator_did", bridge_info.0)?;
+                dict.set_item("member_count", role_state.members.len())?;
+                dict.set_item("outlet_count", bridge_info.1)?;
             }
 
             results.push(dict.into());
@@ -2629,8 +2639,24 @@ mod tests {
     // Helper: register a context with an outlet for FfiBridgeProvider tests.
     // -----------------------------------------------------------------------
 
-    /// Registers a context in the runtime registry and optionally adds an outlet.
-    /// Returns a unique context ID to avoid collisions with parallel tests.
+    /// Registers a context in the bridge FFI registry, spawns its supervisor
+    /// actor, and optionally adds an outlet. Returns a unique context ID to avoid
+    /// collisions with parallel tests.
+    ///
+    /// The supervisor actor is mandatory: every bridge gate reads membership,
+    /// role assignment, and the ceiling through `live_role_state`, which fails
+    /// closed with `SCP-CTX-2023` when the supervisor holds no actor for the
+    /// context.
+    ///
+    /// The ceiling carries `outlet:register` alone, so the creator's admin role
+    /// grants `OutletRegister`. It deliberately carries NEITHER outlet
+    /// invocation stem: the default `member` role definition lists
+    /// `OutletQueryAll` and `OutletCallAll`, and a ceiling containing those stems
+    /// would hand every inserted member BOTH of them, which erases the
+    /// per-stem distinction the query-stem test measures. A test that needs a
+    /// member to hold one stem grants it through
+    /// `Supervisor::test_grant_member_capability`, which writes
+    /// `member_capabilities` directly and so does not depend on the ceiling.
     ///
     /// Callers must pass the same `bi` they use for subsequent registry lookups;
     /// each `PyBridgeInstance` has its own `instance_id` and context registry.
@@ -2643,7 +2669,26 @@ mod tests {
         let ctx_id = crate::types::generate_random_id("test-mcp");
         crate::runtime::register_context(bi, &ctx_id, creator_did, &[]).unwrap();
 
+        let sup = Arc::clone(crate::runtime::supervisor(bi).expect("supervisor attached"));
+        let rt = crate::runtime().expect("crate runtime initialized");
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![
+                scp_core::context::roles::Capability::new("outlet:register")
+                    .expect("known capability"),
+            ],
+            ..scp_core::context::ContextParams::default()
+        };
+        rt.block_on(sup.create_context(
+            ctx_id.clone(),
+            params,
+            scp_did::DID(creator_did.to_owned()),
+            None,
+        ))
+        .expect("supervisor accepts the context");
+
         if with_outlet {
+            let role_state =
+                crate::runtime::live_role_state(bi, &ctx_id).expect("actor answers role state");
             crate::runtime::with_context(bi, &ctx_id, |rt| {
                 let registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: "calculator".to_owned(),
@@ -2677,7 +2722,7 @@ mod tests {
                 };
                 scp_core::context::outlets::register_outlet(
                     &mut rt.outlet_registry,
-                    &rt.role_state,
+                    &role_state,
                     registration,
                     creator_did,
                 )
@@ -2730,23 +2775,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[cfg(feature = "testing")] // `Supervisor::test_insert_member` is `testing`-gated.
     fn ffi_bridge_provider_validate_capability_rejects_unauthorized() {
         let creator = "did:dht:z6MkCreatorValCapReject";
         let bi = __bi();
         let ctx_id = setup_test_context(&bi, creator, true);
 
-        // Add a member with no OutletCall capability.
+        // Add a member with no OutletCall capability. The insert lands on the
+        // per-context supervisor actor, which owns membership; the bridge holds
+        // no member set to write.
         let member = "did:dht:z6MkMemberNoInvoke";
-        crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            rt.role_state.members.insert(member.to_owned());
-            let mut caps = std::collections::HashSet::new();
-            caps.insert(scp_core::context::roles::Capability::MessagesRead);
-            rt.role_state
-                .member_capabilities
-                .insert(member.to_owned(), caps);
-            Ok(())
-        })
-        .unwrap();
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor attached"));
+        let rt = crate::runtime().expect("crate runtime initialized");
+        rt.block_on(sup.test_insert_member(&ctx_id, scp_did::DID(member.to_owned()), "member"))
+            .expect("supervisor records the member");
 
         let provider = FfiBridgeProvider {
             bi: Arc::downgrade(&bi),
@@ -2784,10 +2826,13 @@ mod tests {
     // #319 UCAN tests, and the shared gate is covered end-to-end by the runtime
     // `invoke_query_session_*` test.
     #[test]
+    // `Supervisor::test_insert_member` is `testing`-gated and
+    // `Supervisor::test_grant_member_capability` is
+    // `outlet-capability-test-grant`-gated; both grants now land on the
+    // per-context supervisor actor, which owns membership and capabilities.
+    #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
     #[allow(clippy::too_many_lines)] // End-to-end query-gate test: register + role-state + two-member gate assertions.
     fn ffi_bridge_provider_validate_capability_query_kind_selects_query_stem() {
-        use scp_core::context::roles::Capability;
-
         let creator = "did:dht:z6MkCreatorQueryStem";
         let member = "did:dht:z6MkMemberQueryStem";
         let bi = __bi();
@@ -2795,8 +2840,10 @@ mod tests {
         // Query-kind one explicitly below.
         let ctx_id = setup_test_context(&bi, creator, false);
 
-        // Register a QUERY-kind outlet and add a member holding ONLY the
-        // Action-class OutletCall grant.
+        let creator_role_state =
+            crate::runtime::live_role_state(&bi, &ctx_id).expect("actor answers role state");
+
+        // Register a QUERY-kind outlet.
         crate::runtime::with_context(&bi, &ctx_id, |rt| {
             let registration = scp_core::context::outlets::OutletRegistration {
                 outlet_id: "lookup".to_owned(),
@@ -2829,74 +2876,71 @@ mod tests {
             };
             scp_core::context::outlets::register_outlet(
                 &mut rt.outlet_registry,
-                &rt.role_state,
+                &creator_role_state,
                 registration,
                 creator,
             )
             .map_err(|e| crate::error::ScpPyError::context(format!("{e}")))?;
-
-            rt.role_state.members.insert(member.to_owned());
-            rt.role_state.member_capabilities.insert(
-                member.to_owned(),
-                std::iter::once(Capability::OutletCall("lookup".to_owned())).collect(),
-            );
             Ok(())
         })
         .unwrap();
 
-        // The MCP defense-in-depth gate reads the registered kind and dispatches
-        // via `has_outlet_invocation_capability`. An OutletCall-only member is
-        // DENIED on a Query outlet because the two stems are independent.
-        let denied = crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            let kind = rt
+        // Add a member holding ONLY the Action-class OutletCall grant. Both the
+        // membership insert and the capability grant land on the per-context
+        // supervisor actor, which owns both.
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).expect("supervisor attached"));
+        let rt = crate::runtime().expect("crate runtime initialized");
+        rt.block_on(sup.test_insert_member(&ctx_id, scp_did::DID(member.to_owned()), "member"))
+            .expect("supervisor records the member");
+        rt.block_on(sup.test_grant_member_capability(
+            &ctx_id,
+            scp_did::DID(member.to_owned()),
+            "outlet:call:lookup",
+        ))
+        .expect("supervisor grants the Action-class capability");
+
+        // The MCP defense-in-depth gate reads the registered kind from the bridge
+        // registry and the capability from the supervisor's AUTHORITATIVE role
+        // state, then dispatches via `has_outlet_invocation_capability`. An
+        // OutletCall-only member is DENIED on a Query outlet because the two
+        // stems are independent.
+        let outlet_kind = crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            Ok(rt
                 .outlet_registry
                 .get("lookup")
-                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
-            assert_eq!(
-                kind,
-                scp_core::context::outlets::OutletKind::Query,
-                "outlet must round-trip as Query through the bridge registry"
-            );
-            Ok(
-                scp_core::context::outlets::invoke::has_outlet_invocation_capability(
-                    &rt.role_state,
-                    member,
-                    "lookup",
-                    kind,
-                ),
-            )
+                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind))
         })
         .unwrap();
+        assert_eq!(
+            outlet_kind,
+            scp_core::context::outlets::OutletKind::Query,
+            "outlet must round-trip as Query through the bridge registry"
+        );
+
+        let denied = scp_core::context::outlets::invoke::has_outlet_invocation_capability(
+            &crate::runtime::live_role_state(&bi, &ctx_id).expect("actor answers role state"),
+            member,
+            "lookup",
+            outlet_kind,
+        );
         assert!(
             !denied,
             "Query outlet must be denied to a member holding only OutletCall"
         );
 
-        // Grant the Query-class capability → ALLOWED.
-        crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            rt.role_state
-                .member_capabilities
-                .get_mut(member)
-                .unwrap()
-                .insert(Capability::OutletQuery("lookup".to_owned()));
-            Ok(())
-        })
-        .unwrap();
-        let allowed = crate::runtime::with_context(&bi, &ctx_id, |rt| {
-            let kind = rt
-                .outlet_registry
-                .get("lookup")
-                .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
-            Ok(
-                scp_core::context::outlets::invoke::has_outlet_invocation_capability(
-                    &rt.role_state,
-                    member,
-                    "lookup",
-                    kind,
-                ),
-            )
-        })
-        .unwrap();
+        // Grant the Query-class capability on the supervisor → ALLOWED.
+        rt.block_on(sup.test_grant_member_capability(
+            &ctx_id,
+            scp_did::DID(member.to_owned()),
+            "outlet:query:lookup",
+        ))
+        .expect("supervisor grants the Query-class capability");
+        let allowed = scp_core::context::outlets::invoke::has_outlet_invocation_capability(
+            &crate::runtime::live_role_state(&bi, &ctx_id).expect("actor answers role state"),
+            member,
+            "lookup",
+            outlet_kind,
+        );
         assert!(
             allowed,
             "Query outlet must be allowed once the member holds OutletQuery"

@@ -383,8 +383,8 @@ pub(crate) fn validate_outlet_ucan(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &rt.ceiling_strings,
-            context_creator_did: &rt.creator_did,
+            ceiling: &live_ceiling,
+            context_creator_did: &live_creator_did,
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
@@ -1000,17 +1000,18 @@ fn outlet_invoke_cross_context_impl(
     })?;
 
     // Defense-in-depth: check role-state capabilities in the source context
-    // using the kind-appropriate split stem for the target outlet.
-    let source_has_capability = crate::runtime::with_context(bi, source_context_id, |rt| {
-        Ok(
-            scp_core::context::outlets::has_outlet_invocation_capability(
-                &rt.role_state,
-                invoker_did,
-                outlet_id,
-                target_outlet_kind,
-            ),
-        )
-    })?;
+    // using the kind-appropriate split stem for the target outlet. The check
+    // decides authorization, so it reads the source context's AUTHORITATIVE role
+    // state from that context's supervisor actor: a `RemoveMember` another
+    // participant committed in the source context refuses this cross-context
+    // call on the very next invocation.
+    let source_role_state = crate::runtime::live_role_state(bi, source_context_id)?;
+    let source_has_capability = scp_core::context::outlets::has_outlet_invocation_capability(
+        &source_role_state,
+        invoker_did,
+        outlet_id,
+        target_outlet_kind,
+    );
 
     if !source_has_capability {
         return Err(ScpPyError::ucan(format!(
@@ -1544,6 +1545,12 @@ fn outlet_session_invoke_impl(
         proof_tokens.as_ref(),
     )?;
 
+    // The defense-in-depth gate below decides authorization, so read the
+    // AUTHORITATIVE role state from the per-context supervisor actor BEFORE
+    // entering the sync `with_context` closure. A `RemoveMember` or `ChangeRole`
+    // another participant committed refuses the very next session call.
+    let session_role_state = crate::runtime::live_role_state(bi, context_id)?;
+
     let output_json = crate::runtime::with_context(bi, context_id, |rt| {
         // Look up session.
         let session = rt
@@ -1576,7 +1583,7 @@ fn outlet_session_invoke_impl(
             .get(&outlet_id)
             .map_or(scp_core::context::outlets::OutletKind::Action, |r| r.kind);
         if !scp_core::context::outlets::has_outlet_invocation_capability(
-            &rt.role_state,
+            &session_role_state,
             invoker_did,
             &outlet_id,
             outlet_kind,
@@ -1709,6 +1716,13 @@ fn outlet_interface_expose_impl(
         None => None,
     };
 
+    // `expose_outlet` admits only an admin of the source context, so read the
+    // AUTHORITATIVE role state and creator DID from the per-context supervisor
+    // actor: a governance `ChangeRole` that demoted the caller refuses this
+    // exposure on the very next call.
+    let role_state = crate::runtime::live_role_state(bi, context_id)?;
+    let creator_did = role_state.creator_did.clone();
+
     Ok(crate::runtime::with_context(bi, context_id, |rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.to_string(),
@@ -1719,8 +1733,8 @@ fn outlet_interface_expose_impl(
             context_handle.context_id(),
             &outlet_id.to_owned(),
             &target_context_id.to_owned(),
-            &rt.role_state,
-            &rt.creator_did,
+            &role_state,
+            &creator_did,
             &rt.outlet_registry,
             rate_limit,
             None,
@@ -1769,29 +1783,37 @@ fn outlet_interface_accept_impl(
             code: codes::VALID_7041.to_owned(),
         })?;
 
-    Ok(crate::runtime::with_context(bi, context_id, |rt| {
-        let context_handle = scp_core::context::ContextHandle::new(
-            context_id.to_string(),
-            scp_core::context::ContextParams::default(),
-        );
+    // `accept_outlet_interface` admits only an admin of the target context, so
+    // read the AUTHORITATIVE role state and creator DID from the per-context
+    // supervisor actor. `live_role_state` also fails closed when the supervisor
+    // holds no actor for `context_id`, which subsumes the bridge-registration
+    // precondition the removed `with_context` lookup enforced.
+    let role_state = crate::runtime::live_role_state(bi, context_id)?;
+    let creator_did = role_state.creator_did.clone();
 
-        scp_core::context::outlets::interface::accept_outlet_interface(
-            context_handle.context_id(),
-            &mut interface,
-            &rt.role_state,
-            &rt.creator_did,
-            None,
-        )
-        .map_err(|e| ScpPyError::ContextError {
-            message: format!("accept_outlet_interface failed: {e}"),
-            code: codes::OUTLET_6032.to_owned(),
-        })?;
+    let context_handle = scp_core::context::ContextHandle::new(
+        context_id.to_string(),
+        scp_core::context::ContextParams::default(),
+    );
 
+    scp_core::context::outlets::interface::accept_outlet_interface(
+        context_handle.context_id(),
+        &mut interface,
+        &role_state,
+        &creator_did,
+        None,
+    )
+    .map_err(|e| ScpPyError::ContextError {
+        message: format!("accept_outlet_interface failed: {e}"),
+        code: codes::OUTLET_6032.to_owned(),
+    })?;
+
+    Ok(
         serde_json::to_string(&interface).map_err(|e| ScpPyError::ContextError {
             message: format!("failed to serialize OutletInterface: {e}"),
             code: codes::OUTLET_6033.to_owned(),
-        })
-    })?)
+        })?,
+    )
 }
 
 /// Revokes a cross-context outlet interface (§6.2.0.1 step 5).
@@ -2743,11 +2765,34 @@ mod tests {
         let ctx_id = format!("ctx-ts-test-{}", std::process::id());
         let creator_did = "did:dht:z6MkTestTimestamp";
 
+        crate::init_runtime().ok();
         let scp = default_scp();
         let bi = &*scp.inner;
+        crate::runtime::init_context_manager_for_test(bi);
 
         // Register FFI state so the context exists in the runtime registry.
         crate::runtime::register_ffi_state(bi, &ctx_id, creator_did, &[]).unwrap();
+
+        // Spawn the per-context supervisor actor with a ceiling that grants the
+        // creator's admin role `OutletRegister`. `outlet_register` reads the
+        // registrant's authority through `live_role_state`, which fails closed
+        // when the supervisor holds no actor for the context.
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(bi).unwrap());
+        let rt = crate::runtime().unwrap();
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![
+                scp_core::context::roles::Capability::new("outlet:register")
+                    .expect("known capability"),
+            ],
+            ..scp_core::context::ContextParams::default()
+        };
+        rt.block_on(sup.create_context(
+            ctx_id.clone(),
+            params,
+            scp_did::DID(creator_did.to_owned()),
+            None,
+        ))
+        .expect("supervisor accepts the context");
 
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
@@ -2888,5 +2933,147 @@ mod tests {
             }
             other => panic!("expected SagaBusy, got {other:?}"),
         }
+    }
+
+    /// A membership change that lands REMOTELY refuses the next unary bridge
+    /// call.
+    ///
+    /// `Supervisor::leave_context` applies the removal directly to the
+    /// per-context actor, never through `PyScp::context_leave`, so no bridge
+    /// entry point runs that could have refreshed a bridge-held copy. The
+    /// removal strips the departing DID from `members`, `assignments`,
+    /// `member_capabilities`, and `suspended_capabilities` (spec §5.6.1), so the
+    /// creator loses `OutletRegister`. `PyScp::outlet_register` then refuses the
+    /// second registration with `SCP-CTX-2001`, because
+    /// `outlet_register_impl` reads the registrant's authority through
+    /// `crate::runtime::live_role_state`.
+    ///
+    /// Reverting the `live_role_state` call in `outlet_register_impl` to any
+    /// state the bridge captured at registration time fails this test: the
+    /// captured copy still lists the creator as an admin, so the second
+    /// registration succeeds.
+    #[test]
+    #[cfg(feature = "testing")] // `Supervisor::test_insert_member` is `testing`-gated.
+    fn remote_member_removal_refuses_the_next_outlet_register() {
+        pyo3::prepare_freethreaded_python();
+        crate::init_runtime().ok();
+        Python::with_gil(|py| {
+            let scp = crate::scp::PyScp::new_in_memory_for_test();
+            let bi = scp.inner.clone();
+            let creator = "did:key:z6MkRemoteRemovalOutletReg";
+            let ctx_id = format!("remote-removal-{}", uuid::Uuid::new_v4());
+
+            crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+            let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            let rt = crate::runtime().unwrap();
+            let params = scp_core::context::ContextParams {
+                ceiling: vec![
+                    scp_core::context::roles::Capability::new("outlet:register")
+                        .expect("known capability"),
+                    scp_core::context::roles::Capability::new("member:remove")
+                        .expect("known capability"),
+                ],
+                ..scp_core::context::ContextParams::default()
+            };
+            rt.block_on(sup.create_context(
+                ctx_id.clone(),
+                params,
+                scp_did::DID(creator.to_owned()),
+                None,
+            ))
+            .expect("supervisor accepts the context");
+
+            // Baseline: while the creator is a member, the gate ADMITS the
+            // registration. Without this the test could pass for the wrong
+            // reason (a registration that never worked at all).
+            let first = build_outlet_registration_dict(py, "before-removal", creator);
+            scp.outlet_register(&ctx_id, &first.as_borrowed())
+                .expect("an admin creator may register an outlet");
+
+            // Seat a SECOND member so the creator's departure below leaves the
+            // context populated and therefore `Active`, which keeps the refusal
+            // attributable to the role gate rather than to a lifecycle
+            // transition.
+            rt.block_on(sup.test_insert_member(
+                &ctx_id,
+                scp_did::DID("did:key:z6MkRemainingMemberOutletReg".to_owned()),
+                "member",
+            ))
+            .expect("supervisor records the second member");
+
+            // The removal lands on the supervisor actor alone.
+            let core_handle = scp_core::context::ContextHandle::new(
+                ctx_id.clone(),
+                scp_core::context::ContextParams::default(),
+            );
+            let creator_did = scp_did::DID(creator.to_owned());
+            rt.block_on(async {
+                let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
+                // Self-removal: the caller and the removed member are the creator.
+                sup.leave_context(&core_handle, &creator_did, &creator_did)
+                    .await
+            })
+            .expect("supervisor removes the creator");
+
+            // The next unary call is REFUSED with a typed error.
+            let second = build_outlet_registration_dict(py, "after-removal", creator);
+            let err = scp
+                .outlet_register(&ctx_id, &second.as_borrowed())
+                .expect_err("a removed registrant must not register an outlet");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(codes::CTX_2001),
+                "refusal must carry SCP-CTX-2001, got: {msg}"
+            );
+            assert!(
+                msg.contains("outlet registration failed"),
+                "refusal must name the failed registration, got: {msg}"
+            );
+
+            crate::runtime::remove_context(&bi, &ctx_id);
+        });
+    }
+
+    /// Builds a minimal `PyDict` outlet registration whose schemas clear the
+    /// §6.2 specificity floor (two properties per side).
+    fn build_outlet_registration_dict<'py>(
+        py: Python<'py>,
+        name: &str,
+        operator_did: &str,
+    ) -> Bound<'py, PyDict> {
+        let reg = PyDict::new(py);
+        reg.set_item("name", name).unwrap();
+        reg.set_item("description", format!("Outlet {name}"))
+            .unwrap();
+        reg.set_item("operator_did", operator_did).unwrap();
+        let schema = PyDict::new(py);
+        schema
+            .set_item(
+                "input_schema",
+                crate::types::json_to_py_dict(
+                    py,
+                    &serde_json::json!({
+                        "type": "object",
+                        "properties": { "a": {"type": "number"}, "b": {"type": "number"} }
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        schema
+            .set_item(
+                "output_schema",
+                crate::types::json_to_py_dict(
+                    py,
+                    &serde_json::json!({
+                        "type": "object",
+                        "properties": { "result": {"type": "number"}, "ok": {"type": "boolean"} }
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        reg.set_item("schema", schema).unwrap();
+        reg
     }
 }

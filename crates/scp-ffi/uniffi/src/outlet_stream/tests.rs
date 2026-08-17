@@ -351,6 +351,7 @@ async fn live_poll_next_drains_to_terminal() {
         .context_create(
             Arc::clone(&creator_identity),
             streaming_context_params(&[
+                "outlet:register",
                 "outlet:call:*",
                 "messages:read",
                 "messages:write",
@@ -564,6 +565,7 @@ mod streaming_vectors_live {
             .context_create(
                 Arc::clone(&creator_identity),
                 streaming_context_params(&[
+                    "outlet:register",
                     "outlet:call:*",
                     "messages:read",
                     "messages:write",
@@ -831,6 +833,10 @@ mod xctx_streaming_saga_tests {
     }
 
     const STREAMING_CEILING: &[&str] = &[
+        // `outlet_register` reads the registrant's authority from the context's
+        // supervisor actor, so the ceiling must grant the creator's admin role
+        // `OutletRegister`.
+        "outlet:register",
         "outlet:call:*",
         "messages:read",
         "messages:write",
@@ -981,6 +987,7 @@ mod xctx_streaming_saga_tests {
     /// non-active lifecycle state through the supervisor close path.
     const CLOSEABLE_STREAMING_CEILING: &[&str] = &[
         "context:close",
+        "outlet:register",
         "outlet:call:*",
         "messages:read",
         "messages:write",

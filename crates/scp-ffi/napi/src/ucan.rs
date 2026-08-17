@@ -500,15 +500,16 @@ pub(crate) async fn ucan_mint_on(
     let creator_did = handle.creator_did();
     let context_id = handle.context_id();
 
-    // Get ceiling from the context handle for mint-time enforcement (#339).
-    // Empty ceiling means the user passed `[]` — apply the default ceiling
-    // instead of `None` (which would mean unlimited). See #1419.
-    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
-    let ceiling = Some(if ceiling_strings.is_empty() {
-        scp_core::context::roles::default_ceiling().to_ucan_string_set()
-    } else {
-        ceiling_strings
-    });
+    // Mint-time ceiling enforcement (#339) decides which capabilities this
+    // token may carry, so read the ceiling from the per-context supervisor
+    // actor. A governance `ModifyCeiling` that narrowed the ceiling refuses the
+    // very next mint, and an EMPTY ceiling authorizes nothing — no
+    // `default_ceiling()` stands in for a caller.
+    let ceiling = Some(
+        crate::runtime::live_ceiling_strings(bi, &context_id)
+            .await
+            .map_err(napi::Error::from)?,
+    );
 
     let params = MintParams {
         issuer_did: &creator_did,
@@ -626,15 +627,16 @@ pub(crate) async fn ucan_delegate_on(
         .collect::<Result<Vec<_>, ScpNapiError>>()
         .map_err(napi::Error::from)?;
 
-    // Get ceiling from the context handle for delegation-time enforcement (#339).
-    // Empty ceiling means the user passed `[]` — apply the default ceiling
-    // instead of `None` (which would mean unlimited). See #1419.
-    let ceiling_strings: std::collections::HashSet<String> = handle.ceiling().into_iter().collect();
-    let ceiling = Some(if ceiling_strings.is_empty() {
-        scp_core::context::roles::default_ceiling().to_ucan_string_set()
-    } else {
-        ceiling_strings
-    });
+    // Delegation-time ceiling enforcement (#339) decides which capabilities the
+    // delegated token may carry, so read the ceiling from the per-context
+    // supervisor actor. A governance `ModifyCeiling` that narrowed the ceiling
+    // refuses the very next delegation, and an EMPTY ceiling authorizes nothing
+    // — no `default_ceiling()` stands in for a caller.
+    let ceiling = Some(
+        crate::runtime::live_ceiling_strings(bi, &context_id)
+            .await
+            .map_err(napi::Error::from)?,
+    );
 
     // Look up the DELEGATOR's identity from the global identity registry.
     // This is critical: the delegation must be signed with the delegator's
@@ -1559,6 +1561,122 @@ mod tests {
         assert!(
             empty.is_err(),
             "ucan_validate must fail closed when presenting_agent_did is empty"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ceiling liveness — a mint reads what governance holds, never a copy
+    // -----------------------------------------------------------------------
+
+    /// `ucan_mint_on` reads its mint-time ceiling from a per-context supervisor
+    /// actor, so a `ModifyCeiling` that governance committed refuses the very
+    /// next mint of a capability that ceiling dropped.
+    ///
+    /// Governance narrows this context's ceiling through `Supervisor`
+    /// (`propose_governance_action` plus `ApplyPendingCeilingModification`),
+    /// never through a bridge entry point, so no bridge path could refresh a
+    /// copy. Revert the `live_ceiling_strings` read in `ucan_mint_on` back to
+    /// `handle.ceiling()` and this test fails: a handle-held copy still carries
+    /// `messages:write`, so a mint that governance forbids succeeds.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mint_refuses_a_capability_governance_dropped_from_the_ceiling() {
+        use scp_core::context::actor::commands::GovernanceCommand;
+        use scp_core::context::governance::GovernanceAction;
+        use scp_core::context::roles::Capability;
+        use scp_core::context::state::GovernanceActionResult;
+        use scp_did::DID;
+
+        let scp = crate::scp::Scp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create (creator) should succeed");
+        let creator = identity.inner.did.clone();
+
+        // A GOVERNED ceiling policy is what lets governance modify this ceiling
+        // at all — `execute_modify_ceiling` refuses an immutable one.
+        let params = serde_json::json!({
+            "ceiling": ["messages:read", "messages:write"],
+            "ceilingPolicy": "governed",
+            "governance": "single_admin",
+            "memoryScope": "ephemeral",
+        })
+        .to_string();
+        let handle = crate::context::context_create_on(&bi, &identity, params)
+            .await
+            .expect("context_create should succeed");
+        let context_id = handle.context_id();
+
+        // Baseline: this ceiling admits `messages:write`, so minting it
+        // succeeds.
+        ucan_mint_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkCeilingMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await
+        .expect("a mint within the ceiling must succeed");
+
+        // Governance drops `messages:write` and keeps `messages:read`. A single
+        // admin's proposal auto-executes, which STAGES the modification behind
+        // its §5.3.2 notification window.
+        let sup = crate::runtime::supervisor(&bi).expect("supervisor must be initialized");
+        let signing_key = crate::context::resolve_napi_signing_key(&handle)
+            .await
+            .expect("the creator's retained custody exports its signing key");
+        let (_proposal, _events, outcome) = sup
+            .propose_governance_action(
+                &context_id,
+                &DID(creator),
+                GovernanceAction::ModifyCeiling {
+                    new_ceiling: vec![Capability::MessagesRead],
+                },
+                &signing_key,
+            )
+            .await
+            .expect("the single admin proposes ModifyCeiling");
+        assert!(
+            matches!(outcome, Some(GovernanceActionResult::CeilingModified)),
+            "a single-admin ModifyCeiling proposal auto-executes: {outcome:?}"
+        );
+
+        // Elapse the notification window: apply the staged modification at a
+        // timestamp past its effective deadline.
+        let far_future = 4_102_444_800_u64; // 2100-01-01T00:00:00Z
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_governance_command(GovernanceCommand::ApplyPendingCeilingModification {
+            context_id: context_id.clone(),
+            current_timestamp: far_future,
+            reply: tx,
+        })
+        .await
+        .expect("the supervisor accepts the apply command");
+        assert!(
+            rx.await
+                .expect("the apply reply channel stays open")
+                .expect("applying the staged modification succeeds"),
+            "the staged ceiling modification is effective at the far-future timestamp"
+        );
+
+        // A narrowed ceiling refuses the next mint of `messages:write`.
+        let refused = ucan_mint_on(
+            &bi,
+            &handle,
+            "did:dht:z6MkCeilingMember".to_owned(),
+            vec!["messages:write".to_owned()],
+            None,
+        )
+        .await;
+        let Err(err) = refused else {
+            panic!("a mint outside the narrowed ceiling must be refused")
+        };
+        assert!(
+            err.to_string().contains("capability outside ceiling"),
+            "the refusal names the ceiling that governance narrowed: {err}"
         );
     }
 }

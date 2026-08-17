@@ -1734,6 +1734,34 @@ mod tests {
         assert!(msg.contains("got 0"));
     }
 
+    /// Spawns the per-context supervisor actor for `ctx_id` with a ceiling that
+    /// grants `creator_did`'s admin role `OutletRegister`.
+    ///
+    /// `outlet_register_on` reads the registrant's authority through
+    /// `crate::runtime::live_role_state`, which fails closed when the supervisor
+    /// holds no actor for the context. A bridge-only `test_active_on` handle
+    /// therefore no longer suffices on its own.
+    async fn spawn_register_capable_actor(
+        bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
+        ctx_id: &str,
+        creator_did: &str,
+    ) {
+        crate::runtime::init_supervisor_for_test_on(bi);
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(bi).unwrap());
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![scp_core::context::roles::Capability::OutletRegister],
+            ..scp_core::context::ContextParams::default()
+        };
+        sup.create_context(
+            ctx_id.to_owned(),
+            params,
+            scp_did::DID(creator_did.to_owned()),
+            None,
+        )
+        .await
+        .expect("supervisor accepts the context");
+    }
+
     /// `registered_at` on an outlet registered via the NAPI bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
     /// Calls the actual `outlet_register` bridge function and inspects the
@@ -1747,6 +1775,7 @@ mod tests {
         let creator_did = "did:dht:z6MkNapiTsTest";
 
         let handle = NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator_did.to_owned());
+        spawn_register_capable_actor(&bi, &ctx_id, creator_did).await;
 
         let definition = NapiOutletDefinition {
             name: "napi-timestamp-probe".to_owned(),
@@ -1797,6 +1826,7 @@ mod tests {
         let ctx_id = format!("ctx-napi-kind-test-{}", std::process::id());
         let creator_did = "did:dht:z6MkNapiKindTest";
         let handle = NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator_did.to_owned());
+        spawn_register_capable_actor(&bi, &ctx_id, creator_did).await;
 
         let definition = NapiOutletDefinition {
             name: "napi-query-probe".to_owned(),
@@ -1989,6 +2019,137 @@ mod tests {
             nonce,
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
+    }
+
+    /// The live-role-state gating tests need a real identity and a real
+    /// supervisor actor, so this submodule is gated on `testing`.
+    #[cfg(feature = "testing")]
+    mod live_role_state_tests {
+        use super::*;
+
+        /// Creates a context through the real `context_create_on` path, so both
+        /// the bridge handle and the per-context supervisor actor exist. The
+        /// ceiling carries `outlet:register`, so the creator's admin role grants
+        /// `OutletRegister` until a membership change strips it.
+        async fn create_registerable_context(
+            bi: &std::sync::Arc<crate::runtime::NapiBridgeInstance>,
+            owner_identity: &crate::identity::NapiIdentity,
+        ) -> crate::context::NapiContextHandle {
+            let params = serde_json::json!({
+                "ceiling": ["outlet:register", "member:remove", "messages:read", "messages:write"],
+                "governance": "single_admin",
+                "memoryScope": "ephemeral",
+            })
+            .to_string();
+            crate::context::context_create_on(bi, owner_identity, params)
+                .await
+                .expect("context_create should succeed")
+        }
+
+        /// Builds an outlet definition whose schemas clear the §6.2 specificity
+        /// floor (two properties per side).
+        fn registerable_outlet_def(outlet_name: &str, owner: &str) -> NapiOutletDefinition {
+            NapiOutletDefinition {
+                name: outlet_name.to_owned(),
+                description: format!("Outlet: {outlet_name}"),
+                kind: NapiOutletKind::Action,
+                input_schema_json:
+                    r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}}}"#
+                        .to_owned(),
+                output_schema_json:
+                    r#"{"type":"object","properties":{"sum":{"type":"number"},"ok":{"type":"number"}}}"#
+                        .to_owned(),
+                test_vectors_json: None,
+                implementation_hash: None,
+                operator_did: owner.to_owned(),
+                cost: None,
+            }
+        }
+
+        /// A membership change that lands REMOTELY refuses the next unary bridge
+        /// call.
+        ///
+        /// `Supervisor::leave_context` applies the removal directly to the
+        /// per-context actor, never through `context_leave_on`, so no bridge
+        /// entry point runs that could have refreshed a bridge-held copy. The
+        /// removal strips the departing DID from `members`, `assignments`,
+        /// `member_capabilities`, and `suspended_capabilities` (spec §5.6.1), so
+        /// the creator loses `OutletRegister`. `outlet_register_on` then refuses
+        /// the second registration with `SCP-OUTLET-6001`, because it reads the
+        /// registrant's authority through `crate::runtime::live_role_state`.
+        ///
+        /// Reverting the `live_role_state` call in `outlet_register_on` to any
+        /// state the bridge captured at registration time fails this test: the
+        /// captured copy still lists the creator as an admin, so the second
+        /// registration succeeds.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn remote_member_removal_refuses_the_next_outlet_register() {
+            let scp = crate::scp::Scp::new_in_memory_for_test();
+            let bi = std::sync::Arc::clone(&scp.inner);
+
+            let owner_identity = scp
+                .identity_create("in_memory".to_owned(), None)
+                .await
+                .expect("identity_create should succeed");
+            let owner_did = owner_identity.did();
+            let handle = create_registerable_context(&bi, &owner_identity).await;
+            let context_id = handle.context_id();
+
+            // Baseline: while the creator is a member, the gate ADMITS the
+            // registration. Without this the test could pass for the wrong
+            // reason (a registration that never worked at all).
+            outlet_register_on(
+                &bi,
+                &handle,
+                registerable_outlet_def("before_removal", &owner_did),
+            )
+            .await
+            .expect("an admin creator may register an outlet");
+
+            // Seat a SECOND member so the creator's departure below leaves the
+            // context populated and therefore `Active`. Without it the departure
+            // empties the membership, the context transitions to `Closing`, and
+            // the lifecycle gate refuses the second registration before the role
+            // gate under test ever runs.
+            let sup = std::sync::Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+            sup.test_insert_member(
+                &context_id,
+                scp_did::DID("did:key:z6MkNapiRemainingMember".to_owned()),
+                "member",
+            )
+            .await
+            .expect("supervisor records the second member");
+
+            // The removal lands on the supervisor actor alone.
+            let core_handle = scp_core::context::ContextHandle::new(
+                context_id.clone(),
+                scp_core::context::ContextParams::default(),
+            );
+            let _ = core_handle.transition_to(&scp_core::context::ContextState::Active);
+            let owner = scp_did::DID(owner_did.clone());
+            // Self-removal: the caller and the removed member are the creator.
+            sup.leave_context(&core_handle, &owner, &owner)
+                .await
+                .expect("supervisor removes the creator");
+
+            // The next unary call is REFUSED with a typed error.
+            let err = outlet_register_on(
+                &bi,
+                &handle,
+                registerable_outlet_def("after_removal", &owner_did),
+            )
+            .await
+            .expect_err("a removed registrant must not register an outlet");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(codes::OUTLET_6001),
+                "refusal must carry SCP-OUTLET-6001, got: {msg}"
+            );
+            assert!(
+                msg.contains("outlet registration failed"),
+                "refusal must name the failed registration, got: {msg}"
+            );
+        }
     }
 
     /// All §6.2.4 cross-context-outlet saga binding tests and their pure-string /

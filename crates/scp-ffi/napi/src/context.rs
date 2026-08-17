@@ -232,7 +232,12 @@ impl NapiContextHandle {
         self.mode.clone()
     }
 
-    /// Returns the capability ceiling for this context.
+    /// Returns the capability ceiling this handle recorded at creation.
+    ///
+    /// **No authorization gate reads this getter.** Governance narrows a
+    /// ceiling on the per-context supervisor actor without touching this
+    /// handle, so every gate that authorizes from a ceiling calls
+    /// [`crate::runtime::live_ceiling_strings`] instead.
     #[napi(getter)]
     #[must_use]
     pub fn ceiling(&self) -> Vec<String> {
@@ -1368,13 +1373,11 @@ pub(crate) async fn context_join_from_welcome_on(
     // `spawn_actor_from_welcome` consumes the single-use KeyPackage, and leaves
     // any pre-existing entry untouched (never roll back state we did not create).
     //
-    // FLAG-1: the caller no longer supplies a ceiling, so register with the
-    // DEFAULT ceiling (`&[]`). The Occupied dedup is keyed on `context_id`, so
-    // the "detect a duplicate BEFORE consuming the single-use KeyPackage"
-    // crash-safety is preserved regardless of the ceiling. The AUTHENTICATED
-    // ceiling is re-synced from the joined handle's signed params AFTER a
-    // successful spawn (see `sync_ceiling_from_params` below).
-    crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did, &[])
+    // FLAG-1: the caller supplies no ceiling, and the bridge stores none. Every
+    // UCAN gate reads the AUTHENTICATED ceiling from the per-context supervisor
+    // actor, which `spawn_actor_from_welcome` seeds from the joined MLS group's
+    // signed context binding.
+    crate::runtime::register_ffi_state(bi, &sealed.context_id, &sealed.creator_did)
         .map_err(NapiError::from)?;
     // The joiner's membership is recorded by `spawn_actor_from_welcome` below,
     // in the per-context actor that owns the authoritative role state. The
@@ -1408,33 +1411,10 @@ pub(crate) async fn context_join_from_welcome_on(
         }
     };
 
-    // FLAG-1: re-sync the AUTHENTICATED ceiling from the joined handle's signed
-    // params, overwriting the default ceiling used for the reversible precheck.
-    // The authoritative ceiling lives in the bundle the creator signed — never in
-    // caller input. This runs AFTER the irreversible commit; the FFI state was
-    // just registered (and not removed on this success path), so the sync targets
-    // a live entry.
-    //
-    // BLACK-2JF-01 — post-irreversible-commit compensation: the sync fails ONLY
-    // if a concurrent close/leave removed the just-registered FFI state in the
-    // window since the spawn returned. A close/leave does NOT despawn the runtime
-    // actor, so returning `Err` here without tearing the actor down would strand a
-    // live, orphaned actor for a join that never fully materialized at the bridge.
-    // Compensate with the COMPLETE teardown (`discard_joined_context`): it removes
-    // the actor handle AND destroys the resident MLS group AND deletes the durable
-    // Class-S snapshot the join persisted — a bare `despawn_actor` would leave the
-    // crypto group and snapshot behind, resurrecting the context on restart and
-    // blocking a fresh re-join. Then purge residual bridge state and surface the
-    // error.
-    if let Err(e) = crate::runtime::sync_ceiling_from_params(
-        bi,
-        &sealed.context_id,
-        &core_handle.params().ceiling,
-    ) {
-        sup.discard_joined_context(&sealed.context_id).await;
-        crate::runtime::remove_context(bi, &sealed.context_id);
-        return Err(NapiError::from(e));
-    }
+    // FLAG-1 (ceiling sync deleted): the bridge holds no ceiling copy to
+    // re-sync. Every UCAN gate reads the AUTHENTICATED ceiling — the one the
+    // creator signed into the bundle — from the per-context supervisor actor
+    // that the spawn above registered.
 
     // Runtime join committed. Register the context in the known-contexts
     // discovery registry so a Welcome-joined context is surfaced by discovery,
@@ -3629,7 +3609,7 @@ pub(crate) async fn context_reconnect_on(
 ///
 /// The NAPI handle retains `in_memory_custody` and `signing_key` (`KeyHandle`)
 /// from the creating identity. This function exports the raw key bytes.
-async fn resolve_napi_signing_key(
+pub(crate) async fn resolve_napi_signing_key(
     handle: &NapiContextHandle,
 ) -> napi::Result<ed25519_dalek::SigningKey> {
     let custody = handle.in_memory_custody.as_ref().ok_or_else(|| {

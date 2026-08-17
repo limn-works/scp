@@ -431,6 +431,18 @@ mod live {
 
         let ctx = {
             let params = PyDict::new(py);
+            // `outlet_register` and `ucan_mint` below both read this context's
+            // supervisor actor — the first for the registrant's authority, the
+            // second for the enforced ceiling — so the ceiling must carry both
+            // `outlet:register` and the `outlet:call:*` stem the minted token
+            // claims. A context created with no ceiling authorizes even its
+            // creator for nothing, and admits no minted capability.
+            params
+                .set_item(
+                    "ceiling",
+                    PyList::new(py, ["outlet:register", "outlet:call:*"]).unwrap(),
+                )
+                .unwrap();
             let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
             handle_context_id(py, &handle)
         };

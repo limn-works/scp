@@ -22,11 +22,24 @@ The `Supervisor` is constructed via `Supervisor::with_providers_and_journal(...)
 ### UCAN State Registry
 
 A separate `DashMap<String, UcanContextState>` in `runtime.rs` stores per-context UCAN
-validation state (revocation lists, nonce trackers, capability ceilings, event logs for
-Merkle proofs). This is NOT a duplicate of `Supervisor` state — the supervisor does not
-track UCAN revocation or nonces.
+validation state (revocation lists, nonce trackers, event logs for Merkle proofs). This
+is NOT a duplicate of `Supervisor` state — the supervisor does not track UCAN revocation
+or nonces.
 
 Functions: `ensure_registered`, `with_context`, `remove_context`.
+
+**Authorization reads live supervisor state.** This registry holds NO capability ceiling.
+Every gate that authorizes from a ceiling — `ucan_validate`, `ucan_evaluate`, `ucan_mint`,
+`ucan_delegate`, and the outlet-invocation gate — reads
+`runtime::live_ceiling_strings(bi, context_id).await`, which routes through the
+per-context supervisor actor and fails closed with `SCP-CTX-2023` when the supervisor
+holds no actor for that context. An EMPTY ceiling authorizes nothing: the bridge
+substitutes no `default_ceiling()` on a caller's behalf, so a test that needs an
+authorized creator passes the capabilities it needs in the `ceiling` create param. The
+bridge stored a ceiling string set plus a `sync_ceiling_from_params` refresh helper until
+governance narrowing a ceiling proved a bridge copy cannot stay current — do NOT
+reintroduce either. `NapiContextHandle::ceiling` remains as a descriptive getter for JS
+callers, and NO authorization gate reads it.
 
 ### Module Structure
 

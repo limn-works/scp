@@ -1751,42 +1751,36 @@ where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::runtime::Handle::try_current() {
-        Err(_) => {
-            let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-            Ok(rt.block_on(fut))
-        }
-        Ok(handle) => match handle.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => {
-                Ok(tokio::task::block_in_place(|| handle.block_on(fut)))
-            }
-            _ => {
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => {
-                            let _ = tx.send(Some(rt.block_on(fut)));
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                "dedicated supervisor-query runtime build failed; failing closed"
-                            );
-                            let _ = tx.send(None);
-                        }
-                    }
-                });
-                rx.recv().ok().flatten().ok_or_else(|| {
-                    ScpPyError::context(
-                        "supervisor query could not be driven on a dedicated runtime".to_owned(),
-                    )
-                })
-            }
-        },
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
+        return Ok(rt.block_on(fut));
+    };
+    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+        return Ok(tokio::task::block_in_place(|| handle.block_on(fut)));
     }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => {
+                let _ = tx.send(Some(rt.block_on(fut)));
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "dedicated supervisor-query runtime build failed; failing closed"
+                );
+                let _ = tx.send(None);
+            }
+        }
+    });
+    rx.recv().ok().flatten().ok_or_else(|| {
+        ScpPyError::context(
+            "supervisor query could not be driven on a dedicated runtime".to_owned(),
+        )
+    })
 }
 
 /// Builds the fail-closed error a live read returns when the supervisor holds

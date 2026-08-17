@@ -82,6 +82,10 @@ fn default_encrypted_params() -> ContextParams {
         ceiling: vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
+            // `outlet_register` reads the registrant's authority from the
+            // context's supervisor actor, so the ceiling must grant the
+            // creator's admin role `OutletRegister`.
+            "outlet:register".to_owned(),
             "outlet:call:*".to_owned(),
         ],
         ceiling_policy: CeilingPolicy::Immutable,

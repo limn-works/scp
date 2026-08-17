@@ -363,17 +363,24 @@ impl ProtocolRepoVariant {
 /// validation pipeline (ADR-016). These are NOT duplicates of `ContextManager`
 /// state — the manager does not track UCAN revocation or nonces.
 ///
-/// The NAPI bridge extends this with bridge-specific fields (`role_state`,
-/// `outlet_registry`, `outlet_handlers`, `session_store`). The `UniFFI` bridge
+/// The NAPI bridge extends this with bridge-specific fields
+/// (`outlet_registry`, `outlet_handlers`, `session_store`). The `UniFFI` bridge
 /// uses this as-is (type alias `UcanContextState = UcanContextStateCore`).
+///
+/// This struct holds NO capability ceiling. A ceiling belongs to a per-context
+/// supervisor actor, and every gate that authorizes from a ceiling reads that
+/// actor through `live_ceiling_strings` (NAPI) or `live_role_state` (`UniFFI`).
+/// Both bridges cached a ceiling string set here until governance narrowing a
+/// ceiling on another participant proved a bridge copy cannot stay current: no
+/// remote path invalidated a copy, so a `ModifyCeiling` another participant
+/// committed left every bridge gate admitting a capability that context already
+/// forbade. Do NOT reintroduce a ceiling field, and do NOT add a refresh call
+/// site — a refresh site closes no window.
 pub struct UcanContextStateCore {
     /// UCAN revocation list for this context.
     pub revocation_list: scp_core::crypto::ucan::revoke::RevocationList,
     /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
     pub nonce_tracker: scp_core::crypto::ucan::nonce::NonceTracker<scp_clock::SystemClock>,
-    /// Capability ceiling as a set of `{resource}:{action}` strings for
-    /// UCAN validation (ADR-016 step 8).
-    pub ceiling_strings: std::collections::HashSet<String>,
     /// The DID of the context creator.
     pub creator_did: String,
     /// Event log (Merkle tree) for this context.

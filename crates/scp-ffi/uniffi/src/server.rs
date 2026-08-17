@@ -44,20 +44,19 @@ impl From<ServerError> for ScpError {
                 msg: user_msg,
                 code: codes::CTX_2051.to_owned(),
             },
-            ServerError::Platform(_) => Self::Context {
+            // Two platform-layer failures share `SCP-CTX-2053`. `Platform`
+            // reports that a platform capability the node needs is unavailable.
+            // `StorageSalt` reports that the salt sidecar deriving the node's
+            // storage-encryption key is unusable, so the node refuses to persist
+            // state it could not encrypt (spec §17.6 storage selection fails
+            // closed).
+            ServerError::Platform(_) | ServerError::StorageSalt(_) => Self::Context {
                 msg: user_msg,
                 code: codes::CTX_2053.to_owned(),
             },
             ServerError::Io(_) => Self::Context {
                 msg: user_msg,
                 code: codes::CTX_2052.to_owned(),
-            },
-            // The salt sidecar that derives the node's storage-encryption key is
-            // unusable, so the node refuses to persist state it could not
-            // encrypt (spec §17.6 storage selection fails closed).
-            ServerError::StorageSalt(_) => Self::Context {
-                msg: user_msg,
-                code: codes::CTX_2053.to_owned(),
             },
             // Both are actionable configuration errors surfaced as validation
             // failures: a missing SQLCipher passphrase, and relay-identity

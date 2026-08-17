@@ -137,6 +137,13 @@ fn create_test_identity(bi: &PyBridgeInstance) -> String {
 /// Creates a context via the per-instance `Supervisor` and registers FFI
 /// state. Returns the `context_id`.
 ///
+/// The context carries `scp_core::context::roles::default_ceiling()`, so the
+/// creator's admin role grants `OutletRegister`, `MessagesWrite`, and the outlet
+/// call/query stems the outlet and UCAN tests exercise. The bridge keeps no
+/// ceiling copy: every gate reads the ceiling and the member capabilities from
+/// this context's supervisor actor, so a context created with the empty
+/// `ContextParams::default()` ceiling authorizes its creator for nothing.
+///
 /// Takes the bridge instance so the caller can reuse the same `bi` for
 /// subsequent registry lookups — each `PyBridgeInstance` has its own
 /// identity/context registry and `instance_id`.
@@ -151,7 +158,13 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     let ctx_id = context_id.clone();
 
     rt.block_on(async move {
-        let params = scp_core::context::ContextParams::default();
+        let params = scp_core::context::ContextParams {
+            ceiling: scp_core::context::roles::default_ceiling()
+                .iter()
+                .cloned()
+                .collect(),
+            ..scp_core::context::ContextParams::default()
+        };
         supervisor
             .create_context(ctx_id.clone(), params, creator.clone(), None)
             .await
@@ -1310,12 +1323,10 @@ fn cross_domain_identity_context_outlet_eventlog_provenance() {
         let did_a = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did_a);
 
-        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
-            rt.ceiling_strings.insert("outlet_call:*".to_owned());
-            rt.ceiling_strings.insert("messages:write".to_owned());
-            Ok(())
-        })
-        .unwrap();
+        // `create_test_context` seeds the context's ceiling with
+        // `default_ceiling()`, which already carries `OutletCallAll` and
+        // `MessagesWrite`. The bridge holds no ceiling to widen: every gate reads
+        // the ceiling from this context's supervisor actor.
 
         // Register an outlet using the helper.
         let reg = build_outlet_reg(py, "cross_domain_outlet", &did_a);
@@ -1415,6 +1426,12 @@ fn random_64hex_context_id() -> String {
 /// Creates a co-resident context under a real 64-hex id (so the saga
 /// chokepoint round-trips to the actor). Mirrors [`create_test_context`] but
 /// with a caller-chosen id.
+///
+/// The ceiling carries `OutletRegister` alone, because every caller registers a
+/// saga outlet into the returned context and `outlet_register` reads the
+/// registrant's authority from this context's supervisor actor. The ceiling
+/// omits `ContextClose`, so the creator still cannot close the context — the
+/// property [`create_closeable_test_context`] exists to supply.
 fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context_id: &str) {
     setup();
     runtime::register_context(bi, context_id, creator_did, &[]).unwrap();
@@ -1425,7 +1442,10 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
     let ctx_id = context_id.to_owned();
 
     rt.block_on(async move {
-        let params = scp_core::context::ContextParams::default();
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![scp_core::context::roles::Capability::OutletRegister],
+            ..scp_core::context::ContextParams::default()
+        };
         supervisor
             .create_context(ctx_id.clone(), params, creator.clone(), None)
             .await
@@ -1435,11 +1455,13 @@ fn create_test_context_with_id(bi: &PyBridgeInstance, creator_did: &str, context
 }
 
 /// Creates a registered context whose CREATOR holds the `ContextClose`
-/// capability (the ceiling is seeded with `context:close`), so the creator can
-/// later drive it `Closed` through the REAL supervisor close path. The default
-/// `create_test_context_with_id` uses an EMPTY ceiling, under which even the
-/// creator lacks `context:close` — hence this close-capable variant. Returns the
-/// generated 64-hex context id.
+/// capability, so the creator can later drive it `Closed` through the REAL
+/// supervisor close path. `create_test_context_with_id` omits `context:close`
+/// from its ceiling, under which even the creator cannot close the context —
+/// hence this close-capable variant. The ceiling also carries `OutletRegister`,
+/// because callers register a saga outlet into the returned context and
+/// `outlet_register` reads the registrant's authority from this context's
+/// supervisor actor. Returns the generated 64-hex context id.
 fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     use scp_core::context::roles::Capability;
 
@@ -1454,7 +1476,7 @@ fn create_closeable_test_context(bi: &PyBridgeInstance, creator_did: &str) -> St
 
     rt.block_on(async move {
         let params = scp_core::context::ContextParams {
-            ceiling: vec![Capability::ContextClose],
+            ceiling: vec![Capability::ContextClose, Capability::OutletRegister],
             ..scp_core::context::ContextParams::default()
         };
         supervisor
@@ -2850,6 +2872,18 @@ fn outlet_stream_open_path_wired_and_control_plane_not_found() {
         // created on a different runtime is unreachable → transport.rate-limited).
         let ctx = {
             let params = PyDict::new(py);
+            // `outlet_register` and `ucan_mint` below both read this context's
+            // supervisor actor — the first for the registrant's authority, the
+            // second for the enforced ceiling — so the ceiling must carry both
+            // `outlet:register` and the invocation stem the minted token claims.
+            // A context created with no ceiling authorizes even its creator for
+            // nothing, and admits no minted capability.
+            params
+                .set_item(
+                    "ceiling",
+                    PyList::new(py, ["outlet:register", "outlet:call:*"]).unwrap(),
+                )
+                .unwrap();
             let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
             handle_context_id(py, &handle)
         };
@@ -3028,6 +3062,16 @@ fn outlet_stream_live_poll_next_drains_to_terminal_without_gil_deadlock() {
         runtime::init_context_manager_for_test(bi);
         let ctx = {
             let params = PyDict::new(py);
+            // `outlet_register` and `ucan_mint` below both read this context's
+            // supervisor actor — the first for the registrant's authority, the
+            // second for the enforced ceiling — so the ceiling must carry both
+            // `outlet:register` and the invocation stem the minted token claims.
+            params
+                .set_item(
+                    "ceiling",
+                    PyList::new(py, ["outlet:register", "outlet:call:*"]).unwrap(),
+                )
+                .unwrap();
             let handle = scp.context_create(&creator, &params.as_borrowed()).unwrap();
             handle_context_id(py, &handle)
         };
