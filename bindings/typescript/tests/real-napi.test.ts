@@ -1612,9 +1612,35 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
         "api",
         "cooperative",
       ] as const satisfies readonly BridgeMode[]) {
-        const reg = addon.bridgeRegister(`ctx-${mode}`, "did:key:op", "did:key:gov", "slack", mode);
+        // Spec §12.2.1 requires a platform key plus its identifier for
+        // cooperative mode and forbids both outside it.
+        const cooperative = mode === "cooperative";
+        const reg = addon.bridgeRegister(
+          `ctx-${mode}`,
+          "did:key:op",
+          "did:key:gov",
+          "slack",
+          mode,
+          cooperative ? "https://platform.example.com/hooks" : undefined,
+          cooperative ? Buffer.alloc(32, 7) : undefined,
+          cooperative ? "platform-key-1" : undefined,
+        );
         expect(reg.status).toBe("active");
       }
+    });
+
+    test("rejects a cooperative bridge carrying no platform key identifier", () => {
+      expect(() =>
+        addon.bridgeRegister(
+          "ctx-coop-missing-key-id",
+          "did:key:op",
+          "did:key:gov",
+          "slack",
+          "cooperative",
+          "https://platform.example.com/hooks",
+          Buffer.alloc(32, 7),
+        ),
+      ).toThrow(/platform_key/);
     });
   });
 
