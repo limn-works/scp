@@ -130,6 +130,7 @@ pub fn bridge_evaluate_trust(
         status: BridgeStatus::Active,
         registration_context: String::new(),
         registered_at: 0,
+        max_shadows: 10_000,
     };
 
     let shadow = ShadowIdentity {
