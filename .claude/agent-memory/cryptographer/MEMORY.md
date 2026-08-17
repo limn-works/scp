@@ -5,7 +5,7 @@ Keep this file under 140 lines: past line 200 it silently truncates on load.
 
 ## Constructions — signing preimages and verifiers
 
-- [custody-violation-signing](custody-violation-signing.md) — issue #2335 finding 11 FIXED: §9.5.1 preimages + Ed25519 verifiers for ScpCustodyViolationAttestation / CounterAttestation; separators `SCP-CUSTODY-VIOLATION-V1:` / `SCP-COUNTER-ATTESTATION-V1:`; variant discriminator byte
+- [custody-violation-signing](custody-violation-signing.md) — issue #2335 finding 11 FIXED: §9.5.1 preimages + Ed25519 verifiers, Verified* newtypes (private verify fns, no Deserialize), `violation_reference` = violation signing hash as `[u8;32]`, CategoryARejection carries the layer-3 record, §25.25 Vectors 38/39
 - [adr039-persona-and-signing](adr039-persona-and-signing.md) — `#active`/`#agent` is inside the signed InnerEnvelope preimage (SOUND); KeyResolver widened; production resolver still returns None for every (DID,kid)
 - [HPKE RFC 9180 conformance](hpke-rfc9180-conformance.md) — custom-ECIES finding FIXED: one hand-implemented RFC 9180 core in scp-protocol/src/crypto/hpke.rs (A.1 KAT + hpke-rs oracle), custody Decap variant, 60→48 wire
 - [event-log-and-canonical-hashing](event-log-and-canonical-hashing.md) — RFC 6962 separation, `hash_pair()` triplicated, open canonical-hash weaknesses, SCP-126 pruning defects, signed context export, PseudonymAnnounced removal
