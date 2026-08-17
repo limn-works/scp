@@ -268,6 +268,18 @@ fn invalid_request(msg: impl Into<String>) -> (StatusCode, Json<ApiError>) {
     )
 }
 
+/// Maximum request body any bridge route buffers, in bytes.
+///
+/// Spec §12.10.4 caps `content` at [`MAX_MESSAGE_CONTENT_BYTES`] and requires a
+/// larger request to answer `INVALID_REQUEST` (400). Axum's own 2 MiB default
+/// answers 413 instead for a body above it, so this limit sits just above that
+/// content cap: a body carrying content one byte over the cap still reaches
+/// [`emit_message_handler`], which answers the 400 §12.10.4 specifies, while a
+/// body far above it is refused before a node buffers it. The 8 KiB of headroom
+/// covers a request's JSON envelope — its field names, its `shadow_id`, its
+/// `content_type`, and JSON string escaping of the content itself.
+pub(crate) const MAX_BRIDGE_BODY_BYTES: usize = MAX_MESSAGE_CONTENT_BYTES + 8 * 1024;
+
 /// Maximum `content` size `POST /v1/scp/bridge/message` accepts, in bytes.
 ///
 /// Spec §12.10.4 caps it at 262,144 bytes (256 KiB), matching a relay's default
@@ -500,6 +512,31 @@ async fn create_shadow_handler(
                 platform_user_id: body.platform_user_id,
                 attributed_role: existing.attributed_role.clone(),
                 created_at: existing.created_at,
+            }),
+        )
+            .into_response();
+    }
+
+    // Spec §12.2.1 makes `max_shadows` a governance-configured limit for this
+    // bridge, and `ShadowRegistry` holds one per-bridge limit for a whole
+    // context, so it cannot express two bridges with different limits. This
+    // check reads the limit governance approved for the calling bridge and
+    // counts that bridge's own shadows against it; the registry's own limit
+    // stays as a second, context-wide bound.
+    let owned_shadows = registry
+        .shadows()
+        .iter()
+        .filter(|shadow| shadow.bridge_id == bridge_id)
+        .count();
+    if owned_shadows >= auth_ctx.bridge.max_shadows as usize {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                error: format!(
+                    "bridge has reached its governance-configured shadow limit of {}",
+                    auth_ctx.bridge.max_shadows
+                ),
+                code: "BRIDGE_FORBIDDEN".to_owned(),
             }),
         )
             .into_response();
@@ -1121,6 +1158,7 @@ async fn webhook_handler(
 /// auth middleware layer applied by the caller).
 pub fn bridge_router(state: Arc<BridgeState>) -> Router {
     Router::new()
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BRIDGE_BODY_BYTES))
         .route("/v1/scp/bridge/shadow", post(create_shadow_handler))
         .route(
             "/v1/scp/bridge/shadow/{shadow_id}",
@@ -1141,6 +1179,7 @@ pub fn bridge_router(state: Arc<BridgeState>) -> Router {
 /// legitimate platform webhook callbacks with 401.
 pub fn bridge_webhook_router(state: Arc<BridgeState>) -> Router {
     Router::new()
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BRIDGE_BODY_BYTES))
         .route("/v1/scp/bridge/webhook", post(webhook_handler))
         .with_state(state)
 }
@@ -1190,6 +1229,7 @@ mod tests {
                 status: BridgeStatus::Active,
                 registration_context: "ctx-test-001".to_owned(),
                 registered_at: 1_700_000_000,
+                max_shadows: 10_000,
             },
         }
     }

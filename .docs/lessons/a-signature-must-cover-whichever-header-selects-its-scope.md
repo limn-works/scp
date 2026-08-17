@@ -54,6 +54,25 @@ with `timestamp="12"` and `key_id="a1"` with `timestamp="2"` produce identical b
 restrict each segment's alphabet and separate segments with a byte outside it, or length-prefix
 each segment. Do not rely on a segment's expected shape.
 
+## The same failure in an identifier derivation
+
+Spec §12.2.1 step 3 derived a bridge id as `SHA-256(context_id || operator_did || platform ||
+timestamp)`, with no separator between three variable-length strings. Context `ctx-a` with
+operator `bc` and context `ctx-ab` with operator `c` produce identical bytes, so two
+registrations derive one id — and a bridge id decides which context a request acts inside.
+That is the same defect as an unframed signed payload, one layer over: a hash preimage and a
+signature preimage both need each variable-length segment to be recoverable.
+
+A test caught it because it asserted the property rather than the value: it derived two ids
+from a shifted boundary and required them to differ. An assertion that only compared a derived
+id against a fixed vector would have passed. When a function claims injectivity, test
+injectivity.
+
+The fix length-prefixes each segment with eight big-endian bytes. Commit `017e6c840` had
+already fixed the same class in `derive_shadow_id`, which escapes `%` and `:` in each segment.
+Two fixes for one class in one file is a signal to look for a third: check every composite
+identifier a system builds.
+
 ## Where this generalizes
 
 Any verifier that reads a caller-supplied identifier before checking a signature: webhook
