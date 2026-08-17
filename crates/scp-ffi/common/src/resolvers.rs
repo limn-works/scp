@@ -470,22 +470,32 @@ impl IdentityBackedDidResolver {
     /// key stops verifying as soon as an owner publishes the document that
     /// retired it.
     ///
-    /// **No artifact names a relationship for a UCAN signature, so this crate
-    /// chose one.** ADR-039's UCAN Impact section says a `kid` header names
-    /// which verification method signed a token, per RFC 7515, and names no
-    /// relationship; §7.3.1 of the trust spec names none either. W3C DID Core
-    /// §5.3.4 defines `capabilityInvocation` and §5.3.5 defines
-    /// `capabilityDelegation`, and a UCAN does one of those two things, so a
-    /// reader has grounds to call `assertionMethod` the wrong choice. The cost
-    /// of the choice is concrete: an owner who withdraws a key from
-    /// `assertionMethod` to stop it delegating capabilities also stops it
-    /// signing event-log leaves, governance votes, checkpoints, and `KeyPackage`
-    /// attestations, because `DidDocument` carries no `capabilityInvocation`
-    /// or `capabilityDelegation` array to separate those powers. Settling this
-    /// means amending §7.3.1 of the trust spec or ADR-039's UCAN Impact
-    /// section, and deciding there whether `DidDocument` gains those two
-    /// arrays. Until that lands, this comment states a code decision rather
-    /// than a protocol rule.
+    /// **`assertionMethod` is this crate's choice, and §18.2.2A of the
+    /// addressability spec assigns a UCAN a different array.** That section is
+    /// the field-level schema for every SCP DID document, and it marks
+    /// `capabilityInvocation` and `capabilityDelegation` Required with fixed
+    /// membership: `capabilityInvocation` MUST reference `#0` and `#active`,
+    /// and `capabilityDelegation` MUST reference only `#0`. W3C DID Core §5.3.4
+    /// and §5.3.5 define those two for invoking and delegating a capability,
+    /// which is what a UCAN does.
+    ///
+    /// [`DidDocument`](scp_did::DidDocument) implements neither array. Every
+    /// document this codebase publishes therefore omits two fields §18.2.2A
+    /// requires, and this function reads the array the type does carry.
+    ///
+    /// **Two artifacts conflict, so a human decides before the code moves.**
+    /// §18.2.2A excludes `#agent` from `capabilityInvocation`, while ADR-039's
+    /// Category B grants an agent sub-delegation of a UCAN and its UCAN Impact
+    /// section scopes a self-delegation with `fct.scp_key_scope: "#agent"`. A
+    /// spec governs an ADR, so §18.2.2A wins on its face — and taking it at
+    /// face value removes an agent's ability to invoke any capability, which
+    /// ADR-039 exists to grant. Settling that decides which array gates this
+    /// function and what `DidDocument` must carry.
+    ///
+    /// The cost of the present choice is concrete: an owner who withdraws a key
+    /// from `assertionMethod` to stop it delegating capabilities also stops it
+    /// signing event-log leaves, governance votes, checkpoints, and
+    /// `KeyPackage` attestations, because no array separates those powers.
     ///
     /// A [`SigningKeyId`](scp_did::SigningKeyId) argument, rather than a
     /// fragment string, keeps the admitted set closed at two operational

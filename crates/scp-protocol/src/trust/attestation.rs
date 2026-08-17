@@ -672,9 +672,31 @@ pub trait DidPublicKeyResolver {
 ///
 /// This resolver does NOT perform full DID document resolution (DHT lookup,
 /// relay query, cache check). It extracts the identity key directly from the
-/// DID string, which is sufficient for attestation signature verification
-/// because the identity key (`#0`) is the canonical signing key for
-/// attestations per ADR-017.
+/// DID string, so it answers every call with `#0`.
+///
+/// **The citation this doc comment carried does not support that, and a spec
+/// clause contradicts it.** It read "the identity key (`#0`) is the canonical
+/// signing key for attestations per ADR-017". ADR-017 in
+/// `.docs/adrs/phase-4.md` states one relevant line — "Verifies Ed25519
+/// signature against issuer's public key (resolved via DID)" — and names no
+/// verification method. §9.5.2 of the security-model spec names one, and
+/// excludes this resolver's answer: a `KeyPackageAttestation` "is signed by the
+/// DID verification method named in `signing_key_id` (field 6, `#active` or
+/// `#agent` — never `#0`)". §3.5.2 of the identity spec says the same for an
+/// identity link attestation.
+///
+/// A `did:dht` string is z-base-32 of an Identity Key, so this resolver
+/// verifies an attestation against the one method those clauses exclude, and a
+/// rotated `#active` or `#agent` key can never be withdrawn from it. Shipped
+/// callers reach it at `crates/scp-ffi/common/src/trust_store.rs` and through
+/// the `UniFFI` bridge.
+///
+/// A fix routes those callers through
+/// `scp_ffi_common::resolvers::IdentityBackedDidResolver`, whose
+/// `DidPublicKeyResolver` implementation resolves `#active` under
+/// `assertionMethod`. It needs a ruling first: this type's own name and doc
+/// assert an `#0` rule that no artifact states, and whoever wrote them may have
+/// had a reason no artifact records.
 ///
 /// For use cases that require resolving the active signing key (`#active`) or
 /// agent key (`#agent`), callers should use the full DID resolution pipeline

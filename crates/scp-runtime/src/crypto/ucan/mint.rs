@@ -548,19 +548,14 @@ pub async fn mint_ucan(
     // caller sets both.
     //
     // OPEN QUESTION — a caller setting both to DIFFERENT methods gets a token
-    // no verifier accepts, and two artifacts disagree about which side is
-    // wrong. `validate_key_scope` step 5b requires `kid` to EQUAL
-    // `fct.scp_key_scope`, and §9.7.4 of the security-model spec agrees: "The
-    // agent signs these scoped UCANs with its `#agent` key." But
-    // `crates/scp-runtime/tests/agent_binding_integration.rs` mints
-    // `{signing_key_id: Active, key_scope: "#agent"}` and asserts "JWT header
-    // kid must be #active (the signing key)" — a delegation FROM `#active` TO
-    // `#agent`, which is how §9.7.4's own sentence opens. Under step 5b that
-    // token verifies nowhere.
+    // no verifier accepts, because `validate_key_scope` step 5b requires `kid`
+    // to equal `fct.scp_key_scope`. Five artifacts split on what those two
+    // name, and `.docs/specs/00-open-questions.md` records the split under
+    // Crypto and Security.
     //
-    // Rejecting the pair here would pick one reading, so this does not. A human
-    // settles whether step 5b compares a signer against a grantee or against
-    // itself, and the losing side changes.
+    // Rejecting the pair here would pick one reading, so this does not.
+    // `crates/scp-runtime/tests/ucan_validate_integration.rs::scoped_ucan_mints_and_validates`
+    // is the round trip that settles it, ignored until a human does.
     let header = params
         .signing_key_id
         .or(key_scope_id)
@@ -2991,28 +2986,16 @@ mod tests {
         );
     }
 
-    /// A `signing_key_id` and a `key_scope` naming different methods mint a
-    /// token whose header names the signer and whose facts name the scope.
+    /// Records where the `kid` header and `fct.scp_key_scope` come from.
     ///
-    /// **This token verifies nowhere, and that is an open question rather than
-    /// a settled behaviour.** `validate_key_scope` step 5b requires the `kid`
-    /// header to equal `fct.scp_key_scope`, so it returns `KeyScopeMismatch`
-    /// for every token this pair produces. Two artifacts disagree about which
-    /// side is wrong:
-    ///
-    /// - §9.7.4 of the security-model spec says "The agent signs these scoped
-    ///   UCANs with its `#agent` key", which matches step 5b's equality.
-    /// - The same sentence opens "scoped UCANs delegated from `#active` to
-    ///   `#agent`", and
-    ///   `crates/scp-runtime/tests/agent_binding_integration.rs` mints exactly
-    ///   this pair and asserts "JWT header kid must be #active (the signing
-    ///   key)" — a signer and a grantee that legitimately differ.
-    ///
-    /// This test records what minting does today. It asserts no verdict on
-    /// which reading is right, because a human settles that and the losing side
-    /// changes.
+    /// `signing_key_id` reaches the header and `key_scope` reaches the facts.
+    /// This asserts field placement and nothing about whether a resulting token
+    /// validates: `validate_key_scope` step 5b compares those two, the artifacts
+    /// disagree about what each one names, and
+    /// `crates/scp-runtime/tests/ucan_validate_integration.rs::scoped_ucan_mints_and_validates`
+    /// carries the round trip that settles it, ignored until a human does.
     #[tokio::test]
-    async fn mint_ucan_carries_the_signer_in_the_header_and_the_scope_in_the_facts() {
+    async fn mint_ucan_puts_signing_key_id_in_the_header_and_key_scope_in_the_facts() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
         let caps = vec!["messages:write".to_owned()];
 
@@ -3038,49 +3021,13 @@ mod tests {
         assert_eq!(
             token.header.kid,
             Some(scp_did::SigningKeyId::Agent),
-            "the header names signing_key_id"
+            "the header carries signing_key_id"
         );
         let fct = token.payload.fct.as_ref().unwrap();
         assert_eq!(
             fct.get("scp_key_scope"),
             Some(&serde_json::Value::String("#active".to_owned())),
-            "the facts name key_scope"
-        );
-    }
-
-    /// A `signing_key_id` and a `key_scope` naming one method mint a token
-    /// whose header and facts agree, which is what step 5b requires. This case
-    /// carries no open question.
-    #[tokio::test]
-    async fn mint_ucan_accepts_a_signing_key_id_that_agrees_with_key_scope() {
-        let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["messages:write".to_owned()];
-
-        let params = MintParams {
-            issuer_did: &issuer_did,
-            issuer_key: &key_handle,
-            audience_did: &issuer_did,
-            context_id: "ctx-1",
-            capabilities: &caps,
-            lifetime_secs: 3600,
-            not_before: None,
-            proofs: vec![],
-            facts: None,
-            key_scope: Some("#agent".to_owned()),
-            signing_key_id: Some(SigningKeyId::Agent),
-            ceiling: None,
-        };
-
-        let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
-            .await
-            .expect("an agreeing pair mints");
-
-        assert_eq!(token.header.kid, Some(scp_did::SigningKeyId::Agent));
-        let fct = token.payload.fct.as_ref().unwrap();
-        assert_eq!(
-            fct.get("scp_key_scope"),
-            Some(&serde_json::Value::String("#agent".to_owned())),
-            "the facts must name the method the header names"
+            "the facts carry key_scope"
         );
     }
 

@@ -1592,6 +1592,93 @@ async fn validate_ucan_accepts_self_delegation_with_key_scope() {
 // Step 5b: Key scope verification (SCP-AB-013)
 // ---------------------------------------------------------------------------
 
+/// Mints the scoped self-delegation §7.2.2 of the trust-validation spec
+/// describes, and validates it.
+///
+/// **Ignored because a protocol question is open, not because the test is
+/// unfinished.** `validate_key_scope` step 5b compares the `kid` header against
+/// `fct.scp_key_scope`, and the artifacts disagree about what those two name:
+///
+/// - §7.2.2 of the trust-validation spec says intra-DID delegation uses a
+///   self-delegation UCAN where "the issuing key is `#active`" and
+///   "`fct.scp_key_scope: \"#agent\"` scopes the delegation to the agent
+///   verification method" — a signer and a grantee that differ. §19.4 of the
+///   economic-governance spec and the white paper draw the same edge, and
+///   `agent_binding_integration.rs` mints exactly that shape.
+/// - §9.7.4 of the security-model spec says scoped UCANs are "signed by the old
+///   `#agent` key", and ADR-039's Decision section says step 5b must "verify the
+///   signing key matches the specified scope" — a signer and a grantee that
+///   agree, which is what `validate_key_scope` implements.
+/// - ADR-039 acceptance criterion 7 and story SCP-AB-013 say "the presenting
+///   key", which is neither: a UCAN carries no presenter field, and
+///   `validate_key_scope` substitutes the signer for one.
+///
+/// This test fails today, because it mints under the first reading and
+/// validates under the second. Un-ignoring it means picking one, so whoever
+/// settles the question un-ignores it and fixes whichever side loses —
+/// `validate_key_scope` if a signer and a grantee may differ, `mint_ucan` if
+/// they may not.
+///
+/// No other test mints through `mint_ucan` and validates through
+/// `validate_ucan` with a `key_scope` set, which is why the contradiction
+/// survived. ADR-039 acceptance criterion 20 asks for this round trip.
+#[tokio::test]
+#[ignore = "step 5b's contract is unsettled; see this test's doc comment"]
+async fn scoped_ucan_mints_and_validates() {
+    let (custody, key_active, issuer_did, pk_active) = setup_identity().await;
+    let caps = vec!["messages:write".to_owned()];
+
+    // §7.2.2: the issuing key is `#active`, and the scope names `#agent`.
+    let params = MintParams {
+        issuer_did: &issuer_did,
+        issuer_key: &key_active,
+        audience_did: &issuer_did,
+        context_id: "ctx-scope",
+        capabilities: &caps,
+        lifetime_secs: 3600,
+        not_before: None,
+        proofs: vec![],
+        facts: None,
+        key_scope: Some("#agent".to_owned()),
+        signing_key_id: Some(scp_did::SigningKeyId::Active),
+        ceiling: None,
+    };
+
+    let token = mint_ucan(&params, &custody, &scp_clock::SystemClock)
+        .await
+        .expect("a scoped self-delegation mints");
+
+    let resolver = InMemoryDidResolver {
+        keys: std::iter::once((issuer_did.clone(), pk_active)).collect(),
+        kid_keys: std::iter::once((
+            (issuer_did.clone(), scp_did::SigningKeyId::Active),
+            pk_active,
+        ))
+        .collect(),
+    };
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let proof_resolver = InMemoryProofResolver::new();
+    let ceiling = default_ceiling();
+    let required_cap = CapabilityUri::new("ctx-scope", "messages", "write");
+
+    let mut ctx = build_context(
+        &resolver,
+        &mut nonce_tracker,
+        &revocation_checker,
+        &proof_resolver,
+        &ceiling,
+        &issuer_did,
+        &issuer_did,
+    );
+
+    let result = validate_ucan(&token, &required_cap, &mut ctx);
+    assert!(
+        result.is_ok(),
+        "a scoped self-delegation minted per §7.2.2 must validate: {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn validate_ucan_accepts_matching_key_scope() {
     // Token with key_scope="#agent", signed by #agent key -> accepted.
