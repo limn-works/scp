@@ -330,7 +330,10 @@ impl Drop for RelayHandle {
 /// automatically -- only the relay is bound.
 #[derive(uniffi::Object)]
 pub struct NodeHandle {
-    inner: RunningNode,
+    /// Shared with this instance's borrower registry, which holds a `Weak` to
+    /// this same node so `Scp::shutdown` stops it before releasing storage
+    /// (see `scp_ffi_common::bridge_instance::InstanceBorrower`).
+    inner: Arc<RunningNode>,
     /// Owning `UniffiBridgeInstance` — the handle reaches back into its
     /// instance's `ContextManager` for broadcast-key lookup during HTTP
     /// projection. Phase D (#1695) replaced `crate::runtime::context_manager()`
@@ -753,7 +756,10 @@ pub(crate) async fn node_start_in_memory_on(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
-    let inner = RunningNode::InMemoryEncrypted(node);
+    // Register this node as a borrower of this instance's resources, so
+    // `Scp::shutdown` stops it before `bridge_specific_shutdown` releases
+    // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+    let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
     wire_node_webhook_events(bi, &inner).await;
 
     let instance_id = bi.core.instance_id();
@@ -805,6 +811,12 @@ pub(crate) async fn node_start_local_on(
                 .map(RunningNode::Sqlite)
         }
     }?;
+    // This node holds a clone of this instance's storage `Arc`, so register it
+    // before anything else: `Scp::shutdown` must stop this node before
+    // `bridge_specific_shutdown` closes that `SQLCipher` handle and drops an
+    // advisory `flock(2)`
+    // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+    let inner = server::register_node(&bi.core, inner);
 
     // Auto-wire the ContextManager with relay transport.
     // Use the internal loopback URL — see comment in node_start_in_memory.

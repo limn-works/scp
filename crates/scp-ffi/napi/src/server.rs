@@ -259,7 +259,10 @@ impl Drop for NapiRelayHandle {
 /// only the relay is bound.
 #[napi]
 pub struct NapiNodeHandle {
-    inner: RunningNode,
+    /// Shared with this instance's borrower registry, which holds a `Weak` to
+    /// this same node so `SCP.shutdown()` stops it before releasing storage
+    /// (see `scp_ffi_common::bridge_instance::InstanceBorrower`).
+    inner: Arc<RunningNode>,
     /// The `NapiBridgeInstance` that minted this handle.
     ///
     /// Retained so that methods like `enable_site_projection` can resolve
@@ -627,7 +630,10 @@ pub(crate) async fn node_start_in_memory_on(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
-    let inner = RunningNode::InMemoryEncrypted(node);
+    // Register this node as a borrower of this instance's resources, so
+    // `SCP.shutdown()` stops it before `bridge_specific_shutdown` releases
+    // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+    let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
     wire_node_webhook_events(bi, &inner).await;
 
     increment_handle_count();
@@ -676,6 +682,12 @@ pub(crate) async fn node_start_local_on(
         }
     }
     .map_err(server_err)?;
+    // This node holds a clone of this instance's storage `Arc`, so register it
+    // before anything else: `SCP.shutdown()` must stop this node before
+    // `bridge_specific_shutdown` closes that `SQLCipher` handle and drops an
+    // advisory `flock(2)`
+    // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+    let inner = server::register_node(&bi.core, inner);
 
     let did = inner.did().to_owned();
     let relay_url = inner.internal_relay_url();

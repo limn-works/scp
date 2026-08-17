@@ -32,6 +32,7 @@ use scp_platform::file::FileKeyCustody;
 use scp_platform::in_memory::InMemoryStorage;
 use scp_platform::sqlite::SqliteStorage;
 
+use crate::bridge_instance::{CoreFields, InstanceBorrower};
 use crate::dht::{DhtInitError, FfiDhtClient};
 // `ClientDhtConfig` is only referenced by the production (non-test) fail-closed
 // node DHT client in `start_node_local`; the test-harness build uses the
@@ -955,6 +956,40 @@ impl RunningNode {
     }
 }
 
+impl InstanceBorrower for RunningNode {
+    /// Signals this node's relay and background tasks to stop, so a node stops
+    /// writing through whatever storage handle it holds.
+    fn stop(&self) {
+        self.shutdown();
+    }
+
+    /// Reports whether a shutdown signal already reached this node.
+    fn stopped(&self) -> bool {
+        self.is_shutdown()
+    }
+}
+
+/// Wraps a started node in an [`Arc`] and registers it with `core` as a
+/// borrower of that instance's storage.
+///
+/// Every bridge node-start path (`node_start_in_memory_*`,
+/// `node_start_local_*`, across `PyO3`, NAPI, and `UniFFI`) routes its node
+/// through this one call, so registration is not a step a bridge author can
+/// forget while still obtaining an `Arc<RunningNode>` for its handle type.
+///
+/// Registration is what makes `SCP.shutdown()` stop a node before
+/// `bridge_specific_shutdown` closes this instance's `SQLCipher` handle and
+/// drops an advisory `flock(2)` on `{dir}/scp.db.lock`. See
+/// [`InstanceBorrower`] for what that release corrupts when a node outlives
+/// it, and [`CoreFields::register_borrower`] for how a registration races a
+/// concurrent shutdown.
+#[must_use]
+pub fn register_node(core: &CoreFields, node: RunningNode) -> Arc<RunningNode> {
+    let node = Arc::new(node);
+    core.register_borrower(&node);
+    node
+}
+
 /// Spawns a webhook-event `consumer` (from `ApplicationNode::wire_context_events`
 /// or [`RunningNode::wire_context_events`]) under the bridge instance's
 /// `JoinSet`, bound to its cancellation token.
@@ -1381,6 +1416,161 @@ mod tests {
         }
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------
+    // Storage-borrower shutdown ordering (red-hat RED-1002)
+    // -----------------------------------------------------------------
+
+    /// A bridge instance for shutdown-ordering tests, holding one
+    /// `Arc<SqliteStorage>` exactly as `PyBridgeInstance`,
+    /// `NapiBridgeInstance`, and `UniffiBridgeInstance` hold theirs.
+    ///
+    /// Its `bridge_specific_shutdown` reproduces what all three shipped
+    /// bridges do there: it calls [`SqliteStorage::close`], which drops an
+    /// advisory `flock(2)` on `{dir}/scp.db.lock`. Before that call it records
+    /// whether its registered node had already stopped, which is what makes
+    /// ordering — not merely eventual shutdown — observable to a test.
+    struct StorageOwningInstance {
+        core: CoreFields,
+        storage: Arc<SqliteStorage>,
+        node: std::sync::Mutex<Option<std::sync::Weak<RunningNode>>>,
+        node_stopped_before_close: std::sync::atomic::AtomicBool,
+    }
+
+    impl StorageOwningInstance {
+        fn new(storage: Arc<SqliteStorage>) -> Self {
+            Self {
+                core: CoreFields::new(),
+                storage,
+                node: std::sync::Mutex::new(None),
+                node_stopped_before_close: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// Points this instance at `node` for observation only. Registration
+        /// for shutdown purposes happens in [`register_node`], which every
+        /// shipped bridge calls.
+        fn observe(&self, node: &Arc<RunningNode>) {
+            *self.node.lock().expect("observation mutex") = Some(Arc::downgrade(node));
+        }
+
+        /// Reports what `bridge_specific_shutdown` saw when it ran.
+        fn node_stopped_before_close(&self) -> bool {
+            self.node_stopped_before_close
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::bridge_instance::BridgeInstanceCore for StorageOwningInstance {
+        fn core(&self) -> &CoreFields {
+            &self.core
+        }
+
+        fn bridge_specific_shutdown(&self) {
+            let stopped = self
+                .node
+                .lock()
+                .expect("observation mutex")
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|node| InstanceBorrower::stopped(&*node));
+            self.node_stopped_before_close
+                .store(stopped, std::sync::atomic::Ordering::SeqCst);
+            // What every shipped bridge does here, and what makes ordering
+            // load-bearing: releasing an advisory lock that guards one writer
+            // per directory.
+            self.storage.close();
+        }
+    }
+
+    /// An instance stops a node it started before releasing a `SQLCipher`
+    /// handle that node writes through.
+    ///
+    /// Without a borrower registry, `bridge_specific_shutdown` dropped an
+    /// advisory `flock(2)` on `{dir}/scp.db.lock` while a live node kept
+    /// writing through its clone of that same `Arc<SqliteStorage>` — a second
+    /// process could then open one database alongside a first writer, which
+    /// invites split-brain writes and WAL corruption (red-hat RED-1002).
+    #[tokio::test]
+    async fn instance_shutdown_stops_a_node_before_releasing_its_sqlite_lock() {
+        use crate::bridge_instance::BridgeInstanceCore as _;
+
+        let tmp = temp_dir_for("node-borrower-order");
+        let db_dir = tmp.join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        let storage = instance_sqlite_storage(&db_dir);
+        let instance = StorageOwningInstance::new(Arc::clone(&storage));
+
+        let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
+            .await
+            .unwrap();
+        let node = register_node(instance.core(), RunningNode::Sqlite(node));
+        instance.observe(&node);
+        assert!(
+            !node.is_shutdown(),
+            "a freshly started node must be running before its instance shuts down"
+        );
+
+        instance
+            .shutdown(std::time::Duration::from_secs(10))
+            .await
+            .expect("a first shutdown must not report AlreadyShutDown");
+
+        assert!(
+            node.is_shutdown(),
+            "an instance shutdown must stop a node that borrows its storage"
+        );
+        assert!(
+            instance.node_stopped_before_close(),
+            "a node must already be stopped when bridge_specific_shutdown releases \
+             an advisory SQLCipher lock, otherwise a live writer outlives that lock"
+        );
+
+        drop(node);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Stopping borrowers first leaves intact what [`SqliteStorage::close`]
+    /// exists for: a caller reopens one directory after `shutdown()` even
+    /// while still holding its `SCP` handle.
+    #[tokio::test]
+    async fn a_sqlite_directory_reopens_after_an_instance_shutdown() {
+        use crate::bridge_instance::BridgeInstanceCore as _;
+
+        let tmp = temp_dir_for("node-borrower-reopen");
+        let db_dir = tmp.join("db");
+        std::fs::create_dir_all(&db_dir).unwrap();
+
+        let storage = instance_sqlite_storage(&db_dir);
+        let instance = StorageOwningInstance::new(Arc::clone(&storage));
+
+        let node = start_node_local(&tmp, Arc::clone(&storage), None, Some(test_passphrase()))
+            .await
+            .unwrap();
+        let node = register_node(instance.core(), RunningNode::Sqlite(node));
+        instance.observe(&node);
+
+        instance
+            .shutdown(std::time::Duration::from_secs(10))
+            .await
+            .expect("a first shutdown must not report AlreadyShutDown");
+
+        // Drop this node so its relay tasks and redb handle release, matching
+        // an SDK caller who drops a node handle after `SCP.shutdown()`.
+        drop(node);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // `instance` and `storage` stay alive on purpose: `SqliteStorage::close`
+        // exists so a reopen succeeds while a caller still holds its handle.
+        let reopened = SqliteStorage::new(&db_dir, &[0x11u8; 32])
+            .expect("a second SQLCipher open must succeed after an instance shutdown");
+        reopened.close();
+
+        drop(instance);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

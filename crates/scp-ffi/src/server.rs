@@ -299,7 +299,10 @@ impl Drop for PyRelayHandle {
 /// only the relay is bound.
 #[pyclass(name = "NodeHandle")]
 pub struct PyNodeHandle {
-    inner: RunningNode,
+    /// Shared with this instance's borrower registry, which holds a `Weak` to
+    /// this same node so `SCP.shutdown()` stops it before releasing storage
+    /// (see `scp_ffi_common::bridge_instance::InstanceBorrower`).
+    inner: Arc<RunningNode>,
     /// Bridge instance affinity id (Phase 4 PR 1 — #1549).
     ///
     /// `dead_code` allowance: future commits of this PR will add
@@ -699,7 +702,10 @@ impl crate::scp::PyScp {
         let bridge_token = node.bridge_token_hex();
         auto_wire_context_manager(bi, py, rt, &did, &relay_url, bridge_token);
 
-        let inner = RunningNode::InMemoryEncrypted(node);
+        // Register this node as a borrower of this instance's resources, so
+        // `SCP.shutdown()` stops it before `bridge_specific_shutdown` releases
+        // anything (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+        let inner = server::register_node(&bi.core, RunningNode::InMemoryEncrypted(node));
         wire_node_webhook_events(bi, py, rt, &inner);
 
         let instance_id = bi.core.instance_id();
@@ -775,6 +781,12 @@ impl crate::scp::PyScp {
             }
             .map_err(server_err)
         })?;
+        // This node holds a clone of this instance's storage `Arc`, so register
+        // it before anything else: `SCP.shutdown()` must stop this node before
+        // `bridge_specific_shutdown` closes that `SQLCipher` handle and drops
+        // an advisory `flock(2)`
+        // (`scp_ffi_common::bridge_instance::InstanceBorrower`).
+        let inner = server::register_node(&bi.core, inner);
 
         // Auto-wire the ContextManager with relay transport so that
         // context operations work immediately after node startup.

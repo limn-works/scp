@@ -57,7 +57,14 @@ custody = ["dep:scp-platform"]
 # auto-generate path FAILS CLOSED (`ServerError::AutoGenerateUnavailable`) on a
 # shipped build instead of running a nullifier-backed node. No test-harness
 # platform edge is present, transitively or otherwise — G1 proves it.
-server = ["dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/file", "scp-platform/encrypting", "dep:scp-identity", "dep:rand", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
+# `resolvers` is listed because `server.rs` names `scp_core::context::supervisor::Supervisor`
+# (in `wire_and_supervise_context_events`) and `crate::bridge_instance::CoreFields`
+# (in `register_node`), and both live behind `resolvers`. That edge held before
+# this line existed only because `resolvers` is a default feature; declaring it
+# makes `--no-default-features --features server` compile rather than fail on a
+# missing `scp-core` dep. It resolves no new feature anywhere, because every
+# crate enabling `server` already enables `resolvers`.
+server = ["resolvers", "dep:scp-transport", "dep:scp-node", "dep:scp-platform", "scp-platform/in-memory-storage", "scp-platform/file", "scp-platform/encrypting", "dep:scp-identity", "dep:rand", "dep:tokio", "dep:tokio-util", "dep:tracing", "dep:thiserror"]
 
 [dependencies]
 scp-core = { path = "../../scp-core", optional = true }
