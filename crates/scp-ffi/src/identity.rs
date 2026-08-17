@@ -138,24 +138,34 @@ fn ensure_did_resolver_initialized_on(
     // resolvable and any DID-resolving verification (UCAN validation,
     // governance vote verification) fails with "unknown voter". Scoped
     // per-instance to match where the resolver itself is stored.
-    let dht_client = Arc::new(build_ffi_dht_client()?);
-    let relay_querier = Arc::new(NoOpRelayQuerier);
-    let cache = Arc::new(DidCache::new());
-    let bootstrap_relays = Vec::new();
+    //
+    // Atomic init, matching the napi-rs (`napi/src/identity.rs`) and UniFFI
+    // (`uniffi/src/bridge.rs`) twins: build a candidate client and a candidate
+    // cache, publish each into its set-if-unset `OnceLock`, then RE-READ the
+    // winner and build the resolver over what this instance retains. Two
+    // threads reaching first init together — a Python thread pool makes that
+    // reachable, and identity-link verification adds a fourth caller — each
+    // build a candidate; without the re-read, one thread's resolver reads
+    // client A while `shared_did_method` and `publish_to_resolver_dht_for`
+    // publish into client B, so freshly minted identities never resolve on
+    // this instance and `invalidate_resolver_cache` targets a cache no
+    // resolver reads.
+    let candidate_client = Arc::new(build_ffi_dht_client()?);
+    crate::runtime::set_resolver_dht_client(bi, Arc::clone(&candidate_client));
+    let dht_client = crate::runtime::resolver_dht_client(bi).unwrap_or(candidate_client);
+
+    let candidate_cache = Arc::new(DidCache::new());
+    crate::runtime::set_resolver_cache(bi, Arc::clone(&candidate_cache));
+    let cache = crate::runtime::resolver_cache(bi).unwrap_or(candidate_cache);
 
     let resolver = Arc::new(DualLayerResolver::new(
-        relay_querier,
-        Arc::clone(&dht_client),
-        Arc::clone(&cache),
-        bootstrap_relays,
+        Arc::new(NoOpRelayQuerier),
+        dht_client,
+        cache,
+        Vec::new(),
     ));
 
     crate::runtime::init_did_resolver(bi, resolver, handle);
-    crate::runtime::set_resolver_dht_client(bi, dht_client);
-    // Retain the SAME cache `Arc` the resolver was built over so post-rotation
-    // re-publishes can invalidate the stale cached document (see
-    // `invalidate_resolver_cache`).
-    crate::runtime::set_resolver_cache(bi, cache);
     Ok(())
 }
 
@@ -1005,7 +1015,7 @@ pub fn identity_verify_device_attestation(_did: &str, token_base64: &str) -> PyR
 /// Always raises `IdentityError` with code `SCP-IDENT-1060`.
 #[pyfunction]
 #[pyo3(name = "py_verify_identity_link_attestation")]
-pub fn verify_identity_link_attestation_module_scope(
+pub fn verify_identity_link_attestation(
     attestation_json: &str,
     issuer_public_key_hex: &str,
 ) -> PyResult<bool> {
@@ -1627,33 +1637,33 @@ impl crate::scp::PyScp {
 
     /// Verifies an identity link attestation per spec §3.5.4.
     ///
-    /// Resolves an issuer's DID document through this instance's validating
-    /// resolver (§3.5.4 step 1), then runs every remaining step through the
-    /// pure `scp_core::identity::attestation::verify_identity_link_attestation`
-    /// seam: structural validation, document-to-issuer binding, signature
-    /// against a key that document publishes at `#active` or `#agent`,
-    /// `revocation_status`, `expires_at`, and evidence freshness.
+    /// Acquires this instance's validating DID resolver, then hands every
+    /// remaining decision to the one shared flow all three bridges run,
+    /// `scp_ffi_common::attestation::verify_link_attestation`. That flow
+    /// resolves an issuer's DID document (§3.5.4 step 1), fails closed when
+    /// that document publishes an `AttestationRevocations` service endpoint
+    /// (§3.5.2), and runs structural validation, document-to-issuer binding,
+    /// signature under an `#active` or `#agent` key that document publishes
+    /// (steps 1–2), `revocation_status` (step 3), `expires_at` (step 4), and
+    /// evidence freshness (step 5, which degrades rather than rejects).
     ///
     /// # Arguments
     ///
     /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
     /// * `issuer_public_key_hex` — Hex-encoded 32-byte Ed25519 public key that
-    ///   a caller asserts signed this attestation. This method checks that
+    ///   a caller asserts belongs to this issuer. This method checks that
     ///   assertion against an issuer's resolved DID document; it never uses
     ///   this key as a substitute for that document. A caller who names a key
-    ///   other than one that verified receives `False`.
+    ///   that document publishes at neither `#active` nor `#agent` receives
+    ///   `False`.
     ///
     /// # Returns
     ///
-    /// `True` when every §3.5.4 step passes and a key a caller named is a key
-    /// that verified. `False` when a step rejects — a bad signature, a revoked
-    /// or expired attestation, a key an issuer's document does not publish, or
-    /// a Class 2 (`signed_post` / `dns_record`) attestation whose external
-    /// proof resource this bridge does not fetch. Spec §3.5.0 states that an
-    /// unverified Reference attestation is equivalent to no attestation, so a
-    /// caller performs that fetch itself and treats a `False` on a Class 2
-    /// attestation as "not yet verified" rather than as "forged". Every
-    /// rejection reason reaches `tracing` at `info` level.
+    /// `True` when §3.5.4 steps 1 through 5 pass and a key a caller named is
+    /// one an issuer's document publishes. `False` when a check rejects — a
+    /// bad signature, a revoked or expired attestation, or a key an issuer's
+    /// document does not publish. Every rejection reason reaches `tracing` at
+    /// `info` level.
     ///
     /// Stale evidence (§3.5.4 step 5) returns `True`: §3.5.4 degrades a stale
     /// attestation's trust weight and does not reject it.
@@ -1661,68 +1671,42 @@ impl crate::scp::PyScp {
     /// # Errors
     ///
     /// Raises `IdentityError` with `SCP-IDENT-1044` when the JSON or the hex
-    /// key is malformed, and with `SCP-IDENT-1060` when an issuer's DID
-    /// document cannot be resolved — a precondition failure, which this method
-    /// never reports as `False`.
+    /// key is malformed, `SCP-IDENT-1060` when an issuer's DID document cannot
+    /// be resolved, `SCP-IDENT-1061` when an issuer publishes an attestation
+    /// revocation list this bridge does not fetch, and `SCP-IDENT-1062` for a
+    /// Class 2 (`signed_post` / `dns_record`) attestation whose external proof
+    /// resource this bridge does not fetch. None of those four conditions is
+    /// reported as `False`, because `False` on this surface reads as "forged".
     pub fn verify_identity_link_attestation(
         &self,
         py: Python<'_>,
         attestation_json: &str,
         issuer_public_key_hex: &str,
     ) -> PyResult<bool> {
-        let parsed = scp_ffi_common::attestation::parse_link_attestation(
-            attestation_json,
-            issuer_public_key_hex,
-        )
-        .map_err(|e| {
-            ScpPyError::identity_with_code(e.to_string(), scp_ffi_common::error_codes::IDENT_1044)
-        })?;
+        use scp_ffi_common::attestation::LinkVerifyError;
+
+        /// Maps a shared-flow error onto this bridge's error type.
+        fn to_py(e: &LinkVerifyError) -> ScpPyError {
+            ScpPyError::identity_with_code(e.to_string(), e.error_code())
+        }
 
         let rt = crate::runtime()?;
         let bi = Arc::clone(&self.inner);
+        let attestation_json = attestation_json.to_owned();
+        let issuer_public_key_hex = issuer_public_key_hex.to_owned();
 
         py.allow_threads(move || -> Result<bool, ScpPyError> {
             ensure_did_resolver_initialized_on(&bi, rt.handle().clone())?;
-            let resolver = crate::runtime::did_resolver(&bi).ok_or_else(|| {
-                ScpPyError::identity_with_code(
-                    "identity link attestation verification has no DID resolver on this \
-                     bridge instance"
-                        .to_owned(),
-                    scp_ffi_common::error_codes::IDENT_1060,
-                )
-            })?;
+            let resolver = crate::runtime::did_resolver(&bi)
+                .ok_or_else(|| to_py(&LinkVerifyError::ResolverUnavailable))?;
             let resolver = Arc::clone(resolver);
 
-            let issuer = parsed.issuer_did().to_owned();
-            let issuer_document = rt
-                .block_on(async {
-                    scp_identity::resolver::DidResolver::resolve(&*resolver, &issuer).await
-                })
-                .map_err(|e| {
-                    ScpPyError::identity_with_code(
-                        format!(
-                            "identity link attestation verification could not resolve issuer \
-                             {issuer} (spec §3.5.4 step 1): {e}"
-                        ),
-                        scp_ffi_common::error_codes::IDENT_1060,
-                    )
-                })?
-                .ok_or_else(|| {
-                    ScpPyError::identity_with_code(
-                        format!(
-                            "identity link attestation verification found no DID document for \
-                             issuer {issuer} (spec §3.5.4 step 1)"
-                        ),
-                        scp_ffi_common::error_codes::IDENT_1060,
-                    )
-                })?;
-
-            let now_secs = scp_clock::SystemClock.now_secs();
-            Ok(scp_ffi_common::attestation::decide_link_attestation(
-                &parsed,
-                &issuer_document.document,
-                now_secs,
+            rt.block_on(scp_ffi_common::attestation::verify_link_attestation(
+                &*resolver,
+                &attestation_json,
+                &issuer_public_key_hex,
             ))
+            .map_err(|e| to_py(&e))
         })
         .map_err(PyErr::from)
     }
@@ -2817,11 +2801,19 @@ impl crate::scp::PyScp {
 /// Registers identity bridge classes on the `_scp_core` module.
 ///
 /// Stateful identity operations are methods on the `SCP` class (see the
-/// `#[pymethods]` block above) and registered automatically with the
-/// class. The opaque [`PyIdentity`] and [`PyDIDDocument`] classes plus the
-/// pure verification helpers (`identity_verify_device_attestation`,
-/// `verify_identity_link_attestation`) are registered manually here per
-/// ADR-048 §1.
+/// `#[pymethods]` block above) and registered automatically with the class.
+/// The opaque [`PyIdentity`] and [`PyDIDDocument`] classes are registered
+/// manually here, alongside two module-level free functions:
+/// `identity_verify_device_attestation`, a pure helper ADR-048 §1 places at
+/// module scope, and [`verify_identity_link_attestation`], which declines with
+/// `SCP-IDENT-1060`. ADR-048 authorizes neither the placement nor the decline
+/// of that second function — that document names no identity-link
+/// verification operation at all. GitHub issue #2335 finding 2 decided it:
+/// spec §3.5.4 step 1 resolves an issuer's DID document, which needs a
+/// per-instance resolver, so the operation lives on
+/// [`PyScp::verify_identity_link_attestation`](crate::scp::PyScp::verify_identity_link_attestation)
+/// and this free function keeps the Python-visible name while refusing to
+/// answer.
 ///
 /// Called from the `_scp_core` module init function in `lib.rs`.
 ///
@@ -2835,10 +2827,7 @@ pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // shipped build gets the fail-closed (IDENT_1016) free fn. Both cfg arms
     // define `identity_verify_device_attestation`, so the name always resolves.
     m.add_function(wrap_pyfunction!(identity_verify_device_attestation, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        verify_identity_link_attestation_module_scope,
-        m
-    )?)?;
+    m.add_function(wrap_pyfunction!(verify_identity_link_attestation, m)?)?;
     Ok(())
 }
 
@@ -2939,7 +2928,7 @@ mod tests {
     fn module_scope_link_verification_declines_fail_closed() {
         setup();
         Python::with_gil(|_py| {
-            let err = verify_identity_link_attestation_module_scope("{}", &"00".repeat(32))
+            let err = verify_identity_link_attestation("{}", &"00".repeat(32))
                 .expect_err("module-scope verification must decline");
             let msg = err.to_string();
             assert!(
@@ -2964,6 +2953,112 @@ mod tests {
             assert!(
                 msg.contains(scp_ffi_common::error_codes::IDENT_1044),
                 "malformed attestation JSON must raise SCP-IDENT-1044, got: {msg}"
+            );
+        });
+    }
+
+    /// Mints a Class 1 (`oauth`) link attestation on a fresh identity and
+    /// returns a `PyScp` bound to that identity's bridge instance, that
+    /// identity's attestation JSON, and its `#active` key as hex.
+    fn minted_link_attestation(py: Python<'_>) -> (crate::scp::PyScp, String, String) {
+        let scp = default_scp();
+        let identity = scp
+            .identity_create(py, "in_memory", None)
+            .expect("creating an identity must succeed");
+        let did = identity.did;
+        let attestation_json = scp
+            .create_identity_link_attestation(
+                py,
+                &did,
+                "google.com",
+                "alice",
+                r#"{"provider":"google.com","subject_id":"12345","verified_at":1700000000}"#,
+                "oauth",
+                Some("12345"),
+            )
+            .expect("minting a link attestation must succeed");
+        let active_multibase = crate::runtime::with_identity(&scp.inner, &did, |entry| {
+            Ok(entry
+                .document
+                .verification_method_by_fragment("active")
+                .map(|vm| vm.public_key_multibase.clone()))
+        })
+        .expect("the freshly created identity must be in this instance's registry")
+        .expect("a DID document must publish an #active verification method");
+        let active_hex = hex::encode(
+            scp_did::decode_multibase_key(&active_multibase)
+                .expect("a freshly minted #active key must decode"),
+        );
+        (scp, attestation_json, active_hex)
+    }
+
+    #[test]
+    fn per_instance_link_verification_accepts_a_key_the_did_document_publishes() {
+        setup();
+        Python::with_gil(|py| {
+            let (scp, attestation_json, active_hex) = minted_link_attestation(py);
+            let verified = scp
+                .verify_identity_link_attestation(py, &attestation_json, &active_hex)
+                .expect("verification of a freshly minted attestation must not raise");
+            assert!(
+                verified,
+                "an attestation signed by the #active key an issuer's DID document \
+                 publishes must verify (spec §3.5.4)"
+            );
+        });
+    }
+
+    /// Regression pin for GitHub issue #2335 finding 2, in the shape that
+    /// finding names: an attacker supplies BOTH an attestation and the key
+    /// that signs it, keeping an honest issuer's DID in the `issuer` field.
+    ///
+    /// A verifier that calls `attestation.verify_signature(caller_key)` and
+    /// returns that boolean answers `True` here, because the attacker's own
+    /// signature verifies under the attacker's own key. Taking the signing key
+    /// from an issuer's resolved DID document instead answers `False`, because
+    /// that document publishes neither the attacker's key at `#active` nor at
+    /// `#agent`.
+    ///
+    /// Passing a key nobody signed with does NOT exhibit that gap — a
+    /// signature check rejects it either way — so this test forges rather than
+    /// mutating a key.
+    #[test]
+    fn per_instance_link_verification_rejects_an_attacker_supplied_key_and_attestation() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        setup();
+        Python::with_gil(|py| {
+            let (scp, attestation_json, _active_hex) = minted_link_attestation(py);
+
+            // Forge: keep an honest issuer's DID, re-sign under an attacker's key.
+            let attacker = SigningKey::from_bytes(&[0x07; 32]);
+            let mut forged: scp_core::identity::attestation::IdentityLinkAttestation =
+                serde_json::from_str(&attestation_json).expect("minted attestation must parse");
+            forged.signature = Vec::new();
+            let canonical = forged
+                .canonical_signing_bytes()
+                .expect("canonical bytes must compute");
+            forged.signature = attacker.sign(&canonical).to_bytes().to_vec();
+            let forged_json = serde_json::to_string(&forged).expect("forgery must serialize");
+            let attacker_hex = hex::encode(attacker.verifying_key().to_bytes());
+
+            // The forgery is internally consistent: it verifies under the key
+            // an attacker supplies alongside it.
+            assert!(
+                forged
+                    .verify_signature(&attacker.verifying_key().to_bytes())
+                    .is_ok(),
+                "the forgery must verify under an attacker's own key, or this test \
+                 exercises nothing"
+            );
+
+            let verified = scp
+                .verify_identity_link_attestation(py, &forged_json, &attacker_hex)
+                .expect("verification of a forgery must not raise");
+            assert!(
+                !verified,
+                "an attestation an attacker signed with a key an issuer's DID document \
+                 publishes at neither #active nor #agent must not verify (spec §3.5.4 step 1)"
             );
         });
     }

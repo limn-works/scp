@@ -313,6 +313,51 @@ pub const IDENT_1059: &str = "SCP-IDENT-1059";
 /// precondition failure apart from a plain resolve call that failed.
 pub const IDENT_1060: &str = "SCP-IDENT-1060";
 
+/// Identity-link attestation verification found an issuer publishing an
+/// attestation revocation list that no bridge reads (FAIL CLOSED).
+///
+/// Spec §3.5.2 states: "Verifiers check revocation by resolving the issuer's
+/// DID document and looking for an `AttestationRevocations` service endpoint
+/// (§18.2.2). The endpoint returns a list of revoked attestation IDs." Spec
+/// §3.5.2 further states that the endpoint check "is ALWAYS required regardless
+/// of `revocation_status` value", because a holder who keeps an
+/// `Active`-signed copy replays it after an issuer revokes it. No bridge
+/// fetches that endpoint, so a bridge that resolves a document publishing one
+/// cannot conclude an attestation is unrevoked and raises this code instead of
+/// answering `true`.
+///
+/// A caller that meets this code fetches that endpoint itself, checks whether
+/// it lists this attestation's `id`, and decides. A caller cannot suppress this
+/// code by supplying different arguments, because an issuer's own DID document
+/// decides whether it applies.
+///
+/// Distinct from [`IDENT_1060`] (an issuer's document could not be resolved at
+/// all) so an SDK consumer can tell "no document" apart from "a document whose
+/// revocation list this bridge does not read".
+pub const IDENT_1061: &str = "SCP-IDENT-1061";
+
+/// Identity-link attestation verification reached a class 2 (Reference)
+/// attestation whose external proof resource nobody fetched (FAIL CLOSED).
+///
+/// Spec §3.5.4 Class 2 step 2 has a verifier fetch a `signed_post` URL or query
+/// a `dns_record` TXT record and confirm an issuer's DID appears in it. No
+/// bridge performs that fetch. Spec §3.5.4 Class 2 step 3 then states the
+/// attestation "is unverified. Treat as if the attestation does not exist for
+/// trust evaluation. Do not cache a negative result." Answering `false` would
+/// hand a caller exactly that negative result, and a caller reads `false` on
+/// this surface as "this attestation is forged", so a bridge raises this code
+/// instead.
+///
+/// A caller that meets this code performs that fetch itself — HTTP GET for
+/// `signed_post`, DNS TXT lookup of `_scp-verify.<domain>` for `dns_record` —
+/// confirms an issuer's DID appears in what it fetched, and treats a failed or
+/// absent fetch as "not yet verified" rather than caching a rejection.
+///
+/// Distinct from [`IDENT_1060`] and [`IDENT_1061`]: a signature already
+/// verified under a key an issuer's DID document publishes, so what remains
+/// unchecked is an external resource rather than an issuer's document.
+pub const IDENT_1062: &str = "SCP-IDENT-1062";
+
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
 // -------------------------------------------------------------------------

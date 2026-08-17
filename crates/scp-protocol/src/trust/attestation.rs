@@ -716,12 +716,29 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
 /// lists, or external revocation services. The trait is object-safe and
 /// designed for injection into [`verify_attestation`].
 ///
-/// See spec §7.4.1 (attestation verification).
+/// SECURITY (issuer scoping — a requirement on every implementation).
+/// An implementation MUST report a revocation only when the issuer that signed
+/// that revocation equals the `issuer` argument. §7.4.1 of
+/// `.docs/specs/07-trust-validation-and-capabilities.md` describes
+/// `Attestation.id` as a UUID v4 that an issuer chooses, and states no rule
+/// deriving that id from its issuer, so `attestation_id` alone identifies no
+/// issuer and two issuers can carry one id. An implementation that decides on
+/// `attestation_id` alone therefore lets an attacker suppress an honest issuer's
+/// attestation: the attacker mints a DID at no cost, signs a self-revoking
+/// attestation carrying the honest issuer's id, and every later verification of
+/// the honest issuer's attestation then reports a revocation. §7.4.4 grants a
+/// revocation to the issuer alone ("Only the issuer (`revoked_by == issuer`) can
+/// revoke an attestation"), and scoping each answer to one issuer is how an
+/// implementation of this trait keeps that grant.
+///
+/// See spec §7.4.1 (attestation verification) and §7.4.4 (revocation).
 pub trait AttestationRevocationChecker {
-    /// Checks if the attestation with the given ID has been revoked by the issuer.
+    /// Checks whether `issuer` revoked the attestation carrying `attestation_id`.
     ///
-    /// Returns `Some(revoked_at)` with the revocation timestamp (seconds) if the
-    /// attestation has been revoked, or `None` if the attestation is still active.
+    /// Returns `Some(revoked_at)` with the revocation timestamp (seconds) when
+    /// `issuer` revoked that attestation, or `None` when `issuer` did not. A
+    /// revocation that a DID other than `issuer` signed MUST yield `None` here,
+    /// per the issuer-scoping requirement on this trait.
     fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64>;
 }
 
@@ -3152,15 +3169,17 @@ mod tests {
         }
     }
 
-    /// A test revocation checker that only revokes a specific attestation ID.
+    /// A test revocation checker that revokes one attestation id issued by one
+    /// issuer, matching the issuer-scoping requirement this trait states.
     struct SelectiveRevokedChecker {
+        target_issuer: DID,
         target_id: String,
         revoked_at: u64,
     }
 
     impl AttestationRevocationChecker for SelectiveRevokedChecker {
-        fn check_revocation(&self, attestation_id: &str, _issuer: &DID) -> Option<u64> {
-            if attestation_id == self.target_id {
+        fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64> {
+            if attestation_id == self.target_id && *issuer == self.target_issuer {
                 Some(self.revoked_at)
             } else {
                 None
@@ -3302,6 +3321,7 @@ mod tests {
 
         // Checker targets a different attestation ID.
         let checker = SelectiveRevokedChecker {
+            target_issuer: DID::from("did:key:issuer"),
             target_id: "some-other-att-id".to_owned(),
             revoked_at: 999,
         };
@@ -3310,6 +3330,74 @@ mod tests {
         assert!(
             result.is_ok(),
             "expected Ok for non-targeted attestation, got {result:?}"
+        );
+    }
+
+    /// SECURITY (issuer scoping, issue #2335 finding 13).
+    /// `verify_attestation_with_revocation` hands a checker the attestation's own
+    /// `issuer`, so a checker that scopes a revocation to a different issuer
+    /// reports nothing. Passing an id without an issuer would let one issuer's
+    /// revocation suppress another issuer's attestation carrying that same id,
+    /// which the issuer-scoping requirement on `AttestationRevocationChecker`
+    /// forbids.
+    #[test]
+    fn revocation_checker_receives_the_attestations_own_issuer() {
+        let (signing_key, pubkey_bytes) = test_keypair();
+        let mut resolver = TestResolver::new();
+        resolver.add_key("did:key:issuer", pubkey_bytes);
+        let clock = TestClock::new(1000);
+
+        let attestation = make_signed_attestation(
+            &signing_key,
+            AttestationType::Endorsement,
+            "did:key:issuer",
+            "did:key:subject",
+            900,
+            Some(2000),
+            None,
+            None,
+        );
+
+        // Same attestation id, a DIFFERENT issuer: the checker must report
+        // nothing, which it can only do if it receives the issuer.
+        let foreign_issuer_checker = SelectiveRevokedChecker {
+            target_issuer: DID::from("did:key:someone-else"),
+            target_id: attestation.id.clone(),
+            revoked_at: 999,
+        };
+        let unaffected = verify_attestation_with_revocation(
+            &attestation,
+            &resolver,
+            &clock,
+            Some(&foreign_issuer_checker),
+        );
+        assert!(
+            unaffected.is_ok(),
+            "a revocation another issuer signed must not reject this attestation, got {unaffected:?}"
+        );
+
+        // Same attestation id, the attestation's OWN issuer: the checker reports
+        // a revocation, which proves the argument carries that issuer.
+        let own_issuer_checker = SelectiveRevokedChecker {
+            target_issuer: attestation.issuer.clone(),
+            target_id: attestation.id.clone(),
+            revoked_at: 999,
+        };
+        let rejected = verify_attestation_with_revocation(
+            &attestation,
+            &resolver,
+            &clock,
+            Some(&own_issuer_checker),
+        );
+        assert!(
+            matches!(
+                rejected,
+                Err(TrustError::AttestationRevoked {
+                    revoked_at: 999,
+                    ..
+                })
+            ),
+            "expected AttestationRevoked at 999, got {rejected:?}"
         );
     }
 

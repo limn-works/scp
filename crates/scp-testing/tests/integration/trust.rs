@@ -9,7 +9,12 @@
     clippy::doc_markdown,
     clippy::redundant_clone,
     clippy::cloned_ref_to_slice_refs,
-    clippy::missing_const_for_fn
+    clippy::missing_const_for_fn,
+    // An in-memory `TrustProtocolRepository` below holds one lock guard across
+    // a lookup and its inserts on purpose: `add_revocations` needs both steps
+    // under one guard, or a concurrent caller on one context drops what another
+    // adds. Tightening that guard's scope would reintroduce that lost update.
+    clippy::significant_drop_tightening
 )]
 
 //! B12: Trust, sybil resistance, and participation admission integration tests.
@@ -634,8 +639,9 @@ async fn custody_violation_attestation() {
     assert_eq!(attestation.violation_kind(), "CategoryAViolation");
     assert_eq!(attestation.verifier_did, did("did:dht:z6MkVerifier"));
 
-    // Validation should pass.
-    assert!(attestation.validate().is_ok());
+    // Field shapes should pass. This check establishes nothing about who
+    // signed; `VerifiedCustodyViolation::verify` answers that.
+    assert!(attestation.validate_field_shape().is_ok());
 
     // Empty evidence should fail.
     let bad_violation = CustodyViolationType::CategoryAViolation {
@@ -702,9 +708,24 @@ async fn counter_attestation() {
     let sk = sk_for(30);
     let sig = sk.sign(b"counter-claim-data");
 
-    let counter = CounterAttestation::new(
+    // A counter-claim names a violation record by a 32-byte reference spec
+    // section §9.5.2 derives, so build a record first and let `referencing`
+    // compute that reference rather than inventing an identifier.
+    let violation = ScpCustodyViolationAttestation::new(
         did("did:dht:z6MkSubject"),
-        "violation-ref-001".to_owned(),
+        1000,
+        CustodyViolationType::CategoryAViolation {
+            action: "did_document_update".to_owned(),
+            signer_key_id: SigningKeyId::Agent,
+            signature_evidence: vec![1, 2, 3, 4],
+        },
+        vec![5, 6, 7, 8],
+        did("did:dht:z6MkVerifier"),
+    )
+    .unwrap();
+
+    let counter = CounterAttestation::referencing(
+        &violation,
         "Key was compromised and rotated".to_owned(),
         2000,
         sig.to_bytes().to_vec(),
@@ -712,44 +733,26 @@ async fn counter_attestation() {
     .unwrap();
 
     assert_eq!(counter.subject_did, did("did:dht:z6MkSubject"));
-    assert_eq!(counter.violation_reference, "violation-ref-001");
+    assert_eq!(
+        counter.violation_reference,
+        violation.signing_hash().unwrap(),
+        "a counter-claim's reference equals a contested record's signing hash"
+    );
     assert_eq!(counter.explanation, "Key was compromised and rotated");
     assert_eq!(counter.timestamp, 2000);
     assert!(!counter.signature.is_empty());
-    assert!(counter.validate().is_ok());
+    assert!(counter.validate_field_shape().is_ok());
 
-    // Empty fields should fail.
+    // An empty explanation and an empty signature each fail.
     assert!(
-        CounterAttestation::new(
-            did("did:dht:z6MkSubject"),
-            String::new(),
-            "explanation".to_owned(),
-            2000,
-            vec![1],
-        )
-        .is_err()
+        CounterAttestation::referencing(&violation, String::new(), 2000, vec![1]).is_err(),
+        "an empty explanation must be rejected"
     );
 
     assert!(
-        CounterAttestation::new(
-            did("did:dht:z6MkSubject"),
-            "ref".to_owned(),
-            String::new(),
-            2000,
-            vec![1],
-        )
-        .is_err()
-    );
-
-    assert!(
-        CounterAttestation::new(
-            did("did:dht:z6MkSubject"),
-            "ref".to_owned(),
-            "explanation".to_owned(),
-            2000,
-            vec![],
-        )
-        .is_err()
+        CounterAttestation::referencing(&violation, "explanation".to_owned(), 2000, vec![])
+            .is_err(),
+        "an empty signature must be rejected"
     );
 }
 
@@ -1296,4 +1299,212 @@ async fn block_list_state_from_events() {
     ];
     let state_unblocked = BlockListState::from_events(&events_with_unblock);
     assert!(!state_unblocked.is_blocked_in_context(&eve, "ctx-1"));
+}
+
+// ---------------------------------------------------------------------------
+// Issuer-scoped attestation revocation (§7.4.4, issue #2335 finding 13)
+// ---------------------------------------------------------------------------
+
+/// Minimal `TrustProtocolRepository` for the revocation-scoping tests below.
+/// Keys cached attestations by `(context, subject, issuer, id)` so two issuers
+/// carrying one attestation id coexist, which is what these tests need to
+/// observe.
+#[derive(Default)]
+struct ScopingTestStore {
+    attestations: std::sync::Mutex<
+        HashMap<(String, String, String, String), scp_core::trust::aggregate::CachedAttestation>,
+    >,
+    revocations: std::sync::Mutex<HashMap<String, HashMap<String, bool>>>,
+    challenges:
+        std::sync::Mutex<HashMap<(String, String), Vec<scp_core::trust::ChallengeVerification>>>,
+}
+
+impl scp_core::trust::aggregate::TrustProtocolRepository for ScopingTestStore {
+    fn get_cached_attestations(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+    ) -> Result<Vec<scp_core::trust::aggregate::CachedAttestation>, TrustError> {
+        let store = self.attestations.lock().unwrap();
+        Ok(store
+            .iter()
+            .filter(|((ctx, subject, _, _), _)| ctx == context_id && subject == subject_did)
+            .map(|(_, entry)| entry.clone())
+            .collect())
+    }
+
+    fn store_cached_attestation(
+        &self,
+        context_id: &str,
+        entry: scp_core::trust::aggregate::CachedAttestation,
+    ) -> Result<(), TrustError> {
+        let mut store = self.attestations.lock().unwrap();
+        store.insert(
+            (
+                context_id.to_owned(),
+                entry.attestation.subject.to_string(),
+                entry.attestation.issuer.to_string(),
+                entry.attestation.id.clone(),
+            ),
+            entry,
+        );
+        Ok(())
+    }
+
+    fn get_revocation_state(&self, context_id: &str) -> Result<HashMap<String, bool>, TrustError> {
+        let store = self.revocations.lock().unwrap();
+        Ok(store.get(context_id).cloned().unwrap_or_default())
+    }
+
+    fn store_revocation_state(
+        &self,
+        context_id: &str,
+        state: &HashMap<String, bool>,
+    ) -> Result<(), TrustError> {
+        let mut store = self.revocations.lock().unwrap();
+        store.insert(context_id.to_owned(), state.clone());
+        Ok(())
+    }
+
+    fn add_revocations(&self, context_id: &str, keys: &[String]) -> Result<(), TrustError> {
+        // One guard spans the lookup and the inserts, so a concurrent caller on
+        // this context cannot drop what this call adds.
+        let mut store = self.revocations.lock().unwrap();
+        let entry = store.entry(context_id.to_owned()).or_default();
+        for key in keys {
+            entry.insert(key.clone(), true);
+        }
+        Ok(())
+    }
+
+    fn get_challenge_results(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+    ) -> Result<Vec<scp_core::trust::ChallengeVerification>, TrustError> {
+        let store = self.challenges.lock().unwrap();
+        let key = (context_id.to_owned(), subject_did.to_owned());
+        Ok(store.get(&key).cloned().unwrap_or_default())
+    }
+
+    fn store_challenge_result(
+        &self,
+        context_id: &str,
+        result: &scp_core::trust::ChallengeVerification,
+    ) -> Result<(), TrustError> {
+        let mut store = self.challenges.lock().unwrap();
+        let key = (context_id.to_owned(), result.subject_did.to_string());
+        store.entry(key).or_default().push(result.clone());
+        Ok(())
+    }
+}
+
+/// Wraps an attestation as a cache entry that stays fresh forever, so no TTL
+/// effect can explain an exclusion these tests observe.
+fn scoping_entry(attestation: Attestation) -> scp_core::trust::aggregate::CachedAttestation {
+    scp_core::trust::aggregate::CachedAttestation {
+        attestation,
+        verified_at: 0,
+        ttl_secs: u64::MAX,
+    }
+}
+
+/// SECURITY (issuer-scoped revocation, §7.4.4, issue #2335 finding 13).
+/// §7.4.1 describes `Attestation.id` as a UUID v4 that an issuer chooses and
+/// states no rule deriving that id from its issuer, so two issuers can carry one
+/// id. §7.4.4 grants a revocation to the issuer alone. An attacker who derives a
+/// DID from a fresh keypair therefore MUST NOT be able to suppress an honest
+/// issuer's attestation by recording a revocation that names that attestation's
+/// id: `AttestationCache::get_verified_attestations` keeps returning the honest
+/// issuer's attestation. The second half revokes under the honest issuer's own
+/// DID and observes the exclusion, so the first half's survival is attributable
+/// to issuer scoping rather than to a revocation list nobody reads.
+#[test]
+fn attestation_revocation_binds_to_the_issuer_that_signed_it() {
+    use scp_core::trust::aggregate::{
+        AttestationCache, TrustProtocolRepository, revocation_list_key,
+    };
+
+    let context_id = "ctx-issuer-scoped-revocation";
+    let subject_did = "did:key:subject-scoped";
+    let shared_id = "endorsement-shared-2026";
+
+    let honest_sk = sk_for(71);
+    let attacker_sk = sk_for(73);
+
+    let honest = make_signed_attestation(
+        shared_id,
+        AttestationType::Endorsement,
+        "did:key:placeholder",
+        subject_did,
+        &honest_sk,
+        1000,
+        Some(u64::MAX),
+        None,
+    );
+    let attacker = make_signed_attestation(
+        shared_id,
+        AttestationType::Endorsement,
+        "did:key:placeholder",
+        subject_did,
+        &attacker_sk,
+        1000,
+        Some(u64::MAX),
+        None,
+    );
+    assert_ne!(
+        honest.issuer, attacker.issuer,
+        "the two issuers must differ for this test to exercise issuer scoping"
+    );
+
+    let mut resolver = TestKeyResolver::new();
+    resolver.add(
+        honest.issuer.as_ref(),
+        honest_sk.verifying_key().to_bytes().to_vec(),
+    );
+    resolver.add(
+        attacker.issuer.as_ref(),
+        attacker_sk.verifying_key().to_bytes().to_vec(),
+    );
+    let clock = FixedClock(2000);
+
+    let store = ScopingTestStore::default();
+    store
+        .store_cached_attestation(context_id, scoping_entry(honest.clone()))
+        .unwrap();
+
+    // The attacker records a revocation of the shared id under its own DID.
+    let mut revoked = HashMap::new();
+    revoked.insert(revocation_list_key(&attacker.issuer, shared_id), true);
+    store.store_revocation_state(context_id, &revoked).unwrap();
+
+    let cache = AttestationCache::new(store);
+    let survived = cache
+        .get_verified_attestations(context_id, subject_did, &resolver, &clock)
+        .unwrap();
+    assert_eq!(
+        survived.len(),
+        1,
+        "a revocation the attacker signed must leave the honest issuer's attestation counted, got {survived:?}"
+    );
+    assert_eq!(
+        survived[0].issuer, honest.issuer,
+        "the surviving attestation must be the honest issuer's"
+    );
+
+    // The honest issuer revokes its own attestation, and that revocation lands.
+    let mut both_revoked = revoked.clone();
+    both_revoked.insert(revocation_list_key(&honest.issuer, shared_id), true);
+    cache
+        .store()
+        .store_revocation_state(context_id, &both_revoked)
+        .unwrap();
+
+    let excluded = cache
+        .get_verified_attestations(context_id, subject_did, &resolver, &clock)
+        .unwrap();
+    assert!(
+        excluded.is_empty(),
+        "an issuer's own revocation must exclude that issuer's attestation, got {excluded:?}"
+    );
 }

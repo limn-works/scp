@@ -451,6 +451,12 @@ describe("dispatcher invariant (ADR-048 §1 + §7)", () => {
       // route to a per-instance method those wrappers have yet to take
       // (GitHub issue #2335 finding 2). native.ts routes through a class
       // method; scp.ts still routes through that declining free fn.
+      //
+      // ADR-048 authorizes neither half of this overlap: searching
+      // .docs/adrs/ADR-048-scp-multi-instance.md for `verify_link_attestation`
+      // returns zero matches, so that document names no identity-link
+      // verification operation. GitHub issue #2335 finding 2 decided it, and
+      // this entry records that decision rather than an ADR-048 clause.
       "identityVerifyLinkAttestation",
     ]);
     const { classMethods, freeFns } = extractNapiSurface();

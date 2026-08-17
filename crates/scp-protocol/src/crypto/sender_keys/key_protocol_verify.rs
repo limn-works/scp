@@ -25,6 +25,7 @@ use super::generate_sender_key;
 use super::{SenderKey, SenderKeyError};
 use crate::crypto::hpke;
 use crate::serde_util::{serde_hpke_sealed_48, serde_pubkey_32, serde_signature_64};
+use crate::trust::custody_violation::CategoryARejection;
 use scp_did::SigningKeyId;
 
 // ---------------------------------------------------------------------------
@@ -403,30 +404,48 @@ pub fn verify_epoch_advance(
 /// should only be called when the caller knows the sender key operation is
 /// part of a larger DID-modification flow.
 ///
+/// A rejection carries both halves ADR-039, shared-DID human-agent identity
+/// model (`.docs/adrs/phase-1.md`), enforcement-stack layer 3 requires: the
+/// rejection a caller surfaces, and the
+/// [`CategoryAViolation`](crate::trust::custody_violation::CustodyViolationType::CategoryAViolation)
+/// record a caller logs, holding `evidence_signature` as the observed evidence.
+/// A caller that only rejects the operation converts the rejection with
+/// `SenderKeyError::from`, which keeps the message and drops the record.
+///
 /// # Errors
 ///
-/// Returns [`SenderKeyError::CategoryAViolation`] if an agent key attempted
-/// a DID document modification via the sender key protocol.
+/// Returns [`CategoryARejection`] if an agent key attempted a DID document
+/// modification via the sender key protocol.
 pub fn enforce_sender_key_category_a(
     signer_key_ref: SigningKeyId,
     sender_did: &str,
     action_resource: &str,
     evidence_signature: &[u8],
-) -> Result<(), SenderKeyError> {
+) -> Result<(), CategoryARejection> {
     use crate::trust::custody_violation::{classify_action, enforce_category_a};
 
     let category = classify_action(action_resource);
-    if let Err(violation) = enforce_category_a(
+    enforce_category_a(
         signer_key_ref,
         category,
         sender_did,
         &format!("sender key operation: {action_resource}"),
         evidence_signature,
-    ) {
-        return Err(SenderKeyError::CategoryAViolation(violation.error_message));
-    }
+    )
+    .map_err(CategoryARejection::from)
+}
 
-    Ok(())
+impl From<CategoryARejection> for SenderKeyError {
+    /// Keeps the rejection message and drops the violation record.
+    ///
+    /// A caller that logs the record matches on [`CategoryARejection`] before
+    /// converting, because [`SenderKeyError::CategoryAViolation`] carries a
+    /// string and cannot hold a
+    /// [`CategoryAViolation`](crate::trust::custody_violation::CustodyViolationType::CategoryAViolation)
+    /// record.
+    fn from(rejection: CategoryARejection) -> Self {
+        Self::CategoryAViolation(rejection.error_message().to_owned())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1759,14 +1778,65 @@ mod tests {
             "did_document",
             &[0xAB; 64],
         );
-        assert!(
-            result.is_err(),
-            "agent key should be rejected for did_document"
-        );
+        let rejection = result.expect_err("agent key should be rejected for did_document");
         assert!(matches!(
-            result.unwrap_err(),
+            SenderKeyError::from(rejection),
             SenderKeyError::CategoryAViolation(_)
         ));
+    }
+
+    /// ADR-039, shared-DID human-agent identity model (`.docs/adrs/phase-1.md`),
+    /// enforcement-stack layer 3 requires a verification point to reject a
+    /// Category A action `#agent` signed and to record it. This test pins the
+    /// recording half: the signature bytes this caller passed reach the
+    /// `signature_evidence` field of the record the rejection carries.
+    #[test]
+    fn enforce_rejection_carries_the_observed_signature_into_a_record() {
+        use crate::trust::custody_violation::CustodyViolationType;
+
+        let evidence = [0xAB; 64];
+        let rejection = enforce_sender_key_category_a(
+            SigningKeyId::Agent,
+            "did:dht:alice",
+            "did_document",
+            &evidence,
+        )
+        .expect_err("agent key should be rejected for did_document");
+
+        assert_eq!(rejection.violator_did(), "did:dht:alice");
+        let violation = rejection
+            .recorded_violation()
+            .expect("a rejection carrying 64 evidence bytes builds a conformant record");
+        match violation {
+            CustodyViolationType::CategoryAViolation {
+                action,
+                signer_key_id,
+                signature_evidence,
+            } => {
+                assert_eq!(action, "sender key operation: did_document");
+                assert_eq!(*signer_key_id, SigningKeyId::Agent);
+                assert_eq!(signature_evidence.as_slice(), evidence.as_slice());
+            }
+            CustodyViolationType::AttestationMismatch { .. } => {
+                panic!("Category A enforcement must produce a CategoryAViolation")
+            }
+        }
+    }
+
+    /// A verification point that observed no signature bytes still rejects, and
+    /// reports that no conformant record accompanies that rejection rather than
+    /// inventing evidence.
+    #[test]
+    fn enforce_rejection_without_evidence_records_nothing() {
+        let rejection = enforce_sender_key_category_a(
+            SigningKeyId::Agent,
+            "did:dht:alice",
+            "did_document",
+            &[],
+        )
+        .expect_err("agent key should be rejected for did_document");
+
+        assert!(rejection.recorded_violation().is_none());
     }
 
     #[test]

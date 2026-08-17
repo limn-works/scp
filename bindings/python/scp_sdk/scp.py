@@ -1026,21 +1026,34 @@ class SCP:
         per-instance method. It resolves an issuer's DID document through this
         instance's resolver (§3.5.4 step 1), then checks structure, a binding
         between that document and an issuer, a signature under a key that
-        document publishes at ``#active`` or ``#agent``, revocation status,
-        expiry, and evidence freshness.
+        document publishes at ``#active`` or ``#agent`` (steps 1 and 2),
+        revocation status (step 3), expiry (step 4), and evidence freshness
+        (step 5, which lowers trust weight rather than rejecting).
 
-        ``issuer_public_key_hex`` states which key a caller believes signed.
-        That statement is checked against an issuer's resolved document; it is
-        never a substitute for it. Before GitHub issue #2335 finding 2, a
-        module-level free function verified against that key alone and returned
-        ``True`` for an attacker who supplied both an attestation and a key.
-        That free function now raises ``SCP-IDENT-1060``.
+        ``issuer_public_key_hex`` states which key a caller believes belongs to
+        this issuer. That statement is checked against an issuer's resolved
+        document; it is never a substitute for it. Before GitHub issue #2335
+        finding 2, a module-level free function verified against that key alone
+        and returned ``True`` for an attacker who supplied both an attestation
+        and a key. That free function now raises ``SCP-IDENT-1060``.
 
-        Returns ``True`` when every §3.5.4 step passes. Returns ``False`` when a
-        step rejects, including a Class 2 (``signed_post`` / ``dns_record``)
-        attestation whose external proof resource no bridge fetches — §3.5.0
-        makes an unfetched Reference attestation equivalent to no attestation,
-        so a caller performs that fetch itself.
+        Returns ``True`` when §3.5.4 steps 1 through 5 pass and a key a caller
+        named is one an issuer's document publishes. Returns ``False`` when a
+        check rejects: a bad signature, a revoked or expired attestation, or a
+        key an issuer's document publishes at neither fragment.
+
+        Two checks no bridge performs raise instead of returning a verdict, so
+        a caller performs them itself:
+
+        - ``SCP-IDENT-1061`` when an issuer's DID document publishes an
+          ``AttestationRevocations`` service endpoint. Spec §3.5.2 requires a
+          verifier to read that list of revoked attestation IDs regardless of
+          an attestation's own ``revocation_status``, and no bridge fetches it.
+        - ``SCP-IDENT-1062`` for a Class 2 (``signed_post`` / ``dns_record``)
+          attestation, whose external proof resource no bridge fetches. Spec
+          §3.5.4 Class 2 step 3 leaves such an attestation unverified and
+          forbids caching a negative result, so ``False`` would be wrong. Every
+          Class 2 attestation raises this code through every SDK today.
 
         Raises ``SCP-IDENT-1044`` when an argument is malformed, and
         ``SCP-IDENT-1060`` when an issuer's DID document cannot be resolved.

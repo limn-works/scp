@@ -1057,12 +1057,15 @@ impl Scp {
 
     /// Verifies an identity link attestation per spec §3.5.4.
     ///
-    /// Resolves an issuer's DID document through this instance's validating
-    /// resolver (§3.5.4 step 1), then runs every remaining step through the
-    /// pure `scp_core::identity::attestation::verify_identity_link_attestation`
-    /// seam: structural validation, document-to-issuer binding, signature
-    /// against a key that document publishes at `#active` or `#agent`,
-    /// `revocation_status`, `expires_at`, and evidence freshness.
+    /// Acquires this instance's validating DID resolver, then hands every
+    /// remaining decision to the one shared flow all three bridges run,
+    /// `scp_ffi_common::attestation::verify_link_attestation`. That flow
+    /// resolves an issuer's DID document (§3.5.4 step 1), fails closed when
+    /// that document publishes an `AttestationRevocations` service endpoint
+    /// (§3.5.2), and runs structural validation, document-to-issuer binding,
+    /// signature under an `#active` or `#agent` key that document publishes
+    /// (steps 1–2), `revocation_status` (step 3), `expires_at` (step 4), and
+    /// evidence freshness (step 5, which degrades rather than rejects).
     ///
     /// A module-level `identityVerifyLinkAttestation` free fn remains exported
     /// and declines with `SCP-IDENT-1060`: it reaches no bridge instance, so it
@@ -1072,86 +1075,76 @@ impl Scp {
     ///
     /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
     /// * `issuer_public_key_hex` — Hex-encoded 32-byte Ed25519 public key that
-    ///   a caller asserts signed this attestation. This method checks that
+    ///   a caller asserts belongs to this issuer. This method checks that
     ///   assertion against an issuer's resolved DID document; it never uses
     ///   this key as a substitute for that document.
     ///
     /// # Returns
     ///
-    /// `true` when every §3.5.4 step passes and a key a caller named is a key
-    /// that verified. `false` when a step rejects, including a Class 2
-    /// (`signed_post` / `dns_record`) attestation whose external proof resource
-    /// this bridge does not fetch — §3.5.0 makes an unfetched Reference
-    /// attestation equivalent to no attestation, so a caller performs that
-    /// fetch itself. Stale evidence returns `true`, because §3.5.4 step 5
-    /// degrades rather than rejects. Every rejection reason reaches `tracing`
-    /// at `info` level.
+    /// `true` when §3.5.4 steps 1 through 5 pass and a key a caller named is
+    /// one an issuer's document publishes. `false` when a check rejects — a bad
+    /// signature, a revoked or expired attestation, or a key an issuer's
+    /// document does not publish. Stale evidence returns `true`, because
+    /// §3.5.4 step 5 degrades rather than rejects. Every rejection reason
+    /// reaches `tracing` at `info` level.
     ///
     /// # Errors
     ///
-    /// Returns `SCP-IDENT-1044` when the JSON or the hex key is malformed, and
-    /// `SCP-IDENT-1060` when an issuer's DID document cannot be resolved — a
-    /// precondition failure, which this method never reports as `false`.
+    /// Returns `SCP-IDENT-1044` when the JSON or the hex key is malformed,
+    /// `SCP-IDENT-1060` when an issuer's DID document cannot be resolved,
+    /// `SCP-IDENT-1061` when an issuer publishes an attestation revocation
+    /// list this bridge does not fetch, and `SCP-IDENT-1062` for a Class 2
+    /// (`signed_post` / `dns_record`) attestation whose external proof
+    /// resource this bridge does not fetch. None of those four conditions is
+    /// reported as `false`, because `false` on this surface reads as "forged".
     #[napi]
     pub async fn identity_verify_link_attestation(
         &self,
         attestation_json: String,
         issuer_public_key_hex: String,
     ) -> napi::Result<bool> {
-        use scp_clock::Clock;
+        use scp_ffi_common::attestation::LinkVerifyError;
 
-        let parsed = scp_ffi_common::attestation::parse_link_attestation(
+        /// Maps a shared-flow error onto this bridge's error type.
+        fn to_napi(e: &LinkVerifyError) -> NapiError {
+            NapiError::from(ScpNapiError::Identity {
+                message: e.to_string(),
+                code: e.error_code().to_owned(),
+            })
+        }
+
+        let bi = Arc::clone(&self.inner);
+        // `ensure_did_resolver_initialized_on` builds a real Mainline Pkarr
+        // client on a shipped build — a socket bind plus thread spawn — and
+        // this is an async fn, so that work would otherwise block a tokio
+        // worker.
+        let resolver = tokio::task::spawn_blocking(move || {
+            crate::identity::ensure_did_resolver_initialized_on(&bi)?;
+            crate::runtime::did_resolver(&bi)
+                .map(Arc::clone)
+                .ok_or_else(|| -> ScpNapiError {
+                    ScpNapiError::Identity {
+                        message: LinkVerifyError::ResolverUnavailable.to_string(),
+                        code: LinkVerifyError::ResolverUnavailable.error_code().to_owned(),
+                    }
+                })
+        })
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("tokio task join error while acquiring a DID resolver: {e}"),
+                code: codes::IDENT_1060.to_owned(),
+            })
+        })?
+        .map_err(NapiError::from)?;
+
+        scp_ffi_common::attestation::verify_link_attestation(
+            &*resolver,
             &attestation_json,
             &issuer_public_key_hex,
         )
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: e.to_string(),
-                code: codes::IDENT_1044.to_owned(),
-            })
-        })?;
-
-        let bi = &*self.inner;
-        crate::identity::ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
-        let resolver = crate::runtime::did_resolver(bi)
-            .map(Arc::clone)
-            .ok_or_else(|| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: "identity link attestation verification has no DID resolver on \
-                              this bridge instance"
-                        .to_owned(),
-                    code: codes::IDENT_1060.to_owned(),
-                })
-            })?;
-
-        let issuer = parsed.issuer_did().to_owned();
-        let issuer_document = scp_identity::resolver::DidResolver::resolve(&*resolver, &issuer)
-            .await
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: format!(
-                        "identity link attestation verification could not resolve issuer \
-                             {issuer} (spec §3.5.4 step 1): {e}"
-                    ),
-                    code: codes::IDENT_1060.to_owned(),
-                })
-            })?
-            .ok_or_else(|| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: format!(
-                        "identity link attestation verification found no DID document for \
-                             issuer {issuer} (spec §3.5.4 step 1)"
-                    ),
-                    code: codes::IDENT_1060.to_owned(),
-                })
-            })?;
-
-        let now_secs = scp_clock::SystemClock.now_secs();
-        Ok(scp_ffi_common::attestation::decide_link_attestation(
-            &parsed,
-            &issuer_document.document,
-            now_secs,
-        ))
+        .await
+        .map_err(|e| to_napi(&e))
     }
 
     /// Per-instance equivalent of `identity_execute_recovery` (spec §9.12).
@@ -4952,6 +4945,52 @@ impl Scp {
         crate::context::context_seed_peer_pseudonym_on(&self.inner, handle, peer_did, pseudonym)
             .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Module-scope identity link attestation verification — declines, fail closed
+// ---------------------------------------------------------------------------
+//
+// This free fn sits in `scp.rs`, beside the per-instance method it names,
+// rather than in `identity.rs` where the rest of this bridge's identity free
+// fns live. The reverse-coverage gate
+// `every_exported_ffi_fn_is_registered_or_allowlisted`
+// (`crates/scp-testing/tests/integration/ffi_conformance.rs`) derives a
+// registered operation's canonical site from the one file exporting its name,
+// so exporting `identity_verify_link_attestation` from two files leaks and
+// would need an entry in that gate's `REGISTERED_NAME_MULTIPATH_ALLOWLIST`.
+// The PyO3 bridge keeps its pair in `scp-ffi/src/identity.rs` and the UniFFI
+// bridge keeps its pair in `scp-ffi/uniffi/src/bridge.rs`, so one file per
+// bridge is what every bridge already does.
+
+/// Declines identity link attestation verification at module scope, fail
+/// closed (`SCP-IDENT-1060`).
+///
+/// PR-E #28 restored this operation as a module-level free fn on a premise
+/// GitHub issue #2335 finding 2 falsified: that verification is pure Ed25519
+/// signature checking against a caller-supplied key. Spec §3.5.4 step 1
+/// resolves an issuer's DID document first and takes a signing key from it, so
+/// a key a caller supplies is an assertion to check rather than a source of
+/// truth, and checking it needs a per-instance DID resolver. Phase D (pull
+/// request #1695) deleted every process-wide default bridge instance, so a free
+/// fn reaches no resolver.
+///
+/// See [`Scp::identity_verify_link_attestation`] for the per-instance method
+/// that resolves an issuer's DID document and runs spec §3.5.4.
+///
+/// # Errors
+///
+/// Always returns `SCP-IDENT-1060`.
+#[napi(js_name = "identityVerifyLinkAttestation")]
+pub fn identity_verify_link_attestation(
+    attestation_json: String,
+    issuer_public_key_hex: String,
+) -> napi::Result<bool> {
+    let _ = (attestation_json, issuer_public_key_hex);
+    Err(NapiError::from(ScpNapiError::Identity {
+        message: scp_ffi_common::attestation::LINK_VERIFY_REQUIRES_INSTANCE.to_owned(),
+        code: codes::IDENT_1060.to_owned(),
+    }))
 }
 
 // ---------------------------------------------------------------------------

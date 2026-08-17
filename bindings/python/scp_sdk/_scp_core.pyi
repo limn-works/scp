@@ -979,7 +979,10 @@ def identity_verify_device_attestation(_did: str, token_base64: str) -> bool: ..
 
 # Always raises `SCP-IDENT-1060`: spec §3.5.4 step 1 resolves an issuer's DID
 # document, and a module-level free function reaches no per-instance resolver.
-# Use `SCP.verify_identity_link_attestation` instead.
+# Use `SCP.verify_identity_link_attestation` instead. ADR-048 §1 does not place
+# this function at module scope and does not authorize its decline — that
+# document names no identity-link verification operation. It sits here because
+# it kept a Python-visible name that predates GitHub issue #2335 finding 2.
 def py_verify_identity_link_attestation(
     attestation_json: str, issuer_public_key_hex: str
 ) -> bool: ...
