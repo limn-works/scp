@@ -74,6 +74,30 @@ pub type NodeFilesystemStorage = EncryptingAdapter<FilesystemStorage>;
 /// uses for `scp.salt` beside `scp.db` (`scp_platform::sqlite`).
 const STORAGE_SALT_FILE_NAME: &str = "storage.salt";
 
+/// File name of the persistent node key custody file [`start_node_local`]
+/// opens when the caller passes no pre-existing identity.
+///
+/// `FileKeyCustody` writes it under a key the caller's passphrase derives, so
+/// its presence is one of the two facts
+/// [`verify_or_init_passphrase_canary`] reads to decide whether a data
+/// directory already holds state an earlier key wrote.
+const NODE_IDENTITY_KEY_FILE_NAME: &str = "identity.key";
+
+/// Storage key of the passphrase canary record [`start_node_local`] writes
+/// through the same [`EncryptingAdapter`] that wraps every protocol value.
+///
+/// The prefix is the canary's own, so no `list_keys` caller in the protocol
+/// layer (every one of which scopes its prefix) ever sees this record.
+const STORAGE_CANARY_KEY: &str = "scp-storage-canary/v1";
+
+/// Plaintext of the passphrase canary record.
+///
+/// The bytes are not secret. What proves the passphrase is that
+/// `EncryptingAdapter::open` recovers exactly these bytes: the AES-256-GCM tag
+/// over the record, with [`STORAGE_CANARY_KEY`] as the AAD, only verifies under
+/// the key the first start derived.
+const STORAGE_CANARY_PLAINTEXT: &[u8] = b"scp-node-storage-passphrase-canary-v1";
+
 /// Pre-existing identity to use when starting an application node.
 ///
 /// Constructed by FFI bridges from their identity registries. Contains
@@ -146,6 +170,17 @@ pub enum ServerError {
     /// fails closed).
     #[error("storage salt error: {0}")]
     StorageSalt(String),
+
+    /// The key the caller's passphrase derived did not open the canary record
+    /// that the data directory's first start wrote under its own key.
+    ///
+    /// Either the caller typed a different passphrase than the one that
+    /// initialized this data directory, or the canary record itself is gone or
+    /// damaged. Both refuse startup: a node that proceeds under a
+    /// non-matching key writes a second, unreadable key regime into the same
+    /// store and silently orphans everything the first key wrote.
+    #[error("storage passphrase does not open this data directory: {0}")]
+    PassphraseMismatch(String),
 }
 
 impl ServerError {
@@ -170,6 +205,9 @@ impl ServerError {
                 "auto-generated in-memory node identity is unavailable in this build".to_owned()
             }
             Self::StorageSalt(_) => "storage key derivation failed".to_owned(),
+            Self::PassphraseMismatch(_) => {
+                "storage passphrase does not open this data directory".to_owned()
+            }
         }
     }
 }
@@ -288,6 +326,91 @@ fn write_salt_atomically(
         let _ = std::fs::remove_file(&temp_path);
     }
     write_result.map_err(ServerError::Io)
+}
+
+// ---------------------------------------------------------------------------
+// Storage-encryption passphrase canary
+// ---------------------------------------------------------------------------
+
+/// Proves that the caller's passphrase derived the same AES-256-GCM key that
+/// wrote this data directory, or writes that proof when the directory holds
+/// nothing a previous key wrote.
+///
+/// Argon2id derives a key from any passphrase, so a wrong passphrase produces a
+/// well-formed key that decrypts nothing. Without this check
+/// [`start_node_local`] would open the store under that key and write new
+/// protocol state under it, mixing two key regimes into one directory: every
+/// value the first key wrote becomes unreadable, and the operator sees an empty
+/// node rather than an error.
+///
+/// `storage` is the [`EncryptingAdapter`] the node itself will use, so this
+/// check exercises the exact key, cipher, and AAD binding that guards real
+/// protocol values — it derives nothing of its own.
+///
+/// The decision reads two facts and covers all four of their combinations:
+///
+/// | canary record | directory holds prior state | outcome |
+/// |---|---|---|
+/// | opens to the expected bytes | either | accept |
+/// | present but does not open, or opens to other bytes | either | refuse |
+/// | absent | no | write the canary |
+/// | absent | yes | refuse |
+///
+/// "Holds prior state" means the protocol store has at least one entry, or
+/// `<data_dir>/identity.key` exists. The caller's passphrase keys both — the
+/// store through the salt sidecar above, the custody file through
+/// `FileKeyCustody`'s own header salt — and `start_node_local` calls this
+/// function before it touches either one, so a first start interrupted after
+/// the salt sidecar landed and before the canary did finds neither and resumes
+/// rather than bricking an empty directory. A directory that holds either one
+/// and has lost its canary cannot be vouched for, so this function refuses it
+/// instead of re-keying it.
+///
+/// # Errors
+///
+/// Returns [`ServerError::PassphraseMismatch`] when the canary record does not
+/// open under the derived key, carries different bytes, or is absent from a
+/// directory that already holds state a previous key wrote. Returns
+/// [`ServerError::Platform`] when writing the record fails, and
+/// [`ServerError::Io`] when reading the protocol store directory fails.
+async fn verify_or_init_passphrase_canary<S: scp_platform::traits::Storage>(
+    storage: &S,
+    data_dir: &Path,
+    storage_dir: &Path,
+) -> Result<(), ServerError> {
+    match storage.retrieve(STORAGE_CANARY_KEY).await {
+        Ok(Some(bytes)) if bytes == STORAGE_CANARY_PLAINTEXT => return Ok(()),
+        Ok(Some(_)) => {
+            return Err(ServerError::PassphraseMismatch(
+                "the canary record decrypted to unexpected bytes".to_owned(),
+            ));
+        }
+        // `EncryptingAdapter::open` reports a failed AES-256-GCM tag check as a
+        // `StorageError`, and so does a read the filesystem refused. Both
+        // refuse startup, so this arm reports them together rather than
+        // matching on the message text of one of them.
+        Err(_) => {
+            return Err(ServerError::PassphraseMismatch(
+                "the derived key did not open the canary record".to_owned(),
+            ));
+        }
+        Ok(None) => {}
+    }
+
+    // No canary record. Adopting this key orphans nothing only when no earlier
+    // key wrote anything here.
+    let identity_key_path = data_dir.join(NODE_IDENTITY_KEY_FILE_NAME);
+    if storage_dir_has_entries(storage_dir)? || identity_key_path.exists() {
+        return Err(ServerError::PassphraseMismatch(format!(
+            "{} holds state a previous key wrote but carries no canary record",
+            data_dir.display()
+        )));
+    }
+
+    storage
+        .store(STORAGE_CANARY_KEY, STORAGE_CANARY_PLAINTEXT)
+        .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +756,13 @@ pub async fn start_node_in_memory(
 /// of inventing a key or writing plaintext (spec §17.6 storage selection fails
 /// closed, ADR-062 §Status).
 ///
+/// A passphrase this data directory was NOT initialized with returns
+/// [`ServerError::PassphraseMismatch`]. Argon2id derives a well-formed key from
+/// any passphrase, so the first start writes a canary record under its own key
+/// and every later start reads that record back before the node opens key
+/// custody or writes protocol state — see
+/// [`verify_or_init_passphrase_canary`].
+///
 /// # Errors
 ///
 /// Returns [`ServerError`] if:
@@ -640,6 +770,8 @@ pub async fn start_node_in_memory(
 /// - No passphrase was provided ([`ServerError::MissingPassphrase`])
 /// - The storage salt sidecar is unusable ([`ServerError::StorageSalt`])
 /// - Argon2id key derivation fails ([`ServerError::Platform`])
+/// - The derived key does not open the data directory's canary record
+///   ([`ServerError::PassphraseMismatch`])
 /// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
 /// - The redb blob database cannot be opened ([`ServerError::Storage`])
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
@@ -686,6 +818,15 @@ pub async fn start_node_local(
     // identity modes). `EncryptingAdapter` is what satisfies `Node::start`'s
     // sealed `EncryptedStorage` bound.
     let storage = EncryptingAdapter::new(FilesystemStorage::new(&storage_dir)?, storage_key);
+
+    // Prove the derived key is the one this data directory was initialized
+    // with, BEFORE the node opens key custody or writes any protocol state
+    // under it. Argon2id turns a mistyped passphrase into a valid-looking key,
+    // and `FileKeyCustody::new` accepts one without checking it, so this canary
+    // is what turns a wrong passphrase into an error instead of a second key
+    // regime layered over the first.
+    verify_or_init_passphrase_canary(&storage, data_dir, &storage_dir).await?;
+
     let blob_storage = BlobStorageBackend::redb(&blob_path)?;
 
     // Build the node via the ADR-052 flat-config front door (Phase B-P2). The
@@ -723,7 +864,7 @@ pub async fn start_node_local(
         .await?
     } else {
         // Persistent key custody — keys survive process restarts.
-        let key_path = data_dir.join("identity.key");
+        let key_path = data_dir.join(NODE_IDENTITY_KEY_FILE_NAME);
         let key_custody = Arc::new(scp_platform::file::FileKeyCustody::new(
             &key_path,
             &passphrase,
@@ -1805,6 +1946,227 @@ mod tests {
             "expected ServerError::StorageSalt, got: {err:?}"
         );
         assert_eq!(err.user_message(), "storage key derivation failed");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // Storage-encryption passphrase canary
+    // -----------------------------------------------------------------------
+
+    /// The canary proves which KEY wrote a store, so the same inner bytes must
+    /// admit the writing key and refuse a different one.
+    ///
+    /// Argon2id maps every passphrase to a well-formed 32-byte key, so nothing
+    /// upstream of this check distinguishes the right passphrase from a wrong
+    /// one. This test drives the two keys directly, skipping Argon2id, because
+    /// the property under test is the key comparison rather than the
+    /// derivation.
+    ///
+    /// REVERT LINE: `verify_or_init_passphrase_canary(&storage, data_dir, &storage_dir).await?;`
+    /// in `start_node_local`. Deleting the whole helper makes this test fail to
+    /// compile; leaving the helper but dropping that call makes
+    /// `node_local_refuses_a_passphrase_that_did_not_initialize_it` fail.
+    #[tokio::test]
+    async fn passphrase_canary_admits_the_writing_key_and_refuses_another() {
+        let tmp = std::env::temp_dir().join(format!(
+            "scp-test-canary-keys-{}-{}",
+            std::process::id(),
+            "admits"
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let storage_dir = tmp.join("storage");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+
+        let inner = Arc::new(InMemoryStorage::new());
+        let key_a = Zeroizing::new([0x11u8; 32]);
+        let key_b = Zeroizing::new([0x22u8; 32]);
+
+        let first_start = EncryptingAdapter::new(Arc::clone(&inner), key_a.clone());
+        verify_or_init_passphrase_canary(&first_start, &tmp, &storage_dir)
+            .await
+            .expect("an empty directory takes the canary this key writes");
+
+        let reopen_same_key = EncryptingAdapter::new(Arc::clone(&inner), key_a);
+        verify_or_init_passphrase_canary(&reopen_same_key, &tmp, &storage_dir)
+            .await
+            .expect("the writing key reopens the store");
+
+        let reopen_other_key = EncryptingAdapter::new(Arc::clone(&inner), key_b);
+        let err = verify_or_init_passphrase_canary(&reopen_other_key, &tmp, &storage_dir)
+            .await
+            .expect_err("a key that did not write the canary must be refused");
+        assert!(
+            matches!(err, ServerError::PassphraseMismatch(_)),
+            "expected ServerError::PassphraseMismatch, got: {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A directory that already holds state a previous key wrote, but carries
+    /// no canary record, fails closed instead of adopting the key it was handed.
+    ///
+    /// Two facts each independently mean "a previous key wrote here": an entry
+    /// in the protocol store, and the `identity.key` custody file. This test
+    /// drives each one on its own so neither arm can carry the other.
+    #[tokio::test]
+    async fn passphrase_canary_refuses_prior_state_with_no_canary_record() {
+        // Arm 1: the protocol store holds an entry.
+        let store_arm = std::env::temp_dir().join(format!(
+            "scp-test-canary-prior-store-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&store_arm);
+        let store_arm_storage = store_arm.join("storage");
+        std::fs::create_dir_all(&store_arm_storage).unwrap();
+        std::fs::write(store_arm_storage.join("some-earlier-value"), b"ciphertext").unwrap();
+
+        let store = EncryptingAdapter::new(InMemoryStorage::new(), Zeroizing::new([0x33u8; 32]));
+        let err = verify_or_init_passphrase_canary(&store, &store_arm, &store_arm_storage)
+            .await
+            .expect_err("a populated store with no canary must be refused");
+        assert!(
+            matches!(err, ServerError::PassphraseMismatch(_)),
+            "expected ServerError::PassphraseMismatch, got: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&store_arm);
+
+        // Arm 2: the protocol store is empty but the custody file exists.
+        let key_arm =
+            std::env::temp_dir().join(format!("scp-test-canary-prior-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&key_arm);
+        let key_arm_storage = key_arm.join("storage");
+        std::fs::create_dir_all(&key_arm_storage).unwrap();
+        std::fs::write(key_arm.join("identity.key"), b"custody bytes").unwrap();
+
+        let store = EncryptingAdapter::new(InMemoryStorage::new(), Zeroizing::new([0x44u8; 32]));
+        let err = verify_or_init_passphrase_canary(&store, &key_arm, &key_arm_storage)
+            .await
+            .expect_err("an existing custody file with no canary must be refused");
+        assert!(
+            matches!(err, ServerError::PassphraseMismatch(_)),
+            "expected ServerError::PassphraseMismatch, got: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&key_arm);
+    }
+
+    /// A first start interrupted after the salt sidecar landed and before the
+    /// canary record did resumes on the next start instead of bricking.
+    ///
+    /// The interrupted start wrote no protocol value and no custody file, so
+    /// adopting the key orphans nothing. Refusing here would leave an empty
+    /// data directory permanently unusable through `start_node_local`.
+    #[tokio::test]
+    async fn node_local_resumes_a_first_start_interrupted_before_the_canary() {
+        let tmp = std::env::temp_dir().join(format!(
+            "scp-test-node-canary-resume-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Reproduce the interrupted state exactly: a valid salt sidecar, an
+        // empty protocol store, no custody file, no canary record.
+        let storage_dir = tmp.join("storage");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let salt = load_or_init_storage_salt(&tmp, &storage_dir).unwrap();
+        assert_eq!(salt.len(), ARGON2_SALT_LEN);
+        assert!(tmp.join("storage.salt").is_file());
+
+        let node = start_node_local(&tmp, None, Some(test_passphrase()))
+            .await
+            .expect("an interrupted first start must resume, not brick");
+        node.shutdown();
+        drop(node);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Restarting `start_node_local` with the passphrase that initialized the
+    /// data directory succeeds, so the canary refuses no legitimate reopen.
+    #[tokio::test]
+    async fn node_local_reopens_with_the_initializing_passphrase() {
+        let tmp = std::env::temp_dir().join(format!(
+            "scp-test-node-canary-reopen-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let node = start_node_local(&tmp, None, Some(test_passphrase()))
+            .await
+            .unwrap();
+        let first_did = node.identity().did().to_owned();
+        node.shutdown();
+        drop(node);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let reopened = start_node_local(&tmp, None, Some(test_passphrase()))
+            .await
+            .expect("the initializing passphrase must reopen the data directory");
+        assert_eq!(
+            reopened.identity().did(),
+            first_did,
+            "the reopened node must carry the DID the first start persisted"
+        );
+        reopened.shutdown();
+        drop(reopened);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A passphrase other than the one that initialized the data directory is
+    /// refused before the node writes anything under the key it derived.
+    ///
+    /// Without the canary, Argon2id derives a second valid-looking key from the
+    /// wrong passphrase, `FileKeyCustody::new` accepts it without checking it,
+    /// and the node writes a second key regime into the same
+    /// `<data_dir>/storage/` — orphaning every value the first key wrote and
+    /// reporting no error to the operator.
+    #[tokio::test]
+    async fn node_local_refuses_a_passphrase_that_did_not_initialize_it() {
+        let tmp = std::env::temp_dir().join(format!(
+            "scp-test-node-canary-mismatch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let node = start_node_local(&tmp, None, Some(test_passphrase()))
+            .await
+            .unwrap();
+        node.shutdown();
+        drop(node);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let files_before = {
+            let mut files = Vec::new();
+            collect_files(&tmp.join("storage"), &mut files);
+            files.len()
+        };
+
+        let wrong = Zeroizing::new("a different passphrase".to_owned());
+        let err = start_node_local(&tmp, None, Some(wrong))
+            .await
+            .err()
+            .expect("a non-initializing passphrase must fail closed");
+        assert!(
+            matches!(err, ServerError::PassphraseMismatch(_)),
+            "expected ServerError::PassphraseMismatch, got: {err:?}"
+        );
+        assert_eq!(
+            err.user_message(),
+            "storage passphrase does not open this data directory"
+        );
+
+        let mut files_after = Vec::new();
+        collect_files(&tmp.join("storage"), &mut files_after);
+        assert_eq!(
+            files_after.len(),
+            files_before,
+            "the refused start must write no value under its own key"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

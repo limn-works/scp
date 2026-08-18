@@ -2497,17 +2497,18 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        let state = handle
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
-
-        if *state != "active" {
+        // Read the AUTHORITATIVE lifecycle state from the per-context
+        // supervisor actor. `PyContextHandle::state` is a per-handle cached
+        // cell that ADR-049 §10 documents as a best-effort snapshot: it lags
+        // a close committed elsewhere, and a gate reading the lagging value
+        // admits an operation on a closing context. Mirrors the NAPI
+        // (`live_context_state_str`) and UniFFI (`live_context_state`) gates.
+        let state = crate::runtime::live_context_state_str(bi, &handle.context_id)?;
+        if state != "active" {
             return Err(PyRuntimeError::new_err(format!(
                 "cannot join context in '{state}' state -- context must be 'active'"
             )));
         }
-        drop(state);
 
         // Parse optional spending UCAN JWT for AND-composition (join cost).
         let spending_ucan = spending_ucan_jwt
@@ -3117,17 +3118,18 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        let state = handle
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
-
-        if *state != "active" {
+        // Read the AUTHORITATIVE lifecycle state from the per-context
+        // supervisor actor. `PyContextHandle::state` is a per-handle cached
+        // cell that ADR-049 §10 documents as a best-effort snapshot: it lags
+        // a close committed elsewhere, and a gate reading the lagging value
+        // admits an operation on a closing context. Mirrors the NAPI
+        // (`live_context_state_str`) and UniFFI (`live_context_state`) gates.
+        let state = crate::runtime::live_context_state_str(bi, &handle.context_id)?;
+        if state != "active" {
             return Err(PyRuntimeError::new_err(format!(
                 "cannot leave context in '{state}' state -- context must be 'active'"
             )));
         }
-        drop(state);
 
         // Delegate leave to the shared ContextManager for membership tracking.
         {
@@ -3189,12 +3191,14 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        let mut state = handle
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
-
-        if *state != "active" {
+        // Read the AUTHORITATIVE lifecycle state from the per-context
+        // supervisor actor. `PyContextHandle::state` is a per-handle cached
+        // cell that ADR-049 §10 documents as a best-effort snapshot: it lags
+        // a close committed elsewhere, and a gate reading the lagging value
+        // admits an operation on a closing context. Mirrors the NAPI
+        // (`live_context_state_str`) and UniFFI (`live_context_state`) gates.
+        let state = crate::runtime::live_context_state_str(bi, &handle.context_id)?;
+        if state != "active" {
             return Err(PyRuntimeError::new_err(format!(
                 "cannot close context in '{state}' state -- context must be 'active'"
             )));
@@ -3300,10 +3304,17 @@ impl crate::scp::PyScp {
         // FFI bridge state → bridge outlet dispatch fails closed for this id.
         crate::runtime::remove_context(bi, &handle.context_id);
 
-        // Transition directly to "closed" (skipping "closing" for the bridge
-        // layer -- the full runtime will implement the cooperative closing window).
-        "closed".clone_into(&mut state);
-        drop(state);
+        // Update the handle's cached snapshot to "closed" (skipping "closing"
+        // for the bridge layer -- the full runtime will implement the
+        // cooperative closing window). This cell is descriptive only: the gate
+        // above read the supervisor actor, not this cell.
+        {
+            let mut cached = handle
+                .state
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
+            "closed".clone_into(&mut cached);
+        }
 
         // Bridge: drain the `SystemClose` event the close produced and
         // deliver it through the channel sender captured before FFI-state
@@ -3338,17 +3349,18 @@ impl crate::scp::PyScp {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
         validate::validate_did(identity_did)?;
-        let state = handle
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
-
-        if *state != "active" {
+        // Read the AUTHORITATIVE lifecycle state from the per-context
+        // supervisor actor. `PyContextHandle::state` is a per-handle cached
+        // cell that ADR-049 §10 documents as a best-effort snapshot: it lags
+        // a close committed elsewhere, and a gate reading the lagging value
+        // admits an operation on a closing context. Mirrors the NAPI
+        // (`live_context_state_str`) and UniFFI (`live_context_state`) gates.
+        let state = crate::runtime::live_context_state_str(bi, &handle.context_id)?;
+        if state != "active" {
             return Err(PyRuntimeError::new_err(format!(
                 "cannot send to context in '{state}' state -- context must be 'active'"
             )));
         }
-        drop(state);
 
         // Extract payload bytes: must be bytes or str.
         let payload_bytes: Vec<u8> = if payload.is_instance_of::<pyo3::types::PyBytes>() {
@@ -3442,17 +3454,18 @@ impl crate::scp::PyScp {
     pub fn context_receive(&self, handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, handle);
-        let state = handle
-            .state
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("context state lock is poisoned"))?;
-
-        if *state != "active" {
+        // Read the AUTHORITATIVE lifecycle state from the per-context
+        // supervisor actor. `PyContextHandle::state` is a per-handle cached
+        // cell that ADR-049 §10 documents as a best-effort snapshot: it lags
+        // a close committed elsewhere, and a gate reading the lagging value
+        // admits an operation on a closing context. Mirrors the NAPI
+        // (`live_context_state_str`) and UniFFI (`live_context_state`) gates.
+        let state = crate::runtime::live_context_state_str(bi, &handle.context_id)?;
+        if state != "active" {
             return Err(PyRuntimeError::new_err(format!(
                 "cannot receive from context in '{state}' state -- context must be 'active'"
             )));
         }
-        drop(state);
 
         let (tx, rx) = mpsc::channel::<PyMessage>(crate::runtime::RECEIVE_BUFFER_CAPACITY);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
@@ -6173,10 +6186,17 @@ mod tests {
         );
     }
 
-    /// Builds an active `PyContextHandle` for the given mode, driving the real
-    /// `PyContextParams` parse so the handle carries an authoritative
-    /// `ContextMode` (the same axis `context_join` branches on at the mode
-    /// gate). Used by the encrypted-join hard-fail coverage below.
+    /// Builds a `PyContextHandle` for the given mode over a context the
+    /// supervisor holds in `Active`, driving the real `PyContextParams` parse so
+    /// the handle carries an authoritative `ContextMode` (the same axis
+    /// `context_join` branches on at the mode gate). Used by the encrypted-join
+    /// hard-fail coverage below.
+    ///
+    /// The supervisor actor is mandatory: `context_join` reads the context's
+    /// lifecycle state from that actor through
+    /// `crate::runtime::live_context_state_str`, so a handle over a context the
+    /// supervisor does not hold is refused at the state gate and never reaches
+    /// the pseudonym-derivation seam these tests measure.
     fn active_handle_for_mode(
         bi: &crate::runtime::PyBridgeInstance,
         creator_did: &str,
@@ -6187,9 +6207,19 @@ mod tests {
             dict.set_item("mode", mode).unwrap();
             PyContextParams::from_py_dict(&dict).unwrap()
         });
-        let handle = PyContextHandle::new(bi, "0".repeat(64), creator_did.to_owned(), params);
-        *handle.state.lock().unwrap() = "active".to_owned();
-        handle
+        let context_id = format!("join-mode-gate-{}", uuid::Uuid::new_v4());
+        crate::runtime::init_context_manager_for_test(bi);
+        crate::runtime::register_context(bi, &context_id, creator_did, &[]).unwrap();
+        let sup = crate::runtime::supervisor(bi).unwrap();
+        let rt = crate::runtime().unwrap();
+        rt.block_on(sup.create_context(
+            context_id.clone(),
+            scp_core::context::ContextParams::default(),
+            scp_did::DID(creator_did.to_owned()),
+            None,
+        ))
+        .unwrap();
+        PyContextHandle::new(bi, context_id, creator_did.to_owned(), params)
     }
 
     /// §9.10.4 (PR-1744 main fix): an ENCRYPTED `context_join` HARD-FAILS
@@ -7519,8 +7549,13 @@ mod tests {
         ))
         .unwrap();
 
-        // Mint the handle off the same instance and mark it active so the
-        // close passes the bridge-side state gate and reaches the dispatch.
+        // Mint the handle off the same instance. `context_close` reads the
+        // context's lifecycle state from the supervisor actor created above,
+        // which answers `Active`, so the close passes the state gate and
+        // reaches the dispatch. Stamping the handle's own cached cell "active"
+        // is what makes the final assertion observable: a successful close
+        // overwrites that cell with "closed", so a cell still reading "active"
+        // proves the failed close returned before the transition.
         let handle =
             PyContextHandle::new(&bi, ctx_id.clone(), creator.to_owned(), default_params());
         "active".clone_into(&mut handle.state.lock().unwrap());
@@ -8548,6 +8583,186 @@ class SignOnlyCustody:
         assert_eq!(
             signer.message_signer().key().to_bytes(),
             active_key.to_bytes()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle gates read the supervisor actor, not the handle's cached cell
+    // -----------------------------------------------------------------------
+
+    /// Creates a context the supervisor holds in `Active`, closes it through
+    /// the supervisor, and returns a handle whose OWN cached `state` cell still
+    /// reads `"active"`.
+    ///
+    /// The divergence is the whole point: the supervisor answers `Closed` while
+    /// the handle answers `"active"`, so a gate that consults the cached cell
+    /// admits the operation and a gate that consults the actor refuses it.
+    fn closed_context_with_stale_active_handle() -> (
+        std::sync::Arc<crate::runtime::PyBridgeInstance>,
+        PyContextHandle,
+    ) {
+        crate::init_runtime().ok();
+        let creator = "did:key:z6MkStaleStateCreator";
+        let ctx_id = format!("stale-state-gate-{}", uuid::Uuid::new_v4());
+
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+
+        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+        let sup = Arc::clone(crate::runtime::supervisor(&bi).unwrap());
+        let rt = crate::runtime().unwrap();
+        let params = scp_core::context::ContextParams {
+            ceiling: vec![
+                scp_core::context::params::Capability::new("context:close")
+                    .expect("known capability"),
+            ],
+            ..scp_core::context::ContextParams::default()
+        };
+        rt.block_on(sup.create_context(
+            ctx_id.clone(),
+            params,
+            scp_did::DID(creator.to_owned()),
+            None,
+        ))
+        .unwrap();
+
+        // Close through a FIRST handle. That call writes "closed" into the
+        // first handle's cached cell and leaves the actor holding `Closed`.
+        let closing_handle =
+            PyContextHandle::new(&bi, ctx_id.clone(), creator.to_owned(), default_params());
+        "active".clone_into(&mut closing_handle.state.lock().unwrap());
+        scp.context_close(&closing_handle, creator)
+            .expect("the creator holds ContextClose, so the close must succeed");
+
+        // A SECOND handle over the same context never observed that close, so
+        // its cached cell still reads "active" — the stale value under test.
+        let stale_handle = PyContextHandle::new(&bi, ctx_id, creator.to_owned(), default_params());
+        "active".clone_into(&mut stale_handle.state.lock().unwrap());
+        assert_eq!(
+            *stale_handle.state.lock().unwrap(),
+            "active",
+            "the second handle must carry the stale cached value this test drives"
+        );
+        (bi, stale_handle)
+    }
+
+    /// Every `PyScp` entry point that refuses a non-active context reads the
+    /// supervisor actor, so a closed context is refused through a handle whose
+    /// cached cell still reads `"active"`.
+    ///
+    /// The five gates are `context_join`, `context_leave`, `context_close`,
+    /// `context_send`, and `context_receive` — the same set the NAPI bridge
+    /// gates through `runtime::live_context_state_str` and the `UniFFI` bridge
+    /// gates through `UniffiBridgeInstance::live_context_state`.
+    ///
+    /// REVERT LINE: each `let state = crate::runtime::live_context_state_str(bi, &handle.context_id)?;`
+    /// in this file. Reverting any one of them to `handle.state.lock()` makes
+    /// its sub-assertion below fail: the stale cell reads "active", so the gate
+    /// admits the operation on a context the supervisor already closed.
+    #[test]
+    fn lifecycle_gates_refuse_a_closed_context_through_a_stale_active_handle() {
+        let (bi, handle) = closed_context_with_stale_active_handle();
+        let scp = crate::scp::PyScp {
+            inner: std::sync::Arc::clone(&bi),
+        };
+        let member = "did:key:z6MkStaleStateMember";
+
+        // The supervisor's own word for the post-close state. `context_close`
+        // transitions the actor and the async finalize completes afterwards, so
+        // the actor answers "closing" or "closed" depending on where that
+        // finalize is. Both are non-active, and each gate quotes back exactly
+        // the state IT read — which is what distinguishes the actor's answer
+        // from the handle's cached "active".
+        let live = crate::runtime::live_context_state_str(&bi, handle.context_id()).unwrap();
+        assert_ne!(
+            live, "active",
+            "the closed context's actor must report a non-active state"
+        );
+        assert_eq!(
+            *handle.state.lock().unwrap(),
+            "active",
+            "the handle's cached cell must still read the stale \"active\""
+        );
+
+        let join = scp
+            .context_join(&handle, member, None)
+            .expect_err("join must refuse a closed context");
+        assert!(
+            join.to_string()
+                .contains(&format!("cannot join context in '{live}' state")),
+            "join must refuse on the live state '{live}', got: {join}"
+        );
+
+        let leave = scp
+            .context_leave(&handle, member)
+            .expect_err("leave must refuse a closed context");
+        assert!(
+            leave
+                .to_string()
+                .contains(&format!("cannot leave context in '{live}' state")),
+            "leave must refuse on the live state '{live}', got: {leave}"
+        );
+
+        let close = scp
+            .context_close(&handle, member)
+            .expect_err("close must refuse an already-closed context");
+        assert!(
+            close
+                .to_string()
+                .contains(&format!("cannot close context in '{live}' state")),
+            "close must refuse on the live state '{live}', got: {close}"
+        );
+
+        let receive = scp
+            .context_receive(&handle)
+            .err()
+            .expect("receive must refuse a closed context");
+        assert!(
+            receive
+                .to_string()
+                .contains(&format!("cannot receive from context in '{live}' state")),
+            "receive must refuse on the live state '{live}', got: {receive}"
+        );
+
+        let send = Python::with_gil(|py| {
+            let payload = pyo3::types::PyBytes::new(py, b"payload");
+            scp.context_send(&handle, member, payload.as_any(), None)
+                .expect_err("send must refuse a closed context")
+        });
+        assert!(
+            send.to_string()
+                .contains(&format!("cannot send to context in '{live}' state")),
+            "send must refuse on the live state '{live}', got: {send}"
+        );
+    }
+
+    /// A context the supervisor holds no actor for is refused, so each gate
+    /// fails CLOSED rather than reading the handle's cached `"active"`.
+    #[test]
+    fn lifecycle_gates_refuse_a_context_the_supervisor_does_not_hold() {
+        crate::init_runtime().ok();
+        let creator = "did:key:z6MkUnknownCtxCreator";
+        let scp = crate::scp::PyScp::new_in_memory_for_test();
+        let bi = std::sync::Arc::clone(&scp.inner);
+        // The supervisor exists but was never told about this context id.
+        crate::runtime::init_context_manager_for_test(&bi);
+
+        let handle = PyContextHandle::new(
+            &bi,
+            format!("never-created-{}", uuid::Uuid::new_v4()),
+            creator.to_owned(),
+            default_params(),
+        );
+        "active".clone_into(&mut handle.state.lock().unwrap());
+
+        let err = scp
+            .context_receive(&handle)
+            .err()
+            .expect("an unknown context must be refused");
+        assert!(
+            err.to_string()
+                .contains("cannot receive from context in 'unknown'"),
+            "an unknown context must read as 'unknown', got: {err}"
         );
     }
 }

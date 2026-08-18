@@ -1243,7 +1243,14 @@ pub(crate) fn enforce_caller_principal_binding(
 /// 1. **Validate inputs** (well-formed ids/dids/outlet-id; the nonce decodes to
 ///    `[u8; 16]`, fail-closed on a wrong length — a hex string is the one
 ///    canonical form).
-/// 2. **Caller-principal binding (§6.2.4 *Caller authentication*, normative).**
+/// 2. **Both contexts Active.** Read each participant's lifecycle state from
+///    its own supervisor actor and refuse a non-`Active` one before the
+///    caller-principal binding and before the saga drives, so a closing context
+///    is refused before the saga reserves any escrow. Codes: `SCP-OUTLET-6010`
+///    (caller axis) / `SCP-OUTLET-6011` (target axis). Matches the same gate in
+///    the `UniFFI` (`Scp::outlet_invoke_cross_context_saga`) and NAPI
+///    (`outlet_invoke_cross_context_saga_on`) exports.
+/// 3. **Caller-principal binding (§6.2.4 *Caller authentication*, normative).**
 ///    `caller_did` MUST be an identity THIS bridge instance hosts/authenticated
 ///    (present in the per-instance identity registry — the co-resident SDK
 ///    seam's channel-authenticated principal) AND a member of
@@ -1252,17 +1259,17 @@ pub(crate) fn enforce_caller_principal_binding(
 ///    unauthenticated caller). `nonce` / `timestamp` / `chain_depth` REMAIN
 ///    caller-supplied freshness fields (the target B validates them — they are
 ///    not minted here).
-/// 3. **Chokepoint (ADR-056).** Convert the caller/target id STRINGS → `[u8; 32]`
+/// 4. **Chokepoint (ADR-056).** Convert the caller/target id STRINGS → `[u8; 32]`
 ///    via `scp_core::context::state::context_id_to_bytes` (decode-64-hex-else-
 ///    SHA256). Raw `Sha256` of a 64-hex id would double-hash and miss the actor.
-/// 4. **Signing keys.** Resolve each co-resident context's Active Signing Key
+/// 5. **Signing keys.** Resolve each co-resident context's Active Signing Key
 ///    via the context's `creator_did`.
-/// 5. **Executor.** Snapshot the TARGET context's outlet handler under
+/// 6. **Executor.** Snapshot the TARGET context's outlet handler under
 ///    [`with_context`](crate::runtime::with_context) and build the
 ///    non-`Send`-safe `move |input| async {…}` closure the supervisor runs
 ///    supervisor-side at Commit-B (mirrors `outlet_invoke_impl`'s executor
 ///    pattern).
-/// 6. [`block_on`](tokio::runtime::Runtime::block_on) the producer; map the
+/// 7. [`block_on`](tokio::runtime::Runtime::block_on) the producer; map the
 ///    terminal `SagaError` → typed bridge error, `Committed` →
 ///    [`PySagaResult`].
 #[allow(clippy::too_many_arguments)] // Flat §6.2.4 envelope — agent-first named params, no builder.
@@ -1284,6 +1291,35 @@ fn outlet_invoke_cross_context_saga_impl(
     validate::validate_context_id(target_context_id)?;
     validate::validate_did(caller_did)?;
     validate::validate_outlet_id(outlet_registration_id)?;
+
+    // Both contexts MUST be Active before this money-moving saga touches any
+    // state. Read each participant's AUTHORITATIVE lifecycle state from its own
+    // supervisor actor: `PyContextHandle::state` is a per-handle cached cell
+    // that lags a close (the supervisor flips the context to `Closing` while
+    // the cache still reads `"active"` until the async finalize completes), and
+    // a saga admitted on the lagging value debits escrow for a closing context.
+    // Checked BEFORE the caller-principal binding and before the saga drives,
+    // so a non-active context is refused before any reservation.
+    let caller_state = crate::runtime::live_context_state_str(bi, caller_context_id)?;
+    if caller_state != "active" {
+        return Err(ScpPyError::ContextError {
+            message: format!(
+                "cannot start cross-context saga: caller context in '{caller_state}' state"
+            ),
+            code: codes::OUTLET_6010.to_owned(),
+        }
+        .into());
+    }
+    let target_state = crate::runtime::live_context_state_str(bi, target_context_id)?;
+    if target_state != "active" {
+        return Err(ScpPyError::ContextError {
+            message: format!(
+                "cannot start cross-context saga: target context in '{target_state}' state"
+            ),
+            code: codes::OUTLET_6011.to_owned(),
+        }
+        .into());
+    }
 
     let asserted_nonce = decode_asserted_nonce(asserted_nonce_hex)?;
     let input_json = py_dict_to_json(input)?;
@@ -3075,5 +3111,120 @@ mod tests {
             .unwrap();
         reg.set_item("schema", schema).unwrap();
         reg
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-context saga: both participants must be Active
+    // -----------------------------------------------------------------------
+
+    /// Registers FFI state and spawns a supervisor actor for `ctx_id`, leaving
+    /// the context `Active`. Returns nothing: the caller identifies the context
+    /// by the id it passed.
+    fn spawn_active_saga_context(bi: &PyBridgeInstance, ctx_id: &str, creator_did: &str) {
+        crate::runtime::register_ffi_state(bi, ctx_id, creator_did, &[]).unwrap();
+        let sup = std::sync::Arc::clone(crate::runtime::supervisor(bi).unwrap());
+        let rt = crate::runtime().unwrap();
+        rt.block_on(sup.create_context(
+            ctx_id.to_owned(),
+            scp_core::context::ContextParams::default(),
+            scp_did::DID(creator_did.to_owned()),
+            None,
+        ))
+        .expect("supervisor accepts the context");
+    }
+
+    /// `outlet_invoke_cross_context_saga` refuses a caller context the
+    /// supervisor does not hold, with `SCP-OUTLET-6010`, and a target context
+    /// the supervisor does not hold, with `SCP-OUTLET-6011`.
+    ///
+    /// The `UniFFI` bridge (`Scp::outlet_invoke_cross_context_saga`) and the
+    /// NAPI bridge (`outlet_invoke_cross_context_saga_on`) already carry these
+    /// two gates on the same two codes; this pins the `PyO3` reference bridge to
+    /// the same contract.
+    ///
+    /// The gates run BEFORE the caller-principal binding, so a refusal here
+    /// carries the outlet code rather than the `SCP-SAGA-13050` binding code —
+    /// which is what proves the state check ran first and the saga reserved
+    /// nothing.
+    ///
+    /// REVERT LINE: `let caller_state = crate::runtime::live_context_state_str(bi, caller_context_id)?;`
+    /// and its target-axis twin in `outlet_invoke_cross_context_saga_impl`.
+    /// Deleting either one makes its sub-assertion below fail: the call then
+    /// reaches the caller-principal binding and reports `SCP-SAGA-13050`.
+    #[test]
+    fn cross_context_saga_refuses_a_non_active_participant_on_each_axis() {
+        crate::init_runtime().ok();
+        let scp = default_scp();
+        let bi = &*scp.inner;
+        crate::runtime::init_context_manager_for_test(bi);
+
+        let creator = "did:dht:z6MkSagaStateGateCreator";
+        let caller_ctx = format!("saga-gate-caller-{}", uuid::Uuid::new_v4());
+        let target_ctx = format!("saga-gate-target-{}", uuid::Uuid::new_v4());
+        let absent_ctx = format!("saga-gate-absent-{}", uuid::Uuid::new_v4());
+
+        spawn_active_saga_context(bi, &caller_ctx, creator);
+        spawn_active_saga_context(bi, &target_ctx, creator);
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let input = PyDict::new(py);
+            input.set_item("a", 1).unwrap();
+
+            // Caller axis: the supervisor holds no actor for `absent_ctx`, so
+            // its live state reads "unknown" and the caller gate refuses.
+            let caller_err = outlet_invoke_cross_context_saga_impl(
+                bi,
+                &absent_ctx,
+                &target_ctx,
+                creator,
+                "some-outlet",
+                &input,
+                &"ab".repeat(16),
+                1_700_000_000_000,
+                1,
+                None,
+            )
+            .expect_err("a caller context the supervisor does not hold must be refused");
+            let caller_msg = caller_err.to_string();
+            assert!(
+                caller_msg.contains(codes::OUTLET_6010),
+                "caller axis must report {}, got: {caller_msg}",
+                codes::OUTLET_6010
+            );
+            assert!(
+                caller_msg.contains("caller context in 'unknown' state"),
+                "caller axis must quote the live state it read, got: {caller_msg}"
+            );
+
+            // Target axis: the caller context IS active, so the caller gate
+            // passes and the target gate is the one that refuses.
+            let target_err = outlet_invoke_cross_context_saga_impl(
+                bi,
+                &caller_ctx,
+                &absent_ctx,
+                creator,
+                "some-outlet",
+                &input,
+                &"ab".repeat(16),
+                1_700_000_000_000,
+                1,
+                None,
+            )
+            .expect_err("a target context the supervisor does not hold must be refused");
+            let target_msg = target_err.to_string();
+            assert!(
+                target_msg.contains(codes::OUTLET_6011),
+                "target axis must report {}, got: {target_msg}",
+                codes::OUTLET_6011
+            );
+            assert!(
+                target_msg.contains("target context in 'unknown' state"),
+                "target axis must quote the live state it read, got: {target_msg}"
+            );
+        });
+
+        crate::runtime::remove_context(bi, &caller_ctx);
+        crate::runtime::remove_context(bi, &target_ctx);
     }
 }

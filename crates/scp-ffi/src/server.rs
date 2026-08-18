@@ -47,6 +47,17 @@ fn server_err(e: ServerError) -> PyErr {
             }
             .into()
         }
+        ServerError::PassphraseMismatch(_) => {
+            // The caller supplied a passphrase that does not open this data
+            // directory, so the value is wrong rather than absent:
+            // SCP-VALID-7005 (invalid field value). Matches the UniFFI and
+            // NAPI bridges.
+            crate::error::ScpPyError::ValidationError {
+                message: e.user_message(),
+                code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
+            }
+            .into()
+        }
         _ => pyo3::exceptions::PyRuntimeError::new_err(e.user_message()),
     }
 }

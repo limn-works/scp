@@ -67,6 +67,14 @@ impl From<ServerError> for ScpError {
                     code: codes::VALID_7004.to_owned(),
                 }
             }
+            // The caller supplied a passphrase that does not open this data
+            // directory, so the value is wrong rather than absent:
+            // `SCP-VALID-7005` (invalid field value), not `SCP-VALID-7004`
+            // (missing required field).
+            ServerError::PassphraseMismatch(_) => Self::Validation {
+                msg: user_msg,
+                code: codes::VALID_7005.to_owned(),
+            },
             // The node's production DHT client could not be built (fail-closed,
             // ADR-062 §Decision 1) — surfaced as an identity/DID-resolution
             // error since the DHT backs DID resolution.

@@ -2665,6 +2665,13 @@ mod tests {
         creator_did: &str,
         with_outlet: bool,
     ) -> String {
+        // Spawning the supervisor actor below drives `sup.create_context` on
+        // the crate's shared tokio runtime. Python's module import calls
+        // `init_runtime`; a Rust `#[test]` process never imports the module, so
+        // this helper initializes the runtime itself. `init_runtime` is
+        // idempotent (`OnceLock`).
+        crate::init_runtime().expect("crate tokio runtime initializes");
+
         // Use a unique context ID to avoid collisions across parallel tests.
         let ctx_id = crate::types::generate_random_id("test-mcp");
         crate::runtime::register_context(bi, &ctx_id, creator_did, &[]).unwrap();
