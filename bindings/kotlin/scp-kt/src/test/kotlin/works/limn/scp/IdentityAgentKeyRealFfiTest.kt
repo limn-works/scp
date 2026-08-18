@@ -26,19 +26,23 @@
 
 package works.limn.scp
 
-import uniffi.scp.Identity
-import uniffi.scp.StorageConfig
-import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertNotEquals
-import kotlin.test.assertNotNull
-import kotlin.test.assertTrue
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import uniffi.scp.Identity
+import uniffi.scp.StorageConfig
+import works.limn.scp.bridge.CoroutineBridge
+import works.limn.scp.conformance.ConformanceStubBindings
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.seconds
 
 class IdentityAgentKeyRealFfiTest {
     companion object {
@@ -75,14 +79,24 @@ class IdentityAgentKeyRealFfiTest {
     @AfterEach
     fun tearDown() {
         if (!this::scp.isInitialized) return
-        // Teardown calls the UniFFI shutdown directly rather than
-        // `SCP.shutdown(bridge, timeout)`, because that overload needs a
-        // `CoroutineBridge`, and constructing one needs a `NativeBindings`
-        // that only the test source set implements. This suite must reach the
-        // five operations under test without a test double, so it takes the
-        // bridge-free teardown path.
-        runBlocking { scp.inner.shutdown(timeoutMillis = SHUTDOWN_TIMEOUT_MILLIS) }
+        // Teardown drives the SDK's own `SCP.shutdown(bridge, timeout)`, which
+        // records the shutdown on the instance and so keeps the finalizer from
+        // logging "garbage-collected without a shutdown() call" for every
+        // instance this suite creates. The `CoroutineBridge` that overload
+        // needs carries `ConformanceStubBindings` only to satisfy the
+        // signature: `shutdown` reaches the real cdylib through `inner`, and
+        // the five operations under test never touch this bridge.
+        // `PersistenceTest.bridge()` and `JoinFromWelcomeTest.shutdownBridge()`
+        // build the same teardown bridge for the same reason.
+        runBlocking { scp.shutdown(shutdownBridge(), SHUTDOWN_TIMEOUT) }
     }
+
+    private fun shutdownBridge(): CoroutineBridge =
+        CoroutineBridge(
+            nativeBindings = ConformanceStubBindings(),
+            ioDispatcher = Dispatchers.IO,
+            cpuDispatcher = Dispatchers.Default,
+        )
 
     private suspend fun freshIdentity(): Identity = scp.identityCreate(custody = "in_memory")
 
@@ -176,10 +190,11 @@ class IdentityAgentKeyRealFfiTest {
             val migrated = scp.identityMigrate(original)
 
             assertNotEquals(originalDid, migrated.did(), "identityMigrate must mint a new DID")
-            val rotationEvent = assertNotNull(
-                migrated.rotationEventJson(),
-                "spec §9.12 and ADR-003 §4b require a DidRotationEvent that the caller distributes to active contexts",
-            )
+            val rotationEvent =
+                assertNotNull(
+                    migrated.rotationEventJson(),
+                    "spec §9.12 and ADR-003 §4b require a DidRotationEvent the caller distributes to active contexts",
+                )
             assertTrue(
                 rotationEvent.contains(originalDid),
                 "the rotation event must name the OLD DID so peers can re-bind the membership",
@@ -188,5 +203,5 @@ class IdentityAgentKeyRealFfiTest {
     }
 }
 
-/** Teardown deadline for the UniFFI shutdown, in milliseconds. */
-private const val SHUTDOWN_TIMEOUT_MILLIS: ULong = 1_000u
+/** Teardown deadline for the SDK shutdown. */
+private val SHUTDOWN_TIMEOUT = 1.seconds

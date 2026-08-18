@@ -998,7 +998,13 @@ jobs:
         run: |
           # Set JNA library path to find the compiled Rust cdylib
           export LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          ./gradlew testDebugUnitTest
+          # Name both test tasks explicitly. `:scp-kt` is a kotlin-jvm module
+          # and declares `test`; only the Android library module declares
+          # `testDebugUnitTest`. Running the bare name `testDebugUnitTest`
+          # therefore ran the Android unit tests alone and skipped every
+          # `:scp-kt` test — including the real-FFI suites that exercise the
+          # compiled cdylib this job builds two steps above.
+          ./gradlew :scp-kt:test :scp-kt-android:testDebugUnitTest
 
   # ── Swift ──────────────────────────────────────────────────────────
   swift-lint:

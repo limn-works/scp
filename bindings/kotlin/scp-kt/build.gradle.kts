@@ -34,18 +34,15 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 }
 
-// Exclude RealFFITest from compilation when UniFFI bindings are not generated.
-// The test references `uniffi.scp.*` classes that only exist after running
-// `./scripts/generate-uniffi-kotlin.sh`. CI generates bindings before tests;
-// local dev can skip these tests safely.
+// Directory `generateUniffiBindings` writes the generated Kotlin bindings into.
+// `compileKotlin` depends on that task (see the bottom of this file), so every
+// compilation regenerates the bindings and no source-set exclusion is needed to
+// keep a `uniffi.scp.*` reference compiling. The exclusion that used to sit here
+// named `RealFFITest.kt`, a file the repository no longer contains, and it
+// gated on `listFiles()`, which lists only this directory's immediate children
+// while the generator writes `uniffi/scp/scp.kt` two levels down — so the
+// condition was already always false.
 val uniffiBindingsDir = file("src/main/kotlin/works/limn/scp/internal")
-val hasUniffiBindings = uniffiBindingsDir.exists() && uniffiBindingsDir.listFiles()?.any { it.extension == "kt" } == true
-
-if (!hasUniffiBindings) {
-    sourceSets.test {
-        kotlin.exclude("**/RealFFITest.kt")
-    }
-}
 
 tasks.test {
     useJUnitPlatform()
@@ -94,11 +91,20 @@ detekt {
 // contains `generateUniffiBindings`' output directory. Gradle rejects a task
 // that reads another task's declared output without an ordering edge, so
 // `./gradlew detekt test` failed with an implicit-dependency validation error
-// once the generated bindings existed on disk. `dependsOn` states the edge
-// Gradle asked for, and it matches the `compileKotlin` edge below: detekt
-// analyses the same regenerated tree the compiler sees.
+// once the generated bindings existed on disk.
+//
+// The edge is `mustRunAfter`, not `dependsOn`: detekt EXCLUDES the generated
+// tree on the next line, so detekt never analyses what the generator writes
+// and needs no generated file to run. `dependsOn` would force
+// `generateUniffiBindings` — and the `cargo build` inside
+// `scripts/generate-uniffi-kotlin.sh` — onto every `./gradlew :scp-kt:detekt`,
+// including the `kotlin-lint` job in `.github/workflows/ci.yml`, which
+// installs no Rust toolchain and caches no cargo target directory.
+// `mustRunAfter` states only the ordering Gradle asked for: when both tasks
+// are in one build, detekt runs after the generator; when detekt runs alone,
+// no Rust is compiled.
 tasks.withType<io.gitlab.arturbosch.detekt.Detekt>().configureEach {
-    dependsOn("generateUniffiBindings")
+    mustRunAfter("generateUniffiBindings")
     exclude("**/internal/uniffi/**")
 }
 
@@ -113,12 +119,15 @@ ktlint {
 }
 
 // Every ktlint task reads the same main source tree detekt reads, so Gradle
-// rejects it for the same missing ordering edge. Name-matching covers the
-// check and format tasks the plugin generates per source set
-// (`runKtlintCheckOverMainSourceSet`, `runKtlintFormatOverTestSourceSet`, and
-// their siblings) without naming each one.
+// rejects it for the same missing ordering edge. The `ktlint` filter above
+// drops the generated tree from every ktlint task, so these tasks also need
+// ordering rather than execution — `mustRunAfter` for the same reason detekt
+// uses it. Name-matching covers the check and format tasks the plugin
+// generates per source set (`runKtlintCheckOverMainSourceSet`,
+// `runKtlintFormatOverTestSourceSet`, and their siblings) without naming
+// each one.
 tasks.matching { it.name.startsWith("runKtlint") }.configureEach {
-    dependsOn("generateUniffiBindings")
+    mustRunAfter("generateUniffiBindings")
 }
 
 // ---------------------------------------------------------------------------
