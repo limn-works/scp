@@ -1300,6 +1300,20 @@ export class SCP {
     }
   }
 
+  /**
+   * Resolves a human-readable address (spec section 22.8).
+   *
+   * Returns a JSON string holding one object with two keys. `resolutions`
+   * carries the AddressResolution entries sorted by trust level, highest
+   * first. `unavailable_layers` carries every layer nobody queried, each with
+   * a `layer` name and a `reason`. Both keys are always present.
+   *
+   * Read `unavailable_layers` before acting on the first entry in
+   * `resolutions`: section 22.8.2 ranks by trust, so a layer nobody queried
+   * may hold a binding that outranks every entry there. This binding
+   * configures no domain, so an unscoped address always reports the domain
+   * layer.
+   */
   async addressResolve(
     ownerDid: string,
     address: string,

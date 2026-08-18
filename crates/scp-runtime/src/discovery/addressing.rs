@@ -369,11 +369,13 @@ impl AddressResolver {
     /// addresses, all layers are searched per §22.8.2.
     ///
     /// The returned [`AddressResolutionOutcome`] carries both the bindings
-    /// resolution found and every layer that answered [`LayerUnavailable`]
-    /// rather than a result vector. A caller that acts on the top-ranked
-    /// binding reads `unavailable_layers` to learn whether a higher-trust
-    /// layer went unqueried, because §22.8.2 ranks by trust and an unqueried
-    /// higher-trust layer may hold a different binding.
+    /// resolution found and every layer nobody read — one that answered
+    /// [`LayerUnavailable`] rather than a result vector, and one that
+    /// `known_contexts` or `known_domains` named nothing to query for. A
+    /// caller that acts on the top-ranked binding reads `unavailable_layers`
+    /// to learn whether a higher-trust layer went unread, because §22.8.2
+    /// ranks by trust and an unread higher-trust layer may hold a different
+    /// binding.
     ///
     /// # Arguments
     ///
@@ -388,11 +390,13 @@ impl AddressResolver {
     ///
     /// Returns [`AddressingError::EmptyAddress`] and its sibling parse
     /// variants when `address` is malformed. Returns
-    /// [`AddressingError::NotFound`] when every consulted layer answered and
-    /// none held a binding. Returns [`AddressingError::LayersUnavailable`]
-    /// when no layer held a binding and `handle_querier` could not query at
-    /// least one layer, which tells a caller that a capability is missing
-    /// rather than a binding.
+    /// [`AddressingError::NotFound`] when a read happened against every layer
+    /// this address reaches and none held a binding. Returns
+    /// [`AddressingError::LayersUnavailable`] when no layer held a binding and
+    /// nobody read at least one layer — because `handle_querier` reaches no
+    /// such layer, or because `known_contexts` or `known_domains` named
+    /// nothing to query there — which tells a caller that a capability is
+    /// missing rather than a binding.
     #[allow(clippy::future_not_send)] // async trait methods don't support Send bounds
     pub async fn resolve<P, H>(
         &mut self,
@@ -544,11 +548,20 @@ pub trait HandleQuerier {
 
 /// Queries every handle layer that `parsed` reaches, per §22.8.2.
 ///
-/// Returns the bindings those layers held, paired with every layer that
-/// answered [`LayerUnavailable`] rather than a result vector. A caller
-/// separates "this layer held no binding" from "nobody queried this layer" by
-/// reading the second vector. Petname resolution happens before this call,
-/// because §22.8.2 step 1 stops at a petname hit.
+/// Returns the bindings those layers held, paired with every layer nobody
+/// queried. A caller separates "this layer held no binding" from "nobody
+/// queried this layer" by reading the second vector. Petname resolution
+/// happens before this call, because §22.8.2 step 1 stops at a petname hit.
+///
+/// Two conditions put a layer in the second vector, and this function records
+/// both, because both leave a caller in the same position: nobody read that
+/// layer, so a binding may sit there unseen.
+/// - `handle_querier` answered [`LayerUnavailable`], which says this
+///   deployment reaches no such layer at all.
+/// - `known_contexts` or `known_domains` named nothing for that layer, so this
+///   function issued no query. `known_domains` is empty on all three FFI
+///   bridges, so an unscoped resolution through a bridge always reports the
+///   domain layer here.
 #[allow(clippy::future_not_send)] // async trait methods don't support Send bounds
 async fn query_handle_layers<H>(
     parsed: &ParsedAddress,
@@ -570,6 +583,20 @@ where
                         .lookup_handle(context_id, local_part, None)
                         .await,
                     &mut results,
+                    &mut unavailable,
+                );
+            } else {
+                // The caller configured no context for this scope, so this
+                // resolver queried no handle registry. Returning nothing here
+                // would tell a caller that a registry answered and held no
+                // entry for the handle.
+                record_unavailable(
+                    LayerUnavailable {
+                        layer: ResolutionLayer::HandleRegistry,
+                        reason: format!(
+                            "no context is configured for scope '{scope}', so no handle registry was queried"
+                        ),
+                    },
                     &mut unavailable,
                 );
             }
@@ -604,6 +631,15 @@ where
         }
         ParsedAddress::Unscoped { name } => {
             // Every context with discovery outlets (§22.8.2 step 2).
+            if known_contexts.is_empty() {
+                record_unavailable(
+                    LayerUnavailable {
+                        layer: ResolutionLayer::HandleRegistry,
+                        reason: "no context with discovery outlets is configured, so no handle registry was queried".to_owned(),
+                    },
+                    &mut unavailable,
+                );
+            }
             for context_id in known_contexts.values() {
                 record_layer_answer(
                     handle_querier.lookup_handle(context_id, name, None).await,
@@ -613,6 +649,17 @@ where
             }
 
             // Each configured domain (§22.8.2 step 2a).
+            if known_domains.is_empty() {
+                record_unavailable(
+                    LayerUnavailable {
+                        layer: ResolutionLayer::Domain,
+                        reason:
+                            "no domain is configured, so no .well-known/scp document was fetched"
+                                .to_owned(),
+                    },
+                    &mut unavailable,
+                );
+            }
             for domain in known_domains {
                 record_layer_answer(
                     handle_querier.lookup_domain_handle(domain, name).await,
@@ -635,10 +682,6 @@ where
 
 /// Pushes one layer's answer onto `results`, or that layer's unavailability
 /// onto `unavailable`.
-///
-/// A caller that queries one layer once per domain or once per context still
-/// learns of one absent capability, so this records each distinct
-/// [`LayerUnavailable`] once.
 fn record_layer_answer(
     answer: Result<Vec<AddressResolution>, LayerUnavailable>,
     results: &mut Vec<AddressResolution>,
@@ -646,11 +689,21 @@ fn record_layer_answer(
 ) {
     match answer {
         Ok(found) => results.extend(found),
-        Err(missing) => {
-            if !unavailable.contains(&missing) {
-                unavailable.push(missing);
-            }
-        }
+        Err(missing) => record_unavailable(missing, unavailable),
+    }
+}
+
+/// Records one unqueried layer, skipping a duplicate of an entry already
+/// recorded.
+///
+/// Two entries are duplicates when they carry the same layer AND the same
+/// reason, which is how querying one layer once per configured domain still
+/// produces one entry. Two queries against the same layer that fail for
+/// different reasons — one context holds no registry while another holds one —
+/// stay as two entries, because each names a different thing nobody queried.
+fn record_unavailable(missing: LayerUnavailable, unavailable: &mut Vec<LayerUnavailable>) {
+    if !unavailable.contains(&missing) {
+        unavailable.push(missing);
     }
 }
 
@@ -1154,6 +1207,10 @@ mod tests {
         /// invokes no `attestation_lookup` outlet and fetches no
         /// `.well-known/scp` document.
         unavailable_layers: Vec<ResolutionLayer>,
+        /// Contexts this querier holds no handle registry for, modelling
+        /// `LocalHandleQuerier`, whose reason names the context it found no
+        /// registry for.
+        unavailable_context_registries: Vec<String>,
     }
 
     impl TestHandleQuerier {
@@ -1163,6 +1220,7 @@ mod tests {
                 domain_handles: HashMap::new(),
                 attestation_handles: HashMap::new(),
                 unavailable_layers: Vec::new(),
+                unavailable_context_registries: Vec::new(),
             }
         }
 
@@ -1170,6 +1228,15 @@ mod tests {
         /// [`LayerUnavailable`].
         fn mark_unavailable(&mut self, layer: ResolutionLayer) {
             self.unavailable_layers.push(layer);
+        }
+
+        /// Marks one context's handle registry unreachable, so a lookup
+        /// against that context answers with a [`LayerUnavailable`] whose
+        /// reason names it. Two such contexts therefore produce two distinct
+        /// entries under one layer.
+        fn mark_context_registry_unavailable(&mut self, context_id: &str) {
+            self.unavailable_context_registries
+                .push(context_id.to_owned());
         }
 
         /// Answers with [`LayerUnavailable`] when a caller marked `layer`
@@ -1247,6 +1314,12 @@ mod tests {
             _type_filter: Option<AddressType>,
         ) -> Result<Vec<AddressResolution>, LayerUnavailable> {
             self.availability(&ResolutionLayer::HandleRegistry)?;
+            if self.unavailable_context_registries.contains(context_id) {
+                return Err(LayerUnavailable {
+                    layer: ResolutionLayer::HandleRegistry,
+                    reason: format!("no local handle registry for context {context_id}"),
+                });
+            }
             Ok(self
                 .discovery_handles
                 .get(&(context_id.clone(), handle.to_owned()))
@@ -1608,11 +1681,17 @@ mod tests {
             .expect("the cache holds the first answer");
 
         assert_eq!(first.unavailable_layers, second.unavailable_layers);
-        assert_eq!(second.unavailable_layers.len(), 1);
-        assert_eq!(
-            second.unavailable_layers[0].layer,
-            ResolutionLayer::Attestation
-        );
+        // The querier reaches no attestation index, and this call configured
+        // no domain, so both layers went unqueried on the first answer and the
+        // cached second answer repeats both.
+        assert_eq!(second.unavailable_layers.len(), 2);
+        let layers: Vec<ResolutionLayer> = second
+            .unavailable_layers
+            .iter()
+            .map(|entry| entry.layer.clone())
+            .collect();
+        assert!(layers.contains(&ResolutionLayer::Attestation));
+        assert!(layers.contains(&ResolutionLayer::Domain));
     }
 
     #[tokio::test]
@@ -1645,8 +1724,39 @@ mod tests {
         ));
     }
 
+    /// A scoped address whose scope IS configured, and whose handle registry
+    /// answered and held no entry, reports [`AddressingError::NotFound`]: every
+    /// layer this address reaches answered.
     #[tokio::test]
     async fn resolve_not_found_returns_error() {
+        let petnames = TestPetnameStore::new();
+        let querier = TestHandleQuerier::new();
+        let mut known = HashMap::new();
+        known.insert("nowhere".to_owned(), "ctx-nowhere".to_owned());
+
+        let mut resolver = AddressResolver::new();
+        let result = resolver
+            .resolve(
+                "nonexistent@nowhere",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_clock::SystemClock,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AddressingError::NotFound(_))),
+            "expected NotFound, got {result:?}"
+        );
+    }
+
+    /// A scoped address whose scope is configured NOWHERE reaches no handle
+    /// registry, so resolution reports the handle-registry layer as unqueried
+    /// rather than reporting that a registry answered and held no entry.
+    #[tokio::test]
+    async fn resolve_discovery_handle_reports_the_layer_when_its_scope_is_unconfigured() {
         let petnames = TestPetnameStore::new();
         let querier = TestHandleQuerier::new();
         let known = HashMap::new();
@@ -1663,7 +1773,168 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(AddressingError::NotFound(_))));
+        let Err(AddressingError::LayersUnavailable { address, layers }) = result else {
+            panic!("expected LayersUnavailable, got {result:?}");
+        };
+        assert_eq!(address, "nonexistent@nowhere");
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].layer, ResolutionLayer::HandleRegistry);
+        assert!(
+            layers[0].reason.contains("nowhere"),
+            "the reason names the scope nobody configured: {}",
+            layers[0].reason
+        );
+    }
+
+    /// An unscoped resolution with no configured domain fetched no
+    /// `.well-known/scp` document, so it reports the domain layer even though
+    /// its querier reaches that layer. All three FFI bridges pass an empty
+    /// domain list, so this is what they report.
+    #[tokio::test]
+    async fn resolve_unscoped_reports_the_domain_layer_when_no_domain_is_configured() {
+        let petnames = TestPetnameStore::new();
+        let mut querier = TestHandleQuerier::new();
+        querier.add_discovery_handle("ctx-cooking", "alice", "did:dht:zAlice", "cooking");
+        querier.add_attestation_handle("alice", "did:dht:zAlice");
+
+        let mut known = HashMap::new();
+        known.insert("cooking".to_owned(), "ctx-cooking".to_owned());
+
+        let mut resolver = AddressResolver::new();
+        let outcome = resolver
+            .resolve(
+                "alice",
+                &petnames,
+                &querier,
+                &known,
+                &[],
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("the handle registry holds a binding for alice");
+
+        assert_eq!(outcome.unavailable_layers.len(), 1);
+        assert_eq!(outcome.unavailable_layers[0].layer, ResolutionLayer::Domain);
+        assert!(
+            outcome.unavailable_layers[0].reason.contains("no domain"),
+            "the reason names the missing configuration: {}",
+            outcome.unavailable_layers[0].reason
+        );
+    }
+
+    /// An unscoped resolution that knows no context with discovery outlets
+    /// queried no handle registry, and says so.
+    #[tokio::test]
+    async fn resolve_unscoped_reports_the_handle_registry_when_no_context_is_configured() {
+        let petnames = TestPetnameStore::new();
+        let mut querier = TestHandleQuerier::new();
+        querier.add_domain_handle("example.com", "alice", "did:dht:zAlice");
+
+        let known = HashMap::new();
+
+        let mut resolver = AddressResolver::new();
+        let outcome = resolver
+            .resolve(
+                "alice",
+                &petnames,
+                &querier,
+                &known,
+                &["example.com"],
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("the domain handle map holds a binding for alice");
+
+        let layers: Vec<ResolutionLayer> = outcome
+            .unavailable_layers
+            .iter()
+            .map(|entry| entry.layer.clone())
+            .collect();
+        assert!(
+            layers.contains(&ResolutionLayer::HandleRegistry),
+            "expected the handle-registry layer, got {layers:?}"
+        );
+    }
+
+    /// One layer produces one entry per distinct reason. Two contexts whose
+    /// registries this deployment reaches for neither name two different
+    /// things nobody queried, so collapsing them to one entry would drop the
+    /// name of one context.
+    #[tokio::test]
+    async fn resolve_records_one_entry_per_distinct_reason_under_one_layer() {
+        let petnames = TestPetnameStore::new();
+        let mut querier = TestHandleQuerier::new();
+        querier.add_discovery_handle("ctx-found", "alice", "did:dht:zAlice", "found");
+        querier.mark_context_registry_unavailable("ctx-absent-a");
+        querier.mark_context_registry_unavailable("ctx-absent-b");
+
+        let mut known = HashMap::new();
+        known.insert("found".to_owned(), "ctx-found".to_owned());
+        known.insert("absent-a".to_owned(), "ctx-absent-a".to_owned());
+        known.insert("absent-b".to_owned(), "ctx-absent-b".to_owned());
+
+        let mut resolver = AddressResolver::new();
+        let outcome = resolver
+            .resolve(
+                "alice",
+                &petnames,
+                &querier,
+                &known,
+                &["example.com", "example.org"],
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("ctx-found holds a binding for alice");
+
+        let registry_reasons: Vec<&str> = outcome
+            .unavailable_layers
+            .iter()
+            .filter(|entry| entry.layer == ResolutionLayer::HandleRegistry)
+            .map(|entry| entry.reason.as_str())
+            .collect();
+        assert_eq!(
+            registry_reasons.len(),
+            2,
+            "two unreachable registries name two things, got {registry_reasons:?}"
+        );
+        assert!(registry_reasons.iter().any(|r| r.contains("ctx-absent-a")));
+        assert!(registry_reasons.iter().any(|r| r.contains("ctx-absent-b")));
+    }
+
+    /// Two configured domains against one unreachable domain layer produce one
+    /// entry, because both queries went unmade for the same reason.
+    #[tokio::test]
+    async fn resolve_records_one_entry_for_two_domains_that_share_a_reason() {
+        let petnames = TestPetnameStore::new();
+        let mut querier = TestHandleQuerier::new();
+        querier.add_discovery_handle("ctx-cooking", "alice", "did:dht:zAlice", "cooking");
+        querier.mark_unavailable(ResolutionLayer::Domain);
+
+        let mut known = HashMap::new();
+        known.insert("cooking".to_owned(), "ctx-cooking".to_owned());
+
+        let mut resolver = AddressResolver::new();
+        let outcome = resolver
+            .resolve(
+                "alice",
+                &petnames,
+                &querier,
+                &known,
+                &["example.com", "example.org"],
+                &scp_clock::SystemClock,
+            )
+            .await
+            .expect("the handle registry holds a binding for alice");
+
+        let domain_entries = outcome
+            .unavailable_layers
+            .iter()
+            .filter(|entry| entry.layer == ResolutionLayer::Domain)
+            .count();
+        assert_eq!(
+            domain_entries, 1,
+            "two domains sharing one reason collapse to one entry"
+        );
     }
 
     /// A querier that reaches no attestation index reports

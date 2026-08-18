@@ -326,11 +326,22 @@ pub fn handle_entry_to_resolution(
 /// [`AddressingError::LayersUnavailable`] carries its own code, because a
 /// caller acts differently on "this build queries no attestation index" than
 /// on "no DID registered that handle".
+///
+/// The match names every variant and uses no wildcard arm, so adding a variant
+/// to [`AddressingError`] stops this crate compiling until somebody assigns
+/// that variant a code. A wildcard arm would instead hand a new "capability
+/// absent" variant the "binding absent" code and report nothing.
 #[must_use]
 pub const fn address_resolution_error_code(error: &AddressingError) -> &'static str {
     match error {
         AddressingError::LayersUnavailable { .. } => crate::error_codes::VALID_7136,
-        _ => crate::error_codes::VALID_7091,
+        AddressingError::EmptyAddress
+        | AddressingError::LocalPartTooLong
+        | AddressingError::InvalidLocalPartCharacters
+        | AddressingError::InvalidLocalPartBoundary
+        | AddressingError::ConsecutivePeriods
+        | AddressingError::NotFound(_)
+        | AddressingError::ResolutionFailed { .. } => crate::error_codes::VALID_7091,
     }
 }
 
@@ -708,6 +719,60 @@ mod tests {
             assert_eq!(
                 resolution_path_to_json(&path)["layer"],
                 layer_unavailable_to_json(&unavailable)["layer"]
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // address_resolution_error_code
+    // -----------------------------------------------------------------------
+
+    /// A caller distinguishes "a capability is absent" from "a binding is
+    /// absent" by the code alone, so the two failures never share one code.
+    #[test]
+    fn layers_unavailable_and_not_found_carry_different_codes() {
+        let unavailable = AddressingError::LayersUnavailable {
+            address: "alice".to_owned(),
+            layers: vec![LayerUnavailable {
+                layer: ResolutionLayer::Attestation,
+                reason: "no attestation_lookup outlet".to_owned(),
+            }],
+        };
+        let not_found = AddressingError::NotFound("alice".to_owned());
+
+        assert_eq!(
+            address_resolution_error_code(&unavailable),
+            crate::error_codes::VALID_7136
+        );
+        assert_eq!(
+            address_resolution_error_code(&not_found),
+            crate::error_codes::VALID_7091
+        );
+        assert_ne!(
+            address_resolution_error_code(&unavailable),
+            address_resolution_error_code(&not_found)
+        );
+    }
+
+    /// Every parse failure keeps the address-resolution code the three bridges
+    /// reported before `LayersUnavailable` existed.
+    #[test]
+    fn parse_failures_keep_the_address_resolution_code() {
+        for error in [
+            AddressingError::EmptyAddress,
+            AddressingError::LocalPartTooLong,
+            AddressingError::InvalidLocalPartCharacters,
+            AddressingError::InvalidLocalPartBoundary,
+            AddressingError::ConsecutivePeriods,
+            AddressingError::ResolutionFailed {
+                layer: "Domain".to_owned(),
+                message: "fetch failed".to_owned(),
+            },
+        ] {
+            assert_eq!(
+                address_resolution_error_code(&error),
+                crate::error_codes::VALID_7091,
+                "unexpected code for {error:?}"
             );
         }
     }

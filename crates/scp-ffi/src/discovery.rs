@@ -1726,20 +1726,39 @@ mod tests {
             "HandleRegistryVerified"
         );
 
-        // §22.8.2 step 2a queries one domain per configured domain, and this
-        // bridge configures none, so resolution never reaches the domain
-        // layer. It does reach the attestation layer, which answers
-        // unavailable because this bridge invokes no `attestation_lookup`
-        // outlet.
+        // This bridge invokes no `attestation_lookup` outlet, so nobody read
+        // an attestation index. §22.8.2 step 2a queries one domain per
+        // configured domain and this bridge configures none, so nobody read a
+        // `.well-known/scp` document either. Both layers therefore appear
+        // here, which is what §22.8.2a requires: a caller acting on the
+        // handle-registry binding learns that two other layers went unread.
         let unavailable = parsed["unavailable_layers"].as_array().unwrap();
-        assert_eq!(unavailable.len(), 1);
-        assert_eq!(unavailable[0]["layer"], "Attestation");
+        let layers: Vec<&str> = unavailable
+            .iter()
+            .map(|entry| entry["layer"].as_str().unwrap())
+            .collect();
+        assert_eq!(unavailable.len(), 2, "got layers: {layers:?}");
+        assert!(layers.contains(&"Attestation"), "got layers: {layers:?}");
+        assert!(layers.contains(&"Domain"), "got layers: {layers:?}");
+
+        let attestation_reason = unavailable
+            .iter()
+            .find(|entry| entry["layer"] == "Attestation")
+            .and_then(|entry| entry["reason"].as_str())
+            .expect("the attestation entry carries a reason");
         assert!(
-            unavailable[0]["reason"]
-                .as_str()
-                .unwrap()
-                .contains("attestation_lookup"),
-            "the reason must name the outlet this bridge never invokes"
+            attestation_reason.contains("attestation_lookup"),
+            "the reason must name the outlet this bridge never invokes: {attestation_reason}"
+        );
+
+        let domain_reason = unavailable
+            .iter()
+            .find(|entry| entry["layer"] == "Domain")
+            .and_then(|entry| entry["reason"].as_str())
+            .expect("the domain entry carries a reason");
+        assert!(
+            domain_reason.contains("no domain"),
+            "the reason must name the missing configuration: {domain_reason}"
         );
     }
 

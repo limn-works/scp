@@ -578,7 +578,9 @@ class DiscoveryBridge internal constructor(
  * answered may hold a binding that outranks every binding in [resolutions].
  *
  * @property resolutions AddressResolution JSON elements, highest trust first.
- * @property unavailableLayers Layers this build could not query, each once.
+ * @property unavailableLayers Every layer nobody queried, each distinct
+ *   layer-and-reason pair once. One layer name appears more than once when two
+ *   queries against it went unmade for different reasons.
  */
 data class AddressResolutionOutcome(
     val resolutions: List<JsonElement>,
@@ -589,11 +591,12 @@ data class AddressResolutionOutcome(
 }
 
 /**
- * A resolution layer this build cannot query at all.
+ * A resolution layer nobody queried — either this build reaches no such layer,
+ * or its configuration named nothing to query there.
  *
  * @property layer Layer name: `Petname`, `HandleRegistry`, `Attestation`, `Domain`,
  *   or `MultiLayerCorroborated`.
- * @property reason Why this build reaches no such layer.
+ * @property reason Why nobody queried that layer.
  */
 data class UnavailableResolutionLayer(
     val layer: String,

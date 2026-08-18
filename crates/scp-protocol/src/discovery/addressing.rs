@@ -169,8 +169,7 @@ impl AddressResolution {
     }
 }
 
-/// A resolution layer that a [`crate::discovery::AddressResolution`] producer
-/// cannot query at all.
+/// A resolution layer that nobody queried.
 ///
 /// A querier returns this value instead of an empty result vector when that
 /// querier implements no path to a layer. An empty vector and this error carry
@@ -180,6 +179,12 @@ impl AddressResolution {
 /// normative outlet name, so a bridge that never invokes `attestation_lookup`
 /// reports [`ResolutionLayer::Attestation`] as unavailable rather than
 /// reporting zero results.
+///
+/// A resolver also raises this value for itself, without calling a querier,
+/// when its own configuration names nothing for a layer — no context for the
+/// scope an address carries, no context with discovery outlets at all, or no
+/// domain to fetch `.well-known/scp` from. Silence there would claim the same
+/// false thing an empty vector claims.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{layer:?} resolution layer is unavailable: {reason}")]
 pub struct LayerUnavailable {
@@ -192,8 +197,9 @@ pub struct LayerUnavailable {
 /// What one address resolution found, plus which layers never answered.
 ///
 /// A caller reads `resolutions` to learn which bindings resolution found, and
-/// reads `unavailable_layers` to learn which layers this deployment could not
-/// query. A resolution that found one `HandleRegistry` binding while the
+/// reads `unavailable_layers` to learn which layers nobody read — because this
+/// deployment reaches no such layer, or because its configuration named
+/// nothing to query there. A resolution that found one `HandleRegistry` binding while the
 /// attestation layer and the domain layer went unqueried carries a different
 /// meaning from one that found the same binding after every layer answered:
 /// in the first case a higher-trust layer may hold a different binding that
@@ -209,16 +215,24 @@ pub struct AddressResolutionOutcome {
     /// Never empty: resolution returns [`AddressingError::NotFound`] or
     /// [`AddressingError::LayersUnavailable`] instead of an empty vector.
     pub resolutions: Vec<AddressResolution>,
-    /// Layers that answered [`LayerUnavailable`] rather than a result vector,
-    /// each layer recorded once however many times resolution queried it.
+    /// Every layer nobody queried, each distinct [`LayerUnavailable`] recorded
+    /// once.
+    ///
+    /// Two entries are the same entry when they carry the same layer AND the
+    /// same reason, so querying one layer once per configured domain still
+    /// yields one entry. One layer appears more than once when two queries
+    /// against it went unmade for different reasons — one context holds no
+    /// handle registry while another holds one — because each entry names a
+    /// different thing nobody queried.
     ///
     /// Empty when every layer resolution consulted answered.
     pub unavailable_layers: Vec<LayerUnavailable>,
 }
 
 impl AddressResolutionOutcome {
-    /// Returns `true` when every layer resolution consulted answered, so no
-    /// binding escaped the search for want of a capability.
+    /// Returns `true` when a read happened against every layer this resolution
+    /// consulted, so no binding escaped the search for want of a capability or
+    /// for want of a configured context or domain.
     #[must_use]
     pub const fn every_layer_answered(&self) -> bool {
         self.unavailable_layers.is_empty()
