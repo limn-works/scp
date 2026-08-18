@@ -5726,6 +5726,7 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "tower",
  "x25519-dalek 2.0.1",
+ "z-base-32",
  "zeroize",
 ]
 

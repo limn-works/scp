@@ -395,12 +395,11 @@ fn install_seedable_resolver(
     bi: &std::sync::Arc<NapiBridgeInstance>,
 ) -> std::sync::Arc<scp_dht::InMemoryDhtClient> {
     let dht_client = std::sync::Arc::new(scp_dht::InMemoryDhtClient::new());
-    let resolver = std::sync::Arc::new(scp_identity::DualLayerResolver::new(
-        std::sync::Arc::new(scp_identity::NoOpRelayQuerier),
+    let resolver = scp_ffi_common::build_production_did_resolver(
+        bi.core.relay_querier(),
         std::sync::Arc::clone(&dht_client),
         std::sync::Arc::new(scp_identity::DidCache::new()),
-        Vec::new(),
-    ));
+    );
     crate::runtime::init_did_resolver(bi, resolver, tokio::runtime::Handle::current());
     dht_client
 }

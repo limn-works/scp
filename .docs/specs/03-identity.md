@@ -916,6 +916,7 @@ The parallel query model (step 3) requires clear rules for when queries are canc
 - **Both layers succeed, same sequence number.** The documents MUST be byte-identical (same key signs both, same content). If they differ despite identical sequence numbers, this indicates a bug in the publishing implementation. The resolver MUST log a warning and accept either document (they should be identical; if not, neither is more authoritative).
 - **Both layers succeed, different sequence numbers.** The higher sequence number is authoritative. The resolver MAY re-publish the fresher document to the layer that returned the stale one (protocol-level healing, §3.10.7).
 - **One layer fails, one succeeds.** The successful response is accepted. The failed layer's error is logged but does not prevent resolution. The resolver does NOT retry the failed layer synchronously — the next resolution cycle (24h for active contacts, 7d for inactive) will attempt both layers again.
+- **One layer fails, the other reports the DID absent.** The resolver returns an absent result that carries each layer's status: which layer answered, and which layer could not answer. The resolver MUST NOT return a bare not-found here. A caller that reads a bare not-found cannot tell a DID that nobody published from a DID whose only holder was unreachable, so the caller would treat a suppressed layer as proof of absence. The criterion a caller applies: a layer *answered* when it returned a record or reported that it holds none, and a layer *could not answer* when every source in that layer errored, timed out, or had no live connection.
 - **Both layers fail.** If a cached document exists and is less than 7 days old, the cached document is returned with a `resolution_source: "cache"` indicator. If no cache exists or the cache is older than 7 days, resolution fails with error `DID_RESOLUTION_FAILED` (code 5010). The resolver MUST NOT fabricate a document.
 - **One layer returns invalid signature.** The response is discarded as if the layer had failed. An invalid signature is logged at WARN level (it may indicate relay tampering). The resolver does not fall back to the invalid document under any circumstances.
 - **Relay blob fails frame decoding.** A relay blob that does not decode as a valid DID-record frame (§9.10.12) — shorter than the 105-byte fixed prefix, carrying an empty `value`, exceeding the bounded `value` length, or an unrecognized `version` — is discarded as if the relay had failed. Malformed framing is never trusted and never partially parsed (§9.10.12 decoder rules); the resolver falls through to the other layer exactly as for an invalid signature.
@@ -1003,7 +1004,33 @@ The SDK exposes a unified resolution interface that composes both layers:
 /// Implements the parallel dual-layer resolution protocol (§3.10.4).
 pub trait DidResolver: Send + Sync {
     fn resolve(&self, did: &str)
-        -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send;
+        -> impl Future<Output = Result<ResolutionOutcome, IdentityError>> + Send;
+}
+
+/// What a resolution attempt produced (§3.10.4).
+pub enum ResolutionOutcome {
+    /// A layer served a document that verified against the DID-derived key.
+    Found(ResolvedDidDocument),
+    /// No layer served a document. `layers` records which layers answered, so a
+    /// caller distinguishes a DID nobody published from a DID whose only holder
+    /// was unreachable (§3.10.4 "One layer fails, the other reports the DID absent").
+    Absent { layers: LayerAvailability },
+}
+
+/// Whether each resolution layer answered the query (§3.10.4).
+pub struct LayerAvailability {
+    /// The SCP relay layer (§3.10.2).
+    pub relay: LayerStatus,
+    /// The Mainline DHT layer (§3.10.3).
+    pub dht: LayerStatus,
+}
+
+/// Whether one resolution layer answered (§3.10.4).
+pub enum LayerStatus {
+    /// The layer returned a record, or reported that it holds none.
+    Answered,
+    /// Every source in the layer errored, timed out, or had no live connection.
+    Unavailable,
 }
 
 /// A resolved DID document with provenance metadata.

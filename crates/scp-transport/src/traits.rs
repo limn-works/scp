@@ -13,6 +13,7 @@
 //! See ADR-005 in `.docs/adrs/phase-1.md` for the full transport abstraction design.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::Stream;
 use scp_core::envelope::OuterEnvelope;
@@ -336,6 +337,69 @@ pub trait TransportAdapter: Send + Sync {
 /// — without the call site naming a concrete transport type. Each method
 /// forwards to the inner trait object.
 impl TransportAdapter for Box<dyn TransportAdapter> {
+    fn send(&self, envelope: &OuterEnvelope) -> BoxFuture<'_, Result<BlobId, TransportError>> {
+        (**self).send(envelope)
+    }
+
+    fn subscribe(
+        &self,
+        routing_id: &RoutingId,
+        since: Option<u64>,
+    ) -> BoxFuture<'_, Result<SubscriptionStream, TransportError>> {
+        (**self).subscribe(routing_id, since)
+    }
+
+    fn unsubscribe(&self, routing_id: &RoutingId) -> BoxFuture<'_, Result<(), TransportError>> {
+        (**self).unsubscribe(routing_id)
+    }
+
+    fn query(
+        &self,
+        routing_id: &RoutingId,
+        since: Option<u64>,
+    ) -> BoxFuture<'_, Result<Vec<OuterEnvelope>, TransportError>> {
+        (**self).query(routing_id, since)
+    }
+
+    fn delete(&self, blob_id: &BlobId) -> BoxFuture<'_, Result<(), TransportError>> {
+        (**self).delete(blob_id)
+    }
+
+    fn publish_raw(
+        &self,
+        routing_id: &RoutingId,
+        blob_ttl: u64,
+        blob: Vec<u8>,
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
+        (**self).publish_raw(routing_id, blob_ttl, blob)
+    }
+
+    fn query_raw(
+        &self,
+        routing_id: &RoutingId,
+        since: Option<u64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<Vec<u8>>, TransportError>> {
+        (**self).query_raw(routing_id, since, limit)
+    }
+
+    fn record_heartbeat_received(&self) -> BoxFuture<'_, ()> {
+        (**self).record_heartbeat_received()
+    }
+}
+
+/// Blanket impl so a shared adapter handle is itself a [`TransportAdapter`].
+///
+/// One connected relay serves two consumers at once: the
+/// [`TransportManager`](crate::TransportManager) that sends and subscribes over
+/// it, and the
+/// [`TransportRelayQuerier`](crate::native::TransportRelayQuerier) that runs DID
+/// QUERY over it (spec §3.10.4 step 3a). A bridge therefore holds the connected
+/// adapter as `Arc<dyn TransportAdapter>` and hands a clone to each. This impl
+/// lets that shared handle be passed anywhere a concrete adapter
+/// `A: TransportAdapter` is expected. Each method forwards to the inner trait
+/// object.
+impl TransportAdapter for Arc<dyn TransportAdapter> {
     fn send(&self, envelope: &OuterEnvelope) -> BoxFuture<'_, Result<BlobId, TransportError>> {
         (**self).send(envelope)
     }

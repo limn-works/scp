@@ -47,14 +47,13 @@ use scp_dht::DhtClient;
 #[cfg(test)]
 use scp_dht::InMemoryDhtClient;
 use scp_ffi_common::dht::FfiDhtClient;
-// `DidCache` / `DualLayerResolver` / `NoOpRelayQuerier` are named only by the
-// testing-gated DID-resolver-init and DHT-signer helpers (production create
-// fails closed before resolver init — ADR-062 §Decision 6).
+// `DidCache` is named only by the testing-gated DID-resolver-init and DHT-signer
+// helpers (production create fails closed before resolver init — ADR-062
+// §Decision 6). The resolver itself is composed by the one shared builder,
+// `scp_ffi_common::build_production_did_resolver`.
 #[cfg(feature = "testing")]
 use scp_identity::DidCache;
 use scp_identity::IdentityError;
-#[cfg(feature = "testing")]
-use scp_identity::resolver::{DualLayerResolver, NoOpRelayQuerier};
 
 use scp_did::DidDocument as CoreDidDocument;
 use scp_identity::{DidDht, DidMethod, ScpIdentity};
@@ -9491,12 +9490,13 @@ fn ensure_did_resolver_initialized_on(
         .map(Arc::clone)
         .unwrap_or(candidate_cache);
 
-    let resolver = Arc::new(DualLayerResolver::new(
-        Arc::new(NoOpRelayQuerier),
-        dht_client,
-        cache,
-        Vec::new(),
-    ));
+    // The relay layer is this instance's `TransportRelayQuerier` behind the
+    // production `RealMultiRelayQuerier` composer, and the same object supplies
+    // the bootstrap relay URLs — so the resolver queries exactly the relays
+    // `transport_connect` has bound, including relays bound after this call
+    // (§3.10.4 step 3a, §18.5.1 priority 1).
+    let resolver =
+        scp_ffi_common::build_production_did_resolver(bi.core.relay_querier(), dht_client, cache);
 
     bi.set_did_resolver(resolver, handle);
     Ok(())
@@ -15923,9 +15923,12 @@ impl Scp {
                 // multi-relay support (ADR-012). The manager provides relay set
                 // assignment, reliability scoring, and suppression detection.
                 // The selector returns a `Box<dyn TransportAdapter>`; the
-                // blanket `impl TransportAdapter for Box<dyn TransportAdapter>`
-                // lets it be used where a concrete adapter is expected.
-                let manager = scp_transport::TransportManager::new(adapter);
+                // blanket `impl TransportAdapter for Arc<dyn TransportAdapter>`
+                // lets ONE connected adapter serve both consumers of this relay
+                // — the `TransportManager` that sends and subscribes over it,
+                // and the DID relay querier that runs QUERY over it (§3.10.2).
+                let shared: Arc<dyn scp_transport::TransportAdapter> = Arc::from(adapter);
+                let manager = scp_transport::TransportManager::new(Box::new(Arc::clone(&shared)));
 
                 // Install the manager on THIS instance's CoreFields — not on
                 // the process-wide DEFAULT_BRIDGE_INSTANCE.
@@ -15935,6 +15938,11 @@ impl Scp {
                         msg: e.to_string(),
                         code: codes::TRANS_5002.to_owned(),
                     })?;
+
+                // Bind the same connection into the relay layer of DID
+                // resolution, so a DID published to this relay resolves
+                // (§3.10.4 step 3a).
+                bi.core.bind_relay_transport(relay_url.clone(), shared);
 
                 // Register the URL on this bridge's pending-reconnect set
                 // so `BridgeInstanceCore::resume` can rebuild the transport
@@ -16068,6 +16076,9 @@ impl Scp {
                 // explicitly disconnected (#1678).
                 if let Some(ref url) = disconnecting_url {
                     bi.core.remove_relay_url(url);
+                    // Stop the DID resolver from querying a relay this caller
+                    // walked away from (§3.10.4 step 3a).
+                    bi.core.unbind_relay_transport(url);
                 }
 
                 Ok(())
@@ -22148,16 +22159,15 @@ mod tests {
 
         // Verify using IdentityBackedDidResolver — the same type the bridge
         // function uses via the BridgeInstance DID resolver.
-        let dual = DualLayerResolver::new(
-            Arc::new(NoOpRelayQuerier),
+        // Compose through the SAME builder the shipped bridge calls, so this
+        // test exercises the production relay+DHT composition (§3.10.4).
+        let dual = scp_ffi_common::build_production_did_resolver(
+            Arc::new(scp_transport::native::TransportRelayQuerier::new()),
             dht_client,
             Arc::new(DidCache::new()),
-            Vec::new(),
         );
-        let resolver = scp_ffi_common::IdentityBackedDidResolver::new(
-            Arc::new(dual),
-            tokio::runtime::Handle::current(),
-        );
+        let resolver =
+            scp_ffi_common::IdentityBackedDidResolver::new(dual, tokio::runtime::Handle::current());
         let auth = core_verify(&resolver, &response, &challenge).await.unwrap();
 
         assert_eq!(auth.did, identity.did);
@@ -24794,12 +24804,11 @@ mod tests {
                 scp_dht::InMemoryDhtClient::new(),
             ));
             let cache = Arc::new(scp_identity::DidCache::new());
-            let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::new(
-                Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+            let resolver = scp_ffi_common::build_production_did_resolver(
+                bi.core.relay_querier(),
                 Arc::clone(&dht_client),
                 Arc::clone(&cache),
-                Vec::new(),
-            ));
+            );
             bi.set_did_resolver(resolver, tokio::runtime::Handle::current());
             bi.core.set_dht_client(Arc::clone(&dht_client));
             bi.core.set_resolver_cache(cache);

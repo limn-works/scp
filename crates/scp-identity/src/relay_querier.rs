@@ -116,6 +116,16 @@ const PER_RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// intra-relay candidate scan. The cap trades an unbounded-verification `DoS` for
 /// a suppression vector that a malicious relay already possesses for free.
 ///
+/// # Answering versus failing (§3.10.4)
+///
+/// The composer returns `Ok(None)` only when at least one relay answered and no
+/// relay held a valid record. It returns `Err` when the relay layer could not
+/// answer at all — an empty URL list, or every relay erroring, timing out, or
+/// having no bound transport. The [`DualLayerResolver`](crate::resolver::DualLayerResolver)
+/// turns that `Err` into [`LayerStatus::Unavailable`](crate::resolver::LayerStatus::Unavailable),
+/// so a caller never reads an unreachable relay layer as evidence that nobody
+/// published the DID.
+///
 /// # Layering
 ///
 /// This composer owns **intra-relay candidate selection** (highest-seq among
@@ -173,24 +183,38 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
             // provenance differs.
             //
             // `routing_id` is `[u8; 32]` (Copy); each task gets its own copy.
-            let mut tasks: JoinSet<(String, Vec<_>)> = JoinSet::new();
+            //
+            // An empty URL list means no relay is available to ask, which the
+            // composer reports as a layer failure rather than as "the relays
+            // hold no record for this DID" (§3.10.4).
+            if relay_urls.is_empty() {
+                return Err(IdentityError::RelayNotConnected(format!(
+                    "no relay URL is available to query for {did}"
+                )));
+            }
+
+            let relay_count = relay_urls.len();
+            let mut tasks: JoinSet<(String, Option<Vec<_>>)> = JoinSet::new();
             for relay_url in relay_urls {
                 let inner = Arc::clone(&inner);
                 tasks.spawn(async move {
+                    // `None` means this relay could not answer (error or
+                    // timeout); `Some(candidates)` means it answered, possibly
+                    // with an empty candidate list.
                     let candidates = match tokio::time::timeout(
                         PER_RELAY_TIMEOUT,
                         inner.query(&relay_url, &routing_id),
                     )
                     .await
                     {
-                        Ok(Ok(v)) => v,
+                        Ok(Ok(v)) => Some(v),
                         Ok(Err(e)) => {
                             debug!(relay_url = %relay_url, error = %e, "relay query failed — skipping relay");
-                            Vec::new()
+                            None
                         }
                         Err(_elapsed) => {
                             debug!(relay_url = %relay_url, "relay query timed out — skipping relay");
-                            Vec::new()
+                            None
                         }
                     };
                     (relay_url, candidates)
@@ -200,12 +224,15 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
             // Track the highest-seq valid record across all relays (§3.10.4 step 5
             // / §3.10.7: "the highest valid sequence number wins").
             let mut best: Option<RelayRecord> = None;
+            // How many relays answered — returned a candidate list, empty or
+            // not. A relay that errored, timed out, or panicked did not answer.
+            let mut relays_that_answered = 0_usize;
 
             while let Some(join_result) = tasks.join_next().await {
                 // Transport errors and relay timeouts are already handled inside
-                // the spawned task: they return an empty Vec and skip the relay
-                // without aborting the sweep. A JoinError here is a task panic —
-                // a bug, but still must not abort the sweep.
+                // the spawned task: they yield `None` and skip the relay without
+                // aborting the sweep. A JoinError here is a task panic — a bug,
+                // but still must not abort the sweep.
                 let (relay_url, candidates) = match join_result {
                     Ok(task_output) => task_output,
                     Err(e) => {
@@ -213,6 +240,10 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
                         continue;
                     }
                 };
+                let Some(candidates) = candidates else {
+                    continue;
+                };
+                relays_that_answered += 1;
 
                 // Apply a defensive cap: an untrusted relay must not be able to
                 // drive O(N) Ed25519 verifications per resolve (§3.10.8). This is
@@ -244,6 +275,16 @@ impl<Q: RelayQuerier + 'static> MultiRelayQuerier for RealMultiRelayQuerier<Q> {
                         });
                     }
                 }
+            }
+
+            // No relay answered: the relay layer could not answer at all, which
+            // the resolver must not read as "the relays hold no record for this
+            // DID" (§3.10.4). One relay answering is enough for `Ok`, because
+            // the layer then produced a real answer from a real source.
+            if relays_that_answered == 0 {
+                return Err(IdentityError::RelayQueryFailed(format!(
+                    "all {relay_count} relay queries for {did} failed or timed out"
+                )));
             }
 
             // The resolver re-verifies the returned record (defense in depth)
@@ -556,14 +597,21 @@ mod tests {
         );
     }
 
-    /// An empty relay list returns `Ok(None)` immediately without querying.
+    /// An empty relay list means no relay is available to ask, which is not the
+    /// same claim as "the relays hold no record for this DID". The composer
+    /// returns `RelayNotConnected` so `DualLayerResolver` marks the relay layer
+    /// unavailable instead of counting it as an answered absence (spec §3.10.4,
+    /// "One layer fails, the other reports the DID absent").
     #[tokio::test]
-    async fn empty_relay_list_returns_none() {
+    async fn empty_relay_list_is_an_error_not_an_absence() {
         let (vk, _sk) = make_ed25519_keypair();
         let did = did_from_public_key(&vk);
         let composer = RealMultiRelayQuerier::new(Arc::new(InMemoryRelayQuerier::new()));
-        let result = composer.query(&did, &[]).await.unwrap();
-        assert!(result.is_none());
+        let result = composer.query(&did, &[]).await;
+        assert!(
+            matches!(result, Err(IdentityError::RelayNotConnected(_))),
+            "an empty relay list must surface as RelayNotConnected, not Ok(None)"
+        );
     }
 
     /// A malformed DID string (not `did:dht:z...`) returns `Err` immediately.

@@ -336,6 +336,16 @@ pub struct CoreFields {
     /// See #311 for the unification design.
     did_resolver: OnceLock<Arc<IdentityBackedDidResolver>>,
 
+    /// The relay layer of this instance's DID resolution (spec §3.10.2).
+    ///
+    /// Built with the instance, before any relay connection exists, and bound to
+    /// a live transport by [`bind_relay_transport`](Self::bind_relay_transport)
+    /// as each `transport_connect` establishes one. The resolver reads the bound
+    /// set on every resolve, so a relay connected after the resolver was built is
+    /// reachable (§3.10.4 step 3a). One querier per instance, never a process
+    /// global, so two bridge instances never share relay bindings.
+    relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
+
     /// Shared DHT client backing the production DID resolver.
     ///
     /// Retained on the instance so that `identity_create` publishes freshly
@@ -565,6 +575,7 @@ impl CoreFields {
             economy_antispam: DashMap::new(),
             bridge_state: DashMap::new(),
             did_resolver: OnceLock::new(),
+            relay_querier: Arc::new(scp_transport::native::TransportRelayQuerier::new()),
             dht_client: OnceLock::new(),
             resolver_cache: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
@@ -650,6 +661,7 @@ impl CoreFields {
             economy_antispam: DashMap::new(),
             bridge_state: DashMap::new(),
             did_resolver: OnceLock::new(),
+            relay_querier: Arc::new(scp_transport::native::TransportRelayQuerier::new()),
             dht_client: OnceLock::new(),
             resolver_cache: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
@@ -2193,6 +2205,39 @@ impl CoreFields {
         if self.did_resolver.set(resolver).is_err() {
             tracing::warn!("set_did_resolver called but resolver already initialized — ignoring");
         }
+    }
+
+    /// Returns this instance's relay-layer DID querier (spec §3.10.2).
+    ///
+    /// The querier exists from instance construction, so a caller may compose it
+    /// into a resolver before any relay is connected and bind transports later.
+    #[must_use]
+    pub fn relay_querier(&self) -> Arc<scp_transport::native::TransportRelayQuerier> {
+        Arc::clone(&self.relay_querier)
+    }
+
+    /// Binds a connected relay transport into this instance's relay-layer DID
+    /// querier, so DID QUERY (§3.10.2) runs over the same connection the rest of
+    /// the bridge already uses for this relay.
+    ///
+    /// Bridges call this from `transport_connect`, immediately after
+    /// [`Self::set_transport`]. Binding is idempotent: a later bind for the same
+    /// URL replaces the earlier adapter.
+    pub fn bind_relay_transport(
+        &self,
+        relay_url: impl Into<String>,
+        adapter: Arc<dyn scp_transport::TransportAdapter>,
+    ) {
+        self.relay_querier.bind(relay_url, adapter);
+    }
+
+    /// Removes a relay's DID-QUERY binding, so a resolver stops asking a relay
+    /// this instance walked away from.
+    ///
+    /// Bridges call this from `transport_disconnect`, alongside
+    /// [`Self::remove_relay_url`].
+    pub fn unbind_relay_transport(&self, relay_url: &str) {
+        self.relay_querier.unbind(relay_url);
     }
 
     /// Returns the shared DHT client backing the DID resolver, if initialized.

@@ -71,7 +71,7 @@ use scp_ffi_common::dht::FfiDhtClient;
 #[cfg(all(test, feature = "testing"))]
 use scp_identity::DidMethod;
 use scp_identity::IdentityError;
-use scp_identity::{DidCache, DidDht, DualLayerResolver, NoOpRelayQuerier, ScpIdentity};
+use scp_identity::{DidCache, DidDht, ScpIdentity};
 #[cfg(feature = "testing")]
 use scp_platform::testing::InMemoryKeyCustody;
 #[cfg(feature = "testing")]
@@ -193,7 +193,6 @@ pub(crate) fn ensure_did_resolver_initialized_on(
             .unwrap_or(candidate)
     };
 
-    let relay_querier = Arc::new(NoOpRelayQuerier);
     // Bind the resolver over the CANONICAL per-instance cache (set-if-unset then
     // re-read). Retaining the SAME cache `Arc` the resolver reads from lets
     // post-rotation re-publishes drop the stale cached document (see
@@ -211,14 +210,14 @@ pub(crate) fn ensure_did_resolver_initialized_on(
         .resolver_cache()
         .map(Arc::clone)
         .unwrap_or(candidate_cache);
-    let bootstrap_relays = Vec::new();
 
-    let resolver = Arc::new(DualLayerResolver::new(
-        relay_querier,
-        dht_client,
-        cache,
-        bootstrap_relays,
-    ));
+    // The relay layer is this instance's `TransportRelayQuerier` behind the
+    // production `RealMultiRelayQuerier` composer, and the same object supplies
+    // the bootstrap relay URLs — so the resolver queries exactly the relays
+    // `transport_connect` has bound, including relays bound after this call
+    // (§3.10.4 step 3a, §18.5.1 priority 1).
+    let resolver =
+        scp_ffi_common::build_production_did_resolver(bi.core.relay_querier(), dht_client, cache);
 
     crate::runtime::init_did_resolver(bi, resolver, handle);
     Ok(())

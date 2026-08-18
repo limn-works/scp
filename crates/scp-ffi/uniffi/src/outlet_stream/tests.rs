@@ -203,12 +203,11 @@ fn install_seedable_resolver(
         scp_dht::InMemoryDhtClient::new(),
     ));
     let cache = Arc::new(scp_identity::DidCache::new());
-    let resolver = Arc::new(scp_identity::resolver::DualLayerResolver::new(
-        Arc::new(scp_identity::resolver::NoOpRelayQuerier),
+    let resolver = scp_ffi_common::build_production_did_resolver(
+        bi.core.relay_querier(),
         Arc::clone(&dht_client),
         Arc::clone(&cache),
-        Vec::new(),
-    ));
+    );
     bi.set_did_resolver(resolver, tokio::runtime::Handle::current());
     bi.core.set_dht_client(Arc::clone(&dht_client));
     bi.core.set_resolver_cache(cache);

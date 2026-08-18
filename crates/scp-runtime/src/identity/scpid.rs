@@ -320,13 +320,29 @@ pub async fn scpid_verify(
     }
 
     // Step 5: Resolve the DID document.
-    let did_result = resolver
+    // Both absent arms reject (fail-closed); the message names whether every
+    // layer answered and none holds the DID, or a layer could not answer at all
+    // (§3.10.4).
+    let did_result = match resolver
         .resolve(&response.did)
         .await
         .map_err(|e| ScpIdError::DidResolutionFailed(e.to_string()))?
-        .ok_or_else(|| {
-            ScpIdError::DidResolutionFailed(format!("DID not found: {}", response.did))
-        })?;
+    {
+        scp_identity::ResolutionOutcome::Found(found) => found,
+        scp_identity::ResolutionOutcome::Absent { layers } if layers.any_unavailable() => {
+            return Err(ScpIdError::DidResolutionFailed(format!(
+                "DID {} did not resolve: {} could not answer",
+                response.did,
+                layers.unavailable_layers()
+            )));
+        }
+        scp_identity::ResolutionOutcome::Absent { .. } => {
+            return Err(ScpIdError::DidResolutionFailed(format!(
+                "DID not found: {}",
+                response.did
+            )));
+        }
+    };
 
     let doc = &did_result.document;
 
@@ -1046,24 +1062,31 @@ mod tests {
             &self,
             _did: &str,
         ) -> impl Future<
-            Output = Result<
-                Option<scp_identity::resolver::ResolvedDidDocument>,
-                scp_identity::IdentityError,
-            >,
+            Output = Result<scp_identity::ResolutionOutcome, scp_identity::IdentityError>,
         > + Send {
             let result = if self.fail {
                 Err(scp_identity::IdentityError::DhtResolveFailed(
                     "test resolver failure".to_owned(),
                 ))
             } else {
-                Ok(self
-                    .document
-                    .clone()
-                    .map(|doc| scp_identity::resolver::ResolvedDidDocument {
-                        document: doc,
-                        seq: 1,
-                        source: scp_identity::resolver::ResolutionSource::Cache,
-                    }))
+                Ok(self.document.clone().map_or(
+                    // Both layers answered and neither holds the DID.
+                    scp_identity::ResolutionOutcome::Absent {
+                        layers: scp_identity::LayerAvailability {
+                            relay: scp_identity::LayerStatus::Answered,
+                            dht: scp_identity::LayerStatus::Answered,
+                        },
+                    },
+                    |doc| {
+                        scp_identity::ResolutionOutcome::Found(
+                            scp_identity::resolver::ResolvedDidDocument {
+                                document: doc,
+                                seq: 1,
+                                source: scp_identity::resolver::ResolutionSource::Cache,
+                            },
+                        )
+                    },
+                ))
             };
             async move { result }
         }

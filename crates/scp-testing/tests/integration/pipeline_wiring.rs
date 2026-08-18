@@ -134,6 +134,21 @@ const COMMON_BROADCAST_SRC: &str =
 const BRIDGE_INSTANCE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/common/src/bridge_instance.rs");
 
+// Per-bridge DID-resolver initialization (spec §3.10.4). Each bridge composes
+// its resolver through the ONE shared builder
+// `scp_ffi_common::build_production_did_resolver`, which puts the production
+// relay querier on the relay layer. Pinned by
+// `every_bridge_composes_the_production_relay_layer` so a bridge cannot revert
+// to a relay layer that answers without querying a relay.
+const PYO3_IDENTITY_SRC: &str = include_str!("../../../../crates/scp-ffi/src/identity.rs");
+const NAPI_IDENTITY_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/identity.rs");
+
+// Per-bridge transport connect/disconnect. Each binds its live relay adapter
+// into the instance's relay querier so DID QUERY runs over the same connection
+// (§3.10.2). Pinned by `every_bridge_binds_its_relay_into_did_resolution`.
+const PYO3_TRANSPORT_SRC: &str = include_str!("../../../../crates/scp-ffi/src/transport.rs");
+const NAPI_TRANSPORT_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/transport.rs");
+
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
@@ -3631,6 +3646,236 @@ fn no_stale_ignores() {
     }
 
     assert!(stale.is_empty(), "Stale ignores:\n  {}", stale.join("\n  "));
+}
+
+// ---------------------------------------------------------------------------
+// Relay layer of DID resolution (spec §3.10.2 / §3.10.4; ADR-062 §Decision 5
+// as amended 2026-08-17)
+// ---------------------------------------------------------------------------
+
+/// A relay transport that serves preset raw blobs at one routing ID.
+///
+/// Only `query_raw` is meaningful — the DID resolution READ path (§3.10.2). Every
+/// other method reports "not connected" rather than fabricating a success.
+mod relay_blob_adapter {
+    use std::pin::Pin;
+
+    use scp_core::envelope::OuterEnvelope;
+    use scp_transport::error::TransportError;
+    use scp_transport::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter};
+
+    type BoxFut<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+    /// Serves `blobs` for `routing_id`, and nothing for any other routing ID.
+    pub struct SingleRoutingIdAdapter {
+        routing_id: [u8; 32],
+        blobs: Vec<Vec<u8>>,
+    }
+
+    impl SingleRoutingIdAdapter {
+        pub const fn new(routing_id: [u8; 32], blobs: Vec<Vec<u8>>) -> Self {
+            Self { routing_id, blobs }
+        }
+    }
+
+    impl TransportAdapter for SingleRoutingIdAdapter {
+        fn send(&self, _envelope: &OuterEnvelope) -> BoxFut<'_, Result<BlobId, TransportError>> {
+            Box::pin(async { Err(TransportError::NotConnected) })
+        }
+
+        fn subscribe(
+            &self,
+            _routing_id: &RoutingId,
+            _since: Option<u64>,
+        ) -> BoxFut<'_, Result<SubscriptionStream, TransportError>> {
+            Box::pin(async { Err(TransportError::NotConnected) })
+        }
+
+        fn unsubscribe(&self, _routing_id: &RoutingId) -> BoxFut<'_, Result<(), TransportError>> {
+            Box::pin(async { Err(TransportError::NotConnected) })
+        }
+
+        fn query(
+            &self,
+            _routing_id: &RoutingId,
+            _since: Option<u64>,
+        ) -> BoxFut<'_, Result<Vec<OuterEnvelope>, TransportError>> {
+            Box::pin(async { Err(TransportError::NotConnected) })
+        }
+
+        fn delete(&self, _blob_id: &BlobId) -> BoxFut<'_, Result<(), TransportError>> {
+            Box::pin(async { Err(TransportError::NotConnected) })
+        }
+
+        fn query_raw(
+            &self,
+            routing_id: &RoutingId,
+            _since: Option<u64>,
+            _limit: u32,
+        ) -> BoxFut<'_, Result<Vec<Vec<u8>>, TransportError>> {
+            let matches = routing_id.as_bytes() == &self.routing_id;
+            let blobs = if matches {
+                self.blobs.clone()
+            } else {
+                Vec::new()
+            };
+            Box::pin(async move { Ok(blobs) })
+        }
+    }
+}
+
+/// Every bridge composes its DID resolver through the shared production builder,
+/// which puts `RealMultiRelayQuerier<TransportRelayQuerier>` on the relay layer.
+///
+/// Before this wiring landed each bridge passed a no-op relay querier whose
+/// `Ok(None)` told every caller "the relays hold no record for this DID" without
+/// querying a relay. ADR-062 §Decision 5 names that type and records the
+/// classification that let it ship.
+#[test]
+fn every_bridge_composes_the_production_relay_layer() {
+    for (bridge, src, init_fn) in [
+        (
+            "PyO3",
+            PYO3_IDENTITY_SRC,
+            "ensure_did_resolver_initialized_on",
+        ),
+        (
+            "napi-rs",
+            NAPI_IDENTITY_SRC,
+            "ensure_did_resolver_initialized_on",
+        ),
+        (
+            "UniFFI",
+            UNIFFI_BRIDGE_SRC,
+            "ensure_did_resolver_initialized_on",
+        ),
+    ] {
+        assert!(
+            fn_body_contains(src, init_fn, "build_production_did_resolver"),
+            "{bridge}: {init_fn} must compose the resolver through \
+             scp_ffi_common::build_production_did_resolver so the relay layer is the \
+             production TransportRelayQuerier (spec §3.10.4 step 3a)"
+        );
+        assert!(
+            fn_body_contains(src, init_fn, "relay_querier"),
+            "{bridge}: {init_fn} must pass the instance's relay querier into the builder, \
+             not a fresh one, so relays bound by transport_connect are reachable"
+        );
+    }
+}
+
+/// Every bridge binds its connected relay transport into the relay layer of DID
+/// resolution, and unbinds it on disconnect.
+///
+/// Without the bind, the composed relay querier holds no transport and every
+/// resolve reports the relay layer unavailable — the resolver would be wired to
+/// a relay layer that can never answer.
+#[test]
+fn every_bridge_binds_its_relay_into_did_resolution() {
+    for (bridge, src, connect_fn, disconnect_fn) in [
+        (
+            "PyO3",
+            PYO3_TRANSPORT_SRC,
+            "transport_connect",
+            "transport_disconnect",
+        ),
+        (
+            "napi-rs",
+            NAPI_TRANSPORT_SRC,
+            "transport_connect_on",
+            "transport_disconnect_on",
+        ),
+        (
+            "UniFFI",
+            UNIFFI_BRIDGE_SRC,
+            "transport_connect",
+            "transport_disconnect",
+        ),
+    ] {
+        assert!(
+            fn_body_contains(src, connect_fn, "bind_relay_transport"),
+            "{bridge}: {connect_fn} must bind the connected adapter into the instance's \
+             relay querier so DID QUERY runs over that connection (spec §3.10.2)"
+        );
+        assert!(
+            fn_body_contains(src, disconnect_fn, "unbind_relay_transport"),
+            "{bridge}: {disconnect_fn} must unbind the relay so the resolver stops \
+             querying a relay the caller walked away from"
+        );
+    }
+}
+
+/// Calls the shared production builder with real arguments and asserts the
+/// composed resolver actually reaches the relay layer: a DID published ONLY to a
+/// relay resolves, with `ResolutionSource::ScpRelay` provenance.
+///
+/// This is the live counterpart to the structural assertions above — it proves
+/// the composition works, not merely that the call text is present.
+#[tokio::test]
+async fn production_builder_resolves_a_did_held_only_by_a_relay() {
+    use std::sync::Arc;
+
+    use ed25519_dalek::{Signer, SigningKey};
+    use scp_dht::{InMemoryDhtClient, bep44_signable};
+    use scp_did::DidDocument;
+    use scp_identity::resolver::{DidResolver, ResolutionOutcome, ResolutionSource};
+    use scp_identity::{DidCache, did_routing_id};
+    use scp_protocol::envelope::did_record::DidRecordV1;
+    use scp_transport::native::TransportRelayQuerier;
+
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let public_key = signing_key.verifying_key();
+    let did = format!("did:dht:z{}", zbase32::encode(public_key.as_bytes()));
+    let document = DidDocument::new(&did, public_key.as_bytes(), &[2u8; 32], &[3u8; 32]);
+
+    let value = document
+        .to_json()
+        .expect("document serializes")
+        .into_bytes();
+    let seq = 4_u64;
+    let signature: [u8; 64] = signing_key.sign(&bep44_signable(&value, seq)).to_bytes();
+    let frame = DidRecordV1::try_new(*public_key.as_bytes(), seq, signature, value)
+        .expect("DID record frame builds")
+        .encode();
+
+    // A relay that serves exactly this frame at the DID's routing ID.
+    let relay_url = "wss://relay.pipeline-wiring.test/scp/v1";
+    let adapter: Arc<dyn scp_transport::TransportAdapter> = Arc::new(
+        relay_blob_adapter::SingleRoutingIdAdapter::new(did_routing_id(&did), vec![frame]),
+    );
+
+    let relay_querier = Arc::new(TransportRelayQuerier::new());
+    // The resolver is built BEFORE the relay is bound, exactly as a bridge does
+    // it at FFI init — the bind below must still take effect.
+    let resolver = scp_ffi_common::build_production_did_resolver(
+        Arc::clone(&relay_querier),
+        // The DHT layer holds nothing, so only the relay layer can answer.
+        Arc::new(InMemoryDhtClient::new()),
+        Arc::new(DidCache::new()),
+    );
+    relay_querier.bind(relay_url, adapter);
+
+    match resolver
+        .resolve(&did)
+        .await
+        .expect("resolution must not fail")
+    {
+        ResolutionOutcome::Found(found) => {
+            assert_eq!(found.seq, seq);
+            assert_eq!(
+                found.source,
+                ResolutionSource::ScpRelay {
+                    relay_url: relay_url.to_owned()
+                },
+                "the document came from the relay layer, not the empty DHT"
+            );
+            assert_eq!(found.document.id, did);
+        }
+        ResolutionOutcome::Absent { layers } => panic!(
+            "a DID published only to a bound relay must resolve; layers were {layers:?}. \
+             The relay layer is not wired into the production resolver."
+        ),
+    }
 }
 
 /// Verifies that CLAUDE.md contains the required enforcement sections.

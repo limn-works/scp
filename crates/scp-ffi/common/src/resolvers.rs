@@ -20,7 +20,64 @@ use scp_core::trust::TrustError;
 use scp_core::trust::attestation::DidPublicKeyResolver;
 use scp_did::decode_multibase_key;
 use scp_identity::IdentityError;
-use scp_identity::resolver::ResolvedDidDocument;
+use scp_identity::resolver::{ResolutionOutcome, ResolvedDidDocument};
+
+// ---------------------------------------------------------------------------
+// Production resolver composition (§3.10.4)
+// ---------------------------------------------------------------------------
+
+/// The DID resolver every shipped bridge runs: SCP relay QUERY (§3.10.2) and
+/// Mainline DHT (§3.10.3) in parallel, with the real relay querier on the relay
+/// layer.
+///
+/// Named so the three bridges and the wiring tests refer to ONE type rather than
+/// each spelling out the generic parameters.
+pub type ProductionDidResolver<D> = scp_identity::DualLayerResolver<
+    scp_identity::RealMultiRelayQuerier<scp_transport::native::TransportRelayQuerier>,
+    D,
+    scp_clock::SystemClock,
+>;
+
+/// Composes the production DID resolver for one bridge instance (§3.10.4).
+///
+/// This is the single composition site the `PyO3`, napi-rs, and `UniFFI` bridges all
+/// call, so no bridge can compose a different relay layer from the others.
+///
+/// # Arguments
+///
+/// * `relay_querier` — the instance's [`TransportRelayQuerier`](scp_transport::native::TransportRelayQuerier).
+///   It serves two roles here: the relay layer's querier, and the source of the
+///   bootstrap relay URL list. Passing the same object for both is what makes
+///   the resolver query exactly the relays the instance has bound, and makes a
+///   relay bound *after* this call reachable (§3.10.4 step 3a, §18.5.1
+///   priority 1).
+/// * `dht_client` — the instance's DHT client, the same one identity creation
+///   publishes into.
+/// * `cache` — the instance's [`DidCache`](scp_identity::DidCache), retained by
+///   the caller so a post-rotation republish can invalidate the stale document.
+///
+/// # Layer honesty
+///
+/// The composed resolver reports a layer that could not answer as
+/// [`LayerStatus::Unavailable`](scp_identity::LayerStatus::Unavailable) rather
+/// than folding it into a not-found, and [`IdentityBackedDidResolver`] turns
+/// that into [`ResolutionError::NetworkUnavailable`] (§3.10.4).
+pub fn build_production_did_resolver<D>(
+    relay_querier: Arc<scp_transport::native::TransportRelayQuerier>,
+    dht_client: Arc<D>,
+    cache: Arc<scp_identity::DidCache>,
+) -> Arc<ProductionDidResolver<D>>
+where
+    D: scp_dht::DhtClient,
+{
+    let bootstrap_relays: Arc<dyn scp_identity::BootstrapRelays> = relay_querier.clone();
+    Arc::new(scp_identity::DualLayerResolver::new(
+        Arc::new(scp_identity::RealMultiRelayQuerier::new(relay_querier)),
+        dht_client,
+        cache,
+        bootstrap_relays,
+    ))
+}
 
 // ---------------------------------------------------------------------------
 // BridgeDidResolver
@@ -143,10 +200,7 @@ impl From<ResolutionError> for TrustError {
 /// The function takes a DID string (owned, for `Send` + `'static`) and returns
 /// a boxed future. This allows [`IdentityBackedDidResolver`] to hold any
 /// resolver without leaking its generic type parameters.
-type AsyncResolveFn = dyn Fn(
-        String,
-    )
-        -> Pin<Box<dyn Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send>>
+type AsyncResolveFn = dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<ResolutionOutcome, IdentityError>> + Send>>
     + Send
     + Sync;
 
@@ -283,6 +337,26 @@ impl IdentityBackedDidResolver {
         std::mem::take(&mut *events)
     }
 
+    /// Resolves a DID and returns the document, or the typed reason it did not
+    /// resolve.
+    ///
+    /// This is the async surface of this resolver's error taxonomy. It reports a
+    /// resolution layer that could not answer as
+    /// [`ResolutionError::NetworkUnavailable`] and a DID that every reachable
+    /// layer says it does not hold as [`ResolutionError::NotFound`], so a caller
+    /// distinguishes an unreachable network from a DID nobody published
+    /// (§3.10.4). The sync trait implementations collapse both to a rejection;
+    /// an async caller that wants to retry reads this instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolutionError`] carrying which of the four conditions —
+    /// not-found, invalid document, network unavailable, or sequence
+    /// downgrade — the resolution hit.
+    pub async fn resolve_typed(&self, did: &str) -> Result<ResolvedDidDocument, ResolutionError> {
+        Self::resolve_document(&*self.resolve_fn, did).await
+    }
+
     /// Resolves a DID via the identity layer and returns the full resolved
     /// document with provenance metadata.
     ///
@@ -295,8 +369,25 @@ impl IdentityBackedDidResolver {
         let result = (resolve_fn)(did.to_owned()).await;
 
         match result {
-            Ok(Some(doc)) => Ok(doc),
-            Ok(None) => Err(ResolutionError::NotFound(did.to_owned())),
+            Ok(ResolutionOutcome::Found(doc)) => Ok(doc),
+            // A layer that could not answer is a network condition, NOT evidence
+            // that nobody published the DID. Reporting it as `NotFound` would
+            // let a caller treat a suppressed or disconnected relay as proof of
+            // absence (§3.10.4, "One layer fails, the other reports the DID
+            // absent").
+            Ok(ResolutionOutcome::Absent { layers }) if layers.any_unavailable() => {
+                Err(ResolutionError::NetworkUnavailable(format!(
+                    "{did} did not resolve: {} could not answer",
+                    layers.unavailable_layers()
+                )))
+            }
+            Ok(ResolutionOutcome::Absent { .. }) => Err(ResolutionError::NotFound(did.to_owned())),
+            Err(IdentityError::ResolutionFailed {
+                did: failed,
+                reason,
+            }) => Err(ResolutionError::NetworkUnavailable(format!(
+                "{failed}: {reason}"
+            ))),
             Err(
                 IdentityError::Bep44SignatureInvalid(msg)
                 | IdentityError::SelfCertificationFailed(msg)
@@ -308,9 +399,11 @@ impl IdentityBackedDidResolver {
             }) => Err(ResolutionError::Revoked(format!(
                 "stale sequence for {did}: received {received}, last known {last_known}"
             ))),
-            Err(IdentityError::DhtResolveFailed(msg) | IdentityError::RelayQueryFailed(msg)) => {
-                Err(ResolutionError::NetworkUnavailable(msg))
-            }
+            Err(
+                IdentityError::DhtResolveFailed(msg)
+                | IdentityError::RelayQueryFailed(msg)
+                | IdentityError::RelayNotConnected(msg),
+            ) => Err(ResolutionError::NetworkUnavailable(msg)),
             Err(IdentityError::DhtNotFound(msg)) => Err(ResolutionError::NotFound(msg)),
             Err(e) => Err(ResolutionError::InvalidDocument(e.to_string())),
         }
@@ -627,7 +720,7 @@ impl scp_identity::resolver::DidResolver for IdentityBackedDidResolver {
     fn resolve(
         &self,
         did: &str,
-    ) -> impl Future<Output = Result<Option<ResolvedDidDocument>, IdentityError>> + Send {
+    ) -> impl Future<Output = Result<ResolutionOutcome, IdentityError>> + Send {
         let resolve_fn = Arc::clone(&self.resolve_fn);
         let did_owned = did.to_owned();
         async move { (resolve_fn)(did_owned).await }
@@ -909,17 +1002,21 @@ mod tests {
     use scp_core::crypto::ucan::validate::DidResolver as CoreDidResolver;
     use scp_dht::InMemoryDhtClient;
     use scp_did::DidDocument;
+    use scp_identity::DidMethod;
     use scp_identity::cache::DidCache;
     use scp_identity::resolver::{ResolutionSource, ResolvedDidDocument};
-    use scp_identity::{DidMethod, DualLayerResolver, NoOpRelayQuerier};
+    use scp_transport::native::TransportRelayQuerier;
     use std::sync::Arc;
 
-    /// Helper: create a `DualLayerResolver` with in-memory backends for testing.
-    fn make_test_resolver() -> Arc<DualLayerResolver<NoOpRelayQuerier, InMemoryDhtClient>> {
-        let dht = Arc::new(InMemoryDhtClient::new());
-        let relay = Arc::new(NoOpRelayQuerier);
-        let cache = Arc::new(DidCache::new());
-        Arc::new(DualLayerResolver::new(relay, dht, cache, Vec::new()))
+    /// Helper: composes the production resolver over an in-memory DHT and a
+    /// relay querier with no bound transport, through the SAME builder the
+    /// shipped bridges call.
+    fn make_test_resolver() -> Arc<ProductionDidResolver<InMemoryDhtClient>> {
+        build_production_did_resolver(
+            Arc::new(TransportRelayQuerier::new()),
+            Arc::new(InMemoryDhtClient::new()),
+            Arc::new(DidCache::new()),
+        )
     }
 
     /// Helper: create an `IdentityBackedDidResolver` wrapping a test resolver.
@@ -1252,9 +1349,11 @@ mod tests {
         dht: Arc<InMemoryDhtClient>,
         handle: tokio::runtime::Handle,
     ) -> Arc<IdentityBackedDidResolver> {
-        let relay = Arc::new(NoOpRelayQuerier);
-        let cache = Arc::new(DidCache::new());
-        let resolver = Arc::new(DualLayerResolver::new(relay, dht, cache, Vec::new()));
+        let resolver = build_production_did_resolver(
+            Arc::new(TransportRelayQuerier::new()),
+            dht,
+            Arc::new(DidCache::new()),
+        );
         Arc::new(IdentityBackedDidResolver::new(resolver, handle))
     }
 

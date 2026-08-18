@@ -121,19 +121,21 @@ fn ffi_dht_client_is_pkarr_only_in_shipped_build() {
 // ---------------------------------------------------------------------------
 
 /// A `DhtMode::Disabled` node resolves via the `DualLayerResolver` with the DHT
-/// arm off (`DisabledDhtClient`) and the interim `NoOpRelayQuerier` relay arm.
-/// An unknown DID therefore resolves to honest `Ok(None)` — never a typed error
-/// on resolve, never a fabricated or in-memory document (ADR-062 §Decision 1,
-/// A2). Runs in a shipped (non-`testing`) build to prove the property without
-/// any test-harness DHT.
+/// arm off (`DisabledDhtClient`) and the production relay querier holding no
+/// bound transport. An unknown DID therefore resolves to an honest absent
+/// outcome that names the relay layer unavailable — never a typed error on
+/// resolve, never a fabricated or in-memory document (ADR-062 §Decision 1, A2,
+/// as amended 2026-08-17; spec §3.10.4). Runs in a shipped (non-`testing`) build
+/// to prove the property without any test-harness DHT.
 #[cfg(not(feature = "testing"))]
 #[tokio::test]
 async fn disabled_node_resolution_returns_ok_none_for_unknown_did() {
     use std::sync::Arc;
 
     use scp_dht::DisabledDhtClient;
-    use scp_identity::resolver::{DidResolver, NoOpRelayQuerier};
-    use scp_identity::{DidCache, DualLayerResolver};
+    use scp_identity::resolver::{DidResolver, LayerStatus, ResolutionOutcome};
+    use scp_identity::{BootstrapRelays, DidCache, DualLayerResolver, RealMultiRelayQuerier};
+    use scp_transport::native::TransportRelayQuerier;
 
     // A well-formed-but-unpublished did:dht:z identifier.
     let did = {
@@ -143,22 +145,37 @@ async fn disabled_node_resolution_returns_ok_none_for_unknown_did() {
         format!("did:dht:z{}", zbase32::encode(vk.as_bytes()))
     };
 
+    let relay_querier = Arc::new(TransportRelayQuerier::new());
+    let bootstrap: Arc<dyn BootstrapRelays> = relay_querier.clone();
     let resolver = DualLayerResolver::new(
-        Arc::new(NoOpRelayQuerier),
+        Arc::new(RealMultiRelayQuerier::new(relay_querier)),
         Arc::new(DisabledDhtClient),
         Arc::new(DidCache::new()),
-        Vec::new(),
+        bootstrap,
     );
 
     let resolution = resolver
         .resolve(&did)
         .await
-        .expect("Disabled resolution must not error — the DHT arm contributes Ok(None)");
-    assert!(
-        resolution.is_none(),
-        "a Disabled node must resolve an unknown DID to honest not-found Ok(None), \
-         never a fabricated or in-memory document"
-    );
+        .expect("Disabled resolution must not error — the DHT arm answers with Ok(None)");
+    match resolution {
+        ResolutionOutcome::Absent { layers } => {
+            assert_eq!(
+                layers.dht,
+                LayerStatus::Answered,
+                "the Disabled DHT arm answers that it holds nothing"
+            );
+            assert_eq!(
+                layers.relay,
+                LayerStatus::Unavailable,
+                "no relay transport is bound, which the relay layer reports honestly \
+                 instead of claiming the relays hold no such DID"
+            );
+        }
+        ResolutionOutcome::Found(doc) => panic!(
+            "a Disabled node must never fabricate or serve an in-memory document, got {doc:?}"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,9 +192,12 @@ async fn disabled_node_resolution_returns_ok_none_for_unknown_did() {
 async fn rotation_is_reflected_by_resolve_through_shared_resolver() {
     use std::sync::Arc;
 
-    use scp_identity::resolver::{DidResolver, NoOpRelayQuerier};
-    use scp_identity::{DidDht, DidMethod, DualLayerResolver};
+    use scp_identity::resolver::DidResolver;
+    use scp_identity::{
+        BootstrapRelays, DidDht, DidMethod, DualLayerResolver, RealMultiRelayQuerier,
+    };
     use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
+    use scp_transport::native::TransportRelayQuerier;
 
     let custody = Arc::new(InMemoryKeyCustody::new());
     let pre_rotation = InMemoryPreRotationCustody::new();
@@ -194,17 +214,20 @@ async fn rotation_is_reflected_by_resolve_through_shared_resolver() {
 
     // The resolver shares the DID method's DHT client and cache — the same
     // wiring the node uses (build_shared_cache_key_resolver).
+    let relay_querier = Arc::new(TransportRelayQuerier::new());
+    let bootstrap: Arc<dyn BootstrapRelays> = relay_querier.clone();
     let resolver = DualLayerResolver::new(
-        Arc::new(NoOpRelayQuerier),
+        Arc::new(RealMultiRelayQuerier::new(relay_querier)),
         Arc::clone(did_dht.dht_client()),
         Arc::clone(did_dht.cache()),
-        Vec::new(),
+        bootstrap,
     );
 
     let before = resolver
         .resolve(&identity.did)
         .await
         .expect("resolve must not error")
+        .into_found()
         .expect("the published identity must resolve");
     let active_before = active_key_multibase(&before.document);
 
@@ -220,6 +243,7 @@ async fn rotation_is_reflected_by_resolve_through_shared_resolver() {
         .resolve(&rotated_identity.did)
         .await
         .expect("resolve must not error")
+        .into_found()
         .expect("the rotated identity must resolve");
     let active_after = active_key_multibase(&after.document);
 

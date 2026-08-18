@@ -49,7 +49,7 @@ use scp_did::DidDocument;
 // in-memory seam are both encapsulated in the single cfg-gated
 // `scp_ffi_common::dht::build_ffi_dht_client`; this bridge only maps its error.
 use scp_ffi_common::dht::FfiDhtClient;
-use scp_identity::{DidCache, DidDht, DidMethod, DualLayerResolver, NoOpRelayQuerier};
+use scp_identity::{DidCache, DidDht, DidMethod};
 // Only the testing-gated `identity_migrate` path constructs a `ScpIdentity`
 // value directly (production migration is unreachable — ADR-062 §Decision 6).
 #[cfg(feature = "testing")]
@@ -111,11 +111,18 @@ pub(crate) fn no_pre_rotation_backend() -> ScpPyError {
 
 /// Ensures the given bridge instance's production DID resolver is initialized.
 ///
-/// Creates a `DualLayerResolver` backed by the shared [`FfiDhtClient`] (the
-/// real Mainline Pkarr client in a shipped build, or the in-memory test seam
-/// under `testing`) and `NoOpRelayQuerier` (relay resolution will be upgraded
-/// when a production relay querier is available). The resolver is shared across
-/// all UCAN validation and attestation verification calls on the same bridge.
+/// Composes the resolver through the one shared builder every bridge calls,
+/// [`scp_ffi_common::build_production_did_resolver`]: the relay layer is the
+/// instance's [`TransportRelayQuerier`](scp_transport::native::TransportRelayQuerier)
+/// behind the production `RealMultiRelayQuerier` composer (§3.10.2), and the DHT
+/// layer is the shared [`FfiDhtClient`] (the real Mainline Pkarr client in a
+/// shipped build, or the in-memory test seam under `testing`). The resolver is
+/// shared across all UCAN validation and attestation verification calls on the
+/// same bridge.
+///
+/// The same querier object supplies the bootstrap relay URLs, so the resolver
+/// asks exactly the relays `transport_connect` has bound — including relays
+/// bound after this call (§3.10.4 step 3a, §18.5.1 priority 1).
 ///
 /// This is idempotent: subsequent calls are no-ops.
 ///
@@ -123,7 +130,8 @@ pub(crate) fn no_pre_rotation_backend() -> ScpPyError {
 /// the [`DhtInitError`](scp_ffi_common::dht::DhtInitError)-derived
 /// [`ScpPyError`] rather than substituting a nullifier.
 ///
-/// See #311 for the DID resolver unification design and ADR-062 §Decision 1.
+/// See #311 for the DID resolver unification design, ADR-062 §Decision 1, and
+/// the 2026-08-17 amendment to ADR-062 §Decision 5 for the relay-layer wiring.
 fn ensure_did_resolver_initialized_on(
     bi: &PyBridgeInstance,
     handle: tokio::runtime::Handle,
@@ -139,16 +147,13 @@ fn ensure_did_resolver_initialized_on(
     // governance vote verification) fails with "unknown voter". Scoped
     // per-instance to match where the resolver itself is stored.
     let dht_client = Arc::new(build_ffi_dht_client()?);
-    let relay_querier = Arc::new(NoOpRelayQuerier);
     let cache = Arc::new(DidCache::new());
-    let bootstrap_relays = Vec::new();
 
-    let resolver = Arc::new(DualLayerResolver::new(
-        relay_querier,
+    let resolver = scp_ffi_common::build_production_did_resolver(
+        bi.core.relay_querier(),
         Arc::clone(&dht_client),
         Arc::clone(&cache),
-        bootstrap_relays,
-    ));
+    );
 
     crate::runtime::init_did_resolver(bi, resolver, handle);
     crate::runtime::set_resolver_dht_client(bi, dht_client);

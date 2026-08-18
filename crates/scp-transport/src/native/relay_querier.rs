@@ -34,11 +34,22 @@
 //!
 //! DID resolvers are constructed at FFI init, before any relay connection
 //! exists, so the transport is bound **after** the querier is built via
-//! [`bind`](TransportRelayQuerier::bind). Until a relay URL is bound, a query
-//! for it returns an empty candidate list (fail-closed) — the composer then
-//! falls through to the next relay and the DHT layer (§3.10.4). No lock is ever
-//! held across an `.await`: the adapter handle is cloned out under a short
-//! synchronous lock, which is then dropped before the query future runs.
+//! [`bind`](TransportRelayQuerier::bind). A query for an unbound relay URL
+//! returns [`IdentityError::RelayNotConnected`] — a typed error, never an empty
+//! candidate list, because an empty list asserts that the relay answered and
+//! holds nothing, which this querier cannot claim about a relay it never
+//! reached. The composer skips the relay and, when no relay answers, reports the
+//! whole relay layer unavailable (§3.10.4). No lock is ever held across an
+//! `.await`: the adapter handle is cloned out under a short synchronous lock,
+//! which is then dropped before the query future runs.
+//!
+//! # Bootstrap relay set
+//!
+//! [`bound_relay_urls`](TransportRelayQuerier::bound_relay_urls) returns the
+//! relay URLs with a live binding, and the
+//! [`BootstrapRelays`](scp_identity::BootstrapRelays) impl exposes it to the
+//! resolver. The resolver reads it on every resolve, so a relay connected after
+//! the resolver was built is reachable (§3.10.4 step 3a, §18.5.1 priority 1).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -108,6 +119,33 @@ impl TransportRelayQuerier {
     fn adapter_for(&self, relay_url: &str) -> Option<Arc<dyn TransportAdapter>> {
         self.relays.read().ok()?.get(relay_url).cloned()
     }
+
+    /// Returns every relay URL that currently has a bound transport.
+    ///
+    /// This is the resolver's bootstrap relay set (spec §18.5.1 priority 1 —
+    /// the relays the caller explicitly configured and this instance connected).
+    /// A poisoned lock yields an empty list, which the composer reports as a
+    /// relay layer that could not answer.
+    #[must_use]
+    pub fn bound_relay_urls(&self) -> Vec<String> {
+        self.relays
+            .read()
+            .map(|relays| relays.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Supplies the resolver's bootstrap relay set from the live bindings.
+///
+/// A bridge builds its DID resolver at FFI init, before it connects any relay,
+/// and binds each relay into this querier as `transport_connect` establishes it.
+/// Reading the bound set on every resolve — rather than capturing a list at
+/// resolver-construction time — is what makes a relay connected after init
+/// reachable to the resolver (§3.10.4 step 3a).
+impl scp_identity::BootstrapRelays for TransportRelayQuerier {
+    fn bootstrap_relay_urls(&self) -> Vec<String> {
+        self.bound_relay_urls()
+    }
 }
 
 // The `RelayQuerier` trait uses RPITIT with an explicit `+ Send` bound; an
@@ -127,13 +165,17 @@ impl RelayQuerier for TransportRelayQuerier {
 
         async move {
             let Some(adapter) = adapter else {
-                // Fail-closed: no live transport for this relay. The composer
-                // falls through to the next relay / the DHT layer (§3.10.4).
+                // Fail-closed with a TYPED error, never an empty candidate list.
+                // An empty list would tell the composer "this relay answered and
+                // holds nothing", which is a claim this querier cannot make about
+                // a relay it never reached (§3.10.4). The composer skips this
+                // relay and, if no relay answers, reports the whole layer
+                // unavailable.
                 debug!(
                     relay_url = %relay_url,
-                    "TransportRelayQuerier: no live transport bound — returning no candidates"
+                    "TransportRelayQuerier: no live transport bound — reporting the relay unreachable"
                 );
-                return Ok(Vec::new());
+                return Err(IdentityError::RelayNotConnected(relay_url));
             };
 
             // QUERY limit N = 16 (§3.10.2), the one canonical N.
@@ -357,17 +399,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn unbound_relay_fails_closed_empty() {
-        let (vk, _sk) = keypair(9);
-        let did = did_of(&vk);
-        let rid = routing_id_of(&did);
-
-        // No bind() call — the querier has no transport for this URL.
-        let querier = TransportRelayQuerier::new();
-        let records = RelayQuerier::query(&querier, RELAY, &rid).await.unwrap();
-        assert!(records.is_empty(), "unbound relay must fail closed (empty)");
-    }
+    // The former `unbound_relay_fails_closed_empty` asserted that an unbound
+    // relay yields an EMPTY candidate list. That outcome is indistinguishable
+    // from "the relay answered and holds no record", which this querier cannot
+    // claim about a relay it never reached (§3.10.4). The stronger replacement
+    // is `unbound_relay_reports_not_connected_rather_than_no_candidates` below,
+    // which pins the typed `RelayNotConnected` error.
 
     // ------------------------------------------------------------------
     // AC 5 (querier/composer selection half): a genuine highest-seq record
@@ -529,5 +566,78 @@ mod tests {
 
         let result = RelayQuerier::query(&querier, RELAY, &rid).await;
         assert!(matches!(result, Err(IdentityError::RelayQueryFailed(_))));
+    }
+
+    /// An unbound relay URL yields a TYPED error, never an empty candidate list.
+    ///
+    /// An empty list would tell the composer "this relay answered and holds
+    /// nothing", which this querier cannot claim about a relay it never reached
+    /// (§3.10.4).
+    #[tokio::test]
+    async fn unbound_relay_reports_not_connected_rather_than_no_candidates() {
+        let (vk, _sk) = keypair(42);
+        let did = did_of(&vk);
+        let rid = routing_id_of(&did);
+
+        let querier = TransportRelayQuerier::new();
+
+        let result = RelayQuerier::query(&querier, RELAY, &rid).await;
+        match result {
+            Err(IdentityError::RelayNotConnected(url)) => assert_eq!(url, RELAY),
+            other => panic!("an unbound relay must report RelayNotConnected, got {other:?}"),
+        }
+    }
+
+    /// With no relay bound anywhere, the composer reports the relay layer as
+    /// unable to answer, not as a relay set that holds no record.
+    #[tokio::test]
+    async fn composer_errors_when_every_relay_is_unreachable() {
+        let (vk, _sk) = keypair(43);
+        let did = did_of(&vk);
+
+        let querier = Arc::new(TransportRelayQuerier::new());
+        let composer = RealMultiRelayQuerier::new(querier);
+
+        let result = composer.query(&did, &[RELAY.to_owned()]).await;
+        assert!(
+            matches!(result, Err(IdentityError::RelayQueryFailed(_))),
+            "every relay failing must surface as an error, not Ok(None)"
+        );
+    }
+
+    /// An empty relay URL list is "no relay is available to ask", not "the
+    /// relays hold no record".
+    #[tokio::test]
+    async fn composer_errors_when_no_relay_url_is_available() {
+        let (vk, _sk) = keypair(44);
+        let did = did_of(&vk);
+
+        let querier = Arc::new(TransportRelayQuerier::new());
+        let composer = RealMultiRelayQuerier::new(querier);
+
+        let result = composer.query(&did, &[]).await;
+        assert!(
+            matches!(result, Err(IdentityError::RelayNotConnected(_))),
+            "an empty relay list must surface as an error, not Ok(None)"
+        );
+    }
+
+    /// `bound_relay_urls` reports exactly the relays with a live binding, which
+    /// is the bootstrap relay set the resolver reads on every resolve
+    /// (§3.10.4 step 3a, §18.5.1 priority 1).
+    #[test]
+    fn bound_relay_urls_tracks_bind_and_unbind() {
+        use scp_identity::BootstrapRelays;
+
+        let querier = TransportRelayQuerier::new();
+        assert!(querier.bound_relay_urls().is_empty());
+
+        querier.bind(RELAY, Arc::new(MockRawAdapter::new(Vec::new())));
+        assert_eq!(querier.bound_relay_urls(), vec![RELAY.to_owned()]);
+        assert_eq!(querier.bootstrap_relay_urls(), vec![RELAY.to_owned()]);
+
+        querier.unbind(RELAY);
+        assert!(querier.bound_relay_urls().is_empty());
+        assert!(querier.bootstrap_relay_urls().is_empty());
     }
 }

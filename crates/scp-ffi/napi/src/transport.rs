@@ -283,8 +283,17 @@ pub(crate) async fn transport_connect_on(
             // `Box<dyn TransportAdapter>`; the blanket
             // `impl TransportAdapter for Box<dyn TransportAdapter>` lets it be
             // used anywhere a concrete adapter is expected.
-            let manager = scp_transport::TransportManager::new(adapter);
+            // Share ONE connected adapter between the two consumers of this
+            // relay: the `TransportManager` that sends and subscribes over it,
+            // and the DID relay querier that runs QUERY over it (§3.10.2).
+            let shared: Arc<dyn scp_transport::TransportAdapter> = Arc::from(adapter);
+
+            let manager = scp_transport::TransportManager::new(Box::new(Arc::clone(&shared)));
             set_transport_manager_on(bi, manager)?;
+
+            // Bind the same connection into the relay layer of DID resolution,
+            // so a DID published to this relay resolves (§3.10.4 step 3a).
+            bi.core.bind_relay_transport(relay_url.clone(), shared);
 
             // Register the URL on the bridge's pending-reconnect set so
             // `BridgeInstanceCore::resume` can rebuild the transport after
@@ -395,6 +404,9 @@ pub(crate) async fn transport_disconnect_on(
 
     if let Some(ref url) = disconnecting_url {
         bi.core.remove_relay_url(url);
+        // Stop the DID resolver from querying a relay this caller walked away
+        // from (§3.10.4 step 3a).
+        bi.core.unbind_relay_transport(url);
     }
 
     Ok(())
