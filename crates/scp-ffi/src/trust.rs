@@ -1041,13 +1041,18 @@ impl crate::scp::PyScp {
     /// agent-level evaluation.
     ///
     /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
-    /// as a JSON string. Uses the `BridgeInstance` storage provider for persistent
-    /// trust data when initialized (trust data survives across calls and restarts);
-    /// falls back to an ephemeral in-memory store otherwise.
+    /// as a JSON string. Reads and writes trust data through this instance's
+    /// configured storage provider, so cached attestations, revocation lists,
+    /// and challenge results survive across calls and restarts.
     ///
     /// # Errors
     ///
-    /// Returns `ScpError` if any JSON input is malformed or if aggregation fails.
+    /// Returns `ScpError` if any JSON input is malformed, if aggregation fails,
+    /// or — with code `SCP-VALID-7005` — if this instance has not allocated its
+    /// storage provider. An earlier version aggregated into an ephemeral
+    /// in-memory store in that case and reported success, which sent a
+    /// `SCP({"type": "sqlite", ...})` caller's trust writes somewhere that
+    /// caller never configured.
     ///
     /// See ADR-017 acceptance criterion 9, spec §7.3.
     #[pyo3(name = "aggregate_trust_input")]
@@ -1715,6 +1720,89 @@ mod tests {
         let result =
             py_check_capability_requirements("ctx-admission", subject, &requirements, "[]", &cvs);
         assert!(result.is_err());
+    }
+
+    /// A `PyScp` wrapping a `PyBridgeInstance` that never allocated a storage
+    /// provider — the state `PyBridgeInstance::new_py` leaves behind.
+    fn scp_without_storage() -> crate::scp::PyScp {
+        crate::scp::PyScp::from_bridge_instance(
+            Arc::new(crate::runtime::PyBridgeInstance::new_py()),
+        )
+    }
+
+    /// `aggregate_with_storage` raises `SCP-VALID-7005` when this instance holds
+    /// no storage provider, and the `aggregate_trust_input` docstring states
+    /// that. An earlier version substituted an ephemeral `InMemoryFfiTrustStore`
+    /// and reported success, so a caller who configured `SQLCipher` storage had
+    /// every cached attestation, revocation, and challenge result land in a
+    /// store that caller never configured. This test pins the raise: restoring
+    /// the fallback turns `is_err()` into `Ok`.
+    #[test]
+    fn aggregate_trust_input_fails_closed_without_a_storage_provider() {
+        let result = scp_without_storage().aggregate_trust_input(
+            "ctx-1",
+            "did:key:test",
+            "[]",
+            "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]",
+            "[]",
+            "{}",
+            "{}",
+            "[]",
+            "[]",
+        );
+        assert!(
+            result.is_err(),
+            "aggregation without a storage provider must raise, not aggregate \
+             into an ephemeral store"
+        );
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains(scp_ffi_common::error_codes::VALID_7005),
+            "expected {}, got: {err_str}",
+            scp_ffi_common::error_codes::VALID_7005
+        );
+    }
+
+    /// The §7.4.4 revocation list lives in this instance's storage, so a
+    /// verification that can read no list raises rather than reporting a verdict
+    /// that consulted nothing. The attestation JSON below parses and carries a
+    /// well-formed signature field, so the raise below is attributable to the
+    /// absent storage provider rather than to a parse failure.
+    #[test]
+    fn trust_verify_attestation_fails_closed_without_a_storage_provider() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let attestation = scp_core::trust::Attestation {
+                id: "att-no-storage".to_owned(),
+                attestation_type: scp_core::trust::AttestationType::Endorsement,
+                issuer: "did:key:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz11"
+                    .into(),
+                subject: "did:key:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz22"
+                    .into(),
+                claim: serde_json::json!({"skill": "rust"}),
+                evidence: None,
+                issued_at: 1000,
+                expires_at: Some(u64::MAX),
+                renewal_interval: None,
+                revocation_status: scp_core::trust::RevocationStatus::Active,
+                signature: vec![0u8; 64],
+                renewed_at: None,
+            };
+            let attestation_json = serde_json::to_string(&attestation).unwrap();
+            let result =
+                scp_without_storage().trust_verify_attestation(py, "ctx-1", &attestation_json);
+            assert!(
+                result.is_err(),
+                "verification without a storage provider must raise, not report \
+                 a verdict that read no revocation list"
+            );
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains(scp_ffi_common::error_codes::VALID_7005),
+                "expected {}, got: {err_str}",
+                scp_ffi_common::error_codes::VALID_7005
+            );
+        });
     }
 
     #[test]

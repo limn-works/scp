@@ -637,23 +637,22 @@ pub fn verified_attestations<S: TrustProtocolRepository>(
 ///
 /// # What this writes
 ///
-/// An attestation that carries an issuer-signed revocation of itself — the form
-/// §7.4.4 has an issuer publish, and the form [`is_issuer_signed_revocation`]
-/// recognizes — adds `revocation_list_key(issuer, id)` to this context's
-/// revocation list through
-/// [`add_revocations`](TrustProtocolRepository::add_revocations). An
-/// application that verifies a republished revoked copy therefore rejects a
-/// pre-revocation copy of that same id, from that same issuer, on every later
-/// call, without having to route that copy through
-/// [`populate_and_aggregate`] as well. A failed write propagates as a
-/// [`TrustError::StoreError`] rather than returning a verdict that dropped a
-/// revocation.
+/// Nothing. This function reads a revocation list and reports a verdict, and an
+/// application that hands it an attestation decides nothing about what a
+/// context's revocation list holds. A caller controls both the context id and
+/// the attestation bytes this op receives, so writing an entry per call would
+/// let that caller grow a context's revocation list without bound, and
+/// [`get_revocation_state`](TrustProtocolRepository::get_revocation_state)
+/// loads that whole list on every later verification in that context.
+/// [`verify_and_cache_attestations`] is the path that records a revocation,
+/// because a caller reaches it by asking to ingest and count an attestation
+/// rather than by asking a question about one.
 ///
 /// # Errors
 ///
-/// Returns [`TrustError::StoreError`] when the revocation-list read or that
-/// write fails, and the [`TrustError`] variant that `verify_attestation` raises
-/// when the attestation fails verification — including
+/// Returns [`TrustError::StoreError`] when the revocation-list read fails, and
+/// the [`TrustError`] variant that `verify_attestation` raises when the
+/// attestation fails verification — including
 /// [`TrustError::AttestationRevoked`] when this context's revocation list names
 /// this attestation's issuer together with its id.
 pub fn verify_attestation_in_context<S: TrustProtocolRepository>(
@@ -665,32 +664,7 @@ pub fn verify_attestation_in_context<S: TrustProtocolRepository>(
 ) -> Result<(), TrustError> {
     let revoked = store.get_revocation_state(context_id)?;
     let revocation_checker = RevocationMapChecker { revoked: &revoked };
-    let outcome = scp_core::trust::verify_attestation(
-        attestation,
-        resolver,
-        clock,
-        Some(&revocation_checker),
-    );
-
-    // Record what this verification learned, on the same terms the ingest path
-    // applies. Section 7.4.4 has an issuer publish a revocation by republishing
-    // a genuinely-signed revoked copy, and this op is where an application
-    // hands such a copy to the SDK. Reading that copy and forgetting it would
-    // leave a holder of a pre-revocation copy of the same id, from that same
-    // issuer, verifying afterwards.
-    if let Err(reason) = &outcome
-        && is_issuer_signed_revocation(reason, attestation)
-    {
-        let key = revocation_list_key(&attestation.issuer, &attestation.id);
-        if !revoked.get(&key).copied().unwrap_or(false) {
-            // A failed write propagates rather than reporting a verdict that
-            // dropped a revocation, matching how this module treats a failed
-            // `get_revocation_state`.
-            store.add_revocations(context_id, std::slice::from_ref(&key))?;
-        }
-    }
-
-    outcome
+    scp_core::trust::verify_attestation(attestation, resolver, clock, Some(&revocation_checker))
 }
 
 #[cfg(test)]
@@ -2528,18 +2502,25 @@ mod tests {
         );
     }
 
-    /// SECURITY (revocation write-back on the verify op, §7.4.4). Section 7.4.4
-    /// has an issuer publish a revocation by republishing a genuinely-signed
-    /// revoked copy, and `trust_verify_attestation` is where an application
-    /// hands such a copy to the SDK. A verification that read that copy and
-    /// forgot it would leave a holder of a pre-revocation copy of the same id
-    /// verifying afterwards, for as long as that application never routed a
-    /// revoked copy through `trust_aggregate`. This test pins the write:
-    /// removing it turns the second assertion's expected `AttestationRevoked`
-    /// into `Ok(())`.
+    /// SECURITY (the verify op writes nothing, §7.4.4).
+    /// [`verify_attestation_in_context`] answers a question about one
+    /// attestation, and a caller controls both the context id and the
+    /// attestation bytes it hands that op. Recording a revocation there would
+    /// let that caller add one entry per call to a context's revocation list —
+    /// an attacker derives a DID from a fresh keypair at no cost and signs a
+    /// self-revoking attestation, so each call costs it one Ed25519 signature —
+    /// and `get_revocation_state` loads that whole list on every later
+    /// verification in that context. [`verify_and_cache_attestations`] is the
+    /// path that records a revocation, because a caller reaches it by asking to
+    /// ingest and count an attestation.
+    ///
+    /// This test pins that absence: restoring an `add_revocations` call inside
+    /// [`verify_attestation_in_context`] turns the last two assertions below
+    /// from an empty list plus `Ok(())` into a one-entry list plus
+    /// `Err(AttestationRevoked)`.
     #[test]
-    fn verifying_a_republished_revoked_copy_bars_a_later_pre_revocation_copy() {
-        let context_id = "ctx-verify-op-writes-back";
+    fn verifying_a_republished_revoked_copy_records_nothing() {
+        let context_id = "ctx-verify-op-writes-nothing";
         let subject_did =
             "did:key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc99";
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[67u8; 32]);
@@ -2552,12 +2533,9 @@ mod tests {
         let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
         let clock = scp_clock::SystemClock;
 
-        // Control: the pre-revocation copy verifies before anything records a
-        // revocation, so the rejection below is attributable to that write.
-        verify_attestation_in_context(&store, context_id, &active_copy, &resolver, &clock)
-            .expect("a signed, unexpired, unlisted attestation verifies");
-
-        // An application verifies the republished revoked copy.
+        // An application verifies the republished revoked copy. Step 4 of
+        // `verify_attestation` reads the signed `Revoked` field that copy
+        // carries, so the verdict rejects it.
         let revoked_read =
             verify_attestation_in_context(&store, context_id, &revoked_copy, &resolver, &clock);
         assert!(
@@ -2565,26 +2543,19 @@ mod tests {
             "a revoked copy must not verify, got {revoked_read:?}"
         );
 
-        // That verification recorded the revocation, so the pre-revocation copy
-        // stops verifying.
-        let after =
-            verify_attestation_in_context(&store, context_id, &active_copy, &resolver, &clock);
+        // That verification recorded nothing, so this context's revocation list
+        // still holds no entry.
+        let listed = store.get_revocation_state(context_id).unwrap();
         assert!(
-            matches!(
-                &after,
-                Err(TrustError::AttestationRevoked { attestation_id, .. })
-                    if attestation_id == "att-verify-writeback"
-            ),
-            "verifying a republished revoked copy must bar a pre-revocation copy, got {after:?}"
+            listed.is_empty(),
+            "the verify op must not write a revocation list entry, list holds {listed:?}"
         );
 
-        // That write is issuer-scoped: another issuer's attestation carrying
-        // that same id keeps verifying.
-        let other_key = ed25519_dalek::SigningKey::from_bytes(&[71u8; 32]);
-        let other_issuer_copy =
-            make_genuinely_signed("att-verify-writeback", subject_did, &other_key);
-        verify_attestation_in_context(&store, context_id, &other_issuer_copy, &resolver, &clock)
-            .expect("one issuer's revocation must not reject another issuer's attestation");
+        // A pre-revocation copy of that same id therefore still verifies: an
+        // ingest through `verified_attestations`, not a verification, is what
+        // records a revocation.
+        verify_attestation_in_context(&store, context_id, &active_copy, &resolver, &clock)
+            .expect("no revocation was recorded, so this copy still verifies");
     }
 
     /// SECURITY (issuer-scoped revocation across a writer and a reader). One

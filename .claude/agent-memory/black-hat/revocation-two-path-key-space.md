@@ -22,6 +22,24 @@ revocation list on every bridge").
   scan, not `LIKE`, so an underscore in a context id is not a wildcard.
 - Every non-test `AttestationRevocationChecker` implementation is issuer-scoped.
 
+## Status of each finding at `cda7215734`
+
+Commits after `29d9eacc97` closed R1, R4, R5, R6, and R7, and this file's entries
+for those five describe `29d9eacc97` rather than head. R8 closed on
+2026-08-17 in the same commit that withdrew R2. R3 and R9 stay open.
+
+| Finding | State at `cda7215734` | What closed it |
+| --- | --- | --- |
+| R1 cross-issuer cache overwrite | closed | `attestation_key` hashes `revocation_list_key(issuer, id)`; the FFI in-memory store matches on issuer AND id |
+| R2 verify op never writes | withdrawn — see below | the write-back that closed it is reverted |
+| R3 whole-list read per verification | open | — |
+| R4 revocation replace deletes first | closed | `store_trust_revocation_state` writes every named entry, then deletes only the entries the new map omits |
+| R5 twin checkers | closed | one `pub RevocationMapChecker` in `scp_protocol::trust::aggregate`; `RevocationStateChecker` deleted |
+| R6 batch abort discards revocations | closed | the INFRA arm calls `write_revocations` before returning |
+| R7 no subject binding on ingest | closed | `verify_and_cache_attestations` takes `subject_did` and drops an entry naming another subject |
+| R8 stale aggregation doc | closed | `PyScp::aggregate_trust_input`'s docstring states the `SCP-VALID-7005` raise, and two tests pin it |
+| R9 `renew_attestation` has no production caller | open | — |
+
 ## What does not
 
 **R1 (HIGH) — the attestation CACHE is keyed on a bare id, so the issuer-scoped
@@ -38,12 +56,27 @@ own copy, and `revocation_list_key(A, X)` drops the slot that used to hold
 keys on `(ctx, subject, ISSUER, id)` — strictly finer than every production
 store — so the guard cannot observe the collision.
 
-**R2 (HIGH) — `trust_verify_attestation` reads the list and never writes it.**
-`verify_attestation_in_context`
+**R2 (HIGH, WITHDRAWN 2026-08-17) — `trust_verify_attestation` reads the list
+and never writes it.** `verify_attestation_in_context`
 (`crates/scp-ffi/common/src/trust_store.rs:607-617`) is read-only. Only
 `verify_and_cache_attestations` writes, and only `trust_aggregate` /
 `participation_record` reach it. An app whose verification entry point is
 `trust_verify_attestation` never records a revocation it just saw.
+
+*Withdrawn.* Commit `cda7215734` closed R2 by calling `add_revocations` from
+`verify_attestation_in_context`, and that fix trades R2 for R3 at a worse
+exchange rate. A caller supplies both the context id and the attestation bytes
+that op receives, so a write there hands that caller one durable revocation-list
+entry per call, priced at one Ed25519 signature over a DID the caller derives
+from a fresh keypair. R3's read then charges every later verification in that
+context for the entries the caller added. An orchestrating agent ruled on
+pull request #2366 that the revocation write-back is deleted, and applied the
+same ruling to pull request #2371; commit `cda7215734`'s write-back is reverted
+under it. **The general lesson: closing a read-only-path finding by adding a
+durable write to that path is a defect whenever a caller reaches the path
+directly, because it converts a caller's question into a caller's write.**
+`verifying_a_republished_revoked_copy_records_nothing`
+(`crates/scp-ffi/common/src/trust_store.rs`) pins the absence.
 
 **R3 (MED-HIGH) — `get_revocation_state` loads the whole list per verification.**
 `load_trust_revocation_state` (`crates/scp-runtime/src/store/trust.rs:253-266`)

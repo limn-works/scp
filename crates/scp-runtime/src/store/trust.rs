@@ -8,7 +8,7 @@
 //! # Key convention
 //!
 //! ```text
-//! trust/{context_id}/attestation/{subject_did}/{attestation_id}
+//! trust/{context_id}/attestation/{subject_did}/{sha256_hex(revocation_list_key)}
 //! trust/{context_id}/revocation/{sha256_hex(revocation_list_key)}
 //! trust/{context_id}/challenge/{subject_did}/{verification_id}
 //! ```
