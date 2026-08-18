@@ -105,7 +105,7 @@ if (scp === null) {
       // The dummy signature cannot verify — but a structured `valid: false`
       // result (not a parse error) proves the serialized envelope reached the
       // real verifier.
-      const result = live.trustVerifyAttestation(attestation) as {
+      const result = live.trustVerifyAttestation("ctx-verify-ffi", attestation) as {
         valid: boolean;
         errorMessage: string;
       };

@@ -359,7 +359,11 @@ final class ChallengeTrustInputCallThroughTests: XCTestCase {
         // The dummy signature cannot verify — a structured `valid: false`
         // (not a thrown parse error) proves the envelope reached the real
         // verifier.
-        let result = try trustVerifyAttestation(attestation: makeAttestationEnvelope())
+        let scp = try SCP(storage: .inMemory)
+        let result = try scp.trustVerifyAttestation(
+            contextId: "ctx-verify-ffi",
+            attestation: makeAttestationEnvelope()
+        )
         XCTAssertFalse(result.valid)
         XCTAssertFalse(result.errorMessage.isEmpty)
     }

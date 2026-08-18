@@ -29,7 +29,7 @@ use scp_event_log::Event;
 use super::attestation::{
     Attestation, AttestationRevocationChecker, AttestorInfo, DidPublicKeyResolver, FreshnessStatus,
     ThresholdCheckInput, ThresholdRequirement, check_attestation_freshness,
-    check_threshold_attestation, verify_attestation, verify_attestation_with_revocation,
+    check_threshold_attestation, verify_attestation,
 };
 use super::challenge::{ChallengeVerification, verify_challenge_verification};
 use super::consequence::ConsequenceRule;
@@ -74,8 +74,9 @@ pub trait TrustProtocolRepository: Send + Sync {
     /// returned unverified by [`AttestationCache::get_verified_attestations`].
     /// Untrusted attestations MUST instead go through
     /// [`AttestationCache::verify_and_cache`], which verifies the signature,
-    /// expiry, and revocation against the resolver-resolved issuer key and stamps
-    /// a trusted `verified_at` before calling this method.
+    /// the expiry, and the revocation status against the resolver-resolved
+    /// issuer key and stamps a trusted `verified_at` before calling this
+    /// method.
     ///
     /// # Errors
     ///
@@ -198,7 +199,9 @@ pub fn revocation_list_key(issuer: &DID, attestation_id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// [`AttestationRevocationChecker`] backed by a context's persisted revocation
-/// list — an `issuer + attestation_id -> revoked` map from
+/// list.
+///
+/// That list is an `issuer + attestation_id -> revoked` map from
 /// [`TrustProtocolRepository::get_revocation_state`], whose keys
 /// [`revocation_list_key`] builds.
 ///
@@ -206,9 +209,22 @@ pub fn revocation_list_key(issuer: &DID, attestation_id: &str) -> String {
 /// enforces context revocation, not only the ingest path: a cached attestation
 /// that is later context-revoked is dropped on read (even while still inside its
 /// cache TTL) rather than continuing to inflate trust until TTL expiry.
-struct RevocationMapChecker<'a> {
+///
+/// SECURITY (one lookup rule, not two). Every path that answers step 5 of
+/// [`verify_attestation`] from a persisted revocation list constructs THIS
+/// type: the read path here, the FFI ingest path, and each bridge's
+/// `trust_verify_attestation` op through
+/// `scp_ffi_common::trust_store::verify_attestation_in_context`. A second copy
+/// of this body in another crate would let one path's default, or one path's
+/// key, drift from another's while both compiled and every test passed, and a
+/// reader consulting a different rule from a writer is the defect
+/// [`revocation_list_key`] exists to prevent.
+pub struct RevocationMapChecker<'a> {
     /// `revocation_list_key(issuer, attestation_id) -> revoked` for the context.
-    revoked: &'a HashMap<String, bool>,
+    ///
+    /// A caller builds every key it inserts with [`revocation_list_key`]; a bare
+    /// attestation id is not a key.
+    pub revoked: &'a HashMap<String, bool>,
 }
 
 impl AttestationRevocationChecker for RevocationMapChecker<'_> {
@@ -309,8 +325,9 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
     ///
     /// SECURITY: returning fresh entries WITHOUT re-verification is sound only
     /// because `verified_at` is a TRUSTED stamp — it is set exclusively by
-    /// [`Self::verify_and_cache`] AFTER a successful signature/expiry/revocation
-    /// check (and re-stamped here after a successful re-verification). The cache
+    /// [`Self::verify_and_cache`] AFTER a successful
+    /// signature/expiry/revocation check (and re-stamped here after a
+    /// successful re-verification). The cache
     /// invariant is therefore "fresh ⟹ verified within TTL". Callers MUST NOT
     /// populate the backing store with caller-controlled `verified_at` via the
     /// raw [`TrustProtocolRepository::store_cached_attestation`]; untrusted
@@ -371,7 +388,7 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
                 // parse, no network), so no transient fault can spuriously drop a
                 // valid entry. A future networked/fallible resolver swap MUST
                 // revisit this to separate rejections from infra faults.
-                if verify_attestation_with_revocation(
+                if verify_attestation(
                     &entry.attestation,
                     resolver,
                     clock,
@@ -407,10 +424,16 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         Ok(result)
     }
 
-    /// Verifies and caches a new attestation.
+    /// Verifies a new attestation and caches it when verification succeeds.
     ///
-    /// Verifies the attestation, and if valid, stores it in the cache with
-    /// the current timestamp and configured TTL.
+    /// [`verify_attestation`] checks the signature, the evidence, the expiry,
+    /// the issuer-signed `revocation_status` field, and the supplied
+    /// [`AttestationRevocationChecker`]. An attestation that is
+    /// validly signed but listed in the context's external revocation list is
+    /// rejected, so this method neither caches nor counts it. A caller that
+    /// holds no revocation list passes `None`, which restricts revocation
+    /// checking to the issuer-signed `revocation_status` field and records that
+    /// restriction at a call site a reader can grep.
     ///
     /// # Errors
     ///
@@ -421,42 +444,9 @@ impl<S: TrustProtocolRepository> AttestationCache<S> {
         attestation: &Attestation,
         resolver: &impl DidPublicKeyResolver,
         clock: &impl Clock,
-    ) -> Result<(), TrustError> {
-        verify_attestation(attestation, resolver, clock)?;
-
-        let entry = CachedAttestation {
-            attestation: attestation.clone(),
-            verified_at: clock.now_secs(),
-            ttl_secs: self.ttl_secs,
-        };
-        self.store.store_cached_attestation(context_id, entry)?;
-
-        Ok(())
-    }
-
-    /// Verifies and caches a new attestation, additionally consulting an
-    /// external revocation checker.
-    ///
-    /// Identical to [`verify_and_cache`](Self::verify_and_cache) except the
-    /// supplied [`AttestationRevocationChecker`] is queried during verification
-    /// (via [`verify_attestation_with_revocation`]). An attestation that is
-    /// validly signed but listed in the context's external revocation list is
-    /// rejected, so it is neither cached nor counted. Passing `None` makes this
-    /// behave exactly like `verify_and_cache` (issuer-bound `revocation_status`
-    /// field only).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustError`] if verification or caching fails.
-    pub fn verify_and_cache_with_revocation(
-        &self,
-        context_id: &str,
-        attestation: &Attestation,
-        resolver: &impl DidPublicKeyResolver,
-        clock: &impl Clock,
         revocation_checker: Option<&dyn AttestationRevocationChecker>,
     ) -> Result<(), TrustError> {
-        verify_attestation_with_revocation(attestation, resolver, clock, revocation_checker)?;
+        verify_attestation(attestation, resolver, clock, revocation_checker)?;
 
         let entry = CachedAttestation {
             attestation: attestation.clone(),

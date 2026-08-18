@@ -41,6 +41,7 @@ Example usage::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from dataclasses import dataclass
@@ -70,6 +71,7 @@ if TYPE_CHECKING:
         AttestorInfo,
         BehavioralRecord,
         CachedAttestation,
+        CachedAttestationEnvelope,
         CapabilityValidation,
         ChallengeVerification,
         EventLogEntry,
@@ -2365,6 +2367,50 @@ class SCP:
     async def trust_query_score(self, did: str, context_id: str) -> Any:
         """Delegate to ``_scp_core.SCP.trust_query_score``."""
         return await asyncio.to_thread(self._native.trust_query_score, did, context_id)
+
+    async def trust_verify_attestation(
+        self,
+        context_id: str,
+        attestation: CachedAttestationEnvelope | dict[str, Any],
+    ) -> Any:
+        """Verify an attestation against ``context_id`` (ADR-017, §7.4.4).
+
+        Checks the Ed25519 signature against the issuer key the resolver
+        returns, the evidence, the expiry, the issuer-signed
+        ``revocation_status`` field, and ``context_id``'s persisted revocation
+        list. Section 7.4.4 of the trust spec states that revocation is
+        immediate for a new verification, and a holder of a pre-revocation copy
+        still carries ``revocation_status: Active``, so reading the revocation
+        list is what rejects that holder's copy.
+
+        Takes the typed attestation envelope
+        (:class:`~scp_sdk.trust.CachedAttestationEnvelope` — the same wire DTO
+        the cached-attestation inputs use) and serializes it to the serde wire
+        shape internally (ADR-058) before crossing FFI.
+
+        Args:
+            context_id: The context whose revocation list this verification
+                reads.
+            attestation: The typed attestation envelope (or a raw
+                equivalently-shaped dict).
+
+        Returns:
+            A dict with ``valid`` (bool), ``chain_depth`` (int), and ``error``
+            (str | None — the verification failure reason when ``valid`` is
+            ``False``).
+
+        Raises:
+            ValueError: If ``context_id`` fails format validation, if the
+                serialized envelope fails bridge deserialization, or if this
+                instance has not allocated its storage provider (the revocation
+                list lives in that storage, so verification fails closed rather
+                than reporting a verdict that consulted no list).
+        """
+        return await asyncio.to_thread(
+            self._native.trust_verify_attestation,
+            context_id,
+            json.dumps(attestation),
+        )
 
     async def evaluate_trust(
         self,

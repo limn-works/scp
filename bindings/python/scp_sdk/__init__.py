@@ -201,7 +201,6 @@ from scp_sdk.trust import (
     check_capability_requirements,
     evaluate_trust,
     trust_create_challenge,
-    trust_verify_attestation,
     trust_verify_response,
     verify_participation_requirements,
 )
@@ -365,7 +364,6 @@ __all__ = [
     "policy_requires_payment",
     "run_sync",
     "trust_create_challenge",
-    "trust_verify_attestation",
     "trust_verify_response",
     "validate_admission",
     "validate_broadcast_key_hex",

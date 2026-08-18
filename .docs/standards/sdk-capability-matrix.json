@@ -708,7 +708,7 @@
           "typescript": true,
           "kotlin": true,
           "swift": true,
-          "notes": "Attestation verification op (ADR-017, §7.4): all four SDKs expose an idiomatic typed wrapper taking the CachedAttestationEnvelope wire DTO (Python scp_sdk.trust_verify_attestation, TypeScript SCP.trustVerifyAttestation, Kotlin SCP.trustVerifyAttestation, Swift free function trustVerifyAttestation per ADR-048 §1 + §7)."
+          "notes": "Attestation verification op (ADR-017, §7.4.4): all four SDKs expose an idiomatic typed wrapper taking a context id plus the CachedAttestationEnvelope wire DTO (Python SCP.trust_verify_attestation, TypeScript SCP.trustVerifyAttestation, Kotlin SCP.trustVerifyAttestation, Swift SCP.trustVerifyAttestation). The op reads that context's persisted revocation list, which ADR-048 §1 makes a per-instance operation rather than a pure helper, so every SDK surfaces it as an SCP method."
         },
         {
           "name": "trust_verify_response",

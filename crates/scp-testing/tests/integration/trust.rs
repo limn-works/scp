@@ -301,7 +301,7 @@ async fn attestation_verify_roundtrip() {
     resolver.add(&issuer_did, vk.to_bytes().to_vec());
 
     let clock = FixedClock(2000);
-    let result = verify_attestation(&att, &resolver, &clock);
+    let result = verify_attestation(&att, &resolver, &clock, None);
     assert!(result.is_ok(), "verify_attestation failed: {result:?}");
 }
 

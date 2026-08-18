@@ -6908,37 +6908,6 @@ pub fn trust_query_score(did: String, context_id: String) -> Result<TrustScoreRe
     })
 }
 
-/// Verifies an attestation's Ed25519 signature, evidence, expiry, and
-/// revocation status.
-///
-/// See ADR-017 Layer 3 (Attestation).
-#[uniffi::export]
-pub fn trust_verify_attestation(
-    attestation_json: String,
-) -> Result<AttestationVerificationResult, ScpError> {
-    let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse attestation JSON: {e}"),
-            code: codes::VALID_7012.to_owned(),
-        })?;
-
-    let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-    let clock = scp_clock::SystemClock;
-
-    match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
-        Ok(()) => Ok(AttestationVerificationResult {
-            valid: true,
-            chain_depth: 1,
-            error_message: String::new(),
-        }),
-        Err(e) => Ok(AttestationVerificationResult {
-            valid: false,
-            chain_depth: 0,
-            error_message: format!("{e}"),
-        }),
-    }
-}
-
 /// Creates a challenge request for capability verification.
 ///
 /// See ADR-017 Layer 3 (Challenge-Response).
@@ -7205,6 +7174,29 @@ fn run_verified_attestations<S: scp_platform::traits::Storage + 'static>(
         context_id,
         subject_did,
         cached_attestations,
+    )
+}
+
+/// Builds a `ProtocolRepositoryTrustBridge` over the concrete backend behind a
+/// [`ProtocolRepoVariant`](crate::runtime::ProtocolRepoVariant) arm and verifies
+/// one attestation against that context's revocation list. Single source of
+/// truth for the per-backend verification path: both variants route through
+/// this one generic body (mirroring the `PyO3` and napi-rs bridges'
+/// `run_verify_attestation`).
+fn run_verify_attestation<S: scp_platform::traits::Storage + 'static>(
+    repo: &std::sync::Arc<scp_core::store::ProtocolRepository<S>>,
+    context_id: &str,
+    attestation: &scp_core::trust::Attestation,
+) -> Result<(), scp_core::trust::TrustError> {
+    let handle = runtime().handle().clone();
+    let bridge =
+        scp_core::trust::ProtocolRepositoryTrustBridge::new(std::sync::Arc::clone(repo), handle);
+    scp_ffi_common::trust_store::verify_attestation_in_context(
+        &bridge,
+        context_id,
+        attestation,
+        &scp_core::trust::IdentityDidPublicKeyResolver,
+        &scp_clock::SystemClock,
     )
 }
 
@@ -17064,6 +17056,68 @@ impl Scp {
         }
     }
 
+    /// Verifies an attestation against `context_id`.
+    ///
+    /// Checks the Ed25519 signature against the resolver-resolved issuer key,
+    /// the evidence, the expiry, the issuer-signed `revocation_status` field,
+    /// and this context's persisted revocation list, which THIS instance's
+    /// `ProtocolRepository` variant holds. Section 7.4.4 of
+    /// `.docs/specs/07-trust-validation-and-capabilities.md` states that
+    /// revocation is immediate for a new verification, and a holder of a
+    /// pre-revocation copy still carries `revocation_status: Active`, so the
+    /// revocation-list read is what rejects that holder's copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScpError::Validation`] when `context_id` fails format
+    /// validation or the attestation JSON is malformed. A verification failure
+    /// is reported in the returned [`AttestationVerificationResult`], not as an
+    /// error.
+    ///
+    /// See ADR-017 Layer 3 (Attestation) and spec §7.4.4.
+    pub fn trust_verify_attestation(
+        &self,
+        context_id: String,
+        attestation_json: String,
+    ) -> Result<AttestationVerificationResult, ScpError> {
+        // Full format validation (matching the PyO3 reference bridge), not just
+        // a non-empty check, so all native bridges reject malformed ids
+        // identically.
+        validate_context_id(&context_id)?;
+
+        let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse attestation JSON: {e}"),
+                code: codes::VALID_7012.to_owned(),
+            })?;
+
+        // Per-instance dispatch cannot be `None` — each `UniffiBridgeInstance`
+        // owns a concrete `ProtocolRepoVariant` from construction, so this
+        // verification always reaches the same revocation list that
+        // `aggregate_trust_input` and `participation_record` write and read.
+        let outcome = match self.inner.protocol_repository() {
+            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                run_verify_attestation(repo, &context_id, &attestation)
+            }
+            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                run_verify_attestation(repo, &context_id, &attestation)
+            }
+        };
+
+        match outcome {
+            Ok(()) => Ok(AttestationVerificationResult {
+                valid: true,
+                chain_depth: 1,
+                error_message: String::new(),
+            }),
+            Err(e) => Ok(AttestationVerificationResult {
+                valid: false,
+                chain_depth: 0,
+                error_message: format!("{e}"),
+            }),
+        }
+    }
+
     /// Computes the structured participation record (§7.3.2) for `subject_did`
     /// in `context_id`.
     ///
@@ -20038,8 +20092,104 @@ mod tests {
 
     #[test]
     fn trust_verify_attestation_rejects_invalid_json_with_code() {
-        let result = trust_verify_attestation("not json".to_owned());
+        let result = scp_test().trust_verify_attestation("ctx-1".to_owned(), "not json".to_owned());
         assert_eq!(validation_code(&result.unwrap_err()), codes::VALID_7012);
+    }
+
+    #[test]
+    fn trust_verify_attestation_rejects_malformed_context_id() {
+        let result = scp_test().trust_verify_attestation(String::new(), "{}".to_owned());
+        assert!(
+            result.is_err(),
+            "an empty context_id must not reach verification"
+        );
+    }
+
+    /// A context-revoked attestation must report `valid == false`. This test
+    /// signs an attestation whose own `revocation_status` reads `Active` — the
+    /// copy a holder keeps after an issuer publishes a revoked replacement —
+    /// writes its id into that context's revocation list through the same
+    /// repository this bridge reads, and verifies it again.
+    ///
+    /// Passing `None` for the revocation checker inside
+    /// `verify_attestation_in_context` turns this `valid == false` back into
+    /// `valid == true`, so this assertion fails the moment that regression
+    /// lands.
+    #[test]
+    fn trust_verify_attestation_reports_a_context_revoked_attestation_invalid() {
+        use ed25519_dalek::Signer;
+        use scp_core::trust::aggregate::TrustProtocolRepository;
+
+        let scp = scp_test();
+        let context_id = "ctx-revocation-read";
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[25u8; 32]);
+        let pubkey: [u8; 32] = signing_key.verifying_key().to_bytes();
+        let issuer = scp_did::did_dht_from_public_key(&pubkey);
+        let mut attestation = scp_core::trust::Attestation {
+            id: "att-revoked-by-context".to_owned(),
+            attestation_type: scp_core::trust::AttestationType::Endorsement,
+            issuer,
+            subject: "did:key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc33"
+                .into(),
+            claim: serde_json::json!({"skill": "rust"}),
+            evidence: None,
+            issued_at: 1000,
+            expires_at: Some(u64::MAX),
+            renewal_interval: None,
+            revocation_status: scp_core::trust::RevocationStatus::Active,
+            signature: Vec::new(),
+            renewed_at: None,
+        };
+        let canonical = scp_core::trust::canonical_attestation_bytes(&attestation).unwrap();
+        attestation.signature = signing_key.sign(&canonical).to_bytes().to_vec();
+        let attestation_json = serde_json::to_string(&attestation).unwrap();
+
+        let before = scp
+            .trust_verify_attestation(context_id.to_owned(), attestation_json.clone())
+            .unwrap();
+        assert!(
+            before.valid,
+            "a signed, unexpired, unlisted attestation verifies: {}",
+            before.error_message
+        );
+
+        let mut state = std::collections::HashMap::new();
+        // A revocation-list key binds an issuer to an attestation id, because
+        // §7.4.4 grants a revocation to that issuer alone.
+        state.insert(
+            scp_core::trust::aggregate::revocation_list_key(
+                &attestation.issuer,
+                "att-revoked-by-context",
+            ),
+            true,
+        );
+        let handle = runtime().handle().clone();
+        match scp.inner.protocol_repository() {
+            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle)
+                    .store_revocation_state(context_id, &state)
+                    .unwrap();
+            }
+            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle)
+                    .store_revocation_state(context_id, &state)
+                    .unwrap();
+            }
+        }
+
+        let after = scp
+            .trust_verify_attestation(context_id.to_owned(), attestation_json)
+            .unwrap();
+        assert!(
+            !after.valid,
+            "a context-revoked attestation must not verify (§7.4.4)"
+        );
+        assert!(
+            after.error_message.contains("revoked"),
+            "expected a revocation error, got: {}",
+            after.error_message
+        );
     }
 
     #[test]

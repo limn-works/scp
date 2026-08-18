@@ -8,7 +8,7 @@
 //! # Key convention
 //!
 //! ```text
-//! trust/{context_id}/attestation/{subject_did}/{attestation_id}
+//! trust/{context_id}/attestation/{subject_did}/{sha256_hex(revocation_list_key)}
 //! trust/{context_id}/revocation/{sha256_hex(revocation_list_key)}
 //! trust/{context_id}/challenge/{subject_did}/{verification_id}
 //! ```
@@ -31,16 +31,41 @@ use scp_protocol::trust::challenge::ChallengeVerification;
 
 /// Builds the storage key for a cached attestation.
 ///
-/// Format: `trust/{context_id}/attestation/{subject_did}/{attestation_id}`
+/// Format: `trust/{context_id}/attestation/{subject_did}/{sha256_hex(issuer + id)}`
+///
+/// SECURITY (cross-issuer cache overwrite, issue #2335 finding 13). §7.4.1 of
+/// `.docs/specs/07-trust-validation-and-capabilities.md` describes
+/// `Attestation.id` as a UUID v4 an issuer chooses and states no rule deriving
+/// that id from its issuer, so two issuers can carry one id. A cache key built
+/// from a subject plus a bare id therefore lets one issuer's entry replace
+/// another's: an attacker derives a DID from a fresh keypair at no cost
+/// (`IdentityDidPublicKeyResolver` reads a public key out of a DID string, so
+/// no publication gates it), signs an attestation carrying an honest issuer's
+/// id, and one ingest overwrites the honest issuer's cached entry. Keying on
+/// `revocation_list_key(issuer, id)` — whose leading issuer byte length makes
+/// that join injective — gives each issuer its own slot, which is the same
+/// scoping a context's revocation list already applies.
+///
+/// The joined value is hashed for the same reason
+/// [`revocation_entry_key`] hashes: a caller chooses both an issuer DID and an
+/// attestation id, so those bytes must never reach a storage path, and a
+/// fixed-width hex component is one `sanitize_key_component` always accepts.
 fn attestation_key(
     context_id: &str,
     subject_did: &str,
+    issuer: &scp_did::DID,
     attestation_id: &str,
 ) -> Result<String, StoreError> {
+    use sha2::{Digest, Sha256};
     let ctx = sanitize_key_component(context_id)?;
     let subject = sanitize_key_component(subject_did)?;
-    let att = sanitize_key_component(attestation_id)?;
-    Ok(format!("trust/{ctx}/attestation/{subject}/{att}"))
+    let digest = Sha256::digest(
+        scp_protocol::trust::aggregate::revocation_list_key(issuer, attestation_id).as_bytes(),
+    );
+    Ok(format!(
+        "trust/{ctx}/attestation/{subject}/{}",
+        hex::encode(digest)
+    ))
 }
 
 /// Builds the prefix for listing all cached attestations for a subject DID
@@ -126,9 +151,10 @@ fn challenge_prefix(context_id: &str, subject_did: &str) -> Result<String, Store
 impl<S: Storage> ProtocolRepository<S> {
     /// Stores a cached attestation entry.
     ///
-    /// The key includes the attestation's subject DID and unique ID, so
-    /// storing the same attestation ID again replaces the previous entry
-    /// (replace-by-ID semantics).
+    /// The key includes the attestation's subject DID, its issuer, and its id,
+    /// so storing the same id from the same issuer again replaces that entry,
+    /// and an attestation another issuer signed under that same id occupies its
+    /// own slot (see [`attestation_key`]).
     ///
     /// # Errors
     ///
@@ -142,6 +168,7 @@ impl<S: Storage> ProtocolRepository<S> {
         let key = attestation_key(
             context_id,
             entry.attestation.subject.as_ref(),
+            &entry.attestation.issuer,
             &entry.attestation.id,
         )?;
         self.store_value(&key, entry).await
@@ -183,6 +210,16 @@ impl<S: Storage> ProtocolRepository<S> {
     /// each value reports whether the issuer inside its key revoked that
     /// attestation (`true` = revoked).
     ///
+    /// SECURITY (write order). Every entry `state` names is written BEFORE any
+    /// earlier entry is deleted, and only entries `state` omits are deleted.
+    /// This repository exposes no transaction, so a failure part way through
+    /// leaves a mixture either way; ordering the writes first decides which
+    /// mixture. Deleting first and failing at write k leaves a context holding
+    /// fewer revocations than it did before the call, and a dropped revocation
+    /// lets a revoked attestation count again. Writing first and failing leaves
+    /// a context holding a superset, which rejects an attestation rather than
+    /// admitting one.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if key sanitization, serialization, or storage
@@ -193,7 +230,7 @@ impl<S: Storage> ProtocolRepository<S> {
         state: &HashMap<String, bool>,
     ) -> Result<(), StoreError> {
         let prefix = revocation_prefix(context_id)?;
-        self.storage().delete_prefix(&prefix).await?;
+        let mut keep = std::collections::HashSet::with_capacity(state.len());
         for (list_key, revoked) in state {
             let key = revocation_entry_key(context_id, list_key)?;
             let record = RevocationRecord {
@@ -201,6 +238,12 @@ impl<S: Storage> ProtocolRepository<S> {
                 revoked: *revoked,
             };
             self.store_value(&key, &record).await?;
+            keep.insert(key);
+        }
+        for key in self.storage().list_keys(&prefix).await? {
+            if !keep.contains(&key) {
+                self.storage().delete(&key).await?;
+            }
         }
         Ok(())
     }
@@ -635,6 +678,47 @@ mod tests {
         assert_eq!(loaded[0].verified_at, 2000);
     }
 
+    /// SECURITY (cross-issuer cache overwrite, issue #2335 finding 13). Two
+    /// issuers can carry one attestation id, because §7.4.1 of
+    /// `.docs/specs/07-trust-validation-and-capabilities.md` binds
+    /// `Attestation.id` to no issuer. A cache keyed on a subject plus a bare id
+    /// lets an attacker's attestation replace an honest issuer's entry, which
+    /// suppresses that entry whatever a context's revocation list says. Each
+    /// issuer therefore owns its own slot.
+    #[tokio::test]
+    async fn one_issuers_attestation_does_not_replace_anothers_under_a_shared_id() {
+        let store = new_store();
+        let mut honest = make_cached("shared-id", "did:key:alice", 1000, 300);
+        honest.attestation.issuer = "did:key:honest".into();
+        let mut attacker = make_cached("shared-id", "did:key:alice", 2000, 300);
+        attacker.attestation.issuer = "did:key:attacker".into();
+
+        store
+            .store_trust_cached_attestation("ctx-1", &honest)
+            .await
+            .unwrap();
+        store
+            .store_trust_cached_attestation("ctx-1", &attacker)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_trust_cached_attestations("ctx-1", "did:key:alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "each issuer keeps its own slot under a shared id, store holds {loaded:?}"
+        );
+        assert!(
+            loaded
+                .iter()
+                .any(|e| e.attestation.issuer.as_ref() == "did:key:honest"),
+            "the honest issuer's attestation must survive, store holds {loaded:?}"
+        );
+    }
+
     #[tokio::test]
     async fn attestation_empty_context() {
         let store = new_store();
@@ -849,13 +933,47 @@ mod tests {
         assert!(loaded.is_err());
     }
 
+    /// An attestation id carrying a NUL byte, a path separator, or a traversal
+    /// segment reaches no storage path, because [`attestation_key`] hashes the
+    /// issuer-plus-id join and puts only fixed-width hex in that component.
+    /// This asserts the property that hashing establishes: such an id round
+    /// trips, and it lands in its own slot rather than in a neighbour's.
+    ///
+    /// Before hashing, this test asserted that `store_trust_cached_attestation`
+    /// REJECTED such an id, which was the weaker guarantee available while an
+    /// id reached `sanitize_key_component` directly. Hashing closes that path
+    /// by construction, so the assertion states what now holds.
     #[tokio::test]
-    async fn rejects_null_byte_in_attestation_id() {
+    async fn an_attestation_id_carrying_path_characters_round_trips() {
         let store = new_store();
-        let mut entry = make_cached("att\0evil", "did:key:alice", 1000, 300);
-        entry.attestation.id = "att\0evil".to_owned();
-        let result = store.store_trust_cached_attestation("ctx-1", &entry).await;
-        assert!(result.is_err());
+        let mut hostile = make_cached("att\0evil/../victim", "did:key:alice", 1000, 300);
+        hostile.attestation.id = "att\0evil/../victim".to_owned();
+        let neighbour = make_cached("att-1", "did:key:alice", 2000, 300);
+
+        store
+            .store_trust_cached_attestation("ctx-1", &hostile)
+            .await
+            .unwrap();
+        store
+            .store_trust_cached_attestation("ctx-1", &neighbour)
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_trust_cached_attestations("ctx-1", "did:key:alice")
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "a hostile id occupies its own slot, store holds {loaded:?}"
+        );
+        assert!(
+            loaded
+                .iter()
+                .any(|e| e.attestation.id == "att\0evil/../victim"),
+            "a hostile id round trips through the record, store holds {loaded:?}"
+        );
     }
 
     // -------------------------------------------------------------------

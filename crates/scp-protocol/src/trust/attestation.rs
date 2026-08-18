@@ -625,7 +625,7 @@ pub struct AttestorInfo {
     /// [`check_threshold_attestation`] counts this attestation only when its
     /// `attestation_type` matches the requirement, its `subject` matches the
     /// evaluated subject DID, its `issuer` equals the `did` field above, and
-    /// [`verify_attestation_with_revocation`] accepts it.
+    /// [`verify_attestation`] accepts it.
     pub attestation: Option<Attestation>,
 }
 
@@ -731,6 +731,12 @@ impl DidPublicKeyResolver for IdentityDidPublicKeyResolver {
 /// revoke an attestation"), and scoping each answer to one issuer is how an
 /// implementation of this trait keeps that grant.
 ///
+/// This crate ships no blanket implementation that answers "not revoked" for
+/// every id. An implementation that always answers `None` states a false
+/// guarantee to a caller that reads a revocation list through it, so each
+/// caller either supplies an implementation backed by a real revocation list or
+/// passes `None` and thereby states that it consulted no list.
+///
 /// See spec §7.4.1 (attestation verification) and §7.4.4 (revocation).
 pub trait AttestationRevocationChecker {
     /// Checks whether `issuer` revoked the attestation carrying `attestation_id`.
@@ -740,18 +746,6 @@ pub trait AttestationRevocationChecker {
     /// revocation that a DID other than `issuer` signed MUST yield `None` here,
     /// per the issuer-scoping requirement on this trait.
     fn check_revocation(&self, attestation_id: &str, issuer: &DID) -> Option<u64>;
-}
-
-/// No-op revocation checker that always returns `None` (not revoked).
-///
-/// Suitable for testing, offline verification, or contexts where external
-/// revocation checking is not available.
-pub struct NoOpRevocationChecker;
-
-impl AttestationRevocationChecker for NoOpRevocationChecker {
-    fn check_revocation(&self, _attestation_id: &str, _issuer: &DID) -> Option<u64> {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +902,15 @@ impl Default for AttestationVerificationCache {
 
 /// Verifies an attestation's signature, evidence, expiry, and revocation status.
 ///
+/// This is this module's only attestation-verification entry point, and
+/// `revocation_checker` is a required argument on it. Every caller therefore
+/// states which external revocation list it consulted, and a caller that
+/// consulted no list writes `None` and records that absence at a call site a
+/// reader can grep. An earlier three-argument wrapper hid that `None` inside
+/// itself, so a caller could not tell from a call site whether verification had
+/// read a revocation list; deleting that wrapper is what removed the hiding
+/// place.
+///
 /// # Verification steps
 ///
 /// 1. **Signature:** Verifies the Ed25519 signature against the issuer's public
@@ -917,10 +920,12 @@ impl Default for AttestationVerificationCache {
 /// 3. **Expiry:** Rejects if `expires_at < now`.
 /// 4. **Revocation (field):** Rejects if the attestation's `revocation_status`
 ///    field is `Revoked`.
-/// 5. **Revocation (external):** If a [`AttestationRevocationChecker`] is
-///    provided, queries it for external revocation signals. This is belt-and-
-///    suspenders with step 4: the field may be stale while the checker queries
-///    a live revocation service.
+/// 5. **Revocation (external):** If an [`AttestationRevocationChecker`] is
+///    provided, queries it for external revocation signals. Step 4 reads a
+///    field the holder of a stale copy still carries as `Active`, so step 5 is
+///    what makes §7.4.4 of
+///    `.docs/specs/07-trust-validation-and-capabilities.md` ("Revocation is
+///    immediate for new verifications") hold against such a holder.
 ///
 /// # Errors
 ///
@@ -935,29 +940,6 @@ impl Default for AttestationVerificationCache {
 ///
 /// See ADR-017 acceptance criteria 3-7.
 pub fn verify_attestation(
-    attestation: &Attestation,
-    resolver: &(impl DidPublicKeyResolver + ?Sized),
-    clock: &(impl Clock + ?Sized),
-) -> Result<(), TrustError> {
-    verify_attestation_with_revocation(attestation, resolver, clock, None)
-}
-
-/// Verifies an attestation with an optional external revocation checker.
-///
-/// This is the full-featured verification entry point. [`verify_attestation`]
-/// delegates here with `revocation_checker: None` for backward compatibility.
-///
-/// See [`verify_attestation`] for the verification steps and error semantics.
-///
-/// # Errors
-///
-/// Returns a specific [`TrustError`] variant for each failure mode:
-/// - [`TrustError::AttestationSignatureInvalid`] for signature failures
-/// - [`TrustError::AttestationExpired`] when past expiry
-/// - [`TrustError::AttestationRevoked`] when revoked (field or external checker)
-/// - [`TrustError::AttestationEvidenceInvalid`] when required evidence is
-///   missing or invalid
-pub fn verify_attestation_with_revocation(
     attestation: &Attestation,
     resolver: &(impl DidPublicKeyResolver + ?Sized),
     clock: &(impl Clock + ?Sized),
@@ -1116,7 +1098,7 @@ pub struct ThresholdCheckInput<'a> {
 ///    for some other DID.
 /// 3. That attestation names the attestor's own DID as its `issuer`, which
 ///    stops an attacker from claiming an attestation that someone else issued.
-/// 4. [`verify_attestation_with_revocation`] accepts that attestation, so a
+/// 4. [`verify_attestation`] accepts that attestation, so a
 ///    forged signature, an expired attestation, and a revoked attestation each
 ///    fall out of the count. Per the [`DidPublicKeyResolver`] totality
 ///    invariant an `Err` is terminal, so this function discards the attestation
@@ -1172,7 +1154,7 @@ pub fn check_threshold_attestation(input: &ThresholdCheckInput<'_>) -> Threshold
             continue;
         }
         // Rule 4: signature, evidence, expiry, and revocation.
-        if verify_attestation_with_revocation(
+        if verify_attestation(
             attestation,
             input.resolver,
             input.clock,
@@ -1597,7 +1579,7 @@ mod tests {
             None,
         );
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
@@ -1622,7 +1604,7 @@ mod tests {
         // Corrupt the signature.
         attestation.signature[0] ^= 0xff;
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::AttestationSignatureInvalid { .. }) => {}
@@ -1650,7 +1632,7 @@ mod tests {
             None,
         );
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::AttestationSignatureInvalid { .. }) => {}
@@ -1677,7 +1659,7 @@ mod tests {
             None,
         );
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::AttestationExpired {
@@ -1712,7 +1694,7 @@ mod tests {
             },
         );
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::AttestationRevoked {
@@ -1751,7 +1733,7 @@ mod tests {
             revoked_by: "did:key:issuer".into(),
         };
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::AttestationSignatureInvalid { .. }) => {}
@@ -1779,7 +1761,7 @@ mod tests {
             None, // No evidence -- should fail.
         );
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::AttestationEvidenceInvalid { .. }) => {}
@@ -1810,7 +1792,7 @@ mod tests {
             Some(evidence),
         );
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
@@ -1837,7 +1819,7 @@ mod tests {
             Some(evidence),
         );
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::AttestationEvidenceInvalid { .. }) => {}
@@ -1863,7 +1845,7 @@ mod tests {
             None,
         );
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
@@ -2831,7 +2813,7 @@ mod tests {
 
         let baseline_bytes = canonical_attestation_bytes(&signed).unwrap();
         assert!(
-            verify_attestation(&signed, &resolver, &clock).is_ok(),
+            verify_attestation(&signed, &resolver, &clock, None).is_ok(),
             "baseline attestation must verify"
         );
 
@@ -2852,7 +2834,7 @@ mod tests {
         // 2. The original signature still verifies over the tampered struct —
         //    proving the mutation is undetectable via the signature.
         assert!(
-            verify_attestation(&tampered, &resolver, &clock).is_ok(),
+            verify_attestation(&tampered, &resolver, &clock, None).is_ok(),
             "mutating unauthenticated renewal fields must not invalidate the signature"
         );
     }
@@ -3133,7 +3115,7 @@ mod tests {
             },
         );
 
-        let result = verify_attestation(&attestation, &resolver, &clock);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_err());
         match result {
             Err(TrustError::AttestationRevocationInvalid {
@@ -3150,9 +3132,22 @@ mod tests {
     // AttestationRevocationChecker tests
     // -----------------------------------------------------------------------
 
+    /// A test revocation checker standing in for a context whose revocation
+    /// list holds no entries, so it reports every id as not revoked. This type
+    /// lives inside the test module because a production caller that holds no
+    /// revocation list passes `None` instead of an always-answers-`None`
+    /// implementation.
+    struct EmptyRevocationList;
+
+    impl AttestationRevocationChecker for EmptyRevocationList {
+        fn check_revocation(&self, _attestation_id: &str, _issuer: &DID) -> Option<u64> {
+            None
+        }
+    }
+
     #[test]
-    fn noop_revocation_checker_returns_none() {
-        let checker = NoOpRevocationChecker;
+    fn empty_revocation_list_reports_no_revocation() {
+        let checker = EmptyRevocationList;
         let result = checker.check_revocation("att-1", &DID::from("did:key:issuer"));
         assert!(result.is_none());
     }
@@ -3188,7 +3183,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_attestation_with_revocation_checker_rejects_revoked() {
+    fn verify_attestation_checker_rejects_revoked() {
         let (signing_key, pubkey_bytes) = test_keypair();
         let mut resolver = TestResolver::new();
         resolver.add_key("did:key:issuer", pubkey_bytes);
@@ -3206,8 +3201,7 @@ mod tests {
         );
 
         let checker = AlwaysRevokedChecker { revoked_at: 999 };
-        let result =
-            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        let result = verify_attestation(&attestation, &resolver, &clock, Some(&checker));
         assert!(result.is_err());
         match result {
             Err(TrustError::AttestationRevoked {
@@ -3218,7 +3212,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_attestation_with_noop_checker_succeeds() {
+    fn verify_attestation_with_empty_revocation_list_succeeds() {
         let (signing_key, pubkey_bytes) = test_keypair();
         let mut resolver = TestResolver::new();
         resolver.add_key("did:key:issuer", pubkey_bytes);
@@ -3235,9 +3229,8 @@ mod tests {
             None,
         );
 
-        let checker = NoOpRevocationChecker;
-        let result =
-            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        let checker = EmptyRevocationList;
+        let result = verify_attestation(&attestation, &resolver, &clock, Some(&checker));
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
@@ -3259,13 +3252,14 @@ mod tests {
             None,
         );
 
-        let result = verify_attestation_with_revocation(&attestation, &resolver, &clock, None);
+        let result = verify_attestation(&attestation, &resolver, &clock, None);
         assert!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
     #[test]
     fn verify_attestation_field_revocation_takes_precedence_over_checker() {
-        // Even with a noop checker, a revoked field should fail.
+        // A signed `Revoked` field rejects even when a context's revocation
+        // list holds no entry for that attestation id.
         // Must use make_signed_attestation_with_revocation so the signature
         // covers the revocation_status (it's in the signed scope).
         let (signing_key, pubkey_bytes) = test_keypair();
@@ -3289,9 +3283,8 @@ mod tests {
             },
         );
 
-        let checker = NoOpRevocationChecker;
-        let result =
-            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        let checker = EmptyRevocationList;
+        let result = verify_attestation(&attestation, &resolver, &clock, Some(&checker));
         assert!(result.is_err());
         match result {
             Err(TrustError::AttestationRevoked {
@@ -3325,8 +3318,7 @@ mod tests {
             target_id: "some-other-att-id".to_owned(),
             revoked_at: 999,
         };
-        let result =
-            verify_attestation_with_revocation(&attestation, &resolver, &clock, Some(&checker));
+        let result = verify_attestation(&attestation, &resolver, &clock, Some(&checker));
         assert!(
             result.is_ok(),
             "expected Ok for non-targeted attestation, got {result:?}"
@@ -3334,7 +3326,7 @@ mod tests {
     }
 
     /// SECURITY (issuer scoping, issue #2335 finding 13).
-    /// `verify_attestation_with_revocation` hands a checker the attestation's own
+    /// `verify_attestation` hands a checker the attestation's own
     /// `issuer`, so a checker that scopes a revocation to a different issuer
     /// reports nothing. Passing an id without an issuer would let one issuer's
     /// revocation suppress another issuer's attestation carrying that same id,
@@ -3365,7 +3357,7 @@ mod tests {
             target_id: attestation.id.clone(),
             revoked_at: 999,
         };
-        let unaffected = verify_attestation_with_revocation(
+        let unaffected = verify_attestation(
             &attestation,
             &resolver,
             &clock,
@@ -3383,12 +3375,8 @@ mod tests {
             target_id: attestation.id.clone(),
             revoked_at: 999,
         };
-        let rejected = verify_attestation_with_revocation(
-            &attestation,
-            &resolver,
-            &clock,
-            Some(&own_issuer_checker),
-        );
+        let rejected =
+            verify_attestation(&attestation, &resolver, &clock, Some(&own_issuer_checker));
         assert!(
             matches!(
                 rejected,

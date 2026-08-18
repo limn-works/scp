@@ -3381,16 +3381,26 @@ export class SCP {
   }
 
   /**
-   * Verify an attestation's Ed25519 signature, evidence, expiry, and
-   * revocation status (ADR-017, §7.4).
+   * Verify an attestation against `contextId` (ADR-017, §7.4.4).
+   *
+   * Checks the Ed25519 signature against the issuer key the resolver returns,
+   * the evidence, the expiry, the issuer-signed `revocation_status` field, and
+   * `contextId`'s persisted revocation list. Section 7.4.4 of the trust spec
+   * states that revocation is immediate for a new verification, and a holder of
+   * a pre-revocation copy still carries `revocation_status: "Active"`, so
+   * reading the revocation list is what rejects that holder's copy.
    *
    * Takes the typed attestation envelope ({@link CachedAttestationEnvelope})
    * and serializes it to the serde wire shape internally (ADR-058) before
    * crossing FFI.
+   *
+   * @param contextId - Context whose revocation list this verification reads.
+   * @param attestation - Typed attestation envelope.
    */
-  trustVerifyAttestation(attestation: CachedAttestationEnvelope): unknown {
+  trustVerifyAttestation(contextId: string, attestation: CachedAttestationEnvelope): unknown {
     try {
-      return (this.#native.trustVerifyAttestation as (j: string) => unknown)(
+      return (this.#native.trustVerifyAttestation as (c: string, j: string) => unknown)(
+        contextId,
         encodeAttestation(attestation),
       );
     } catch (err) {

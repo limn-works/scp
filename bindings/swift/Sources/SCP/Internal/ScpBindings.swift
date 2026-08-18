@@ -3620,6 +3620,29 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func trustCreateChallenge(targetDid: String) throws  -> ChallengeResult
     
     /**
+     * Verifies an attestation against `context_id`.
+     *
+     * Checks the Ed25519 signature against the resolver-resolved issuer key,
+     * the evidence, the expiry, the issuer-signed `revocation_status` field,
+     * and this context's persisted revocation list, which THIS instance's
+     * `ProtocolRepository` variant holds. Section 7.4.4 of
+     * `.docs/specs/07-trust-validation-and-capabilities.md` states that
+     * revocation is immediate for a new verification, and a holder of a
+     * pre-revocation copy still carries `revocation_status: Active`, so the
+     * revocation-list read is what rejects that holder's copy.
+     *
+     * # Errors
+     *
+     * Returns [`ScpError::Validation`] when `context_id` fails format
+     * validation or the attestation JSON is malformed. A verification failure
+     * is reported in the returned [`AttestationVerificationResult`], not as an
+     * error.
+     *
+     * See ADR-017 Layer 3 (Attestation) and spec §7.4.4.
+     */
+    func trustVerifyAttestation(contextId: String, attestationJson: String) throws  -> AttestationVerificationResult
+    
+    /**
      * Per-instance equivalent of the free-function [`trust_verify_response`].
      *
      * Stateless helper — uses an ephemeral verification signer per call.
@@ -7446,6 +7469,36 @@ open func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
     return try  FfiConverterTypeChallengeResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_scp_trust_create_challenge(self.uniffiClonePointer(),
         FfiConverterString.lower(targetDid),$0
+    )
+})
+}
+    
+    /**
+     * Verifies an attestation against `context_id`.
+     *
+     * Checks the Ed25519 signature against the resolver-resolved issuer key,
+     * the evidence, the expiry, the issuer-signed `revocation_status` field,
+     * and this context's persisted revocation list, which THIS instance's
+     * `ProtocolRepository` variant holds. Section 7.4.4 of
+     * `.docs/specs/07-trust-validation-and-capabilities.md` states that
+     * revocation is immediate for a new verification, and a holder of a
+     * pre-revocation copy still carries `revocation_status: Active`, so the
+     * revocation-list read is what rejects that holder's copy.
+     *
+     * # Errors
+     *
+     * Returns [`ScpError::Validation`] when `context_id` fails format
+     * validation or the attestation JSON is malformed. A verification failure
+     * is reported in the returned [`AttestationVerificationResult`], not as an
+     * error.
+     *
+     * See ADR-017 Layer 3 (Attestation) and spec §7.4.4.
+     */
+open func trustVerifyAttestation(contextId: String, attestationJson: String)throws  -> AttestationVerificationResult  {
+    return try  FfiConverterTypeAttestationVerificationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_attestation(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(attestationJson),$0
     )
 })
 }
@@ -17446,19 +17499,6 @@ public func trustQueryScore(did: String, contextId: String)throws  -> TrustScore
 })
 }
 /**
- * Verifies an attestation's Ed25519 signature, evidence, expiry, and
- * revocation status.
- *
- * See ADR-017 Layer 3 (Attestation).
- */
-public func trustVerifyAttestation(attestationJson: String)throws  -> AttestationVerificationResult  {
-    return try  FfiConverterTypeAttestationVerificationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_trust_verify_attestation(
-        FfiConverterString.lower(attestationJson),$0
-    )
-})
-}
-/**
  * Verifies a challenge response against its original challenge request.
  *
  * See ADR-017 Layer 3 (Challenge-Response).
@@ -17667,9 +17707,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_query_score() != 58685) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_attestation() != 50772) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_response() != 47639) {
@@ -18246,6 +18283,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 25481) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_attestation() != 24460) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {

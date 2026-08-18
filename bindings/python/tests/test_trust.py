@@ -1315,18 +1315,20 @@ class TestTrustVerifyTyped:
         }
 
     def test_verify_attestation_serializes_the_typed_envelope(self) -> None:
-        from scp_sdk.trust import trust_verify_attestation
+        from scp_sdk.scp import SCP
 
-        bridge = MagicMock()
-        bridge.trust_verify_attestation.return_value = {
+        scp = MagicMock()
+        scp._native.trust_verify_attestation.return_value = {
             "valid": False,
             "chain_depth": 0,
             "error": "unresolvable issuer",
         }
-        with patch("scp_sdk.trust._bridge", return_value=bridge):
-            result = trust_verify_attestation(self._envelope())
+        result = asyncio.run(
+            SCP.trust_verify_attestation(scp, "ctx-1", self._envelope()),
+        )
         assert result["valid"] is False
-        (wire_json,) = bridge.trust_verify_attestation.call_args[0]
+        context_id, wire_json = scp._native.trust_verify_attestation.call_args[0]
+        assert context_id == "ctx-1"
         assert json.loads(wire_json) == self._envelope()
 
     def test_verify_response_serializes_both_typed_records(self) -> None:
@@ -1346,9 +1348,12 @@ class TestTrustVerifyTyped:
         `Attestation` deserializer: a dummy signature yields a structured
         `valid: False` (verification ran), never a parse error."""
         pytest.importorskip("_scp_core")
-        from scp_sdk.trust import trust_verify_attestation
+        from scp_sdk.scp import SCP
 
-        result = trust_verify_attestation(self._envelope())
+        scp = SCP(storage={"type": "in_memory"})
+        result = asyncio.run(
+            scp.trust_verify_attestation("ctx-verify-typed", self._envelope()),
+        )
         assert result["valid"] is False
         assert result["error"]
 
