@@ -276,7 +276,7 @@ impl Scp {
         let bi = NapiBridgeInstance::with_storage_napi(storage).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: e.to_string(),
-                code: codes::STORAGE_8001.to_owned(),
+                code: codes::STORAGE_8004.to_owned(),
             })
         })?;
         Ok(Self {

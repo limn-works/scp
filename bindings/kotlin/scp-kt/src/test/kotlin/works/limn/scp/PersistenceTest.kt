@@ -57,10 +57,12 @@ class PersistenceTest {
          * cannot be opened — `StorageInitError::SqliteOpen` converted to
          * `ScpError::Validation` in `crates/scp-ffi/uniffi/src/runtime.rs`, the
          * same code the `PyO3` and NAPI bridges report for that same failure.
-         * Spec §17.6 makes a failed durable-backend open terminal, so this code
-         * is the observable proof that no in-memory downgrade happened.
+         * The number is 8004 rather than 8001 because `AndroidStorage` in
+         * `scp-kt-android` already owns 8001–8003. Spec §17.6 makes a failed
+         * durable-backend open terminal, so this code is the observable proof
+         * that no in-memory downgrade happened.
          */
-        private const val STORAGE_OPEN_FAILED_CODE = "SCP-STORAGE-8001"
+        private const val STORAGE_OPEN_FAILED_CODE = "SCP-STORAGE-8004"
 
         private var nativeAvailable = false
         private var skipReason = ""
@@ -194,7 +196,7 @@ class PersistenceTest {
             // fails at the `PRAGMA key` / WAL-mode step because `SQLCipher`
             // rejects the key as "file is not a database". The UniFFI bridge
             // converts that `StorageInitError::SqliteOpen` to
-            // `ScpError::Validation` with code `SCP-STORAGE-8001`
+            // `ScpError::Validation` with code `SCP-STORAGE-8004`
             // (`crates/scp-ffi/uniffi/src/runtime.rs`, the
             // `From<StorageInitError> for ScpError` impl), which the generated
             // Kotlin surfaces as `ScpException.Validation`. Main's 9fa80e13c

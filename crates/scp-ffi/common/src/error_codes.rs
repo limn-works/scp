@@ -1009,15 +1009,24 @@ pub const VALID_7133: &str = "SCP-VALID-7133";
 pub const VALID_7134: &str = "SCP-VALID-7134";
 /// Address resolution ambiguous error.
 pub const VALID_7135: &str = "SCP-VALID-7135";
-/// Address resolution reached no binding, and could not query at least one
-/// layer.
+/// Address resolution reached no binding, and nobody read at least one
+/// layer's data.
 ///
-/// Which layer went unqueried: attestation reverse-lookup (§22.5.1),
-/// `.well-known/scp` domain handles (§22.6.1), or a context handle registry
-/// this bridge instance does not hold. `VALID_7091` reports one other case,
-/// where every consulted layer answered and none held a binding, so a caller
-/// reads `VALID_7136` as "capability absent" and `VALID_7091` as "binding
-/// absent".
+/// The criterion, per §22.8.2a of
+/// `.docs/specs/22-human-readable-addressing.md`: resolution held no binding,
+/// and for at least one layer no read happened at all. `VALID_7091` reports
+/// the other case, where every consulted layer was read and none held a
+/// binding, so a caller reads `VALID_7136` as "capability absent" and
+/// `VALID_7091` as "binding absent". A caller retries `VALID_7136` against a
+/// deployment holding the missing capability; retrying `VALID_7091` anywhere
+/// returns the same answer.
+///
+/// Layers that go unread on these bridges, as evidence of what the criterion
+/// admits rather than as the criterion itself: attestation reverse-lookup
+/// (§22.5.1), because no bridge invokes an `attestation_lookup` outlet;
+/// `.well-known/scp` domain handles (§22.6.1), because no bridge performs that
+/// fetch and no bridge configures a domain; and a context handle registry this
+/// bridge instance does not hold.
 pub const VALID_7136: &str = "SCP-VALID-7136";
 /// Recovery or custody-migration concurrency cap reached.
 ///
@@ -1072,7 +1081,14 @@ pub const STORAGE_8000: &str = "SCP-STORAGE-8000";
 /// Spec §17.6 makes this terminal — no bridge downgrades to in-memory
 /// storage after it. All three bridges report this one code, so a caller
 /// reading a code learns the same thing whichever binding raised it.
-pub const STORAGE_8001: &str = "SCP-STORAGE-8001";
+///
+/// The number is `8004`, not `8001`, because the `scp-kt-android`
+/// `AndroidStorage` backend already owns `8001`--`8003`
+/// (`.docs/standards/sdk-common.md` §Registered SCP-STORAGE- codes). An
+/// Android app links `AndroidStorage` and this bridge into one process, so
+/// reusing `8001` would make one code string mean both "storage key not
+/// found" and "durable backend failed to open" inside that app.
+pub const STORAGE_8004: &str = "SCP-STORAGE-8004";
 
 // -------------------------------------------------------------------------
 // Attestation (SCP-ATTEST- 9000--9999)
