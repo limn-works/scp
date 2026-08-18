@@ -526,6 +526,84 @@ async fn context_send_message() {
         .expect("context_send should succeed for a context creator");
 }
 
+/// `invite_member` seals a real bundle for an invitee this same `Scp` minted.
+///
+/// The Kotlin suite asserts the same outcome through the generated bindings
+/// (`bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/JoinFromWelcomeTest.kt`),
+/// and `cargo nextest run --workspace` runs no Kotlin. This test therefore
+/// carries the claim: sealing resolves the invitee's `#active` key from a DID
+/// document, and `identity_create` publishes that document into the same DHT
+/// client the per-instance resolver reads. Were that publish to stop happening,
+/// the invite would fail at the `#active`-key resolution seam and this test
+/// would report it, rather than a Kotlin job that CI does not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_member_seals_for_a_locally_minted_invitee() {
+    use scp_ffi_uniffi::bridge::InviteMemberOutcome;
+
+    let scp = Scp::new_in_memory_for_test();
+    let creator = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .unwrap();
+    let invitee = scp
+        .identity_create("in_memory".to_owned(), None)
+        .await
+        .unwrap();
+    let creator_did = creator.did();
+
+    // The invite routes through the actor's governance gate, which enforces
+    // the proposer's `governance:propose` capability and nothing else, so the
+    // ceiling must carry it. This is the ceiling the Kotlin suite's
+    // `makeInviteParams()` builds.
+    let mut params = full_capability_params();
+    params.ceiling.push("governance:propose".to_owned());
+    params.ceiling.push("governance:vote".to_owned());
+    let handle = scp
+        .context_create(Arc::clone(&creator), params)
+        .await
+        .unwrap();
+    let context_id = handle.context_id();
+
+    let reservation = scp
+        .reserve_key_package(Arc::clone(&invitee))
+        .await
+        .expect("reserve_key_package should mint a single-use KeyPackage");
+
+    let outcome = scp
+        .invite_member(
+            creator,
+            context_id.clone(),
+            invitee.did(),
+            reservation.key_package_public,
+            Vec::new(),
+        )
+        .await
+        .expect("invite_member should seal for an invitee this instance minted");
+
+    let InviteMemberOutcome::Sealed { bundle, delivered } = outcome;
+    assert_eq!(
+        bundle.context_id, context_id,
+        "the sealed bundle names the context the creator invited into"
+    );
+    assert_eq!(
+        bundle.creator_did, creator_did,
+        "the sealed bundle names the creator who signed it"
+    );
+    assert_eq!(
+        bundle.enc.len(),
+        32,
+        "RFC 9180 HPKE encapsulates a 32-byte key"
+    );
+    assert!(
+        !bundle.ciphertext.is_empty(),
+        "HPKE sealing produces a ciphertext"
+    );
+    assert!(
+        !delivered,
+        "no relay URL was supplied, so the caller delivers the bundle itself"
+    );
+}
+
 #[tokio::test]
 async fn context_close_lifecycle() {
     let scp = Scp::new_in_memory_for_test();
