@@ -5383,7 +5383,7 @@
         },
         "criteriaStatus": {
           "assessedOn": "2026-08-17",
-          "assessedAgainst": "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift and bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift, after the change that anchors an `x5c` chain at Apple's App Attest root certificate and that serializes App Attest calls",
+          "assessedAgainst": "bindings/swift/Sources/SCP/Platform/AppleDeviceAttestation.swift and bindings/swift/Tests/SCPTests/Platform/AppleDeviceAttestationTests.swift, after the change that anchors an `x5c` chain at Apple's App Attest root certificate, serializes App Attest calls, and binds authenticator data to the credential certificate and to this app's stored App Attest key identifier",
           "met": [
             {
               "criterion": "Implements DeviceAttestation trait for Apple platforms",
@@ -5401,7 +5401,7 @@
           "unmet": [
             {
               "criterion": "Server-side verification validates attestation against Apple's attestation root",
-              "evidence": "`verify(token:)` calls `AppAttestAttestationObject.isWellFormed(_:relyingPartyIdHash:anchorCertificates:)`, which applies the four clauses of ADR-025 acceptance criterion 3 and evaluates the `x5c` chain as an X.509 certification path anchored at Apple's App Attest root certificate: `AppAttestAnchor` carries that root's DER bytes, `chainTerminatesAtAnchor(_:anchorCertificates:)` passes them to `SecTrustSetAnchorCertificates` with `SecTrustSetAnchorCertificatesOnly` and network fetching turned off, and it requires the evaluated path to begin with `x5c` element 0 and element 1. A device therefore rejects a chain Apple did not sign. This criterion names server-side verification, and no relay code performs it: no file under `crates/` reads an `x5c` chain, calls Apple's App Attest attestation endpoint, or validates the receipt, and nothing anywhere binds an attestation to the challenge a relay issued."
+              "evidence": "`verify(token:)` calls `AppAttestAttestationObject.isWellFormed(_:relyingPartyIdHash:anchorCertificates:appAttestKeyIdentifier:)`, which applies the five clauses of ADR-025 acceptance criterion 3 and evaluates the `x5c` chain as an X.509 certification path anchored at Apple's App Attest root certificate: `AppAttestAnchor` carries that root's DER bytes, `chainTerminatesAtAnchor(_:anchorCertificates:)` passes them to `SecTrustSetAnchorCertificates` with `SecTrustSetAnchorCertificatesOnly` and network fetching turned off, and it requires the evaluated path to begin with `x5c` element 0 and element 1. A device therefore rejects a chain Apple did not sign. Clause 5 then requires the credential ID in `authData` to equal `SHA-256` of the credential certificate's public key and to equal the App Attest key identifier this adapter stored, so a chain Apple issued for one app's App Attest key no longer accepts authenticator data written for a second app, and `AppAttestCredentialBindingTests` drives that rejection. This criterion names server-side verification, and no relay code performs it: no file under `crates/` reads an `x5c` chain, calls Apple's App Attest attestation endpoint, or validates the receipt, and nothing anywhere binds an attestation to the challenge a relay issued."
             },
             {
               "criterion": "Fraud metric handling integrated (risk metric from Apple)",

@@ -144,10 +144,27 @@
         /// - Throws: ``StorageError/databaseError(_:)`` if the database cannot
         ///   be opened or configured.
         public static func open() throws -> AppleStorage {
-            let key = try generateOrRetrieveEncryptionKey()
+            try open(at: databaseFileURL(), encryptionKey: generateOrRetrieveEncryptionKey())
+        }
 
-            let dbURL = databaseFileURL()
-
+        /// Open (or create) an SCP storage database at `fileURL`, encrypted
+        /// under `encryptionKey`.
+        ///
+        /// ``open()`` calls this with the canonical database path and the
+        /// Keychain-held key, and it is the call an app makes. A caller that
+        /// holds its own key and its own path calls this one: the storage tests
+        /// under `bindings/swift/Tests/SCPTests/Platform/` do, so that they
+        /// exercise these methods against a database this process created rather
+        /// than against this device's Keychain item and this device's storage.
+        ///
+        /// - Parameters:
+        ///   - fileURL: Where this connection reads and writes its database
+        ///     file. On iOS this method sets file protection on that path before
+        ///     it opens the connection.
+        ///   - encryptionKey: 32 bytes SQLCipher takes through `PRAGMA key`.
+        /// - Throws: ``StorageError/databaseError(_:)`` if the database cannot
+        ///   be opened or configured.
+        static func open(at fileURL: URL, encryptionKey: Data) throws -> AppleStorage {
             #if os(iOS)
                 // Set file protection before opening the database.
                 // NSFileProtectionCompleteUntilFirstUserAuthentication allows background
@@ -158,18 +175,18 @@
                 // Only set the attribute if the file already exists; SQLCipher will
                 // create the file on first connection. On creation the attribute must
                 // be set before writes begin, so we create an empty placeholder here.
-                if !fileManager.fileExists(atPath: dbURL.path) {
-                    fileManager.createFile(atPath: dbURL.path, contents: nil)
+                if !fileManager.fileExists(atPath: fileURL.path) {
+                    fileManager.createFile(atPath: fileURL.path, contents: nil)
                 }
                 try fileManager.setAttributes(
                     [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
-                    ofItemAtPath: dbURL.path
+                    ofItemAtPath: fileURL.path
                 )
             #endif
 
             // Open the SQLite database.
             var dbHandle: OpaquePointer?
-            let openResult = sqlite3_open(dbURL.path, &dbHandle)
+            let openResult = sqlite3_open(fileURL.path, &dbHandle)
             // swiftlint:disable:next identifier_name
             guard openResult == SQLITE_OK, let db = dbHandle else {
                 let msg = dbHandle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown error"
@@ -180,7 +197,7 @@
             }
 
             // Apply SQLCipher encryption key (spec §17.5).
-            let hexKey = key.hexEncodedString
+            let hexKey = encryptionKey.hexEncodedString
             let pragmas = """
             PRAGMA key = "x'\(hexKey)'";
             PRAGMA cipher_page_size = 4096;
@@ -199,7 +216,7 @@
             ) WITHOUT ROWID;
             """)
 
-            return AppleStorage(db: db, encryptionKey: key)
+            return AppleStorage(db: db, encryptionKey: encryptionKey)
         }
 
         // MARK: Encryption Key
@@ -277,6 +294,87 @@
             return keyData
         }
 
+        // MARK: Parameter binding
+
+        /// Bind `value` to parameter `index` of `statement`, and throw when
+        /// SQLite rejects that bind.
+        ///
+        /// **Why every call site reads this return code.** SQLite reports a
+        /// rejected bind through a return code and leaves that parameter reading
+        /// `NULL`, and a statement carrying `NULL` where a key belongs still
+        /// steps to `SQLITE_DONE`. `DELETE FROM kv WHERE key = NULL` then
+        /// matches no row and reports success, `SELECT 1 FROM kv WHERE key =
+        /// NULL` reports absence for a key this database holds, and an insert
+        /// writes a row holding no key. Reading this code is what turns each of
+        /// those answers into a thrown error.
+        ///
+        /// - Parameters:
+        ///   - value: Text SQLite copies before this call returns, because the
+        ///     destructor argument is `SQLITE_TRANSIENT`.
+        ///   - statement: A statement `sqlite3_prepare_v2` produced.
+        ///   - index: A one-based parameter position.
+        /// - Throws: `StorageError.databaseError` when `statement` is `nil`, and
+        ///   when `sqlite3_bind_text` answers anything other than `SQLITE_OK`.
+        static func bindText(_ value: String, to statement: OpaquePointer?, at index: Int32) throws {
+            guard let statement else {
+                throw StorageError.databaseError("bindText received no prepared statement")
+            }
+            let status = sqlite3_bind_text(
+                statement,
+                index,
+                (value as NSString).utf8String,
+                -1,
+                transientDestructor
+            )
+            guard status == SQLITE_OK else {
+                throw StorageError.databaseError(errorMessage(for: statement))
+            }
+        }
+
+        /// Bind `value` to parameter `index` of `statement` as a blob, and throw
+        /// when SQLite rejects that bind.
+        ///
+        /// `bindText(_:to:at:)` states why every call site reads this return
+        /// code. An empty `Data` may hand `withUnsafeBytes` a `nil` base
+        /// address, and `sqlite3_bind_blob` reads a `nil` pointer as a request
+        /// to bind `NULL`, so this method binds a zero-length blob for that
+        /// case; the `kv` table declares `value BLOB NOT NULL`, and `NULL` would
+        /// make an insert of empty bytes fail.
+        ///
+        /// - Throws: `StorageError.databaseError` when `statement` is `nil`, and
+        ///   when SQLite answers anything other than `SQLITE_OK`.
+        static func bindBlob(_ value: Data, to statement: OpaquePointer?, at index: Int32) throws {
+            guard let statement else {
+                throw StorageError.databaseError("bindBlob received no prepared statement")
+            }
+            let status = value.withUnsafeBytes { raw -> Int32 in
+                guard let base = raw.baseAddress, raw.count > 0 else {
+                    return sqlite3_bind_zeroblob(statement, index, 0)
+                }
+                return sqlite3_bind_blob(statement, index, base, Int32(raw.count), transientDestructor)
+            }
+            guard status == SQLITE_OK else {
+                throw StorageError.databaseError(errorMessage(for: statement))
+            }
+        }
+
+        /// `SQLITE_TRANSIENT`, which tells SQLite to copy a bound value's bytes
+        /// before the binding call returns.
+        ///
+        /// The SQLite C header spells this constant as a cast of `-1` to a
+        /// destructor pointer, and no Swift overlay exposes it, so this property
+        /// rebuilds that cast.
+        private static let transientDestructor = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        /// The last error message SQLite recorded on the connection that
+        /// prepared `statement`.
+        private static func errorMessage(for statement: OpaquePointer) -> String {
+            guard let handle = sqlite3_db_handle(statement) else {
+                return "SQLite reported no connection for this statement"
+            }
+            return String(cString: sqlite3_errmsg(handle))
+        }
+
         // MARK: StorageProvider implementation
 
         /// Store `value` under `key`, overwriting any existing value.
@@ -288,21 +386,8 @@
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 throw StorageError.databaseError(lastErrorMessage())
             }
-            // SQLite reports a failed bind through a return code, and a
-            // statement carrying an unbound parameter still steps to
-            // `SQLITE_DONE` while writing `NULL`. Reading both codes is what
-            // turns such a failure into a thrown error rather than into a row
-            // holding no value.
-            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-            guard sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, transient) == SQLITE_OK else {
-                throw StorageError.databaseError(lastErrorMessage())
-            }
-            let valueBindStatus = value.withUnsafeBytes { ptr in
-                sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(ptr.count), transient)
-            }
-            guard valueBindStatus == SQLITE_OK else {
-                throw StorageError.databaseError(lastErrorMessage())
-            }
+            try Self.bindText(key, to: stmt, at: 1)
+            try Self.bindBlob(value, to: stmt, at: 2)
             guard sqlite3_step(stmt) == SQLITE_DONE else {
                 throw StorageError.databaseError(lastErrorMessage())
             }
@@ -317,7 +402,7 @@
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 throw StorageError.databaseError(lastErrorMessage())
             }
-            sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            try Self.bindText(key, to: stmt, at: 1)
 
             let result = sqlite3_step(stmt)
             if result == SQLITE_ROW {
@@ -342,7 +427,7 @@
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 throw StorageError.databaseError(lastErrorMessage())
             }
-            sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            try Self.bindText(key, to: stmt, at: 1)
             guard sqlite3_step(stmt) == SQLITE_DONE else {
                 throw StorageError.databaseError(lastErrorMessage())
             }
@@ -355,21 +440,19 @@
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
 
-            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-
             if let upper = Self.prefixSuccessor(prefix) {
                 let sql = "SELECT key FROM kv WHERE key >= ?1 AND key < ?2 ORDER BY key"
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                     throw StorageError.databaseError(lastErrorMessage())
                 }
-                sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
-                sqlite3_bind_text(stmt, 2, (upper as NSString).utf8String, -1, transient)
+                try Self.bindText(prefix, to: stmt, at: 1)
+                try Self.bindText(upper, to: stmt, at: 2)
             } else {
                 let sql = "SELECT key FROM kv WHERE key >= ?1 ORDER BY key"
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                     throw StorageError.databaseError(lastErrorMessage())
                 }
-                sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
+                try Self.bindText(prefix, to: stmt, at: 1)
             }
 
             var keys: [String] = []
@@ -388,21 +471,19 @@
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
 
-            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-
             if let upper = Self.prefixSuccessor(prefix) {
                 let sql = "DELETE FROM kv WHERE key >= ?1 AND key < ?2"
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                     throw StorageError.databaseError(lastErrorMessage())
                 }
-                sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
-                sqlite3_bind_text(stmt, 2, (upper as NSString).utf8String, -1, transient)
+                try Self.bindText(prefix, to: stmt, at: 1)
+                try Self.bindText(upper, to: stmt, at: 2)
             } else {
                 let sql = "DELETE FROM kv WHERE key >= ?1"
                 guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                     throw StorageError.databaseError(lastErrorMessage())
                 }
-                sqlite3_bind_text(stmt, 1, (prefix as NSString).utf8String, -1, transient)
+                try Self.bindText(prefix, to: stmt, at: 1)
             }
 
             guard sqlite3_step(stmt) == SQLITE_DONE else {
@@ -420,7 +501,7 @@
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
                 throw StorageError.databaseError(lastErrorMessage())
             }
-            sqlite3_bind_text(stmt, 1, (key as NSString).utf8String, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+            try Self.bindText(key, to: stmt, at: 1)
 
             let result = sqlite3_step(stmt)
             if result == SQLITE_ROW {

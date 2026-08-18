@@ -490,8 +490,8 @@
         /// app's App Attest key produced.
         ///
         /// **Criterion this method applies:** acceptance criterion 3 of ADR-025
-        /// in `.docs/adrs/phase-5.md`, whose four clauses
-        /// `AppAttestAttestationObject.isWellFormed(_:relyingPartyIdHash:anchorCertificates:)`
+        /// in `.docs/adrs/phase-5.md`, whose five clauses
+        /// `AppAttestAttestationObject.isWellFormed(_:relyingPartyIdHash:anchorCertificates:appAttestKeyIdentifier:)`
         /// states in code:
         ///
         /// 1. `token` decodes as one complete CBOR map whose key set is
@@ -506,27 +506,67 @@
         ///    is element 1.
         /// 4. `authData` holds a byte string of at least 87 bytes whose first
         ///    32 bytes equal `SHA-256` of an App ID this adapter was
-        ///    initialized with, whose bytes 37 through 52 equal one of two App
-        ///    Attest AAGUIDs, and whose bytes 53 and 54 equal `0x00 0x20`.
+        ///    initialized with, whose bytes 33 through 36 are all zero, whose
+        ///    bytes 37 through 52 equal one of two App Attest AAGUIDs, and
+        ///    whose bytes 53 and 54 equal `0x00 0x20`.
+        /// 5. Bytes 55 through 86 of `authData` equal `SHA-256` of the public
+        ///    key in `x5c` element 0, and equal the App Attest key identifier
+        ///    this adapter stored, base64-decoded.
         ///
         /// A token that fails any clause makes this method return `false`.
+        ///
+        /// **What clause 5 decides.** Clause 3 reads certificates and no
+        /// `authData` byte, and clause 4 reads `authData` bytes and no
+        /// certificate, so a certificate chain Apple issued for one app's App
+        /// Attest key, paired with `authData` an attacker wrote naming a second
+        /// app, satisfies both clauses at once. Clause 5 makes the credential ID
+        /// one value both halves must agree on, and makes this adapter's stored
+        /// key identifier the value they must both agree with, so an accepted
+        /// token names a key this device's Secure Enclave holds.
         ///
         /// **What this method does not decide:** it checks no receipt, it reads
         /// no nonce out of the credential certificate, and it therefore binds
         /// `token` to no challenge. An SCP relay performs those three checks. A
-        /// `true` result here means Apple issued the certificate that signed
-        /// this attestation for this app, never that this attestation answers
-        /// the challenge a relay issued.
+        /// `true` result here means Apple issued that certificate for this app's
+        /// stored App Attest key, never that this attestation answers the
+        /// challenge a relay issued.
+        ///
+        /// **What this method answers before `attest` runs:** `false`. Clause 5
+        /// reads a stored App Attest key identifier, and a device that generated
+        /// no App Attest key stores none. Such a device produced no attestation
+        /// object, so rejecting every token is the honest answer for it.
         ///
         /// - Parameter token: Raw attestation bytes to validate.
-        /// - Returns: `true` when `token` satisfies all four clauses above,
+        /// - Returns: `true` when `token` satisfies all five clauses above,
         ///   `false` for every other input.
         public func verify(token: Data) -> Bool {
-            AppAttestAttestationObject.isWellFormed(
+            guard let keyIdentifier = storedKeyIdentifier() else { return false }
+            return AppAttestAttestationObject.isWellFormed(
                 token,
                 relyingPartyIdHash: relyingPartyIdHash,
-                anchorCertificates: anchorCertificates
+                anchorCertificates: anchorCertificates,
+                appAttestKeyIdentifier: keyIdentifier
             )
+        }
+
+        /// The 32 bytes clause 5 compares a credential ID against.
+        ///
+        /// `DCAppAttestService.generateKey` hands an app a base64 string that
+        /// encodes `SHA-256` of that key's public key, which Apple's article
+        /// "Validating Apps That Connect to Your Server" calls the key
+        /// identifier, and `generateAndStoreKey` persists that string. Decoding
+        /// it yields those 32 bytes.
+        ///
+        /// - Returns: The stored key identifier. This method answers `nil` when
+        ///   this adapter stored no key ID, and when a stored key ID decodes to
+        ///   any byte count other than 32. `verify(token:)` rejects every token
+        ///   for a `nil` answer rather than skipping clause 5.
+        private func storedKeyIdentifier() -> Data? {
+            guard let keyId = loadKeyId(),
+                  let identifier = Data(base64Encoded: keyId),
+                  identifier.count == AppAttestAttestationObject.credentialIdByteCount
+            else { return nil }
+            return identifier
         }
 
         // MARK: - Private helpers
@@ -831,13 +871,17 @@
     /// holding `fmt`, `attStmt`, and `authData`, where `fmt` holds text
     /// `"apple-appattest"`.
     ///
-    /// `isWellFormed(_:relyingPartyIdHash:anchorCertificates:)` applies four
-    /// clauses of acceptance criterion 3 in ADR-025, `.docs/adrs/phase-5.md`.
-    /// Each clause names which values it permits, so an accepted set stays
-    /// closed by construction rather than by a list of rejected spellings.
-    /// Clause 3 anchors the `x5c` chain at Apple's App Attest root certificate,
-    /// so a token whose certificates Apple did not issue fails this check
-    /// however faithfully someone rebuilt the rest of the structure.
+    /// `isWellFormed(_:relyingPartyIdHash:anchorCertificates:appAttestKeyIdentifier:)`
+    /// applies five clauses of acceptance criterion 3 in ADR-025,
+    /// `.docs/adrs/phase-5.md`. Each clause names which values it permits, so an
+    /// accepted set stays closed by construction rather than by a list of
+    /// rejected spellings. Clause 3 anchors the `x5c` chain at Apple's App
+    /// Attest root certificate, so a token whose certificates Apple did not
+    /// issue fails this check however faithfully someone rebuilt the rest of the
+    /// structure. Clause 5 requires the credential certificate, the credential
+    /// ID, and a caller's stored App Attest key identifier to name one key, so a
+    /// chain Apple issued for one app's key fails this check when it arrives
+    /// beside authenticator data written for a different app.
     enum AppAttestAttestationObject {
         /// Three keys an App Attest attestation object carries, and only three
         /// keys clause 1 accepts.
@@ -878,8 +922,20 @@
         private static let aaguidOffset = 37
         private static let aaguidLength = 16
 
+        /// Where a sign counter starts inside authenticator data, and how many
+        /// bytes it occupies.
+        private static let signCounterOffset = 33
+        private static let signCounterLength = 4
+
         /// Where a credential-ID length starts inside authenticator data.
         private static let credentialIdLengthOffset = 53
+
+        /// Where a credential ID starts inside authenticator data, and how many
+        /// bytes it occupies. `AppleDeviceAttestation.storedKeyIdentifier()`
+        /// reads that count to decide how many bytes a stored key identifier
+        /// must decode to, because clause 5 compares those two values.
+        private static let credentialIdOffset = 55
+        static let credentialIdByteCount = 32
 
         /// An AAGUID a production App Attest key carries: ASCII bytes of
         /// `appattest` followed by seven zero bytes.
@@ -893,7 +949,24 @@
         /// `UInt16`.
         private static let credentialIdLengthBytes: [UInt8] = [0x00, 0x20]
 
-        /// Report whether `token` satisfies all four clauses of acceptance
+        /// Two values that live in different entries of one attestation object,
+        /// and that clause 5 requires to name one App Attest key.
+        ///
+        /// Clause 3 reads a credential certificate out of `attStmt`, clause 4
+        /// reads a credential ID out of `authData`, and a CBOR map hands those
+        /// two entries to a reader one at a time. Collecting both while reading
+        /// each entry is what lets clause 5 compare them once the map ends.
+        private struct AttestedCredential {
+            /// Element 0 of `x5c`, which clause 3 calls the credential
+            /// certificate.
+            var certificate: SecCertificate?
+
+            /// Bytes 55 through 86 of `authData`, which clause 4 calls the
+            /// credential ID.
+            var credentialId: ArraySlice<UInt8>?
+        }
+
+        /// Report whether `token` satisfies all five clauses of acceptance
         /// criterion 3 in ADR-025.
         ///
         /// - Parameters:
@@ -904,14 +977,19 @@
         ///   - anchorCertificates: Certificates clause 3 requires an `x5c`
         ///     chain to terminate at. A caller running in production passes
         ///     Apple's App Attest root certificate.
+        ///   - appAttestKeyIdentifier: The 32 bytes `DCAppAttestService`
+        ///     identifies a caller's App Attest key by, which clause 5 requires
+        ///     both the credential ID and `SHA-256` of the credential
+        ///     certificate's public key to equal.
         /// - Returns: `true` only for a complete, correctly keyed,
         ///   definite-length CBOR attestation object whose attestation
-        ///   statement and authenticator data satisfy clauses 3 and 4; `false`
-        ///   for every other input.
+        ///   statement and authenticator data satisfy clauses 3 and 4 and name
+        ///   the key clause 5 names; `false` for every other input.
         static func isWellFormed(
             _ token: Data,
             relyingPartyIdHash: Data,
-            anchorCertificates: [SecCertificate]
+            anchorCertificates: [SecCertificate],
+            appAttestKeyIdentifier: Data
         ) -> Bool {
             var reader = CBORReader(token)
             guard let entryCount = reader.readMapHeader(),
@@ -919,6 +997,7 @@
 
             // A map carrying `Key.allCases.count` entries, no key twice and no
             // key outside `Key`, carries each of three keys exactly once.
+            var credential = AttestedCredential()
             var seenKeys = Set<Key>()
             for _ in 0 ..< entryCount {
                 guard let name = reader.readTextString(),
@@ -928,28 +1007,87 @@
                           for: key,
                           from: &reader,
                           relyingPartyIdHash: relyingPartyIdHash,
-                          anchorCertificates: anchorCertificates
+                          anchorCertificates: anchorCertificates,
+                          into: &credential
                       ) else { return false }
             }
 
-            return reader.isAtEnd
+            guard reader.isAtEnd else { return false }
+            return namesOneAppAttestKey(credential, identifier: appAttestKeyIdentifier)
+        }
+
+        /// Apply clause 5: one App Attest key identifier, named by the
+        /// credential certificate, by the credential ID, and by this adapter's
+        /// stored key ID.
+        ///
+        /// **The criterion this method applies.** Apple's article "Validating
+        /// Apps That Connect to Your Server" states both comparisons this method
+        /// makes. Its step 5 reads "Create the SHA256 hash of the public key in
+        /// credCert, and verify that it matches the key identifier from your
+        /// app", and its step 9 reads "Verify that the authenticator data's
+        /// credentialId field is the same as the key identifier." Requiring all
+        /// three values to agree is what stops a chain Apple issued for one App
+        /// Attest key from carrying authenticator data written for a different
+        /// app.
+        private static func namesOneAppAttestKey(
+            _ credential: AttestedCredential,
+            identifier appAttestKeyIdentifier: Data
+        ) -> Bool {
+            guard let certificate = credential.certificate,
+                  let credentialId = credential.credentialId,
+                  let publicKeyDigest = publicKeyDigest(of: certificate) else { return false }
+            return credentialId.elementsEqual(publicKeyDigest)
+                && credentialId.elementsEqual(appAttestKeyIdentifier)
+        }
+
+        /// `SHA-256` of `certificate`'s public key, in the encoding Apple
+        /// hashes to build an App Attest key identifier.
+        ///
+        /// `SecKeyCopyExternalRepresentation` returns an elliptic-curve public
+        /// key as its uncompressed X9.63 point — one `0x04` byte, then the X
+        /// coordinate, then the Y coordinate — which is the encoding every App
+        /// Attest verifier hashes, and which `DCAppAttestService` hashes to
+        /// build the key ID it hands an app.
+        ///
+        /// - Returns: 32 bytes. This method answers `nil` for a certificate
+        ///   `SecCertificateCopyKey` reads no key out of, and for a key
+        ///   `SecKeyCopyExternalRepresentation` produces no encoding for. Clause
+        ///   5 rejects the token for a `nil` answer.
+        private static func publicKeyDigest(of certificate: SecCertificate) -> Data? {
+            guard let publicKey = SecCertificateCopyKey(certificate),
+                  let encoded = SecKeyCopyExternalRepresentation(publicKey, nil) as Data?
+            else { return nil }
+            return Data(SHA256.hash(data: encoded))
         }
 
         /// Consume a value that follows `key` and report whether that value
         /// satisfies a constraint `key` imposes.
+        ///
+        /// - Parameter credential: Collects the credential certificate and the
+        ///   credential ID this value carries, which clause 5 reads after every
+        ///   entry has been consumed.
         private static func readValue(
             for key: Key,
             from reader: inout CBORReader,
             relyingPartyIdHash: Data,
-            anchorCertificates: [SecCertificate]
+            anchorCertificates: [SecCertificate],
+            into credential: inout AttestedCredential
         ) -> Bool {
             switch key {
             case .format:
                 return reader.readTextString() == appleAttestationFormat
             case .attestationStatement:
-                return readAttestationStatement(from: &reader, anchorCertificates: anchorCertificates)
+                return readAttestationStatement(
+                    from: &reader,
+                    anchorCertificates: anchorCertificates,
+                    into: &credential
+                )
             case .authenticatorData:
-                return readAuthenticatorData(from: &reader, relyingPartyIdHash: relyingPartyIdHash)
+                return readAuthenticatorData(
+                    from: &reader,
+                    relyingPartyIdHash: relyingPartyIdHash,
+                    into: &credential
+                )
             }
         }
 
@@ -957,7 +1095,8 @@
         /// exactly `x5c` and `receipt`.
         private static func readAttestationStatement(
             from reader: inout CBORReader,
-            anchorCertificates: [SecCertificate]
+            anchorCertificates: [SecCertificate],
+            into credential: inout AttestedCredential
         ) -> Bool {
             guard let entryCount = reader.readMapHeader(),
                   entryCount == StatementKey.allCases.count else { return false }
@@ -970,7 +1109,8 @@
                       readStatementValue(
                           for: key,
                           from: &reader,
-                          anchorCertificates: anchorCertificates
+                          anchorCertificates: anchorCertificates,
+                          into: &credential
                       ) else { return false }
             }
             return true
@@ -981,11 +1121,16 @@
         private static func readStatementValue(
             for key: StatementKey,
             from reader: inout CBORReader,
-            anchorCertificates: [SecCertificate]
+            anchorCertificates: [SecCertificate],
+            into credential: inout AttestedCredential
         ) -> Bool {
             switch key {
             case .certificateChain:
-                return readCertificateChain(from: &reader, anchorCertificates: anchorCertificates)
+                return readCertificateChain(
+                    from: &reader,
+                    anchorCertificates: anchorCertificates,
+                    into: &credential
+                )
             case .receipt:
                 return reader.readByteString() != nil
             }
@@ -1024,7 +1169,8 @@
         /// network.
         private static func readCertificateChain(
             from reader: inout CBORReader,
-            anchorCertificates: [SecCertificate]
+            anchorCertificates: [SecCertificate],
+            into credential: inout AttestedCredential
         ) -> Bool {
             guard let certificateCount = reader.readArrayHeader(),
                   certificateCount >= minimumCertificateCount else { return false }
@@ -1037,7 +1183,15 @@
                 chain.append(certificate)
             }
 
-            return chainTerminatesAtAnchor(chain, anchorCertificates: anchorCertificates)
+            guard chainTerminatesAtAnchor(chain, anchorCertificates: anchorCertificates) else {
+                return false
+            }
+            // Clause 3 assigns element 0 the credential-certificate position,
+            // and clause 5 hashes that certificate's public key, so this method
+            // hands element 0 forward once the evaluation confirmed that
+            // position.
+            credential.certificate = chain[0]
+            return true
         }
 
         /// Evaluate `chain` against `anchorCertificates` and report whether the
@@ -1088,22 +1242,36 @@
         /// Apply clause 4 to an `authData` value: a byte string of at least 87
         /// bytes carrying attested credential data for this app.
         ///
-        /// Clause 4 constrains three fields by value and leaves three fields
-        /// unconstrained. It fixes a relying-party ID hash, an AAGUID, and a
-        /// credential-ID length. It fixes no value for a flags byte, for a sign
-        /// counter, or for 32 credential-ID bytes, so this method reads none of
-        /// those three fields and rejects nothing on their contents.
+        /// Clause 4 constrains four fields by value and leaves the flags byte
+        /// unconstrained. It fixes a relying-party ID hash, a sign counter, an
+        /// AAGUID, and a credential-ID length. It fixes no value for byte 32,
+        /// the flags byte, so this method reads that byte and rejects nothing on
+        /// its contents. It hands the 32 credential-ID bytes to clause 5, which
+        /// fixes them against the credential certificate and against a stored
+        /// key identifier rather than against a constant.
         private static func readAuthenticatorData(
             from reader: inout CBORReader,
-            relyingPartyIdHash: Data
+            relyingPartyIdHash: Data,
+            into credential: inout AttestedCredential
         ) -> Bool {
             guard let authenticatorData = reader.readByteString(),
                   authenticatorData.count >= minimumAuthenticatorDataLength else { return false }
 
             // `prefix` and `dropFirst` count from a slice's own start, so these
-            // three field reads need no index arithmetic and copy no bytes.
+            // field reads need no index arithmetic and copy no bytes.
             let relyingPartyIdHashField = authenticatorData.prefix(relyingPartyIdHashLength)
             guard relyingPartyIdHashField.elementsEqual(relyingPartyIdHash) else { return false }
+
+            // Apple's article "Validating Apps That Connect to Your Server"
+            // states "Verify that the authenticator data's counter field equals
+            // 0" as one step of validating an attestation. App Attest raises a
+            // counter across assertions and leaves it at zero in the attestation
+            // object, so a non-zero counter here names a value no `attestKey`
+            // call produced.
+            let signCounterField = authenticatorData
+                .dropFirst(signCounterOffset)
+                .prefix(signCounterLength)
+            guard signCounterField.allSatisfy({ $0 == 0 }) else { return false }
 
             // Apple's article "Validating Apps That Connect to Your Server"
             // instructs a verifier to expect `appattestdevelop` from an app
@@ -1129,7 +1297,14 @@
             let credentialIdLengthField = authenticatorData
                 .dropFirst(credentialIdLengthOffset)
                 .prefix(credentialIdLengthBytes.count)
-            return credentialIdLengthField.elementsEqual(credentialIdLengthBytes)
+            guard credentialIdLengthField.elementsEqual(credentialIdLengthBytes) else { return false }
+
+            // An 87-byte floor puts 32 bytes at offset 55, so this slice holds
+            // 32 bytes for every input reaching this line.
+            credential.credentialId = authenticatorData
+                .dropFirst(credentialIdOffset)
+                .prefix(credentialIdByteCount)
+            return true
         }
     }
 
