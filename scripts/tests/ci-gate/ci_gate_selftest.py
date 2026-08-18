@@ -31,6 +31,21 @@ nothing:
   win-shell    A job whose matrix selects windows-latest ran a `run:` script
                that declared no `shell:`, so GitHub read one script text as
                PowerShell on that leg and as bash on every other leg.
+  step-filter  Job rust-test gated seven steps on `needs.changes.outputs.rust`
+               and carried no job-level `if:`, so a renamed filter output
+               skipped every step while that job reported success over zero
+               tests. An aggregate and a filter-key check below both read
+               job-level conditions only, so neither could see it.
+  empty-input  Job sign-windows signed every .dll a PowerShell pipeline
+               returned and uploaded the result as `windows-signed`. That
+               pipeline runs zero times over an empty set and exits 0, so a
+               Windows build leg that produced no binary published an artifact
+               named as signed that carried nothing signed.
+  path-closure A `fuzz` filter listed nine of the thirteen crates a fuzz build
+               reads. It omitted scp-relay-client, which fuzz/Cargo.toml
+               declares as a direct dependency, and omitted scp-core,
+               scp-identity and scp-platform, so a change to any of those four
+               skipped job fuzz-build.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -49,6 +64,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import NamedTuple
 
@@ -116,6 +132,48 @@ VALUE_FLAGS = {
     "--filterset",
     "-P",
 }
+
+# CRITERION: after a `--`, any token a test harness does not consume as a
+# flag's value is a name filter, and a libtest harness exits 0 when its filter
+# selects no test. `cargo test --release -p scp-testing -- conformance` in
+# release.yml is the command that prompted reading past a `--`: a rename moving
+# every conformance test out of a name carrying "conformance" would have left a
+# release gate green over zero assertions.
+#
+# INDICATORS, not a criterion: the names below are whichever libtest and nextest
+# flags take a separate value. Omitting one makes that value read as a filter
+# and fails this self-test, which errs toward rejecting a command rather than
+# toward passing one.
+HARNESS_VALUE_FLAGS = {
+    "--test-threads",
+    "--skip",
+    "--logfile",
+    "--format",
+    "--color",
+    "--shuffle-seed",
+    "-Z",
+}
+
+# A `${{ … }}` expression is one argument once GitHub substitutes it, so it
+# collapses to one token before a command is split. Splitting it instead reads
+# `matrix.target` in `--target ${{ matrix.target }}` as a name filter.
+EXPRESSION = re.compile(r"\$\{\{[^}]*\}\}")
+
+# CRITERION: a job that compiles a crate must run whenever any crate that
+# crate's build reads has changed, so a path filter selecting that job lists
+# every directory in that crate's path-dependency closure. Each entry names a
+# filter and the manifest whose closure that filter must cover. A closure comes
+# from `[dependencies]`, `[build-dependencies]` and `[target.*]` path entries in
+# Cargo.toml files, which is what `cargo tree -e no-dev` walks; read against
+# `cargo tree -e no-dev` for both manifests on 2026-08-17, and both agreed.
+PATH_DEP_CLOSURE_FILTERS = {
+    "fuzz": "fuzz/Cargo.toml",
+    "typescript-wasm": "crates/scp-client-wasm/Cargo.toml",
+}
+
+# Rejects an empty .dll set. Job sign-windows in release.yml must run it before
+# it uploads an artifact named `windows-signed`.
+GUARD_SCRIPT = "scripts/assert-nonempty-dll-set.sh"
 
 # CRITERION: a `uses:` ref names a branch or a tag that action's own repository
 # publishes. A ref naming anything else fails a run in about six seconds with
@@ -186,6 +244,7 @@ RUST_ONLY_RUNS = {
     "rust-deny": True,
     "rust-doc": True,
     "rust-fmt": True,
+    "rust-test": True,
     "rust-test-napi-production": True,
     "scaffold-typescript-web-check": False,
     "swift-build-test": True,
@@ -247,20 +306,40 @@ def logical_lines(script: str) -> list[str]:
     return out
 
 
-def positional_filters(command: str) -> list[str]:
-    """Return bare test-name arguments a cargo command carries."""
-    tokens = shlex.split(command.split(" -- ", 1)[0])
-    for word in ("cargo", "test", "nextest", "run"):
-        if tokens and tokens[0] == word:
-            tokens.pop(0)
-    filters, skip_next = [], False
+def split_command(command: str) -> list[str]:
+    """Split a shell command into tokens, keeping each `${{ … }}` whole."""
+    return shlex.split(EXPRESSION.sub("EXPRESSION", command))
+
+
+def bare_tokens(tokens: list[str], value_flags: set[str]) -> list[str]:
+    """Return tokens that are neither a flag nor a flag's value."""
+    bare, skip_next = [], False
     for token in tokens:
         if skip_next:
             skip_next = False
-        elif token in VALUE_FLAGS:
+        elif token in value_flags:
             skip_next = True
         elif not token.startswith("-"):
-            filters.append(token)
+            bare.append(token)
+    return bare
+
+
+def positional_filters(command: str) -> list[str]:
+    """Return bare test-name arguments a cargo command carries.
+
+    Reads both sides of a `--`. Cargo takes a name filter directly, and it also
+    forwards every token after a `--` to a test harness, which takes a name
+    filter there. Reading only a cargo side missed
+    `cargo test … -- conformance`, whose harness exits 0 when no test name
+    carries "conformance".
+    """
+    cargo_side, _, harness_side = command.partition(" -- ")
+    tokens = split_command(cargo_side)
+    for word in ("cargo", "test", "nextest", "run"):
+        if tokens and tokens[0] == word:
+            tokens.pop(0)
+    filters = bare_tokens(tokens, VALUE_FLAGS)
+    filters += bare_tokens(split_command(harness_side), HARNESS_VALUE_FLAGS)
     return filters
 
 
@@ -476,6 +555,141 @@ def check_windows_shell(path: Path, doc: dict) -> None:
             )
 
 
+def path_filters(jobs: dict) -> dict[str, list[str]]:
+    """Return each `changes` filter name mapped to its path patterns."""
+    for step in jobs["changes"]["steps"]:
+        if str(step.get("uses", "")).startswith("dorny/paths-filter"):
+            return yaml.safe_load(step["with"]["filters"])
+    raise AssertionError("job `changes` runs no dorny/paths-filter step")
+
+
+def path_dependency_closure(manifest: Path) -> set[str]:
+    """Return every crate directory a manifest reaches through `path =` deps.
+
+    Walks `[dependencies]`, `[build-dependencies]` and each `[target.*]` table,
+    which together are what `cargo tree -e no-dev` walks. Skips
+    `[dev-dependencies]`, because a shipped or fuzzed build does not compile
+    them. Returns directories relative to a repository root, so a caller
+    compares them against a path filter directly.
+    """
+    directories: set[str] = set()
+    pending = [manifest.resolve()]
+    seen = {manifest.resolve()}
+    while pending:
+        current = pending.pop()
+        document = tomllib.loads(current.read_text())
+        tables = [
+            document.get("dependencies") or {},
+            document.get("build-dependencies") or {},
+        ]
+        for target in (document.get("target") or {}).values():
+            tables.append(target.get("dependencies") or {})
+            tables.append(target.get("build-dependencies") or {})
+        for table in tables:
+            for spec in table.values():
+                if not isinstance(spec, dict) or "path" not in spec:
+                    continue
+                child = (current.parent / spec["path"]).resolve() / "Cargo.toml"
+                directories.add(str(child.parent.relative_to(REPO)))
+                if child not in seen:
+                    seen.add(child)
+                    pending.append(child)
+    return directories
+
+
+def check_path_dep_closures(jobs: dict) -> None:
+    """Each named filter lists every directory its crate's build reads."""
+    filters = path_filters(jobs)
+    for filter_name, manifest in sorted(PATH_DEP_CLOSURE_FILTERS.items()):
+        if filter_name not in filters:
+            check(
+                f"filter {filter_name!r} covers its path-dependency closure",
+                False,
+                f"job `changes` declares no {filter_name!r} filter; PATH_DEP_CLOSURE_FILTERS "
+                f"names it, so either that filter was renamed or this entry is stale",
+            )
+            continue
+        patterns = set(filters[filter_name])
+        root = str(Path(manifest).parent)
+        wanted = path_dependency_closure(REPO / manifest) | {root}
+        missing = sorted(
+            directory for directory in wanted if f"{directory}/**" not in patterns
+        )
+        check(
+            f"filter {filter_name!r} covers its path-dependency closure",
+            not missing,
+            f"missing {[directory + '/**' for directory in missing]} — a change to "
+            f"one of those skips every job this filter selects",
+        )
+
+
+def check_filter_outputs_gate_jobs(jobs: dict) -> None:
+    """A `changes` filter output appears only in a job-level `if:`.
+
+    CRITERION: every `needs.changes.outputs.*` reference in this workflow sits
+    in a job's own `if:`. A step-level reference produces a job that reports
+    success having run nothing, and scripts/ci-aggregate-result.py judges a
+    dependency by reading that dependency's job-level `if:`, so it reads such a
+    job as a job that ran. Job rust-test carried seven step-level references and
+    no job-level `if:`, which made a renamed filter output green over zero
+    tests.
+    """
+    for job_id, job in sorted(jobs.items()):
+        offenders = []
+        for index, step in enumerate(job.get("steps") or []):
+            if not isinstance(step, dict):
+                continue
+            named = sorted(set(FILTER_REFERENCE.findall(str(step.get("if") or ""))))
+            if named:
+                name = step.get("name") or step.get("uses") or f"step {index}"
+                offenders.append(f"{name!r} names {named}")
+        check(
+            f"{job_id}: no step gates on a filter output",
+            not offenders,
+            "; ".join(offenders)
+            + " — a step-level filter condition makes this job report success over "
+            "zero work when that output changes; gate the job instead",
+        )
+
+
+def check_signing_guard(documents: list[tuple[Path, dict]]) -> None:
+    """Job sign-windows rejects an empty DLL set before it uploads one.
+
+    CRITERION: in release.yml, job sign-windows runs
+    scripts/assert-nonempty-dll-set.sh at a step index below its
+    actions/upload-artifact step. Its signing loop iterated whatever
+    Get-ChildItem returned, ran zero times over an empty set, exited 0, and let
+    the upload publish artifact `windows-signed` carrying nothing signed.
+
+    This pins one job's wiring and nothing else. Whether that script rejects an
+    empty set is a separate question, which
+    scripts/tests/sign-windows/run-tests.sh answers by running it against
+    fixture directories.
+    """
+    # Looked up by key, not filtered for: a renamed workflow or a deleted job
+    # raises a KeyError here rather than leaving this check running over nothing
+    # and reporting a pass.
+    steps = {path.name: doc for path, doc in documents}["release.yml"]["jobs"][
+        "sign-windows"
+    ]["steps"]
+    guard = [
+        index
+        for index, step in enumerate(steps)
+        if GUARD_SCRIPT in str(step.get("run") or "")
+    ]
+    upload = [
+        index
+        for index, step in enumerate(steps)
+        if str(step.get("uses") or "").startswith("actions/upload-artifact")
+    ]
+    check(
+        f"release.yml:sign-windows runs {GUARD_SCRIPT} before it uploads",
+        bool(guard) and bool(upload) and min(guard) < min(upload),
+        f"guard at steps {guard}, upload at steps {upload} — an empty DLL set "
+        f"otherwise reaches an artifact named windows-signed",
+    )
+
+
 def collect_pinned_nightlies(doc: dict) -> set[str]:
     """Return every date-pinned nightly a workflow's steps request."""
     pinned = set()
@@ -543,6 +757,9 @@ def main() -> int:
     for path, doc in documents:
         check_windows_shell(path, doc)
 
+    print("empty-input — a signing job rejects an empty DLL set before uploading one")
+    check_signing_guard(documents)
+
     print("coverage — every job reaches a required status check")
     defined = set(jobs) - {"ci"}
     declared = set(jobs["ci"]["needs"])
@@ -562,29 +779,41 @@ def main() -> int:
         f"{sorted(RUST_ONLY)}",
     )
 
+    print("path-closure — a path filter covers every crate its jobs compile")
+    check_path_dep_closures(jobs)
+
+    print("step-filter — a filter output gates a job, never a step")
+    check_filter_outputs_gate_jobs(jobs)
+
     print(
         "zero-test — a filtered test selection that matches nothing must exit non-zero"
     )
-    for job_id in sorted(jobs):
-        for step in jobs[job_id].get("steps", []):
-            for line in logical_lines(step.get("run") or ""):
-                if line.startswith("cargo test "):
-                    filters = positional_filters(line)
-                    check(
-                        f"{job_id}: {line[:58]}",
-                        not filters,
-                        f"test-name filter {filters} — `cargo test` exits 0 when its filter "
-                        f"selects nothing; use `cargo nextest run --no-tests=fail -E 'test(name)'`",
-                    )
-                if "cargo nextest run" in line and (
-                    " -E " in line or positional_filters(line)
-                ):
-                    check(
-                        f"{job_id}: {line[:58]}",
-                        "--no-tests=fail" in line,
-                        "a filtered nextest selection must set --no-tests=fail, which exits 4 "
-                        "when a selection is empty",
-                    )
+    # Every workflow, not ci.yml alone: release.yml ran
+    # `cargo test --release -p scp-testing -- conformance`, whose harness filter
+    # this check read past a `--` to find, and that job gates a release.
+    for path, doc in documents:
+        for job_id, job in sorted(doc["jobs"].items()):
+            for step in job.get("steps") or []:
+                if not isinstance(step, dict):
+                    continue
+                for line in logical_lines(step.get("run") or ""):
+                    if line.startswith("cargo test "):
+                        filters = positional_filters(line)
+                        check(
+                            f"{path.name}:{job_id}: {line[:58]}",
+                            not filters,
+                            f"test-name filter {filters} — `cargo test` exits 0 when its filter "
+                            f"selects nothing; use `cargo nextest run --no-tests=fail -E 'test(name)'`",
+                        )
+                    if "cargo nextest run" in line and (
+                        " -E " in line or positional_filters(line)
+                    ):
+                        check(
+                            f"{path.name}:{job_id}: {line[:58]}",
+                            "--no-tests=fail" in line,
+                            "a filtered nextest selection must set --no-tests=fail, which exits 4 "
+                            "when a selection is empty",
+                        )
 
     rust_pr = SCENARIOS["rust-only, pull_request"]
     docs_pr = SCENARIOS["docs-only, pull_request"]

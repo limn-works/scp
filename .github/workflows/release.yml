@@ -81,6 +81,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Cache Cargo registry and build
         uses: actions/cache@v4
         with:
@@ -99,7 +101,16 @@ jobs:
       - name: Run conformance test suite
         run: |
           if [ -d tests/conformance ]; then
-            cargo test --release -p scp-testing -- conformance
+            # nextest with --no-tests=fail, not `cargo test … -- conformance`.
+            # `cargo test` hands a bare word after `--` to a test harness as a
+            # name filter, and that harness exits 0 when its filter selects no
+            # test. A rename that moved every conformance test out of a name
+            # carrying "conformance" would have left this release gate green
+            # over zero assertions. nextest exits 4 on an empty selection.
+            # scripts/tests/ci-gate/ci_gate_selftest.py reads this workflow and
+            # rejects any `cargo test` carrying a name filter, before or after
+            # a `--`.
+            cargo nextest run --no-tests=fail --release -p scp-testing -E 'test(conformance)'
           else
             echo "::notice::Conformance fixture directory not yet created — workspace tests serve as gate"
           fi
@@ -278,6 +289,18 @@ jobs:
           name: cbindgen-x86_64-pc-windows-msvc
           path: windows-cbindgen/
 
+      # Runs before signing, so a release fails before an unsigned bundle can
+      # reach an artifact named `windows-signed`. A checkout supplies this
+      # script, which the two download steps above do not.
+      - name: Check out this repository
+        uses: actions/checkout@v5
+        with:
+          path: repo
+
+      - name: Assert a Windows build leg produced DLLs to sign
+        shell: bash
+        run: bash repo/scripts/assert-nonempty-dll-set.sh windows-artifacts windows-cbindgen
+
       - name: Import Authenticode certificate
         env:
           WINDOWS_SIGN_CERT: ${{ secrets.WINDOWS_SIGN_CERT }}
@@ -295,9 +318,22 @@ jobs:
       - name: Sign DLLs
         shell: pwsh
         run: |
-          Get-ChildItem -Recurse -Include *.dll windows-artifacts/, windows-cbindgen/ | ForEach-Object {
-            & signtool sign /sha1 $env:SIGN_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $_.FullName
-            Write-Host "Signed: $($_.FullName)"
+          # Step "Assert a Windows build leg produced DLLs to sign" above has
+          # already rejected an empty set, which this loop would otherwise run
+          # zero times over and exit 0 on.
+          $dlls = @(Get-ChildItem -Recurse -Include *.dll windows-artifacts/, windows-cbindgen/)
+          Write-Host "Signing $($dlls.Count) DLL(s)"
+          foreach ($dll in $dlls) {
+            & signtool sign /sha1 $env:SIGN_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $dll.FullName
+            # signtool is a native command, so a non-zero exit sets
+            # $LASTEXITCODE without stopping this script. Only a last
+            # invocation's code reaches GitHub, so an earlier failure would
+            # otherwise ship one unsigned DLL under a green step.
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "signtool exited $LASTEXITCODE for $($dll.FullName)"
+              exit $LASTEXITCODE
+            }
+            Write-Host "Signed: $($dll.FullName)"
           }
 
       - name: Upload signed Windows artifacts

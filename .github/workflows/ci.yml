@@ -140,16 +140,29 @@ jobs:
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
             fuzz:
+              # Every crate `cargo tree -e no-dev` reaches from fuzz/Cargo.toml,
+              # read 2026-08-17. This list named nine of thirteen: it omitted
+              # scp-relay-client, which fuzz/Cargo.toml declares as a direct
+              # dependency, and omitted scp-core, scp-identity and scp-platform,
+              # which scp-runtime pulls in. A change to any of those four broke
+              # the fuzz build while job fuzz-build skipped.
+              # scripts/tests/ci-gate/ci_gate_selftest.py recomputes this closure
+              # from Cargo.toml path dependencies and fails when an entry is
+              # missing, so a new dependency edge cannot silently shrink it.
               - 'fuzz/**'
-              - 'crates/scp-protocol/**'
-              - 'crates/scp-transport/**'
-              - 'crates/scp-runtime/**'
-              - 'crates/scp-event-log/**'
               - 'crates/scp-clock/**'
+              - 'crates/scp-core/**'
               - 'crates/scp-crypto/**'
-              - 'crates/scp-did/**'
               - 'crates/scp-dht/**'
+              - 'crates/scp-did/**'
+              - 'crates/scp-event-log/**'
+              - 'crates/scp-identity/**'
               - 'crates/scp-mls/**'
+              - 'crates/scp-platform/**'
+              - 'crates/scp-protocol/**'
+              - 'crates/scp-relay-client/**'
+              - 'crates/scp-runtime/**'
+              - 'crates/scp-transport/**'
 
   # ── Error codes ───────────────────────────────────────────────────
   error-codes:
@@ -630,10 +643,21 @@ jobs:
           # invocation covers all four.
           cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
 
-  # Matrix jobs must always expand so each OS variant reports a status
-  # to branch protection. Step-level `if` skips the heavy work instead.
+  # This job runs `cargo nextest run --workspace`, so a merge gate rests on it.
+  # It gates on `rust` at job level, never at step level. It carried seven
+  # step-level `if: needs.changes.outputs.rust == 'true'` conditions instead,
+  # under a comment claiming each matrix leg had to expand and report a status
+  # to branch protection. That claim no longer holds: a repository ruleset
+  # requires one status check, `ci`, and scripts/ci-aggregate-result.py judges a
+  # skipped dependency against that dependency's own job-level `if:`. Under
+  # step-level conditions, a renamed or misspelled filter output skipped every
+  # step, this job reported success over zero tests, and both an aggregate and a
+  # filter-key check in scripts/tests/ci-gate/ci_gate_selftest.py read only
+  # job-level conditions, so neither could see it. That self-test now rejects
+  # any `needs.changes.outputs.*` reference outside a job-level `if:`.
   rust-test:
     needs: changes
+    if: needs.changes.outputs.rust == 'true'
     name: Rust / test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -643,7 +667,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - name: Free disk space (Ubuntu)
-        if: needs.changes.outputs.rust == 'true' && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         run: |
           # The full Rust workspace (657 deps, 16 crates) needs ~12GB to compile.
           # Ubuntu runners ship with ~14GB free but pre-installed SDKs consume
@@ -654,19 +678,13 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           df -h /
       - uses: actions/checkout@v5
-        if: needs.changes.outputs.rust == 'true'
       - uses: dtolnay/rust-toolchain@stable
-        if: needs.changes.outputs.rust == 'true'
       - uses: actions/setup-python@v5
-        if: needs.changes.outputs.rust == 'true'
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
-        if: needs.changes.outputs.rust == 'true'
       - uses: taiki-e/install-action@nextest
-        if: needs.changes.outputs.rust == 'true'
       - name: Run tests
-        if: needs.changes.outputs.rust == 'true'
         run: |
           LIBDIR="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
@@ -1575,6 +1593,11 @@ jobs:
       # one required status check, matching a pytest pin in sdk-coverage.
       - run: pip install 'pyyaml>=6,<7'
       - run: bash scripts/tests/ci-gate/run-tests.sh
+      # A ci-gate assertion pins job sign-windows in release.yml to running
+      # scripts/assert-nonempty-dll-set.sh before its upload. Whether that
+      # script rejects an empty .dll set is a separate question, which these
+      # fixtures answer by running it against real directories.
+      - run: bash scripts/tests/sign-windows/run-tests.sh
       # Two fuzz.yml jobs size `timeout-minutes` by selecting a whole-minute
       # budget per `fuzz_time` option, because GitHub expressions carry no
       # arithmetic. scripts/tests/ci-gate reads those chains and assumes an

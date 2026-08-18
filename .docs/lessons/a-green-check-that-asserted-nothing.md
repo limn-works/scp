@@ -1,7 +1,7 @@
-# A Green Check That Asserted Nothing: Six Ways CI Reported Success Over Zero Work
+# A Green Check That Asserted Nothing: Eight Ways CI Reported Success Over Zero Work
 
-**Date:** 2026-08-16
-**Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `scripts/check-cross-layer.sh`
+**Date:** 2026-08-16, extended 2026-08-17
+**Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `.github/workflows/release.yml`, `scripts/check-cross-layer.sh`, `scripts/check-shipped-feature-graph.sh`
 
 ## Rule
 
@@ -10,7 +10,7 @@ fail on whichever defect it exists to catch, and keep that failure as a test. Ev
 defect below produced a green check while work behind it never ran, and every one passed
 review because a check *looked* like it was doing its job.
 
-## Six failure shapes
+## Eight failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when a filter selects no test. Two tests it named
@@ -18,7 +18,10 @@ carry `#[cfg(not(feature = "testing"))]`, so any dependency edge that turned `te
 for that crate would delete them and leave a green lane over zero assertions. Measured on
 this tree: `cargo test <filter>` with a name that matches nothing exits 0, while
 `cargo nextest run --no-tests=fail -E 'test(name)'` exits 4. Prefer whichever command
-reports an empty selection.
+reports an empty selection. A filter also hides after a `--`: job conformance in
+release.yml ran `cargo test --release -p scp-testing -- conformance`, which hands
+`conformance` to a libtest harness as a name filter, and that harness exits 0 when no
+test name carries it. Read both sides of a `--` when auditing a test command.
 
 **2. An aggregate that cannot tell "skipped" from "passed".** A `ci` job — one
 status check this repository's ruleset requires — compared each dependency's result against
@@ -35,7 +38,13 @@ directory. All four bridges reach every Rust workspace crate through scp-core, s
 request touching only `crates/scp-runtime/` skipped all four test jobs and roughly 2,600
 assertions executed zero times under a green check. When a job's real dependency closure
 is nearly a whole tree, gate it on a filter for that tree rather than enumerating a
-closure you must re-verify on every new dependency edge.
+closure you must re-verify on every new dependency edge. A `fuzz` filter showed the other
+half of the same shape: it enumerated a closure and got it wrong, listing nine of the
+thirteen crates `cargo tree -e no-dev` reaches from `fuzz/Cargo.toml`. It omitted
+`scp-relay-client`, a direct dependency, along with `scp-core`, `scp-identity` and
+`scp-platform`. Where you do enumerate a closure, compute it in a test rather than
+copying it into a comment: `scripts/tests/ci-gate/ci_gate_selftest.py` rebuilds both
+enumerated closures from `Cargo.toml` path dependencies and fails on a missing entry.
 
 **4. `grep -q` inside a pipeline under `set -o pipefail`.** `grep -q` stops reading at its
 first match and exits, which closes a pipe while its writer is still writing; that writer
@@ -43,7 +52,15 @@ dies of SIGPIPE and returns 141, and `pipefail` hands 141 back even though grep 
 that pattern. `scripts/check-cross-layer.sh` searched a 74 KB diff this way, so its
 verdict depended on where a match sat: a name on a first line read as absent and this
 gate rejected a pull request, while an identical name on a last line read as present.
-Write `grep PATTERN >/dev/null` instead, so grep reads its whole input.
+Write `grep PATTERN >/dev/null` instead, so grep reads its whole input. The same
+construct sat in `scripts/check-shipped-feature-graph.sh`, the prove-absence gate that
+ADR-062, capability injection, mandates in §Decision 6, where it probed a `cargo tree`
+output for a `scp-testing v…` crate
+node. There it failed OPEN rather than closed: `cargo tree -e no-dev -p scp-node` prints
+96,898 bytes on this tree, and prepending one `scp-testing v0.1.0` line to that output
+made `grep -q` report the harness crate ABSENT, which is the verdict that lets a shipped
+artifact pass a zero-nullifier gate. Fixing one instance of this construct is not
+finishing: grep every gate for `grep -q` inside a pipeline.
 
 **5. A job with no `timeout-minutes`.** GitHub's default per-job ceiling is 360 minutes.
 No job in this workflow set a timeout, so one hang burned six runner-hours. Size each
@@ -64,17 +81,53 @@ selected per option through `X == 'v' && minutes || …`; and GitHub validates a
 input against a definition on a default branch, so a new option list cannot be exercised
 from a feature branch.
 
+**7. A condition on every step of a job that carries none itself.** Job `rust-test` runs
+`cargo nextest run --workspace`. It carried no job-level `if:` and instead repeated
+`if: needs.changes.outputs.rust == 'true'` on seven steps, under a comment claiming each
+matrix leg had to expand to report a status to branch protection. A renamed or misspelled
+filter output therefore skipped all seven steps while that job reported success, and both
+guards built to catch exactly that read job-level conditions only: an aggregate decides
+whether a dependency was supposed to run by evaluating that dependency's own `if:`, and a
+filter-key check scans job `if:` expressions for names `changes` never published. Gate a
+job at job level, and let an aggregate judge the skip. Where a step genuinely needs its
+own condition, that condition must name something other than a filter output —
+`runner.os == 'Linux'` on a disk-cleanup step is fine.
+
+**8. A loop over an empty input set that then publishes its output.** Job `sign-windows`
+in release.yml Authenticode-signed every `.dll` a PowerShell pipeline returned, then
+uploaded `windows-artifacts/` and `windows-cbindgen/` under artifact name
+`windows-signed`. A pipeline over an empty file set runs zero times and exits 0, so a
+Windows build leg that produced no binary published an artifact named as signed that
+carried nothing signed. Job `rust` of build-matrix.yml is how such a leg arises: it ran a
+POSIX `for` loop with no `shell:` declared, which GitHub read as PowerShell on that one
+leg, so that leg failed before its first `cargo build` and uploaded nothing. A transform
+step must assert its input set is non-empty before a publish step consumes its output.
+The same step also swallowed a signing failure: `signtool` is a native command, so a
+non-zero exit sets `$LASTEXITCODE` without stopping a pwsh script, and only a last
+invocation's code reaches GitHub, so one failed signature among many passed as green.
+
 ## Tests holding these closed
 
 - `scripts/tests/ci-gate/run-tests.sh` — asserts every job sets a `timeout-minutes`, that
-  every job is a dependency of `ci`, that no `cargo test` in that workflow carries a
-  test-name filter, that four binding test jobs run on a Rust-only change, that any job
-  reading a runtime-scaling input sizes its budget from that input and covers every
-  permitted option, and that an aggregate rejects a skipped dependency its condition
-  selected to run.
+  every job is a dependency of `ci`, that no `cargo test` in any workflow carries a
+  test-name filter on either side of a `--`, that four binding test jobs run on a
+  Rust-only change, that any job reading a runtime-scaling input sizes its budget from
+  that input and covers every permitted option, that no step gates itself on a `changes`
+  filter output, that the `fuzz` and `typescript-wasm` filters cover the path-dependency
+  closure of the manifests they guard, that job `sign-windows` runs its non-empty-input
+  guard before its upload, and that an aggregate rejects a skipped dependency its
+  condition selected to run.
 - `scripts/tests/cross-layer/run-tests.sh` — plants an FFI export at a first line and at
   a last line of a 155 KB diff, proves that gate finds both, then plants a missing export
   and proves it still rejects that.
+- `scripts/tests/sign-windows/run-tests.sh` — runs `scripts/assert-nonempty-dll-set.sh`
+  against fixture directories: a nested `.dll` is found, a directory holding only `.lib`
+  and `.txt` is rejected, a directory that was never downloaded is rejected, and naming no
+  directory at all is rejected.
+- `scripts/check-shipped-feature-graph.sh --self-test` — builds a 200 KB synthetic
+  `cargo tree` output with a `scp-testing v0.1.0` node on its first line and on its last
+  line, and asserts the crate-node probe reports that node present in both, then asserts a
+  tree carrying no such node still reads as absent.
 
-Both harnesses were run against unfixed code first and failed on exactly a defect each
+Every harness above was run against unfixed code first and failed on exactly a defect it
 describes. A harness that has never failed has not been tested.
