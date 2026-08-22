@@ -60,7 +60,17 @@ node. There it failed OPEN rather than closed: `cargo tree -e no-dev -p scp-node
 96,898 bytes on this tree, and prepending one `scp-testing v0.1.0` line to that output
 made `grep -q` report the harness crate ABSENT, which is the verdict that lets a shipped
 artifact pass a zero-nullifier gate. Fixing one instance of this construct is not
-finishing: grep every gate for `grep -q` inside a pipeline.
+finishing: grep every gate for `grep -q` inside a pipeline. That grep found three more.
+`scripts/hooks/pretooluse-enforcement-files.sh`, which blocks an in-band write to any
+enforcement file, ran `echo "$command_str" | grep -qE`, so an agent defeated it by making
+its command long: measured, a 43-byte `tee` at a protected basename exited 2 (BLOCK), and
+that same `tee` followed by a 166,933-byte heredoc exited 0 (ALLOW).
+`scripts/check-saga-gating-granularity.sh` piped three supervisor function bodies into six
+such probes; measured, a 194,118-byte body carrying `.contains(` on its second line
+returned 141 under `grep -Fq` and 0 under `grep -F … >/dev/null`, and its
+`extractor_has_no_standing_prefix` probe fails OPEN in that direction.
+`scripts/tests/bridge-symmetry/run-tests.sh` matched a substring in gate output the same
+way. Search for the construct, not for the file you already know about.
 
 **5. A job with no `timeout-minutes`.** GitHub's default per-job ceiling is 360 minutes.
 No job in this workflow set a timeout, so one hang burned six runner-hours. Size each
@@ -146,6 +156,15 @@ a workspace manifest and raises on an inherited name no workspace publishes.
   against fixture directories: a nested `.dll` is found, a directory holding only `.lib`
   and `.txt` is rejected, a directory that was never downloaded is rejected, and naming no
   directory at all is rejected.
+- `scripts/tests/enforcement-files-hook/run-tests.sh` — three cases pad a `tee`, a
+  redirect and a `sed -i` at a protected file past 64 KB and assert the hook still exits 2.
+- `scripts/check-saga-gating-granularity.sh --self-test` — fixture (h) pads each of three
+  supervisor function bodies past 64 KB, leaving every token on an early line, and asserts
+  that a supervisor satisfying every positive assertion is still accepted. Fixtures (i)
+  and (j) plant a `"standing-"` literal in the extractor, (i) in a short body and (j) on
+  an early line of a padded one, and assert both are rejected: a failure of (i) alone
+  means P5 is dead, and a failure of (j) alone means P5's verdict depends on how long that
+  body is. P5 carried no behavioral proof before, which is why its fail-open survived.
 - `scripts/check-shipped-feature-graph.sh --self-test` — builds a 200 KB synthetic
   `cargo tree` output with a `scp-testing v0.1.0` node on its first line and on its last
   line, and asserts the crate-node probe reports that node present in both, then asserts a

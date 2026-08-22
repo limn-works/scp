@@ -242,6 +242,19 @@ fn_body() {
 # count — the tokens must appear in live code. The additional `return Err(`
 # requirement ensures a real early-return reject, not a discarded binding.
 # Returns 0 (present) or 1 (absent).
+#
+# Every probe below writes grep's output to /dev/null instead of passing grep a
+# -q flag. `set -o pipefail` (line 111) makes a pipeline report a last non-zero
+# exit status any stage returned. `grep -q` stops reading at its first match and
+# exits, which closes a pipe while `printf` is still writing; `printf` then dies
+# of SIGPIPE and returns 141, and pipefail hands 141 to `||`, which reads a token
+# grep FOUND as a token absent. Measured on this tree: a 194,118-byte function
+# body carrying `.contains(` on its second line returned 141 under `grep -Fq`
+# and 0 under `grep -F … >/dev/null`. A supervisor function long enough to pass
+# a 64 KB pipe buffer would therefore fail P3 and P4 while satisfying them, and
+# would pass P5 while violating it — a FAIL-OPEN read on the one probe whose
+# match means "regression present". Fixture (h) in self_test asserts every
+# verdict over a padded body.
 # ---------------------------------------------------------------------------
 has_overlap_reject_in_reserve() {
     local file="$1" body code
@@ -250,11 +263,11 @@ has_overlap_reject_in_reserve() {
     # Strip //-comment tails so tokens that appear ONLY in comments do not count
     # (a gutted reject with explanatory-comment-only tokens must NOT pass).
     code="$(printf '%s' "$body" | sed 's://.*$::')"
-    printf '%s' "$code" | grep -Fq -- '.contains(' || return 1
-    printf '%s' "$code" | grep -Fq -- 'SagaBusy' || return 1
-    printf '%s' "$code" | grep -Fq -- 'ActorBusy' || return 1
+    printf '%s' "$code" | grep -F -- '.contains(' >/dev/null || return 1
+    printf '%s' "$code" | grep -F -- 'SagaBusy' >/dev/null || return 1
+    printf '%s' "$code" | grep -F -- 'ActorBusy' >/dev/null || return 1
     # The reject must be a real early-return, not a discarded binding.
-    printf '%s' "$code" | grep -Eq -- 'return[[:space:]]+Err\(' || return 1
+    printf '%s' "$code" | grep -E -- 'return[[:space:]]+Err\(' >/dev/null || return 1
     return 0
 }
 
@@ -267,7 +280,7 @@ start_saga_calls_reserve() {
     local file="$1" body
     body="$(fn_body "$file" 'start_saga')"
     [[ -n "$body" ]] || return 1
-    printf '%s' "$body" | grep -Fq -- 'try_reserve_context_set(' || return 1
+    printf '%s' "$body" | grep -F -- 'try_reserve_context_set(' >/dev/null || return 1
     return 0
 }
 
@@ -285,7 +298,7 @@ extractor_has_no_standing_prefix() {
     # Absence of the function is a SEPARATE failure (P2); treat a missing body
     # as "clean" here so P5 does not double-count it.
     [[ -n "$body" ]] || return 0
-    if printf '%s' "$body" | grep -Eq -- '"standing-|generate_standing_context_id'; then
+    if printf '%s' "$body" | grep -E -- '"standing-|generate_standing_context_id' >/dev/null; then
         return 1
     fi
     return 0
@@ -667,6 +680,111 @@ self_test() {
         printf 'dead — restore the comment-tail stripping and the early-return check.\n' >&2
         rc=1
     fi
+
+    # ---- fixture (h): a correct supervisor whose bodies pass a pipe buffer -> PASS.
+    # Every probe in has_overlap_reject_in_reserve, start_saga_calls_reserve and
+    # extractor_has_no_standing_prefix pipes a function body into grep under
+    # `set -o pipefail`. Under `grep -q`, grep exits at its first match, `printf`
+    # dies of SIGPIPE, and pipefail reports 141 — so a token near a top of a long
+    # body read as ABSENT. This fixture pads each of the three bodies past 64 KB
+    # with brace-free comment lines, leaving every token on an early line, and
+    # asserts the gate still ACCEPTS it. Measured: a 194,118-byte body carrying
+    # `.contains(` on its second line returned 141 under `grep -Fq` and 0 under
+    # `grep -F … >/dev/null`.
+    local sup_h="$fixt/sup_h.rs" pad_i
+    {
+        printf 'struct Supervisor {\n'
+        printf '    reserved_saga_contexts: std::sync::Mutex<HashSet<String>>,\n'
+        printf '    spawn_generation: std::sync::atomic::AtomicU64,\n'
+        printf '}\n'
+        printf 'fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {\n'
+        printf '    let out = vec![hex::encode(derive_standing_context_digest(a, b))];\n'
+        for ((pad_i = 0; pad_i < 1200; pad_i++)); do
+            printf '    // padding %d — widens this body past a pipe buffer\n' "$pad_i"
+        done
+        printf '    out\n'
+        printf '}\n'
+        printf 'fn try_reserve_context_set(&self, set: &[String]) -> Result<R, E> {\n'
+        printf '    if set.iter().find(|id| reserved.contains(*id)).is_some() {\n'
+        printf '        return Err(ContextError::ActorBusy("... SagaBusy".into()));\n'
+        printf '    }\n'
+        for ((pad_i = 0; pad_i < 1200; pad_i++)); do
+            printf '    // padding %d — widens this body past a pipe buffer\n' "$pad_i"
+        done
+        printf '    Ok(reservation)\n'
+        printf '}\n'
+        printf 'pub async fn start_saga(&self, input: SagaInput) -> Result<O, E> {\n'
+        printf '    let set = saga_participant_context_set(&input);\n'
+        printf '    let _r = self.try_reserve_context_set(&set)?;\n'
+        for ((pad_i = 0; pad_i < 1200; pad_i++)); do
+            printf '    // padding %d — widens this body past a pipe buffer\n' "$pad_i"
+        done
+        printf '    Ok(out)\n'
+        printf '}\n'
+    } > "$sup_h"
+    local ffi_h="$fixt/ffi_h"
+    mkdir -p "$ffi_h"
+    printf 'pub fn unrelated() {}\n' > "$ffi_h/exports.rs"
+
+    if ! run_check "$sup_h" "$ffi_h" "self-test(h)" "$tests_ok" >/dev/null 2>&1; then
+        printf '%sSELF-TEST FAILED (h)%s: a supervisor satisfying every positive assertion\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf 'was rejected once its function bodies grew past a 64 KB pipe buffer, so this\n' >&2
+        printf 'gate reads a token grep found as a token absent. Replace every `grep -q`\n' >&2
+        printf 'inside a pipeline here with `grep … >/dev/null`, which reads its whole input.\n' >&2
+        rc=1
+    fi
+
+    # ---- fixtures (i) and (j): a `"standing-"` literal in the extractor -> FAIL.
+    # P5 carried no behavioral proof at all, and its probe is the one whose MATCH
+    # means "regression present", so a 141 from SIGPIPE reads as "clean" and lets
+    # a violating supervisor through. (i) plants the literal in a short body and
+    # (j) plants it on an early line of a body padded past 64 KB; both must be
+    # REJECTED. A failure of (i) alone means P5 is dead; a failure of (j) alone
+    # means P5's verdict depends on how long that body is.
+    local sup_name padded literal_line
+    literal_line='    vec![format!("standing-{}", hex::encode(digest))]'
+    for sup_name in i j; do
+        local sup_p="$fixt/sup_${sup_name}.rs"
+        [[ "$sup_name" == "j" ]] && padded=1 || padded=0
+        {
+            printf 'struct Supervisor {\n'
+            printf '    reserved_saga_contexts: std::sync::Mutex<HashSet<String>>,\n'
+            printf '    spawn_generation: std::sync::atomic::AtomicU64,\n'
+            printf '}\n'
+            printf 'fn saga_participant_context_set(input: &SagaInput) -> Vec<String> {\n'
+            printf '%s\n' "$literal_line"
+            if [[ "$padded" -eq 1 ]]; then
+                for ((pad_i = 0; pad_i < 1200; pad_i++)); do
+                    printf '    // padding %d — widens this body past a pipe buffer\n' "$pad_i"
+                done
+            fi
+            printf '}\n'
+            printf 'fn try_reserve_context_set(&self, set: &[String]) -> Result<R, E> {\n'
+            printf '    if set.iter().find(|id| reserved.contains(*id)).is_some() {\n'
+            printf '        return Err(ContextError::ActorBusy("... SagaBusy".into()));\n'
+            printf '    }\n'
+            printf '    Ok(reservation)\n'
+            printf '}\n'
+            printf 'pub async fn start_saga(&self, input: SagaInput) -> Result<O, E> {\n'
+            printf '    let set = saga_participant_context_set(&input);\n'
+            printf '    let _r = self.try_reserve_context_set(&set)?;\n'
+            printf '    Ok(out)\n'
+            printf '}\n'
+        } > "$sup_p"
+        local ffi_p="$fixt/ffi_${sup_name}"
+        mkdir -p "$ffi_p"
+        printf 'pub fn unrelated() {}\n' > "$ffi_p/exports.rs"
+
+        if run_check "$sup_p" "$ffi_p" "self-test($sup_name)" "$tests_ok" >/dev/null 2>&1; then
+            printf '%sSELF-TEST FAILED (%s)%s: an extractor emitting a `"standing-"`-prefixed\n' \
+                "$C_RED" "$sup_name" "$C_RESET" >&2
+            printf 'literal into the reserved set was wrongly ACCEPTED, so P5 does not reject\n' >&2
+            printf 'the FIX-1 regression it names — a reservation keyed on the DISPLAY id\n' >&2
+            printf 'rather than on the canonical raw digest.\n' >&2
+            rc=1
+        fi
+    done
 
     rm -rf "$fixt"
     return "$rc"

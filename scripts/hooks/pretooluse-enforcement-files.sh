@@ -118,8 +118,23 @@ if [[ "$tool_name" == "Bash" ]]; then
             # placed AFTER the script, exotic obfuscation) fall to CI.
             # POSIX `[[:space:]]` (not `[ \t]`, whose literal `t` would exclude
             # path components containing the letter t, e.g. `scripts/`).
-            if echo "$command_str" | grep -qE '\b(tee|mv|cp|cat[^|]*>|sed[[:space:]]+(-[[:alpha:]]+[[:space:]]+)*(-[[:alpha:]]*i[[:alpha:]]*|--in-place)[^[:space:]]*|python3?(\.[0-9]+)?[[:space:]]+-c)[[:space:]].*'"$basename" \
-               || echo "$command_str" | grep -qE '>>?\|?[[:space:]]*[^[:space:]|]*'"$basename"; then
+            #
+            # Both searches write grep's output to /dev/null rather than passing
+            # grep a -q flag. `set -o pipefail` (line 31) makes a pipeline report
+            # a last non-zero exit status any stage returned. `grep -q` stops
+            # reading at its first match and exits, which closes a pipe while
+            # `echo` is still writing; `echo` then dies of SIGPIPE and returns
+            # 141, and pipefail hands 141 to `if`, which takes its else branch
+            # and ALLOWS the write. Measured on this tree: a 43-byte `tee` at a
+            # protected basename exited 2 (BLOCK), and that same `tee` followed
+            # by a 166,933-byte heredoc exited 0 (ALLOW) — padding a command
+            # past a 64 KB pipe buffer defeated this hook entirely.
+            # `grep -E … >/dev/null` reads its whole input, so `echo` never
+            # receives SIGPIPE and a pipeline reports grep's own verdict.
+            # scripts/tests/enforcement-files-hook/run-tests.sh asserts a padded
+            # write is still blocked.
+            if echo "$command_str" | grep -E '\b(tee|mv|cp|cat[^|]*>|sed[[:space:]]+(-[[:alpha:]]+[[:space:]]+)*(-[[:alpha:]]*i[[:alpha:]]*|--in-place)[^[:space:]]*|python3?(\.[0-9]+)?[[:space:]]+-c)[[:space:]].*'"$basename" >/dev/null \
+               || echo "$command_str" | grep -E '>>?\|?[[:space:]]*[^[:space:]|]*'"$basename" >/dev/null; then
                 echo "enforcement file protected (Bash write): $basename" >&2
                 echo "Detected an apparent write/redirect to a protected" \
                      "enforcement file via Bash. Use a dedicated PR." >&2
