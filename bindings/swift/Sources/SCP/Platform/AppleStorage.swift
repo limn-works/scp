@@ -308,24 +308,54 @@
         /// writes a row holding no key. Reading this code is what turns each of
         /// those answers into a thrown error.
         ///
+        /// **Why this method passes a byte count rather than a C string.**
+        /// `sqlite3_bind_text` reads a negative length as "the bytes up to the
+        /// first zero byte", so binding a key through a C string pointer stores
+        /// `set(key: "a\u{0}b", …)` under the one-byte key `a`, and
+        /// `set(key: "a\u{0}c", …)` then overwrites that same row. SQLite
+        /// answers `SQLITE_OK` for that bind, so the return code this method
+        /// reads rejects nothing there. Passing `value.utf8.count` is what
+        /// gives two keys that differ after a zero byte two rows. That count
+        /// also forbids the null pointer `NSString.utf8String` may answer, which
+        /// SQLite reads as a request to bind `NULL` while still answering
+        /// `SQLITE_OK`.
+        ///
         /// - Parameters:
         ///   - value: Text SQLite copies before this call returns, because the
         ///     destructor argument is `SQLITE_TRANSIENT`.
         ///   - statement: A statement `sqlite3_prepare_v2` produced.
         ///   - index: A one-based parameter position.
-        /// - Throws: `StorageError.databaseError` when `statement` is `nil`, and
+        /// - Throws: `StorageError.databaseError` when `statement` is `nil`,
+        ///   when `value` holds more UTF-8 bytes than an `Int32` counts, and
         ///   when `sqlite3_bind_text` answers anything other than `SQLITE_OK`.
         static func bindText(_ value: String, to statement: OpaquePointer?, at index: Int32) throws {
             guard let statement else {
                 throw StorageError.databaseError("bindText received no prepared statement")
             }
-            let status = sqlite3_bind_text(
-                statement,
-                index,
-                (value as NSString).utf8String,
-                -1,
-                transientDestructor
-            )
+            let utf8 = Array(value.utf8)
+            guard let byteCount = Int32(exactly: utf8.count) else {
+                throw StorageError.databaseError(
+                    "bindText received \(utf8.count) UTF-8 bytes, which no Int32 length counts"
+                )
+            }
+            let status = utf8.withUnsafeBufferPointer { buffer -> Int32 in
+                guard let base = buffer.baseAddress else {
+                    // `UnsafeBufferPointer.baseAddress` documents `nil` for an
+                    // empty buffer, and SQLite reads a null pointer as a request
+                    // to bind `NULL` while still answering `SQLITE_OK`, so this
+                    // arm binds zero bytes of a literal instead. The Swift 6.2
+                    // toolchain answers a non-null address for an empty
+                    // `Array<UInt8>`, so no `swift test` case reaches this arm
+                    // and none of them pins it.
+                    return sqlite3_bind_text(statement, index, "", 0, transientDestructor)
+                }
+                return UnsafeRawPointer(base).withMemoryRebound(
+                    to: CChar.self,
+                    capacity: buffer.count
+                ) { characters in
+                    sqlite3_bind_text(statement, index, characters, byteCount, transientDestructor)
+                }
+            }
             guard status == SQLITE_OK else {
                 throw StorageError.databaseError(errorMessage(for: statement))
             }
@@ -457,9 +487,26 @@
 
             var keys: [String] = []
             while sqlite3_step(stmt) == SQLITE_ROW {
-                if let cStr = sqlite3_column_text(stmt, 0) {
-                    keys.append(String(cString: cStr))
+                // `String(cString:)` stops at the first zero byte, which would
+                // return `a` for a stored key `a\u{0}b` and would return one
+                // string for two keys that differ only after that byte.
+                // `sqlite3_column_bytes` reports how many bytes SQLite holds for
+                // this column, and SQLite's documentation requires the call
+                // order below: read the column through `sqlite3_column_text`
+                // first, then ask for its byte count.
+                guard let text = sqlite3_column_text(stmt, 0) else { continue }
+                let byteCount = Int(sqlite3_column_bytes(stmt, 0))
+                let bytes = Data(UnsafeBufferPointer(start: text, count: byteCount))
+                // §17.3 of the persistence-and-storage spec states that keys are
+                // UTF-8 strings, so bytes that decode as no UTF-8 string name a
+                // key this storage never wrote. Throwing reports that, where
+                // substituting U+FFFD would return a string naming no row.
+                guard let key = String(bytes: bytes, encoding: .utf8) else {
+                    throw StorageError.databaseError(
+                        "a stored key of \(byteCount) bytes decodes as no UTF-8 string"
+                    )
                 }
+                keys.append(key)
             }
             return keys
         }

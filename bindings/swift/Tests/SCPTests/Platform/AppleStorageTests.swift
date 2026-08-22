@@ -3,10 +3,11 @@
 // These cases run against `AppleStorage` itself, opened at a database file this
 // process created under an encryption key this file holds, rather than against
 // the in-memory replica in `StorageConformanceTests.swift`. That replica shares
-// the schema and the query text and shares no line of `AppleStorage`, so a
-// defect in `AppleStorage` reaches no assertion there.
+// the schema, the query text, and the two parameter-binding helpers, and it
+// shares no line of the six `StorageProvider` method bodies, so a defect in one
+// of those six bodies reaches no assertion there.
 //
-// Three properties these cases pin:
+// Four properties these cases pin:
 //
 // 1. Every `AppleStorage` method throws when SQLite rejects a parameter bind,
 //    and none of them reports a result computed from an unbound parameter.
@@ -18,7 +19,13 @@
 //    Apple platform adapter, in `.docs/adrs/phase-5.md` states that criterion.
 // 2. The six `StorageProvider` methods round-trip values through the real
 //    database file, including a value of zero bytes.
-// 3. No file this storage writes carries a stored value in plaintext, which is
+// 3. Two keys that differ only after a zero byte name two rows, and `listKeys`
+//    returns each of them whole. `sqlite3_bind_text` reads a negative length as
+//    "the bytes up to the first zero byte" and answers `SQLITE_OK` for that
+//    bind, so the return code property above rejects nothing there; the byte
+//    count each method passes is what separates the two keys. The same
+//    acceptance criterion states that property.
+// 4. No file this storage writes carries a stored value in plaintext, which is
 //    the observable behind the same criterion's encryption clause: SQLCipher
 //    receives the 32-byte key through `PRAGMA key` before any other operation on
 //    the connection, and plain SQLite ignores that pragma without an error.
@@ -184,6 +191,27 @@
             try AppleStorage.bindBlob(Data(), to: stmt, at: 2)
             #expect(sqlite3_step(stmt) == SQLITE_DONE)
         }
+
+        @Test("bindText binds every byte of a value carrying a zero byte")
+        func bindTextBindsPastAZeroByte() throws {
+            // `sqlite3_bind_text` reads a negative length as "the bytes up to
+            // the first zero byte" and answers `SQLITE_OK`, so this case fails
+            // for an implementation that passes `-1`: SQLite would report 5
+            // bytes for a 9-byte value. `length()` counts characters up to the
+            // first zero byte for a text value and counts bytes for a blob, so
+            // this case casts the parameter to a blob first.
+            let connection = try makeBareConnection()
+            defer { sqlite3_close_v2(connection) }
+
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT length(CAST(?1 AS BLOB))"
+            #expect(sqlite3_prepare_v2(connection, sql, -1, &stmt, nil) == SQLITE_OK)
+
+            try AppleStorage.bindText("alpha\u{0}one", to: stmt, at: 1)
+            #expect(sqlite3_step(stmt) == SQLITE_ROW)
+            #expect(sqlite3_column_int(stmt, 0) == 9)
+        }
     }
 
     // MARK: - Round-trip tests
@@ -327,6 +355,34 @@
             try await fixture.storage.set(key: "gamma", value: Data([0x01]))
             try await fixture.storage.set(key: "gamma", value: Data([0x02, 0x03]))
             #expect(try await fixture.storage.get(key: "gamma") == Data([0x02, 0x03]))
+        }
+
+        @Test("two keys that differ only after a zero byte name two rows")
+        func keysDifferingAfterAZeroByteNameTwoRows() async throws {
+            // An implementation that binds a key as a C string stores both of
+            // these under the five-byte key `delta`, so the second `set`
+            // overwrites the first, `get` answers `[0x02]` for both, and
+            // `listKeys` answers `["delta"]`. Six of the eight assertions below
+            // fail for that implementation; a measured run of it recorded those
+            // six.
+            let fixture = try makeStorageFixture()
+            defer { fixture.removeFiles() }
+
+            let first = "delta\u{0}one"
+            let second = "delta\u{0}two"
+            try await fixture.storage.set(key: first, value: Data([0x01]))
+            try await fixture.storage.set(key: second, value: Data([0x02]))
+
+            #expect(try await fixture.storage.get(key: first) == Data([0x01]))
+            #expect(try await fixture.storage.get(key: second) == Data([0x02]))
+            #expect(try await fixture.storage.get(key: "delta") == nil)
+            #expect(try await fixture.storage.exists(key: "delta") == false)
+            #expect(try await fixture.storage.listKeys(prefix: "delta") == [first, second])
+
+            try await fixture.storage.delete(key: first)
+            #expect(try await fixture.storage.exists(key: first) == false)
+            #expect(try await fixture.storage.exists(key: second) == true)
+            #expect(try await fixture.storage.deletePrefix(prefix: "delta") == 1)
         }
     }
 
