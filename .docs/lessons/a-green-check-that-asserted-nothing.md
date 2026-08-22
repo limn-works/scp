@@ -1,6 +1,6 @@
-# A Green Check That Asserted Nothing: Eight Ways CI Reported Success Over Zero Work
+# A Green Check That Asserted Nothing: Nine Ways CI Reported Success Over Zero Work
 
-**Date:** 2026-08-16, extended 2026-08-17
+**Date:** 2026-08-16, extended 2026-08-17 and 2026-08-22
 **Source:** branch `fix/ci-enforces-what-it-claims` — `.github/workflows/ci.yml`, `.github/workflows/fuzz.yml`, `.github/workflows/release.yml`, `scripts/check-cross-layer.sh`, `scripts/check-shipped-feature-graph.sh`
 
 ## Rule
@@ -10,7 +10,7 @@ fail on whichever defect it exists to catch, and keep that failure as a test. Ev
 defect below produced a green check while work behind it never ran, and every one passed
 review because a check *looked* like it was doing its job.
 
-## Eight failure shapes
+## Nine failure shapes
 
 **1. A command that treats "nothing matched" as success.** `cargo test -p scp-node --lib
 pre_rotation_severance` exits 0 when a filter selects no test. Two tests it named
@@ -33,7 +33,7 @@ dependency map with `toJSON(needs)` so an aggregate covers every dependency by
 construction, and decide per job whether that job was supposed to run.
 
 **3. A path filter narrower than code it guards.** Filters named `python`, `typescript`,
-`kotlin` and `swift` filters listed each binding's own directory and its bridge
+`kotlin` and `swift` listed each binding's own directory and its bridge
 directory. All four bridges reach every Rust workspace crate through scp-core, so a pull
 request touching only `crates/scp-runtime/` skipped all four test jobs and roughly 2,600
 assertions executed zero times under a green check. When a job's real dependency closure
@@ -106,6 +106,25 @@ The same step also swallowed a signing failure: `signtool` is a native command, 
 non-zero exit sets `$LASTEXITCODE` without stopping a pwsh script, and only a last
 invocation's code reaches GitHub, so one failed signature among many passed as green.
 
+**9. A new guard that reads an absent input as a benign value.** Fixing shapes 2 and 3
+introduced two of these, in the guards those fixes added. `scripts/ci-aggregate-result.py`
+refuses to guess at a `needs.changes.outputs.<key>` that job never published, because
+reading it as `""` would compare unequal to every literal and hold a job at `skipped`
+forever — and then read an absent `GITHUB_EVENT_NAME` as `""` anyway. Job `cross-layer`
+carries `if: github.event_name == 'pull_request'`, so an empty event name made that
+aggregate judge the condition false and accept a skipped `cross-layer` on a pull request:
+measured, `NEEDS_JSON` reporting `cross-layer: skipped` with `GITHUB_EVENT_NAME` unset
+exited 0. `path_dependency_closure` in `scripts/tests/ci-gate/ci_gate_selftest.py` read a
+dependency spec carrying no `path` key as a dependency reaching no crate, and a
+`dep = { workspace = true }` entry carries its `path` in a workspace manifest rather than
+in a member manifest: measured on a two-crate fixture, that walk returned an empty closure
+for a crate an inherited entry reaches, which would let `check_path_dep_closures` report a
+`fuzz` or `typescript-wasm` filter complete while that filter omitted those directories —
+shape 3 again, this time hidden inside a check written to catch shape 3. A guard states a
+criterion over inputs it can read, so an input it cannot read stops it: this aggregate now
+exits 3 on an absent event name, and this closure now resolves an inherited entry against
+a workspace manifest and raises on an inherited name no workspace publishes.
+
 ## Tests holding these closed
 
 - `scripts/tests/ci-gate/run-tests.sh` — asserts every job sets a `timeout-minutes`, that
@@ -115,8 +134,11 @@ invocation's code reaches GitHub, so one failed signature among many passed as g
   that input and covers every permitted option, that no step gates itself on a `changes`
   filter output, that the `fuzz` and `typescript-wasm` filters cover the path-dependency
   closure of the manifests they guard, that job `sign-windows` runs its non-empty-input
-  guard before its upload, and that an aggregate rejects a skipped dependency its
-  condition selected to run.
+  guard before its upload, that an aggregate rejects a skipped dependency its
+  condition selected to run, that an aggregate run without `GITHUB_EVENT_NAME` exits 3
+  rather than accepting a skipped `cross-layer`, and that a closure over a two-crate
+  fixture reaches a leaf whose entry reads `workspace = true` and raises on an inherited
+  name no workspace publishes.
 - `scripts/tests/cross-layer/run-tests.sh` — plants an FFI export at a first line and at
   a last line of a 155 KB diff, proves that gate finds both, then plants a missing export
   and proves it still rejects that.

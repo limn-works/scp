@@ -19,7 +19,14 @@ a job list drifts.
 Inputs:
   NEEDS_JSON         `toJSON(needs)` from a `ci` job: a map of job id to
                      {"result": ..., "outputs": {...}}.
-  GITHUB_EVENT_NAME  whichever event triggered this run.
+  GITHUB_EVENT_NAME  whichever event triggered this run. A runner always sets
+                     it, and this script requires it rather than defaulting it
+                     to "": job cross-layer carries
+                     `if: github.event_name == 'pull_request'`, so an empty
+                     event name reads that condition as false and accepts a
+                     skipped cross-layer on a pull request. Defaulting an
+                     absent input is the same fail-open read that
+                     `resolve_operand` refuses for an absent filter output.
   argv[1]            path to a workflow file (default .github/workflows/ci.yml).
 
 Exit 0: every dependency that was supposed to run reported success.
@@ -29,6 +36,7 @@ Exit 2: a workflow carries an `if:` expression this evaluator cannot read, or
         that expression names a `changes` output that job never published.
         Teach this evaluator a new construct, or correct a stale output name —
         do NOT silence a job.
+Exit 3: an input this script needs is absent or empty.
 """
 
 from __future__ import annotations
@@ -108,6 +116,14 @@ def main() -> int:
 
     needs = json.loads(os.environ["NEEDS_JSON"])
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    if not event_name:
+        print(
+            "::error::GITHUB_EVENT_NAME is absent or empty. A job whose `if:` compares "
+            "github.event_name — cross-layer compares it against 'pull_request' — would "
+            "read that comparison as false, and this gate would then accept that job's "
+            "skip. Refusing to judge any dependency without knowing which event ran."
+        )
+        return 3
 
     failures: list[str] = []
 

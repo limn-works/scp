@@ -45,7 +45,15 @@ nothing:
                reads. It omitted scp-relay-client, which fuzz/Cargo.toml
                declares as a direct dependency, and omitted scp-core,
                scp-identity and scp-platform, so a change to any of those four
-               skipped job fuzz-build.
+               skipped job fuzz-build. A closure computed here then read a
+               dependency spec carrying no `path` key as a dependency reaching
+               no crate, and a `dep = { workspace = true }` entry carries its
+               `path` in a workspace manifest, so an inherited crate and
+               everything it reaches dropped out of a closure this check
+               compares a filter against.
+  event-name   An aggregate read an absent GITHUB_EVENT_NAME as "", so
+               `if: github.event_name == 'pull_request'` on job cross-layer
+               judged false and a skipped cross-layer passed on a pull request.
 
 Assertions over an aggregate's verdict read which jobs a scenario selects out
 of SCENARIOS below, never out of the aggregate itself. Six of them once built
@@ -64,6 +72,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import NamedTuple
@@ -430,8 +439,13 @@ def check_scaling_input_sizes_budget(label, job, budget) -> None:
         )
 
 
-def run_aggregate(needs: dict, event_name: str) -> tuple[int, str]:
-    env = dict(os.environ, NEEDS_JSON=json.dumps(needs), GITHUB_EVENT_NAME=event_name)
+def run_aggregate(needs: dict, event_name: str | None) -> tuple[int, str]:
+    """Run an aggregate over one `needs` map. `event_name=None` unsets it."""
+    env = dict(os.environ, NEEDS_JSON=json.dumps(needs))
+    if event_name is None:
+        env.pop("GITHUB_EVENT_NAME", None)
+    else:
+        env["GITHUB_EVENT_NAME"] = event_name
     proc = subprocess.run(
         [sys.executable, str(AGGREGATE), str(WORKFLOW)],
         env=env,
@@ -563,21 +577,55 @@ def path_filters(jobs: dict) -> dict[str, list[str]]:
     raise AssertionError("job `changes` runs no dorny/paths-filter step")
 
 
-def path_dependency_closure(manifest: Path) -> set[str]:
+def workspace_dependency_specs(manifest: Path) -> tuple[dict, Path]:
+    """Return `[workspace.dependencies]` and a directory its paths resolve against.
+
+    Cargo resolves a `dep = { workspace = true }` entry against the nearest
+    ancestor manifest carrying a `[workspace]` table, a manifest carrying that
+    table itself included, and it reads that entry's `path` relative to that
+    workspace manifest's own directory rather than relative to a member's
+    directory. path_dependency_closure calls this so an inherited dependency
+    contributes its directory to a closure.
+    """
+    resolved = manifest.resolve()
+    document = tomllib.loads(resolved.read_text())
+    if "workspace" in document:
+        return document["workspace"].get("dependencies") or {}, resolved.parent
+    for directory in resolved.parent.parents:
+        candidate = directory / "Cargo.toml"
+        if not candidate.is_file():
+            continue
+        parsed = tomllib.loads(candidate.read_text())
+        if "workspace" in parsed:
+            return parsed["workspace"].get("dependencies") or {}, directory
+    return {}, resolved.parent
+
+
+def path_dependency_closure(manifest: Path, root: Path | None = None) -> set[str]:
     """Return every crate directory a manifest reaches through `path =` deps.
 
     Walks `[dependencies]`, `[build-dependencies]` and each `[target.*]` table,
     which together are what `cargo tree -e no-dev` walks. Skips
     `[dev-dependencies]`, because a shipped or fuzzed build does not compile
-    them. Returns directories relative to a repository root, so a caller
-    compares them against a path filter directly.
+    them. Returns directories relative to `root`, so a caller compares them
+    against a path filter directly.
+
+    A `dep = { workspace = true }` entry carries its `path` in a workspace
+    manifest rather than in a member manifest, so reading a member's own table
+    alone drops that dependency and every crate it reaches. This walk therefore
+    substitutes a workspace spec for each inherited entry, and raises on an
+    inherited name no workspace publishes rather than dropping it — dropping it
+    would shrink a closure and let check_path_dep_closures report a filter
+    complete while that filter omitted those directories.
     """
+    root = (REPO if root is None else root).resolve()
     directories: set[str] = set()
     pending = [manifest.resolve()]
     seen = {manifest.resolve()}
     while pending:
         current = pending.pop()
         document = tomllib.loads(current.read_text())
+        inherited, inherited_base = workspace_dependency_specs(current)
         tables = [
             document.get("dependencies") or {},
             document.get("build-dependencies") or {},
@@ -586,11 +634,25 @@ def path_dependency_closure(manifest: Path) -> set[str]:
             tables.append(target.get("dependencies") or {})
             tables.append(target.get("build-dependencies") or {})
         for table in tables:
-            for spec in table.values():
-                if not isinstance(spec, dict) or "path" not in spec:
+            for name, spec in table.items():
+                if not isinstance(spec, dict):
                     continue
-                child = (current.parent / spec["path"]).resolve() / "Cargo.toml"
-                directories.add(str(child.parent.relative_to(REPO)))
+                base = current.parent
+                if spec.get("workspace") is True:
+                    if name not in inherited:
+                        raise AssertionError(
+                            f"{current}: dependency {name!r} inherits from a workspace "
+                            f"that publishes no {name!r} entry, so no closure can read "
+                            f"its path"
+                        )
+                    spec = inherited[name]
+                    base = inherited_base
+                    if not isinstance(spec, dict):
+                        continue
+                if "path" not in spec:
+                    continue
+                child = (base / spec["path"]).resolve() / "Cargo.toml"
+                directories.add(str(child.parent.relative_to(root)))
                 if child not in seen:
                     seen.add(child)
                     pending.append(child)
@@ -620,6 +682,77 @@ def check_path_dep_closures(jobs: dict) -> None:
             not missing,
             f"missing {[directory + '/**' for directory in missing]} — a change to "
             f"one of those skips every job this filter selects",
+        )
+
+
+def write_inheritance_fixture(root: Path, publish_leaf: bool) -> Path:
+    """Write a two-crate workspace whose consumer inherits its leaf dependency.
+
+    A consumer declares `scp-fixture-leaf = { workspace = true }`, which carries
+    no `path` key of its own. `publish_leaf` decides whether a root manifest's
+    `[workspace.dependencies]` publishes that leaf. Returns a consumer manifest
+    path.
+    """
+    leaf_entry = (
+        'scp-fixture-leaf = { path = "crates/scp-fixture-leaf" }\n'
+        if publish_leaf
+        else ""
+    )
+    (root / "Cargo.toml").write_text(
+        "[workspace]\n"
+        'members = ["crates/scp-fixture-consumer", "crates/scp-fixture-leaf"]\n\n'
+        "[workspace.dependencies]\n" + leaf_entry
+    )
+    for name in ("scp-fixture-consumer", "scp-fixture-leaf"):
+        (root / "crates" / name).mkdir(parents=True)
+    (root / "crates/scp-fixture-leaf/Cargo.toml").write_text(
+        '[package]\nname = "scp-fixture-leaf"\nversion = "0.1.0"\n'
+    )
+    consumer = root / "crates/scp-fixture-consumer/Cargo.toml"
+    consumer.write_text(
+        '[package]\nname = "scp-fixture-consumer"\nversion = "0.1.0"\n\n'
+        "[dependencies]\nscp-fixture-leaf = { workspace = true }\n"
+    )
+    return consumer
+
+
+def check_closure_reads_workspace_inheritance() -> None:
+    """A closure covers a dependency whose `path` lives in a workspace manifest.
+
+    CRITERION: path_dependency_closure returns a directory for every crate a
+    build compiles, however that crate's dependency entry is written. Cargo
+    accepts two spellings — `path =` in a member manifest, and `workspace =
+    true` resolved against a workspace manifest — and reading only a member's
+    own table drops a crate written in a second spelling, along with every
+    crate it reaches. check_path_dep_closures would then report a path filter
+    complete while that filter omitted those directories, which is the defect
+    that check exists to catch.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch) / "inherits"
+        root.mkdir()
+        consumer = write_inheritance_fixture(root, publish_leaf=True)
+        reached = path_dependency_closure(consumer, root=root)
+        check(
+            "a closure covers a dependency inherited from a workspace manifest",
+            reached == {"crates/scp-fixture-leaf"},
+            f"reached {sorted(reached)}, want ['crates/scp-fixture-leaf'] — a "
+            f"`workspace = true` entry carries its path in a workspace manifest",
+        )
+
+        unpublished = Path(scratch) / "unpublished"
+        unpublished.mkdir()
+        orphan = write_inheritance_fixture(unpublished, publish_leaf=False)
+        raised = False
+        try:
+            path_dependency_closure(orphan, root=unpublished)
+        except AssertionError:
+            raised = True
+        check(
+            "an inherited name no workspace publishes stops a closure",
+            raised,
+            "path_dependency_closure returned a set instead of raising, so an "
+            "unreadable entry would shrink a closure rather than fail this self-test",
         )
 
 
@@ -780,6 +913,7 @@ def main() -> int:
     )
 
     print("path-closure — a path filter covers every crate its jobs compile")
+    check_closure_reads_workspace_inheritance()
     check_path_dep_closures(jobs)
 
     print("step-filter — a filter output gates a job, never a step")
@@ -926,6 +1060,20 @@ def main() -> int:
     needs.pop("wasm-test")
     code, out = run_aggregate(needs, docs_pr.event)
     check("a job missing from a dependency list -> exit 1", code == 1, out)
+
+    # Job cross-layer carries `if: github.event_name == 'pull_request'`, so an
+    # aggregate that read an absent GITHUB_EVENT_NAME as "" would judge that
+    # condition false and accept a skipped cross-layer on a pull request. This
+    # scenario reports exactly that skip, so exit 0 here would be a gate reading
+    # a coverage gap as a pass.
+    needs = build_needs(jobs, docs_pr)
+    needs["cross-layer"]["result"] = "skipped"
+    code, out = run_aggregate(needs, None)
+    check(
+        "GITHUB_EVENT_NAME absent, an event-gated job skipped -> exit 3",
+        code == 3 and "GITHUB_EVENT_NAME" in out,
+        f"exit {code}: {out}",
+    )
 
     print("filter-key — an `if:` naming an unpublished filter output stops a gate")
     referenced = {
