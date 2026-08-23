@@ -30,6 +30,6 @@ exit 1
 `PreRotationCustody` backend, and `grep -rn "impl.*PreRotationCustody for" crates/`
 returns exactly one implementation, the test-harness
 `InMemoryPreRotationCustody`. So a shipped build fails closed rather than mint a
-nullifier-backed identity — the no-stand-ins tenet working as designed, and a fact
-the example's own "Run this, then open the printed URL" instruction did not carry
-until this branch added it.
+nullifier-backed identity. That is the no-stand-ins tenet behaving as specified. The
+example's own instruction, "Run this, then open the printed URL", did not carry the
+fact until this branch added it.
