@@ -1,10 +1,10 @@
 # A Fix That Absorbs a Documentation Workstream Cannot Converge
 
-A two-line lockfile change grew to 1,193 inserted lines across 39 files. Nineteen review
-rounds later it was still producing findings, and three claims written in the two newest
-commits were falsified by measurement in the nineteenth. Scoping the branch back to its
-contract — 483 lines across 13 files — ended the loop that fixing individual sentences
-could not.
+A fix that made one example compile on a shipped build grew to 1,204 inserted lines
+across 37 files. Nineteen review rounds later the branch was still producing findings, and
+in the nineteenth round a reviewer falsified three claims that the two newest commits had
+added. Deleting every sentence about a subsystem the branch never modified ended the loop
+that fixing individual sentences could not.
 
 ## The Rule
 
@@ -20,8 +20,11 @@ When the answer is no for most of the diff, the branch has absorbed someone else
 
 The task was a security fix: bump `rustls-webpki` past three certificate-validation
 advisories, delete their `deny.toml` ignore entries, and stop one example from needing a
-test-only feature to compile. The example fix required one true sentence about why a
-shipped build cannot create an identity.
+test-only feature to compile. Pull request #2382, which cleared the Rust 1.98.0 clippy
+lints and named the Rust version in one file, took the `rustls-webpki` bump and the three
+`deny.toml` deletions into main first. This branch then rebased onto that commit, so the
+branch carries no line of the advisory fix and delivers only the example half. The example
+fix required one true sentence about why a shipped build cannot create an identity.
 
 That one sentence became thirty. Each round a reviewer found a surface where the same
 explanation was missing, or wrong, or scoped differently, and each fix added surfaces.
