@@ -106,7 +106,7 @@ mise automatically manages environment variables (`JAVA_HOME`, `ANDROID_HOME`, `
 ```sh
 mise install         # languages, cargo tools, npm globals
 cargo --version      # rustup downloads the pinned toolchain and its targets on first use
-./scripts/setup-toolchain.sh   # Android SDK/NDK (the one thing mise can't do)
+./scripts/setup-toolchain.sh   # Android SDK/NDK, plus a check that every tool resolved
 ```
 
 All three commands are idempotent — safe to re-run at any time. Together they install:
