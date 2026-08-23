@@ -2258,8 +2258,10 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
     let (nat, upnp_mapper, natpmp_mapper) = derive_host_site_nat_slot(skip_nat);
 
     // `IdentitySource::Persisted` gives the self-host node a STABLE DID across
-    // restarts: it creates+persists the identity on first boot and reloads it
-    // thereafter from the root `node_storage`. `tls` defaults to
+    // restarts: it reloads the identity from the root `node_storage`, and creates
+    // and persists one on first boot only under `testing`. On a build without that
+    // feature the create half returns `IdentityError::NoPreRotationBackend`, so a
+    // self-host node starts only against storage a `testing` build already seeded. `tls` defaults to
     // `TlsMode::SelfSigned`, a no-op on a no-domain reach.
     let config = NodeConfig {
         dht,

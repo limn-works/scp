@@ -479,12 +479,9 @@ class Node internal constructor(
          * the first: none of this SDK's create calls mints one, so nothing it
          * offers seeds that directory. The reload branch fires only against a
          * directory a `testing` build already seeded. Passing [identityDid]
-         * does not help either. Every writer to the identity registry — create,
-         * migrate, rotate-key, add-agent, rotate-agent, remove-agent — either fails closed on a
-         * shipped build before it writes, or needs an entry already present, so
-         * the registry never fills.
+         * does not help either, for the reason below.
          *
-         * On a shipped build, supplying [identityDid] does not work either:
+         * On a shipped build, supplying [identityDid] does not work:
          * UniFFI's `build_node_identity_from_uniffi` is replaced under
          * `cfg(not(feature = "testing"))` by a stub that always returns
          * `ScpException.Identity` with code `SCP-IDENT-1013`, because node

@@ -729,12 +729,13 @@ impl crate::scp::PyScp {
     /// persistent identity. The record lives under the storage key
     /// ``scp/identity`` in ``<data_dir>/storage/``; ``<data_dir>/identity.key``
     /// holds only the custody key material. The ``passphrase``
-    /// parameter is required in this mode. On a shipped build this fails on EVERY
-    /// run: creating an identity needs a pre-rotation custody backend that only a
-    /// ``testing`` build has, so it raises ``RuntimeError`` with the message
-    /// "node startup failed" instead of minting a nullifier-backed identity. No
-    /// create call on this bridge mints one either, so ``data_dir`` never comes to
-    /// hold one and ``identity_did`` cannot be resolved from the registry.
+    /// parameter is required in this mode. On a shipped build with no identity in
+    /// ``data_dir`` this fails on every run: creating one needs a pre-rotation
+    /// custody backend that only a ``testing`` build has, so it raises
+    /// ``RuntimeError`` with the message "node startup failed" instead of minting
+    /// a nullifier-backed identity. No create call on this bridge mints one either,
+    /// so that directory only ever comes to hold an identity if a ``testing`` build
+    /// put it there, and the registry ``identity_did`` resolves through stays empty.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
     /// from the `PyO3` identity registry (populated by the ``identity_create*``
