@@ -130,7 +130,7 @@ These only apply to `scp-node` (not `scp-relay`):
 | `SCP_NODE_BIND_ADDR` | `0.0.0.0:9000` | HTTP server bind address |
 | `SCP_NODE_TLS_SELF_SIGNED` | `false` | Use self-signed TLS (development only) |
 | `SCP_NODE_PROJECTION_RATE_LIMIT` | `60` | Per-IP rate limit for projection endpoints |
-| `SCP_NODE_DHT_MODE` | `production` | DHT client mode: `production` or `memory` |
+| `SCP_NODE_DHT_MODE` | `production` | DHT client mode. `production` publishes the node's DID so peers can discover it. `disabled` turns the DHT layer off and is honoured only by `--self-host`; a full relay node rejects it and exits. |
 | `SCP_NODE_DHT_GATEWAYS` | (none) | Comma-separated DHT HTTP gateway URLs |
 | `SCP_STORAGE_PATH` | `$XDG_DATA_HOME/scp/node` | SQLite database directory |
 | `SCP_STORAGE_KEY` | (auto-generated) | Hex-encoded 32-byte SQLCipher encryption key |
@@ -260,12 +260,15 @@ On subsequent runs, the node loads the existing identity from SQLite and reuses 
 ### Development deployment
 
 ```bash
-# Self-signed TLS, in-memory DHT
+# Self-signed TLS; the node still publishes its DID so peers can find it
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
-SCP_NODE_DHT_MODE=memory \
 scp-node --ephemeral
 ```
+
+A full relay node has no non-publishing DHT mode, because a relay whose DID
+never reaches the DHT cannot be discovered. Run `scp-node --self-host` when you
+want a node that publishes nothing.
 
 ### Programmatic usage (Rust SDK)
 
