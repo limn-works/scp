@@ -21,13 +21,15 @@
 # off, so per-package scope narrows the closure without emptying it. Cargo also
 # strips path-only DEV-dependencies from a published manifest, and with them the
 # feature activations they carried, so an example relying on one compiles here and
-# not for a consumer. `crates/scp-runtime/examples/identity.rs` is the measured case,
-# and the reason `crates/scp-runtime/Cargo.toml` names it under `package.exclude`:
-# `scp-dht` and `scp-platform` survive publication as normal dependencies, and
-# `scp-runtime/testing` reaches `scp-platform/testing`, which is why the crate's three
-# other examples do compile for a consumer under `--features testing`. Nothing
-# scp-runtime publishes reaches `scp-dht/testing`, which is what produces
-# `InMemoryDhtClient`; only the stripped dev-dependency edge on `scp-dht` reaches it.
+# not for a consumer. `crates/scp-runtime/examples/identity.rs` is the measured case.
+# It names `InMemoryDhtClient`, which `scp-dht` compiles only under `scp-dht/testing`,
+# and for one round `scp-runtime` reached that feature through the stripped
+# dev-dependency edge alone, so the file compiled here and failed for a consumer.
+# `scp-runtime/testing` now carries `scp-dht/testing` alongside `scp-platform/testing`,
+# and `scp-dht` and `scp-platform` are normal dependencies that survive publication, so
+# all four of that crate's examples compile for a consumer under `--features testing`.
+# A probe crate outside the workspace measured that, not this check, and the limitation
+# stated above holds whatever any one crate's manifest says.
 #
 # Therefore this check CANNOT prove that an example compiles for someone who
 # installs the crate, and CANNOT prove that an example avoids a test-only

@@ -7,17 +7,17 @@
 //! Usage, from a checkout of the repository:
 //!   `cargo run -p scp-runtime --example identity`
 //!
-//! THE PUBLISHED `scp-runtime` CRATE DOES NOT CARRY THIS FILE. `Cargo.toml`
-//! names it under `package.exclude`. The example constructs `InMemoryDhtClient`,
-//! which `scp-dht` compiles only under `scp-dht/testing`, and no feature of
-//! `scp-runtime` activates `scp-dht/testing`. The `[dev-dependencies]` edge on
-//! `scp-dht` activates it here, and cargo strips a path-only dev-dependency from
-//! a published manifest, so a consumer who ran this file against the published
-//! crate would get an unresolved import that no feature flag resolves. The other
-//! three examples do compile for a consumer under `--features testing`, because
-//! `scp-runtime/testing` activates `scp-platform/testing`; this one does not,
-//! because `scp-dht/testing` stays outside every feature list this crate
-//! publishes (ADR-062, capability injection, §Decision 1).
+//! This example names three test-harness types: `InMemoryDhtClient`,
+//! `InMemoryKeyCustody`, and `InMemoryPreRotationCustody`. `scp-dht` compiles
+//! the first only under `scp-dht/testing`, and `scp-platform` compiles the other
+//! two only under `scp-platform/testing`. `scp-runtime/testing` activates both
+//! of those features, and `scp-dht` and `scp-platform` are normal dependencies
+//! that survive publication, so a consumer of the published crate compiles this
+//! file under `--features testing` (ADR-062, capability injection,
+//! §Decision 1). Every one of those types stays out of a shipped artifact,
+//! because no shipped artifact enables `scp-runtime/testing`, which
+//! `scripts/check-shipped-feature-graph.sh`, the shipped-feature-graph
+//! prove-absence gate, asserts on every run.
 
 use std::sync::Arc;
 

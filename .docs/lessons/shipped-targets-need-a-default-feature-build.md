@@ -97,8 +97,7 @@ currently points at.
 `cargo package --list -p scp-runtime` listed all four of that crate's examples while one
 of them carried the declaration. So the declaration is a CI-visibility switch, not a
 shipping switch, and any rule that reads it as a statement about what ships is wrong. The
-crate now publishes three, because of the `package.exclude` key the next section
-describes.
+crate still publishes all four.
 
 This branch added `required-features = ["testing"]` to
 `crates/scp-runtime/examples/identity.rs` on the premise that it could not build on
@@ -113,27 +112,43 @@ target, so a `required-features` declaration no longer removes one from the coun
 revert stands on its own ground, which is that the declaration asserted a build failure
 that does not happen.
 
-## `package.exclude` is the key that stops a file shipping
+## An example a consumer cannot compile names a missing feature edge, not a file to stop publishing
 
-`crates/scp-runtime/Cargo.toml` now carries `exclude = ["examples/identity.rs"]`.
-`cargo package --list -p scp-runtime --allow-dirty` printed that path before the key and
-prints three examples after it, with no warning and exit 0. Cargo states the consequence
-itself: `cargo package --no-verify -p scp-runtime --allow-dirty` prints `warning: ignoring
-example identity as examples/identity.rs is not included in the published package`, so the
-published manifest declares no such target. The example target still exists in a checkout,
-so `scripts/check-examples-build-shipped.sh` still compiles it and still counts eight
-targets.
+`crates/scp-runtime/examples/identity.rs` constructs `InMemoryDhtClient`, which `scp-dht`
+compiles only under `scp-dht/testing`. Before this branch, one edge alone reached that
+feature from `scp-runtime`: the `[dev-dependencies]` entry
+`scp-dht = { path = "../scp-dht", features = ["testing"] }`. Cargo strips a path-only
+dev-dependency from a published manifest, so a consumer of the published crate reached an
+unresolved import that no feature flag resolved.
 
-Read the exit-0 measurement in the section above for what it covers. `cargo clippy -p
-scp-runtime --example identity` resolves the workspace dev closure, where scp-runtime's
-`[dev-dependencies]` entry `scp-dht = { path = "../scp-dht", features = ["testing"] }`
-supplies `InMemoryDhtClient`. Cargo strips a path-only dev-dependency from a published
-manifest, and no feature scp-runtime publishes activates `scp-dht/testing`, so a consumer
-of the published crate reaches an unresolved import that no feature flag resolves. Exit 0
-in the workspace answers what a workspace build does; only the published feature set
-answers what a consumer gets, and the two answers differ for this file. Its three sibling
-examples do compile for a consumer under `--features testing`, because
-`scp-runtime/testing` activates `scp-platform/testing`.
+This branch first answered that by adding `exclude = ["examples/identity.rs"]` to
+`crates/scp-runtime/Cargo.toml`. The key does stop the file shipping, measured:
+`cargo package --list -p scp-runtime --allow-dirty` printed the path before the key and
+printed three examples after it, with no warning and exit 0, and
+`cargo package --no-verify -p scp-runtime --allow-dirty` printed `warning: ignoring example
+identity as examples/identity.rs is not included in the published package`.
+
+A reviewer then traced the cause one step further. `scp-runtime` declares `scp-dht` as a
+normal dependency, which survives publication, and every other consumer of `scp-dht` in
+this workspace already carries `scp-dht/testing` inside its own `testing` feature list:
+`crates/scp-identity/Cargo.toml`, `crates/scp-node/Cargo.toml`, `crates/scp-ffi/Cargo.toml`,
+`crates/scp-ffi/napi/Cargo.toml`, `crates/scp-ffi/common/Cargo.toml`, and
+`crates/scp-ffi/uniffi/Cargo.toml`. Story SCP-CAPINJECT-001 of the capability-injection PRD,
+`.docs/prds/adr062-capability-injection.json`, requires that edge of each consumer, and
+`scp-runtime` was the one consumer that omitted it. Adding `scp-dht/testing` to the
+`testing` list in `crates/scp-runtime/Cargo.toml` makes the example compile for a consumer,
+so the branch deleted the `package.exclude` key and the crate publishes all four examples
+again.
+
+The prove-absence gate does not object. `scripts/check-shipped-feature-graph.sh` asserts
+that each shipped artifact's resolved feature set is a subset of its allowlist, and no
+shipped artifact resolves `scp-runtime/testing`, so `InMemoryDhtClient` stays absent from
+every shipped graph.
+
+**The rule.** When an example fails to compile against the feature set publication produces,
+name the feature the missing item sits behind and decide whether the crate is entitled to
+activate it. Excluding the file deletes the symptom and leaves the feature-list divergence
+in the manifest, where the next example that names the same type meets it again.
 
 ### Measure the consumer state with a probe crate
 
@@ -143,17 +158,20 @@ local package for uploading` and `no matching package named scp-clock found`, be
 path dependencies are not on crates.io. A probe crate answers it instead. Give a scratch
 crate outside the workspace a path dependency on `scp-runtime` with
 `features = ["testing"]`, add plain path dependencies on the crates the examples name
-directly, and copy the example files into its `examples/` directory. Cargo does not resolve
-a dependency's `[dev-dependencies]`, so the probe resolves the feature set publication
-produces.
+directly, copy the example files into its `examples/` directory, and copy
+`examples/support/` with them. Cargo does not resolve a dependency's `[dev-dependencies]`,
+so the probe resolves the feature set publication produces.
 
-Measured on that probe: `cargo build --example identity` exits 101 with one error,
-`unresolved import scp_dht::InMemoryDhtClient`, carrying rustc's note `the item is gated
-behind the testing feature`. `cargo build --example context --example messaging --example
-outlets` exits 0. The `scp_platform::testing::{InMemoryKeyCustody,
-InMemoryPreRotationCustody}` imports in identity.rs resolve in that same failing build,
-which is the direct evidence that `scp-runtime/testing` carries `scp-platform/testing` to
-a consumer and carries nothing to `scp-dht`.
+Measured on that probe with `scp-dht/testing` absent from the `testing` list:
+`cargo build --example identity` exits 101 with one error, `unresolved import
+scp_dht::InMemoryDhtClient`, carrying rustc's note `the item is gated behind the testing
+feature`. The `scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody}`
+imports in that same file resolve in that same failing build, which is the direct evidence
+that `scp-runtime/testing` carried `scp-platform/testing` to a consumer and carried nothing
+to `scp-dht`. Measured on the same probe with the edge added: `cargo build --example
+identity --example context --example messaging --example outlets` exits 0. Run the failing
+case first and the passing case second, because a run against the fixed tree alone
+distinguishes nothing — the trap the next section records.
 
 ## Measure a gate against the defect, never against the fixed tree
 
