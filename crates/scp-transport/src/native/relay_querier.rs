@@ -77,13 +77,33 @@ pub struct TransportRelayQuerier {
     /// `RwLock` because every access is a brief clone-out; the lock is never
     /// held across an `.await` (see the module docs).
     relays: RwLock<HashMap<String, Arc<dyn TransportAdapter>>>,
+    /// One async mutex per `(relay URL, routing ID)` currently being queried, so
+    /// two concurrent resolves of the SAME DID over the SAME relay run one after
+    /// the other.
+    ///
+    /// `NativeRelayClient::query_raw` registers a temporary subscription keyed
+    /// by routing ID and rejects a second registration for the same key, because
+    /// a context subscription overlapping a DID query is a collision it must
+    /// report rather than serve from a dedup-filtered stream. Two concurrent DID
+    /// queries at one routing ID are a legitimate overlap that rule did not
+    /// anticipate: two per-context actors verifying attestations signed by the
+    /// same issuer resolve that issuer's DID at the same moment, and without
+    /// this gate the second one fails and reports the relay layer unavailable
+    /// for a relay that holds the record.
+    ///
+    /// The outer `RwLock` is only ever held for a brief clone-out, never across
+    /// an `.await`.
+    #[allow(clippy::type_complexity)]
+    query_gates: RwLock<HashMap<(String, [u8; 32]), Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl std::fmt::Debug for TransportRelayQuerier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let bound = self.relays.read().map_or(0, |m| m.len());
+        let gates_held = self.query_gates.read().map_or(0, |m| m.len());
         f.debug_struct("TransportRelayQuerier")
             .field("bound_relays", &bound)
+            .field("queries_in_flight", &gates_held)
             .finish()
     }
 }
@@ -95,6 +115,7 @@ impl TransportRelayQuerier {
     pub fn new() -> Self {
         Self {
             relays: RwLock::new(HashMap::new()),
+            query_gates: RwLock::new(HashMap::new()),
         }
     }
 
@@ -135,6 +156,36 @@ impl TransportRelayQuerier {
     /// synchronous lock so the guard never crosses an `.await`.
     fn adapter_for(&self, relay_url: &str) -> Option<Arc<dyn TransportAdapter>> {
         self.relays.read().ok()?.get(relay_url).cloned()
+    }
+
+    /// Returns the gate that serializes queries for one `(relay, routing ID)`,
+    /// cloned out under a short synchronous lock so the guard never crosses an
+    /// `.await`.
+    ///
+    /// A poisoned lock yields a fresh gate nobody else shares, which serializes
+    /// nothing. That degrades this call to the pre-gate behaviour — the second
+    /// concurrent query for the same DID reports a failed relay — and never
+    /// fabricates an answer.
+    fn query_gate(&self, key: &(String, [u8; 32])) -> Arc<tokio::sync::Mutex<()>> {
+        let Ok(mut gates) = self.query_gates.write() else {
+            return Arc::new(tokio::sync::Mutex::new(()));
+        };
+        Arc::clone(gates.entry(key.clone()).or_default())
+    }
+
+    /// Drops the gate for `key` once no caller holds it, so the map does not
+    /// grow by one entry per DID this instance has ever resolved.
+    ///
+    /// The caller has already dropped its own clone, so a strong count of 1
+    /// means the map holds the only reference and no query is waiting.
+    fn release_query_gate(&self, key: &(String, [u8; 32])) {
+        if let Ok(mut gates) = self.query_gates.write()
+            && gates
+                .get(key)
+                .is_some_and(|gate| Arc::strong_count(gate) == 1)
+        {
+            gates.remove(key);
+        }
     }
 
     /// Returns every relay URL that currently has a bound transport, sorted.
@@ -208,10 +259,21 @@ impl RelayQuerier for TransportRelayQuerier {
             // QUERY limit N = 16 (§3.10.2), the one canonical N.
             let limit = u32::try_from(MAX_CANDIDATES_PER_RELAY).unwrap_or(u32::MAX);
 
-            let blobs = adapter
-                .query_raw(&RoutingId::new(routing_id), None, limit)
-                .await
-                .map_err(|e| IdentityError::RelayQueryFailed(e.to_string()))?;
+            // Serialize concurrent queries for this (relay, routing ID): the
+            // relay client refuses a second temporary subscription at one
+            // routing ID, so two simultaneous resolves of one DID would make the
+            // second report a failed relay. See `query_gates`.
+            let gate_key = (relay_url.clone(), routing_id);
+            let gate = self.query_gate(&gate_key);
+            let blobs = {
+                let _held = gate.lock().await;
+                adapter
+                    .query_raw(&RoutingId::new(routing_id), None, limit)
+                    .await
+            };
+            drop(gate);
+            self.release_query_gate(&gate_key);
+            let blobs = blobs.map_err(|e| IdentityError::RelayQueryFailed(e.to_string()))?;
 
             let mut records = Vec::with_capacity(blobs.len().min(MAX_CANDIDATES_PER_RELAY));
             let mut undecodable = 0_usize;

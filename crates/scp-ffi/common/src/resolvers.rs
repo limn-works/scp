@@ -179,6 +179,29 @@ impl std::fmt::Display for ResolutionError {
 
 impl std::error::Error for ResolutionError {}
 
+impl ResolutionError {
+    /// Carries a resolution outcome into the identity error type all three
+    /// bridges already convert, so `identity_resolve` maps one error on every
+    /// bridge rather than each bridge inventing its own mapping.
+    ///
+    /// Each variant keeps its meaning. Only [`Self::NotFound`] asserts that the
+    /// DID is absent, and the resolver reaches it only when every layer reported
+    /// on the DID; [`Self::NetworkUnavailable`] says the resolver learned
+    /// nothing, which is a different claim (§3.10.4).
+    #[must_use]
+    pub fn into_identity_error(self, did: &str) -> IdentityError {
+        match self {
+            Self::NotFound(msg) => IdentityError::ResolutionNotFound(msg),
+            Self::InvalidDocument(msg) => IdentityError::DocumentDeserializationError(msg),
+            Self::NetworkUnavailable(reason) => IdentityError::ResolutionFailed {
+                did: did.to_owned(),
+                reason,
+            },
+            Self::Revoked(msg) => IdentityError::SequenceDowngrade(msg),
+        }
+    }
+}
+
 impl From<ResolutionError> for CoreUcanError {
     fn from(e: ResolutionError) -> Self {
         Self::MalformedToken(e.to_string())

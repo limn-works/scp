@@ -269,6 +269,25 @@ pub enum IdentityError {
         reason: String,
     },
 
+    /// Every resolution layer answered, and none holds a document for this DID
+    /// (§3.10.4).
+    ///
+    /// Distinct from [`Self::DhtNotFound`], which names one layer, and from
+    /// [`Self::ResolutionFailed`], which says the resolver learned nothing. This
+    /// error is the only one that asserts the DID is absent, and it is reachable
+    /// only when every layer reported on the DID.
+    #[error("no resolution layer holds a document for {0}")]
+    ResolutionNotFound(String),
+
+    /// A resolution layer served a document older than one this process already
+    /// accepted for the same DID (§3.10.7).
+    ///
+    /// The resolver rejects the document rather than reinstating a rotated-out
+    /// key, and reports the rejection so a caller can distinguish a downgrade
+    /// attempt from an absent DID.
+    #[error("sequence downgrade detected: {0}")]
+    SequenceDowngrade(String),
+
     /// The resolved document has a stale sequence number (lower than last known).
     #[error("stale sequence number: received {received}, last known {last_known}")]
     StaleSequenceNumber {

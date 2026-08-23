@@ -885,10 +885,27 @@ impl Scp {
         let document = if let Some(doc) = local_doc {
             doc
         } else {
-            let dht = crate::identity::shared_did_method()?;
-            dht.resolve(&did)
+            // Resolve through the instance's dual-layer resolver, the same one
+            // UCAN validation and attestation verification use. Calling
+            // `DidDht::resolve` here would answer from the Mainline DHT alone,
+            // so one bridge instance would give two different answers to "does
+            // this DID resolve" depending on the entry point, and a DID
+            // published only to a relay would not resolve through the operation
+            // §3.10.10 names as the unified interface.
+            crate::identity::ensure_did_resolver_initialized_on(bi).map_err(NapiError::from)?;
+            let resolver = crate::runtime::did_resolver(bi)
+                .ok_or_else(|| {
+                    NapiError::from(ScpNapiError::Identity {
+                        message: "the DID resolver is not initialized on this instance".to_owned(),
+                        code: codes::IDENT_1004.to_owned(),
+                    })
+                })?
+                .clone();
+            resolver
+                .resolve_typed(&did)
                 .await
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?
+                .map_err(|e| NapiError::from(ScpNapiError::from(e.into_identity_error(&did))))?
+                .document
         };
 
         let has_agent_key = document.has_agent_key();

@@ -1632,13 +1632,28 @@ impl crate::scp::PyScp {
 
         py.allow_threads(|| {
             rt.block_on(async {
-                let did_method = shared_did_method(&bi)?;
-                let document = did_method
-                    .resolve(&did_owned)
-                    .await
-                    .map_err(ScpPyError::from)?;
+                // Resolve through the instance's dual-layer resolver, the same
+                // one UCAN validation and attestation verification use. Calling
+                // `DidDht::resolve` here would answer from the Mainline DHT
+                // alone, so one bridge instance would give two different answers
+                // to "does this DID resolve" depending on the entry point, and a
+                // DID published only to a relay would not resolve through the
+                // operation §3.10.10 names as the unified interface.
+                ensure_did_resolver_initialized_on(&bi, rt.handle().clone())?;
+                let resolver = crate::runtime::did_resolver(&bi)
+                    .ok_or_else(|| {
+                        ScpPyError::identity(
+                            "the DID resolver is not initialized on this instance".to_owned(),
+                        )
+                    })?
+                    .clone();
 
-                Ok(PyDIDDocument::new(&bi, document))
+                let outcome = resolver
+                    .resolve_typed(&did_owned)
+                    .await
+                    .map_err(|e| ScpPyError::from(e.into_identity_error(&did_owned)))?;
+
+                Ok(PyDIDDocument::new(&bi, outcome.document))
             })
         })
     }
