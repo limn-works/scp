@@ -358,9 +358,13 @@ fix — an ignore entry for a patched advisory is a false record.
 **Choosing the version.** Take the newest release whose dependency floors this workspace
 already satisfies. Reject a newer release that raises a floor on a native-code dependency
 to supply a capability the workspace does not use, because recompiling a vendored C
-library across every cross-compiled target adds build risk and no security. Decide from
-evidence rather than from the version number: `diff` the candidate's `Cargo.toml` against
-the current one, and read the upstream release notes for every version in between.
+library across every cross-compiled target adds build risk and no security. The case that
+produced this rule: rustls-webpki 0.103.14 raised its `aws-lc-rs` floor from 1.14 to 1.18
+to expose ML-DSA, which would have moved `aws-lc-sys` 0.39.0 to 0.44.0 and its vendored
+AWS-LC 1.71.0 to 5.5.0 under all thirteen targets CI builds, for an algorithm this
+workspace never asserts; 0.103.13 cleared the same three advisories and moved nothing.
+Establish that by evidence: `diff` the candidate's `Cargo.toml` against the current one,
+and read the upstream release notes for every version in between.
 
 **Applying the bump.** Use `cargo update -p <crate> --precise <version>`. A bare
 `cargo update -p <crate>` re-resolves unrelated edges, so read the whole `Cargo.lock` diff

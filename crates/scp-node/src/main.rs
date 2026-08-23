@@ -8,7 +8,9 @@
 //! 2. **Relay-only** (`--relay-only`): Runs a bare [`RelayServer`], identical
 //!    to the standalone `scp-relay` binary.
 //! 3. **Ephemeral** (`--ephemeral`): Runs a full node with all in-memory
-//!    subsystems — nothing persists across restarts.
+//!    subsystems — nothing persists across restarts. A test-harness mode: the
+//!    in-memory DHT and custody compile only under the `testing` feature, so a
+//!    shipped build exits 1 on this flag.
 //! 4. **Self-host** (`--self-host`): Hosts a static website entirely on SCP
 //!    (no DNS name required) — opens an inbound public port, publishes the host's
 //!    IP to the DHT by default, and serves the site over self-signed HTTPS by default
@@ -61,7 +63,8 @@ struct CliConfig {
 /// Accepts:
 ///   `--relay-only`       — relay-only mode
 ///   `--health`           — TCP health probe
-///   `--ephemeral`        — all in-memory subsystems
+///   `--ephemeral`        — all in-memory subsystems (test-harness only; a
+///                          shipped build exits 1)
 ///   `--storage-path <p>` — `SQLite` database directory
 ///   `--help`             — print usage and exit
 fn parse_args() -> CliConfig {
@@ -503,9 +506,9 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
     // Explicit parse: a typo (e.g. "memroy") must NOT silently fall through to
     // the production DHT, which would publish the host's address to the network.
     match parse_dht_mode_or_exit() {
-        // `parse_dht_mode_or_exit` never returns `Disabled` for the full relay
-        // node (it exits with guidance to use `--self-host`); this arm exists
-        // only to keep the match exhaustive and fails closed if ever reached.
+        // `parse_dht_mode_or_exit` returns `Disabled` for `SCP_NODE_DHT_MODE=disabled`
+        // whichever path asked for it, so this arm is the only thing that rejects
+        // the value for the full relay node. Do not delete it as unreachable.
         scp_node::DhtMode::Disabled => {
             tracing::error!(
                 "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
@@ -1127,8 +1130,9 @@ async fn main() {
         {
             eprintln!(
                 "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
-                 available in this build. Run without --ephemeral for a persistent node, or set \
-                 SCP_NODE_DHT_MODE=disabled for a non-publishing node."
+                 available in this build. Run without --ephemeral for a persistent node, or run \
+                 `scp-node --self-host` for a non-publishing hosted site. A full relay node has \
+                 no non-publishing mode: it must publish its DID to be discoverable."
             );
             std::process::exit(1);
         }

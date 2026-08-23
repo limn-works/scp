@@ -207,7 +207,8 @@ pub enum TlsMode {
 /// publishing the node's public address bound to its DID, so the privacy-worst
 /// behavior is never the path of least resistance (ADR-052 M2).
 ///
-/// The former default, [`Memory`](DhtMode::Memory), is now **test-harness-only**
+/// The former default, `DhtMode::Memory` (not linked: the variant does not exist
+/// on a default build), is now **test-harness-only**
 /// (compiled only under `feature = "testing"`): its in-memory client is a
 /// §17.17.3 resolve nullifier — it publishes to and resolves from a process-local
 /// map no peer ever sees, silently emptying the DHT resolution namespace
@@ -1343,7 +1344,9 @@ mod tests {
             // Domain is publishing-capable; this test opts into Production to
             // exercise the public-hosting path (advisory in P1 — the test's
             // TestDidDht uses an in-memory client, so nothing is published
-            // offline). `DhtMode::Memory` would be equally valid (see Test 11).
+            // offline). `DhtMode::Disabled` would be equally valid (see Test 11);
+            // `DhtMode::Memory` would not compile here, because scp-node's own
+            // test build does not enable scp-node's `testing` feature.
             dht: DhtMode::Production,
             ..NodeConfig::defaults(
                 Reach::Domain {
@@ -1658,15 +1661,15 @@ mod tests {
     // --- Test 11: Domain + DhtMode::Disabled is VALID (the fail-safe direction) --
 
     #[tokio::test]
-    async fn domain_plus_dht_memory_is_valid() {
+    async fn domain_plus_dht_disabled_is_valid() {
         // `NodeConfig::defaults` yields `dht: DhtMode::Disabled`. `DhtMode::Disabled`
         // (do not publish the address to the DHT) is the fail-safe, non-disclosing
         // direction and is valid for EVERY reach, including a publishing-capable
         // `Reach::Domain`: "reachable on the domain, but the address is not
         // published to the DHT; share it out-of-band" — the more-private config.
         // Only `DhtMode::Production` discloses, so only it is an explicit opt-in
-        // (M2); `Memory` is never an error. This is the positive companion to
-        // Test 12 (NatTraversal + Memory).
+        // (M2); `Disabled` is never an error. This is the positive companion to
+        // Test 12 (NatTraversal + Disabled).
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             ..NodeConfig::defaults(
