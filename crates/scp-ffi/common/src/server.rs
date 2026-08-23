@@ -437,9 +437,11 @@ pub async fn start_node_in_memory(
 /// - The filesystem storage cannot be initialized ([`ServerError::Platform`])
 /// - The redb blob database cannot be opened ([`ServerError::Storage`])
 /// - No passphrase provided when `identity` is `None` ([`ServerError::MissingPassphrase`])
-/// - `identity` is `None` on a shipped build, on every run, because creating an
-///   identity needs a `PreRotationCustody` backend that only a `testing` build
-///   has ([`ServerError::Node`], whose `user_message` is "node startup failed")
+/// - `identity` is `None` on a shipped build AND `data_dir` holds no identity,
+///   because creating one needs a `PreRotationCustody` backend that only a
+///   `testing` build has ([`ServerError::Node`], whose `user_message` is "node
+///   startup failed"). Against a directory a `testing` build seeded, the reload
+///   branch succeeds.
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local(
     data_dir: &Path,

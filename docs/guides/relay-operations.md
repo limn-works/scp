@@ -348,12 +348,17 @@ use scp_transport::native::storage::BlobStorageBackend;
 // imports stop resolving; `BlobStorageBackend` still imports, and the
 // `::sqlite(...)` constructor is what disappears.
 //
-// A shipped build cannot CREATE an identity: that needs a `PreRotationCustody`
-// backend which only a `testing` build has, so `IdentitySource::Generate` fails on
-// every start and `::Persisted` fails whenever storage holds no identity. The node's
-// own identity paths never mint one, so there is nothing to load unless you minted
-// it through
-// `scp-identity` directly. This
+// The node's own identity paths cannot CREATE one on a shipped build: that needs a
+// `PreRotationCustody` backend which only a `testing` build has, so
+// `IdentitySource::Generate` fails on every start and `::Persisted` fails whenever
+// storage holds no identity.
+//
+// A Rust consumer CAN mint one, because `PreRotationCustody` is an unsealed public
+// trait and `DidMethod::create` takes `&impl PreRotationCustody`. Note what that
+// does NOT mean: `Identity::create` and `Identity::create_ephemeral` both route
+// through the severed `create_inner` and return `NoPreRotationBackend`, so the
+// working path is implementing the trait yourself and calling `DidMethod::create`.
+// See issue 2392 — the severance is enforced at the API, not by construction. This
 // snippet shows the config shape for that case.
 let identity: ScpIdentity = load_node_identity()?;
 let document: DidDocument = load_node_did_document()?;
