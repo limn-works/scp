@@ -146,6 +146,10 @@ check-toolchain-wiring.sh (every container build asserts which compiler it resol
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration
 file to a lane or declares it unread; .mise.toml names no Rust version source),
+check-examples-build-shipped.sh (per-package example lint on shipped features; the
+per-package loop is the assertion — collapsing it into `cargo clippy --workspace
+--examples` makes the gate inert, because a workspace-wide selection unifies
+dev-dependency features and turns `scp-node/testing` back on),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

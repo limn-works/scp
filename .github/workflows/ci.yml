@@ -584,10 +584,8 @@ jobs:
           # invocation covers all four.
           cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
           # Examples ship inside the published crate, so they must build on the
-          # feature set that ships. The check lints one package at a time: a
-          # workspace-wide `--examples` unifies dev-dependency features across
-          # every member and compiles each example with `scp-node/testing` ON,
-          # which accepts the defect it would exist to reject. See the script.
+          # feature set that ships. Package scope is load-bearing — the script
+          # header says why a workspace-wide form is inert.
           bash scripts/check-examples-build-shipped.sh
 
   # Matrix jobs must always expand so each OS variant reports a status

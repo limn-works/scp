@@ -1,4 +1,4 @@
-# A Workspace-Wide `--examples` Lint Turns On the Very Feature It Is Meant to Exclude
+# A Workspace-Wide `--examples` Lint Turns On the Feature It Is Meant to Exclude
 
 **Date:** 2026-08-22
 **Source:** branch `fix/rustls-webpki-advisories` — `crates/scp-node/examples/website.rs`
@@ -35,12 +35,11 @@ Reintroducing `DhtMode::Memory` settled it:
 | `cargo clippy --workspace --examples -- -D warnings` | **exit 0** | exit 0 |
 | `cargo clippy -p scp-node --examples -- -D warnings` | exit 101, `E0599` | exit 0 |
 
-A gate that has never been observed failing is a gate whose failure path has never run.
-Run it against the defect before committing it, and record both exit codes.
+Run a gate against the defect before committing it, and record both exit codes.
 
-A gate whose comment overstates its reach is worse than no gate: the next author reads
-the comment, believes the property is proven, and stops checking. That is the
-extrapolation-as-contract failure `CLAUDE.md` names, written into an enforcement file.
+When a gate's comment overstates its reach, the next author reads the comment, believes
+the property is proven, and stops checking. That is the extrapolation-as-contract failure
+`CLAUDE.md` names, written into an enforcement file.
 
 ## What happened
 
@@ -66,17 +65,27 @@ module in `src/bridge.rs` needs the `testing` feature and is a lib-test target, 
 `[[test]]` target, so it carries no `required-features` guard and cannot drop out. The
 same defect makes `release.yml`'s clippy step red on any release tag.
 
-"Strictly broader" is a claim about coverage, not a claim about the tree compiling. Run
-the widened invocation before adopting it.
+Run the widened invocation before adopting it.
 
 ## What the check does not cover
 
-Cargo gives an example its own crate's dev-dependencies and no invocation switches that
-off, so an example reaching a `testing` feature its **own** crate dev-depends on still
-compiles. `crates/scp-runtime/examples/identity.rs` imports
-`scp_platform::testing::InMemoryKeyCustody` and passes. The check rejects an example that
-reaches a feature no shipped build of its crate enables; it does not prove an example
-compiles for a reader who copies it out and depends on the published crate.
+Cargo gives an example its own crate's dev-dependencies, and no invocation switches that
+off, so two leaks stay open and neither is closable.
+
+**A dependency crate's `testing`, enabled by the linted crate's own dev-deps.**
+`crates/scp-node/Cargo.toml` dev-depends on `scp-platform` and `scp-dht` with
+`features = ["testing"]`, so `scp_platform::testing` stays reachable from a scp-node
+example.
+
+**A dev-dependency back-edge that re-enables the linted crate's own `testing`.**
+`scp-runtime` and `scp-transport` dev-depend on `scp-testing`, whose **normal**
+`scp-core{testing}` edge resolves `scp-runtime/testing` ON — which also satisfies the
+`required-features` guards on those crates' own examples.
+
+So the check rejects an example naming a construct behind its own crate's `testing`, in a
+crate whose dev-dependency graph does not turn that feature back on. `scp-node` is the
+only workspace member where that holds today. It proves nothing about a reader who copies
+an example out and depends on the published crate.
 
 ## How to apply
 
@@ -90,3 +99,8 @@ compiles for a reader who copies it out and depends on the published crate.
   `SCP_NODE_DHT_MODE=memory` to operators when a shipped `scp-node` exits 1 on it.
 - Search both documentation trees. This repository has `.docs/` and a separate lowercase
   `docs/`, and a sweep of one misses the other.
+
+Filed as issue 2386, "release.yml's clippy step cannot pass: scp-ffi-uniffi's inline test
+module needs the testing feature." It is filed rather than fixed because the two available
+fixes are not equivalent, and one of them removes a release-time assertion — which
+`CLAUDE.md` says a human approves.

@@ -5,7 +5,7 @@
 //! to the (in-memory) DHT.
 //!
 //! Usage:
-//!   `cargo run -p scp-runtime --example identity`
+//!   `cargo run -p scp-runtime --example identity --features testing`
 
 use std::sync::Arc;
 
