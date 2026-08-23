@@ -294,10 +294,23 @@ manifest.
   A job gated on `push: tags:` or `workflow_dispatch` gates a release, not a pull request.
 - When a feature flag moves a construct out of a shipped build, grep the whole repository
   for the construct's name — examples, the `README.md` beside the example, operator
-  guides, and environment-variable tables. This branch found the same stale name in
-  `crates/scp-node/examples/README.md`, `crates/scp-node/tests/self_host.rs`, two guides
-  under `.docs/guides/`, and `docs/guides/relay-operations.md`, which advertised
-  `SCP_NODE_DHT_MODE=memory` to operators when a shipped `scp-node` exits 1 on it.
+  guides, environment-variable tables, and the source of the crate that declares the flag.
+  This branch's first sweep searched documentation and stopped there, so it reported five
+  files: `crates/scp-node/examples/README.md`, `crates/scp-node/tests/self_host.rs`,
+  `.docs/guides/deploying-an-scp-website.md`, `.docs/guides/self-hosting-a-website-on-scp.md`,
+  and `docs/guides/relay-operations.md`, which advertised `SCP_NODE_DHT_MODE=memory` to
+  operators when a shipped `scp-node` exits 1 on it.
+- A second sweep, run because the first enumeration was presented as complete, found the
+  stale name inside `crates/scp-node/src` itself — the crate the flag lives in:
+  `config.rs` carried a comment asserting that `SCP_NODE_DHT_MODE=memory` "is exactly the
+  capability the binary exposes", `main.rs` carried a rustdoc comment documenting the
+  no-publish banner case as `SCP_NODE_DHT_MODE=memory`, and `config.rs` carried three
+  tests whose names said `dht_memory` while their bodies passed `DhtMode::Disabled`.
+  Do not read an earlier sweep's file list as the sweep. Re-run the grep.
+- Grep test names, not only code and prose. A test name is a claim about what the test
+  covers, and replacing a value inside the body leaves the name behind:
+  `nat_traversal_plus_dht_memory_is_valid` kept its name after ADR-062, capability
+  injection, replaced its `DhtMode::Memory` with `DhtMode::Disabled`.
 - Search both documentation trees. This repository has `.docs/` and a separate lowercase
   `docs/`, and a sweep of one misses the other.
 

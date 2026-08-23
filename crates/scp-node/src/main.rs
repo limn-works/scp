@@ -1409,34 +1409,37 @@ mod tests {
         );
     }
 
-    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=memory`), the banner must NOT
+    /// With DHT publishing OFF (`SCP_NODE_DHT_MODE=disabled`), the banner must NOT
     /// claim the host's IP is published — it must instead state the node is
     /// reachable but not DHT-discoverable. This is the banner half of the M2
-    /// correction: `memory` (no publish) is a valid self-host mode that opens the
-    /// port without disclosing the address to the DHT.
+    /// correction: `disabled` (no publish) is a valid self-host mode that opens the
+    /// port without disclosing the address to the DHT. ADR-062, capability
+    /// injection, moved the former `memory` value behind the `testing` feature, so
+    /// `disabled` is the no-publish value a shipped binary accepts here.
     #[test]
-    fn self_host_banner_memory_mode_states_no_publish() {
+    fn self_host_banner_no_publish_mode_states_no_publish() {
         let port = 8443u16;
-        let memory = self_host_banner(port, false, false);
+        let no_publish = self_host_banner(port, false, false);
 
         // The port is still opened, so the public-internet exposure stands.
         assert!(
-            memory.contains("PUBLIC INTERNET"),
-            "memory-mode banner must still disclose public-internet port exposure"
+            no_publish.contains("PUBLIC INTERNET"),
+            "no-publish banner must still disclose public-internet port exposure"
         );
         // But the IP<->identity DHT publication line must be GONE.
         assert!(
-            !memory.contains("PUBLIC IP will be published"),
-            "memory-mode banner must NOT claim the public IP is published to the DHT"
+            !no_publish.contains("PUBLIC IP will be published"),
+            "no-publish banner must NOT claim the public IP is published to the DHT"
         );
         assert!(
-            !memory.contains("IP<->identity disclosure"),
-            "memory-mode banner must NOT claim an IP<->identity disclosure"
+            !no_publish.contains("IP<->identity disclosure"),
+            "no-publish banner must NOT claim an IP<->identity disclosure"
         );
         // And it must state the no-publish / not-discoverable posture.
         assert!(
-            memory.contains("DHT publishing is OFF") && memory.contains("NOT DHT-discoverable"),
-            "memory-mode banner must state the address is not published and not DHT-discoverable"
+            no_publish.contains("DHT publishing is OFF")
+                && no_publish.contains("NOT DHT-discoverable"),
+            "no-publish banner must state the address is not published and not DHT-discoverable"
         );
     }
 }
