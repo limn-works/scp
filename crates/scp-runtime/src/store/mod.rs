@@ -448,7 +448,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Currently no key-space migrations are registered (schema version
     /// has never changed). This hook is functional and ready for future
     /// versions to register migration steps.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn run_schema_migrations(&self, _from_version: u16) -> Result<(), StoreError> {
         // Migration steps would be registered here as the schema evolves.
         // Example:

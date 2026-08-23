@@ -449,7 +449,7 @@ impl PyCallbackKeyCustody {
     ///
     /// Returns [`PlatformError::CustodyError`] if the provider raises or
     /// returns a non-32-byte value.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn export_ed25519_signing_key(
         &self,
         handle: &KeyHandle,
@@ -468,6 +468,10 @@ impl PyCallbackKeyCustody {
     }
 }
 
+// `KeyCustody` declares these methods future-returning, so this impl cannot drop
+// `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+// section `clippy::unused_async_trait_impl`.
+#[allow(clippy::unused_async_trait_impl)]
 impl KeyCustody for PyCallbackKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         let type_str = match key_type {

@@ -300,6 +300,18 @@ impl<'a> LocalHandleQuerier<'a> {
     }
 }
 
+// `HandleQuerier` declares these methods future-returning, so this impl cannot drop
+// `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+// section `clippy::unused_async_trait_impl`.
+//
+// What the lint pointed at here is real, and this allow does not answer it: two of the
+// three methods below return an empty vector for a lookup this bridge cannot perform,
+// which a caller cannot tell apart from "the domain publishes no such handle". The fix
+// is a `Result` return across `HandleQuerier` and its callers, so the bridge fails
+// closed; the standard section named above records where that work is tracked. Removing
+// `async` would instead write the missing backend's absence into the signature, and
+// adding the backend later would then be a breaking change.
+#[allow(clippy::unused_async_trait_impl)]
 impl HandleQuerier for LocalHandleQuerier<'_> {
     async fn lookup_handle(
         &self,

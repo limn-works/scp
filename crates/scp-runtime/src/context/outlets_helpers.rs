@@ -3293,6 +3293,10 @@ mod tests {
         /// `complete_outlet_payment` into its error arm. `verify_authorization`
         /// must succeed first (it runs before capture in `process_paid_action`).
         struct FailingCaptureAdapter;
+        // `PaymentAdapter` declares these methods future-returning, so this impl cannot drop
+        // `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+        // section `clippy::unused_async_trait_impl`.
+        #[allow(clippy::unused_async_trait_impl)]
         impl PaymentAdapter for FailingCaptureAdapter {
             fn adapter_id(&self) -> &'static str {
                 "failing-capture"

@@ -183,9 +183,13 @@ fn now_secs() -> u64 {
 // PaymentAdapter implementation
 // ---------------------------------------------------------------------------
 
+// `PaymentAdapter` declares these methods future-returning, so this impl cannot drop
+// `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+// section `clippy::unused_async_trait_impl`.
 #[allow(
-    clippy::similar_names,              // payer/payee are domain terms from the spec.
-    clippy::significant_drop_tightening // Mutex guards are held for the duration of each operation.
+    clippy::similar_names,               // payer/payee are domain terms from the spec.
+    clippy::significant_drop_tightening, // Mutex guards are held for the duration of each operation.
+    clippy::unused_async_trait_impl
 )]
 impl PaymentAdapter for TestAdapter {
     #[allow(clippy::unnecessary_literal_bound)] // Trait signature constrains return type.

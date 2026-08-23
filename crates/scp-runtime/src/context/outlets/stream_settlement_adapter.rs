@@ -302,7 +302,12 @@ mod tests {
     /// A payment adapter whose `capture` ALWAYS fails (authorize succeeds first),
     /// driving the settlement's service-rendered capture-failure arm.
     struct FailCaptureAdapter;
-    #[allow(clippy::similar_names)] // payer/payee is the domain language
+    // `similar_names` fires on payer/payee, which is the domain language.
+    //
+    // `PaymentAdapter` declares these methods future-returning, so this impl cannot drop
+    // `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+    // section `clippy::unused_async_trait_impl`.
+    #[allow(clippy::similar_names, clippy::unused_async_trait_impl)]
     impl PaymentAdapter for FailCaptureAdapter {
         fn adapter_id(&self) -> &'static str {
             "fail-capture"

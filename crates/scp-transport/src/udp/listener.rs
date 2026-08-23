@@ -248,7 +248,7 @@ impl<S: BlobStorage + 'static> UdpDtlsListener<S> {
     /// # Errors
     ///
     /// Returns an error string if the UDP socket cannot be bound.
-    #[allow(clippy::unused_async)] // Async for API consistency with other listeners.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Async for API consistency with other listeners.
     pub async fn start(&self) -> Result<(UdpDtlsShutdownHandle, SocketAddr), String> {
         // Bind with SO_REUSEPORT so per-client DTLS sockets can share the
         // same local address. The kernel routes datagrams from connected

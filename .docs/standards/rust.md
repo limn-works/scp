@@ -314,6 +314,48 @@ Format: `{action}_{condition_or_expected_result}`.
 - Use `futures::StreamExt` for stream operations
 - Cancellation safety: all async functions must be cancellation-safe or documented as not
 
+### `clippy::unused_async_trait_impl`
+
+Clippy 1.98.0 added `unused_async_trait_impl`, which reports an `async fn` whose body
+never awaits, inside an impl block. It is warned workspace-wide through `pedantic` and
+denied in CI by `-D warnings`. Nothing allows it at the workspace level, so every allow
+names one site.
+
+**The criterion for allowing it at a site: the author of the function does not decide
+whether the future exists.** Apply that criterion to decide. The two kinds of site below
+are the ones that satisfy it in this workspace today; each states how it satisfies the
+criterion, so a site of a third kind that satisfies it just as squarely also qualifies, and
+a site that resembles one of these two without satisfying the criterion does not.
+
+- **A trait impl of a trait that declares the method `async`.** The impl cannot drop
+  `async` without hand-writing `fn f(..) -> impl Future<Output = T> + Send { async move
+  { .. } }`, which desugars to the same future. Clippy's own suggestion wraps the body's
+  values in `std::future::ready`, which runs the body at call time instead of at poll
+  time, so for a body with a side effect it moves when that side effect happens. Write
+  `#[allow(clippy::unused_async_trait_impl)]` on the impl block and name the trait in the
+  comment above it.
+- **A function whose caller-facing signature a code generator fixes** — a `#[napi]`
+  method that returns a JavaScript Promise, a UniFFI method that generates a Swift `async`
+  / Kotlin `suspend` signature, or a function held async so a later await point is not a
+  breaking change. Each of these already carries `#[allow(clippy::unused_async)]` with its
+  reason, because `clippy::unused_async` reports the same function. Add
+  `clippy::unused_async_trait_impl` to that same attribute: the second lint name reaches
+  the site through a different path and would otherwise bypass the ruling the site already
+  made.
+
+**What the criterion excludes:** a trait this workspace owns whose methods no impl awaits.
+That combination says the trait should not be async, or that the implementation performing
+the I/O has not been written. Neither is answered by an allow. `HandleQuerier`
+(`crates/scp-runtime/src/discovery/addressing.rs`) and `ContextQuerier`
+(`crates/scp-runtime/src/discovery/search.rs`) are in the second position: both declare
+methods specified to perform network I/O, and the implementations that would do that I/O
+do not exist yet. The allows on their impls carry that reading, and issue #2387, the
+`LocalHandleQuerier` empty-vector lookups, records the defect underneath.
+
+Allowing the lint in `[workspace.lints.clippy]` is forbidden. A workspace allow turns the
+lint off at every impl block in the repository, including impl blocks written after the
+allow, and this lint reported a fail-open capability that no other check had reported.
+
 ## Documentation
 
 - All public items have `///` doc comments

@@ -621,7 +621,14 @@ impl<T: PaymentAdapter> PaymentAdapterDyn for T {
 pub struct NoOpPaymentAdapter;
 
 #[cfg(any(test, feature = "testing"))]
-#[allow(clippy::unnecessary_literal_bound, clippy::similar_names)]
+// `PaymentAdapter` declares these methods future-returning, so this impl cannot drop
+// `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+// section `clippy::unused_async_trait_impl`.
+#[allow(
+    clippy::unnecessary_literal_bound,
+    clippy::similar_names,
+    clippy::unused_async_trait_impl
+)]
 impl PaymentAdapter for NoOpPaymentAdapter {
     fn adapter_id(&self) -> &str {
         "noop"
@@ -756,7 +763,14 @@ pub struct CountingPaymentAdapter {
 }
 
 #[cfg(any(test, feature = "testing"))]
-#[allow(clippy::unnecessary_literal_bound, clippy::similar_names)]
+// `PaymentAdapter` declares these methods future-returning, so this impl cannot drop
+// `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+// section `clippy::unused_async_trait_impl`.
+#[allow(
+    clippy::unnecessary_literal_bound,
+    clippy::similar_names,
+    clippy::unused_async_trait_impl
+)]
 impl PaymentAdapter for CountingPaymentAdapter {
     fn adapter_id(&self) -> &str {
         "counting"

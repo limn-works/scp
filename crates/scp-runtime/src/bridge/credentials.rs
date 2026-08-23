@@ -644,7 +644,13 @@ impl InMemoryCredentialStore {
 // `#[cfg(any(test, feature = "testing"))]`, never a zero-argument default.
 
 #[cfg(any(test, feature = "testing"))]
-#[allow(clippy::significant_drop_tightening)] // Nursery false positive: guards are held across the synchronous critical section, then dropped at scope end.
+// `significant_drop_tightening` is a nursery false positive here: the guards are held
+// across the synchronous critical section, then dropped at scope end.
+//
+// `BridgeCredentialStore` declares these methods future-returning, so this impl cannot
+// drop `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+// section `clippy::unused_async_trait_impl`.
+#[allow(clippy::significant_drop_tightening, clippy::unused_async_trait_impl)]
 impl BridgeCredentialStore for InMemoryCredentialStore {
     async fn provision(
         &self,

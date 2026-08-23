@@ -925,7 +925,7 @@ impl Scp {
 
     /// Per-instance equivalent of `identity_create_link_attestation`.
     #[napi(js_name = "identityCreateLinkAttestation")]
-    #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // napi-rs requires async for Promise return
     pub async fn identity_create_link_attestation(
         &self,
         did: String,

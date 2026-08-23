@@ -2529,6 +2529,10 @@ mod tests {
         }
     }
 
+    // `SyncPhaseDriver` declares these methods future-returning, so this impl cannot drop
+    // `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+    // section `clippy::unused_async_trait_impl`.
+    #[allow(clippy::unused_async_trait_impl)]
     impl SyncPhaseDriver for MockSyncDriver {
         async fn relay_catch_up(
             &self,

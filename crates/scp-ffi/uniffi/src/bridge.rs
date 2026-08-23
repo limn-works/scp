@@ -704,6 +704,10 @@ impl fmt::Debug for CallbackKeyCustody {
 unsafe impl Send for CallbackKeyCustody {}
 unsafe impl Sync for CallbackKeyCustody {}
 
+// `KeyCustody` declares these methods future-returning, so this impl cannot drop
+// `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+// section `clippy::unused_async_trait_impl`.
+#[allow(clippy::unused_async_trait_impl)]
 impl KeyCustody for CallbackKeyCustody {
     async fn generate_keypair(&self, key_type: KeyType) -> Result<KeyHandle, PlatformError> {
         let type_str = match key_type {
@@ -15952,7 +15956,7 @@ impl Scp {
     ///
     /// Routes through `&*self.inner`. Rejects any `TransportManager`
     /// whose `instance_id` does not match this `SCP`'s.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn transport_status(
         &self,
         manager: Arc<TransportManager>,
@@ -15986,7 +15990,7 @@ impl Scp {
     /// Since the result is stateless as far as the bridge is
     /// concerned (no cross-instance handle is passed in), there is no
     /// handle-affinity check to perform.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn transport_manager_status(&self) -> Result<TransportStatus, ScpError> {
         let (connected, relay_url, latency_ms) =
             scp_ffi_common::handleless_transport_status(self.inner.core.has_transport());
@@ -16111,7 +16115,7 @@ impl Scp {
     /// Routes through `&*self.inner`. The MCP server registry is
     /// module-level (not per-instance) so the returned opaque handle
     /// string is globally unique; this method preserves that behaviour.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_server_create(&self, config: McpServerConfig) -> Result<String, ScpError> {
         validate_did(&config.identity_did)?;
         validate_transport_mode(&config.transport)?;
@@ -16224,7 +16228,7 @@ impl Scp {
     ///
     /// Routes through the module-level MCP server registry (the registry
     /// is not per-instance; the opaque handle string is globally unique).
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_server_stop(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
 
@@ -16253,7 +16257,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
     ///
     /// Routes through the module-level MCP client registry.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_connect_stdio(&self, command: Vec<String>) -> Result<String, ScpError> {
         if command.is_empty() {
             return Err(ScpError::Validation {
@@ -16290,7 +16294,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
     ///
     /// Routes through the module-level MCP client registry.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_connect_sse(&self, url: String) -> Result<String, ScpError> {
         validate_relay_url(&url)?;
 
@@ -16317,7 +16321,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
     ///
     /// Routes through the module-level MCP client registry.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_disconnect(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
 
@@ -16335,7 +16339,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_list_tools`.
     ///
     /// Routes through the module-level MCP client registry.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_list_tools(
         &self,
         handle: String,
@@ -16373,7 +16377,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_invoke`.
     ///
     /// Routes through the module-level MCP client registry.
-    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn mcp_client_invoke(
         &self,
         handle: String,

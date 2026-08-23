@@ -1159,7 +1159,7 @@ impl CoreFields {
     // chain async transport reconnect and persisted-context restoration on
     // top. Making the core method sync would force awkward `.await`ing of
     // a non-future in every override.
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn resume(&self) -> Result<(), LifecycleError> {
         if self.is_shutdown() {
             return Err(LifecycleError::AlreadyShutDown);

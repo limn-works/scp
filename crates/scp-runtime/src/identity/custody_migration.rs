@@ -386,7 +386,7 @@ impl CustodyMigrationOrchestrator {
     ///
     /// Returns [`CustodyMigrationError`] for fatal failures in steps 1–3.
     /// Steps 4–5 failures are recorded in the result, not as errors.
-    #[allow(clippy::unused_async)] // async by design: SDK integration layer adds await points
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // async by design: SDK integration layer adds await points
     #[allow(clippy::future_not_send)] // backend trait object is not Sync by design
     pub async fn execute(
         &self,

@@ -357,7 +357,10 @@ impl TransportSelector {
     /// records no suppression (the QUIC code is compiled out, leaving the
     /// function with no `.await` — hence the conditional `unused_async` allow).
     #[allow(unused_variables)]
-    #[cfg_attr(not(feature = "quic"), allow(clippy::unused_async))]
+    #[cfg_attr(
+        not(feature = "quic"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn try_quic_probe(
         &self,
         relay_url: &str,

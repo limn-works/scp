@@ -362,7 +362,10 @@ impl RelayTransportDiscovery {
     /// When the `quic` feature is disabled there is no HTTP client and no QUIC
     /// to select, so this always returns `Resolved(None)` (WebSocket baseline)
     /// without a fetch.
-    #[cfg_attr(not(feature = "quic"), allow(clippy::unused_async))]
+    #[cfg_attr(
+        not(feature = "quic"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn fetch_transports(&self, relay_url: &str) -> FetchOutcome {
         #[cfg(feature = "quic")]
         {

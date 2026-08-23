@@ -1052,6 +1052,10 @@ mod tests {
         }
     }
 
+    // `HandleQuerier` declares these methods future-returning, so this impl cannot drop
+    // `async` without hand-writing the same future. See `.docs/standards/rust.md`,
+    // section `clippy::unused_async_trait_impl`.
+    #[allow(clippy::unused_async_trait_impl)]
     impl HandleQuerier for TestHandleQuerier {
         async fn lookup_handle(
             &self,

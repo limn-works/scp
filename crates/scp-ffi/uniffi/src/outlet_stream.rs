@@ -1775,7 +1775,7 @@ impl Scp {
     // Uniform async FFI surface: the body is pure/sync, but the method stays
     // `async` so the whole `outlet_stream_*` surface has one call shape across
     // Swift/Kotlin (every sibling op is async).
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn outlet_stream_verify_chunk_signature(
         &self,
         chunk_bytes: Vec<u8>,
@@ -1801,7 +1801,7 @@ impl Scp {
     // Uniform async FFI surface: the body is pure/sync, but the method stays
     // `async` so the whole `outlet_stream_*` surface has one call shape across
     // Swift/Kotlin (every sibling op is async).
-    #[allow(clippy::unused_async)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn outlet_stream_compute_caveats_binding(
         &self,
         ucan_cid: Vec<u8>,
