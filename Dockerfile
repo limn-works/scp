@@ -1,12 +1,24 @@
 # Stage 1: Chef — install cargo-chef
 #
-# Keep this tag equal to `channel` in `rust-toolchain.toml`. `COPY . .` carries
-# that file into the build, and rustup honours it over the base image's own
-# compiler, so a mismatched tag makes every cargo step download a second
-# toolchain — and makes `cargo chef cook` compile dependencies with a different
-# compiler than `cargo build` uses, which discards the layer cache the chef
-# stages exist to build.
-FROM rust:1.98-slim AS chef
+# Keep the version equal to `channel` in `rust-toolchain.toml`, patch component
+# included; `scripts/check-toolchain-pin.sh` requires exact equality. A floating
+# tag such as `rust:1.98-slim` resolves to the newest 1.98.x, so the day 1.98.1
+# ships the container would compile on a compiler the pin does not name.
+#
+# Name the Debian release too. `rust:1.98.0-slim` and `rust:1.98.0-slim-trixie`
+# are the same image (Debian 13, glibc 2.41), while the runtime stage below runs
+# `debian:bookworm-slim` (Debian 12, glibc 2.36). glibc is backward compatible
+# only, so a binary linked against 2.41 fails to exec against 2.36 — the runtime
+# container would die at startup with "version `GLIBC_2.xx' not found". The
+# unsuffixed tag hid that: `rust:1.85-slim`, which this file used before the
+# pin, was a bookworm image, so bumping the version alone silently changed the
+# distribution. Move both stages together or neither.
+#
+# The builder stage copies `rust-toolchain.toml` before `cargo chef cook`, so the
+# dependency build and the final build use one compiler. Without that copy the
+# cook step runs on the base image's compiler and `cargo build` runs on the
+# pinned one, which discards the layer cache the chef stages exist to build.
+FROM rust:1.98.0-slim-bookworm AS chef
 RUN cargo install cargo-chef
 WORKDIR /app
 
@@ -18,6 +30,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Stage 3: Builder — cook deps then build
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
+# Pin the compiler before cooking dependencies, so `cargo chef cook` and
+# `cargo build` below compile with the same one and the cached layer stays valid.
+COPY rust-toolchain.toml rust-toolchain.toml
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release -p scp-relay -p scp-node

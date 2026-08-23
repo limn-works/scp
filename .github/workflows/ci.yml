@@ -14,6 +14,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The one nightly the standalone fuzz crate builds on. Nightlies after this
+  # date tightened the `pub(crate)` re-export rules (E0365) and reject openmls
+  # 0.8.1's `pub use crate::ciphersuite::signature::*` at prelude.rs:16.
+  # `fuzz/rust-toolchain.toml` records the same date and the unpin condition,
+  # and `scripts/check-toolchain-pin.sh` fails when the two disagree.
+  FUZZ_TOOLCHAIN: nightly-2026-05-03
 
 jobs:
   check-draft:
@@ -304,17 +310,12 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-handle-affinity.sh
 
-  # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
-  # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern
-  # from creeping back in any language. Every new piece of per-system state
-  # must live on the bridge instance or the language SDK class — not in a
-  # module-level `static` / `let` / `var` / `static var` declaration.
-  #
-  # One job per language to keep failure attribution obvious.
-  # The repository names a Rust version in several places, and a disagreement puts a
-  # developer and CI on different compilers — the drift that let Rust 1.98.0's new
-  # clippy lints break the merge queue overnight while local runs reported a clean
-  # pass. The gate reads a fixed list of locations and requires exact equality.
+  # ── Toolchain pin agreement ────────────────────────────────────────
+  # Several files select a Rust version, and a disagreement puts a developer and
+  # CI on different compilers — the drift that let Rust 1.98.0's new clippy lints
+  # break the merge queue overnight while local runs reported a clean pass. The
+  # gate reads a fixed list of locations, requires exact equality, and fails
+  # closed when a location is missing.
   toolchain-pin:
     needs: check-draft
     name: enforcement / toolchain pin agreement
@@ -323,6 +324,13 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-toolchain-pin.sh
 
+  # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
+  # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern
+  # from creeping back in any language. Every new piece of per-system state
+  # must live on the bridge instance or the language SDK class — not in a
+  # module-level `static` / `let` / `var` / `static var` declaration.
+  #
+  # One job per language to keep failure attribution obvious.
   no-mutable-globals-rust:
     needs: check-draft
     name: enforcement / no-mutable-globals (rust workspace)
@@ -1074,12 +1082,12 @@ jobs:
       # that re-exports under the new compiler rules.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-05-03
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"
       - name: Check fuzz crate compiles
-        run: cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml
+        run: cargo +${{ env.FUZZ_TOOLCHAIN }} check --manifest-path fuzz/Cargo.toml
 
   # ── Bridge parity (ADR-046) ────────────────────────────────────────
   # Cross-bridge runtime parity harness: drives PyO3 (in-process) and
@@ -1326,6 +1334,7 @@ jobs:
       - saga-gating-granularity
       - deleted-primitives
       - bridge-instance-lifecycle
+      - toolchain-pin
       - no-mutable-globals-rust
       - no-mutable-globals-python
       - no-mutable-globals-ts
@@ -1374,6 +1383,7 @@ jobs:
             "${{ needs.saga-gating-granularity.result }}" \
             "${{ needs.deleted-primitives.result }}" \
             "${{ needs.bridge-instance-lifecycle.result }}" \
+            "${{ needs.toolchain-pin.result }}" \
             "${{ needs.no-mutable-globals-rust.result }}" \
             "${{ needs.no-mutable-globals-python.result }}" \
             "${{ needs.no-mutable-globals-ts.result }}" \

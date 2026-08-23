@@ -14,20 +14,34 @@ Rust coding standards, safety rules, linting, formatting, testing, and CI for th
 | cargo-deny | latest | Dependency license/advisory audit |
 | cargo-nextest | latest | Test runner (parallel, better output) |
 
-**The compiler version is pinned, and raising it is a deliberate change.**
-`rust-toolchain.toml` at the repository root names the version above, the `clippy` and
-`rustfmt` components, and every cross-compilation target CI builds for. `.mise.toml` names
-the same version, because mise sets `RUSTUP_TOOLCHAIN` for the commands it runs and that
-variable overrides the file — verify with `mise x -- printenv RUSTUP_TOOLCHAIN`. `fuzz/`
-carries its own pin for the nightly cargo-fuzz needs.
+**The compiler version is pinned, and raising it is a deliberate change.** Four locations
+name the stable version: `rust-toolchain.toml` at the repository root (which also names the
+`clippy` and `rustfmt` components and every cross-compilation target CI builds for),
+`.mise.toml`, `Dockerfile`, and the table above. Two more name the nightly cargo-fuzz needs:
+`fuzz/rust-toolchain.toml` and the `FUZZ_TOOLCHAIN` environment variable in both
+`.github/workflows/fuzz.yml` and `.github/workflows/ci.yml`.
+`scripts/check-toolchain-pin.sh` fails when any of them disagree, and also when the compiler
+a command in the repository resolves to is not the pinned one.
+
+`.mise.toml` has to match because mise sets `RUSTUP_TOOLCHAIN` for the commands it runs, and
+that variable overrides `rust-toolchain.toml` entirely — channel, components, and targets.
+Verify with `mise x -- printenv RUSTUP_TOOLCHAIN`; plain `mise env` does not print it, so
+checking that instead reports the wrong answer.
 
 Before this pin existed, every CI workflow installed `dtolnay/rust-toolchain@stable`, which
 resolves to whichever stable release exists on the morning a job runs. Rust 1.98.0 shipped
-on 2026-08-20 with two new `pedantic` lints, and the `Rust / clippy` required check failed
+on 2026-08-20 with two new lints — one warn-by-default `style` lint and one `pedantic`
+lint, so no group setting would have avoided it — and the `Rust / clippy` required check failed
 on every branch overnight while local runs on 1.97.1 reported a clean pass. To raise the
-version: change `channel` in `rust-toolchain.toml` and `rust` in `.mise.toml` together, run
-the CI clippy command, and fix everything the new release reports in that same pull request.
-Never lower the pin to make a new lint disappear. See
+version: change `rust-toolchain.toml`, `.mise.toml`, `Dockerfile`, and the table above
+together; run `bash scripts/check-toolchain-pin.sh`, which fails until they agree; run the
+CI clippy command; and fix everything the new release reports in that same pull request.
+Never lower the pin to make a new lint disappear.
+
+The `Dockerfile` tag names a Debian release as well as a compiler version. Keep the builder
+stage and the runtime stage on the same one: `rust:1.98.0-slim` is a Debian 13 image, the
+runtime stage runs Debian 12, and glibc is backward compatible only, so binaries built on
+the newer release fail to exec on the older. See
 `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
 
 ## Safety Rules

@@ -15,11 +15,15 @@ fails for a reason nobody changed and nobody can reproduce.
 
 ## What Happened
 
-Rust 1.98.0 shipped on 2026-08-20. Its clippy added `chunks_exact_to_as_chunks` and
-`unused_async_trait_impl`, both in the `pedantic` group, which this workspace enables at
-`warn` in `[workspace.lints.clippy]` and CI escalates with `-D warnings`. Every branch in
-the merge queue started failing `Rust / clippy` the next morning against code no one had
-touched. Local machines were still on 1.97.1, so running the exact CI command locally
+Rust 1.98.0 shipped on 2026-08-20. Its clippy added two lints, and they sit in different
+groups, which matters for what a reader concludes. `chunks_exact_to_as_chunks` is a `style`
+lint, warn by default and a member of `clippy::all`; it fires with no group flags at all.
+`unused_async_trait_impl` is allow by default and reaches this workspace through the
+`pedantic` group. `[workspace.lints.clippy]` enables `all`, `pedantic`, `nursery`, and
+`cargo` at `warn`, and CI escalates every one with `-D warnings`. Dropping `pedantic`
+would therefore not have prevented the outage: the style lint would still have fired.
+Every branch in the merge queue started failing `Rust / clippy` the next morning against
+code no one had touched. Local machines were still on 1.97.1, so running the exact CI command locally
 printed a clean pass, and one agent reported the failure as unreproducible.
 
 CLAUDE.md requires running CI locally before pushing. That requirement decides nothing
@@ -63,8 +67,9 @@ The fuzz-crate check in `.github/workflows/ci.yml` already wrote its toolchain t
 
 Auditing those steps turned up a second defect that had nothing to do with the pin: all
 three fuzz jobs referenced the action as `dtolnay/rust-toolchain@nightly-2026-05-03`, and
-that repository publishes only `master`, `nightly`, and `stable` branches. The ref never
-resolved, so every scheduled Fuzz run failed at job setup with "unable to find version"
+that repository publishes `master`, `stable`, `beta`, `nightly`, and a branch per released
+version — but no dated-nightly branch. The ref never resolved, so every scheduled Fuzz run
+failed at job setup with "unable to find version"
 and the fuzzer had not executed since the ref was introduced. A green pull request tells
 you nothing about a workflow that runs on a schedule. Naming the date through the
 `toolchain` input of `@master` — the form `ci.yml` already used — is the working shape.

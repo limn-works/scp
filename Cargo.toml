@@ -127,9 +127,9 @@ large_stack_arrays = "allow"
 #
 #  - An inherent impl. `clippy::unused_async` reports the same function, so allowing
 #    the second name drops no detection. It does not follow that every such function
-#    carries an individual justification: of the 84 `clippy::unused_async` allows in
-#    the tree, at least four are module-scoped inner attributes covering every
-#    function in their module.
+#    carries an individual justification: 84 lines in the tree mention
+#    `clippy::unused_async`, and three of them are `#![allow(..)]` inner attributes
+#    that cover a whole file or module rather than one function.
 #  - A trait impl. `clippy::unused_async` skips these deliberately. The trait declares
 #    the method as future-returning, so the impl can only re-spell
 #    `async fn f(..) -> T` as `fn f(..) -> impl Future<Output = T> + Send
@@ -138,11 +138,18 @@ large_stack_arrays = "allow"
 #    `std::future::ready`, which runs the body at call time instead of at poll time
 #    and so moves when a side effect such as a map insert happens.
 #
-# WHAT THIS ALLOW DOES NOT DECIDE: whether a trait this workspace owns should declare
-# the method async in the first place. When no impl of a trait ever awaits, the edit
-# worth making is on the trait, and it is a design change this allow neither makes nor
-# forecloses. `HandleQuerier` and `ContextQuerier` are the two traits in that position
-# today.
+# THE CASE THAT LOOKS LIKE AN EXCEPTION, AND IS NOT: a trait this workspace owns whose
+# methods no impl awaits. `HandleQuerier` (crates/scp-runtime/src/discovery/addressing.rs)
+# and `ContextQuerier` (crates/scp-runtime/src/discovery/search.rs) are the two, and
+# de-asyncing either would be the wrong edit. Both declare methods that perform network
+# I/O — `lookup_domain_handle` fetches `.well-known/scp`, `query_context` queries a remote
+# context's `agent_search` outlet. No impl awaits because the implementations that would
+# do that I/O do not exist yet: `ContextQuerier`'s only impl is a test double, and
+# `LocalHandleQuerier` returns an empty vector from two methods it cannot perform.
+# Removing `async` would write the missing backend's absence into the signature and make
+# adding it a breaking change. The empty-vector returns are a separate and more serious
+# defect — an absent capability reading as "no match" rather than failing closed, which
+# the stand-in tenet in CLAUDE.md forbids — and are tracked in issue #2387.
 #
 # `clippy::unused_async` is NOT allowed here — an async function with no await still
 # has to justify itself at every inherent-impl and free-function site.

@@ -97,9 +97,10 @@ jobs:
       #
       # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
       # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
-      # The action publishes only `master`, `nightly`, and `stable` branches, so a
-      # dated ref never resolved and every scheduled run failed at job setup.
-      # Naming the date through the `toolchain` input is what ci.yml already does.
+      # The action publishes `master`, `stable`, `beta`, `nightly`, and a branch per
+      # released version, but no dated-nightly branch, so a `@nightly-<date>` ref
+      # never resolved and every scheduled run failed at job setup. Naming the date
+      # through the `toolchain` input is what ci.yml already does.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
@@ -183,9 +184,10 @@ jobs:
 
       # TEMPORARY: pinned nightly (see the note in fuzz-nightly). Unpin once
       # openmls publishes a fixed prelude and scp-runtime updates its dependency.
-      # The action publishes only `master`, `nightly`, and `stable` branches, so a
-      # dated ref never resolved and every scheduled run failed at job setup.
-      # Naming the date through the `toolchain` input is what ci.yml already does.
+      # The action publishes `master`, `stable`, `beta`, `nightly`, and a branch per
+      # released version, but no dated-nightly branch, so a `@nightly-<date>` ref
+      # never resolved and every scheduled run failed at job setup. Naming the date
+      # through the `toolchain` input is what ci.yml already does.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
@@ -290,9 +292,10 @@ jobs:
       #
       # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
       # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
-      # The action publishes only `master`, `nightly`, and `stable` branches, so a
-      # dated ref never resolved and every scheduled run failed at job setup.
-      # Naming the date through the `toolchain` input is what ci.yml already does.
+      # The action publishes `master`, `stable`, `beta`, `nightly`, and a branch per
+      # released version, but no dated-nightly branch, so a `@nightly-<date>` ref
+      # never resolved and every scheduled run failed at job setup. Naming the date
+      # through the `toolchain` input is what ci.yml already does.
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
