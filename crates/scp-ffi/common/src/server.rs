@@ -304,7 +304,7 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// When `identity` is `None` (auto-generate): available ONLY in a `testing`
 /// build via the test-harness `ApplicationNode::dev` (in-memory key custody,
 /// [`InMemoryStorage`](scp_platform::in_memory::InMemoryStorage), and the
-/// [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) nullifier — no real DHT
+/// `InMemoryDhtClient` nullifier — no real DHT
 /// network). A shipped (no-`testing`) build FAILS CLOSED with
 /// [`ServerError::AutoGenerateUnavailable`] rather than run a nullifier-backed
 /// node (ADR-062 §Decision 1/6); production callers pass an explicit
@@ -386,7 +386,7 @@ pub async fn start_node_in_memory(
 /// - [`BlobStorageBackend::redb`] at `<data_dir>/blobs.redb` — persistent
 ///   relay blob storage
 /// - The production Mainline DHT client, built from `ClientDhtConfig::default()`.
-///   A `testing` build substitutes the [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient)
+///   A `testing` build substitutes the `InMemoryDhtClient`
 ///   nullifier so tests stay offline; a shipped build never reaches it.
 /// - Self-signed TLS (for the localhost domain)
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)
@@ -407,10 +407,10 @@ pub async fn start_node_in_memory(
 /// required in this mode — there is no environment variable fallback.
 ///
 /// On subsequent runs the same DID is reloaded from storage. Creating one on
-/// the FIRST run needs a [`PreRotationCustody`] backend (spec §9.7.4.1 §3), and
+/// the FIRST run needs a `PreRotationCustody` backend (spec §9.7.4.1 §3), and
 /// the only implementation is the test-harness `InMemoryPreRotationCustody`, so
 /// a shipped build fails closed with
-/// [`IdentityError::NoPreRotationBackend`] rather than mint a
+/// `IdentityError::NoPreRotationBackend` rather than mint a
 /// nullifier-backed identity. Pass an explicit `identity` on a shipped build, or
 /// point `data_dir` at a directory that already holds one.
 ///

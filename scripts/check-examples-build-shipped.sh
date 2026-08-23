@@ -56,8 +56,11 @@
 #     the criterion, and it is wider than "edits the manifest": `crates/NAME/build.rs`
 #     needs no manifest key at all, and a build script that prints
 #     `cargo::rustc-cfg=feature="testing"` makes `DhtMode::Memory` exist for every
-#     target of the package. Measured: gate exit 0 on an example naming the
-#     nullifier. `.cargo/config.toml` rustflags is the same class. Defending a gate
+#     target of the package. `.cargo/config.toml` rustflags is the same class.
+#     (A later attempt to reproduce that build script made the gate exit 1 instead,
+#     because the injected cfg desynchronized the lib from its dependency features.
+#     The criterion does not rest on the exit code either way: a writer of the crate
+#     controls what its targets compile against.) Defending a gate
 #     against a writer of its own subject is unbounded, so review covers it; the
 #     enforcement-file hook deliberately protects this script and not the crates.
 #

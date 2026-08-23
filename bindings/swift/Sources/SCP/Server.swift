@@ -99,7 +99,8 @@ public struct Relay: Sendable {
 /// An application node includes a running relay server, a DID identity, and
 /// (optionally) persistent storage. The identity is generated only when the
 /// caller omits one AND the build enables `testing`; a shipped build that must
-/// CREATE one fails closed. Use the static factory
+/// CREATE one fails closed, and reloading an identity the storage already holds
+/// needs no explicit identity and carries no gate. Use the static factory
 /// methods ``startInMemory(scp:identity:)`` or
 /// ``startLocal(scp:dataDir:identity:passphrase:)`` to create an instance.
 ///
@@ -155,7 +156,8 @@ public struct Node: Sendable {
     ///
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
-    ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
+    ///   - identity: A pre-existing ``Identity``. Passing `nil` requests
+    ///     auto-generation, which only a `testing` build provides.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
     /// - Throws: ``ScpError`` if startup fails.
     public static func startInMemory(
@@ -185,7 +187,8 @@ public struct Node: Sendable {
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
     ///   - dataDir: Directory for persistent storage.
-    ///   - identity: A pre-existing ``Identity`` to use, or `nil` to generate a fresh one.
+    ///   - identity: A pre-existing ``Identity``. Passing `nil` reloads the
+    ///     identity the storage already holds; it never generates one.
     ///   - passphrase: Passphrase for Argon2id key derivation. Required when
     ///     `identity` is `nil`.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.

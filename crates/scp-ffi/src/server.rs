@@ -722,7 +722,9 @@ impl crate::scp::PyScp {
     /// blob database at ``<data_dir>/blobs.redb``.
     ///
     /// When ``identity_did`` is ``None`` (the default), the node reloads a
-    /// persistent identity from ``<data_dir>/identity.key``. The ``passphrase``
+    /// persistent identity. The record lives under the storage key
+    /// ``scp/identity`` in ``<data_dir>/storage/``; ``<data_dir>/identity.key``
+    /// holds only the custody key material. The ``passphrase``
     /// parameter is required in this mode. CREATING one on a first run needs a
     /// pre-rotation custody backend that only a ``testing`` build has, so a
     /// shipped build raises ``RuntimeError`` with the message "node startup

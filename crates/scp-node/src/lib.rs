@@ -3709,7 +3709,7 @@ mod tests {
         // explicitly rather than `expect_err`.
         match resolve_identity(source).await {
             Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
-            Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
+            Err(other) => panic!("expected NoPreRotationBackend, got: {other:?}"),
             Ok(_) => panic!(
                 "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
                  pre-rotation nullifier was minted on a shipped-config create path!"
@@ -3732,7 +3732,7 @@ mod tests {
         let storage = InMemoryStorage::new();
         match resolve_identity_persistent(source, true, &storage).await {
             Err(NodeError::Identity(IdentityError::NoPreRotationBackend)) => {}
-            Err(other) => panic!("expected NoPreRotationBackend (SCP-IDENT-1059), got: {other:?}"),
+            Err(other) => panic!("expected NoPreRotationBackend, got: {other:?}"),
             Ok(_) => panic!(
                 "expected fail-closed NoPreRotationBackend, got Ok — the in-memory \
                  pre-rotation nullifier was minted on a shipped-config persist create path!"
