@@ -140,8 +140,12 @@ public struct Node: Sendable {
     /// instead of generating a fresh one. This enables identity portability --
     /// the same DID persists across node restarts.
     ///
-    /// Auto-wires in-memory key custody, in-memory storage, in-memory DHT
-    /// client, self-signed TLS, and a relay on an OS-assigned port.
+    /// Passing `nil` for `identity` requests auto-generation, which is available
+    /// ONLY in a `testing` build (in-memory key custody, in-memory storage, and
+    /// the in-memory DHT client). A shipped build throws
+    /// ``ScpError`` with `AutoGenerateUnavailable` rather than run a node backed
+    /// by an in-memory DHT nullifier, so a production caller passes an identity.
+    /// Self-signed TLS; relay on an OS-assigned port.
     ///
     /// - Parameters:
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.

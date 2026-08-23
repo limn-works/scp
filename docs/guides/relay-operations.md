@@ -76,7 +76,7 @@ scp-relay
 |------|------|---------|----------|------|----------|
 | **Full node** (default) | none | SQLite (SQLCipher) | Persistent DID | `.well-known/scp` + dev API | Production deployment |
 | **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay` |
-| **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` + dev API | Development and testing |
+| **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` + dev API | Test harness only. A shipped build exits 1: the mode needs in-memory DHT and custody, which compile only under the `testing` feature. |
 
 ```bash
 # Full node (production)
@@ -85,7 +85,8 @@ SCP_NODE_DOMAIN=relay.example.com scp-node
 # Relay-only mode
 scp-node --relay-only
 
-# Ephemeral mode (everything in memory)
+# Ephemeral mode — test harness only; a shipped build exits 1 on this flag.
+# Build with `--features testing` to use it.
 SCP_NODE_DOMAIN=localhost scp-node --ephemeral
 ```
 
@@ -142,7 +143,8 @@ scp-node [OPTIONS]
 
 OPTIONS:
     --relay-only            Run as a bare relay server (no identity, no HTTP)
-    --ephemeral             Use in-memory storage for all subsystems
+    --ephemeral             Use in-memory storage for all subsystems (no persistence).
+                            A test-harness mode: a shipped build exits 1 on it.
     --storage-path <PATH>   SQLite database directory
     --health                TCP health probe (exit 0/1)
     --help, -h              Show help
@@ -260,10 +262,12 @@ On subsequent runs, the node loads the existing identity from SQLite and reuses 
 ### Development deployment
 
 ```bash
-# Self-signed TLS; the node still publishes its DID so peers can find it
+# Self-signed TLS; the node still publishes its DID so peers can find it.
+# `--ephemeral` is omitted: a shipped build exits 1 on it, so this node persists
+# its identity and storage to disk.
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
-scp-node --ephemeral
+scp-node
 ```
 
 A full relay node has no non-publishing DHT mode, because a relay whose DID

@@ -885,8 +885,9 @@ pub struct HostSiteReady {
 /// Mainline DHT — a location disclosure). [`DhtMode::Disabled`] (no publish) is
 /// the fail-safe, non-disclosing direction and is valid for every reach —
 /// including [`Reach::NatTraversal`], the "reachable but not DHT-discoverable"
-/// config (share the address out-of-band) — never an error. [`DhtMode::Memory`]
-/// is the test-harness-only analog and is not a shipped option.
+/// config (share the address out-of-band) — never an error. `DhtMode::Memory`
+/// is the test-harness-only analog and is not a shipped option, so it is named
+/// here rather than linked: the variant does not exist on a default build.
 ///
 /// See the runnable example at `crates/scp-node/examples/website.rs` and the
 /// guide `.docs/guides/self-hosting-a-website-on-scp.md`.

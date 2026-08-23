@@ -655,9 +655,12 @@ impl crate::scp::PyScp {
 
     /// Starts a full application node with in-memory storage.
     ///
-    /// When ``identity_did`` is ``None`` (the default), auto-wires in-memory key
-    /// custody, in-memory storage, in-memory DHT client, self-signed TLS, and a
-    /// relay on an OS-assigned port with a fresh DID.
+    /// When ``identity_did`` is ``None`` (the default), auto-generation is
+    /// available ONLY in a ``testing`` build, which wires in-memory key custody,
+    /// in-memory storage, and the in-memory DHT client. A shipped build FAILS
+    /// CLOSED with ``AutoGenerateUnavailable`` rather than run a node backed by
+    /// an in-memory DHT nullifier (ADR-062 Decision 1/6), so a production caller
+    /// passes an explicit ``identity_did``.
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
     /// from the `PyO3` identity registry (populated by ``PyScp::identity_create``).
