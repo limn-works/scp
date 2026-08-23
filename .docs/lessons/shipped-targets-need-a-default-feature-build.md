@@ -41,16 +41,14 @@ means the approach is non-convergent, so stop and reframe.
 | 4b | Any nullifier other than `DhtMode::Memory` | Cargo gives an example its crate's dev-dependencies, which carry `scp-dht/testing` and `scp-platform/testing`. |
 | 4c | `required-features` as a standing exemption | The four `scp-runtime` examples compile on default features anyway; the declaration only hid them. |
 
-Rounds 1 through 3 were patched in the same shape each time, and each patch invited
-the next spelling. What ended it was changing where the check gets its truth.
+Rounds 1 through 3 were patched in the same shape each time, and each patch left the same shape in place, so the next round found another way past it. What ended it was changing where the check gets its truth.
 
 **The reframe: ask what SHIPS, not what cargo selects.** `cargo package --list`
 reports the files that reach crates.io. `cargo metadata` reports targets, and the
 two sets differ in both directions — `autoexamples = false` removes a target while
 the file still ships, and `required-features` removes a target from a filter while
 the file still ships. Sourcing from the published file set closes 4a and 4c at once
-and made the baseline ratchet that round 3 added unnecessary, so it was deleted. A
-reframe that removes a mechanism is a better sign than one that adds one.
+and made the baseline ratchet that round 3 added unnecessary, so it was deleted.
 
 **4b could not be closed, so the claim was withdrawn instead.** An example is a dev
 target and cargo gives it the crate's dev-dependencies; no invocation switches that
@@ -66,35 +64,6 @@ Two guards remain load-bearing and must not be simplified away:
 - **File-set sourcing.** A published `examples/NAME.rs` with no matching target is a
   failure, because nothing compiles it in CI or for a consumer.
 
-## A first run that passes can be your own leftover state
-
-A reviewer reported that `crates/scp-node/examples/website.rs` compiles and still
-fails at runtime. Running it printed `Site is live — open: http://localhost:18099/`,
-which reads as a refutation. It was not one. The run reused an identity an earlier
-run had already persisted under `$XDG_DATA_HOME/scp/node`, so it took the load
-branch and never reached the branch that creates one.
-
-Pointing `XDG_DATA_HOME` at an empty directory reproduced the report exactly:
-
-```
-$ XDG_DATA_HOME=/tmp/fresh PORT=18101 cargo run -q -p scp-node --example website
-Error: NodeBuild("identity error: no production pre-rotation custody backend
-available; pre-rotation recovery custody is not yet implemented — see #1729 / RFC #2130")
-exit 1
-```
-
-`host_site` asks for `IdentitySource::Persisted`. Creating a new identity needs a
-`PreRotationCustody` backend, and `grep -rn "impl.*PreRotationCustody for" crates/`
-returns exactly one implementation, the test-harness
-`InMemoryPreRotationCustody`. So a shipped build fails closed rather than mint a
-nullifier-backed identity — the no-stand-ins tenet working as designed, and a fact
-the example's own "Run this, then open the printed URL" instruction did not carry
-until this branch added it.
-
-When a run is supposed to exercise first-boot behaviour, point every state
-directory the program reads at an empty one. A green first run on a developer
-machine proves the second run works.
-
 ## `required-features` hides an example from CI and does not stop it shipping
 
 `cargo package --list -p scp-runtime` lists all four of that crate's examples. So the
@@ -109,6 +78,9 @@ features, because `scp-runtime` dev-depends on `scp-testing`, whose NORMAL
 `scp-core{testing}` edge resolves `scp-runtime/testing` ON. The declaration bought
 nothing and removed the example from the check, so it was reverted. Coverage went
 from four examples to eight.
+
+See `.docs/lessons/first-boot-testing-needs-an-empty-state-directory.md` for the
+measurement trap that nearly refuted one of the findings above.
 
 ## Measure a gate against the defect, never against the fixed tree
 

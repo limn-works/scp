@@ -3120,8 +3120,8 @@ class SCP:
         ``<data_dir>/identity.key`` and requires ``passphrase``. CREATING one on a
         first run needs a pre-rotation custody backend that only a ``testing``
         build has, so a shipped build raises ``RuntimeError`` carrying
-        ``SCP-IDENT-1059`` rather than mint a nullifier-backed identity (RFC #2130,
-        issue #1729). Pass an explicit ``identity_did``, or point ``data_dir`` at a
+        ``SCP-IDENT-1059`` rather than mint a nullifier-backed identity.
+        Pass an explicit ``identity_did``, or point ``data_dir`` at a
         directory that already holds an identity.
         """
         from scp_sdk.server import Node

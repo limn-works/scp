@@ -277,8 +277,20 @@ want a node that publishes nothing.
 ### Programmatic usage (Rust SDK)
 
 ```rust
-use scp_node::{DhtMode, IdentitySource, Node, NodeConfig, Reach, TlsMode};
+use std::sync::Arc;
+use scp_node::{
+    DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, Reach, TlsMode,
+};
 use scp_transport::native::storage::BlobStorageBackend;
+
+// A shipped build cannot CREATE an identity: that needs a `PreRotationCustody`
+// backend which only a `testing` build has, so `IdentitySource::Generate` and
+// `::Persisted` both fail closed with SCP-IDENT-1059 on a first run. Load the
+// identity you already hold and pass it explicitly.
+let identity: ScpIdentity = load_node_identity()?;
+let document: DidDocument = load_node_did_document()?;
+let did_method: Arc<ConcreteDidMethod> = build_did_method()?;
+let storage = open_encrypted_storage(&storage_dir, &storage_key)?;
 
 // `dht: DhtMode::Production` publishes this node's address bound to its DID, so
 // peers can discover it. That disclosure is a deliberate opt-in, never a default.
@@ -287,7 +299,11 @@ let node = Node::start(NodeConfig {
     tls: TlsMode::Acme { email: Some("admin@example.com".into()) },
     ..NodeConfig::defaults(
         Reach::Domain { domain: "relay.example.com".into() },
-        IdentitySource::Generate { custody, did_method },
+        IdentitySource::Explicit(Box::new(ExplicitIdentity {
+            identity,
+            document,
+            did_method,
+        })),
         storage,
         BlobStorageBackend::sqlite(&blob_db)?, // durable backend for a public node
     )

@@ -3843,7 +3843,7 @@ export class SCP {
    * `<dataDir>/identity.key` and requires `passphrase`. Creating one on a first
    * run needs a pre-rotation custody backend that only a `testing` build has, so
    * a shipped build rejects it with `SCP-IDENT-1059` rather than mint a
-   * nullifier-backed identity (RFC #2130, issue #1729). Pass an explicit
+   * nullifier-backed identity. Pass an explicit
    * `identityDid`, or point `dataDir` at a directory that already holds one.
    */
   async nodeStartLocal(
