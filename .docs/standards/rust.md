@@ -361,7 +361,9 @@ to supply a capability the workspace does not use, because recompiling a vendore
 library across every cross-compiled target adds build risk and no security. The case that
 produced this rule: rustls-webpki 0.103.14 raised its `aws-lc-rs` floor from 1.14 to 1.18
 to expose ML-DSA, which would have moved `aws-lc-sys` 0.39.0 to 0.44.0 and its vendored
-AWS-LC 1.71.0 to 5.5.0 under all thirteen targets CI builds, for an algorithm this
+AWS-LC 1.71.0 to 5.5.0 under twelve of the thirteen targets CI builds — every one
+but `wasm32-unknown-unknown`, whose crate graph contains no `aws-lc-sys` — for an
+algorithm this
 workspace never asserts; 0.103.13 cleared the same three advisories and moved nothing.
 Establish that by evidence: `diff` the candidate's `Cargo.toml` against the current one,
 and read the upstream release notes for every version in between.

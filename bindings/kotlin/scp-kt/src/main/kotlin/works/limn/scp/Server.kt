@@ -261,8 +261,9 @@ class Relay internal constructor(
  * Created via [Node.Companion.startInMemory] or [Node.Companion.startLocal].
  * The node includes a running relay server, a DID identity, and (optionally)
  * persistent storage. The identity is generated only when the caller omits one
- * AND the build enables `testing`; a shipped build requires an explicit
- * identity and fails closed otherwise.
+ * AND the build enables `testing`; a shipped build that must CREATE one fails
+ * closed, and reloading an identity the storage already holds needs no explicit
+ * identity and carries no gate.
  *
  * Implements [AutoCloseable] so it can be used with Kotlin's `use` extension:
  * ```kotlin

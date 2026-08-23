@@ -119,8 +119,8 @@ Additional `RelayConfig` fields with fixed defaults (not configurable via env va
 | `rate_limit_subscribes_per_minute` | `20` | SUBSCRIBE operations per minute per connection |
 | `delivery_jitter_ms` | `50` | Random delivery delay for metadata privacy |
 | `bridge_secret` | `None` | Shared secret for internal bridge auth |
-| `bridge` | `BridgeRole::Disabled` | Whether BRIDGE operations are accepted, and in which role |
-| `did_record_validation` | see `crates/scp-transport/src/native/server.rs` | Whether the relay validates stored DID records |
+| `bridge` | `BridgeRole::Disabled` | Whether BRIDGE operations are accepted |
+| `did_record_validation` | `DidRecordValidation::Enabled` | Whether the relay validates stored DID records |
 
 ### Node-specific configuration
 
@@ -317,7 +317,9 @@ use scp_transport::native::storage::BlobStorageBackend;
 // need to enable any of them: depending on `scp-node` is enough. Cargo unifies the
 // features `scp-node` requests on its own edges into the single build of each
 // dependency, for an external consumer exactly as inside this workspace. Drop
-// `scp-node` from your dependencies and all three imports stop resolving.
+// `scp-node` from your dependencies and the `scp_dht` and `scp_platform::sqlite`
+// imports stop resolving; `BlobStorageBackend` still imports, and the
+// `::sqlite(...)` constructor is what disappears.
 //
 // A shipped build cannot CREATE an identity: that needs a `PreRotationCustody`
 // backend which only a `testing` build has, so `IdentitySource::Generate` and
@@ -371,9 +373,9 @@ take the rest from `NodeConfig::defaults`.
 | `http_bind_addr: Option<SocketAddr>` | Public HTTP server bind address |
 | `local_api: Option<SocketAddr>` | Dev API bind address; `None` disables it |
 | `cors_origins: Option<Vec<String>>` | Allowed CORS origins |
-| `dht_gateways: Vec<String>` | DHT HTTP gateway URLs |
+| `dht_gateways: Vec<String>` | DHT HTTP gateway URLs. Carried but not threaded end-to-end: `split_config` discards it, so setting it has no effect today. |
 | `projection_rate_limit: Option<u32>` | Per-IP rate limit for projection endpoints |
-| `dns_provider: Option<DnsProviderConfig>` | DNS provider for ACME DNS-01 |
+| `dns_provider: Option<DnsProviderConfig>` | Registers a DID-derived subdomain and this node's public IP with the Limn DNS API at `dns.ctx.network`, which runs the Let's Encrypt DNS-01 challenge and returns the certificate. Setting it REPLACES the `tls` provider and overrides the domain; it falls back to self-signed when the API is unreachable. |
 | `nat: NatSlot` | NAT traversal strategy selection |
 | `network_detector: Option<Arc<dyn NetworkChangeDetector>>` | Network change source |
 

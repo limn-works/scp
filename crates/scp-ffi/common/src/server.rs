@@ -400,9 +400,10 @@ pub async fn start_node_in_memory(
 /// identity. This enables identity portability — the same DID persists
 /// across node restarts and can be shared across FFI bridge instances.
 ///
-/// When `identity` is `None`, the node creates or reloads a persistent
-/// identity via [`FileKeyCustody`](scp_platform::file::FileKeyCustody)
-/// backed by `<data_dir>/identity.key`. The `passphrase` parameter is
+/// When `identity` is `None`, the node reloads a persistent identity via
+/// [`FileKeyCustody`](scp_platform::file::FileKeyCustody), whose keystore is
+/// `<data_dir>/identity.key` (the identity record itself lives under the storage
+/// key `scp/identity` in `<data_dir>/storage/`). The `passphrase` parameter is
 /// required in this mode — there is no environment variable fallback.
 ///
 /// On subsequent runs the same DID is reloaded from storage. Creating one on

@@ -3839,11 +3839,14 @@ export class SCP {
   /**
    * Starts an application node with file-backed storage at `dataDir`.
    *
-   * Omitting `identityDid` reloads a persistent identity from
-   * `<dataDir>/identity.key` and requires `passphrase`. Creating one on a first
+   * Omitting `identityDid` reloads a persistent identity and requires
+   * `passphrase`. The identity record lives under the storage key `scp/identity`
+   * in `<dataDir>/storage/`; `<dataDir>/identity.key` holds only the custody key
+   * material, so copying it alone is not enough. Creating one on a first
    * run needs a pre-rotation custody backend that only a `testing` build has, so
-   * a shipped build rejects it with the message "node startup failed" and no
-   * error code, rather than mint a
+   * a shipped build rejects it with the message "node startup failed". The NAPI
+   * layer attaches no code, so `mapBridgeError` defaults `ScpError.code` to
+   * `SCP-UNKNOWN-0000`; match on the message, not the code. Rather than mint a
    * nullifier-backed identity. Pass an explicit
    * `identityDid`, or point `dataDir` at a directory that already holds one.
    */

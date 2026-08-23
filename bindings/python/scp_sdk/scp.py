@@ -3116,8 +3116,10 @@ class SCP:
     ) -> Any:
         """Delegate to ``_scp_core.SCP.node_start_local`` (returns :class:`Node`).
 
-        Passing ``identity_did=None`` reloads a persistent identity from
-        ``<data_dir>/identity.key`` and requires ``passphrase``. CREATING one on a
+        Passing ``identity_did=None`` reloads a persistent identity and requires
+        ``passphrase``. The identity record lives under the storage key
+        ``scp/identity`` in ``<data_dir>/storage/``; ``<data_dir>/identity.key``
+        holds only the custody key material, so copying it alone is not enough. CREATING one on a
         first run needs a pre-rotation custody backend that only a ``testing``
         build has, so a shipped build raises ``RuntimeError`` carrying
         the message "node startup failed" rather than mint a nullifier-backed

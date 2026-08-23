@@ -611,6 +611,11 @@ pub(crate) async fn relay_start_local_on(
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of `node_start_in_memory`.
+///
+/// With `identity_did = None` this requests auto-generation, which a shipped
+/// build refuses: the in-memory custody, storage, and DHT client it needs
+/// compile only under the `testing` feature. The refusal arrives as a plain
+/// error whose message names the unavailable auto-generation, with no code.
 pub(crate) async fn node_start_in_memory_on(
     bi: &Arc<NapiBridgeInstance>,
     identity_did: Option<String>,

@@ -54,7 +54,7 @@ site projection** machinery:
    (`/v1/scp/bridge/*`), which are not mounted on the self-host public surface.
 
    `routing_id = SHA-256(context_id)` (no domain separator —
-   `crates/scp-protocol/src/context/mod.rs:122` `broadcast_routing_id`).
+   `crates/scp-protocol/src/context/mod.rs:141` `broadcast_routing_id`).
    `site_handler` (`crates/scp-node/src/projection.rs`, `fn site_handler`) fetches the encrypted
    blob, **decrypts it server-side** with the broadcast key the node holds
    (`open_broadcast_trusted`, `projection.rs`), and returns **plaintext**
@@ -76,12 +76,12 @@ pull+decrypt:
 - `open_broadcast` (the signature-verifying *client* decryptor,
   `broadcast.rs:615`) has **zero production callers** — only the host-side
   `open_broadcast_trusted` is wired, inside `scp-node`'s HTTP projection.
-- `broadcast_subscribe` (FFI `crates/scp-ffi/src/context.rs:4052` →
+- `broadcast_subscribe` (FFI `crates/scp-ffi/src/context.rs:4873` →
   `subscribe_broadcast` `crates/scp-runtime/src/context/broadcast_helpers.rs:58`)
   is **local roster membership bookkeeping only** — it opens no socket and
   decrypts nothing.
 - The generic transport-receive path `deliver_incoming`
-  (`crates/scp-runtime/src/context/messaging_helpers.rs:1002`) is **MLS-only**; it
+  (`crates/scp-runtime/src/context/messaging_helpers.rs:1451`) is **MLS-only**; it
   has no `BroadcastEnvelope` branch.
 
 **Consequence:** "is the website reachable?" reduces exactly to "**is the origin

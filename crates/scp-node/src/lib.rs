@@ -3686,7 +3686,7 @@ mod tests {
     /// ADR-062 §Decision 6 / SCP-CAPINJECT-006: on a shipped (no-`testing`) build
     /// the production `Node` / self-host identity-generation path has no
     /// pre-rotation custody backend, so it FAILS CLOSED with
-    /// [`IdentityError::NoPreRotationBackend`] (surfaced as SCP-IDENT-1059) rather
+    /// [`IdentityError::NoPreRotationBackend`] rather
     /// than minting the in-memory `InMemoryPreRotationCustody` nullifier.
     ///
     /// Gated `#[cfg(not(feature = "testing"))]`: the fail-closed behavior only
