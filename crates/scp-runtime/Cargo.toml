@@ -9,6 +9,14 @@ homepage.workspace = true
 readme = "README.md"
 keywords = ["protocol", "context", "governance", "encryption"]
 categories = ["cryptography", "network-programming"]
+# `examples/identity.rs` names `InMemoryDhtClient`, which exists only when
+# `scp-dht/testing` is on. No feature of this crate activates `scp-dht/testing`;
+# the `[dev-dependencies]` edge on `scp-dht` below is the only activation, and
+# cargo strips a path-only dev-dependency from a published manifest. A consumer
+# of the published crate therefore cannot compile that file under any feature
+# combination this crate offers, so the crate does not ship it. The target still
+# exists in a checkout, and `scripts/check-examples-build-shipped.sh` compiles it.
+exclude = ["examples/identity.rs"]
 
 [features]
 # Enables non-standard did:key:{hex} DID format acceptance. Only for

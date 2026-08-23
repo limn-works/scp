@@ -94,9 +94,11 @@ currently points at.
 
 ## `required-features` hides an example from CI and does not stop it shipping
 
-`cargo package --list -p scp-runtime` lists all four of that crate's examples. So the
-declaration is a CI-visibility switch, not a shipping switch, and any rule that reads
-it as a statement about what ships is wrong.
+`cargo package --list -p scp-runtime` listed all four of that crate's examples while one
+of them carried the declaration. So the declaration is a CI-visibility switch, not a
+shipping switch, and any rule that reads it as a statement about what ships is wrong. The
+crate now publishes three, because of the `package.exclude` key the next section
+describes.
 
 This branch added `required-features = ["testing"]` to
 `crates/scp-runtime/examples/identity.rs` on the premise that it could not build on
@@ -110,6 +112,48 @@ from four counted targets to eight — against the script as it stood that round
 target, so a `required-features` declaration no longer removes one from the count; the
 revert stands on its own ground, which is that the declaration asserted a build failure
 that does not happen.
+
+## `package.exclude` is the key that stops a file shipping
+
+`crates/scp-runtime/Cargo.toml` now carries `exclude = ["examples/identity.rs"]`.
+`cargo package --list -p scp-runtime --allow-dirty` printed that path before the key and
+prints three examples after it, with no warning and exit 0. Cargo states the consequence
+itself: `cargo package --no-verify -p scp-runtime --allow-dirty` prints `warning: ignoring
+example identity as examples/identity.rs is not included in the published package`, so the
+published manifest declares no such target. The example target still exists in a checkout,
+so `scripts/check-examples-build-shipped.sh` still compiles it and still counts eight
+targets.
+
+Read the exit-0 measurement in the section above for what it covers. `cargo clippy -p
+scp-runtime --example identity` resolves the workspace dev closure, where scp-runtime's
+`[dev-dependencies]` entry `scp-dht = { path = "../scp-dht", features = ["testing"] }`
+supplies `InMemoryDhtClient`. Cargo strips a path-only dev-dependency from a published
+manifest, and no feature scp-runtime publishes activates `scp-dht/testing`, so a consumer
+of the published crate reaches an unresolved import that no feature flag resolves. Exit 0
+in the workspace answers what a workspace build does; only the published feature set
+answers what a consumer gets, and the two answers differ for this file. Its three sibling
+examples do compile for a consumer under `--features testing`, because
+`scp-runtime/testing` activates `scp-platform/testing`.
+
+### Measure the consumer state with a probe crate
+
+Building the packaged crate cannot answer this question in this workspace:
+`cargo package --no-verify -p scp-runtime --allow-dirty` exits 101 with `failed to prepare
+local package for uploading` and `no matching package named scp-clock found`, because the
+path dependencies are not on crates.io. A probe crate answers it instead. Give a scratch
+crate outside the workspace a path dependency on `scp-runtime` with
+`features = ["testing"]`, add plain path dependencies on the crates the examples name
+directly, and copy the example files into its `examples/` directory. Cargo does not resolve
+a dependency's `[dev-dependencies]`, so the probe resolves the feature set publication
+produces.
+
+Measured on that probe: `cargo build --example identity` exits 101 with one error,
+`unresolved import scp_dht::InMemoryDhtClient`, carrying rustc's note `the item is gated
+behind the testing feature`. `cargo build --example context --example messaging --example
+outlets` exits 0. The `scp_platform::testing::{InMemoryKeyCustody,
+InMemoryPreRotationCustody}` imports in identity.rs resolve in that same failing build,
+which is the direct evidence that `scp-runtime/testing` carries `scp-platform/testing` to
+a consumer and carries nothing to `scp-dht`.
 
 ## Measure a gate against the defect, never against the fixed tree
 
