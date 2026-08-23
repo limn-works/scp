@@ -1292,10 +1292,7 @@ impl CoreFields {
     /// Returns `true` if a transport manager has been set.
     #[must_use]
     pub fn has_transport(&self) -> bool {
-        self.transport
-            .read()
-            .ok()
-            .is_some_and(|guard| guard.is_some())
+        self.transport.read().is_ok_and(|guard| guard.is_some())
     }
 
     /// Returns this instance's transport selector for connect-time transparent
@@ -1399,10 +1396,7 @@ impl CoreFields {
     /// Returns `true` if any relay URL is currently registered.
     #[must_use]
     pub fn has_pending_relay_urls(&self) -> bool {
-        self.relay_urls
-            .lock()
-            .ok()
-            .is_some_and(|guard| !guard.is_empty())
+        self.relay_urls.lock().is_ok_and(|guard| !guard.is_empty())
     }
 
     /// Reconnects every pending relay URL registered via [`Self::add_relay_url`].

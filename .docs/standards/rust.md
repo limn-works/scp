@@ -7,12 +7,141 @@ Rust coding standards, safety rules, linting, formatting, testing, and CI for th
 | Tool | Version | Purpose |
 |------|---------|---------|
 | Rust edition | 2024 | Language edition (all crates) |
-| rustc | stable (latest) | Compiler |
-| cargo | stable (latest) | Build system, package manager |
-| clippy | stable (latest) | Linter |
-| rustfmt | stable (latest) | Formatter |
+| rustc, cargo, clippy, rustfmt | the `channel` in `rust-toolchain.toml` | Compiler, build system, linter, formatter |
 | cargo-deny | latest | Dependency license/advisory audit |
 | cargo-nextest | latest | Test runner (parallel, better output) |
+
+**`rust-toolchain.toml` is the one place this repository names a Rust version, and this
+table names none.** A version written here would be a second declaration that could
+disagree with the pin, which is the defect the single-source design removes. Every consumer
+derives the version from that file:
+
+| Consumer | How it reads the pin |
+|----------|----------------------|
+| `cargo`, `rustup` | natively, for any command run inside the repository; rustup installs the `channel`, `components`, and `targets` the file names on first use |
+| `Dockerfile` | copies the file into the builder image before the first cargo command; the base tag names a Debian release only |
+| `templates/personal-relay/README.md` | its `COPY . .` brings the file into the image, for the same reason |
+| the CI workflows | their `dtolnay/rust-toolchain@stable` steps select no version — that action reads no toolchain file — so each one installs rustup's `stable` and runs `rustup default stable`, and rustup then applies `rust-toolchain.toml` as a directory override, which beats the default |
+
+`fuzz/rust-toolchain.toml` names the nightly the standalone fuzz crate needs, because
+cargo-fuzz does not run on stable. rustup applies the toolchain file of the directory a
+command runs in, so every documented fuzz command runs from inside `fuzz/` and names no
+channel; the fuzz check in `.github/workflows/ci.yml` does the same with
+`working-directory: fuzz`. `.github/workflows/fuzz.yml` runs `cargo fuzz --fuzz-dir fuzz`
+from the repository root so its corpus-cache paths and its command paths agree, so it reads
+the channel out of the file in one job and passes that output to the others.
+
+**mise names no Rust version and installs no Rust toolchain.** mise exports one
+`RUSTUP_TOOLCHAIN` for every command it runs, computed from the directory the shell sat in,
+and that variable overrides a toolchain file entirely — channel, components, and targets
+alike. This repository resolves two compilers by directory, so one exported value cannot
+serve both: a mise Rust version source puts every command in `fuzz/` on the workspace's
+stable pin, where cargo-fuzz's `-Z` flags are rejected. rustup resolves both with no
+variable involved, `README.md` lists rustup among the prerequisites, and
+`scripts/check-toolchain-wiring.sh` fails when `.mise.toml` names a Rust version source
+again. A `RUSTUP_TOOLCHAIN` exported from anywhere else still overrides both files:
+`scripts/hooks/pre-commit` compares `rustc --version` against the workspace pin before it
+runs cargo, and `fuzz/build.rs` fails the fuzz build when that crate resolves a compiler
+`fuzz/rust-toolchain.toml` does not name.
+
+To raise the version: edit `channel` in `rust-toolchain.toml`, run the CI clippy command,
+and fix everything the new release reports in that same pull request. rustup downloads the
+new toolchain the first time a cargo command runs in the repository. Never lower the pin to
+make a new lint disappear.
+
+Before the pin existed, every CI workflow installed `dtolnay/rust-toolchain@stable`, which
+resolves to whichever stable release exists on the morning a job runs. Rust 1.98.0 shipped
+on 2026-08-20 with two new lints — one warn-by-default `style` lint and one `pedantic` lint,
+so no group setting would have avoided it — and the `Rust / clippy` required check failed on
+every branch overnight while local runs on 1.97.1 reported a clean pass. See
+`.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
+
+`scripts/check-toolchain-wiring.sh` checks the three properties the derivation cannot
+supply.
+
+First, that every file Docker builds from a `rust` base image carries the ASSERT-PINNED-RUSTC
+block: the base tag names a Debian release and no compiler, so the copied-in file is what
+selects the version, and those three lines make the build compare the compiler it resolved
+against the channel that file names. A container build without them compiles on whatever
+the image ships and succeeds.
+
+The gate decides which files Docker builds by path, through two rules. A basename Docker
+builds is one: `Dockerfile`, `Dockerfile.<suffix>`, `<prefix>.Dockerfile`, and the three
+`Containerfile` spellings. Prose the gate's own BUILT_FROM_DOCUMENTATION list names is the
+other, and `templates/personal-relay/README.md` is the entry there, because that document
+tells an operator to save its container block and build it. Prose that only quotes a
+container build carries no assertion; when such a document holds a `FROM` line naming a
+rust image, its author lists it in the gate's QUOTES_A_CONTAINER_BUILD instead, and the gate
+fails on a file neither list names. Writing a container build under a name outside the first
+rule is therefore still caught, and quoting a Dockerfile in an architecture decision record
+or a runbook no longer forces the author to break the quotation.
+
+That classification search matches a whole `FROM` instruction, written to Dockerfile's
+grammar for it: an optional flag, an image reference, an optional tag or digest, an
+optional `AS <name>`, and then the end of the line. The end-of-line anchor keeps English
+prose out. Docker permits nothing after the image reference but `AS <name>`, so a Markdown
+line reading "from rust sources by uniffi." cannot be a FROM instruction, and an earlier
+expression that stopped at the image reference failed the gate on exactly that sentence.
+
+Second, that every workflow whose jobs a paths filter guards routes a change to the jobs
+that build from it. Each job that compiles a crate of this workspace is guarded by
+`if: needs.changes.outputs.<lane> == 'true'`, and a skipped job reports success rather than
+absence: the `ci` job that aggregates every other job's result counts a skip as a pass, and
+so does branch protection. An unrouted change therefore merges with every job that reads it
+skipped. In `.github/workflows/ci.yml` the pin decides seven lanes, not one:
+
+| Lane | The jobs it guards whose behaviour the pin decides |
+|--------|----------------------------------------------------|
+| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
+| `python` | `python-test` runs `maturin develop --release` |
+| `typescript` | `typescript-check` runs `cargo build -p scp-ffi-napi --release` |
+| `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
+| `scaffold-typescript-web` | `scaffold-typescript-web-check` builds `bindings/typescript-wasm`, which runs that same `wasm-pack build` |
+| `kotlin` | `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing` |
+| `swift` | `swift-build-test` runs `bindings/swift/build-xcframework.sh --dev`, which calls `cargo build` |
+
+Rather than list the pin in seven filters, the `changes` job declares one `toolchain`
+filter and ORs it into every lane's output, so the workflow names each file that filter
+holds once. That filter holds two: `rust-toolchain.toml`, and `.cargo/**`, because cargo
+reads a `.cargo/config.toml` out of every ancestor of the directory a command runs in, and
+this repository's root one sets the rustflag that selects getrandom's wasm backend. The
+gate reads the set of outputs out of the workflow, so a lane added later without the OR
+fails it.
+
+`.github/workflows/docs.yml` carries the same two pieces for the same reason: its
+`rust-docs` job runs `cargo doc --workspace --document-private-items`, which compiles every
+crate on the pinned compiler, and it is the one job in this repository that runs rustdoc
+over the whole workspace while `scp-runtime` denies `rustdoc::broken_intra_doc_links`. The
+gate enumerates the workflows it checks from the tree — each tracked file under
+`.github/workflows/` whose extension GitHub Actions runs and that declares a
+`dorny/paths-filter` step — so a paths-filtered workflow added later is covered without
+anyone editing the gate. A workflow that narrows itself with `on: pull_request: paths:`
+instead needs no `toolchain` filter: a required check whose workflow never starts stays
+pending and blocks the merge, so that mechanism fails closed on its own.
+
+The gate also enumerates two populations of file and requires each member to be routed by
+an entry of the `rust` or `toolchain` filter, or declared in the gate's own list of files
+no compile reads: every root-level file, and — derived from cargo's documented
+configuration discovery — every `.cargo/config.toml` and `.cargo/config` in the tree at any
+depth. Both populations share the criterion that a pull request editing one member and
+nothing else is rare, so an omitted entry stays invisible. A file added to either
+population fails the gate until someone classifies it. The `fuzz` lane is exempt from the
+pin: `fuzz-build` runs `cargo check` with `working-directory: fuzz`, where rustup resolves
+`fuzz/rust-toolchain.toml`, and the `fuzz` filter's `fuzz/**` entry covers that file.
+
+Third, that `.mise.toml` names no Rust version source, for the reason the mise paragraph
+above states. The gate parses that file with `tomllib` and asks whether the `tools` table
+holds a `rust` key, rather than matching a line: TOML reaches one key many ways, and mise
+2026.2.22 resolves `rust` to the same version through all eight of `rust = "…"`,
+`rust = { version = "…" }`, `"rust" = "…"`, `[tools.rust]`, `[tools."rust"]`,
+`tools.rust = "…"`, `rust.version = "…"`, and `rust = ["…"]`. The line matcher the check ran
+before read four of the eight and reported OK for the other four.
+
+The `Dockerfile` base tag selects a Debian release, so keep the builder stage and the
+runtime stage on the same one. The builder reads `rust:slim-bookworm` and the runtime reads
+`debian:bookworm-slim`, which are both Debian 12. Writing `rust:slim` instead would select
+Debian 13, and because glibc is backward compatible only, a binary the builder linked
+against that release's glibc 2.41 fails to exec against Debian 12's glibc 2.36.
 
 ## Safety Rules
 
@@ -118,13 +247,14 @@ proptest! {
 
 SCP uses cargo-fuzz (libFuzzer) for parser safety and security invariant testing at trust
 boundaries. The fuzz crate lives at `fuzz/` (repo root) — a **standalone crate, not a
-workspace member**. All `cargo fuzz` commands require nightly:
+workspace member**. All `cargo fuzz` commands require the one nightly that `fuzz/rust-toolchain.toml` pins —
+nightlies after that date reject openmls 0.8.1's prelude re-export (E0365):
 
 ```sh
-cargo +nightly fuzz list --fuzz-dir fuzz          # list all 19 targets
-cargo +nightly fuzz run <target> --fuzz-dir fuzz \
+cd fuzz && cargo fuzz list          # list all 27 targets
+cd fuzz && cargo fuzz run <target> \
   -- -dict=fuzz/dicts/<dict> -max_total_time=60    # run one target locally
-cargo +nightly check --manifest-path fuzz/Cargo.toml  # compile-check (no fuzzing)
+cd fuzz && cargo check              # compile-check (no fuzzing)
 ```
 
 **Tier strategy** (ADR-045):

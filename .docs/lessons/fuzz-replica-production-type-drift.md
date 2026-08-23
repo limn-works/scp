@@ -100,7 +100,7 @@ add a CI check that verifies the replica is reviewed when the production functio
 1. `grep -n "replica\|// mirrors\|// replicates\|// copy of" fuzz/fuzz_targets/*.rs` — any
    such comment is a candidate for a `#[doc(hidden)] pub` promotion.
 2. When a production crate changes a function that is also used (or replicated) in a fuzz
-   target, the `fuzz-build` CI check (`cargo +nightly check --manifest-path fuzz/Cargo.toml`)
+   target, the `fuzz-build` CI check (`cargo check` on the fuzz crate)
    will catch compilation errors but NOT semantic drift.
 3. When adding a new field to a struct used in fuzzing, audit all fuzz targets for local
    replicas of functions that use that struct.

@@ -28,17 +28,17 @@ Add this to `~/.zshenv` for persistence.
 
 ## Toolchain
 
-All tools are managed by mise (see `.mise.toml`):
+rustup manages Rust, and mise manages every other tool (see `.mise.toml`):
 
-| Tool | Version |
-|------|---------|
-| Rust | stable (+ 10 cross-compilation targets) |
-| Python | 3.12 |
-| Bun | 1.3 |
-| Kotlin | 2.3 |
-| Gradle | 8.14 |
-| Java | Zulu 17 |
-| cargo-nextest, maturin, cargo-deny | latest |
+| Tool | Version | Manager |
+|------|---------|---------|
+| Rust | The version and cross-compilation targets `rust-toolchain.toml` names, which rustup installs the first time a cargo command runs here | rustup |
+| Python | 3.12 | mise |
+| Bun | 1.3 | mise |
+| Kotlin | 2.3 | mise |
+| Gradle | 8.14 | mise |
+| Java | Zulu 17 | mise |
+| cargo-nextest, maturin, cargo-deny | latest | mise |
 
 **Never use npm or npx** -- this project uses bun exclusively for JS/TS.
 

@@ -68,14 +68,33 @@ jobs:
   changes:
     needs: check-draft
     runs-on: ubuntu-latest
+    # `rust-docs` runs `cargo doc --workspace --document-private-items`, which compiles
+    # every crate of this workspace, so `rust-toolchain.toml` selects the compiler that
+    # job's rustdoc runs and `.cargo/config.toml` sets the rustflags it compiles under.
+    # `rust-docs` is also the one job in this repository that exercises rustdoc across the
+    # whole workspace, and `scp-runtime` denies `rustdoc::broken_intra_doc_links`, so a
+    # pull request that raises the pin and changes nothing else has to run it: a new
+    # release's rustdoc diagnostic would otherwise first appear on the next pull request
+    # that touches `crates/scp-runtime/src/**`, against code its author did not write.
+    #
+    # The `toolchain` filter below holds `rust-toolchain.toml` and `.cargo/**`, and the
+    # `docs` output ORs that filter in, which is the shape
+    # `.github/workflows/ci.yml` uses. `scripts/check-toolchain-wiring.sh` reads the
+    # outputs out of every workflow that declares a `dorny/paths-filter` step and fails
+    # when one of them drops the OR.
     outputs:
-      docs: ${{ steps.filter.outputs.docs }}
+      docs: ${{ steps.filter.outputs.docs == 'true' || steps.filter.outputs.toolchain == 'true' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
+            # The files that decide how `rust-docs` compiles, rather than what it
+            # compiles. The `outputs:` block above ORs this filter into the `docs` output.
+            toolchain:
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
             docs:
               # Manifests count: a dependency removal or a feature-flag change
               # readily breaks a cross-crate intra-doc link in `scp-runtime`,

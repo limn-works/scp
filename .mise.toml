@@ -1,10 +1,37 @@
+# mise installs every tool this repository needs EXCEPT Rust, and it names no Rust
+# version. rustup installs Rust, and README.md lists rustup among the prerequisites.
+#
+# WHY. mise exports one `RUSTUP_TOOLCHAIN` for every command it runs, and it computes that
+# value once from the directory the shell sat in. `RUSTUP_TOOLCHAIN` overrides a
+# `rust-toolchain.toml` entirely — channel, components, and targets alike. This repository
+# resolves two compilers by directory: `rust-toolchain.toml` names the stable release the
+# workspace compiles on, and `fuzz/rust-toolchain.toml` names the nightly cargo-fuzz needs.
+# One exported value cannot serve both. Giving mise either kind of Rust version source — a
+# `rust` key under `[tools]`, or `rust-toolchain.toml` registered through
+# `idiomatic_version_file_enable_tools` — puts every command in `fuzz/` on the root pin, and
+# `cd fuzz && cargo fuzz run <target>` then dies on
+# `error: the option 'Z' is only accepted on the nightly compiler`.
+#
+# rustup resolves both, per directory, with no environment variable involved: it reads the
+# toolchain file of the directory each command runs in, and on first use installs the
+# channel, components, and targets that file names. Leaving Rust out of this file is what
+# lets rustup do that.
+#
+# `scripts/check-toolchain-wiring.sh` fails when this file names a Rust version source
+# again. That gate parses this file as TOML and asks whether the `tools` table holds a
+# `rust` key, so every spelling TOML offers for that key — `[tools.rust]`, a dotted
+# `tools.rust =`, a quoted key, an inline table — reaches the same answer.
+# `fuzz/build.rs` fails the fuzz build when a `RUSTUP_TOOLCHAIN` from any other
+# source puts that crate on a compiler `fuzz/rust-toolchain.toml` does not name, and
+# `scripts/hooks/pre-commit` does the same for the workspace before it runs cargo. See
+# `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
+
 [tools]
 java = "zulu-17.64.17"
 bun = "1.3.9"
 python = "3.12.12"
 kotlin = "2.3.10"
 gradle = "8.14.4"
-rust = { version = "stable", targets = "wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android,x86_64-apple-darwin,aarch64-apple-darwin" }
 "cargo:cargo-nextest" = "latest"
 "cargo:maturin" = "latest"
 "cargo:cargo-deny" = "latest"

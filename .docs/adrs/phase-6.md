@@ -3560,7 +3560,7 @@ scp-runtime   = { path = "../crates/scp-runtime",  features = ["testing"] }
 scp-event-log = { path = "../crates/scp-event-log" }
 ```
 
-**Four-tier target strategy.** 19 targets total across four tiers:
+**Four-tier target strategy.** 27 targets total across four tiers:
 
 | Tier | Focus | Strategy | CI cadence |
 |------|-------|----------|-----------|
@@ -3584,8 +3584,15 @@ For parser and deserializer targets (T1/T2), the fuzzer receives a raw `&[u8]` s
 
 **CI cadence:**
 - **Nightly** (`.github/workflows/fuzz.yml`, 03:00 UTC): T1 targets 15 min each, T2 targets 5 min each. All targets parallel. Corpus cached per-target with `actions/cache`; `cargo fuzz cmin` runs after each campaign.
-- **Weekly deep-fuzz** (Saturday 00:00 UTC or `workflow_dispatch`): T1 targets only, 2 hours each, AddressSanitizer enabled (cargo-fuzz default) + UBSan on Saturdays.
-- **Per-PR compilation check** (`cargo +nightly check --manifest-path fuzz/Cargo.toml`): catches API breakage without running the fuzzer. Runs in `.github/workflows/ci.yml` as `fuzz-build`.
+- **Weekly deep-fuzz** (Saturday 00:00 UTC or `workflow_dispatch`): T1 targets only, 2 hours each,
+  AddressSanitizer enabled (cargo-fuzz default). This entry read "+ UBSan on Saturdays" until
+  2026-08-23, and the job it described set `RUSTFLAGS="-Zsanitizer=address,undefined"` and died at
+  cargo-fuzz's first rustc invocation on every run: rustc accepts no `undefined` sanitizer, and its
+  error names the values it does accept (`address`, `cfi`, `dataflow`, `hwaddress`, `kcfi`,
+  `kernel-address`, `kernel-hwaddress`, `leak`, `memory`, `memtag`, `safestack`,
+  `shadow-call-stack`, `thread`, `realtime`). Run 32634187570 recorded it. No deep-fuzz campaign
+  had ever run, so the weekly lane now runs the same AddressSanitizer over the longer budget.
+- **Per-PR compilation check** (`cargo check` on the fuzz crate): catches API breakage without running the fuzzer. Runs in `.github/workflows/ci.yml` as `fuzz-build`. `fuzz/rust-toolchain.toml` names the nightly the crate compiles on and records the condition for unpinning it; no command and no workflow repeats that channel.
 
 ### Rationale
 
@@ -3611,7 +3618,7 @@ These invariants are the governance artifact for the fuzzing infrastructure. Eve
 
 | ID | Invariant | Current coverage |
 |----|-----------|-----------------|
-| I1 | No panic on any untrusted input | All 19 targets |
+| I1 | No panic on any untrusted input | All 27 targets |
 | I2 | No unbounded allocation (bounded by protocol constants from ADR-043) | T1–T6, T10–T11, T14–T15 |
 | I3 | Cryptographic signatures unforgeable (no structural bypass) | T16, T18 |
 | I4 | Nonce replay prevention: accepted nonce never re-accepted | Future T20 (blocked: `InMemoryNonceTracker` uses `SystemClock`) |
@@ -3681,11 +3688,11 @@ fuzz/                        # Standalone cargo-fuzz crate (not workspace member
 
 ### Acceptance Criteria
 
-1. `cargo +nightly fuzz list --fuzz-dir fuzz` lists all 19 targets.
-2. `cargo +nightly check --manifest-path fuzz/Cargo.toml` succeeds on stable CI (nightly toolchain via `+nightly` flag).
+1. `cd fuzz && cargo fuzz list` lists all 27 targets.
+2. `cd fuzz && cargo check` succeeds on a CI runner whose default toolchain is stable, because rustup applies the toolchain file of the directory a command runs in and `fuzz/rust-toolchain.toml` names the nightly.
 3. Fuzz crate is NOT listed in root `Cargo.toml` `[workspace] members`.
-4. `.github/workflows/fuzz.yml` runs T1 targets (15 min) and T2 targets (5 min) nightly; T1 targets with UBSan weekly.
-5. `.github/workflows/ci.yml` includes a `fuzz-build` job that runs `cargo +nightly check --manifest-path fuzz/Cargo.toml`.
+4. `.github/workflows/fuzz.yml` runs T1 targets (15 min) and T2 targets (5 min) nightly, and T1 targets for 2 hours each weekly, both under AddressSanitizer.
+5. `.github/workflows/ci.yml` includes a `fuzz-build` job that compiles the fuzz crate on the channel `fuzz/rust-toolchain.toml` names, and the job repeats that channel nowhere.
 6. Security invariants I1–I10 are documented in `fuzz/README.md` with current coverage status.
 7. `fuzz/.claude/CLAUDE.md` exists with agent-facing conventions: standalone crate caution, nightly requirement, raw-bytes-vs-Arbitrary guidance, dictionary format, invariant catalog.
 8. All T1/T2 targets use raw bytes (`|data: &[u8]|`). All T3/T4 targets that require semantic structure use `Arbitrary`.
