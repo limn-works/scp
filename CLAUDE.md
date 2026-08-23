@@ -142,13 +142,15 @@ bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
 features only, ZERO nullifier exceptions),
-check-examples-build-shipped.sh + examples-shipped-baseline.txt (every example
-target ships in its crate's published archive, so an ungated example must build
-lint-clean on default features; the per-target loop and the baseline ratchet are
-both the assertion — collapsing the loop into `cargo clippy --workspace --examples`
-makes the gate inert because a workspace-wide selection unifies dev-dependency
-features and turns `scp-node/testing` back on, and dropping a baseline entry lets
-`required-features` remove an example from CI while it still ships),
+check-examples-build-shipped.sh (every `examples/*.rs` file a crate PUBLISHES must
+be a cargo example target that builds lint-clean on that crate's default features;
+sourcing the file list from `cargo package --list` rather than from example targets
+is the assertion, because `autoexamples = false` hides a target while still
+shipping the file, and collapsing the per-package loop into `cargo clippy
+--workspace --examples` makes the check inert — a workspace-wide selection unifies
+dev-dependency features and turns `scp-node/testing` back on. The check proves
+compilation only; it CANNOT prove an example avoids a nullifier, because cargo
+gives every example its crate's dev-dependencies),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

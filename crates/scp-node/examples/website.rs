@@ -4,6 +4,20 @@
 //! Override the port with the `PORT` env var, e.g.
 //! `PORT=9000 cargo run -p scp-node --example website`.
 //!
+//! ON A MACHINE WITH NO EXISTING SCP IDENTITY THIS EXITS 1, and prints:
+//!
+//! ```text
+//! Error: NodeBuild("identity error: no production pre-rotation custody backend
+//! available; pre-rotation recovery custody is not yet implemented")
+//! ```
+//!
+//! `host_site` asks for `IdentitySource::Persisted`, and creating a new identity
+//! requires a `PreRotationCustody` backend (spec §9.7.4.1 §3). The only
+//! implementation is the test-harness `InMemoryPreRotationCustody`, so a shipped
+//! build fails closed here instead of minting a nullifier-backed identity — see
+//! RFC #2130 and issue #1729 for the real backend. Once an identity exists in
+//! `$XDG_DATA_HOME/scp/node`, this example loads it and serves the site.
+//!
 //! This is a safe LOCAL demo: it uses `TlsMode::Plaintext` (plain HTTP),
 //! `Reach::Local` (no NAT/UPnP probe, loopback-only addressing), and
 //! `DhtMode::Disabled` — so NO router port is opened and NOTHING is published to
