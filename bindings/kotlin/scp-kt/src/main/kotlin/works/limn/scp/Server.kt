@@ -38,7 +38,8 @@ interface ServerBindings {
     /**
      * Starts a full application node with in-memory storage.
      *
-     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
+     * @param identityDid DID string of a pre-existing identity. Passing null requests
+     *   auto-generation, which only a `testing` build provides.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
      */
     fun nodeStartInMemory(identityDid: String? = null): String
@@ -47,7 +48,8 @@ interface ServerBindings {
      * Starts a full application node with file-backed storage.
      *
      * @param dataDir Directory for persistent storage.
-     * @param identityDid DID string of a pre-existing identity, or null to generate a fresh identity.
+     * @param identityDid DID string of a pre-existing identity. Passing null reloads the
+     *   identity the storage already holds, and creates one only on a `testing` build.
      * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
      * @return JSON-encoded node handle with `relayUrl`, `relayPort`, and `did` fields.
      */
@@ -186,7 +188,7 @@ internal data class NodeInfo(
  *
  * Implements [AutoCloseable] so it can be used with Kotlin's `use` extension:
  * ```kotlin
- * Relay.startInMemory().use { relay ->
+ * Relay.startInMemory(bridge).use { relay ->
  *     println(relay.relayUrl)
  * } // shutdown() called automatically
  * ```
@@ -267,7 +269,7 @@ class Relay internal constructor(
  *
  * Implements [AutoCloseable] so it can be used with Kotlin's `use` extension:
  * ```kotlin
- * Node.startInMemory().use { node ->
+ * Node.startInMemory(bridge).use { node ->
  *     println(node.relayUrl)
  *     println(node.did)
  * } // shutdown() called automatically
@@ -477,7 +479,8 @@ class Node internal constructor(
          * @param bridge The [ServerBridge] providing FFI access.
          * @param dataDir Directory for persistent storage.
          * @param identityDid DID string of a pre-existing identity. Passing null
-         *   reloads the identity the storage already holds; it never generates one.
+         *   reloads the identity the storage already holds, and creates one only on a
+         *   `testing` build.
          * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
          * @return A [Node] with [relayUrl] and [did] populated.
          */
@@ -564,7 +567,8 @@ class ServerBridge internal constructor(
      *
      * @param dataDir Directory for persistent storage.
      * @param identityDid DID string of a pre-existing identity. Passing null
-     *   reloads the identity the storage already holds; it never generates one.
+     *   reloads the identity the storage already holds, and creates one only on a
+     *   `testing` build.
      * @param passphrase Passphrase for Argon2id key derivation. Required when identityDid is null.
      * @return A [Node] with [Node.relayUrl] and [Node.did] populated.
      */

@@ -70,13 +70,18 @@ scp-relay
 
 ### scp-node modes
 
-`scp-node` supports three modes (defined in `crates/scp-node/src/main.rs`):
+`scp-node` supports four modes (defined in `crates/scp-node/src/main.rs`):
 
 | Mode | Flag | Storage | Identity | HTTP | Use case |
 |------|------|---------|----------|------|----------|
-| **Full node** (default) | none | SQLite (SQLCipher) | Persistent DID | `.well-known/scp` + dev API | Production deployment |
-| **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay` |
-| **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` + dev API | Test harness only. A shipped build exits 1: the mode needs in-memory DHT and custody, which compile only under the `testing` feature. |
+| **Full node** (default) | none | SQLite (SQLCipher) | Generated per start, not persisted | `.well-known/scp` | On a shipped build this exits 1: creating an identity needs a pre-rotation custody backend only a `testing` build has. |
+| **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay`. The one mode that starts on a shipped build without an existing identity. |
+| **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` | Test harness only. A shipped build exits 1: the mode needs in-memory DHT and custody, which compile only under the `testing` feature. |
+| **Self-host** | `--self-host` | SQLite (SQLCipher) | Persistent DID | Static site + `.well-known/scp` | Hosts a static site on SCP. Opens an inbound port and, unless `SCP_NODE_DHT_MODE=disabled`, publishes the host's IP to the DHT. |
+
+No binary mode enables the dev API. `NodeConfig::defaults` leaves `local_api: None`,
+and neither `main.rs` nor `self_host.rs` sets it, so the endpoints in the dev-API
+section below are reachable only from a library caller that sets the field.
 
 ```bash
 # Full node (production)
@@ -146,6 +151,10 @@ OPTIONS:
     --relay-only            Run as a bare relay server (no identity, no HTTP)
     --ephemeral             Use in-memory storage for all subsystems (no persistence).
                             A test-harness mode: a shipped build exits 1 on it.
+    --self-host             Host a static site on SCP (no DNS name required).
+                            Opens an inbound port and publishes the host's IP to
+                            the DHT unless SCP_NODE_DHT_MODE=disabled.
+    --site-dir <PATH>       Directory of static files to serve under --self-host
     --storage-path <PATH>   SQLite database directory
     --health                TCP health probe (exit 0/1)
     --help, -h              Show help
@@ -287,16 +296,22 @@ there is nothing stored to reload.
 
 ```bash
 # Self-signed TLS; the node still publishes its DID so peers can find it.
-# `--ephemeral` is omitted: a shipped build exits 1 on it, so this node persists
-# its identity and storage to disk.
+# `--ephemeral` is omitted because a shipped build exits 1 on it. Storage persists
+# to disk; the identity does not, because the full-node path passes
+# `IdentitySource::Generate`, which `Node::start` maps to `persist = false`.
 SCP_NODE_DOMAIN=localhost \
 SCP_NODE_TLS_SELF_SIGNED=1 \
 scp-node
 ```
 
 A full relay node has no non-publishing DHT mode, because a relay whose DID
-never reaches the DHT cannot be discovered. Run `scp-node --self-host` when you
-want a node that publishes nothing.
+never reaches the DHT cannot be discovered.
+
+`--self-host` does NOT publish nothing by default. `parse_dht_mode_or_exit`
+defaults `SCP_NODE_DHT_MODE` to `production`, so a bare `scp-node --self-host`
+publishes the host's public IP bound to its DID to the global Mainline DHT, and
+the binary prints a banner saying so. Set `SCP_NODE_DHT_MODE=disabled` to get a
+node that publishes nothing.
 
 ### Programmatic usage (Rust SDK)
 

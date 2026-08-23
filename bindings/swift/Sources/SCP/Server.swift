@@ -188,7 +188,8 @@ public struct Node: Sendable {
     ///   - scp: The SDK-level ``SCP`` instance that will own the minted handle.
     ///   - dataDir: Directory for persistent storage.
     ///   - identity: A pre-existing ``Identity``. Passing `nil` reloads the
-    ///     identity the storage already holds; it never generates one.
+    ///     identity the storage already holds, and creates one only on a `testing`
+    ///     build.
     ///   - passphrase: Passphrase for Argon2id key derivation. Required when
     ///     `identity` is `nil`.
     /// - Returns: A ``Node`` with ``relayUrl`` and ``did`` populated.
