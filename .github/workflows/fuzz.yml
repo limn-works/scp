@@ -257,11 +257,24 @@ jobs:
           path: fuzz/artifacts/fuzz_mls_decrypt/
           retention-days: 90
 
-  # ── Weekly deep-fuzz: Tier 1 targets, 2 hours each, with UBSan ────────────
+  # ── Weekly deep-fuzz: Tier 1 targets, 2 hours each ────────────────────────
   # Runs at 00:00 UTC every Saturday, or on workflow_dispatch. Only Tier 1
   # targets (highest trust-boundary exposure). Longer time budget surfaces
-  # deeper code paths. AddressSanitizer is cargo-fuzz default; UBSan is added
-  # via RUSTFLAGS to catch undefined behavior in dependency C code.
+  # deeper code paths. AddressSanitizer is cargo-fuzz's default and is what
+  # these jobs run.
+  #
+  # THIS JOB USED TO SET `RUSTFLAGS: -Zsanitizer=address,undefined`, AND THAT
+  # VALUE HAS NEVER BEEN LEGAL. rustc offers no `undefined` sanitizer; run
+  # 32634187570 recorded the compiler's own list —
+  #   error: incorrect value `address,undefined` for unstable option `sanitizer`
+  #   - comma separated list of sanitizers: `address`, `cfi`, `dataflow`,
+  #     `hwaddress`, `kcfi`, `kernel-address`, `kernel-hwaddress`, `leak`,
+  #     `memory`, `memtag`, `safestack`, `shadow-call-stack`, `thread`, or
+  #     'realtime' was expected
+  # — and every one of the six matrix jobs died at `cargo fuzz`'s first rustc
+  # invocation, before the fuzzer started. No deep-fuzz campaign has ever run.
+  # The line's comment also named rmp-serde and OpenMLS as the C code it would
+  # instrument, and both are pure Rust.
   fuzz-weekly:
     name: Deep Fuzz / ${{ matrix.target }}
     needs: toolchain
@@ -316,14 +329,12 @@ jobs:
           key: corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: corpus-${{ matrix.target }}-
 
-      - name: Run deep fuzzer (2 hours, ASan + UBSan)
-        # cargo-fuzz enables AddressSanitizer by default. UBSan is layered on top
-        # via RUSTFLAGS. Combined sanitizers catch both memory safety and undefined
-        # behavior in dependency C code (rmp-serde, OpenMLS, aws-lc-sys).
-        # If UBSan produces spurious errors from dependency C code, fall back to
-        # ASan alone by removing the RUSTFLAGS line.
-        env:
-          RUSTFLAGS: "-Zsanitizer=address,undefined"
+      - name: Run deep fuzzer (2 hours, AddressSanitizer)
+        # cargo-fuzz enables AddressSanitizer and its own coverage instrumentation
+        # through RUSTFLAGS it assembles itself. This step sets no RUSTFLAGS: a
+        # value set here is appended to cargo-fuzz's, and the value this step used
+        # to set named a sanitizer rustc does not have. The comment above the job
+        # records what the compiler reported.
         run: |
           cargo +${{ needs.toolchain.outputs.channel }} fuzz run ${{ matrix.target }} \
             --fuzz-dir fuzz \

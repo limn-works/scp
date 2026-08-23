@@ -3584,7 +3584,14 @@ For parser and deserializer targets (T1/T2), the fuzzer receives a raw `&[u8]` s
 
 **CI cadence:**
 - **Nightly** (`.github/workflows/fuzz.yml`, 03:00 UTC): T1 targets 15 min each, T2 targets 5 min each. All targets parallel. Corpus cached per-target with `actions/cache`; `cargo fuzz cmin` runs after each campaign.
-- **Weekly deep-fuzz** (Saturday 00:00 UTC or `workflow_dispatch`): T1 targets only, 2 hours each, AddressSanitizer enabled (cargo-fuzz default) + UBSan on Saturdays.
+- **Weekly deep-fuzz** (Saturday 00:00 UTC or `workflow_dispatch`): T1 targets only, 2 hours each,
+  AddressSanitizer enabled (cargo-fuzz default). This entry read "+ UBSan on Saturdays" until
+  2026-08-23, and the job it described set `RUSTFLAGS="-Zsanitizer=address,undefined"` and died at
+  cargo-fuzz's first rustc invocation on every run: rustc accepts no `undefined` sanitizer, and its
+  error names the values it does accept (`address`, `cfi`, `dataflow`, `hwaddress`, `kcfi`,
+  `kernel-address`, `kernel-hwaddress`, `leak`, `memory`, `memtag`, `safestack`,
+  `shadow-call-stack`, `thread`, `realtime`). Run 32634187570 recorded it. No deep-fuzz campaign
+  had ever run, so the weekly lane now runs the same AddressSanitizer over the longer budget.
 - **Per-PR compilation check** (`cargo check` on the fuzz crate): catches API breakage without running the fuzzer. Runs in `.github/workflows/ci.yml` as `fuzz-build`. `fuzz/rust-toolchain.toml` names the nightly the crate compiles on and records the condition for unpinning it; no command and no workflow repeats that channel.
 
 ### Rationale
@@ -3684,7 +3691,7 @@ fuzz/                        # Standalone cargo-fuzz crate (not workspace member
 1. `cd fuzz && cargo fuzz list` lists all 27 targets.
 2. `cd fuzz && cargo check` succeeds on a CI runner whose default toolchain is stable, because rustup applies the toolchain file of the directory a command runs in and `fuzz/rust-toolchain.toml` names the nightly.
 3. Fuzz crate is NOT listed in root `Cargo.toml` `[workspace] members`.
-4. `.github/workflows/fuzz.yml` runs T1 targets (15 min) and T2 targets (5 min) nightly; T1 targets with UBSan weekly.
+4. `.github/workflows/fuzz.yml` runs T1 targets (15 min) and T2 targets (5 min) nightly, and T1 targets for 2 hours each weekly, both under AddressSanitizer.
 5. `.github/workflows/ci.yml` includes a `fuzz-build` job that compiles the fuzz crate on the channel `fuzz/rust-toolchain.toml` names, and the job repeats that channel nowhere.
 6. Security invariants I1–I10 are documented in `fuzz/README.md` with current coverage status.
 7. `fuzz/.claude/CLAUDE.md` exists with agent-facing conventions: standalone crate caution, nightly requirement, raw-bytes-vs-Arbitrary guidance, dictionary format, invariant catalog.

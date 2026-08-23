@@ -1227,7 +1227,7 @@ Test:
   • Fuzzing (parser safety + security invariants): 19 libFuzzer targets covering all
     three trust boundaries (B1 relay wire, B2 post-MLS content, B3 resolution/discovery);
     security invariants I1–I10 catalogued in fuzz/README.md; nightly CI runs T1 (15 min)
-    and T2 (5 min) targets; weekly Saturday deep-fuzz runs T1 with UBSan (2 h each);
+    and T2 (5 min) targets; weekly Saturday deep-fuzz runs T1 under ASan (2 h each);
     per-PR fuzz-build check catches compilation breakage without running the fuzzer.
     See ADR-045 and fuzz/README.md.
 ```

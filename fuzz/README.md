@@ -368,18 +368,25 @@ Crash artifacts are under **Actions** → the workflow run → **Artifacts** →
 
 | Mode | Sanitizers | When | Notes |
 |------|-----------|------|-------|
-| Default | AddressSanitizer | Every run (nightly + local) | Cargo-fuzz enables ASan automatically. Catches buffer overflows in dependency `unsafe` (rmp-serde, OpenMLS, aws-lc-sys). |
-| Weekly | ASan + UBSan | Saturday deep-fuzz | Catches undefined behavior in dependency C code. |
+| Default | AddressSanitizer | Every run (nightly, weekly, and local) | Cargo-fuzz enables ASan automatically. Catches buffer overflows in dependency `unsafe` (rmp-serde, OpenMLS, aws-lc-sys). |
+| Not available | UBSan | Never | rustc has no `undefined` sanitizer — see below. |
 | Not used | MSan | Never | Requires full instrumented recompilation of aws-lc-sys C — impractical. |
 | Future | TSan | Stateful targets | For concurrency bugs in `NonceTracker`/`BudgetTracker`. Not yet implemented. |
 
-To run with UBSan locally (nightly only):
+**rustc offers no UndefinedBehaviorSanitizer, so no run here has ever used one.** The weekly
+deep-fuzz job set `RUSTFLAGS="-Zsanitizer=address,undefined"` from the day it was written,
+and every invocation died before the fuzzer started. Run 32634187570 recorded the compiler's
+own list of accepted values:
 
-```sh
-RUSTFLAGS="-Zsanitizer=undefined" \
-  cargo fuzz run fuzz_outer_envelope \
-  -- -dict=dicts/msgpack_outer_envelope.dict -max_total_time=300 -max_len=1048576
+```
+error: incorrect value `address,undefined` for unstable option `sanitizer` - comma separated
+list of sanitizers: `address`, `cfi`, `dataflow`, `hwaddress`, `kcfi`, `kernel-address`,
+`kernel-hwaddress`, `leak`, `memory`, `memtag`, `safestack`, `shadow-call-stack`, `thread`,
+or 'realtime' was expected
 ```
 
-Note: combining `address` and `undefined` sanitizers (`-Zsanitizer=address,undefined`) may not work
-cleanly with all dependency C code. If you see spurious sanitizer errors, fall back to ASan alone.
+`undefined` is not on that list and never has been. The weekly job now runs the same
+AddressSanitizer the nightly job runs, over a two-hour budget instead of fifteen minutes.
+Do not add a `RUSTFLAGS` line to a `cargo fuzz` command: cargo-fuzz assembles its own
+RUSTFLAGS and appends yours, so a value it does not expect reaches rustc alongside the
+instrumentation flags the fuzzer needs.
