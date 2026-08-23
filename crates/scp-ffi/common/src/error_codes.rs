@@ -276,9 +276,11 @@ pub const IDENT_1058: &str = "SCP-IDENT-1058";
 
 /// No production pre-rotation custody backend is available (FAIL CLOSED).
 ///
-/// Surfaced by all native bridges (`PyO3`, napi-rs, `UniFFI`) and `scp-node`
-/// when a production identity-creation path is invoked on a shipped (no-`testing`)
-/// build. Every identity commits a pre-rotation commitment at creation (spec
+/// Surfaced by all three native bridges (`PyO3`, napi-rs, `UniFFI`) on their
+/// identity-creation paths when invoked on a shipped (no-`testing`) build. NOT
+/// surfaced by `scp-node`, which does not depend on this crate: its node-start
+/// paths return the typed `IdentityError::NoPreRotationBackend` with no code
+/// string, and the FFI server surface maps that to "node startup failed". Every identity commits a pre-rotation commitment at creation (spec
 /// §9.7.4.1 §3 — mandatory), which requires a `PreRotationCustody` backend; the
 /// only implementation that exists today is the in-memory test nullifier
 /// (`InMemoryPreRotationCustody`), now gated to the test harness only (ADR-062

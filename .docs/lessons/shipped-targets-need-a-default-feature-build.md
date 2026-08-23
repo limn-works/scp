@@ -45,12 +45,19 @@ The table below has thirteen rows. Row 2 records an overclaim rather than a bypa
 twelve are bypasses, found across seven of the eight rounds. They do not share one root,
 and no single change closed them.
 
-Ten are closed: rows 1, 3, 4a, 4c, 5, 6a, 6b, 7a, and 7b by the five mechanisms listed
-above, and row 6c by reading with `while IFS= read -r` instead of word-splitting.
+Eleven are closed: rows 1, 3, 4a, 4c, 5, 6a, 6b, 7a, and 7b by the five mechanisms
+listed above, row 6c by reading with `while IFS= read -r` instead of word-splitting,
+and row 8 by the lib failing to compile under the injected cfg.
 
-Two are not closed, and are not meant to be: row 4b (any nullifier other than
-`DhtMode::Memory`) and row 8 (a `build.rs` injecting a cfg). Both need write access to
-the crate under test, which is the stated residual limit.
+Row 4b (any nullifier other than `DhtMode::Memory`) is open and is meant to be: cargo
+gives an example its crate's dev-dependencies and no invocation switches that off.
+
+Row 8 (a `build.rs` injecting a cfg) is not demonstrated. Two attempts to reproduce it
+made the gate exit 1, because the injected cfg desynchronizes the lib from its dependency
+features and the lib itself stops compiling. It stays in the table as an untested
+hypothesis rather than a measured bypass. The residual limit does not rest on it: a writer
+of the crate under test controls what its targets compile against, which is the criterion,
+and `build.rs` is one instance of that access rather than the reason for it.
 
 Counting these was itself a source of error. Five earlier drafts of this paragraph
 asserted a total, described a table column, or claimed a coverage that the table three
@@ -118,7 +125,8 @@ Reintroducing `DhtMode::Memory` settled it:
 | `cargo clippy -p scp-node --examples -- -D warnings` | exit 101, `E0599` | **exit 0** | exit 0 |
 | `bash scripts/check-examples-build-shipped.sh` | exit 1, `E0599` | exit 1, names the target | exit 0 |
 
-A fourth defect belongs in the same table and was found later: renaming
+The table carries two defect columns and one control column, so the case below is
+the third defect, not a fourth. It was found later: renaming
 `crates/scp-node/README.md` makes `cargo package --list` exit 101, and an earlier
 version of the check discarded that exit code, so scp-node dropped out in silence —
 7 examples checked instead of 8, with `website.rs` never linted. The check now

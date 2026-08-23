@@ -15,6 +15,13 @@ cargo run -p scp-node --example website
 
 Then open the printed URL in a browser.
 
+**On a machine with no existing SCP identity this exits 1 instead.** `host_site`
+asks for `IdentitySource::Persisted`, and creating a new identity needs a
+`PreRotationCustody` backend whose only implementation is the test harness, so a
+shipped build fails closed rather than mint a nullifier-backed identity. The
+example's own doc comment quotes the exact error. Once an identity exists under
+`$XDG_DATA_HOME/scp/node`, the example loads it and serves the site.
+
 ### What this example does
 
 It hosts the small site under [`website-site/`](./website-site/) (an
@@ -41,7 +48,12 @@ If you don't need to embed hosting in your own program, the `scp-node` binary
 hosts a site directly:
 
 ```sh
-scp-node --self-host --site-dir ./my-site
+SCP_NODE_DHT_MODE=disabled scp-node --self-host --site-dir ./my-site
 ```
+
+`--self-host` on its own defaults to publishing: `SCP_NODE_DHT_MODE` defaults to
+`production`, which puts the host's public IP, bound to its DID, on the global
+Mainline DHT. Set it to `disabled` for a site that publishes nothing. This path
+shares the first-run limit above.
 
 [`scp_node::host_site`]: https://docs.rs/scp-node

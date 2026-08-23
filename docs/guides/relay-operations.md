@@ -7,7 +7,7 @@ SCP relays are untrusted dumb pipes that store and forward opaque, encrypted blo
 SCP provides two relay deployment options:
 
 1. **`scp-relay`** -- A standalone relay binary. Accepts WebSocket connections, stores blobs, and forwards them to subscribers. No identity, no HTTP server, no DID document.
-2. **`scp-node`** -- A full application node that composes a relay, a DID identity, HTTP endpoints (`.well-known/scp`, dev API, broadcast projection), and TLS provisioning into a single deployable unit.
+2. **`scp-node`** -- A full application node that composes a relay, a DID identity, HTTP endpoints (`.well-known/scp`, broadcast projection), and TLS provisioning into a single deployable unit. The dev API is a library-only surface; no binary mode enables it.
 
 Both binaries are configured via environment variables and CLI flags. Both share the same `RelayServer` core (defined in `crates/scp-transport/src/native/server.rs`).
 
@@ -77,14 +77,15 @@ scp-relay
 | **Full node** (default) | none | SQLite (SQLCipher) | Generated per start, not persisted | `.well-known/scp` | On a shipped build this exits 1: creating an identity needs a pre-rotation custody backend only a `testing` build has. |
 | **Relay-only** | `--relay-only` | Configurable | None | None | Equivalent to `scp-relay`. The one mode that starts on a shipped build without an existing identity. |
 | **Ephemeral** | `--ephemeral` | All in-memory | Ephemeral DID | `.well-known/scp` | Test harness only. A shipped build exits 1: the mode needs in-memory DHT and custody, which compile only under the `testing` feature. |
-| **Self-host** | `--self-host` | SQLite (SQLCipher) | Persistent DID | Static site + `.well-known/scp` | Hosts a static site on SCP. Opens an inbound port and, unless `SCP_NODE_DHT_MODE=disabled`, publishes the host's IP to the DHT. |
+| **Self-host** | `--self-host` | SQLite (SQLCipher) | Persistent DID | Static site + `.well-known/scp` | Hosts a static site on SCP. Opens an inbound port and, unless `SCP_NODE_DHT_MODE=disabled`, publishes the host's IP to the DHT. On a shipped build the first run exits 1, for the same reason as the full node; it starts once storage holds an identity. |
 
 No binary mode enables the dev API. `NodeConfig::defaults` leaves `local_api: None`,
 and neither `main.rs` nor `self_host.rs` sets it, so the endpoints in the dev-API
 section below are reachable only from a library caller that sets the field.
 
 ```bash
-# Full node (production)
+# Full node (production) — on a shipped build this exits 1: creating an
+# identity needs a pre-rotation custody backend only a `testing` build has.
 SCP_NODE_DOMAIN=relay.example.com scp-node
 
 # Relay-only mode
@@ -133,12 +134,18 @@ These only apply to `scp-node` (not `scp-relay`):
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `SCP_NODE_DOMAIN` | (required) | Domain for full node mode |
+| `SCP_NODE_DOMAIN` | (required for the full node) | Domain for full node mode. Not read by `--relay-only` or `--self-host`. |
 | `SCP_NODE_BIND_ADDR` | `0.0.0.0:9000` | HTTP server bind address |
 | `SCP_NODE_TLS_SELF_SIGNED` | `false` | Use self-signed TLS (development only) |
 | `SCP_NODE_PROJECTION_RATE_LIMIT` | `60` | Per-IP rate limit for projection endpoints |
 | `SCP_NODE_DHT_MODE` | `production` | DHT client mode. `production` publishes the node's DID so peers can discover it. `disabled` turns the DHT layer off and is honoured only by `--self-host`; a full relay node rejects it and exits. |
 | `SCP_NODE_DHT_GATEWAYS` | (none) | Comma-separated DHT HTTP gateway URLs |
+| `SCP_NODE_SELF_HOST` | `0` | Enable self-host mode (equivalent to `--self-host`) |
+| `SCP_NODE_SITE_DIR` | (none) | Directory of static files to serve under self-host |
+| `SCP_NODE_SELF_HOST_PORT` | `8443` | Port the hosted site listens on |
+| `SCP_NODE_SELF_HOST_PLAINTEXT` | `0` | Serve plain HTTP instead of self-signed HTTPS |
+| `SCP_NODE_SELF_HOST_NO_NAT` | `0` | Skip the NAT/UPnP probe |
+| `SCP_NODE_SELF_HOST_REFRESH_SECS` | `1800` | Seconds between self-host site re-deploys, to beat the blob TTL |
 | `SCP_STORAGE_PATH` | `$XDG_DATA_HOME/scp/node` | SQLite database directory |
 | `SCP_STORAGE_KEY` | (auto-generated) | Hex-encoded 32-byte SQLCipher encryption key |
 
@@ -247,8 +254,8 @@ kill -TERM $(pidof scp-relay)
 The full node (`scp-node` without `--relay-only`) starts an `ApplicationNode` (defined in `crates/scp-node/src/lib.rs`) that composes:
 
 - A relay server (internal, on a random port with bridge secret auth)
-- A DID identity (persistent across restarts via SQLite)
-- An HTTP server serving `.well-known/scp`, WebSocket upgrade, dev API, and broadcast projection
+- A DID identity, generated per start and NOT persisted: the full-node path passes `IdentitySource::Generate`, which `Node::start` maps to `persist = false`
+- An HTTP server serving `.well-known/scp`, WebSocket upgrade, and broadcast projection (the dev API stays off: `NodeConfig::defaults` leaves `local_api: None` and no binary mode sets it)
 - Automatic TLS provisioning via ACME (or self-signed for development)
 
 ### Production deployment
