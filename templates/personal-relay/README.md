@@ -161,14 +161,42 @@ WantedBy=multi-user.target
 
 ### Docker
 
-`Dockerfile` in this directory builds the relay. Run it from the repository root, because
-`scp-personal-relay` declares its own `[workspace]` — so `cargo build -p scp-personal-relay`
-finds no such package at the root — and its manifest names six `crates/*` path dependencies,
-which a build context rooted here cannot reach. Building the manifest by path from a root
-context satisfies both, and the Dockerfile does that:
+**This template does not currently compile against the workspace.**
+`src/main.rs` imports `scp_node::ApplicationNodeBuilder`, which the ADR-052 node-construction
+refactor deleted in favour of `Node::start(NodeConfig { .. })`, so `cargo build` stops at that
+import. Issue #2384, the non-workspace crates that no longer compile, tracks the port. The
+Docker recipe below is correct once that lands, and its Rust version is already governed by
+`scripts/check-toolchain-pin.sh`.
+
+Save the block as `templates/personal-relay/Dockerfile`, then build from the repository root:
 
 ```sh
 docker build -f templates/personal-relay/Dockerfile -t scp-personal-relay .
+```
+
+The root context is not optional. `scp-personal-relay` declares its own `[workspace]`, so
+`cargo build -p scp-personal-relay` finds no such package at the root; and its manifest names
+six `crates/*` path dependencies, which a context rooted at this directory cannot reach.
+Building the manifest by path from a root context satisfies both.
+
+Keep the Rust version equal to `channel` in `rust-toolchain.toml`, and keep the builder stage
+and the runtime stage on the same Debian release: glibc is backward compatible only, so a
+binary linked against a newer release's glibc cannot exec on an older one.
+
+```dockerfile
+FROM rust:1.98.0-bookworm AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release --manifest-path templates/personal-relay/Cargo.toml
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/templates/personal-relay/target/release/scp-personal-relay /usr/local/bin/
+EXPOSE 443
+VOLUME /data
+ENV SCP_RELAY_STORAGE_PATH=/data
+HEALTHCHECK CMD ["/usr/local/bin/scp-personal-relay", "--health"]
+ENTRYPOINT ["/usr/local/bin/scp-personal-relay"]
 ```
 
 ```bash

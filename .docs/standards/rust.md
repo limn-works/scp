@@ -20,7 +20,7 @@ the table above, and it is the only list — a second list in prose goes stale, 
 this pin's own first draft came to name four locations while the gate read seven. The gate
 fails when those locations disagree, when the compiler a command in the repository resolves
 to is not the pinned one, when a container build's `FROM` lines are not the exact set it
-permits, and when a file carrying a `FROM rust` line is missing from its list. Changing a
+permits, and when a file carrying a line-initial `FROM` is missing from its list. Changing a
 container's compiler or Debian release means editing that permitted set in the gate in the
 same commit.
 

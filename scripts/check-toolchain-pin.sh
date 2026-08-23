@@ -16,7 +16,7 @@
 # Stable version — every one of these compiles the workspace:
 #   1. `rust-toolchain.toml`      channel                   — what plain `cargo` resolves to
 #   2. `.mise.toml`               rust version              — what a mise shell resolves to
-#   3. the `FROM` lines of `Dockerfile` and of `templates/personal-relay/Dockerfile` —
+#   3. the `FROM` lines of `Dockerfile` and of `templates/personal-relay/README.md` —
 #      the two container builds of this workspace's crates — each of which must equal
 #      a permitted set written in this gate, so the compiler and the Debian release
 #      both change deliberately
@@ -94,7 +94,7 @@ require mise_version ".mise.toml [tools] rust version" \
 # which predates the `as_chunks` this workspace now calls.
 DOCKERFILES=(
     "Dockerfile"
-    "templates/personal-relay/Dockerfile"
+    "templates/personal-relay/README.md"
 )
 for f in "${DOCKERFILES[@]}"; do
     [[ -f $f ]] || report "container build: $f does not exist"
@@ -108,7 +108,7 @@ NOT_CONTAINER_BUILDS=()
 # The loop above asserts that every listed file exists. On its own that leaves the list
 # open in the other direction: a Dockerfile added anywhere in the repository tomorrow
 # selects a compiler for this workspace's crates and passes unseen, which is exactly how
-# `templates/personal-relay/Dockerfile` shipped naming Rust 1.85. Comparing the two sets
+# `templates/personal-relay/README.md` shipped naming Rust 1.85. Comparing the two sets
 # makes a new container build fail this gate the day it lands rather than the morning the
 # pin moves.
 #
@@ -229,7 +229,7 @@ FROM chef AS builder
 FROM debian:bookworm-slim AS runtime
 EOF
             ;;
-        templates/personal-relay/Dockerfile)
+        templates/personal-relay/README.md)
             cat <<EOF
 FROM rust:@PIN@-bookworm AS builder
 FROM debian:bookworm-slim
