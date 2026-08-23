@@ -16,7 +16,7 @@
 # Stable version — every one of these compiles the workspace:
 #   1. `rust-toolchain.toml`      channel                   — what plain `cargo` resolves to
 #   2. `.mise.toml`               rust version              — what a mise shell resolves to
-#   3. the `FROM` lines of `Dockerfile` and of `templates/personal-relay/README.md` —
+#   3. the `FROM` lines of `Dockerfile` and of `templates/personal-relay/Dockerfile` —
 #      the two container builds of this workspace's crates — each of which must equal
 #      a permitted set written in this gate, so the compiler and the Debian release
 #      both change deliberately
@@ -94,18 +94,30 @@ require mise_version ".mise.toml [tools] rust version" \
 # which predates the `as_chunks` this workspace now calls.
 DOCKERFILES=(
     "Dockerfile"
-    "templates/personal-relay/README.md"
+    "templates/personal-relay/Dockerfile"
 )
 for f in "${DOCKERFILES[@]}"; do
     [[ -f $f ]] || report "container build: $f does not exist"
 done
 
+# Files that carry a line-initial `FROM` and are not container builds of this workspace.
+# Listing them keeps the comparison below an equality rather than a subset, so a new
+# container build cannot hide among them.
+NOT_CONTAINER_BUILDS=()
+
 # The loop above asserts that every listed file exists. On its own that leaves the list
 # open in the other direction: a Dockerfile added anywhere in the repository tomorrow
 # selects a compiler for this workspace's crates and passes unseen, which is exactly how
-# `templates/personal-relay/README.md` shipped naming Rust 1.85. Requiring the two sets to
-# be equal closes both directions, so a new container build fails this gate the day it
-# lands rather than the morning the pin moves.
+# `templates/personal-relay/Dockerfile` shipped naming Rust 1.85. Comparing the two sets
+# makes a new container build fail this gate the day it lands rather than the morning the
+# pin moves.
+#
+# WHAT THIS SEARCH DOES NOT COVER, stated rather than implied: it matches a line-initial,
+# uppercase `FROM`, which is how every container file in this repository writes it and how
+# Docker's own documentation writes it. Docker also accepts a lowercase `from` and leading
+# whitespace, so a new container file written that way would not be discovered here. The
+# byte-exact comparison below has no such gap — it rejects every spelling that is not a
+# permitted line — but it only runs on files this search finds.
 # `--untracked` matters: a container build added but not yet committed is exactly the case
 # a pre-commit or pre-push run has to catch, and plain `git grep` searches only the index.
 # Match `rust` with or without a tag, indented or not, in either case, so a file the
@@ -113,15 +125,23 @@ done
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     report "not inside a git working tree, so the gate cannot search for unlisted container builds"
 else
-    # This file is excluded because `expected_from_lines` above necessarily contains the
-    # permitted `FROM rust:` lines verbatim; it declares them rather than building on them.
-    discovered=$(git grep -l --untracked -iE '^[[:space:]]*FROM[[:space:]]+([^[:space:]]+[[:space:]]+)*rust[:[:space:]]' \
+    # Match a line-initial `FROM` and let the declared list below decide which of those
+    # files is a container build, rather than pattern-matching the image name — a name
+    # admits `rustlang/rust`, `docker.io/library/rust`, a bare `rust`, and a line
+    # continuation, each of which defeated an earlier version of this search.
+    #
+    # This file is excluded because `expected_from_lines` below necessarily contains the
+    # permitted `FROM` lines verbatim; it declares them rather than building on them.
+    discovered=$(git grep -l --untracked -E '^FROM[[:space:]]' \
         -- . ':!scripts/check-toolchain-pin.sh' | sort)
-    listed=$(printf '%s\n' "${DOCKERFILES[@]}" | sort)
+    # bash 3.2 — the version macOS ships — treats an empty array expansion as an unbound
+    # variable under `set -u`, so expand the second list only when it has members.
+    listed=$(printf '%s\n' "${DOCKERFILES[@]}" \
+        ${NOT_CONTAINER_BUILDS[@]+"${NOT_CONTAINER_BUILDS[@]}"} | sed '/^$/d' | sort)
     if [[ $discovered != "$listed" ]]; then
         unlisted=$(comm -23 <(printf '%s\n' "$discovered") <(printf '%s\n' "$listed") | tr '\n' ' ')
         [[ -z ${unlisted// /} ]] ||
-            report "these files carry a 'FROM rust' line and DOCKERFILES does not name them: $unlisted"
+            report "these files carry a line-initial 'FROM' and neither DOCKERFILES nor NOT_CONTAINER_BUILDS names them: $unlisted"
     fi
 fi
 
@@ -181,7 +201,8 @@ fi
 #
 # So each container file declares the exact set of `FROM` lines it may contain, with the
 # pinned version substituted for @PIN@. The gate compares that set against the file, in
-# both directions. Every spelling above fails, because none of them is a listed line, and
+# both directions; `expected_from_lines` below holds those declarations. Every spelling
+# above fails, because none of them is a listed line, and
 # the fix for a legitimate change is to update the expected set here — which is what makes
 # changing a container's compiler or Debian release a deliberate act rather than a silent
 # one.
@@ -208,7 +229,7 @@ FROM chef AS builder
 FROM debian:bookworm-slim AS runtime
 EOF
             ;;
-        templates/personal-relay/README.md)
+        templates/personal-relay/Dockerfile)
             cat <<EOF
 FROM rust:@PIN@-bookworm AS builder
 FROM debian:bookworm-slim

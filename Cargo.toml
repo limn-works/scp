@@ -127,9 +127,9 @@ large_stack_arrays = "allow"
 #
 #  - An inherent impl. `clippy::unused_async` reports the same function, so allowing
 #    the second name drops no detection. It does not follow that every such function
-#    carries an individual justification: 84 lines in the tree mention
-#    `clippy::unused_async`, and three of them are `#![allow(..)]` inner attributes
-#    that cover a whole file or module rather than one function.
+#    carries an individual justification: three of the allows naming
+#    `clippy::unused_async` are `#![allow(..)]` inner attributes covering a whole file or
+#    module rather than one function.
 #  - A trait impl. `clippy::unused_async` skips these deliberately. The trait declares
 #    the method as future-returning, so the impl can only re-spell
 #    `async fn f(..) -> T` as `fn f(..) -> impl Future<Output = T> + Send

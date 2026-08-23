@@ -57,29 +57,38 @@ Three more name the nightly that the standalone fuzz crate needs:
 `.github/workflows/fuzz.yml` and in `.github/workflows/ci.yml`.
 
 `scripts/check-toolchain-pin.sh` holds the authoritative list and requires exact equality.
-Keep no second list: counting the locations in prose produced three artifacts that disagreed
-with the gate and with each other, and one whole commit repairing them. The gate also checks
-three properties that version agreement leaves open: that `rustc --version` in the repository
-equals the pin, that each container build's `FROM` lines equal a set the gate permits, and
-that no file carrying a `FROM rust` line is missing from its list.
+It reads a fixed list of locations and extracts one version string from each, so it admits
+nothing it was not told to check. Keep no second list: counting the locations in prose
+produced three artifacts that disagreed with the gate and with each other, and one whole
+commit repairing them. A comment asking several files to agree is not enforcement, and this
+repository's own tenet is to enforce mechanically.
 
-The container check is a whitelist rather than a parser, and arriving there took three
-rounds of the wrong shape. Each round validated Docker's `FROM` syntax by pattern, and each
-round a reviewer found one more legal spelling the pattern mishandled: an indented keyword,
-a lowercase one, an untagged `FROM rust`, a registry-qualified image, a second stage whose
-tag named no Debian release. Docker's grammar admits many spellings of one image, so
-enumerating them does not terminate. Enumerating the permitted lines does: each container
-file declares the exact `FROM` lines it may contain, every other spelling differs from them
-and fails, and a legitimate change to a container's compiler or Debian release means editing
-that declaration in the same commit. CLAUDE.md asks for this shape directly — a positive
-whitelist closed by construction, never a denylist chasing one more spelling — and the
-review-pass count was the signal that the earlier shape was wrong. The second one exists because the first draft of this fix broke it —
-`rust:1.85-slim` is a Debian 12 image and `rust:1.98.0-slim` is a Debian 13 one, so bumping
-the version alone moved the builder to glibc 2.41 while the runtime stayed on 2.36, and
-glibc is backward compatible only. The gate reads a fixed list of locations and extracts one version string
-from each, so it admits nothing it was not told to check; it never scans for
-version-shaped strings. A comment asking several files to agree is not enforcement, and the repository's
-own tenet is to enforce mechanically.
+The gate checks three further properties that version agreement leaves open. First, that
+`rustc --version` in the repository equals the pin, because a `RUSTUP_TOOLCHAIN` in the
+environment beats every file. Second, that each container build's `FROM` lines equal a set
+the gate permits — which exists because the first draft of this fix broke exactly that:
+`rust:1.85-slim` is a Debian 12 image and `rust:1.98.0-slim` is a Debian 13 one, so raising
+the version alone moved the builder to glibc 2.41 while the runtime stage stayed on glibc
+2.36, and glibc is backward compatible only, so those binaries could not have run. Third,
+that no file carrying a line-initial `FROM` is missing from the gate's list.
+
+## Why the container check is a whitelist and not a parser
+
+Reaching that shape took three rounds of the wrong one. Each round validated Docker's `FROM`
+syntax by pattern, and each round a reviewer named one more legal spelling the pattern
+mishandled: an indented keyword, a lowercase one, an untagged `FROM rust`, a
+registry-qualified image, a second stage whose tag named no Debian release. Docker's grammar
+admits many spellings of one image, so enumerating the spellings does not terminate.
+Enumerating the permitted lines does. Each container file now declares the exact `FROM` lines
+it may contain; every other spelling differs from those lines and fails; and a legitimate
+change to a container's compiler or Debian release means editing that declaration in the same
+commit, which is what makes the change deliberate.
+
+CLAUDE.md asks for this shape directly — a positive whitelist closed by construction, never a
+denylist chasing one more spelling — and it names the review-pass count as the signal that an
+approach is the wrong one. Six rounds on one script was well past that signal. The lesson is
+not that the reviewers found bugs; it is that the third round finding a fourth spelling was
+already enough evidence to change the approach instead of adding a fifth pattern.
 
 `.github/workflows/fuzz.yml` now names the nightly on every `cargo` command. Those steps
 run with the repository root as the working directory, where the root pin applies, and an
