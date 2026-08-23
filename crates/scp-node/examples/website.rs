@@ -17,8 +17,8 @@
 //! implementation is the test-harness `InMemoryPreRotationCustody`, so a shipped
 //! build fails closed here instead of minting a nullifier-backed identity. The
 //! trailing tag is part of the message the program prints, quoted verbatim.
-//! Reloading a stored identity carries no gate, but no shipped create API mints
-//! one, so `$XDG_DATA_HOME/scp/node` never comes to hold one. A `testing`
+//! Reloading a stored identity carries no gate, but the node's own identity
+//! paths never mint one, so `$XDG_DATA_HOME/scp/node` never comes to hold one. A `testing`
 //! build creates and persists one, and then serves the site.
 //!
 //! This is a safe LOCAL demo: it uses `TlsMode::Plaintext` (plain HTTP),

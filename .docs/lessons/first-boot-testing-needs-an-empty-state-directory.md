@@ -3,7 +3,11 @@
 **Date:** 2026-08-22
 **Source:** branch `fix/rustls-webpki-advisories` — a run of
 `crates/scp-node/examples/website.rs` appeared to refute a reviewer's finding, and
-had reused an identity an earlier run persisted.
+had reused an identity a `--features testing` run persisted. Measured both halves:
+`cargo run -p scp-node --features testing --example website` writes
+`$XDG_DATA_HOME/scp/node/{scp.db,.key,custody/,mls/}` and serves the site; the same
+command on default features exits 1 and writes no identity. Only the `testing` build
+can have produced the state the passing run found.
 
 ## The Rule
 

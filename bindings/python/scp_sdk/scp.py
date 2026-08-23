@@ -3103,8 +3103,9 @@ class SCP:
         build refuses: the in-memory key custody, storage, and DHT client it
         needs compile only under the ``testing`` feature (ADR-062 Decision 1/6).
         The refusal arrives as ``RuntimeError`` carrying "auto-generated
-        in-memory node identity is unavailable in this build". Pass an explicit
-        ``identity_did`` on a production path.
+        in-memory node identity is unavailable in this build". A production caller
+        cannot get one from a create call either, because this SDK's create calls
+        fail closed the same way.
         """
         from scp_sdk.server import Node
 
@@ -3119,16 +3120,18 @@ class SCP:
         Passing ``identity_did=None`` reloads a persistent identity and requires
         ``passphrase``. The identity record lives under the storage key
         ``scp/identity`` in ``<data_dir>/storage/``; ``<data_dir>/identity.key``
-        holds only the custody key material, so copying it alone is not enough. CREATING one on a
-        every run needs a pre-rotation custody backend that only a ``testing``
-        build has, so a shipped build raises ``RuntimeError`` carrying
+        holds only the custody key material, so copying it alone is not enough.
+        CREATING one, on every run, needs a pre-rotation custody backend that only
+        a ``testing`` build has, so a shipped build raises ``RuntimeError`` carrying
         the message "node startup failed" rather than mint a nullifier-backed
         identity. No error code reaches the caller on this path.
-        This build fails on EVERY run, not only the first: no shipped create
-        API mints an identity, so nothing can put one in ``data_dir`` and the
-        reload branch never fires. Passing ``identity_did`` does not help either,
-        because that resolves through the identity registry, which only the
-        ``identity_create*`` calls populate and those fail closed too.
+        This build fails on EVERY run, not only the first: none of this SDK's
+        create calls mints an identity, so nothing it offers puts one in
+        ``data_dir`` and the reload branch never fires. Passing ``identity_did``
+        does not help either. Every writer to the identity registry — create,
+        migrate, rotate, add-agent, remove-agent — either fails closed on a
+        shipped build before it writes, or needs an entry already present, so the
+        registry never fills.
         """
         from scp_sdk.server import Node
 

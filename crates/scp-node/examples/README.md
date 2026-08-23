@@ -20,7 +20,7 @@ Then open the printed URL in a browser.
 `PreRotationCustody` backend whose only implementation is the test harness, so a
 shipped build fails closed rather than mint a nullifier-backed identity. The
 example's own doc comment quotes the exact error. Reloading a stored identity
-carries no gate, but no shipped create API mints one, so
+carries no gate, but the node's own identity paths never mint one, so
 `$XDG_DATA_HOME/scp/node` never comes to hold one. Build with `--features
 testing` to run the example end to end.
 

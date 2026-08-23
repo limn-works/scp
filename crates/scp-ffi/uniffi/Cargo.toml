@@ -109,6 +109,15 @@ tempfile = "3"
 # to walk the bridge source without substring matching (PR #1690 retro).
 syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 
+# `lifecycle` calls `Scp::new_in_memory_for_test`, the same `testing`-only symbol
+# the two stanzas below name. Without this it is auto-discovered and fails to
+# compile on a default-features `--all-targets` build. CI's test lane passes
+# `scp-ffi-uniffi/testing`, so the test still runs there.
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle.rs"
+required-features = ["testing"]
+
 [[test]]
 name = "e2e_bridge"
 path = "tests/e2e_bridge.rs"

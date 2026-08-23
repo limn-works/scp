@@ -70,10 +70,20 @@ pub struct Node;
 ///   with the same storage it reloads the same DID.
 /// - [`Explicit`](IdentitySource::Explicit) — use a pre-existing identity and
 ///   DID document supplied by the caller.
+///
+/// **On a build without the `testing` feature, `Generate` and `Persisted` both
+/// fail closed on every start** with `IdentityError::NoPreRotationBackend`:
+/// creating an identity commits a pre-rotation commitment (spec §9.7.4.1 §3),
+/// and this workspace's only `PreRotationCustody` implementation is the test
+/// harness (ADR-062 §Decision 6). `Persisted` never reaches its reload branch,
+/// because nothing the node does puts an identity in storage to reload.
+/// `Explicit` is the only variant a shipped node starts from, and the caller
+/// supplies the identity from outside.
 pub enum IdentitySource<K: KeyCustody, D: DidMethod> {
     /// Generate a new identity using the provided key custody and DID method.
     ///
     /// The identity is **not** persisted; a fresh DID is created on every start.
+    /// Without the `testing` feature this fails closed instead — see the enum doc.
     Generate {
         /// Key custody backend that holds the node's signing keys.
         custody: Arc<K>,
@@ -84,11 +94,14 @@ pub enum IdentitySource<K: KeyCustody, D: DidMethod> {
     /// [`NodeConfig::storage`] slot.
     ///
     /// First start: generate via `did_method.create(custody)` and persist.
-    /// Subsequent starts with the same storage: reload the same DID.
+    /// Subsequent starts with the same storage: reload the same DID. Without the
+    /// `testing` feature the generate half fails closed, so the reload half never
+    /// has anything to reload — see the enum doc.
     Persisted {
         /// Key custody backend that holds the node's signing keys.
         custody: Arc<K>,
-        /// DID method used to create (and on first run, publish) the identity.
+        /// DID method used to create (and, when creation succeeds, publish) the
+        /// identity.
         did_method: Arc<D>,
     },
     /// Use a pre-existing identity and document (boxed to avoid a large variant

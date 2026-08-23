@@ -146,8 +146,9 @@ public struct Node: Sendable {
     /// Passing `nil` for `identity` requests auto-generation, which is available
     /// ONLY in a `testing` build (in-memory key custody, in-memory storage, and
     /// the in-memory DHT client). A shipped build fails closed rather than run a
-    /// node backed by an in-memory DHT nullifier, so a production caller passes
-    /// an identity. Self-signed TLS; relay on an OS-assigned port.
+    /// node backed by an in-memory DHT nullifier. A production caller cannot get
+    /// one from a create call either, because this SDK's create calls fail closed
+    /// the same way. Self-signed TLS; relay on an OS-assigned port.
     ///
     /// The failure arrives as `ScpError.Validation` with code
     /// `SCP-VALID-7004` and the message "auto-generated in-memory node identity
@@ -178,11 +179,12 @@ public struct Node: Sendable {
     /// The failure arrives as `ScpError.Identity` with code `SCP-TRANS-5051` and
     /// the message "node identity operation failed".
     ///
-    /// This build fails on EVERY run, not only the first: no shipped create API
-    /// mints an identity, so nothing can put one in `dataDir` and the reload branch
-    /// never fires. Passing `identity` does not help either, because that resolves
-    /// through the identity registry, which only the identity-create calls populate
-    /// and those fail closed too.
+    /// This build fails on EVERY run, not only the first: none of this SDK's create
+    /// calls mints an identity, so nothing it offers puts one in `dataDir` and the
+    /// reload branch never fires. Passing `identity` does not help either. Every
+    /// writer to the identity registry — create, migrate, rotate, add-agent,
+    /// remove-agent — either fails closed on a shipped build before it writes, or
+    /// needs an entry already present, so the registry never fills.
     ///
     /// No passphrase is required when `identity` is provided.
     ///
