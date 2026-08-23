@@ -69,16 +69,27 @@ jobs:
               # reads it, and the next branch to rebase would find the check red.
               - '.clippy.toml'
               - 'rustfmt.toml'
-              # `scripts/check-toolchain-wiring.sh` fails when any of the five
-              # entries above is absent.
+              # `scripts/check-toolchain-wiring.sh` fails when any of the five entries
+              # above is absent, and fails the same way when any of the six language
+              # filters below omits `rust-toolchain.toml`. That gate's header states the
+              # criterion for what its list holds.
             python:
               - 'bindings/python/**'
               - 'crates/scp-ffi/src/**'
               - 'crates/scp-ffi/common/**'
+              # `python-test` runs `maturin develop --release`, which compiles this
+              # workspace's crates on the compiler `rust-toolchain.toml` names. No entry
+              # above matches a pull request that raises the pin and changes nothing else,
+              # so without this entry that pull request skips this job, and the `ci`
+              # aggregator counts the skip as a pass. The same reasoning puts the pin in
+              # the five filters below.
+              - 'rust-toolchain.toml'
             typescript:
               - 'bindings/typescript/**'
               - 'crates/scp-ffi/napi/**'
               - 'crates/scp-ffi/common/**'
+              # `typescript-check` runs `cargo build -p scp-ffi-napi --release`.
+              - 'rust-toolchain.toml'
             typescript-wasm:
               # The full path-dep closure of scp-client-wasm (verified via
               # `cargo tree -p scp-client-wasm -e no-dev`) — a change to any of
@@ -95,20 +106,31 @@ jobs:
               - 'crates/scp-protocol/**'
               - 'crates/scp-event-log/**'
               - 'crates/scp-relay-client/**'
+              # `typescript-wasm-check` runs `wasm-pack build` from the repository
+              # root, which resolves the pin and compiles `scp-client-wasm` on it.
+              - 'rust-toolchain.toml'
             scaffold-typescript-web:
               # The browser scaffold builds against the local @limn-works/scp-ts-wasm
               # package (file: link), so a change to the scaffold OR to that package's
               # surface can break its typecheck / bundle — both must trigger this job.
               - 'scaffolds/typescript-web/**'
               - 'bindings/typescript-wasm/**'
+              # `scaffold-typescript-web-check` builds `bindings/typescript-wasm`
+              # first, which runs that same `wasm-pack build`.
+              - 'rust-toolchain.toml'
             kotlin:
               - 'bindings/kotlin/**'
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
+              # `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing`.
+              - 'rust-toolchain.toml'
             swift:
               - 'bindings/swift/**'
               - 'crates/scp-ffi/uniffi/**'
               - 'crates/scp-ffi/common/**'
+              # `swift-build-test` runs `bindings/swift/build-xcframework.sh --dev`,
+              # which runs `cargo build`.
+              - 'rust-toolchain.toml'
             fuzz:
               - 'fuzz/**'
               - 'crates/scp-protocol/**'

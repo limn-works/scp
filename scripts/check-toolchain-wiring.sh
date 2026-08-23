@@ -41,14 +41,24 @@
 # ── CHECK 2: the CI paths filters route a change to the jobs that build from it ──────
 #
 # THE CRITERION for what belongs in REQUIRED_FILTER_ENTRIES: a path whose omission from
-# its filter no ordinary pull request reveals. Every Rust job in `.github/workflows/ci.yml`
-# is guarded by `if: needs.changes.outputs.rust == 'true'`, and the `ci` job that
-# aggregates every other job's result fails only on 'failure' or 'cancelled', so a skipped
-# job reports success to branch protection. Dropping `crates/**` from the `rust` filter
-# skips the Rust lane on nearly every pull request, and someone notices within a day.
-# Dropping `rust-toolchain.toml` skips it only on the rare pull request that raises the
-# pin — the one that most needs the lane to run — and nobody notices. The gate covers the
-# second class.
+# its filter no ordinary pull request reveals. Each job in `.github/workflows/ci.yml` that
+# compiles a crate of this workspace is guarded by
+# `if: needs.changes.outputs.<filter> == 'true'`, and the `ci` job that aggregates every
+# other job's result fails only on 'failure' or 'cancelled', so a skipped job reports
+# success to branch protection. Dropping `crates/**` from the `rust` filter skips the Rust
+# lane on nearly every pull request, and someone notices within a day. Dropping
+# `rust-toolchain.toml` skips a lane only on the rare pull request that raises the pin —
+# the one that most needs the lane to run — and nobody notices. The gate covers the second
+# class.
+#
+# Seven filters guard a job that compiles this workspace's crates, not one. `rust` guards
+# clippy, the test lane, the build, cargo-deny, and the image build. `python` guards
+# `maturin develop`, `typescript` guards `cargo build -p scp-ffi-napi`, `typescript-wasm`
+# and `scaffold-typescript-web` guard `wasm-pack build`, `kotlin` guards
+# `cargo build -p scp-ffi-uniffi`, and `swift` guards `build-xcframework.sh`. Every one of
+# those seven compiles on the pinned compiler, so every one has to list the pin. The eighth
+# filter, `fuzz`, guards a job that runs `cargo check` from `fuzz/`, where rustup resolves
+# `fuzz/rust-toolchain.toml` instead, and `fuzz/**` already covers that file.
 #
 # It therefore does NOT establish that the filters are correct, and an `OK` is not that
 # claim: a `rust` filter stripped of `crates/**` passes this gate. Do not grow the list
@@ -120,6 +130,20 @@ REQUIRED_FILTER_ENTRIES=(
     # the first and `rust-fmt` the second, and this filter guards both jobs.
     "rust .clippy.toml"
     "rust rustfmt.toml"
+    # The same pull request that raises the pin, reaching the six other lanes that
+    # compile this workspace's crates. `python-test` runs `maturin develop --release`,
+    # `typescript-check` runs `cargo build -p scp-ffi-napi --release`,
+    # `typescript-wasm-check` and `scaffold-typescript-web-check` run `wasm-pack build`
+    # from the repository root, `kotlin-test` runs `cargo build -p scp-ffi-uniffi`, and
+    # `swift-build-test` runs `bindings/swift/build-xcframework.sh --dev`. rustup applies
+    # the pin to each of those commands, so a pin the filter does not route reaches a
+    # compile that nothing checked.
+    "python rust-toolchain.toml"
+    "typescript rust-toolchain.toml"
+    "typescript-wasm rust-toolchain.toml"
+    "scaffold-typescript-web rust-toolchain.toml"
+    "kotlin rust-toolchain.toml"
+    "swift rust-toolchain.toml"
     # A pull request that raises the fuzz nightly, which lives under `fuzz/`.
     "fuzz fuzz/**"
 )

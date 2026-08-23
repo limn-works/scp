@@ -50,10 +50,26 @@ that image: the base tag names a Debian release and no compiler, so the copy is 
 the version, and a container build that omits it compiles on whatever the image ships.
 Second, that the `dorny/paths-filter` entries in `.github/workflows/ci.yml` route a change
 to `rust-toolchain.toml`, to the container build, or to `fuzz/rust-toolchain.toml` to the
-jobs that build from it. Every Rust job is guarded by
-`if: needs.changes.outputs.rust == 'true'`, and the `ci` job that aggregates every other
-job's result counts a skipped job as a pass, so a filter that omits the pin would let a
-version bump merge without one command compiling on the new compiler.
+jobs that build from it. Each job that compiles a crate of this workspace is guarded by
+`if: needs.changes.outputs.<filter> == 'true'`, and the `ci` job that aggregates every
+other job's result counts a skipped job as a pass, so a filter that omits the pin would let
+a version bump merge without one command compiling on the new compiler.
+
+Seven filters guard such a job, so all seven list `rust-toolchain.toml`:
+
+| Filter | The jobs it guards whose behaviour the pin decides |
+|--------|----------------------------------------------------|
+| `rust` | `rust-fmt`, `rust-clippy`, `rust-test`, `rust-test-napi-production`, `rust-build-pyo3-production`, `rust-build-uniffi-production`, `rust-doc`, `rust-deny`, and `docker-image` |
+| `python` | `python-test` runs `maturin develop --release` |
+| `typescript` | `typescript-check` runs `cargo build -p scp-ffi-napi --release` |
+| `typescript-wasm` | `typescript-wasm-check` runs `wasm-pack build` from the repository root |
+| `scaffold-typescript-web` | `scaffold-typescript-web-check` builds `bindings/typescript-wasm`, which runs that same `wasm-pack build` |
+| `kotlin` | `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing` |
+| `swift` | `swift-build-test` runs `bindings/swift/build-xcframework.sh --dev`, which calls `cargo build` |
+
+The `fuzz` filter is the exception, and it needs no entry: `fuzz-build` runs `cargo check`
+with `working-directory: fuzz`, where rustup resolves `fuzz/rust-toolchain.toml`, and
+`fuzz/**` already covers that file.
 
 The `Dockerfile` base tag selects a Debian release, so keep the builder stage and the
 runtime stage on the same one. The builder reads `rust:slim-bookworm` and the runtime reads

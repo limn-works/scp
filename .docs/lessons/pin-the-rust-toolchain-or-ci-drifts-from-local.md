@@ -152,13 +152,13 @@ Routing is one of two properties the derivation cannot supply, because no file s
 which CI jobs a change has to reach. `scripts/check-toolchain-wiring.sh` asserts that
 membership, and `scripts/tests/toolchain-wiring/run-tests.sh` proves the assertion fires.
 The list it checks holds one line per filter and entry: the `rust` filter must list
-`rust-toolchain.toml`, `Dockerfile`, and `.dockerignore`, and the `fuzz` filter must list
-`fuzz/**`, which covers `fuzz/rust-toolchain.toml`.
+`rust-toolchain.toml`, `Dockerfile`, `.dockerignore`, `.clippy.toml`, and `rustfmt.toml`,
+and the `fuzz` filter must list `fuzz/**`, which covers `fuzz/rust-toolchain.toml`.
 
 That list needed a criterion, and writing one changed what belongs on it. The `rust` filter
 also lists `crates/**` and `Cargo.toml`, and dropping either produces the identical
-failure — the guarded jobs skip and the aggregator passes. The four declared entries share
-a property those two do not: **their omission is invisible on an ordinary pull request.**
+failure — the guarded jobs skip and the aggregator passes. The declared entries share a
+property those two do not: **their omission is invisible on an ordinary pull request.**
 Dropping `crates/**` skips the Rust lane on nearly every pull request and someone notices
 within a day; dropping `rust-toolchain.toml` skips it only on the rare pull request that
 raises the pin — the one that most needs the lane — and nobody notices. The gate covers the
@@ -168,6 +168,40 @@ are correct.
 A gate that runs only when a paths filter selects it enforces nothing for a file the filter
 omits. Adding a file that decides how CI builds means adding that file to the filter that
 runs the jobs it decides for, in the same commit.
+
+## The Rust Lane Is Not the Only Lane That Compiles Rust
+
+Six other filters guard a job that compiles a crate of this workspace, and writing the
+criterion in terms of the `rust` filter hid all six.
+`python-test` runs `maturin develop --release`.
+`typescript-check` runs `cargo build -p scp-ffi-napi --release`.
+`typescript-wasm-check` and `scaffold-typescript-web-check` run `wasm-pack build` from the
+repository root. `kotlin-test` runs `cargo build -p scp-ffi-uniffi --features testing`.
+`swift-build-test` runs `bindings/swift/build-xcframework.sh --dev`, which calls
+`cargo build`. Each of those jobs installs `dtolnay/rust-toolchain@stable` and then runs
+cargo inside the repository, so rustup applies `rust-toolchain.toml` as a directory
+override and each one compiles on the pin.
+
+Listing the pin in the `rust` filter alone therefore reproduced the defect in six more
+filters. A pull request that edits only `channel` runs clippy, the test lane, the builds,
+cargo-deny, and the image build on the new compiler, while `Python / test`,
+`TypeScript / check + lint + test`, the two wasm jobs, `Kotlin / test`, and
+`Swift / build + test` all skip, and the `ci` aggregator counts each skip as a pass. Should the new compiler break the
+pyo3 cdylib link, the UniFFI bindgen run, or the wasm-pack build, the first branch to see
+it is the next one that touches `bindings/python`, and that branch changed no compiler.
+
+All seven filters now list `rust-toolchain.toml`, and `REQUIRED_FILTER_ENTRIES` in the gate
+holds a pair for each, so a filter that drops the entry fails the gate by name.
+`scripts/tests/toolchain-wiring/run-tests.sh` runs one case per pair. `fuzz` is the one
+filter that lists no pin: `fuzz-build` runs `cargo check` with `working-directory: fuzz`,
+where rustup resolves `fuzz/rust-toolchain.toml` instead, and `fuzz/**` already covers that
+file.
+
+The rule the `rust`-only version obscured: **route a file to every filter that guards a job
+whose behaviour the file decides, not to the filter whose name matches the file.**
+`rust-toolchain.toml` sits at the repository root and names a Rust version, which makes the
+`rust` filter the obvious single destination, but the compiler that file selects reaches
+every job that runs cargo.
 
 ## Deleting a Check Because Its Reason Changed Is Not the Same as Deleting It Because Its Target Vanished
 

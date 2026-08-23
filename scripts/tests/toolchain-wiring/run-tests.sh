@@ -8,14 +8,17 @@
 #     what makes the build compare the compiler it resolved against the pin, so a
 #     container that compiles on the base image's own compiler fails its own build.
 #   * Check 2 fails when a `dorny/paths-filter` filter in `ci.yml` omits a declared
-#     entry, and stays silent when every declared entry is present. Every Rust job is
-#     guarded by such a filter, and the `ci` job that aggregates every other job's result
-#     counts a skipped job as a pass, so an omitted entry lets a change merge unbuilt.
+#     entry, and stays silent when every declared entry is present. Each job that compiles
+#     a crate of this workspace is guarded by such a filter — seven filters guard one, not
+#     only `rust` — and the `ci` job that aggregates every other job's result counts a
+#     skipped job as a pass, so an omitted entry lets a change merge unbuilt. One case per
+#     declared pair asserts the gate names that filter and that entry.
 #
 # HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, copies the gate into
-# `scripts/`, runs `git init` so the gate's `git grep` search has a work tree, and writes
-# the case's `ci.yml` and optional `Dockerfile` from heredocs. The gate `cd`s to its own
-# parent's parent, so that directory becomes its repository root.
+# `scripts/`, runs `git init` so the gate's `git grep` search has a work tree, writes the
+# case's `ci.yml` from the `emit_ci` generator below, and writes its optional `Dockerfile`
+# from a heredoc. The gate `cd`s to its own parent's parent, so that directory becomes its
+# repository root.
 #
 # Exit 0 when every case matches its expectation, 1 otherwise.
 
@@ -36,34 +39,84 @@ trap 'rm -rf "$TMP_PARENT"' EXIT
 passed=0
 failed=0
 
-# A ci.yml whose two filters carry every declared entry. Cases that are not about check 2
-# use it so their only finding can come from check 1.
-routing_ok() {
+# ── The canned ci.yml ────────────────────────────────────────────────────────────────
+#
+# One generator produces every `ci.yml` the check-2 cases use, so a case differs from the
+# passing one by exactly the omission it names. `OMIT` selects that omission: empty omits
+# nothing, "<filter> <entry>" drops one path entry from one filter, and "<filter> *" drops
+# the filter and its header. `run_case` calls its producer with no arguments, so the
+# selection travels in this variable, and every case below sets it.
+#
+# Each entry list carries every pair `REQUIRED_FILTER_ENTRIES` declares for that filter,
+# plus at least one entry the gate does not require, so dropping a required entry leaves
+# the filter holding entries and the gate reports the omission rather than the empty
+# filter. A pair added to the gate and not to the loop below still fails against the real
+# `ci.yml` in CI; adding it below is what proves the gate reports that pair by name.
+OMIT=""
+
+# emit_filter <name> <entry>...
+#
+# Writes one filter block. Each block opens with a comment line and a blank line, and the
+# entries alternate the two quote styles YAML accepts, so every case reads the gate's
+# extractor against all three shapes its `sed` parses.
+emit_filter() {
+    local name=$1
+    shift
+    [[ "$name *" == "$OMIT" ]] && return 0
+    printf '            %s:\n' "$name"
+    printf '              # A comment inside a filter block, which the extractor skips.\n'
+    printf '\n'
+    local entry quote index=0
+    for entry in "$@"; do
+        [[ "$name $entry" == "$OMIT" ]] && continue
+        if (( index % 2 == 0 )); then quote="'"; else quote='"'; fi
+        printf '              - %s%s%s\n' "$quote" "$entry" "$quote"
+        index=$((index + 1))
+    done
+}
+
+emit_ci() {
     cat <<'YAML'
 name: CI
 jobs:
   changes:
     runs-on: ubuntu-latest
+    # The real workflow names every filter here too, with a value on the same line. The
+    # extractor must start no block on these lines, so every case carries them.
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      python: ${{ steps.filter.outputs.python }}
+      typescript: ${{ steps.filter.outputs.typescript }}
+      typescript-wasm: ${{ steps.filter.outputs.typescript-wasm }}
+      scaffold-typescript-web: ${{ steps.filter.outputs.scaffold-typescript-web }}
+      kotlin: ${{ steps.filter.outputs.kotlin }}
+      swift: ${{ steps.filter.outputs.swift }}
       fuzz: ${{ steps.filter.outputs.fuzz }}
     steps:
       - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
-            rust:
-              - 'crates/**'
-              # A comment inside a filter block, which the extractor skips.
-              - 'rust-toolchain.toml'
-              - "Dockerfile"
-
-              - '.dockerignore'
-              - '.clippy.toml'
-              - 'rustfmt.toml'
-            fuzz:
-              - 'fuzz/**'
 YAML
+    emit_filter rust 'crates/**' 'rust-toolchain.toml' 'Dockerfile' '.dockerignore' \
+        '.clippy.toml' 'rustfmt.toml'
+    emit_filter python 'bindings/python/**' 'rust-toolchain.toml'
+    emit_filter typescript 'bindings/typescript/**' 'rust-toolchain.toml'
+    emit_filter typescript-wasm 'bindings/typescript-wasm/**' 'rust-toolchain.toml'
+    emit_filter scaffold-typescript-web 'scaffolds/typescript-web/**' 'rust-toolchain.toml'
+    emit_filter kotlin 'bindings/kotlin/**' 'rust-toolchain.toml'
+    emit_filter swift 'bindings/swift/**' 'rust-toolchain.toml'
+    emit_filter fuzz 'crates/scp-protocol/**' 'fuzz/**'
+}
+
+# A ci.yml whose filters carry every declared entry. Cases that are not about check 2 use
+# it so their only finding can come from check 1.
+routing_ok() {
+    # A prefix assignment on a function call persists in the caller in some bash
+    # versions and not others, so assign on its own line and leave no doubt about
+    # which cases run against the complete filter set.
+    OMIT=""
+    emit_ci
 }
 
 # run_case <name> <expected exit> <required substring|""> <ci.yml producer> [dockerfile producer]
@@ -112,103 +165,36 @@ run_case() {
 
 run_case "filters-list-every-entry" 0 "" routing_ok
 
-ci_rust_filter_omits_pin() {
-    cat <<'YAML'
-name: CI
-jobs:
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      fuzz: ${{ steps.filter.outputs.fuzz }}
-    steps:
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            rust:
-              - 'crates/**'
-              - 'Dockerfile'
-              - '.dockerignore'
-            fuzz:
-              - 'fuzz/**'
-YAML
-}
-run_case "rust-filter-omits-the-pin" 1 \
-    "the 'rust' paths filter does not list rust-toolchain.toml" ci_rust_filter_omits_pin
+# One case per pair the gate declares, so dropping a pair from the gate fails a case here
+# rather than passing silently. `emit_ci` leaves out exactly the named entry, and the case
+# asserts the gate names that filter and that entry in its message.
+for pair in \
+    "rust rust-toolchain.toml" \
+    "rust Dockerfile" \
+    "rust .dockerignore" \
+    "rust .clippy.toml" \
+    "rust rustfmt.toml" \
+    "python rust-toolchain.toml" \
+    "typescript rust-toolchain.toml" \
+    "typescript-wasm rust-toolchain.toml" \
+    "scaffold-typescript-web rust-toolchain.toml" \
+    "kotlin rust-toolchain.toml" \
+    "swift rust-toolchain.toml" \
+    "fuzz fuzz/**"; do
+    filter_name=${pair%% *}
+    omitted_entry=${pair#* }
+    OMIT="$pair"
+    run_case "${filter_name}-filter-omits-${omitted_entry//\//-}" 1 \
+        "the '$filter_name' paths filter does not list $omitted_entry" emit_ci
+done
 
-ci_rust_filter_omits_dockerfile() {
-    cat <<'YAML'
-name: CI
-jobs:
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      fuzz: ${{ steps.filter.outputs.fuzz }}
-    steps:
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            rust:
-              - 'crates/**'
-              - 'rust-toolchain.toml'
-              - '.dockerignore'
-            fuzz:
-              - 'fuzz/**'
-YAML
-}
-run_case "rust-filter-omits-the-container-build" 1 \
-    "the 'rust' paths filter does not list Dockerfile" ci_rust_filter_omits_dockerfile
-
-ci_no_rust_filter() {
-    cat <<'YAML'
-name: CI
-jobs:
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      fuzz: ${{ steps.filter.outputs.fuzz }}
-    steps:
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            fuzz:
-              - 'fuzz/**'
-YAML
-}
+# A filter the workflow declares nowhere, which the gate reports as a filter carrying no
+# path entries rather than passing over.
+OMIT="rust *"
 run_case "rust-filter-absent-entirely" 1 \
-    "declares no 'rust:' paths filter with path entries" ci_no_rust_filter
+    "declares no 'rust:' paths filter with path entries" emit_ci
 
-ci_fuzz_filter_omits_crate() {
-    cat <<'YAML'
-name: CI
-jobs:
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      fuzz: ${{ steps.filter.outputs.fuzz }}
-    steps:
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            rust:
-              - 'crates/**'
-              - 'rust-toolchain.toml'
-              - 'Dockerfile'
-              - '.dockerignore'
-              - '.clippy.toml'
-              - 'rustfmt.toml'
-            fuzz:
-              - 'fuzz/fuzz_targets/**'
-YAML
-}
-run_case "fuzz-filter-omits-the-crate" 1 \
-    "the 'fuzz' paths filter does not list fuzz/**" ci_fuzz_filter_omits_crate
+OMIT=""
 
 # ── Check 1: every container build asserts the compiler it resolved ──────────────────
 #
