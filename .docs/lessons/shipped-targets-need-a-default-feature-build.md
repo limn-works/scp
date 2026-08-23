@@ -8,23 +8,24 @@ gate written to reject it accepted it.
 ## The Rule
 
 A build target that ships to a user MUST be compiled by a job that gates the pull
-request, on the feature set that ships. `cargo package --list -p scp-node` lists
-`examples/website.rs`, so a broken example ships to crates.io.
+request. `cargo package --list -p scp-node` lists `examples/website.rs`, so a broken
+example ships to crates.io.
 
-Lint examples **one package at a time**. `cargo clippy --workspace --examples` does not
-enforce that property, and it does not merely under-enforce it — it turns the excluded
-feature on. `--examples` selects dev units, and a workspace-wide selection then unifies
-dev-dependency features across every member. In this workspace `crates/scp-ffi`
-dev-depends on `scp-ffi-common` with `features = ["testing"]`, that crate's `testing`
-list carries `scp-node?/testing`, the weak edge fires, and every example in the workspace
-compiles with `scp-node/testing` ON.
+`scripts/check-examples-build-shipped.sh` carries three mechanisms, and deleting any one
+of them reopens a bypass this repository has already measured:
 
-Source the file list from `cargo package --list`, not from `cargo metadata` example
-targets. The two sets differ in both directions: `autoexamples = false` removes a target
-while the file still ships, and `required-features` removes a target from a filter while
-the file still ships. `scripts/check-examples-build-shipped.sh` reads the published file
-set, fails when a published `examples/NAME.rs` has no matching target, and loops per
-package. Do not collapse the loop back into `--workspace`.
+1. **Lint one package at a time.** `cargo clippy --workspace --examples` unifies
+   dev-dependency features across every member — `crates/scp-ffi` dev-depends on
+   `scp-ffi-common` with `features = ["testing"]`, whose `testing` list carries
+   `scp-node?/testing` — so every example compiles with `scp-node/testing` ON and the
+   check goes inert.
+2. **Iterate targets, not published files, when compiling.** `exclude = ["examples/*"]`
+   empties the published set while the target still exists, and a file-driven loop skips
+   the package in silence.
+3. **Join published file to target on `src_path`, never on target name.** A
+   `[[example]] path =` key can bind the name `website` to a decoy file while
+   `examples/website.rs` still ships with no target. A name join sees the name on both
+   sides and reports success for a file it never opened.
 
 ## Six rounds, nine bypasses, and what finally closed them
 
@@ -46,47 +47,9 @@ target `src_path`, and iterating targets rather than files.
 | 6b | `exclude = ["examples/*"]` | file-driven loop skipped the package |
 | 6c | filename containing a space | unquoted `for` word-split past both checks |
 
-6a is the instructive one: it kept the reported count at eight and printed
-`── scp-node::website` for a file it never opened. A check that reports success by
-name will report success for the wrong file.
-
-## Four rounds, six bypasses, and the reframe that ended it
-
-Each review round produced a different way past this gate. `CLAUDE.md` names the
-pattern: more than about three passes surfacing "a new spelling of the same bypass"
-means the approach is non-convergent, so stop and reframe.
-
-| Round | Bypass | Why it worked |
-|---|---|---|
-| 1 | `cargo clippy --workspace --examples` | A workspace-wide selection unifies dev-dependency features, so `scp-node/testing` was ON for every example. |
-| 2 | (scope overclaimed, not a bypass) | The comment promised a property two live feature leaks broke. |
-| 3 | `required-features = ["testing"]` on the example | Cargo skips a target whose required features are unmet, warns, and exits 0. |
-| 4a | `autoexamples = false` plus a stray `examples/*.rs` | The file still ships; no target exists; a target-sourced list cannot see it. |
-| 4b | Any nullifier other than `DhtMode::Memory` | Cargo gives an example its crate's dev-dependencies, which carry `scp-dht/testing` and `scp-platform/testing`. |
-| 4c | `required-features` as a standing exemption | The four `scp-runtime` examples compile on default features anyway; the declaration only hid them. |
-
-Rounds 1 through 3 were patched in the same shape each time, and each patch left the same shape in place, so the next round found another way past it. What ended it was changing where the check gets its truth.
-
-**The reframe: ask what SHIPS, not what cargo selects.** `cargo package --list`
-reports the files that reach crates.io. `cargo metadata` reports targets, and the
-two sets differ in both directions — `autoexamples = false` removes a target while
-the file still ships, and `required-features` removes a target from a filter while
-the file still ships. Sourcing from the published file set closes 4a and 4c at once
-and made the baseline ratchet that round 3 added unnecessary, so it was deleted.
-
-**4b could not be closed, so the claim was withdrawn instead.** An example is a dev
-target and cargo gives it the crate's dev-dependencies; no invocation switches that
-off. The check therefore proves that a published example compiles for a consumer,
-and proves nothing about which constructs it names. The script says so in the
-imperative, because the earlier version's comment claimed the stronger property and
-a reviewer had to measure it to find out otherwise.
-
-Two guards remain load-bearing and must not be simplified away:
-
-- **Per-package invocation.** Naming the package keeps dev-dependency unification
-  to that package. The workspace-wide form is inert.
-- **File-set sourcing.** A published `examples/NAME.rs` with no matching target is a
-  failure, because nothing compiles it in CI or for a consumer.
+6a kept the reported count at eight and printed `── scp-node::website` for a file it
+never opened. A check that joins on name reports success for whichever file the name
+currently points at.
 
 ## `required-features` hides an example from CI and does not stop it shipping
 
@@ -160,26 +123,17 @@ Run the widened invocation before adopting it.
 
 ## What the check does not cover
 
-Cargo builds an example as a dev target and gives it the crate's dev-dependencies. No
-invocation switches that off, so the check cannot keep a test-only construct out of an
-example, and it does not claim to.
+The script header states this in full; it is the text an editor of the gate reads.
+In short: cargo builds an example as a dev target and gives it the crate's
+dev-dependencies, and no invocation switches that off, so the check proves that
+every example target compiles in this workspace and proves neither that an example
+compiles for someone who installs the crate nor anything about which constructs it
+names. `DhtMode::Memory` was caught only because it sits behind `scp-node`'s OWN
+`testing` feature, which scp-node's dev-dependencies do not enable.
 
-**A dependency crate's `testing`, enabled by the linted crate's own dev-deps.**
-`crates/scp-node/Cargo.toml` dev-depends on `scp-platform` and `scp-dht` with
-`features = ["testing"]`, so an example naming `scp_platform::testing::InMemoryKeyCustody`
-or `scp_dht::InMemoryDhtClient` compiles and passes.
-
-**The same reach through a testing helper crate.** `scp-runtime` and `scp-transport`
-dev-depend on `scp-testing`, whose **normal** dependencies carry `scp-platform{testing}`
-and `scp-dht{testing}`. For `scp-runtime` that edge additionally resolves
-`scp-runtime/testing` ON, through `scp-testing`'s normal `scp-core{testing}` dependency.
-`scp-transport` has no `testing` feature of its own — an earlier draft of this file said
-it did, which a reviewer caught by reading the manifest.
-
-So the check proves that a published example compiles for someone who installs the crate.
-It proves nothing about which constructs that example names. `DhtMode::Memory` was caught
-only because it sits behind `scp-node`'s OWN `testing` feature, which scp-node's
-dev-dependencies do not enable.
+One correction worth keeping: `scp-transport` has no `testing` feature of its own.
+An earlier draft of this file said it did, and a reviewer caught it by reading the
+manifest.
 
 ## How to apply
 

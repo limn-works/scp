@@ -4,12 +4,12 @@
 #   1. Every example target in the workspace compiles, lint-clean.
 #   2. Every published `examples/*.rs` file IS the source of an example target.
 #
-# Assertion 2 joins on PATH, never on target name. A `[[example]] path = …` key
-# can bind the target name `website` to `examples/decoy/website.rs` while
-# `examples/website.rs` still ships with no target of its own; a name join sees
-# `website` on both sides, reports no orphan, compiles the decoy, and prints
-# `── scp-node::website` for a file it never opened. Measured: exit 0 with
-# `DhtMode::Memory` sitting in the published file.
+# Assertion 2 joins on PATH, never on target name. A `[[example]] path = …` key can
+# bind the target name `website` to `examples/decoy/website.rs` while
+# `examples/website.rs` still ships with no target of its own. A join on name then
+# matches `website` against `website` and finds no orphan. The check compiles the
+# decoy and prints `── scp-node::website` for a file it never opened. Measured: exit
+# 0 with `DhtMode::Memory` sitting in the published file.
 #
 # WHAT THIS PROVES AND THE WHOLE OF IT. Assertion 1 compiles each example under
 # the feature closure cargo gives a dev target, which is NOT the crate's default
@@ -27,7 +27,8 @@
 # installs the crate, and CANNOT prove that an example avoids a test-only
 # construct. Do not write a comment, a commit message, or a CI step description
 # claiming either. Four earlier versions of this header claimed one or the other,
-# and each time a reviewer had to measure to find out.
+# and each time a reviewer had to measure the rustc command line to establish that
+# the claim was false.
 #
 # WHAT IT DOES CATCH, measured:
 #   - `crates/scp-node/examples/website.rs` naming `DhtMode::Memory`, because

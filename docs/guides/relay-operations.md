@@ -300,6 +300,10 @@ use scp_node::{
 use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_transport::native::storage::BlobStorageBackend;
 
+// `load_node_identity`, `load_node_did_document`, `build_did_method`, and
+// `open_encrypted_storage` are yours to write; this shows the config shape and the
+// type annotations it needs, not a runnable program.
+//
 // A shipped build cannot CREATE an identity: that needs a `PreRotationCustody`
 // backend which only a `testing` build has, so `IdentitySource::Generate` and
 // `::Persisted` both fail closed with SCP-IDENT-1059 on a first run. Load the
