@@ -22,6 +22,43 @@ compiles with `scp-node/testing` ON.
 `scripts/check-examples-build-shipped.sh` derives the package list from `cargo metadata`
 and loops. Do not collapse the loop back into `--workspace`.
 
+## Three bypasses on one gate is the signal to reframe
+
+The gate took three review rounds, and each round produced a different way past it.
+`CLAUDE.md` names that pattern: more than about three passes surfacing "a new spelling
+of the same bypass" means the approach is non-convergent, so stop and reframe rather
+than patch again.
+
+| Round | Bypass | Why it worked |
+|---|---|---|
+| 1 | `cargo clippy --workspace --examples` | A workspace-wide selection unifies dev-dependency features, so `scp-node/testing` was ON for every example. |
+| 2 | (scope overclaimed, not a bypass) | The comment promised a property two live feature leaks broke. |
+| 3 | Add `required-features = ["testing"]` to the example | Cargo skips a target whose required features are unmet, warns, and exits 0. The loop read exit 0 as a pass. |
+
+Patching round 3 in the same shape — special-casing `required-features` — would have
+invited a fourth spelling. The reframe was to stop asking "does the loop pass?" and pin
+the answer instead: `scripts/examples-shipped-baseline.txt` records which example targets
+must build on default features, and the check fails when an entry leaves that set. A
+manifest edit that removes an example from the check now changes a checked-in file, which
+is the ratchet pattern this repository already uses for bridge symmetry and `OnceLock`
+counts.
+
+Two mechanics carry the property, and both are load-bearing:
+
+- **Name each target.** `cargo clippy -p P --examples` silently no-ops when every example
+  in `P` is feature-gated, and cargo's own "no targets matched" warning is not promoted by
+  `-D warnings`. Naming a target whose required features are unmet is a hard error.
+- **Ratchet the set.** Without the baseline, the count can fall to zero one manifest edit
+  at a time and every job stays green.
+
+## `required-features` hides an example from CI and does not stop it shipping
+
+`cargo package --list -p scp-runtime` lists all four of that crate's examples, and all
+four declare `required-features = ["testing"]`. So the declaration is a CI-visibility
+switch, not a shipping switch. Any rule that reads it as a statement about what ships is
+wrong. `crates/scp-runtime/examples/identity.rs` still ships while importing
+`scp_dht::InMemoryDhtClient` and printing "Published to DHT successfully."
+
 ## Measure a gate against the defect, never against the fixed tree
 
 The workspace-wide line was written, run against the **fixed** tree, observed green, and
@@ -30,10 +67,11 @@ reviewers independently read the resolved features and reported that the line wa
 
 Reintroducing `DhtMode::Memory` settled it:
 
-| Invocation | Bug present | Bug fixed |
-|---|---|---|
-| `cargo clippy --workspace --examples -- -D warnings` | **exit 0** | exit 0 |
-| `cargo clippy -p scp-node --examples -- -D warnings` | exit 101, `E0599` | exit 0 |
+| Invocation | `DhtMode::Memory` restored | `required-features` added | Clean tree |
+|---|---|---|---|
+| `cargo clippy --workspace --examples -- -D warnings` | **exit 0** | exit 0 | exit 0 |
+| `cargo clippy -p scp-node --examples -- -D warnings` | exit 101, `E0599` | **exit 0** | exit 0 |
+| `bash scripts/check-examples-build-shipped.sh` | exit 1, `E0599` | exit 1, names the target | exit 0 |
 
 Run a gate against the defect before committing it, and record both exit codes.
 

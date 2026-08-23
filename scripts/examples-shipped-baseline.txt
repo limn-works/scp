@@ -1,0 +1,18 @@
+# Example targets that MUST build, lint-clean, on their crate's default features.
+#
+# Every example ships inside its crate's published archive, so an example that
+# needs a test-only feature is a broken file in a released crate. This file is a
+# ratchet: scripts/check-examples-build-shipped.sh fails when an entry here is no
+# longer an ungated example target.
+#
+# An entry leaves the set when the example is deleted, renamed, or given
+# `required-features`. Declaring `required-features` removes an example from the
+# check but NOT from the published crate, so it is not a way to ship an example
+# that names a test-only construct. Removing a line here is a reviewed decision.
+#
+# Adding an ungated example needs no edit: the check picks it up from cargo
+# metadata and lints it.
+scp-node::website
+scp-transport::relay-chat
+scp-transport::relay-listen
+scp-transport::relay-send
