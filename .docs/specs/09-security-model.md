@@ -1879,7 +1879,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Default context verification window | 300s (5 min) | Grace period for context close verification | §5.6 |
 | Outlet lifecycle default timeout | 30,000ms (30s) | Default outlet invocation timeout | §6.2 |
 | Outlet lifecycle max timeout | 300,000ms (5 min) | Hard protocol maximum for outlet invocation timeout | §6.2 |
-| Min active voters for fallback | 2 | Minimum voters for governance timeout fallback | §6.4 |
+| Min active voters for fallback | 2 | Minimum voters for governance timeout fallback | §5.9, ADR-031 §10 |
 | Max threshold signers | 64 | Maximum co-signers for multi-sig governance actions | §5.6 |
 | Max role name length | 64 bytes | Maximum length of custom role names | §5.6 |
 

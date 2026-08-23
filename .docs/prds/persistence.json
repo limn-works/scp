@@ -56,7 +56,7 @@
     },
     {
       "id": "gate-persist-4",
-      "name": "BlobStore Adapters",
+      "name": "BlobStorage Adapters",
       "priority": "P0",
       "status": "done",
       "stories": [
@@ -1014,7 +1014,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "### Custom BlobStore Adapters"
+          "section": "### Custom BlobStorage Adapters"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -1059,7 +1059,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+          "section": "## 17.7 First-Party BlobStorage Adapters (Relay/Server)"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -1104,7 +1104,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+          "section": "## 17.7 First-Party BlobStorage Adapters (Relay/Server)"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -1292,7 +1292,7 @@
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+          "section": "## 17.7 First-Party BlobStorage Adapters (Relay/Server)"
         }
       ],
       "details": {
@@ -1379,7 +1379,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+          "section": "## 17.7 First-Party BlobStorage Adapters (Relay/Server)"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -1469,7 +1469,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+          "section": "## 17.7 First-Party BlobStorage Adapters (Relay/Server)"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
@@ -1514,7 +1514,7 @@
       "sources": [
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+          "section": "## 17.7 First-Party BlobStorage Adapters (Relay/Server)"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",

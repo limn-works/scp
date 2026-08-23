@@ -31,7 +31,7 @@ crates/
       builder.rs             # ScenarioBuilder
       helpers.rs             # Test utility helpers
       test_adapter.rs        # Test adapter utilities
-      blob_store_tests.rs    # BlobStore conformance tests
+      blob_store_tests.rs    # BlobStorage conformance tests
       fullstack/             # Full-stack integration test harness
         mod.rs
         crypto.rs            # Crypto integration tests
@@ -192,7 +192,7 @@ Simplified in-memory relay for testing. No WebSocket, no network I/O. Stores blo
 
 ### 16.4.1 StoredBlob
 
-Blobs are stored directly in the relay's internal `HashMap`. No separate `BlobStore` trait — the relay manages its own storage inline.
+Blobs are stored directly in the relay's internal `HashMap`. No separate `BlobStorage` trait — the relay manages its own storage inline.
 
 ```rust
 /// scp-testing/src/relay/mod.rs
@@ -1255,13 +1255,13 @@ macro_rules! push_conformance {
 ```rust
 /// scp-testing/src/conformance/blob_store.rs
 
-/// Generates a test module verifying the `BlobStore` trait contract
+/// Generates a test module verifying the `BlobStorage` trait contract
 /// (§16.4.1; see §17.7 for the full first-party adapter roster).
 ///
 /// Usage:
 /// ```rust
 /// #[cfg(test)]
-/// blob_store_conformance!(|| InMemoryBlobStore::new(clock.clone()));
+/// blob_store_conformance!(|| InMemoryBlobStorage::new(clock.clone()));
 /// ```
 #[macro_export]
 macro_rules! blob_store_conformance {
@@ -1305,8 +1305,10 @@ macro_rules! blob_store_conformance {
             }
 
             #[tokio::test]
-            async fn store_returns_sha256_blob_id() {
-                // Store a blob, verify returned blob_id == SHA-256(blob content).
+            async fn store_returns_blob_id() {
+                // The caller computes blob_id = SHA-256(blob content) and passes it
+                // to store; the storage layer never re-hashes (§17.7.1). Store a blob,
+                // verify the returned blob_id equals the blob_id the caller passed.
             }
 
             #[tokio::test]
@@ -1546,7 +1548,7 @@ Every simulation component maps to a specific protocol mechanism or threat:
 | `key_custody_conformance!()` | ADR-006 | KeyCustody contract |
 | `attestation_conformance!()` | ADR-006 | DeviceAttestation contract |
 | `push_conformance!()` | ADR-006 | Push contract |
-| `blob_store_conformance!()` | §16.4.1, §17.7 | BlobStore contract (5 methods, TTL, concurrent access) |
+| `blob_store_conformance!()` | §16.4.1, §17.7 | BlobStorage contract (5 methods, TTL, concurrent access) |
 | `payment_adapter_conformance!()` | §19.2, §19.2.6 | PaymentAdapter contract (authorize/capture/void/verify/refund, error conditions) |
 | ProtocolRepository integration tests | §17.4, §17.13 | Protocol-layer persistence correctness |
 | MlsStorageBridge tests | §17.9 | OpenMLS state persistence through ProtocolRepository |

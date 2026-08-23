@@ -50,3 +50,9 @@ bindings/python/tests/bridge_parity/helpers/swift_bridge_runner/.build/
 # recorded by the default `--test perf_baseline` run; never committed (one box's
 # numbers must not become a cross-machine gate reference).
 crates/scp-runtime/tests/perf_baseline.json
+
+# Audit-skill scratch output (.claude/skills/audit/SKILL.md §5.1 writes a
+# checkpoint, a coverage matrix, and per-finding notes here on every run).
+# Those files are an inventory of this codebase's unfixed defects, so this
+# public repository never tracks them.
+.claude/agent-memory/audit/

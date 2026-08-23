@@ -323,7 +323,7 @@ scp/
 │   │
 │   ├── scp-testing/           # Network simulation test harness (§16, dev-dependency)
 │   │   ├── clock.rs           # SimulatedClock (manual time control)
-│   │   ├── relay/             # InMemoryRelay, BlobStore, BehaviorMode, SubscriptionRegistry
+│   │   ├── relay/             # InMemoryRelay, BlobStorage, BehaviorMode, SubscriptionRegistry
 │   │   ├── transport.rs       # InMemoryTransport (TransportAdapter over InMemoryRelay)
 │   │   ├── simulator/         # NetworkSimulator, SimulatedIdentity, NetworkTopology
 │   │   ├── builder.rs         # ScenarioBuilder (fluent API for test setup)
@@ -1029,6 +1029,29 @@ Go, C#, and Java SDKs are not currently implemented. The scaffolding directories
 
 ## 4. Build Phases
 
+### 4.0 Definition: Functioning Network
+
+The six per-phase Build and Test lists below decompose the work. This section states the end-to-end criterion those phases build toward, so a reader decides whether the whole system works by checking twelve capabilities against one binding gate, rather than by reading six phase lists and inferring an answer from them.
+
+A functioning SCP network means two or more nodes can:
+
+1. Start and discover each other via relay
+2. Create and resolve DIDs (with device attestation where available)
+3. Create contexts with governance policies
+4. Join/leave contexts with MLS-backed encryption
+5. Exchange encrypted messages end-to-end through SDK bindings
+6. Enforce governance mechanically (ceiling, promotion, roles, UCAN)
+7. Persist all state across restarts
+8. Discover contexts, agents, and capabilities
+9. Operate broadcast contexts with per-author sender keys
+10. Block/unblock members with sender key denial + state destruction
+11. Recover from key compromise
+12. Sync after offline periods
+
+Every capability above must work through at least one SDK binding (Python).
+
+A production-readiness execution plan, written on 2026-03-08 and since deleted, first stated this definition. That plan's remaining 630 lines tracked the production-readiness backlog — the GitHub issues numbered #290 through #401 — and every one of those issues closed. The three gaps that plan listed as REMAINING are built: `MetadataRecord` at `crates/scp-protocol/src/context/metadata.rs:53`, `EquivocationAlert` at `crates/scp-protocol/src/sync/mod.rs:302`, and `ChunkEnvelope` at `crates/scp-protocol/src/envelope/chunk.rs:70`. The tracker was deleted because it had been executed, and this definition moved here because nothing else in the repository states it.
+
 ### Phase 1: Crypto Proof
 
 **Goal:** Prove the crypto stack works. Two Rust processes exchange encrypted messages through a local SCP relay.
@@ -1040,7 +1063,7 @@ Build:
   • scp-core/identity/ — DID creation (did:dht)
   • scp-core/clock.rs — Clock trait + SystemClock (§16.3)
   • scp-transport/native/ — SCP native relay adapter (single relay)
-  • scp-transport/native/blob_store.rs — BlobStore trait (§16.4.1)
+  • scp-transport/native/blob_store.rs — BlobStorage trait (§16.4.1)
   • scp-platform/testing/ — In-memory key storage (delete_prefix, exists — §17.2)
   • scp-core/store/ — Skeleton ProtocolRepository (§17.4)
   • scp-core/crypto/mls/storage.rs — MlsStorageBridge (§17.9)
@@ -1094,7 +1117,7 @@ Test:
   • Context state persists across process restarts (SqliteStorage)
   • ProtocolRepository integration tests: lifecycle, nonces, event range queries (§17.13)
   • MlsStorageBridge tests (§16.13.8) gated against SqliteStorage
-  • All new Storage/BlobStore adapters pass conformance suites
+  • All new Storage/BlobStorage adapters pass conformance suites
   • Block enforcement: assert_block_enforced (§16.10.6) — sender key rotation
     prevents blocked identity from decrypting, other members unaffected
   • Broadcast mode: author publishes broadcast-key-encrypted content, subscriber

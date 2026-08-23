@@ -7,11 +7,11 @@
 - The earlier "ADR-027 amendment requires public key bytes" claim is REJECTED — public keys are publicly derivable, so a public-key-keyed pseudonym is a membership-enumeration oracle.
 - Golden vector tests must assert the private-seed-HKDF derivation, not a public-key-based HMAC.
 
-### HIGH: publicKey() triggers biometric prompt
-- publicKey calls `fetchPrivateKeyBytes` which does `kSecReturnData = true`
-- For biometric-gated items, this WILL trigger Face ID/Touch ID
-- Class doc (line 200) falsely claims publicKey does NOT require biometric auth
-- Fix: store public key bytes separately in Keychain, or cache at generation time
+### FIXED (was a HIGH): publicKey() triggered a biometric prompt
+- `publicKey(_:)` (`Sources/SCP/Platform/AppleKeyCustody.swift:593`) reads the cached public key out of Keychain metadata attributes at `:602-606` and returns it. It reaches no key material, so it raises no Face ID or Touch ID prompt.
+- `storePrivateKeyBytes` (`:406`) takes a non-optional `publicKeyBytes` and writes it into `KeyMetadata.publicKeyBase64` at `:412-415`, so every key this class stores carries the cached public key.
+- One residue: an item stored by a build that predates the metadata cache carries no `publicKeyBase64`, and `publicKey` then falls back to `fetchPrivateKeyBytes` at `:610`, which does prompt. The code comments that fallback as such at `:608-609`.
+- The class doc at `:209-211` now states what the code does: `publicKey` and `destroyKey` require no biometric authentication.
 
 ### Keychain patterns
 - `kSecAttrAccessControl` and `kSecAttrAccessible` are mutually exclusive in SecItemAdd

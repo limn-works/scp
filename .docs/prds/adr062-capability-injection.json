@@ -377,7 +377,7 @@
     },
     {
       "id": "SCP-CAPINJECT-010",
-      "title": "E3 blob storage: delete impl Default for BlobStorageBackend (live SCP-CAPSEL-8011 fix), require the arm at relay/node init; InMemoryBlobStore stays durability-only explicit-only",
+      "title": "E3 blob storage: delete impl Default for BlobStorageBackend (live SCP-CAPSEL-8011 fix), require the arm at relay/node init; InMemoryBlobStorage stays durability-only explicit-only",
       "gate": "gate-capinject-10",
       "priority": "P0",
       "severity": "major",
@@ -387,17 +387,17 @@
         "crates/scp-node/src/self_host.rs",
         "crates/scp-node/src/config.rs"
       ],
-      "description": "ADR-062 Slice 10 (Unit 3, E3 MED; §Decision 5). `BlobStorageBackend::InMemory` is the un-cfg'd variant (storage.rs:480) manufactured by `impl Default -> in_memory()` (storage.rs:561) — a LIVE SCP-CAPSEL-8011 violation (a durability-only arm as the default). Delete `impl Default for BlobStorageBackend` and require the arm to be selected explicitly at relay/node init (the construction boundary). `InMemoryBlobStore` stays durability-only and explicitly selectable (never default/fallback); §17.7 already ships Sqlite/redb/Postgres/S3 real backends. Classified durability-only (blob loss is availability, not a security nullification); the selection-boundary fix is the SCP-CAPSEL-8011 remediation. blockedBy [] (independent live fix). Scope exception: the Default removal + explicit-selection wiring are one selection-boundary change.",
+      "description": "ADR-062 Slice 10 (Unit 3, E3 MED; §Decision 5). `BlobStorageBackend::InMemory` is the un-cfg'd variant (storage.rs:480) manufactured by `impl Default -> in_memory()` (storage.rs:561) — a LIVE SCP-CAPSEL-8011 violation (a durability-only arm as the default). Delete `impl Default for BlobStorageBackend` and require the arm to be selected explicitly at relay/node init (the construction boundary). `InMemoryBlobStorage` stays durability-only and explicitly selectable (never default/fallback); §17.7 already ships Sqlite/redb/Postgres/S3 real backends. Classified durability-only (blob loss is availability, not a security nullification); the selection-boundary fix is the SCP-CAPSEL-8011 remediation. blockedBy [] (independent live fix). Scope exception: the Default removal + explicit-selection wiring are one selection-boundary change.",
       "acceptanceCriteria": [
         "The `impl Default for BlobStorageBackend` is deleted (live SCP-CAPSEL-8011 fix): `grep -n 'impl Default for BlobStorageBackend' crates/scp-transport/src/native/storage.rs` returns 0, and `grep -n 'fn default.*in_memory\\|BlobStorageBackend::default' crates/scp-transport` returns 0.",
         "The blob backend is required (explicit selection) at relay/node init: the relay/node construction takes the blob backend as a non-Option argument (grep the construction signature in scp-node/src/self_host.rs) and there is no code path defaulting/falling back to InMemory (SCP-CAPSEL-8000/8001).",
-        "InMemoryBlobStore stays a legitimate explicit durability-only option: it remains selectable by explicit choice (a test constructs a relay with an explicit InMemory blob backend) but is never the default.",
+        "InMemoryBlobStorage stays a legitimate explicit durability-only option: it remains selectable by explicit choice (a test constructs a relay with an explicit InMemory blob backend) but is never the default.",
         "Full CI green: `cargo fmt --all -- --check`; the workspace clippy command; `DYLD_LIBRARY_PATH=$(python3.12 -c \"import sysconfig; print(sysconfig.get_config_var('LIBDIR'))\") cargo test --workspace` — all exit 0.",
         "`python3.12 scripts/validate-prd.py` exits 0 with this story present."
       ],
       "actionItems": [
         "Delete impl Default for BlobStorageBackend; make the blob backend a required (non-Option) argument at relay/node init.",
-        "Keep InMemoryBlobStore explicitly selectable (never default/fallback); write the explicit-selection + no-default tests; run full CI + review roster."
+        "Keep InMemoryBlobStorage explicitly selectable (never default/fallback); write the explicit-selection + no-default tests; run full CI + review roster."
       ],
       "blockedBy": [],
       "sources": [
@@ -407,7 +407,7 @@
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
-          "section": "## 17.7 First-Party BlobStore Adapters (Relay/Server)"
+          "section": "## 17.7 First-Party BlobStorage Adapters (Relay/Server)"
         },
         {
           "file": ".docs/specs/17-persistence-and-storage.md",
