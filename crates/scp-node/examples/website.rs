@@ -8,14 +8,16 @@
 //!
 //! ```text
 //! Error: NodeBuild("identity error: no production pre-rotation custody backend
-//! available; pre-rotation recovery custody is not yet implemented")
+//! available; pre-rotation recovery custody is not yet implemented — see
+//! #1729 / RFC #2130")
 //! ```
 //!
 //! `host_site` asks for `IdentitySource::Persisted`, and creating a new identity
 //! requires a `PreRotationCustody` backend (spec §9.7.4.1 §3). The only
 //! implementation is the test-harness `InMemoryPreRotationCustody`, so a shipped
-//! build fails closed here instead of minting a nullifier-backed identity, and
-//! the real backend is not yet implemented. Once an identity exists in
+//! build fails closed here instead of minting a nullifier-backed identity. The
+//! trailing tag is part of the message the program prints, quoted verbatim. Once
+//! an identity exists in
 //! `$XDG_DATA_HOME/scp/node`, this example loads it and serves the site.
 //!
 //! This is a safe LOCAL demo: it uses `TlsMode::Plaintext` (plain HTTP),

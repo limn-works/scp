@@ -250,14 +250,27 @@ SCP_STORAGE_PATH=/var/lib/scp/node \
 scp-node
 ```
 
-On first run, the node:
+**A shipped `scp-node` binary cannot complete a first run.** `main.rs` builds every
+node mode through `IdentitySource::Generate`, and creating an identity requires a
+`PreRotationCustody` backend whose only implementation is the test harness. On a
+build without the `testing` feature the node logs `application node failed to
+build` and exits 1 with `SCP-IDENT-1059`. The test
+`pre_rotation_severance_generate_fails_closed` in `crates/scp-node/src/lib.rs`
+pins that behaviour. The real backend is not implemented yet, and the node fails
+closed rather than mint a nullifier-backed identity.
+
+The steps below therefore describe what the binary does once that backend lands,
+and what a `testing` build does today:
+
 1. Creates the storage directory and generates a SQLCipher encryption key (stored at `$SCP_STORAGE_PATH/.key`, mode 0600).
 2. Generates a new Ed25519 identity and publishes the DID document to the DHT.
 3. Starts the internal relay server with bridge secret authentication.
 4. Provisions a TLS certificate via ACME (unless `SCP_NODE_TLS_SELF_SIGNED=1`).
 5. Starts the HTTP server with `.well-known/scp` endpoint.
 
-On subsequent runs, the node loads the existing identity from SQLite and reuses the DID.
+On subsequent runs, the node loads the existing identity from SQLite and reuses
+the DID. That reload path carries no `testing` gate, so a node whose storage
+already holds an identity starts on a shipped build.
 
 ### Development deployment
 
@@ -278,9 +291,13 @@ want a node that publishes nothing.
 
 ```rust
 use std::sync::Arc;
+use scp_did::DidDocument;
+use scp_dht::PkarrDhtClient;
+use scp_identity::{DidDht, ScpIdentity};
 use scp_node::{
     DhtMode, ExplicitIdentity, IdentitySource, Node, NodeConfig, Reach, TlsMode,
 };
+use scp_platform::sqlite::{SqliteKeyCustody, SqliteStorage};
 use scp_transport::native::storage::BlobStorageBackend;
 
 // A shipped build cannot CREATE an identity: that needs a `PreRotationCustody`
@@ -289,21 +306,20 @@ use scp_transport::native::storage::BlobStorageBackend;
 // identity you already hold and pass it explicitly.
 let identity: ScpIdentity = load_node_identity()?;
 let document: DidDocument = load_node_did_document()?;
-let did_method: Arc<ConcreteDidMethod> = build_did_method()?;
-let storage = open_encrypted_storage(&storage_dir, &storage_key)?;
+let did_method: Arc<DidDht<PkarrDhtClient>> = build_did_method()?;
+let storage: SqliteStorage = open_encrypted_storage(&storage_dir, &storage_key)?;
 
-// `dht: DhtMode::Production` publishes this node's address bound to its DID, so
-// peers can discover it. That disclosure is a deliberate opt-in, never a default.
+// `IdentitySource` is generic over the custody and DID-method types, and the
+// `Explicit` arm carries no custody value, so the custody parameter has to be
+// named. `crates/scp-ffi/common/src/server.rs` writes the same turbofish.
 let node = Node::start(NodeConfig {
     dht: DhtMode::Production,
     tls: TlsMode::Acme { email: Some("admin@example.com".into()) },
     ..NodeConfig::defaults(
         Reach::Domain { domain: "relay.example.com".into() },
-        IdentitySource::Explicit(Box::new(ExplicitIdentity {
-            identity,
-            document,
-            did_method,
-        })),
+        IdentitySource::<SqliteKeyCustody, DidDht<PkarrDhtClient>>::Explicit(
+            Box::new(ExplicitIdentity { identity, document, did_method }),
+        ),
         storage,
         BlobStorageBackend::sqlite(&blob_db)?, // durable backend for a public node
     )

@@ -297,8 +297,9 @@ impl Drop for PyRelayHandle {
 /// Created by `node_start_in_memory()` or `node_start_local()`. The node
 /// includes a running relay server, a DID identity, and (optionally) persistent
 /// storage. The identity is generated only when the caller omits one AND the
-/// build enables `testing`; a shipped build requires an explicit identity and
-/// fails closed otherwise. The HTTP server is **not** started automatically --
+/// build enables `testing`; a shipped build that must CREATE one fails closed;
+/// reloading an identity the storage already holds needs no explicit identity
+/// and carries no gate. The HTTP server is **not** started automatically --
 /// only the relay is bound.
 #[pyclass(name = "NodeHandle")]
 pub struct PyNodeHandle {

@@ -113,9 +113,10 @@ Three addressing paths, none requiring DNS-as-central-authority:
 - **No DANE/cert-fingerprint-over-DID.** Only local TOFU relay pinning exists
   (`crates/scp-transport/src/native/cert_pin.rs`). A self-signed node cert can't
   be verified against a DID-published fingerprint yet.
-- **PyO3/NAPI client `identity_resolve` use `InMemoryDhtClient`** (resolve against
-  an empty in-process map, not the network). Only the node binary and the UniFFI
-  per-instance production build hit the real DHT.
+- ~~**PyO3/NAPI client `identity_resolve` use `InMemoryDhtClient`**~~ — no longer
+  true. `build_ffi_dht_client` (`crates/scp-ffi/common/src/dht.rs`) returns the
+  production Pkarr client whenever the `testing` feature is off, and all three
+  bridges route through it, so every shipped build resolves against the real DHT.
 
 ---
 
