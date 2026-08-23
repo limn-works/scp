@@ -129,11 +129,12 @@ fn ffi_dht_client_is_pkarr_only_in_shipped_build() {
 /// to prove the property without any test-harness DHT.
 #[cfg(not(feature = "testing"))]
 #[tokio::test]
-async fn disabled_node_resolution_returns_ok_none_for_unknown_did() {
+async fn disabled_dht_arm_reports_that_it_did_not_answer() {
     use std::sync::Arc;
 
     use scp_dht::DisabledDhtClient;
-    use scp_identity::resolver::{DidResolver, LayerStatus, ResolutionOutcome};
+    use scp_identity::IdentityError;
+    use scp_identity::resolver::DidResolver;
     use scp_identity::{BootstrapRelays, DidCache, DualLayerResolver, RealMultiRelayQuerier};
     use scp_transport::native::TransportRelayQuerier;
 
@@ -154,28 +155,34 @@ async fn disabled_node_resolution_returns_ok_none_for_unknown_did() {
         bootstrap,
     );
 
-    let resolution = resolver
-        .resolve(&did)
+    // `DhtMode::Disabled` is the node's shipped default, and nothing is bound
+    // into the relay querier here, so NEITHER layer asked anyone about this DID.
+    // The resolver must say so. An `Absent` outcome would tell the caller that
+    // nobody published the DID, which no layer in this composition checked.
+    let error = resolver.resolve(&did).await.expect_err(
+        "neither layer reported on the DID, so the resolver must not return an absence",
+    );
+
+    assert!(
+        matches!(error, IdentityError::ResolutionFailed { .. }),
+        "a switched-off DHT arm and an unbound relay layer produce ResolutionFailed, got {error:?}"
+    );
+}
+
+/// The DHT client itself, not just the resolver, refuses to report absence when
+/// the arm is switched off. This is the criterion at its source: a
+/// [`DisabledDhtClient`] asked no DHT node, so it holds no evidence either way.
+#[cfg(not(feature = "testing"))]
+#[tokio::test]
+async fn disabled_dht_client_never_reports_an_absence() {
+    use scp_dht::{DhtClient, DhtError, DisabledDhtClient};
+
+    let error = DisabledDhtClient
+        .resolve(&[3u8; 32])
         .await
-        .expect("Disabled resolution must not error — the DHT arm answers with Ok(None)");
-    match resolution {
-        ResolutionOutcome::Absent { layers } => {
-            assert_eq!(
-                layers.dht,
-                LayerStatus::Answered,
-                "the Disabled DHT arm answers that it holds nothing"
-            );
-            assert_eq!(
-                layers.relay,
-                LayerStatus::Unavailable,
-                "no relay transport is bound, which the relay layer reports honestly \
-                 instead of claiming the relays hold no such DID"
-            );
-        }
-        ResolutionOutcome::Found(doc) => panic!(
-            "a Disabled node must never fabricate or serve an in-memory document, got {doc:?}"
-        ),
-    }
+        .expect_err("a switched-off arm must not answer for a key it never looked up");
+
+    assert!(matches!(error, DhtError::Disabled), "got {error:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +308,7 @@ fn live_mainline_pkarr_roundtrip() {
             .resolve(vk.as_bytes())
             .await
             .expect("resolve from live Mainline DHT")
+            .into_record()
             .expect("the just-published record must be resolvable");
         assert_eq!(record.value, value);
         assert_eq!(record.seq, seq);

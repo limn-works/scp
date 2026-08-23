@@ -62,16 +62,70 @@ pub trait DhtClient: Send + Sync {
     ///
     /// # Returns
     ///
-    /// `Ok(Some((value, signature, seq)))` if found — the document bytes,
-    /// Ed25519 signature, and sequence number. `Ok(None)` if not found.
+    /// [`DhtLookup::Record`] when a source this client reached returned a BEP44
+    /// record for `public_key`. [`DhtLookup::NoRecord`] when a source this
+    /// client reached reported that it holds no record for `public_key`.
+    ///
+    /// An implementation returns `Ok(..)` only when it reached a source that
+    /// reported on this key. It reports every other outcome as `Err`, so a
+    /// caller never reads an unreached DHT as evidence that nobody published
+    /// the key (§3.10.4).
     ///
     /// # Errors
     ///
-    /// Returns [`DhtError::DhtResolveFailed`] if the lookup operation fails.
+    /// Returns [`DhtError::DhtResolveFailed`] when this client reached no
+    /// source that reported on `public_key`, and [`DhtError::Disabled`] when
+    /// the DHT layer is switched off.
     fn resolve(
         &self,
         public_key: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send;
+    ) -> impl Future<Output = Result<DhtLookup, DhtError>> + Send;
+}
+
+/// What a DHT lookup observed about a public key (§3.10.4).
+///
+/// **The criterion:** a lookup produces a `DhtLookup` only when the client
+/// reached a DHT source that reported on the requested key. Both variants are
+/// therefore answers, and the [`DualLayerResolver`] records either one as a DHT
+/// layer that answered. A client that reached no source — the DHT arm is
+/// switched off, every gateway request failed, no DHT node responded — returns
+/// [`DhtError`] instead, which the resolver records as a layer that could not
+/// answer.
+///
+/// The distinction is load-bearing: an unreachable DHT that reported
+/// "no record" would let an attacker who blocks DHT traffic manufacture a
+/// positive claim that nobody published a DID (§3.10.4, "One layer fails, the
+/// other reports the DID absent").
+///
+/// [`DualLayerResolver`]: https://docs.rs/scp-identity
+#[derive(Debug, Clone)]
+pub enum DhtLookup {
+    /// A source this client reached returned a BEP44 record for the key.
+    Record(DhtRecord),
+    /// A source this client reached reported that it holds no record for the
+    /// key.
+    NoRecord,
+}
+
+impl DhtLookup {
+    /// Returns the record when a source returned one, and `None` when a source
+    /// reported that it holds no record.
+    #[must_use]
+    pub fn into_record(self) -> Option<DhtRecord> {
+        match self {
+            Self::Record(record) => Some(record),
+            Self::NoRecord => None,
+        }
+    }
+
+    /// Borrows the record when a source returned one.
+    #[must_use]
+    pub const fn record(&self) -> Option<&DhtRecord> {
+        match self {
+            Self::Record(record) => Some(record),
+            Self::NoRecord => None,
+        }
+    }
 }
 
 /// A BEP44 record retrieved from the DHT.
@@ -174,7 +228,7 @@ impl DhtClient for InMemoryDhtClient {
     fn resolve(
         &self,
         public_key: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send {
+    ) -> impl Future<Output = Result<DhtLookup, DhtError>> + Send {
         async move {
             let items = self.items.lock().await;
             let record = items.get(public_key).map(|item| DhtRecord {
@@ -183,7 +237,9 @@ impl DhtClient for InMemoryDhtClient {
                 seq: item.seq,
             });
             drop(items);
-            Ok(record)
+            // The map IS this client's source, and the map reports on every key
+            // it is asked about, so both outcomes are answers.
+            Ok(record.map_or(DhtLookup::NoRecord, DhtLookup::Record))
         }
     }
 }
@@ -194,16 +250,17 @@ impl DhtClient for InMemoryDhtClient {
 
 /// A [`DhtClient`] with the DHT layer turned off.
 ///
-/// DHT layer disabled — resolves nothing (`Ok(None)`, an honest not-found;
-/// never a fabricated document), and refuses to publish
-/// ([`DhtError::Disabled`], fail-closed — never a silent `Ok`). Used by
-/// `DhtMode::Disabled`; the `DualLayerResolver` composes the relay layer
-/// around it, so a `Disabled` node's resolution still runs (relay arm only).
+/// Both operations fail closed with [`DhtError::Disabled`]: a switched-off arm
+/// reaches no DHT node, so it can neither publish a record nor report on one.
+/// Used by `DhtMode::Disabled`; the `DualLayerResolver` composes the relay layer
+/// around it and records the DHT layer as unavailable, so a `Disabled` node
+/// resolves over the relay arm alone and never tells a caller that the Mainline
+/// DHT holds no record for a DID it never asked about (§3.10.4).
 ///
-/// Unlike [`InMemoryDhtClient`], this is **not** a nullifier: it never reports
-/// a false publish success and never returns a fabricated resolve — both harms
-/// §17.17.3 identifies. Publish fails loud; resolve is honestly empty. It is
-/// therefore compiled unconditionally and safe to ship.
+/// Unlike [`InMemoryDhtClient`], this is **not** a nullifier: it never reports a
+/// false publish success, and it never reports a resolution result it did not
+/// obtain — both harms §17.17.3 identifies. It is therefore compiled
+/// unconditionally and safe to ship.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DisabledDhtClient;
 
@@ -226,10 +283,13 @@ impl DhtClient for DisabledDhtClient {
     fn resolve(
         &self,
         _public_key: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send {
-        // Honest not-found: the DHT arm is off, so it contributes nothing to
-        // resolution. The DualLayerResolver's relay arm supplies any answer.
-        async { Ok(None) }
+    ) -> impl Future<Output = Result<DhtLookup, DhtError>> + Send {
+        // Fail closed. A switched-off arm asked no DHT node about this key, so
+        // it holds no evidence either way. Returning `DhtLookup::NoRecord` here
+        // would tell the resolver that the Mainline DHT answered and holds
+        // nothing, which is the §17.17.3 "reports a result it never obtained"
+        // nullifier this crate refuses to ship.
+        async { Err(DhtError::Disabled) }
     }
 }
 
@@ -256,7 +316,7 @@ mod tests {
         let value = b"test document";
 
         client.publish(&key, &sig, value, 1).await.unwrap();
-        let record = client.resolve(&key).await.unwrap().unwrap();
+        let record = client.resolve(&key).await.unwrap().into_record().unwrap();
 
         assert_eq!(record.value, value);
         assert_eq!(record.signature, sig);
@@ -269,7 +329,36 @@ mod tests {
         let key = [1u8; 32];
 
         let result = client.resolve(&key).await.unwrap();
-        assert!(result.is_none());
+        assert!(
+            matches!(result, DhtLookup::NoRecord),
+            "the map is this client's source and it reported that it holds no record"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_client_reports_no_answer_rather_than_an_absence() {
+        let client = DisabledDhtClient;
+        let key = [7u8; 32];
+
+        let error = client
+            .resolve(&key)
+            .await
+            .expect_err("a switched-off arm asked no DHT node, so it must not answer");
+        assert!(
+            matches!(error, DhtError::Disabled),
+            "a disabled arm reports DhtError::Disabled, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_client_refuses_to_publish() {
+        let client = DisabledDhtClient;
+
+        let error = client
+            .publish(&[7u8; 32], &[8u8; 64], b"doc", 1)
+            .await
+            .expect_err("a switched-off arm publishes to no DHT node");
+        assert!(matches!(error, DhtError::Disabled));
     }
 
     #[tokio::test]
@@ -282,7 +371,7 @@ mod tests {
         client.publish(&key, &sig1, b"version 1", 5).await.unwrap();
         client.publish(&key, &sig2, b"version 2", 3).await.unwrap();
 
-        let record = client.resolve(&key).await.unwrap().unwrap();
+        let record = client.resolve(&key).await.unwrap().into_record().unwrap();
         assert_eq!(record.value, b"version 1");
         assert_eq!(record.seq, 5);
     }
@@ -297,7 +386,7 @@ mod tests {
         client.publish(&key, &sig1, b"version 1", 5).await.unwrap();
         client.publish(&key, &sig2, b"version 2", 5).await.unwrap();
 
-        let record = client.resolve(&key).await.unwrap().unwrap();
+        let record = client.resolve(&key).await.unwrap().into_record().unwrap();
         assert_eq!(record.value, b"version 1");
         assert_eq!(record.seq, 5);
     }
@@ -312,7 +401,7 @@ mod tests {
         client.publish(&key, &sig1, b"version 1", 1).await.unwrap();
         client.publish(&key, &sig2, b"version 2", 2).await.unwrap();
 
-        let record = client.resolve(&key).await.unwrap().unwrap();
+        let record = client.resolve(&key).await.unwrap().into_record().unwrap();
         assert_eq!(record.value, b"version 2");
         assert_eq!(record.seq, 2);
     }

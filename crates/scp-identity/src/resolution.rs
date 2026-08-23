@@ -125,7 +125,11 @@ pub trait RelayQuerier: Send + Sync {
     ///
     /// # Returns
     ///
-    /// A (possibly empty) vector of every decodable, **unverified** candidate.
+    /// A [`RelayQueryAnswer`] carrying every decodable, **unverified**
+    /// candidate, plus the number of blobs the relay returned that did not
+    /// decode. The composer needs the second number because §3.10.4 requires it
+    /// to discard an undecodable blob "as if the relay had failed", which it
+    /// cannot do if the implementation silently drops the blob.
     ///
     /// # Errors
     ///
@@ -134,7 +138,48 @@ pub trait RelayQuerier: Send + Sync {
         &self,
         relay_url: &str,
         routing_id: &[u8; 32],
-    ) -> impl Future<Output = Result<Vec<RelayQueryRecord>, IdentityError>> + Send;
+    ) -> impl Future<Output = Result<RelayQueryAnswer, IdentityError>> + Send;
+}
+
+/// What one relay returned for a routing ID (§3.10.4).
+///
+/// An implementation constructs this only after the relay responded. A relay
+/// that could not be reached yields [`IdentityError`] instead, so the composer
+/// never counts an unreached relay as one that answered.
+#[derive(Debug, Clone, Default)]
+pub struct RelayQueryAnswer {
+    /// Every blob at the routing ID that decoded as a DID-record frame,
+    /// **unverified**. The composer BEP44-verifies each one.
+    pub candidates: Vec<RelayQueryRecord>,
+    /// How many blobs the relay returned that did not decode as a DID-record
+    /// frame (§9.10.12).
+    ///
+    /// §3.10.4 discards each undecodable blob "as if the relay had failed", so
+    /// a relay that returned only undecodable blobs gave the composer no usable
+    /// evidence about the DID and must not be counted as having answered.
+    pub undecodable: usize,
+}
+
+impl RelayQueryAnswer {
+    /// Builds an answer from a relay that returned only decodable blobs.
+    #[must_use]
+    pub const fn from_candidates(candidates: Vec<RelayQueryRecord>) -> Self {
+        Self {
+            candidates,
+            undecodable: 0,
+        }
+    }
+
+    /// Returns `true` when the relay responded and stored nothing at the
+    /// routing ID.
+    ///
+    /// That is the one shape in which a relay reports absence directly: it held
+    /// no blob at all, so there is nothing for the resolver to discard and
+    /// nothing left unexplained.
+    #[must_use]
+    pub const fn holds_nothing(&self) -> bool {
+        self.candidates.is_empty() && self.undecodable == 0
+    }
 }
 
 /// Verifies a raw relay `(value, signature, seq)` record against a DID and
@@ -230,7 +275,7 @@ impl RelayQuerier for InMemoryRelayQuerier {
         &self,
         relay_url: &str,
         routing_id: &[u8; 32],
-    ) -> impl Future<Output = Result<Vec<RelayQueryRecord>, IdentityError>> + Send {
+    ) -> impl Future<Output = Result<RelayQueryAnswer, IdentityError>> + Send {
         async move {
             let records = self
                 .items
@@ -239,7 +284,9 @@ impl RelayQuerier for InMemoryRelayQuerier {
                 .get(&(relay_url.to_owned(), *routing_id))
                 .cloned()
                 .unwrap_or_default();
-            Ok(records)
+            // `insert` takes an already-decoded record, so this double stores no
+            // undecodable blob.
+            Ok(RelayQueryAnswer::from_candidates(records))
         }
     }
 }
@@ -335,18 +382,20 @@ mod tests {
         let out = RelayQuerier::query(&querier, "wss://r/scp/v1", &routing_id)
             .await
             .unwrap();
-        assert_eq!(out.len(), 2, "both co-located records returned");
-        assert_eq!(out[0].seq, 1);
-        assert_eq!(out[1].seq, 2);
+        assert_eq!(out.candidates.len(), 2, "both co-located records returned");
+        assert_eq!(out.candidates[0].seq, 1);
+        assert_eq!(out.candidates[1].seq, 2);
+        assert_eq!(out.undecodable, 0);
     }
 
-    /// An unknown routing ID yields an empty vector (not an error).
+    /// An unknown routing ID yields an empty answer (not an error): the relay
+    /// responded and stored nothing there.
     #[tokio::test]
     async fn in_memory_querier_unknown_routing_id_is_empty() {
         let querier = InMemoryRelayQuerier::new();
         let out = RelayQuerier::query(&querier, "wss://r/scp/v1", &[9u8; 32])
             .await
             .unwrap();
-        assert!(out.is_empty());
+        assert!(out.holds_nothing());
     }
 }

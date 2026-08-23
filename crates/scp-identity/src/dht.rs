@@ -800,10 +800,12 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // first publish and must proceed.
         let public_key = extract_public_key(did)?;
         match self.dht_client.resolve(&public_key).await {
-            Ok(Some(record)) => {
+            Ok(scp_dht::DhtLookup::Record(record)) => {
                 best_seq = best_seq.max(record.seq);
             }
-            Ok(None) => {} // No record on DHT — first publish or expired.
+            // A DHT source reported that it holds no record: a legitimate seq-0
+            // first publish, or an expired record.
+            Ok(scp_dht::DhtLookup::NoRecord) => {}
             Err(e) => return Err(e.into()),
         }
 
@@ -961,6 +963,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .dht_client
             .resolve(&public_key)
             .await?
+            .into_record()
             .ok_or_else(|| IdentityError::DhtNotFound(did_string.to_owned()))?;
 
         // Step 3: Verify BEP44 signature.
@@ -6032,7 +6035,7 @@ mod tests {
         fn resolve(
             &self,
             public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
+        ) -> impl Future<Output = Result<scp_dht::DhtLookup, DhtError>> + Send {
             let pk = *public_key;
             async move { self.inner.resolve(&pk).await }
         }
@@ -6473,7 +6476,7 @@ mod tests {
         fn resolve(
             &self,
             _public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
+        ) -> impl Future<Output = Result<scp_dht::DhtLookup, DhtError>> + Send {
             async {
                 Err(DhtError::DhtResolveFailed(
                     "simulated transient resolve failure".to_owned(),
@@ -6858,7 +6861,7 @@ mod tests {
         fn resolve(
             &self,
             public_key: &[u8; 32],
-        ) -> impl Future<Output = Result<Option<scp_dht::DhtRecord>, DhtError>> + Send {
+        ) -> impl Future<Output = Result<scp_dht::DhtLookup, DhtError>> + Send {
             let pk = *public_key;
             async move { self.inner.resolve(&pk).await }
         }

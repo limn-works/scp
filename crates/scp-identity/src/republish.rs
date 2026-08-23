@@ -893,7 +893,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Verify the document was published to the in-memory DHT.
-        let record = dht.resolve(&[1u8; 32]).await.unwrap();
+        let record = dht.resolve(&[1u8; 32]).await.unwrap().into_record();
         assert!(record.is_some());
 
         manager.stop_republishing("did:dht:zTest1").await;
@@ -947,7 +947,7 @@ mod tests {
         // Give the task time to do its first publish.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let record = dht.resolve(&[1u8; 32]).await.unwrap();
+        let record = dht.resolve(&[1u8; 32]).await.unwrap().into_record();
         assert!(record.is_some());
         assert_eq!(record.unwrap().seq, 1);
 
@@ -999,7 +999,7 @@ mod tests {
         );
 
         // Verify DHT publish also happened.
-        let dht_record = dht.resolve(&[1u8; 32]).await.unwrap();
+        let dht_record = dht.resolve(&[1u8; 32]).await.unwrap().into_record();
         assert!(
             dht_record.is_some(),
             "DHT publish should also have occurred"
@@ -1093,7 +1093,7 @@ mod tests {
 
         // DHT should NOT have been published to.
         assert_eq!(manager.active_count().await, 0, "no DHT tasks");
-        let dht_record = dht.resolve(&[1u8; 32]).await.unwrap();
+        let dht_record = dht.resolve(&[1u8; 32]).await.unwrap().into_record();
         assert!(dht_record.is_none(), "DHT should have no records");
 
         // Relay SHOULD have been published to.
@@ -1128,7 +1128,7 @@ mod tests {
 
         // DHT SHOULD have been published to.
         assert_eq!(manager.active_count().await, 1, "one DHT task");
-        let dht_record = dht.resolve(&[1u8; 32]).await.unwrap();
+        let dht_record = dht.resolve(&[1u8; 32]).await.unwrap().into_record();
         assert!(dht_record.is_some(), "DHT should have a record");
 
         // Relay should NOT have been published to.
@@ -1190,7 +1190,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Verify the old DID document was published.
-        let record = dht.resolve(&[3u8; 32]).await.unwrap();
+        let record = dht.resolve(&[3u8; 32]).await.unwrap().into_record();
         assert!(record.is_some());
         let rec = record.unwrap();
         assert_eq!(rec.value, b"old document with alsoKnownAs redirect");
@@ -1220,7 +1220,7 @@ mod tests {
         // Give the task time to do its first publish.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let record = dht.resolve(&[3u8; 32]).await.unwrap();
+        let record = dht.resolve(&[3u8; 32]).await.unwrap().into_record();
         assert!(record.is_some(), "first publish should happen immediately");
 
         handle.cancel();

@@ -56,7 +56,7 @@ use std::sync::{Arc, RwLock};
 
 use scp_identity::IdentityError;
 use scp_identity::relay_querier::MAX_CANDIDATES_PER_RELAY;
-use scp_identity::resolution::{RelayQuerier, RelayQueryRecord};
+use scp_identity::resolution::{RelayQuerier, RelayQueryAnswer, RelayQueryRecord};
 use scp_protocol::envelope::did_record::DidRecordV1;
 use tracing::debug;
 
@@ -66,8 +66,11 @@ use crate::traits::{RoutingId, TransportAdapter};
 ///
 /// Holds a per-instance, late-bound map of `relay_url -> adapter`. Bindings are
 /// added as relay connections are established (see the module docs) and can be
-/// removed on disconnect. A query for an unbound relay URL fails closed with an
-/// empty candidate list.
+/// removed on disconnect. A query for an unbound relay URL fails closed with
+/// [`IdentityError::RelayNotConnected`] — a typed error, never an empty
+/// candidate list, because an empty list asserts that the relay answered and
+/// holds nothing, which this querier cannot claim about a relay it never
+/// reached.
 #[derive(Default)]
 pub struct TransportRelayQuerier {
     /// Late-bound live transports, keyed by relay URL. Guarded by a synchronous
@@ -157,7 +160,7 @@ impl RelayQuerier for TransportRelayQuerier {
         &self,
         relay_url: &str,
         routing_id: &[u8; 32],
-    ) -> impl Future<Output = Result<Vec<RelayQueryRecord>, IdentityError>> + Send {
+    ) -> impl Future<Output = Result<RelayQueryAnswer, IdentityError>> + Send {
         // Resolve the adapter synchronously and drop the lock before any await.
         let adapter = self.adapter_for(relay_url);
         let routing_id = *routing_id;
@@ -187,6 +190,7 @@ impl RelayQuerier for TransportRelayQuerier {
                 .map_err(|e| IdentityError::RelayQueryFailed(e.to_string()))?;
 
             let mut records = Vec::with_capacity(blobs.len().min(MAX_CANDIDATES_PER_RELAY));
+            let mut undecodable = 0_usize;
             for blob in blobs {
                 match DidRecordV1::decode(&blob) {
                     Ok(frame) => {
@@ -204,7 +208,13 @@ impl RelayQuerier for TransportRelayQuerier {
                     Err(e) => {
                         // Undecodable blob: discard, never partially parse
                         // (§3.10.4). A non-frame or malformed blob is simply not
-                        // a candidate DID record.
+                        // a candidate DID record. Count it, because §3.10.4
+                        // discards it "as if the relay had failed" and only the
+                        // composer can apply that rule — dropping the blob
+                        // silently here would leave the composer unable to tell
+                        // a relay that stored nothing from a relay that stored
+                        // only junk.
+                        undecodable += 1;
                         debug!(
                             relay_url = %relay_url,
                             error = %e,
@@ -213,7 +223,10 @@ impl RelayQuerier for TransportRelayQuerier {
                     }
                 }
             }
-            Ok(records)
+            Ok(RelayQueryAnswer {
+                candidates: records,
+                undecodable,
+            })
         }
     }
 }
@@ -361,13 +374,63 @@ mod tests {
         let records = RelayQuerier::query(&querier, RELAY, &rid).await.unwrap();
 
         assert_eq!(
-            records.len(),
+            records.candidates.len(),
             2,
             "only the two decodable frames survive; both the wrong-version and \
              the correct-version-but-truncated blobs are discarded"
         );
-        let seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
+        let seqs: Vec<u64> = records.candidates.iter().map(|r| r.seq).collect();
         assert!(seqs.contains(&1) && seqs.contains(&2));
+        assert_eq!(
+            records.undecodable, 2,
+            "the querier reports how many blobs it discarded, because §3.10.4 makes the composer \
+             treat each one as if the relay had failed"
+        );
+    }
+
+    /// A relay that returns blobs of which NONE decode as a DID-record frame is
+    /// a relay the composer must treat as failed (§3.10.4), so the querier
+    /// reports the discard count rather than an answer that looks identical to
+    /// "this relay stores nothing".
+    #[tokio::test]
+    async fn all_undecodable_blobs_are_counted_not_silently_dropped() {
+        let (vk, _sk) = keypair(21);
+        let did = did_of(&vk);
+        let rid = routing_id_of(&did);
+
+        let querier = TransportRelayQuerier::new();
+        querier.bind(
+            RELAY,
+            Arc::new(MockRawAdapter::new(vec![
+                vec![0x00, 0x01, 0x02],
+                vec![0x01, 0xDE, 0xAD],
+            ])),
+        );
+
+        let answer = RelayQuerier::query(&querier, RELAY, &rid).await.unwrap();
+
+        assert!(answer.candidates.is_empty());
+        assert_eq!(answer.undecodable, 2);
+        assert!(
+            !answer.holds_nothing(),
+            "a relay that returned junk did NOT report that it holds no record"
+        );
+    }
+
+    /// A relay that responds with no blob at all did report that it holds no
+    /// record for the routing ID.
+    #[tokio::test]
+    async fn no_blobs_reports_that_the_relay_holds_nothing() {
+        let (vk, _sk) = keypair(22);
+        let did = did_of(&vk);
+        let rid = routing_id_of(&did);
+
+        let querier = TransportRelayQuerier::new();
+        querier.bind(RELAY, Arc::new(MockRawAdapter::new(vec![])));
+
+        let answer = RelayQuerier::query(&querier, RELAY, &rid).await.unwrap();
+
+        assert!(answer.holds_nothing());
     }
 
     /// The QUERY is bounded to `MAX_CANDIDATES_PER_RELAY` (N = 16, §3.10.2): the
@@ -393,7 +456,7 @@ mod tests {
 
         let records = RelayQuerier::query(&querier, RELAY, &rid).await.unwrap();
         assert_eq!(
-            records.len(),
+            records.candidates.len(),
             MAX_CANDIDATES_PER_RELAY,
             "querier must bound the QUERY to N = {MAX_CANDIDATES_PER_RELAY} candidates"
         );

@@ -12,7 +12,7 @@
 //! (M3). The in-memory arm is reachable only by test seams that construct
 //! `FfiDhtClient::InMemory(..)` directly.
 
-use scp_dht::{DhtClient, DhtError, DhtRecord, PkarrDhtClient};
+use scp_dht::{DhtClient, DhtError, DhtLookup, PkarrDhtClient};
 
 #[cfg(feature = "testing")]
 use scp_dht::InMemoryDhtClient;
@@ -66,7 +66,7 @@ impl DhtClient for FfiDhtClient {
     fn resolve(
         &self,
         public_key: &[u8; 32],
-    ) -> impl Future<Output = Result<Option<DhtRecord>, DhtError>> + Send {
+    ) -> impl Future<Output = Result<DhtLookup, DhtError>> + Send {
         async move {
             match self {
                 Self::Pkarr(client) => client.resolve(public_key).await,
