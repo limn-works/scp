@@ -385,10 +385,13 @@ home line doesn't have. Honest, not fixable from here.
   over `host_site_until` (env/CLI parsing, the loud banner, and the live-URL
   print stay binary-only via an `on_ready` callback). A runnable example lives at
   `crates/scp-node/examples/website.rs` (`cargo run -p scp-node --example
-  website`). The library default is **fail-safe**: `DhtMode::Disabled` publishes
+  website`). The library default is **fail-safe**: `DhtMode::Memory` publishes
   nothing; public hosting is a deliberate `DhtMode::Production` opt-in (which
   publishes the host's address bound to its DID to the DHT — the same IP-to-
   identity disclosure the binary gates behind `--self-host` + its banner). No new
   protocol logic, specs, ADRs, or enforcement/capability-matrix changes — a
   packaging/ergonomics refactor of the already-shipped self-host flow.
+  (Historical: ADR-062, capability injection, later made `DhtMode::Memory`
+  test-harness-only and put `DhtMode::Disabled` in its place as the shipped
+  no-publish value. This entry records the default as it stood on its own date.)
 - **2026-06-16 (ADR-052 P3a/P5)** — `ApplicationNodeBuilder` and its `.no_domain()` / `.identity_with_storage()` methods were deleted in ADR-052 Phase B-P3a (PR #1815). The `--self-host` binary path now builds `HostSiteConfig { reach: Reach::NatTraversal, tls, dht, … }` and calls `host_site_until` directly (`crates/scp-node/src/main.rs` `run_self_host`). Updated §3, §4, §5, and §6 to reflect the current API. Running log entries from 2026-06-13/2026-06-14 referenced the former typestate builder and are preserved as historical record.

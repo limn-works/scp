@@ -512,7 +512,8 @@ async fn run_full_node_persistent(storage_path: Option<&PathBuf>) {
         scp_node::DhtMode::Disabled => {
             tracing::error!(
                 "DhtMode::Disabled is not a full-relay-node mode — the node must publish its DID. \
-                 Use --self-host for a non-publishing hosted site."
+                 Use --self-host with SCP_NODE_DHT_MODE=disabled for a hosted site that \
+                 publishes nothing; --self-host on its own still publishes."
             );
             std::process::exit(1);
         }
@@ -1132,9 +1133,11 @@ async fn main() {
         {
             eprintln!(
                 "ERROR: --ephemeral is a test-harness mode (in-memory DHT/custody) and is not \
-                 available in this build. Run without --ephemeral for a persistent node, or run \
-                 `scp-node --self-host` for a non-publishing hosted site. A full relay node has \
-                 no non-publishing mode: it must publish its DID to be discoverable."
+                 available in this build. Use --relay-only, which needs no identity and starts \
+                 on a shipped build. Dropping --ephemeral does NOT help: the full node creates \
+                 an identity on every start, which needs a pre-rotation custody backend this \
+                 build does not have. --self-host has the same first-run limit, and publishes \
+                 the host IP unless SCP_NODE_DHT_MODE=disabled."
             );
             std::process::exit(1);
         }

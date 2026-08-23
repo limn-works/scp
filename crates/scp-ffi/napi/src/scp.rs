@@ -378,6 +378,11 @@ impl Scp {
     /// basis of the cross-bridge parity test (ADR-046). `testing_seed` is
     /// only valid for `"in_memory"` custody; other custody types reject
     /// it with `SCP-VALID-7009`.
+    ///
+    /// On a shipped (no-`testing`) build this FAILS CLOSED with
+    /// `SCP-IDENT-1059`: every identity commits a pre-rotation commitment at
+    /// creation, and the only `PreRotationCustody` implementation is the test
+    /// harness, so no production identity can be created yet.
     #[napi(js_name = "identityCreate")]
     // napi-rs requires `async` for the Promise return type. Without the
     // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
@@ -552,6 +557,11 @@ impl Scp {
     ///
     /// Same as [`Self::identity_create`] but the resulting identity also
     /// includes an `#agent` verification method in the DID document.
+    ///
+    /// On a shipped (no-`testing`) build this FAILS CLOSED with
+    /// `SCP-IDENT-1059`: every identity commits a pre-rotation commitment at
+    /// creation, and the only `PreRotationCustody` implementation is the test
+    /// harness, so no production identity can be created yet.
     #[napi(js_name = "identityCreateWithAgentKey")]
     // napi-rs requires `async` for the Promise return type. Without the
     // in-memory-custody backend the only `.await` (the `"in_memory"` arm) is
@@ -675,6 +685,11 @@ impl Scp {
     ///
     /// The callbacks run on the JS thread; the pre-rotation seed is generated
     /// locally (it never traverses the consumer callbacks), per ADR-006.
+    ///
+    /// On a shipped (no-`testing`) build this FAILS CLOSED with
+    /// `SCP-IDENT-1059`: every identity commits a pre-rotation commitment at
+    /// creation, and the only `PreRotationCustody` implementation is the test
+    /// harness, so no production identity can be created yet.
     #[napi(
         js_name = "identityCreateWithCustody",
         ts_return_type = "Promise<NapiIdentity>"
