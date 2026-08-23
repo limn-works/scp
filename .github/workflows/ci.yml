@@ -377,6 +377,21 @@ jobs:
       - name: Run toolchain-wiring cases
         run: bash scripts/tests/toolchain-wiring/run-tests.sh
 
+  # ── CI-aggregator coverage ───────────────────────────────────────────
+  # The `ci` job at the bottom of this file is the one required status check, and it
+  # reads a hand-written list of the jobs whose results it inspects. A job missing from
+  # that list can fail while `ci` reports success. This gate reads the job names out of
+  # this workflow and requires both of the `ci` job's lists to name every one of them.
+  ci-aggregator:
+    needs: check-draft
+    name: enforcement / ci aggregator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash scripts/check-ci-aggregator.sh
+      - name: Run ci-aggregator cases
+        run: bash scripts/tests/ci-aggregator/run-tests.sh
+
   # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
   # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern
   # from creeping back in any language. Every new piece of per-system state
@@ -1443,12 +1458,24 @@ jobs:
           PYTHONPATH=. pytest tests/bridge_parity/ -v -m parity -k "uniffi-swift"
 
   # ── CI Gate ─────────────────────────────────────────────────────────
-  # Single required check for branch protection. Depends on all CI jobs
-  # and uses if: always() so it runs even when paths-filter skips jobs.
+  # Single required check for branch protection. Depends on every other job in this
+  # workflow and uses if: always() so it runs even when paths-filter skips jobs.
   # Reports success only when every non-skipped job succeeded.
+  #
+  # `changes` and `check-draft` are in the list for the same reason every compiling job
+  # is. GitHub reports a job whose dependency failed as `skipped`, and the loop below
+  # treats `skipped` as a pass, so a `changes` job that fails — a filter expression
+  # `dorny/paths-filter` cannot parse, a checkout that errors — skips every job it guards
+  # and this job would print "All CI jobs passed or were skipped" over a run that compiled
+  # nothing. `scripts/check-ci-aggregator.sh` requires the `needs:` list below and the
+  # `results` array beneath it to name every job this workflow declares apart from this
+  # one, so a job added later fails that gate until both lists carry it.
   ci:
     if: always()
     needs:
+      - check-draft
+      - changes
+      - ci-aggregator
       - error-codes
       - shipped-feature-graph
       - fail-closed-pre-rotation
@@ -1503,6 +1530,9 @@ jobs:
       - name: Check job results
         run: |
           results=( \
+            "${{ needs.check-draft.result }}" \
+            "${{ needs.changes.result }}" \
+            "${{ needs.ci-aggregator.result }}" \
             "${{ needs.error-codes.result }}" \
             "${{ needs.shipped-feature-graph.result }}" \
             "${{ needs.fail-closed-pre-rotation.result }}" \

@@ -146,6 +146,9 @@ check-toolchain-wiring.sh (every container build asserts which compiler it resol
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration
 file to a lane or declares it unread; .mise.toml names no Rust version source),
+check-ci-aggregator.sh (the `ci` job of .github/workflows/ci.yml needs every job that
+workflow declares and reads every one of their results, so no job can fail while the one
+required status check reports success),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

@@ -129,6 +129,15 @@ population fails the gate until someone classifies it. The `fuzz` lane is exempt
 pin: `fuzz-build` runs `cargo check` with `working-directory: fuzz`, where rustup resolves
 `fuzz/rust-toolchain.toml`, and the `fuzz` filter's `fuzz/**` entry covers that file.
 
+`scripts/check-ci-aggregator.sh` closes the other half of the same criterion. Everything
+above turns on the fact that a skipped job reports success, and the `ci` job of
+`.github/workflows/ci.yml` is what turns 52 job results into the one required status check.
+That job reads two hand-written lists — its `needs:` list, and the `results` array its step
+builds — and a job missing from either can fail while the required check reports success.
+The gate reads the job names out of the workflow and requires both lists to name every one
+of them apart from `ci` itself, and requires the `ci` job to carry `if: always()`, without
+which GitHub skips the required check on the failure it exists to report.
+
 Third, that `.mise.toml` names no Rust version source, for the reason the mise paragraph
 above states. The gate parses that file with `tomllib` and asks whether the `tools` table
 holds a `rust` key, rather than matching a line: TOML reaches one key many ways, and mise
