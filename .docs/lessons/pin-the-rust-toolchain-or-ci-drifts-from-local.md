@@ -33,8 +33,9 @@ while the two runs resolve to different compilers.
 
 ## The Fix
 
-Five locations name the stable version, and all five now name `1.98.0`. The first draft of
-this fix named two of them:
+Several locations name the stable version, and all of them now name `1.98.0`. The first
+draft of this fix named two, and each review round found more — which is the part worth
+remembering. These four are the ones whose reasons are not obvious:
 
 - `rust-toolchain.toml` at the repository root pins `channel`, the `clippy` and `rustfmt`
   components, and every cross-compilation target some CI job builds for. Listing the
@@ -55,10 +56,14 @@ Three more name the nightly that the standalone fuzz crate needs:
 `fuzz/rust-toolchain.toml`, and the `FUZZ_TOOLCHAIN` environment variable in
 `.github/workflows/fuzz.yml` and in `.github/workflows/ci.yml`.
 
-`scripts/check-toolchain-pin.sh` reads all eight and requires exact equality. It checks two
-further properties that version agreement leaves open: that `rustc --version` in the
-repository equals the pin, and that `Dockerfile`'s builder stage and runtime stage name the
-same Debian release. The second one exists because the first draft of this fix broke it —
+`scripts/check-toolchain-pin.sh` holds the authoritative list and requires exact equality.
+Keep no second list: counting the locations in prose produced three artifacts that disagreed
+with the gate and with each other, and one whole commit repairing them. The gate also checks
+three properties that version agreement leaves open: that `rustc --version` in the repository
+equals the pin, that each container build's builder stage and runtime stage name the same
+Debian release, and that no file carrying a `FROM rust:` line is missing from its list — the
+last one because four review rounds each found one more such file, and a list that checks
+only the files it already names cannot find the next. The second one exists because the first draft of this fix broke it —
 `rust:1.85-slim` is a Debian 12 image and `rust:1.98.0-slim` is a Debian 13 one, so bumping
 the version alone moved the builder to glibc 2.41 while the runtime stayed on 2.36, and
 glibc is backward compatible only. The gate reads a fixed list of locations and extracts one version string
@@ -84,11 +89,10 @@ of `@master`, the form `ci.yml` already used, gives a ref that resolves.
 
 Bumping Rust is a change someone makes on purpose:
 
-1. Raise the version in `rust-toolchain.toml`, `.mise.toml`, `Dockerfile`,
-   `templates/personal-relay/README.md`, and `.docs/standards/rust.md`.
+1. Raise the version in every location `scripts/check-toolchain-pin.sh` names.
 2. Run `mise install`. mise's `RUSTUP_TOOLCHAIN` keeps selecting the previous compiler
    until it does, so the step before this one changes no build.
-3. Run `bash scripts/check-toolchain-pin.sh`, which fails until all five locations and the
+3. Run `bash scripts/check-toolchain-pin.sh`, which fails until every location and the
    active compiler agree.
 4. Run the CI clippy command from the "Orchestrator verification protocol" section of
    CLAUDE.md.

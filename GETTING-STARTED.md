@@ -32,7 +32,7 @@ All tools are managed by mise (see `.mise.toml`):
 
 | Tool | Version |
 |------|---------|
-| Rust | 1.98.0, the version that `rust-toolchain.toml` pins (+ 13 cross-compilation targets) |
+| Rust | The version and cross-compilation targets `rust-toolchain.toml` names |
 | Python | 3.12 |
 | Bun | 1.3 |
 | Kotlin | 2.3 |

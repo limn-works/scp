@@ -14,16 +14,14 @@ Rust coding standards, safety rules, linting, formatting, testing, and CI for th
 | cargo-deny | latest | Dependency license/advisory audit |
 | cargo-nextest | latest | Test runner (parallel, better output) |
 
-**The compiler version is pinned, and raising it is a deliberate change.** Five locations
-name the stable version: `rust-toolchain.toml` at the repository root (which also names the
-`clippy` and `rustfmt` components and every cross-compilation target CI builds for),
-`.mise.toml`, `Dockerfile`, the container build documented in
-`templates/personal-relay/README.md`, and the table above. Three more name the nightly that cargo-fuzz
-needs: `fuzz/rust-toolchain.toml`, and the `FUZZ_TOOLCHAIN` environment variable in
-`.github/workflows/fuzz.yml` and in `.github/workflows/ci.yml`.
-`scripts/check-toolchain-pin.sh` fails when any of them disagree, when the compiler a command
-in the repository resolves to is not the pinned one, and when `Dockerfile`'s builder stage
-names a different Debian release than its runtime stage.
+**The compiler version is pinned, and raising it is a deliberate change.**
+`scripts/check-toolchain-pin.sh` names every location that selects a Rust version, including
+the table above, and it is the only list — a second list in prose goes stale, which is how
+this pin's own first draft came to name four locations while the gate read seven. The gate
+fails when those locations disagree, when the compiler a command in the repository resolves
+to is not the pinned one, when a container build's builder stage names a different Debian
+release than its runtime stage, and when a file carrying a `FROM rust:` line is missing from
+its list.
 
 `.mise.toml` has to match because mise sets `RUSTUP_TOOLCHAIN` for the commands it runs, and
 that variable overrides `rust-toolchain.toml` entirely — channel, components, and targets.
@@ -35,8 +33,8 @@ resolves to whichever stable release exists on the morning a job runs. Rust 1.98
 on 2026-08-20 with two new lints — one warn-by-default `style` lint and one `pedantic`
 lint, so no group setting would have avoided it — and the `Rust / clippy` required check failed
 on every branch overnight while local runs on 1.97.1 reported a clean pass. To raise the
-version: change `rust-toolchain.toml`, `.mise.toml`, `Dockerfile`,
-`templates/personal-relay/README.md`, and the table above together; run `mise install`, because mise's `RUSTUP_TOOLCHAIN` keeps selecting the old
+version: change every location the gate names, the table above included, together; run
+`mise install`, because mise's `RUSTUP_TOOLCHAIN` keeps selecting the old
 compiler until it does; run `bash scripts/check-toolchain-pin.sh`, which fails until every
 location and the active compiler agree; run the CI clippy command; and fix everything the
 new release reports in that same pull request. Never lower the pin to make a new lint

@@ -100,6 +100,22 @@ for f in "${DOCKERFILES[@]}"; do
     [[ -f $f ]] || report "container build: $f does not exist"
 done
 
+# The loop above asserts that every listed file exists. On its own that leaves the list
+# open in the other direction: a Dockerfile added anywhere in the repository tomorrow
+# selects a compiler for this workspace's crates and passes unseen, which is exactly how
+# `templates/personal-relay/README.md` shipped naming Rust 1.85. Requiring the two sets to
+# be equal closes both directions, so a new container build fails this gate the day it
+# lands rather than the morning the pin moves.
+# `--untracked` matters: a container build added but not yet committed is exactly the case
+# a pre-commit or pre-push run has to catch, and plain `git grep` searches only the index.
+discovered=$(git grep -l --untracked -E '^[Ff][Rr][Oo][Mm][[:space:]]+(--[a-z-]+=[^[:space:]]+[[:space:]]+)*rust:' -- . 2>/dev/null | sort || true)
+listed=$(printf '%s\n' "${DOCKERFILES[@]}" | sort)
+if [[ $discovered != "$listed" ]]; then
+    unlisted=$(comm -23 <(printf '%s\n' "$discovered") <(printf '%s\n' "$listed") | tr '\n' ' ')
+    [[ -z ${unlisted// /} ]] ||
+        report "these files carry a 'FROM rust:' line and DOCKERFILES does not name them: $unlisted"
+fi
+
 # The toolchain table names four tools. Checking only `rustc` would let the clippy row
 # — the tool whose version caused the outage — go stale inside the governing standard.
 for tool in rustc cargo clippy rustfmt; do
@@ -137,10 +153,11 @@ fi
 # does not name — the drift this gate exists to stop, admitted by the gate itself.
 # Reduce every `FROM` line to `<image>:<tag>`, so each check below matches one shape
 # instead of carrying its own spelling of the optional parts. Docker allows flags such as
-# `--platform=` before the image and a `@sha256:` digest after the tag, and a stage name is
-# optional; none of those change which image the line selects.
+# `--platform=` before the image and a `@sha256:` digest after the tag, a stage name is
+# optional, and the keyword itself is case-insensitive; none of those change which image
+# the line selects.
 from_images() {
-    sed -nE 's|^FROM[[:space:]]+(--[a-z-]+=[^[:space:]]+[[:space:]]+)*([^[:space:]@]+).*|\2|p' "$1"
+    sed -nE 's|^[Ff][Rr][Oo][Mm][[:space:]]+(--[a-z-]+=[^[:space:]]+[[:space:]]+)*([^[:space:]@]+).*|\2|p' "$1"
 }
 
 # Debian names each release twice — `debian:12-slim` and `debian:bookworm-slim` are the
@@ -229,8 +246,10 @@ fi
 # target list together with its channel.
 # Read the whole `targets = [ .. ]` array, however it is wrapped: TOML accepts it inline on
 # one line or spread over several, and matching quoted strings line by line reads nothing
-# from the inline form and then passes. Fail closed when either list is absent.
-pin_targets=$(tr '\n' ' ' < rust-toolchain.toml |
+# from the inline form and then passes. Strip comments first, so a commented-out or
+# illustrative array later in the file cannot become the one the check reads. Fail closed
+# when either list is absent.
+pin_targets=$(sed 's/#.*//' rust-toolchain.toml | tr '\n' ' ' |
     sed -nE 's/.*targets[[:space:]]*=[[:space:]]*\[([^]]*)\].*/\1/p' |
     tr ',' '\n' | sed -nE 's/[^"]*"([^"]+)".*/\1/p')
 mise_targets=$(sed -nE 's/^[[:space:]]*rust[[:space:]]*=.*targets[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' .mise.toml | tr ',' '\n')
