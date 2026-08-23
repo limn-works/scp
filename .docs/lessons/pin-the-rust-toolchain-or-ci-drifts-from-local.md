@@ -16,24 +16,25 @@ fails for a reason nobody changed and nobody can reproduce.
 ## What Happened
 
 Rust 1.98.0 shipped on 2026-08-20. Its clippy added two lints, and they sit in different
-groups, which matters for what a reader concludes. `chunks_exact_to_as_chunks` is a `style`
-lint, warn by default and a member of `clippy::all`; it fires with no group flags at all.
-`unused_async_trait_impl` is allow by default and reaches this workspace through the
-`pedantic` group. `[workspace.lints.clippy]` enables `all`, `pedantic`, `nursery`, and
-`cargo` at `warn`, and CI escalates every one with `-D warnings`. Dropping `pedantic`
-would therefore not have prevented the outage: the style lint would still have fired.
-Every branch in the merge queue started failing `Rust / clippy` the next morning against
-code no one had touched. Local machines were still on 1.97.1, so running the exact CI command locally
-printed a clean pass, and one agent reported the failure as unreproducible.
+groups. `chunks_exact_to_as_chunks` is a `style` lint, warn by default and a member of
+`clippy::all`, so it fires with no group flags at all. `unused_async_trait_impl` is allow
+by default and reaches this workspace through the `pedantic` group.
+`[workspace.lints.clippy]` enables `all`, `pedantic`, `nursery`, and `cargo` at `warn`,
+and CI escalates every one with `-D warnings`. Dropping `pedantic` would therefore not
+have prevented the outage, because the style lint would still have fired.
+
+Every branch in the merge queue started failing `Rust / clippy` the next morning, against
+code no one had touched. Local machines were still on 1.97.1, so running the exact CI
+command locally printed a clean pass, and one agent reported the failure as
+unreproducible.
 
 CLAUDE.md requires running CI locally before pushing. That requirement decides nothing
 while the two runs resolve to different compilers.
 
 ## The Fix
 
-Counting the places that select a Rust version is the part a reviewer has to check, and
-the first count was wrong. Four locations name the stable version and now all name
-`1.98.0`:
+Four locations name the stable version, and all four now name `1.98.0`. The first draft of
+this fix named two of them:
 
 - `rust-toolchain.toml` at the repository root pins `channel`, the `clippy` and `rustfmt`
   components, and every cross-compilation target some CI job builds for. Listing the
@@ -50,14 +51,15 @@ the first count was wrong. Four locations name the stable version and now all na
   `.docs/standards/` upstream of code. A standard reading "stable (latest)" while a file
   pins a version makes the pin contradict its own governing artifact.
 
-Two more locations name the nightly the standalone fuzz crate needs:
-`fuzz/rust-toolchain.toml` and the `FUZZ_TOOLCHAIN` environment variable in
-`.github/workflows/fuzz.yml`.
+Three more name the nightly that the standalone fuzz crate needs:
+`fuzz/rust-toolchain.toml`, and the `FUZZ_TOOLCHAIN` environment variable in
+`.github/workflows/fuzz.yml` and in `.github/workflows/ci.yml`.
 
-`scripts/check-toolchain-pin.sh` reads all six and requires exact equality. The gate is
-closed by construction — a fixed list of locations, one version string extracted from
-each — rather than a scan for version-shaped strings, so it admits nothing it was not told
-to check. A comment asking several files to agree is not enforcement, and the repository's
+`scripts/check-toolchain-pin.sh` reads all seven and requires exact equality. It also
+compares `rustc --version` against the pin, because file agreement leaves the compiler
+itself unchecked. The gate reads a fixed list of locations and extracts one version string
+from each, so it admits nothing it was not told to check; it never scans for
+version-shaped strings. A comment asking several files to agree is not enforcement, and the repository's
 own tenet is to enforce mechanically.
 
 `.github/workflows/fuzz.yml` now names the nightly on every `cargo` command. Those steps
@@ -69,10 +71,10 @@ Auditing those steps turned up a second defect that had nothing to do with the p
 three fuzz jobs referenced the action as `dtolnay/rust-toolchain@nightly-2026-05-03`, and
 that repository publishes `master`, `stable`, `beta`, `nightly`, and a branch per released
 version — but no dated-nightly branch. The ref never resolved, so every scheduled Fuzz run
-failed at job setup with "unable to find version"
-and the fuzzer had not executed since the ref was introduced. A green pull request tells
-you nothing about a workflow that runs on a schedule. Naming the date through the
-`toolchain` input of `@master` — the form `ci.yml` already used — is the working shape.
+failed at job setup with "unable to find version", and the fuzzer had not executed since
+the ref was introduced. No pull request runs the scheduled Fuzz workflow, so its ten
+consecutive failures never appeared on one. Naming the date through the `toolchain` input
+of `@master`, the form `ci.yml` already used, gives a ref that resolves.
 
 ## Raising the Pin
 
@@ -80,10 +82,13 @@ Bumping Rust is a change someone makes on purpose:
 
 1. Raise the version in `rust-toolchain.toml`, `.mise.toml`, `Dockerfile`, and
    `.docs/standards/rust.md`.
-2. Run `bash scripts/check-toolchain-pin.sh`, which fails until all four agree.
-3. Run the CI clippy command from the "Orchestrator verification protocol" section of
+2. Run `mise install`. mise's `RUSTUP_TOOLCHAIN` keeps selecting the previous compiler
+   until it does, so the step before this one changes no build.
+3. Run `bash scripts/check-toolchain-pin.sh`, which fails until all four locations and the
+   active compiler agree.
+4. Run the CI clippy command from the "Orchestrator verification protocol" section of
    CLAUDE.md.
-4. Fix everything the new release reports, in that same pull request.
+5. Fix everything the new release reports, in that same pull request.
 
-A new stable release reporting new lints is then a scheduled piece of work, not an
-overnight outage of the merge queue.
+A new stable release then reports its lints to whoever raised the pin, on the pull request
+that raised it.

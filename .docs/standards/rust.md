@@ -17,9 +17,9 @@ Rust coding standards, safety rules, linting, formatting, testing, and CI for th
 **The compiler version is pinned, and raising it is a deliberate change.** Four locations
 name the stable version: `rust-toolchain.toml` at the repository root (which also names the
 `clippy` and `rustfmt` components and every cross-compilation target CI builds for),
-`.mise.toml`, `Dockerfile`, and the table above. Two more name the nightly cargo-fuzz needs:
-`fuzz/rust-toolchain.toml` and the `FUZZ_TOOLCHAIN` environment variable in both
-`.github/workflows/fuzz.yml` and `.github/workflows/ci.yml`.
+`.mise.toml`, `Dockerfile`, and the table above. Three more name the nightly that cargo-fuzz
+needs: `fuzz/rust-toolchain.toml`, and the `FUZZ_TOOLCHAIN` environment variable in
+`.github/workflows/fuzz.yml` and in `.github/workflows/ci.yml`.
 `scripts/check-toolchain-pin.sh` fails when any of them disagree, and also when the compiler
 a command in the repository resolves to is not the pinned one.
 
@@ -34,14 +34,18 @@ on 2026-08-20 with two new lints — one warn-by-default `style` lint and one `p
 lint, so no group setting would have avoided it — and the `Rust / clippy` required check failed
 on every branch overnight while local runs on 1.97.1 reported a clean pass. To raise the
 version: change `rust-toolchain.toml`, `.mise.toml`, `Dockerfile`, and the table above
-together; run `bash scripts/check-toolchain-pin.sh`, which fails until they agree; run the
-CI clippy command; and fix everything the new release reports in that same pull request.
-Never lower the pin to make a new lint disappear.
+together; run `mise install`, because mise's `RUSTUP_TOOLCHAIN` keeps selecting the old
+compiler until it does; run `bash scripts/check-toolchain-pin.sh`, which fails until every
+location and the active compiler agree; run the CI clippy command; and fix everything the
+new release reports in that same pull request. Never lower the pin to make a new lint
+disappear.
 
-The `Dockerfile` tag names a Debian release as well as a compiler version. Keep the builder
-stage and the runtime stage on the same one: `rust:1.98.0-slim` is a Debian 13 image, the
-runtime stage runs Debian 12, and glibc is backward compatible only, so binaries built on
-the newer release fail to exec on the older. See
+The `Dockerfile` tag selects a Debian release as well as a compiler version, so name the
+release explicitly and give the builder stage the same one the runtime stage uses. The
+builder currently reads `rust:1.98.0-slim-bookworm` and the runtime reads
+`debian:bookworm-slim`, which are both Debian 12. Writing `rust:1.98.0-slim` instead would
+select Debian 13, and because glibc is backward compatible only, a binary the builder
+linked against that release's glibc 2.41 fails to exec against Debian 12's glibc 2.36. See
 `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
 
 ## Safety Rules
@@ -148,11 +152,11 @@ proptest! {
 
 SCP uses cargo-fuzz (libFuzzer) for parser safety and security invariant testing at trust
 boundaries. The fuzz crate lives at `fuzz/` (repo root) — a **standalone crate, not a
-workspace member**. All `cargo fuzz` commands require the one nightly `fuzz/rust-toolchain.toml` pins —
+workspace member**. All `cargo fuzz` commands require the one nightly that `fuzz/rust-toolchain.toml` pins —
 nightlies after that date reject openmls 0.8.1's prelude re-export (E0365):
 
 ```sh
-cargo +nightly-2026-05-03 fuzz list --fuzz-dir fuzz          # list all 19 targets
+cargo +nightly-2026-05-03 fuzz list --fuzz-dir fuzz          # list all 27 targets
 cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz \
   -- -dict=fuzz/dicts/<dict> -max_total_time=60    # run one target locally
 cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml  # compile-check (no fuzzing)

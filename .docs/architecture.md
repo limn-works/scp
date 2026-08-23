@@ -1211,7 +1211,7 @@ Build:
   • Security audit
   • Governance models beyond single-admin — DONE: GovernanceEngine trait with SingleAdmin,
     Threshold (M-of-N), Majority, and Unanimity models (ADR-031, SCP-129–133)
-  • Fuzzing infrastructure — DONE: standalone fuzz/ crate, 19 targets across 4 tiers,
+  • Fuzzing infrastructure — DONE: standalone fuzz/ crate, 27 targets across 4 tiers,
     nightly + weekly CI campaigns (ADR-045, PRs #1643–1645)
 
 Test:
