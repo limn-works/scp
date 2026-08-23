@@ -376,10 +376,13 @@ and revert every change the advisory did not require. Prove the result resolves 
 `cargo metadata --locked --all-features`.
 
 **Verifying.** Run the cargo-deny version `EmbarkStudios/cargo-deny-action@v2` pins, not
-whatever `cargo install` left on the machine. An older cargo-deny misses whole advisory
-classes — 0.19.0 reports nothing for the `unsound` class that 0.20.2 raises as an error —
-so a green run from the wrong binary proves nothing, and an `advisory-not-detected`
-warning from the wrong binary marks a live entry as unnecessary. Count every copy of the crate in
+whatever `cargo install` left on the machine. CI's verdict is the one that gates the merge,
+so a local run only predicts CI when the binary matches. `.mise.toml` declares
+`"cargo:cargo-deny" = "latest"`, which pins nothing and drifts, so check the installed
+version rather than assuming the toolchain manifest supplied the pinned one. Two
+diagnostics decide the outcome and both are version-sensitive: an `error` fails the run,
+and an `advisory-not-detected` warning marks an ignore entry as unnecessary. Do not delete
+an entry on an `advisory-not-detected` from an unpinned binary. Count every copy of the crate in
 `Cargo.lock` before calling an advisory cleared: a bump that adds a patched version on top
 of unpatched duplicates leaves the unpatched ones compiling into the shipped artifact.
 Measured on 0.20.2, cargo-deny does emit one diagnostic per affected copy — both

@@ -3854,8 +3854,9 @@ export class SCP {
    *
    * With no identity in `dataDir` this build fails on every run, not only the
    * first: none of this SDK's create calls mints one, so nothing it offers seeds
-   * that directory. The reload branch fires only against a directory a `testing`
-   * build already seeded. Passing `identityDid` does not help either. Every
+   * that directory. The reload branch needs a directory that already holds an
+   * identity record, and a custody holding that record's key handles. Passing
+   * `identityDid` does not help either. Every
    * writer to the identity registry — create, migrate, rotate-key, add-agent,
    * rotate-agent, remove-agent — either fails closed on a shipped build before it
    * writes, or needs an entry already present, so the registry never fills.

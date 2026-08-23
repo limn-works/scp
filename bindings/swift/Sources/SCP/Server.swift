@@ -186,8 +186,9 @@ public struct Node: Sendable {
     ///
     /// With no identity in `dataDir` this build fails on every run, not only the
     /// first: none of this SDK's create calls mints one, so nothing it offers seeds
-    /// that directory. The reload branch fires only against a directory a `testing`
-    /// build already seeded. Passing `identity` does not help either, for a
+    /// that directory. The reload branch needs a directory that already holds an
+    /// identity record, and a custody holding that record's key handles. Passing
+    /// `identity` does not help either, for a
     /// reason specific to this bridge: see the `SCP-IDENT-1013` note below.
     ///
     /// On a shipped build, supplying `identity` does not work either: UniFFI's
