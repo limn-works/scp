@@ -111,9 +111,6 @@ target, so a `required-features` declaration no longer removes one from the coun
 revert stands on its own ground, which is that the declaration asserted a build failure
 that does not happen.
 
-See `.docs/lessons/first-boot-testing-needs-an-empty-state-directory.md` for the
-measurement trap that nearly refuted one of the findings above.
-
 ## Measure a gate against the defect, never against the fixed tree
 
 The workspace-wide line was written, run against the **fixed** tree, observed green, and
@@ -151,6 +148,21 @@ Touch the file before measuring, and treat an unexpected exit 0 as a suspected
 stale artifact rather than as proof the defect is absent — the failure mode of a
 gate measurement and the failure mode it is meant to detect look identical from
 the exit code alone.
+
+**A run that reads persisted state returns the null result too.** A reviewer
+reported that `crates/scp-node/examples/website.rs` compiles on default features
+and still exits 1 at run time. Running the example printed
+`Site is live — open: http://localhost:18099/`, which reads as a refutation of the
+report. The run refuted nothing. It found an identity under `$XDG_DATA_HOME/scp/node`
+that an earlier run had persisted, so it took the branch that loads an identity and
+never reached the branch that creates one. Pointing `XDG_DATA_HOME` at an empty
+directory and running the example again reproduced the reviewer's report exactly:
+the program exited 1 and printed `NodeBuild("identity error: no production
+pre-rotation custody backend available; ...")`. The example's own doc comment in
+`crates/scp-node/examples/website.rs` quotes the full message.
+
+So point every state directory the program reads at an empty one before you measure
+behavior that a populated directory changes.
 
 When a gate's comment overstates its reach, the next author reads the comment, believes
 the property is proven, and stops checking. That is the extrapolation-as-contract failure
