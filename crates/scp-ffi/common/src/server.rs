@@ -50,8 +50,11 @@ pub type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>;
 ///
 /// When `Some(NodeIdentity)` is passed to [`start_node_in_memory`] or
 /// [`start_node_local`], the node uses this identity instead of generating
-/// a fresh one. This enables identity portability — the same DID persists
-/// across node restarts and can be shared across FFI bridge instances.
+/// a fresh one. On a `testing` build that enables identity portability — the
+/// same DID persists across node restarts and can be shared across FFI bridge
+/// instances. On a shipped build a caller has no way to obtain one: `PyO3` and
+/// napi resolve it from an identity registry that never fills, and `UniFFI`
+/// rejects any supplied identity with `SCP-IDENT-1013`.
 pub struct NodeIdentity {
     /// The SCP identity containing key handles and DID string.
     pub identity: ScpIdentity,
@@ -404,8 +407,10 @@ pub async fn start_node_in_memory(
 /// # Identity modes
 ///
 /// When `identity` is `Some(NodeIdentity)`, the node uses the pre-existing
-/// identity. This enables identity portability — the same DID persists
-/// across node restarts and can be shared across FFI bridge instances.
+/// identity. On a `testing` build that enables identity portability — the same
+/// DID persists across node restarts and can be shared across FFI bridge
+/// instances. On a shipped build see the note on [`NodeIdentity`]: no bridge
+/// gives a caller a way to obtain one.
 ///
 /// When `identity` is `None`, the node reloads a persistent identity via
 /// [`FileKeyCustody`](scp_platform::file::FileKeyCustody), whose keystore is
