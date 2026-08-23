@@ -25,7 +25,7 @@ traditional web server and no DNS.
 ### Local demo vs public hosting
 
 The example is a **LOCAL demo**: `HostSiteConfig::defaults(Reach::Local)` with
-`tls: TlsMode::Plaintext` and `dht: DhtMode::Memory` — no NAT probe, no router
+`tls: TlsMode::Plaintext` and `dht: DhtMode::Disabled` — no NAT probe, no router
 port opened, nothing published. (The source doc-comment explains each choice.)
 
 For **public hosting** (direct IP, outbound tunnel, or reverse proxy), see the

@@ -1156,7 +1156,7 @@ async fn skip_nat_probe_uses_loopback_relay_url_without_probing() {
     let http_port = 28444u16;
 
     // `Reach::Local` skips the NAT probe (the flat-config equivalent of
-    // `no_domain().skip_nat_probe()`). Local is non-publishing → `DhtMode::Memory`
+    // `no_domain().skip_nat_probe()`). Local is non-publishing → `DhtMode::Disabled`
     // (the default). The `PanicOnProbeNatStrategy` is still supplied via
     // `NatSlot::Custom`: a clean build proves `Local` short-circuited the probe
     // before `select_tier` was ever called.

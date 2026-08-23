@@ -1695,13 +1695,14 @@ mod tests {
     // --- Test 12: NatTraversal + DhtMode::Disabled is VALID --------------------
 
     #[tokio::test]
-    async fn nat_traversal_plus_dht_memory_is_valid() {
+    async fn nat_traversal_plus_dht_disabled_is_valid() {
         // `Reach::NatTraversal` + `DhtMode::Disabled` is the first-class
         // "reachable-but-not-DHT-discoverable" config: publicly reachable via NAT
         // traversal, but the address is NOT published to the DHT (share it
-        // out-of-band). `Memory` is the fail-safe, non-disclosing direction and
-        // must never be rejected; only `DhtMode::Production` discloses (M2). This
-        // is exactly the `SCP_NODE_DHT_MODE=memory` capability the binary exposes.
+        // out-of-band). `Disabled` is the fail-safe, non-disclosing direction and
+        // must never be rejected; only `DhtMode::Production` discloses (M2). The
+        // `--self-host` path honours `SCP_NODE_DHT_MODE=disabled` for this config;
+        // the full relay node rejects it, because it must publish its DID.
         let external_addr = SocketAddr::from(([198, 51, 100, 7], 32891));
         let node = Node::start_for_testing(NodeConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
