@@ -3,12 +3,19 @@
 # canned repositories.
 #
 # WHAT THIS TESTS.
-#   * Check 1 fails when a file that builds from a `rust` base image does not carry the
+#   * Check 1 fails when a file Docker builds from a `rust` base image does not carry the
 #     ASSERT-PINNED-RUSTC block verbatim, and stays silent when it does. "Verbatim" means
 #     the three lines, in order, unbroken: a file keeping one line of the block, and a file
 #     holding all three in reverse order, each fail. Those two cases exist because
 #     `grep -F` splits a pattern holding newlines into one pattern per line and matches
 #     when any single one matches, so the earlier `grep -qzF` comparison passed both.
+#   * Check 1 decides which files Docker builds by path: a basename Docker builds
+#     (`Dockerfile`, `Dockerfile.<suffix>`, `<prefix>.Dockerfile`, and the `Containerfile`
+#     spellings), and the BUILT_FROM_DOCUMENTATION list. Prose that only quotes a container
+#     build carries no assertion, and the cases below cover both directions: a quotation the
+#     gate's QUOTES_A_CONTAINER_BUILD list names passes, and one neither list names fails
+#     with the message that asks its author which of the two it is. A quotation entry naming
+#     a file Docker builds by name is a contradiction the gate reports.
 #   * Check 2 fails when the `toolchain` filter does not hold the pin, when an output of
 #     the `changes` job does not OR that filter in, when the `fuzz` filter drops `fuzz/**`,
 #     and when a root-level file is listed in no filter and declared in no exemption. Each
@@ -21,11 +28,13 @@
 #     the whole repository, which overrides `fuzz/rust-toolchain.toml` and puts every
 #     `cargo fuzz` command on the workspace's stable compiler.
 #
-# HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, copies the gate into
+# HOW EACH CASE IS BUILT. `run_case` makes a temporary directory, writes the gate into
 # `scripts/`, runs `git init` so the gate's `git grep` search and its root-file listing have
-# a work tree, and writes the case's `ci.yml`, `.mise.toml`, optional `Dockerfile`, and
-# optional extra root files. The gate `cd`s to its own parent's parent, so that directory
-# becomes its repository root.
+# a work tree, and writes the case's `ci.yml`, `.mise.toml`, optional `Dockerfile`, optional
+# extra root file, and every path in EXTRA_FILES. The gate `cd`s to its own parent's parent,
+# so that directory becomes its repository root. No canned repository holds
+# `templates/personal-relay/README.md`, the one path BUILT_FROM_DOCUMENTATION names, so
+# every case also proves that a list entry naming an absent file reports nothing.
 #
 # Exit 0 when every case matches its expectation, 1 otherwise.
 
@@ -59,10 +68,18 @@ failed=0
 #                     writes a `rust` key under `[tools]`, "idiomatic" writes the
 #                     `idiomatic_version_file_enable_tools` setting, "absent" writes no file.
 #   EXTRA_ROOT_FILE — one more root-level file to create, or "" for none.
+#   EXTRA_FILES     — path and producer-function name, in pairs, for files below the root.
+#                     `run_case` creates each parent directory.
+#   GATE_TRANSFORM  — the name of a function that rewrites the gate on its way into the
+#                     canned repository, or "" to copy the gate unchanged. One case uses it
+#                     to put a name Docker builds into the gate's own quotation list, which
+#                     no repository file can do.
 OMIT_OUTPUT=""
 OMIT_FILTER=""
 MISE_SOURCE="none"
 EXTRA_ROOT_FILE=""
+EXTRA_FILES=()
+GATE_TRANSFORM=""
 
 # Every output the canned `changes` job declares. `fuzz` is last and is the one output the
 # gate exempts, because `fuzz-build` compiles from `fuzz/` on a different toolchain file.
@@ -186,13 +203,24 @@ run_case() {
 
     root="$TMP_PARENT/$name"
     mkdir -p "$root/scripts" "$root/.github/workflows"
-    cp "$CHECK" "$root/scripts/"
+    if [[ -n $GATE_TRANSFORM ]]; then
+        "$GATE_TRANSFORM" < "$CHECK" > "$root/scripts/$(basename "$CHECK")"
+    else
+        cp "$CHECK" "$root/scripts/"
+    fi
     git -C "$root" init -q
     "$ci_producer" > "$root/.github/workflows/ci.yml"
     "$mise_producer" > "$root/.mise.toml"
     [[ -s "$root/.mise.toml" ]] || rm -f "$root/.mise.toml"
     [[ -n $docker_producer ]] && "$docker_producer" > "$root/Dockerfile"
     [[ -n $EXTRA_ROOT_FILE ]] && printf 'contents\n' > "$root/$EXTRA_ROOT_FILE"
+    local i
+    if (( ${#EXTRA_FILES[@]} > 0 )); then
+        for (( i = 0; i < ${#EXTRA_FILES[@]}; i += 2 )); do
+            mkdir -p "$root/$(dirname "${EXTRA_FILES[i]}")"
+            "${EXTRA_FILES[i + 1]}" > "$root/${EXTRA_FILES[i]}"
+        done
+    fi
 
     output=$(bash "$root/scripts/$(basename "$CHECK")" 2>&1)
     actual_exit=$?
@@ -434,6 +462,134 @@ COPY --from=builder /app/target/release/scp-relay /usr/local/bin/scp-relay
 DOCKER
 }
 run_case "container-names-no-rust-image" 0 "" routing_ok mise_ok docker_names_no_rust_image
+
+# A `Dockerfile` whose keyword carries leading whitespace and lowercase letters. Docker
+# accepts both, so the gate's assertion requirement has to reach this file. The name rule
+# discovers it whatever its `FROM` lines look like, and the matcher then reads them.
+docker_indents_a_lowercase_from() {
+    cat <<'DOCKER'
+  from rust:slim-bookworm AS builder
+WORKDIR /app
+COPY rust-toolchain.toml rust-toolchain.toml
+RUN cargo build --release
+DOCKER
+}
+run_case "container-indents-a-lowercase-from" 1 \
+    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok mise_ok \
+    docker_indents_a_lowercase_from
+
+# ── Check 1: which files Docker builds, and which only quote one ─────────────────────
+
+# The names `docker build` reads. Each lives below the repository root, so check 2c's
+# root-file enumeration does not report it and check 1 is the only source of a finding.
+EXTRA_FILES=("deploy/Dockerfile.relay" docker_omits_the_block)
+run_case "suffixed-dockerfile-name-needs-the-assertion" 1 \
+    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok mise_ok
+
+EXTRA_FILES=("deploy/relay.Dockerfile" docker_omits_the_block)
+run_case "prefixed-dockerfile-name-needs-the-assertion" 1 \
+    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok mise_ok
+
+EXTRA_FILES=("deploy/Containerfile" docker_omits_the_block)
+run_case "containerfile-name-needs-the-assertion" 1 \
+    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok mise_ok
+EXTRA_FILES=()
+
+# Prose quoting a container build, which nobody builds. An earlier revision of the gate
+# searched every file in the tree for a line-initial `FROM` and demanded the assertion from
+# whatever it found, so this document failed a required check that runs on every pull
+# request. The gate now asks its author to classify it.
+doc_quotes_a_container_build() {
+    cat <<'DOC'
+# How the relay image resolves its compiler
+
+The builder stage opens on a Rust base image:
+
+```dockerfile
+FROM rust:bookworm AS builder
+WORKDIR /build
+```
+
+The tag names a Debian release, so the copied-in pin decides the compiler.
+DOC
+}
+
+EXTRA_FILES=(".docs/adrs/adr-099-container-build.md" doc_quotes_a_container_build)
+run_case "prose-quoting-a-container-build-is-unclassified" 1 \
+    "holds a FROM line naming a 'rust' base image, and neither list in this gate classifies it" \
+    routing_ok mise_ok
+
+# The same document at the one path the gate's QUOTES_A_CONTAINER_BUILD list names. The
+# gate reads that list, so the document needs no assertion and reports nothing.
+EXTRA_FILES=("scripts/tests/toolchain-wiring/run-tests.sh" doc_quotes_a_container_build)
+run_case "prose-declared-a-quotation-carries-no-assertion" 0 "" routing_ok mise_ok
+EXTRA_FILES=()
+
+# Prose whose block a reader is told to save and build. `templates/personal-relay/README.md`
+# is the path BUILT_FROM_DOCUMENTATION names, so the assertion requirement reaches it.
+doc_recipe_without_the_assertion() {
+    cat <<'DOC'
+# Personal relay
+
+Save the block below as `Dockerfile`, then build it from the repository root.
+
+```dockerfile
+FROM rust:bookworm AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release
+```
+DOC
+}
+EXTRA_FILES=("templates/personal-relay/README.md" doc_recipe_without_the_assertion)
+run_case "documented-recipe-without-the-assertion" 1 \
+    "does not carry the ASSERT-PINNED-RUSTC block verbatim" routing_ok mise_ok
+
+doc_recipe_with_the_assertion() {
+    cat <<'DOC'
+# Personal relay
+
+Save the block below as `Dockerfile`, then build it from the repository root.
+
+```dockerfile
+FROM rust:bookworm AS builder
+WORKDIR /build
+COPY . .
+RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"; \
+    got="$(rustc --version | cut -d' ' -f2)"; \
+    [ -n "$pin" ] && [ "$got" = "$pin" ] || { echo "image resolved rustc '$got'; rust-toolchain.toml names '$pin'" >&2; exit 1; }
+RUN cargo build --release
+```
+DOC
+}
+EXTRA_FILES=("templates/personal-relay/README.md" doc_recipe_with_the_assertion)
+run_case "documented-recipe-with-the-assertion" 0 "" routing_ok mise_ok
+EXTRA_FILES=()
+
+# A SQL query whose `FROM` clause opens a line. The matcher requires the token `rust`
+# followed by a tag, whitespace, or the end of the line, so `rust_crates` does not match and
+# the file needs no entry in either list.
+sql_selects_from_a_table() {
+    cat <<'SQL'
+SELECT id, name
+FROM rust_crates
+WHERE published_at > now();
+SQL
+}
+EXTRA_FILES=("crates/scp-node/queries/crates.sql" sql_selects_from_a_table)
+run_case "sql-from-clause-is-not-a-container-build" 0 "" routing_ok mise_ok
+EXTRA_FILES=()
+
+# The gate's quotation list naming a file Docker builds by name. No repository file can
+# produce this case, so the transform below writes the entry into the gate itself. The gate
+# reports the contradiction, and the name rule still demands the assertion from that file.
+gate_declares_a_dockerfile_a_quotation() {
+    awk '{ print } /^read -r -d .. QUOTES_A_CONTAINER_BUILD/ { print "Dockerfile" }'
+}
+GATE_TRANSFORM=gate_declares_a_dockerfile_a_quotation
+run_case "quotation-list-cannot-name-a-file-docker-builds" 1 \
+    "whose basename is a name Docker builds" routing_ok mise_ok docker_omits_the_block
+GATE_TRANSFORM=""
 
 echo ""
 echo "toolchain-wiring cases: $passed passed, $failed failed"

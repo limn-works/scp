@@ -59,11 +59,22 @@ every branch overnight while local runs on 1.97.1 reported a clean pass. See
 `scripts/check-toolchain-wiring.sh` checks the three properties the derivation cannot
 supply.
 
-First, that every file building from a `rust` base image carries the ASSERT-PINNED-RUSTC
+First, that every file Docker builds from a `rust` base image carries the ASSERT-PINNED-RUSTC
 block: the base tag names a Debian release and no compiler, so the copied-in file is what
 selects the version, and those three lines make the build compare the compiler it resolved
 against the channel that file names. A container build without them compiles on whatever
 the image ships and succeeds.
+
+The gate decides which files Docker builds by path, through two rules. A basename Docker
+builds is one: `Dockerfile`, `Dockerfile.<suffix>`, `<prefix>.Dockerfile`, and the three
+`Containerfile` spellings. Prose the gate's own BUILT_FROM_DOCUMENTATION list names is the
+other, and `templates/personal-relay/README.md` is the entry there, because that document
+tells an operator to save its container block and build it. Prose that only quotes a
+container build carries no assertion; when such a document holds a `FROM` line naming a
+rust image, its author lists it in the gate's QUOTES_A_CONTAINER_BUILD instead, and the gate
+fails on a file neither list names. Writing a container build under a name outside the first
+rule is therefore still caught, and quoting a Dockerfile in an architecture decision record
+or a runbook no longer forces the author to break the quotation.
 
 Second, that `.github/workflows/ci.yml` routes a change to the jobs that build from it.
 Each job that compiles a crate of this workspace is guarded by

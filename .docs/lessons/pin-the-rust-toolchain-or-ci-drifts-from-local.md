@@ -286,7 +286,7 @@ version did not remove that obligation — it moved it, from the tag to the `COP
 `rust-toolchain.toml` into the image. A new Dockerfile that omits that copy compiles on
 whatever the base image ships and builds successfully, so the `docker-image` job cannot
 detect it. So the check moved with the obligation: `scripts/check-toolchain-wiring.sh` finds
-every file that builds from a `rust` base image and fails when it does not carry the
+every file Docker builds from a `rust` base image and fails when it does not carry the
 ASSERT-PINNED-RUSTC block, which makes the build itself compare the compiler it resolved
 against the copied-in pin.
 
@@ -388,6 +388,47 @@ comparison passed.
 The generalisation: **`grep -F` with a multi-line pattern is a line-membership test, and a
 comment claiming it compares "line for line and in order" describes a command grep does not
 offer.** When a check needs a block comparison, read the file and compare the block.
+
+## Searching for a Keyword Finds the Prose That Quotes It
+
+After the container check became a block comparison, its discovery step still searched every
+file in the tree: `git grep -l --untracked -E '^FROM[[:space:]]'`, then a second pattern
+that kept the files whose `FROM` line named a `rust` image. That search reads a Dockerfile
+and a Markdown file the same way, so a document that pasted a Dockerfile's first line into a
+fenced block became a file the gate demanded the three-line assertion from. The
+`enforcement / toolchain wiring` job runs on every pull request with no paths filter
+(`.github/workflows/ci.yml`, the `toolchain-wiring` job), so a documentation-only pull
+request failed a required check. Its author's two ways out were to paste build-time shell
+into the prose, or to write the sentence so `FROM` no longer opened a line — and that second
+edit also hides a real container build whose author typed a leading space.
+
+The gate's own header stated the opposite: "Under-detection is the failure mode; nothing this
+gate finds is rejected wrongly." That sentence was true of the criterion the header had
+written above it — "a file that Docker builds from a `rust` base image" — and false of the
+search that stood in for the criterion. CLAUDE.md names the failure: the search was an
+indicator list written in the register of a contract. A line-initial `FROM rust` accompanies
+a container build; it does not decide that Docker builds the file.
+
+What decides it is the path, so the gate now reads the path. A basename Docker builds is one
+rule: `Dockerfile`, `Dockerfile.<suffix>`, `<prefix>.Dockerfile`, and the three
+`Containerfile` spellings. The BUILT_FROM_DOCUMENTATION list is the other, and it names
+`templates/personal-relay/README.md`, whose block an operator is told to save and build. The
+tree-wide search survives as a classification check rather than as the discovery rule: a file
+outside both rules that holds a `FROM` line naming a rust image must appear in
+QUOTES_A_CONTAINER_BUILD, and the gate fails on a file neither list names. A container build
+kept under an unconventional name is therefore still caught, and its author says which of the
+two the file is.
+
+Reading the path also closed a gap the text search had. A `Dockerfile` that writes
+`  from rust:slim-bookworm` — indented and lowercase, both of which Docker accepts — escaped
+the old discovery search entirely. The name rule discovers that file whatever its `FROM`
+lines look like.
+
+The generalisation: **when a check asks whether a build system reads a file, the check reads
+what the build system reads — a path, a manifest entry, a workflow input — not a keyword the
+file's contents happen to carry.** A keyword search answers "does this text mention a
+container build", and a document that explains one mentions it exactly as loudly as a
+Dockerfile does.
 
 ## Raising the Pin
 

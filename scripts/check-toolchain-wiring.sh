@@ -9,34 +9,67 @@
 #
 # ── CHECK 1: every container build proves which compiler it resolved ─────────────────
 #
-# THE CRITERION. A file that Docker builds from a `rust` base image compiles this
-# workspace's crates on whatever compiler that image ships, unless the build brings
-# `rust-toolchain.toml` in and rustup resolves it. The property that decides whether the
-# build is correct is therefore the compiler the image actually resolves — not the text
-# of any COPY line.
+# THE CRITERION. Docker builds a file's contents, and a build whose base image is a `rust`
+# image compiles this workspace's crates on whatever compiler that image ships, unless the
+# build brings `rust-toolchain.toml` in and rustup resolves it. The property that decides
+# whether such a build is correct is the compiler the image actually resolves — not the
+# text of any COPY line.
 #
-# So the container files assert it themselves. Each one carries the ASSERT_BLOCK below
-# verbatim: three lines that read the channel out of the copied-in pin, read
-# `rustc --version`, and fail the build when they differ. The gate requires that every
-# discovered container file contains that block, and the block then proves the property
-# at build time.
+# So each such file asserts it itself. Each one carries the ASSERT_BLOCK below verbatim:
+# three lines that read the channel out of the copied-in pin, read `rustc --version`, and
+# fail the build when they differ. The gate requires the block, and the block then proves
+# the property at build time.
 #
-# Reading COPY lines instead does not converge, and two probes show why: a pin copied
-# into a stage that never compiles passes such a check, and a legitimate whole-context
-# copy written `COPY . /build` fails it. Docker's grammar admits many spellings of one
-# effect, and the stage graph decides which copy reaches which compile. One canonical
-# block, compared literally, has neither problem — and unlike a text check it cannot be
-# satisfied by a build whose compiler is wrong.
+# Reading COPY lines instead does not converge, and two probes show why: a pin copied into
+# a stage that never compiles passes such a check, and a legitimate whole-context copy
+# written `COPY . /build` fails it. Docker's grammar admits many spellings of one effect,
+# and the stage graph decides which copy reaches which compile. One canonical block,
+# compared literally, has neither problem — and unlike a text check it cannot be satisfied
+# by a build whose compiler is wrong.
 #
 # This replaces what the base tag used to say out loud. `FROM rust:1.98.0-slim-bookworm`
 # named the compiler, so a stale tag was a string a gate could read; `FROM rust:slim-
 # bookworm` names a Debian release and leaves the compiler to the copied-in file.
 #
-# WHAT THE SEARCH DOES NOT COVER, stated rather than implied: it matches a line-initial,
-# uppercase `FROM`, which is how every container file in this repository writes it and how
-# Docker's own documentation writes it. Docker also accepts a lowercase `from` and leading
-# whitespace, so a container file written that way is not discovered. Under-detection is
-# the failure mode; nothing this gate finds is rejected wrongly.
+# WHICH FILES DOCKER BUILDS. The gate decides that by path, through two rules, and not by
+# searching the tree for a `FROM` line:
+#
+#   * A file whose basename is `Dockerfile`, `Dockerfile.<suffix>`, `<prefix>.Dockerfile`,
+#     `Containerfile`, `Containerfile.<suffix>`, or `<prefix>.Containerfile`. `docker build`
+#     reads `Dockerfile` by default, and `docker build -f` conventionally names one of the
+#     others.
+#   * A file the BUILT_FROM_DOCUMENTATION list below names: prose holding a container block
+#     that the prose tells a reader to save and build. The block an operator runs is the
+#     build, so the obligation follows the block into the prose.
+#
+# Prose that quotes a container build is not a container build, and an earlier revision of
+# this gate could not tell the two apart. It searched every file in the tree for a
+# line-initial `FROM` naming a rust image and demanded the block from whatever it found, so
+# an architecture decision record or a runbook that pasted a Dockerfile's first two lines
+# into a fenced block failed `enforcement / toolchain wiring`, which every pull request
+# runs. That author had two ways out: paste three lines of build-time shell into the prose,
+# or break the quotation so `FROM` no longer opened a line. Breaking it that way also hides
+# a real container build whose author wrote a leading space.
+#
+# The tree-wide search survives as a classification check rather than as the discovery
+# rule. A file that neither rule above covers, and that holds a `FROM` line naming a rust
+# image, must appear in the QUOTES_A_CONTAINER_BUILD list below; the gate fails on a file
+# that appears in neither list. A container build kept under a name Docker does not
+# conventionally use is therefore still caught, and its author states which of the two the
+# file is instead of rewording a sentence. A file that no `FROM` line matches needs no
+# entry in either list, so ordinary prose costs an author nothing.
+#
+# Each list takes its entries at face value, which is the one judgement this check cannot
+# make. The gate rejects the one contradiction it can see: a QUOTES_A_CONTAINER_BUILD entry
+# whose basename is a name Docker builds. An entry naming a file that does not exist is
+# inert, and the gate skips it rather than reporting it.
+#
+# WHAT THE CLASSIFICATION SEARCH DOES NOT COVER, stated rather than implied: it matches a
+# `FROM` line that opens a line apart from leading whitespace, in either case. A container
+# build that reaches the keyword some other way — a line continuation, a file a script
+# generates, a Dockerfile packed into an archive — goes undiscovered when its name is one
+# the first rule does not cover. Under-detection is that search's failure mode. The
+# name rule carries no such gap, because it reads the path rather than the file's text.
 #
 # ── CHECK 2: the CI paths filters route a change to the jobs that build from it ──────
 #
@@ -118,45 +151,105 @@ report() {
 
 # ── Check 1 ──────────────────────────────────────────────────────────────────────────
 #
-# The canonical assertion, held here once. A container file must contain it verbatim.
-# Changing it means changing this string and every container file in the same commit,
+# The canonical assertion, held here once. A container build must contain it verbatim.
+# Changing it means changing this string and every container build in the same commit,
 # which is what makes the change deliberate.
 read -r -d '' ASSERT_BLOCK <<'BLOCK' || true
 RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"; \
     got="$(rustc --version | cut -d' ' -f2)"; \
     [ -n "$pin" ] && [ "$got" = "$pin" ] || { echo "image resolved rustc '$got'; rust-toolchain.toml names '$pin'" >&2; exit 1; }
 BLOCK
-# The heredoc ends the block with a newline; a container file may end there too, and
+# The heredoc ends the block with a newline; a container build may end there too, and
 # `$(cat …)` drops trailing newlines, so drop it here as well and compare what remains.
 ASSERT_BLOCK=${ASSERT_BLOCK%$'\n'}
 
-# `--untracked` matters: a container build added but not yet committed is exactly the case
-# a pre-push run has to catch, and plain `git grep` searches only the index. This file is
-# excluded because it necessarily contains the block it looks for.
+# Prose holding a container block that the prose tells a reader to save and build. Listing
+# a file here claims that Docker builds what it holds, so the file carries the assertion.
+read -r -d '' BUILT_FROM_DOCUMENTATION <<'LIST' || true
+templates/personal-relay/README.md
+LIST
+
+# Prose that quotes a container build nobody builds. Listing a file here claims that no
+# Docker build reads it, so the file carries no assertion.
+read -r -d '' QUOTES_A_CONTAINER_BUILD <<'LIST' || true
+scripts/tests/toolchain-wiring/run-tests.sh
+LIST
+
+# A `FROM` line naming a `rust` base image: opening a line apart from leading whitespace,
+# in either case, with or without a registry prefix and with or without a tag. A stage name
+# does not match, because `FROM chef AS builder` names no image whose compiler to pin.
+FROM_RUST_IMAGE='^[[:space:]]*FROM[[:space:]]+([a-z0-9._:-]+/)*rust(:[^[:space:]]*)?([[:space:]]|$)'
+
+# The names `docker build` reads: its default, and the two conventional spellings `-f`
+# names. Podman reads the `Containerfile` spellings, and `docker build -f` accepts them.
+docker_builds_by_name() {
+    case ${1##*/} in
+        Dockerfile | Dockerfile.* | *.Dockerfile) return 0 ;;
+        Containerfile | Containerfile.* | *.Containerfile) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A file Docker builds carries the block when it names a `rust` base image, and carries no
+# assertion otherwise: a runtime-only build runs no rustc, so the assertion would fail it.
+require_assertion() {
+    local f=$1 file_text
+    if ! grep -qiE "$FROM_RUST_IMAGE" "$f"; then
+        return 0
+    fi
+    # A byte-for-byte substring test over the whole file, so the block's three lines match
+    # in order and unbroken. `grep -F` cannot do this: it splits a pattern holding newlines
+    # into one pattern per line and matches when ANY of them matches, so a file keeping a
+    # single line of the block — or all three lines reversed — satisfies it. Measured on
+    # GNU grep 3.12, BSD grep 2.6.0-FreeBSD, and ugrep 7.8.4, with and without `-z`.
+    file_text=$(cat "$f")
+    if [[ $file_text != *"$ASSERT_BLOCK"* ]]; then
+        report "$f builds from a 'rust' base image and does not carry the ASSERT-PINNED-RUSTC block verbatim, so its build never checks which compiler the image resolved. Copy the block from $PIN's own consumer, the root Dockerfile, or from the ASSERT_BLOCK definition in this gate."
+    fi
+}
+
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    report "not inside a git working tree, so the gate cannot search for container builds"
+    report "not inside a git working tree, so the gate cannot enumerate the files Docker builds"
 else
+    # A quotation entry whose basename Docker builds contradicts the name rule, and it
+    # would exempt a real container build from the assertion.
+    while IFS= read -r quoted; do
+        [[ -n $quoted ]] || continue
+        if docker_builds_by_name "$quoted"; then
+            report "QUOTES_A_CONTAINER_BUILD in this gate lists $quoted, whose basename is a name Docker builds. A container build cannot be declared a quotation of one. Delete the entry, and copy the ASSERT-PINNED-RUSTC block into that file."
+        fi
+    done <<< "$QUOTES_A_CONTAINER_BUILD"
+
+    # `--others` matters: a container build added but not yet committed is exactly the case
+    # a pre-push run has to catch, and `--cached` alone lists only what the index holds.
+    tree_files=$(git ls-files --cached --others --exclude-standard 2>/dev/null || true)
+    if [[ -z $tree_files ]]; then
+        report "git listed no files, so the gate cannot enumerate the files Docker builds"
+    else
+        while IFS= read -r f; do
+            [[ -n $f ]] || continue
+            [[ -f $f ]] || continue
+            if docker_builds_by_name "$f"; then
+                require_assertion "$f"
+            fi
+        done <<< "$tree_files"
+    fi
+
+    while IFS= read -r doc; do
+        [[ -n $doc ]] || continue
+        [[ -f $doc ]] || continue
+        require_assertion "$doc"
+    done <<< "$BUILT_FROM_DOCUMENTATION"
+
+    # The classification search: every remaining file holding a `FROM` line that names a
+    # rust image is one the author has to classify.
     while IFS= read -r f; do
         [[ -n $f ]] || continue
-        # A container build of this workspace is one whose base image is a `rust` image.
-        # Match the image name after `FROM`, with or without a registry prefix or a tag,
-        # and ignore a stage name (`FROM chef AS builder` names no image to pin).
-        grep -qiE '^FROM[[:space:]]+([a-z0-9.:-]+/)*rust(:[^[:space:]]*)?([[:space:]]|$)' "$f" || continue
-        # A byte-for-byte substring test over the whole file, so the block's three lines
-        # match in order and unbroken. `grep -F` cannot do this: it splits a pattern
-        # holding newlines into one pattern per line and matches when ANY of them matches,
-        # so a file keeping a single line of the block — or all three lines reversed —
-        # satisfies it. Measured on GNU grep 3.12, BSD grep 2.6.0-FreeBSD, and ugrep 7.8.4,
-        # with and without `-z`.
-        file_text=$(cat "$f")
-        if [[ $file_text != *"$ASSERT_BLOCK"* ]]; then
-            report "$f builds from a 'rust' base image and does not carry the ASSERT-PINNED-RUSTC block verbatim, so its build never checks which compiler the image resolved. Copy the block from $PIN's own consumer, the root Dockerfile, or from the ASSERT_BLOCK definition in this gate."
-        fi
-        # This gate and its cases are excluded because both necessarily contain the lines
-        # they look for: the gate holds ASSERT_BLOCK, and the cases hold canned Dockerfiles
-        # that they write into temporary directories at run time.
-    done < <(git grep -l --untracked -E '^FROM[[:space:]]' \
-        -- . ':!scripts/check-toolchain-wiring.sh' ':!scripts/tests/toolchain-wiring/*')
+        if docker_builds_by_name "$f"; then continue; fi
+        if grep -qxF -- "$f" <<< "$BUILT_FROM_DOCUMENTATION"; then continue; fi
+        if grep -qxF -- "$f" <<< "$QUOTES_A_CONTAINER_BUILD"; then continue; fi
+        report "$f holds a FROM line naming a 'rust' base image, and neither list in this gate classifies it. When Docker builds what this file holds — directly, or because the text tells a reader to save the block and build it — list it in BUILT_FROM_DOCUMENTATION and copy the ASSERT-PINNED-RUSTC block into it. When the text only quotes a container build for a reader, list it in QUOTES_A_CONTAINER_BUILD."
+    done < <(git grep -l --untracked -iE "$FROM_RUST_IMAGE" -- . || true)
 fi
 
 # ── Check 2 ──────────────────────────────────────────────────────────────────────────
