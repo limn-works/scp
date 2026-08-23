@@ -41,16 +41,18 @@ after Caulfield.
 
 ## Eight rounds, twelve bypasses, and which ones the gate closes
 
-The table below has thirteen rows. Row 2 records an overclaim rather than a bypass, so
-twelve are bypasses, found across seven of the eight rounds. They do not share one root,
-and no single change closed them.
+The table below has thirteen rows. Two are not measured bypasses: row 2 records an
+overclaim, and row 8 is a hypothesis two reproduction attempts failed to demonstrate. The
+remaining eleven are measured bypasses, found across seven of the eight rounds. They do
+not share one root, and no single change closed them.
 
-Eleven are closed: rows 1, 3, 4a, 4c, 5, 6a, 6b, 7a, and 7b by the five mechanisms
-listed above, row 6c by reading with `while IFS= read -r` instead of word-splitting,
-and row 8 by the lib failing to compile under the injected cfg.
+Ten of the eleven are closed: rows 1, 3, 4a, 4c, 5, 6a, 6b, 7a, and 7b by the five
+mechanisms listed above, and row 6c by reading with `while IFS= read -r` instead of
+word-splitting.
 
-Row 4b (any nullifier other than `DhtMode::Memory`) is open and is meant to be: cargo
-gives an example its crate's dev-dependencies and no invocation switches that off.
+Row 4b (any nullifier other than `DhtMode::Memory`) is the one open bypass, and is meant
+to be: cargo gives an example its crate's dev-dependencies and no invocation switches that
+off.
 
 Row 8 (a `build.rs` injecting a cfg) is not demonstrated. Two attempts to reproduce it
 made the gate exit 1, because the injected cfg desynchronizes the lib from its dependency

@@ -3847,8 +3847,11 @@ export class SCP {
    * a shipped build rejects it with the message "node startup failed". The NAPI
    * layer attaches no code, so `mapBridgeError` defaults `ScpError.code` to
    * `SCP-UNKNOWN-0000`; match on the message, not the code. It fails closed
-   * rather than mint a nullifier-backed identity. Pass an explicit
-   * `identityDid`, or point `dataDir` at a directory that already holds one.
+   * rather than mint a nullifier-backed identity.
+   *
+   * This build fails on EVERY run, not only the first: no shipped path creates an
+   * identity anywhere, so nothing can put one in `dataDir` and nothing can hand
+   * you one to pass. Both remedies wait on a real pre-rotation backend.
    */
   async nodeStartLocal(
     dataDir: string,
