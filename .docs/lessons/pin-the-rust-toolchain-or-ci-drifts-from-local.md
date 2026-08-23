@@ -55,9 +55,13 @@ Three more name the nightly that the standalone fuzz crate needs:
 `fuzz/rust-toolchain.toml`, and the `FUZZ_TOOLCHAIN` environment variable in
 `.github/workflows/fuzz.yml` and in `.github/workflows/ci.yml`.
 
-`scripts/check-toolchain-pin.sh` reads all seven and requires exact equality. It also
-compares `rustc --version` against the pin, because file agreement leaves the compiler
-itself unchecked. The gate reads a fixed list of locations and extracts one version string
+`scripts/check-toolchain-pin.sh` reads all seven and requires exact equality. It checks two
+further properties that version agreement leaves open: that `rustc --version` in the
+repository equals the pin, and that `Dockerfile`'s builder stage and runtime stage name the
+same Debian release. The second one exists because the first draft of this fix broke it —
+`rust:1.85-slim` is a Debian 12 image and `rust:1.98.0-slim` is a Debian 13 one, so bumping
+the version alone moved the builder to glibc 2.41 while the runtime stayed on 2.36, and
+glibc is backward compatible only. The gate reads a fixed list of locations and extracts one version string
 from each, so it admits nothing it was not told to check; it never scans for
 version-shaped strings. A comment asking several files to agree is not enforcement, and the repository's
 own tenet is to enforce mechanically.

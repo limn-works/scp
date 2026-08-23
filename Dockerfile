@@ -30,8 +30,10 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Stage 3: Builder — cook deps then build
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-# Pin the compiler before cooking dependencies, so `cargo chef cook` and
-# `cargo build` below compile with the same one and the cached layer stays valid.
+# Give the cook step the pin, so a future tag naming a compiler other than the
+# pinned one cannot split the dependency build from the final build. The gate
+# rejects that tag today, which makes this a second line of defence rather than
+# the thing that keeps the two steps on one compiler.
 COPY rust-toolchain.toml rust-toolchain.toml
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .

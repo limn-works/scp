@@ -20,8 +20,9 @@ name the stable version: `rust-toolchain.toml` at the repository root (which als
 `.mise.toml`, `Dockerfile`, and the table above. Three more name the nightly that cargo-fuzz
 needs: `fuzz/rust-toolchain.toml`, and the `FUZZ_TOOLCHAIN` environment variable in
 `.github/workflows/fuzz.yml` and in `.github/workflows/ci.yml`.
-`scripts/check-toolchain-pin.sh` fails when any of them disagree, and also when the compiler
-a command in the repository resolves to is not the pinned one.
+`scripts/check-toolchain-pin.sh` fails when any of them disagree, when the compiler a command
+in the repository resolves to is not the pinned one, and when `Dockerfile`'s builder stage
+names a different Debian release than its runtime stage.
 
 `.mise.toml` has to match because mise sets `RUSTUP_TOOLCHAIN` for the commands it runs, and
 that variable overrides `rust-toolchain.toml` entirely — channel, components, and targets.

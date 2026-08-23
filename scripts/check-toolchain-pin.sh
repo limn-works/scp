@@ -16,7 +16,9 @@
 # Stable version — every one of these compiles the workspace:
 #   1. `rust-toolchain.toml`      channel                   — what plain `cargo` resolves to
 #   2. `.mise.toml`               rust version              — what a mise shell resolves to
-#   3. `Dockerfile`               every `FROM rust:` tag    — the container build
+#   3. `Dockerfile`               every `FROM rust:` tag    — the container build, and
+#                                 its `FROM debian:` stage, whose Debian release must
+#                                 equal the builder's
 #   4. `.docs/standards/rust.md`  rustc/cargo/clippy/rustfmt rows — the governing standard
 #
 # Nightly version — the standalone fuzz crate needs one, and cargo-fuzz does not run
@@ -133,6 +135,30 @@ while IFS= read -r tag; do
     [[ $base == "$pin_version" ]] ||
         report "Dockerfile builds on rust:$tag; rust-toolchain.toml names $pin_version"
 done <<< "$docker_versions"
+
+# The `FROM rust:` tag selects a Debian release as well as a compiler version, and the
+# runtime stage selects one too. glibc is backward compatible only, so a binary the builder
+# links against a newer release's glibc cannot exec on an older one, and the runtime
+# container dies at startup with "version `GLIBC_2.xx' not found". Requiring the version to
+# match leaves that unchecked, because the version is the part of the tag before the first
+# hyphen. Require both stages to name a release, and require the names to be equal. An
+# unsuffixed `rust:1.98.0-slim` names none, so it follows whichever Debian the rust image
+# currently defaults to and changes distribution under the build without the tag changing —
+# which is how `rust:1.85-slim` (Debian 12) became `rust:1.98.0-slim` (Debian 13) during
+# this pin's own first draft.
+builder_suites=$(sed -nE 's|^FROM rust:[^-]+-slim-([a-z]+)[[:space:]].*|\1|p' Dockerfile 2>/dev/null || true)
+runtime_suites=$(sed -nE 's|^FROM debian:([a-z]+)-slim[[:space:]].*|\1|p' Dockerfile 2>/dev/null || true)
+if [[ -z $builder_suites ]]; then
+    report "Dockerfile builder: no 'FROM rust:<version>-slim-<debian-release>' line found; an unsuffixed tag follows whichever Debian the rust image defaults to"
+elif [[ -z $runtime_suites ]]; then
+    report "Dockerfile runtime: no 'FROM debian:<debian-release>-slim' line found"
+else
+    while IFS= read -r suite; do
+        [[ -n $suite ]] || continue
+        grep -qx "$suite" <<< "$runtime_suites" ||
+            report "Dockerfile builds on Debian $suite; its runtime stage runs Debian $(tr '\n' ' ' <<< "$runtime_suites")"
+    done <<< "$builder_suites"
+fi
 
 for tool in rustc cargo clippy rustfmt; do
     var="standard_${tool}_version"
