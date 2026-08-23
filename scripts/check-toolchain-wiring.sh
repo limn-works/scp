@@ -253,8 +253,9 @@ else
             # `fuzz` is the one lane the pin does not decide: `fuzz-build` runs
             # `cargo check` with `working-directory: fuzz`, where rustup resolves
             # `fuzz/rust-toolchain.toml` instead. Check 2d covers that file.
-            [[ $output_name == "fuzz" ]] && continue
-            [[ $output_name == "$TOOLCHAIN_FILTER" ]] && continue
+            if [[ $output_name == "fuzz" || $output_name == "$TOOLCHAIN_FILTER" ]]; then
+                continue
+            fi
             if [[ $output_expr != *"steps.filter.outputs.$TOOLCHAIN_FILTER"* ]]; then
                 report "$CI_WORKFLOW: the 'changes' job's '$output_name' output does not read steps.filter.outputs.$TOOLCHAIN_FILTER, so a pull request that raises the pin skips every job that output guards, and the 'ci' aggregator job counts each skip as a pass"
             fi
@@ -276,9 +277,12 @@ else
                 if grep -qxF -- "$root_file" <<< "$toolchain_entries"; then continue; fi
                 declared=0
                 for unread in "${NO_RUST_JOB_READS[@]}"; do
-                    [[ $root_file == "$unread" ]] && declared=1 && break
+                    if [[ $root_file == "$unread" ]]; then
+                        declared=1
+                        break
+                    fi
                 done
-                [[ $declared -eq 1 ]] && continue
+                if [[ $declared -eq 1 ]]; then continue; fi
                 report "$root_file sits at the repository root and neither the 'rust' filter nor the '$TOOLCHAIN_FILTER' filter in $CI_WORKFLOW lists it, and NO_RUST_JOB_READS in this gate does not declare it unread. A pull request that changes only that file leaves the filter output 'false', every job the filter guards skips, and the 'ci' aggregator job counts a skipped job as a pass. List it in the filter that guards the jobs it decides, or declare it in NO_RUST_JOB_READS."
             done <<< "$root_files"
         fi
