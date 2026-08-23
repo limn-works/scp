@@ -11,7 +11,7 @@ A build target that ships to a user MUST be compiled by a job that gates the pul
 request. `cargo package --list -p scp-node` lists `examples/website.rs`, so a broken
 example ships to crates.io.
 
-`scripts/check-examples-build-shipped.sh` carries three mechanisms, and deleting any one
+`scripts/check-examples-build-shipped.sh` carries five mechanisms, and deleting any one
 of them reopens a bypass this repository has already measured:
 
 1. **Lint one package at a time.** `cargo clippy --workspace --examples` unifies
@@ -26,13 +26,26 @@ of them reopens a bypass this repository has already measured:
    `[[example]] path =` key can bind the name `website` to a decoy file while
    `examples/website.rs` still ships with no target. A name join sees the name on both
    sides and reports success for a file it never opened.
+4. **Enumerate both auto-discovered layouts.** Cargo discovers `examples/NAME.rs` and
+   `examples/NAME/main.rs`. A pattern matching only the first is blind to a layout that
+   needs no manifest edit.
+5. **Report a `cargo package --list` failure unconditionally.** Gating that branch on the
+   crate having targets inverts it, because `autoexamples = false` empties the target set
+   and that is exactly when a published example is invisible.
 
-## Six rounds, nine bypasses, and what finally closed them
+Bypass 8 is closed by none of them, and deliberately so: a `build.rs` can inject any cfg
+into every target of its own package. The criterion for what this gate cannot defend
+against is **write access to the crate under test**, not "edits the manifest" — an earlier
+draft wrote the narrower indicator as the contract, which is the failure `CLAUDE.md` names
+after Caulfield.
 
-Nine distinct ways past this gate were found across six review rounds. The first
-eight all shared one root: the check compared **names** or **shapes** rather than
-the thing being asserted. What closed them was joining published file path to
-target `src_path`, and iterating targets rather than files.
+## Eight rounds, twelve bypasses, and what closed each one
+
+Twelve distinct ways past this gate were found across eight review rounds. They do
+not share one root, and no single change closed them; the table below names each
+root and the mechanism that answers it. Counting them was itself a source of error:
+two earlier drafts of this paragraph asserted totals that the table three lines
+below already contradicted.
 
 | Round | Bypass | Root |
 |---|---|---|
@@ -48,6 +61,7 @@ target `src_path`, and iterating targets rather than files.
 | 6c | filename containing a space | unquoted `for` word-split past both checks |
 | 7a | `examples/website/main.rs` directory layout | cargo auto-discovers it and publishes it; the enumerating regex matched only the flat form |
 | 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
+| 8 | `crates/scp-node/build.rs` printing `cargo::rustc-cfg=feature="testing"` | cargo auto-discovers `build.rs` with no manifest key, and the cfg reaches every target of the package |
 
 7a needed no manifest edit and no adversary. Cargo auto-discovers both
 `examples/NAME.rs` and `examples/NAME/main.rs`; the check's regex encoded only the
@@ -124,7 +138,9 @@ Widening the pull-request job to `cargo clippy --workspace --all-targets` on def
 features looks strictly better and fails today: `scp-ffi-uniffi`'s inline `#[cfg(test)]`
 module in `src/bridge.rs` needs the `testing` feature and is a lib-test target, not a
 `[[test]]` target, so it carries no `required-features` guard and cannot drop out. The
-same defect makes `release.yml`'s clippy step red on any release tag.
+same defect makes `release.yml`'s clippy step fail whenever that workflow runs.
+Its trigger is `workflow_dispatch`, not a tag push, so the step has never run on a
+merge and the breakage stayed invisible.
 
 Run the widened invocation before adopting it.
 
