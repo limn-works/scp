@@ -1,0 +1,23 @@
+# Fixture: the entries are double-quoted and one filter carries a blank line, both of
+# which YAML permits. The extractor reads the paths the same way it reads the
+# single-quoted form, so the gate raises no paths-filter finding.
+name: CI
+env:
+  FUZZ_TOOLCHAIN: nightly-2026-05-03
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      fuzz: ${{ steps.filter.outputs.fuzz }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - "crates/**"
+
+              - "rust-toolchain.toml"
+            fuzz:
+              - "fuzz/**"

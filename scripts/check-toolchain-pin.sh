@@ -28,7 +28,7 @@
 #   6. `.github/workflows/fuzz.yml`      FUZZ_TOOLCHAIN
 #   7. `.github/workflows/ci.yml`        FUZZ_TOOLCHAIN
 #
-# It also checks two things that file agreement alone does not establish:
+# It also checks three things that file agreement alone does not establish:
 #   * `rustc --version` — the compiler a command in this directory actually resolves
 #     to. Files agreeing is not compilers agreeing: mise sets `RUSTUP_TOOLCHAIN`, which
 #     overrides `rust-toolchain.toml` entirely, so a shell can compile on a different
@@ -36,6 +36,11 @@
 #   * `.mise.toml` targets ⊇ `rust-toolchain.toml` targets. `RUSTUP_TOOLCHAIN` discards
 #     the pin's target list along with its channel, so a target present only in the pin
 #     is a cross-build that CI performs and a mise shell cannot.
+#   * the `dorny/paths-filter` entries in `.github/workflows/ci.yml` list every file that
+#     selects a compiler. A pin the filter does not name skips every Rust job on the pull
+#     request that raises it, and the `ci` job that aggregates every other job's result
+#     reports a skipped job as a pass, so the bump merges without one command compiling on
+#     the new compiler.
 #
 # The gate FAILS CLOSED. A location that is missing, or whose version string does not
 # parse, is a failure — never a skipped check. `.docs/lessons/coverage-gates-must-fail-closed.md`
@@ -175,10 +180,80 @@ for wf in .github/workflows/fuzz.yml .github/workflows/ci.yml; do
         report "$wf defines FUZZ_TOOLCHAIN $count times; a job-level env block overrides the workflow-level one, and the gate reads only the first"
 done
 
-# Any location that produced no value already set `fail`. Stop here rather than
-# compare, because two empty values would otherwise agree with each other.
+# ── The paths filter must route a pin change to the jobs that compile on it ──
+#
+# `.github/workflows/ci.yml` guards every Rust job with
+# `if: needs.changes.outputs.rust == 'true'`, and its `ci` job — the one that aggregates
+# every other job's result — fails only on a result of 'failure' or 'cancelled'. A skipped
+# job therefore reports success to branch protection. `rust-toolchain.toml` selects the
+# compiler those jobs run, so a pull request that raises the pin and changes nothing else
+# has to reach the `rust` filter; otherwise clippy, the test lane, the build, and
+# cargo-deny all skip, and the bump merges on a compiler nothing compiled. The result
+# repeats the outage the pin exists to prevent: the pin moves, no job compiles on it, and
+# every branch that rebases finds a red required check the next morning.
+#
+# `fuzz/rust-toolchain.toml` selects the compiler for the fuzz-crate check in the same
+# workflow, which `needs.changes.outputs.fuzz` guards, and the `fuzz/**` entry covers it.
+#
+# `.mise.toml` is deliberately absent from this list. No CI job reads it, and the version
+# comparison below already forces a `.mise.toml` rust bump to move `rust-toolchain.toml`
+# in the same commit, which triggers the `rust` filter.
+#
+# The list is closed by construction: each line names one filter and one entry that filter
+# must contain, and the check is exact string membership. It never infers which files
+# select a compiler.
+REQUIRED_FILTER_ENTRIES=(
+    "rust rust-toolchain.toml"
+    "fuzz fuzz/**"
+)
+
+# Print the path entries of one `dorny/paths-filter` filter, one per line.
+#
+# The filter block is a YAML literal scalar inside ci.yml, so read it as text: start at a
+# line holding nothing but `<name>:`, take the `- <path>` lines that follow, skip comment
+# and blank lines, and stop at the first line that is none of those. Each filter name
+# appears exactly once in that form, because the `outputs:` block writes
+# `rust: ${{ ... }}` with a value on the same line.
+#
+# The `sed` accepts the three ways YAML spells a scalar in a sequence — plain,
+# single-quoted, double-quoted — and nothing else. An entry written in a fourth way, such
+# as a flow sequence on the `<name>:` line, yields no path and the caller reports the
+# filter as carrying none, which fails the gate rather than passing it.
+filter_entries() {
+    local wf=$1 name=$2
+    awk -v key="$name" '
+        $0 ~ "^[[:space:]]*" key ":[[:space:]]*$" { inblock = 1; next }
+        inblock == 1 {
+            if ($0 ~ /^[[:space:]]*#/) next
+            if ($0 ~ /^[[:space:]]*$/) next
+            if ($0 ~ /^[[:space:]]*-[[:space:]]/) { print; next }
+            exit
+        }
+    ' "$wf" | sed -nE "s/^[[:space:]]*-[[:space:]]*[\"']?([^\"']*)[\"']?[[:space:]]*$/\1/p"
+}
+
+ci_workflow=".github/workflows/ci.yml"
+for pair in "${REQUIRED_FILTER_ENTRIES[@]}"; do
+    filter_name=${pair%% *}
+    required_entry=${pair#* }
+    if [[ ! -f $ci_workflow ]]; then
+        report "paths filter: $ci_workflow does not exist, so the gate cannot confirm that $required_entry reaches the jobs it selects a compiler for"
+        continue
+    fi
+    entries=$(filter_entries "$ci_workflow" "$filter_name")
+    if [[ -z $entries ]]; then
+        report "$ci_workflow declares no '$filter_name:' paths filter with path entries, so the gate cannot confirm that $required_entry reaches the jobs that filter guards"
+    elif ! grep -qxF -- "$required_entry" <<< "$entries"; then
+        report "$ci_workflow: the '$filter_name' paths filter does not list $required_entry. A pull request that changes only that file leaves the filter output 'false', every job the filter guards skips, and the 'ci' aggregator job counts a skipped job as a pass — so a compiler bump would merge without those jobs running on the new compiler."
+    fi
+done
+
+# Any location that produced no value already set `fail`, and so did any paths filter
+# that does not route a pin change to the jobs it selects a compiler for. Stop here
+# rather than compare, because two empty values would otherwise agree with each other.
 if [[ $fail -ne 0 ]]; then
-    printf '\nEvery location above must name a version before the gate can compare them.\n' >&2
+    printf '\nFix every failure above. The gate compares versions only after each location\n' >&2
+    printf 'names one, so it stops before the comparison.\n' >&2
     exit 1
 fi
 
@@ -338,6 +413,7 @@ if [[ $fail -eq 0 ]]; then
     printf 'OK: stable pin %s agrees across rust-toolchain.toml, .mise.toml, Dockerfile,\n' "$pin_version"
     printf '    .docs/standards/rust.md, the .mise.toml target list, and the active rustc\n'
     printf 'OK: fuzz pin %s agrees across fuzz/rust-toolchain.toml, fuzz.yml, and ci.yml\n' "$fuzz_version"
+    printf 'OK: the ci.yml rust and fuzz paths filters list the files that pin their compilers\n'
     exit 0
 fi
 

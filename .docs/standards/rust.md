@@ -20,9 +20,12 @@ the table above, and it is the only list — a second list in prose goes stale, 
 this pin's own first draft came to name four locations while the gate read seven. The gate
 fails when those locations disagree, when the compiler a command in the repository resolves
 to is not the pinned one, when a container build's `FROM` lines are not the exact set it
-permits, and when a file carrying a line-initial `FROM` is missing from its list. Changing a
-container's compiler or Debian release means editing that permitted set in the gate in the
-same commit.
+permits, when a file carrying a line-initial `FROM` is missing from its list, and when a
+`dorny/paths-filter` entry in `.github/workflows/ci.yml` omits a file that pins a compiler
+— which would let a pin bump merge while every job that compiles on it skips, because the
+`ci` job that aggregates every other job's result counts a skipped job as a pass. Changing
+a container's compiler or Debian release means editing that permitted set in the gate in
+the same commit.
 
 `.mise.toml` has to match because mise sets `RUSTUP_TOOLCHAIN` for the commands it runs, and
 that variable overrides `rust-toolchain.toml` entirely — channel, components, and targets.

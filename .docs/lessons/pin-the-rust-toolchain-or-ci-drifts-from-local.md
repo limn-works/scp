@@ -63,20 +63,51 @@ produced three artifacts that disagreed with the gate and with each other, and o
 commit repairing them. A comment asking several files to agree is not enforcement, and this
 repository's own tenet is to enforce mechanically.
 
-The gate checks three further properties that version agreement leaves open. First, that
+The gate checks four further properties that version agreement leaves open. First, that
 `rustc --version` in the repository equals the pin, because a `RUSTUP_TOOLCHAIN` in the
 environment beats every file. Second, that each container build's `FROM` lines equal a set
 the gate permits — which exists because the first draft of this fix broke exactly that:
 `rust:1.85-slim` is a Debian 12 image and `rust:1.98.0-slim` is a Debian 13 one, so raising
 the version alone moved the builder to glibc 2.41 while the runtime stage stayed on glibc
 2.36, and glibc is backward compatible only, so those binaries could not have run. Third,
-that no file carrying a line-initial `FROM` is missing from the gate's list.
+that no file carrying a line-initial `FROM` is missing from the gate's list. Fourth, that
+each `dorny/paths-filter` entry in `.github/workflows/ci.yml` lists the file that pins the
+compiler for the jobs that filter guards — the property the next section describes.
+
+## The Paths Filter Has To List the Pin
+
+`.github/workflows/ci.yml` guards every Rust job with
+`if: needs.changes.outputs.rust == 'true'`, and the `ci` job that aggregates every other
+job's result fails only on a result of `failure` or `cancelled`, so a skipped job reports
+success to branch protection. The `rust` filter that produces that output listed
+`crates/**`, `Cargo.toml`, `Cargo.lock`, and `deny.toml`, and this fix made
+`rust-toolchain.toml` the file that chooses the compiler those jobs run.
+
+Adding the pin without adding the filter entry would have reproduced the outage the pin
+prevents, one step later. A pull request raising the pin to 1.99.0 touches
+`rust-toolchain.toml` and `.mise.toml`, and neither path matches any entry the `rust` filter
+listed. `rust` resolves to `false`, `Rust / clippy`, `Rust / test`, `Rust / build`, and
+`Rust / deny` all skip, the `ci` aggregator reports success, and the bump merges without
+one command compiling on 1.99.0. Every branch that rebases onto it then finds
+`Rust / clippy` red the next morning, which is the outage this pin exists to prevent,
+reached through the pin file itself.
+
+So `scripts/check-toolchain-pin.sh` now asserts the filter membership, and
+`scripts/tests/toolchain-pin/run-tests.sh` proves the assertion fires. The list it checks
+holds one line per filter: the `rust` filter must list `rust-toolchain.toml`, and the `fuzz`
+filter must list `fuzz/**`, which covers `fuzz/rust-toolchain.toml`. `.mise.toml` is not on
+that list, because no CI job reads it and the version comparison already forces a `.mise.toml`
+bump to move `rust-toolchain.toml` in the same commit.
+
+A gate that runs only when a paths filter selects it enforces nothing for a file the filter
+omits. Adding a file that decides how CI builds means adding that file to the filter that
+runs the jobs it decides for, in the same commit.
 
 ## Why the container check is a whitelist and not a parser
 
-Reaching that shape took three rounds of the wrong one. Each round validated Docker's `FROM`
-syntax by pattern, and each round a reviewer named one more legal spelling the pattern
-mishandled: an indented keyword, a lowercase one, an untagged `FROM rust`, a
+The container check took three rounds of the wrong shape before it became a whitelist.
+Each round validated Docker's `FROM` syntax by pattern, and each round a reviewer named
+one more legal spelling the pattern mishandled: an indented keyword, a lowercase one, an untagged `FROM rust`, a
 registry-qualified image, a second stage whose tag named no Debian release. Docker's grammar
 admits many spellings of one image, so enumerating the spellings does not terminate.
 Enumerating the permitted lines does. Each container file now declares the exact `FROM` lines

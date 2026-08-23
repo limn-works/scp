@@ -56,6 +56,15 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              # `rust-toolchain.toml` chooses the compiler every Rust job below
+              # runs, and every one of those jobs is guarded by
+              # `needs.changes.outputs.rust == 'true'`, while the `ci` job that
+              # aggregates every other job's result counts a skipped job as a
+              # pass. Leaving this entry out lets a pull request that raises the
+              # pin and nothing else merge without clippy, the test lane, the
+              # build, or cargo-deny ever compiling on the new compiler.
+              # `scripts/check-toolchain-pin.sh` fails when this entry is absent.
+              - 'rust-toolchain.toml'
             python:
               - 'bindings/python/**'
               - 'crates/scp-ffi/src/**'
@@ -323,6 +332,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-toolchain-pin.sh
+      - name: Run toolchain-pin fixture tests
+        run: bash scripts/tests/toolchain-pin/run-tests.sh
 
   # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
   # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern

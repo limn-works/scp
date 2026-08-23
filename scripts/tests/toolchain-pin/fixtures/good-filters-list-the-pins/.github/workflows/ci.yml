@@ -1,0 +1,24 @@
+# Fixture: both paths filters list the file that pins the compiler for the jobs
+# each filter guards, so the gate raises neither paths-filter finding.
+name: CI
+env:
+  FUZZ_TOOLCHAIN: nightly-2026-05-03
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      fuzz: ${{ steps.filter.outputs.fuzz }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              # A comment inside a filter block, which the extractor skips.
+              - 'rust-toolchain.toml'
+            fuzz:
+              - 'fuzz/**'
+              - 'crates/scp-protocol/**'

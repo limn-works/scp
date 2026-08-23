@@ -1,0 +1,24 @@
+# Fixture: the `rust` filter names no toolchain pin. A pull request that raises
+# `rust-toolchain.toml` and changes nothing else leaves the filter output 'false',
+# every Rust job skips, and the `ci` aggregator job counts a skipped job as a pass.
+name: CI
+env:
+  FUZZ_TOOLCHAIN: nightly-2026-05-03
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      fuzz: ${{ steps.filter.outputs.fuzz }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+            fuzz:
+              - 'fuzz/**'
