@@ -957,6 +957,16 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - run: ./gradlew :scp-kt:runKtlintCheckOverMainSourceSet
       - run: ./gradlew :scp-kt:detekt
+      # `generateUniffiBindings` writes into `src/main/kotlin`, so Gradle fails
+      # any task that reads that root and carries no ordering edge to it. Gradle
+      # reports the failure only when both tasks land in one build and the
+      # reader executes, and no job ran `sourcesJar` or `dokkaHtml` beside the
+      # generator — so both shipped without an edge, and the release workflow's
+      # publish-maven step would have aborted at `sourcesJar`. This gate reads
+      # the edges out of Gradle's task model, so it fails on a missing edge
+      # whatever the caller asked to build. It compiles no Rust, which is why it
+      # belongs in this job rather than in `kotlin-test`.
+      - run: ./gradlew :scp-kt:checkUniffiBindingsOrdering
 
   kotlin-test:
     needs: changes
