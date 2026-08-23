@@ -2843,6 +2843,7 @@ mod tests {
     // #319 UCAN tests, and the shared gate is covered end-to-end by the runtime
     // `invoke_query_session_*` test.
     #[test]
+    #[cfg(all(feature = "testing", feature = "outlet-capability-test-grant"))]
     #[allow(clippy::too_many_lines)] // End-to-end query-gate test: register + role-state + two-member gate assertions.
     fn ffi_bridge_provider_validate_capability_query_kind_selects_query_stem() {
         let creator = "did:dht:z6MkCreatorQueryStem";
