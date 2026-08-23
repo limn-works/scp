@@ -1138,9 +1138,10 @@ async fn main() {
                  available in this build. Use --relay-only, which needs no identity and starts \
                  on a shipped build. Dropping --ephemeral does NOT help: the full node creates \
                  an identity on every start, which needs a pre-rotation custody backend this \
-                 build does not have, on this start or any later one. --self-host hits the \
-                 same wall, and publishes \
-                 the host IP unless SCP_NODE_DHT_MODE=disabled."
+                 build does not have, on this start or any later one. --self-host reloads \
+                 an identity its storage already holds, so it starts only against a \
+                 directory a testing build seeded, and it publishes the host IP unless \
+                 SCP_NODE_DHT_MODE=disabled."
             );
             std::process::exit(1);
         }

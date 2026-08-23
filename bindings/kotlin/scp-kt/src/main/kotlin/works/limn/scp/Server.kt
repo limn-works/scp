@@ -434,9 +434,12 @@ class Node internal constructor(
         /**
          * Starts a full application node with in-memory storage.
          *
-         * When [identityDid] is provided, the node uses the pre-existing
-         * identity instead of generating a fresh one. This enables identity
-         * portability -- the same DID persists across node restarts.
+         * When [identityDid] is provided, a shipped build REJECTS it: UniFFI's
+         * `build_node_identity_from_uniffi` is replaced under
+         * `cfg(not(feature = "testing"))` by a stub that always returns
+         * `ScpException.Identity` with code `SCP-IDENT-1013`. On a `testing`
+         * build the node uses the pre-existing identity, so the same DID
+         * persists across restarts.
          *
          * Passing null for [identityDid] requests auto-generation, which is
          * available ONLY in a `testing` build (in-memory key custody, in-memory
@@ -472,11 +475,12 @@ class Node internal constructor(
          * nullifier-backed identity. The failure arrives as
          * `ScpException.Identity` with code `SCP-TRANS-5051` and the message
          * "node identity operation failed".
-         * This build fails on EVERY run, not only the first: none of this SDK's
-         * create calls mints an identity, so nothing it offers puts one in
-         * [dataDir] and the reload branch never fires. Passing [identityDid]
+         * With no identity in [dataDir] this build fails on every run, not only
+         * the first: none of this SDK's create calls mints one, so nothing it
+         * offers seeds that directory. The reload branch fires only against a
+         * directory a `testing` build already seeded. Passing [identityDid]
          * does not help either. Every writer to the identity registry — create,
-         * migrate, rotate, add-agent, remove-agent — either fails closed on a
+         * migrate, rotate-key, add-agent, rotate-agent, remove-agent — either fails closed on a
          * shipped build before it writes, or needs an entry already present, so
          * the registry never fills.
          *
@@ -556,7 +560,8 @@ class ServerBridge internal constructor(
     /**
      * Starts a full application node with in-memory storage.
      *
-     * When [identityDid] is provided, the node uses the pre-existing
+     * When [identityDid] is provided, a shipped build REJECTS it with
+     * `SCP-IDENT-1013`; on a `testing` build the node uses the pre-existing
      * identity instead of generating a fresh one.
      *
      * @param identityDid DID string of a pre-existing identity. Passing null

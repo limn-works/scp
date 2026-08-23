@@ -11,8 +11,9 @@ no separate web server and no DNS requirement on the origin). See the runnable e
 the first run and every later one.** `host_site` passes
 `IdentitySource::Persisted`, and creating an identity needs a `PreRotationCustody` backend
 whose only implementation is the test harness, so the node fails closed rather than mint a
-nullifier-backed identity. Reloading a stored identity carries no gate, but `host_site`
-never mints one, so no storage directory it manages comes to hold one. These recipes wait
+nullifier-backed identity. Reloading a stored identity carries no gate and does work;
+what fails is minting one, so a storage directory comes to hold an identity only if a
+`testing` build put it there. These recipes wait
 on a real pre-rotation backend. The example at `crates/scp-node/examples/website.rs` documents the same failure
 and quotes the exact error.
 

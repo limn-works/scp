@@ -296,8 +296,10 @@ The full-node mode fails on **every** run, not only the first. `main.rs` passes
 never writes an identity either, and the "subsequent runs reload it" case cannot
 arise from it. The reload path is real and ungated, but only the `--self-host`
 flow and the FFI `start_node_local` surface reach it, because those pass
-`IdentitySource::Persisted` — and both still fail closed, because nothing on a
-shipped path ever creates the identity they would reload.
+`IdentitySource::Persisted` — and both still fail closed whenever storage holds no
+identity, because nothing on a shipped path creates the one they would reload. Given
+a storage slot and matching custody that a `testing` build already wrote, the reload
+branch is ungated and does serve.
 
 ### Development deployment
 
@@ -347,9 +349,10 @@ use scp_transport::native::storage::BlobStorageBackend;
 // `::sqlite(...)` constructor is what disappears.
 //
 // A shipped build cannot CREATE an identity: that needs a `PreRotationCustody`
-// backend which only a `testing` build has, so `IdentitySource::Generate` and
-// `::Persisted` both fail closed on every run, and the node's own identity paths
-// never mint one, so there is no identity to load unless you minted it through
+// backend which only a `testing` build has, so `IdentitySource::Generate` fails on
+// every start and `::Persisted` fails whenever storage holds no identity. The node's
+// own identity paths never mint one, so there is nothing to load unless you minted
+// it through
 // `scp-identity` directly. This
 // snippet shows the config shape for that case.
 let identity: ScpIdentity = load_node_identity()?;

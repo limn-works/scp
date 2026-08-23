@@ -16694,6 +16694,12 @@ impl Scp {
     /// must have been minted by this `Scp` (cross-instance handles are
     /// rejected via the `CoreFields::check_handle` call).
     ///
+    /// On a shipped build a supplied `identity` is REJECTED regardless:
+    /// `build_node_identity_from_uniffi` is replaced under
+    /// `cfg(not(feature = "testing"))` by a stub returning `SCP-IDENT-1013`,
+    /// because node identity portability needs custody access this bridge does
+    /// not have.
+    ///
     /// Omitting `identity` requests auto-generation, which a shipped build
     /// refuses: the in-memory custody, storage, and DHT client it needs compile
     /// only under the `testing` feature. The refusal arrives as
@@ -16716,13 +16722,20 @@ impl Scp {
     /// Per-instance equivalent of the free-function `node_start_local`.
     ///
     /// Omitting `identity` reloads the identity the storage already holds and
-    /// requires `passphrase`. On a shipped build this fails on every run:
+    /// requires `passphrase`. On a shipped build with no identity in storage this
+    /// fails on every run:
     /// creating an identity needs a pre-rotation
     /// custody backend that only a `testing` build has, so a shipped build fails
     /// closed with `ScpError::Identity`, code `SCP-TRANS-5051`.
     ///
     /// Starts a file-backed application node at `data_dir`. If `identity`
     /// is supplied, it must have been minted by this `Scp`.
+    ///
+    /// On a shipped build a supplied `identity` is REJECTED regardless:
+    /// `build_node_identity_from_uniffi` is replaced under
+    /// `cfg(not(feature = "testing"))` by a stub returning `SCP-IDENT-1013`,
+    /// because node identity portability needs custody access this bridge does
+    /// not have.
     #[cfg(feature = "server")]
     pub async fn node_start_local(
         &self,
