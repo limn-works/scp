@@ -146,15 +146,10 @@ check-toolchain-wiring.sh (every container build asserts which compiler it resol
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration
 file to a lane or declares it unread; .mise.toml names no Rust version source),
-check-examples-build-shipped.sh (every `examples/*.rs` file a crate PUBLISHES must
-be a cargo example target that builds lint-clean on that crate's default features;
-sourcing the file list from `cargo package --list` rather than from example targets
-is the assertion, because `autoexamples = false` hides a target while still
-shipping the file, and collapsing the per-package loop into `cargo clippy
---workspace --examples` makes the check inert — a workspace-wide selection unifies
-dev-dependency features and turns `scp-node/testing` back on. The check proves
-compilation only; it CANNOT prove an example avoids a nullifier, because cargo
-gives every example its crate's dev-dependencies),
+check-examples-build-shipped.sh (every published `examples/*.rs` must be a cargo
+example target that builds lint-clean on default features; the `cargo package
+--list` sourcing and the per-package loop are both the assertion — see the script
+header),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

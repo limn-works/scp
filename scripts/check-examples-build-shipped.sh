@@ -1,39 +1,31 @@
 #!/usr/bin/env bash
-# Every `examples/*.rs` file a crate publishes must be a cargo example target
-# that compiles, lint-clean, on that crate's default features.
+# Every `examples/*.rs` file a crate PUBLISHES must be a cargo example target that
+# compiles, lint-clean, on that crate's default features.
 #
 # WHAT THIS PROVES, and the whole of it: a file that ships to crates.io under
-# `examples/` compiles for someone who installs the published crate. Nothing more.
+# `examples/` compiles for someone who installs the published crate.
 #
-# WHAT IT EXPLICITLY DOES NOT PROVE: that an example avoids a test-only
-# construct. It cannot. Cargo builds an example as a dev target and gives it the
-# crate's dev-dependencies, and no cargo invocation switches that off. Measured:
-# `crates/scp-node/Cargo.toml` dev-depends on `scp-dht` and `scp-platform` with
-# `features = ["testing"]`, so an example naming `scp_dht::InMemoryDhtClient` or
-# `scp_platform::testing::InMemoryKeyCustody` compiles and this check passes it.
-# `crates/scp-transport` reaches the same types through its `scp-testing`
-# dev-dependency, whose NORMAL deps carry both with `testing` on. Do not write a
-# comment here, or a commit message, claiming this check keeps nullifiers out of
+# WHAT IT EXPLICITLY DOES NOT PROVE: that an example avoids a test-only construct.
+# It cannot. Cargo builds an example as a dev target and hands it the crate's
+# dev-dependencies, and no cargo invocation switches that off, so an example
+# naming `scp_dht::InMemoryDhtClient` compiles and passes here. Do not write a
+# comment, or a commit message, claiming this check keeps nullifiers out of
 # examples. It does not, and saying so would let the next author stop checking.
 #
-# WHY THE FILE LIST COMES FROM `cargo package --list`, NOT `cargo metadata`.
-# Metadata reports example TARGETS. `autoexamples = false` in a crate manifest
-# suppresses target auto-discovery while `cargo package` still ships the file, so
-# a target-sourced list silently drops it and the check passes over a file no job
-# ever compiles. Reading the published file set closes that: a shipped
-# `examples/NAME.rs` with no corresponding target is itself a failure here.
+# Two mechanics are load-bearing. Do not simplify either away.
+#   1. The file list comes from `cargo package --list`, not `cargo metadata`.
+#      Metadata reports TARGETS, and `autoexamples = false` suppresses a target
+#      while `cargo package` still ships the file. A published `examples/NAME.rs`
+#      with no matching target is a failure here, because nothing compiles it.
+#   2. Each package is linted on its own. `cargo clippy --workspace --examples`
+#      unifies dev-dependency features across every member and turns
+#      `scp-node/testing` ON, which makes the check inert.
 #
-# WHY PACKAGE SCOPE IS LOAD-BEARING. A future editor MUST NOT collapse this into
-# `cargo clippy --workspace --examples`. A workspace-wide selection unifies
-# dev-dependency features across ALL members: `crates/scp-ffi` dev-depends on
-# `scp-ffi-common` with `features = ["testing"]`, that crate's `testing` list
-# carries `scp-node?/testing`, and every example then compiles with
-# `scp-node/testing` ON. Measured: the workspace-wide form exits 0 on an example
-# selecting `DhtMode::Memory`; this loop exits 1.
+# Compiling is also not running: `crates/scp-node/examples/website.rs` passes here
+# and still exits 1 on a machine with no existing identity.
 #
-# Compiling is also not running. `crates/scp-node/examples/website.rs` passes here
-# and still exits 1 on a machine with no existing identity, because creating one
-# needs a pre-rotation custody backend only a `testing` build has.
+# See .docs/lessons/shipped-targets-need-a-default-feature-build.md for the
+# measurements behind each claim above.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -41,9 +33,8 @@ cd "$(dirname "$0")/.."
 status=0
 checked=0
 
-# Closed by construction: every workspace member is considered, so a crate that
-# gains its first example is covered without editing this file.
-PKGS="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' | sort)"
+META="$(cargo metadata --no-deps --format-version 1)"
+PKGS="$(printf '%s' "$META" | jq -r '.packages[].name' | sort)"
 
 if [ -z "$PKGS" ]; then
   echo "FAIL: cargo metadata reported no workspace package." >&2
@@ -51,28 +42,30 @@ if [ -z "$PKGS" ]; then
 fi
 
 for pkg in $PKGS; do
-  # Files this crate actually publishes, restricted to top-level examples/*.rs.
-  # A file in an examples/ SUBDIRECTORY (e.g. examples/support/mod.rs) is a helper
-  # module, not an auto-discovered target, so it is not expected to be one.
-  FILES="$(
-    cargo package --list -p "$pkg" --allow-dirty 2>/dev/null \
-      | grep -E '^examples/[^/]+\.rs$' \
-      | sed -e 's|^examples/||' -e 's|\.rs$||' \
-      | sort || true
-  )"
+  # Never swallow this exit code. `cargo package --list` fails (101) on a manifest
+  # error such as a `readme` pointing at a missing file, and treating that as
+  # "this crate publishes no examples" would drop the crate out of the check in
+  # silence -- the same invisible-gap failure the file-set sourcing exists to stop.
+  if ! RAW="$(cargo package --list -p "$pkg" --allow-dirty 2>&1)"; then
+    echo "FAIL: 'cargo package --list -p $pkg' failed, so its examples went unchecked." >&2
+    printf '%s\n' "$RAW" >&2
+    status=1
+    continue
+  fi
+
+  # Only top-level `examples/*.rs` files are auto-discovered as targets; a file in
+  # an examples/ subdirectory (e.g. examples/support/mod.rs) is a helper module.
+  FILES="$(printf '%s\n' "$RAW" \
+    | grep -E '^examples/[^/]+\.rs$' \
+    | sed -e 's|^examples/||' -e 's|\.rs$||' \
+    | sort || true)"
   [ -n "$FILES" ] || continue
 
-  # Example targets cargo knows about for this crate.
-  TARGETS="$(
-    cargo metadata --no-deps --format-version 1 \
-      | jq -r --arg p "$pkg" '
-          .packages[] | select(.name == $p)
-          | .targets[] | select(.kind[] == "example") | .name
-        ' \
-      | sort
-  )"
+  TARGETS="$(printf '%s' "$META" | jq -r --arg p "$pkg" '
+      .packages[] | select(.name == $p)
+      | .targets[] | select(.kind[] == "example") | .name
+    ' | sort)"
 
-  # A published example file with no target is compiled by nothing, ever.
   ORPHANS="$(comm -23 <(printf '%s\n' "$FILES") <(printf '%s\n' "$TARGETS") || true)"
   if [ -n "$ORPHANS" ]; then
     echo "FAIL: $pkg publishes these examples/*.rs files with no cargo example target:" >&2
