@@ -46,6 +46,13 @@ target `src_path`, and iterating targets rather than files.
 | 6a | `[[example]] path = "examples/decoy/website.rs"` | name join saw `website` on both sides |
 | 6b | `exclude = ["examples/*"]` | file-driven loop skipped the package |
 | 6c | filename containing a space | unquoted `for` word-split past both checks |
+| 7a | `examples/website/main.rs` directory layout | cargo auto-discovers it and publishes it; the enumerating regex matched only the flat form |
+| 7b | `autoexamples = false` + a `cargo package --list` failure | the failure branch was gated on the crate having targets, which that key empties |
+
+7a needed no manifest edit and no adversary. Cargo auto-discovers both
+`examples/NAME.rs` and `examples/NAME/main.rs`; the check's regex encoded only the
+first, and the comment above it stated the false rule as fact. A join is only as
+sound as the set it enumerates, and the enumerator was wrong about cargo.
 
 6a kept the reported count at eight and printed `── scp-node::website` for a file it
 never opened. A check that joins on name reports success for whichever file the name
