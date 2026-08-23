@@ -1,23 +1,32 @@
+[settings]
+# Read `rust-toolchain.toml` instead of naming a Rust version here.
+#
+# mise installs rust through rustup and, for an installed toolchain, exports
+# `RUSTUP_TOOLCHAIN` for every command it runs. That variable overrides
+# `rust-toolchain.toml` entirely — channel, components, and targets alike — so a
+# `rust = "..."` entry in this file used to decide which compiler a local shell got,
+# and `rust = "stable"` is how a shell came to run 1.97.1 while every file in the
+# repository read 1.98.0. See
+# `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
+#
+# This setting registers `rust-toolchain.toml` as the rust tool's version source, so
+# mise reads `channel`, `components`, and `targets` out of that file, passes them to
+# `rustup toolchain install`, and exports the channel it just read, so the value mise
+# exports is derived from the file and cannot contradict it. When the file names a
+# toolchain rustup has not installed yet, mise exports nothing and rustup reads the same
+# file directly; both paths resolve the channel below. A `RUSTUP_TOOLCHAIN` exported from
+# outside this repository still wins over both, which is why `scripts/hooks/pre-commit`
+# compares `rustc --version` against the pin before it runs cargo.
+# https://mise.jdx.dev/configuration.html#idiomatic-version-files names the setting;
+# the rust tool registers `rust-toolchain.toml` (registry/rust.toml).
+idiomatic_version_file_enable_tools = ["rust"]
+
 [tools]
 java = "zulu-17.64.17"
 bun = "1.3.9"
 python = "3.12.12"
 kotlin = "2.3.10"
 gradle = "8.14.4"
-# Keep `version` equal to `channel` in `rust-toolchain.toml`, and keep `targets` a
-# superset of that file's `targets`.
-#
-# mise sets RUSTUP_TOOLCHAIN for the commands it runs, and that variable overrides
-# `rust-toolchain.toml` entirely — channel, components, and targets alike. Check it
-# with `mise x -- printenv RUSTUP_TOOLCHAIN`; note that plain `mise env` does not
-# print the variable, so that command is the one that answers the question. Naming
-# "stable" here would therefore let a local shell resolve a different compiler than
-# CI resolves and hide the exact failure the pin exists to prevent, and omitting a
-# target here makes a cross-build that CI performs fail locally.
-#
-# `mise ls rust` reports the requested version as `(missing)` until `mise install`
-# runs, and mise falls back to the previously installed toolchain until then.
-rust = { version = "1.98.0", targets = "wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-pc-windows-msvc" }
 "cargo:cargo-nextest" = "latest"
 "cargo:maturin" = "latest"
 "cargo:cargo-deny" = "latest"

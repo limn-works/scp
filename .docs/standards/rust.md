@@ -7,50 +7,59 @@ Rust coding standards, safety rules, linting, formatting, testing, and CI for th
 | Tool | Version | Purpose |
 |------|---------|---------|
 | Rust edition | 2024 | Language edition (all crates) |
-| rustc | 1.98.0 | Compiler |
-| cargo | 1.98.0 | Build system, package manager |
-| clippy | 1.98.0 | Linter |
-| rustfmt | 1.98.0 | Formatter |
+| rustc, cargo, clippy, rustfmt | the `channel` in `rust-toolchain.toml` | Compiler, build system, linter, formatter |
 | cargo-deny | latest | Dependency license/advisory audit |
 | cargo-nextest | latest | Test runner (parallel, better output) |
 
-**The compiler version is pinned, and raising it is a deliberate change.**
-`scripts/check-toolchain-pin.sh` names every location that selects a Rust version, including
-the table above, and it is the only list — a second list in prose goes stale, which is how
-this pin's own first draft came to name four locations while the gate read seven. The gate
-fails when those locations disagree, when the compiler a command in the repository resolves
-to is not the pinned one, when a container build's `FROM` lines are not the exact set it
-permits, when a file carrying a line-initial `FROM` is missing from its list, and when a
-`dorny/paths-filter` entry in `.github/workflows/ci.yml` omits a file that pins a compiler
-— which would let a pin bump merge while every job that compiles on it skips, because the
-`ci` job that aggregates every other job's result counts a skipped job as a pass. Changing
-a container's compiler or Debian release means editing that permitted set in the gate in
-the same commit.
+**`rust-toolchain.toml` is the one place this repository names a Rust version, and this
+table names none.** A version written here would be a second declaration that could
+disagree with the pin, which is the defect the single-source design removes. Every consumer
+derives the version from that file:
 
-`.mise.toml` has to match because mise sets `RUSTUP_TOOLCHAIN` for the commands it runs, and
-that variable overrides `rust-toolchain.toml` entirely — channel, components, and targets.
-Verify with `mise x -- printenv RUSTUP_TOOLCHAIN`; plain `mise env` does not print it, so
-checking that instead reports the wrong answer.
+| Consumer | How it reads the pin |
+|----------|----------------------|
+| `cargo`, `rustup` | natively, for any command run inside the repository |
+| mise | `.mise.toml` sets `idiomatic_version_file_enable_tools = ["rust"]`, which makes `rust-toolchain.toml` the rust tool's version source; mise passes its `channel`, `components`, and `targets` to `rustup toolchain install` and exports `RUSTUP_TOOLCHAIN` with the channel it read |
+| `Dockerfile` | copies the file into the builder image before the first cargo command; the base tag names a Debian release only |
+| `templates/personal-relay/README.md` | its `COPY . .` brings the file into the image, for the same reason |
+| the CI workflows | their `dtolnay/rust-toolchain@stable` steps select no version — that action reads no toolchain file — so each one installs rustup's `stable` and runs `rustup default stable`, and rustup then applies `rust-toolchain.toml` as a directory override, which beats the default |
 
-Before this pin existed, every CI workflow installed `dtolnay/rust-toolchain@stable`, which
-resolves to whichever stable release exists on the morning a job runs. Rust 1.98.0 shipped
-on 2026-08-20 with two new lints — one warn-by-default `style` lint and one `pedantic`
-lint, so no group setting would have avoided it — and the `Rust / clippy` required check failed
-on every branch overnight while local runs on 1.97.1 reported a clean pass. To raise the
-version: change every location the gate names, the table above included, together; run
-`mise install`, because mise's `RUSTUP_TOOLCHAIN` keeps selecting the old
-compiler until it does; run `bash scripts/check-toolchain-pin.sh`, which fails until every
-location and the active compiler agree; run the CI clippy command; and fix everything the
+`fuzz/rust-toolchain.toml` names the nightly the standalone fuzz crate needs, because
+cargo-fuzz does not run on stable. rustup applies the toolchain file of the directory a
+command runs in, so every documented fuzz command runs from inside `fuzz/` and names no
+channel; the fuzz check in `.github/workflows/ci.yml` does the same with
+`working-directory: fuzz`. `.github/workflows/fuzz.yml` runs `cargo fuzz --fuzz-dir fuzz`
+from the repository root so its corpus-cache paths and its command paths agree, so it reads
+the channel out of the file in one job and passes that output to the others.
+
+To raise the version: edit `channel` in `rust-toolchain.toml`, run `mise install` so the
+local shell picks up the new toolchain, run the CI clippy command, and fix everything the
 new release reports in that same pull request. Never lower the pin to make a new lint
 disappear.
 
-The `Dockerfile` tag selects a Debian release as well as a compiler version, so name the
-release explicitly and give the builder stage the same one the runtime stage uses. The
-builder currently reads `rust:1.98.0-slim-bookworm` and the runtime reads
-`debian:bookworm-slim`, which are both Debian 12. Writing `rust:1.98.0-slim` instead would
-select Debian 13, and because glibc is backward compatible only, a binary the builder
-linked against that release's glibc 2.41 fails to exec against Debian 12's glibc 2.36. See
+Before the pin existed, every CI workflow installed `dtolnay/rust-toolchain@stable`, which
+resolves to whichever stable release exists on the morning a job runs. Rust 1.98.0 shipped
+on 2026-08-20 with two new lints — one warn-by-default `style` lint and one `pedantic` lint,
+so no group setting would have avoided it — and the `Rust / clippy` required check failed on
+every branch overnight while local runs on 1.97.1 reported a clean pass. See
 `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
+
+`scripts/check-toolchain-wiring.sh` checks the two properties the derivation cannot supply.
+First, that every file building from a `rust` base image copies `rust-toolchain.toml` into
+that image: the base tag names a Debian release and no compiler, so the copy is what selects
+the version, and a container build that omits it compiles on whatever the image ships.
+Second, that the `dorny/paths-filter` entries in `.github/workflows/ci.yml` route a change
+to `rust-toolchain.toml`, to the container build, or to `fuzz/rust-toolchain.toml` to the
+jobs that build from it. Every Rust job is guarded by
+`if: needs.changes.outputs.rust == 'true'`, and the `ci` job that aggregates every other
+job's result counts a skipped job as a pass, so a filter that omits the pin would let a
+version bump merge without one command compiling on the new compiler.
+
+The `Dockerfile` base tag selects a Debian release, so keep the builder stage and the
+runtime stage on the same one. The builder reads `rust:slim-bookworm` and the runtime reads
+`debian:bookworm-slim`, which are both Debian 12. Writing `rust:slim` instead would select
+Debian 13, and because glibc is backward compatible only, a binary the builder linked
+against that release's glibc 2.41 fails to exec against Debian 12's glibc 2.36.
 
 ## Safety Rules
 
@@ -160,10 +169,10 @@ workspace member**. All `cargo fuzz` commands require the one nightly that `fuzz
 nightlies after that date reject openmls 0.8.1's prelude re-export (E0365):
 
 ```sh
-cargo +nightly-2026-05-03 fuzz list --fuzz-dir fuzz          # list all 27 targets
-cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz \
+cd fuzz && cargo fuzz list          # list all 27 targets
+cd fuzz && cargo fuzz run <target> \
   -- -dict=fuzz/dicts/<dict> -max_total_time=60    # run one target locally
-cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml  # compile-check (no fuzzing)
+cd fuzz && cargo check              # compile-check (no fuzzing)
 ```
 
 **Tier strategy** (ADR-045):

@@ -142,8 +142,9 @@ bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
 features only, ZERO nullifier exceptions),
-check-toolchain-pin.sh (every location that selects a Rust version names the same
-version; the fuzz crate's pin stays on a nightly),
+check-toolchain-wiring.sh (every container build copies the Rust pin into its image;
+the ci.yml paths filters route a change to a pin or a container build to the jobs
+that build from it),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:
@@ -184,7 +185,7 @@ Caulfield asked a model to characterize the director Chris Columbus and got "war
 
 All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm or npx** — bun only for JS/TS. System `python3` is Xcode 3.9 — **do not use it**; use `python3.12`.
 
-**Rust is pinned, and raising the pin is a deliberate change.** `scripts/check-toolchain-pin.sh` names every location that selects a Rust version — do not keep a second list anywhere, because a list nothing reads goes stale. The gate fails when those locations disagree, when the compiler a command in the repository resolves to is not the pinned one, when a container build's `FROM` lines are not the exact set the gate permits, when a file carrying a line-initial `FROM` is missing from the list, and when a `dorny/paths-filter` entry in `.github/workflows/ci.yml` omits a file that pins a compiler, which would let a pin bump merge while every job that compiles on it skips. Changing a container's compiler or Debian release means editing the permitted set in the gate in the same commit, which is what makes that change deliberate. mise sets `RUSTUP_TOOLCHAIN` for the commands it runs, and that variable overrides `rust-toolchain.toml` entirely, which is why `.mise.toml` must match — check it with `mise x -- printenv RUSTUP_TOOLCHAIN`, since plain `mise env` does not print it. To raise the version: change every stable location the gate names, run `mise install` so the shell picks up the new toolchain, run `bash scripts/check-toolchain-pin.sh`, run the CI clippy command from the Orchestrator verification protocol below, and fix everything the new release reports in that same pull request. Never lower the pin to make a new lint disappear. See `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`, which records the merge-queue outage that a floating `@stable` caused.
+**`rust-toolchain.toml` is the one place this repository names a Rust version.** Every other consumer derives the version from that file, so no two files can disagree: `cargo` and `rustup` read it natively; `.mise.toml` sets `idiomatic_version_file_enable_tools = ["rust"]`, which makes mise read the file's channel, components, and targets and export `RUSTUP_TOOLCHAIN` with the channel it read; `Dockerfile` and the container recipe in `templates/personal-relay/README.md` copy the file into the image before any cargo command, and their base tags name a Debian release and no Rust version. `fuzz/rust-toolchain.toml` names the nightly the standalone fuzz crate needs; run every fuzz command from inside `fuzz/` and rustup applies that file, so no command names the channel, and `.github/workflows/fuzz.yml` — whose commands run from the repository root — reads the channel out of the file in one job. To raise either version: edit `channel`, run `mise install`, run the CI clippy command from the Orchestrator verification protocol below, and fix everything the new release reports in that same pull request. Never lower the pin to make a new lint disappear. A `RUSTUP_TOOLCHAIN` exported into your shell from outside the repository still overrides the file, so `scripts/hooks/pre-commit` compares `rustc --version` against the pin before it runs cargo. `scripts/check-toolchain-wiring.sh` checks the two properties a derivation cannot supply: that every container build copies `rust-toolchain.toml` into its image, since the base tag no longer names a compiler; and that the `dorny/paths-filter` entries in `.github/workflows/ci.yml` route a change to a pin or to a container build to the jobs that build from it, since the `ci` aggregator job counts a skipped job as a pass. See `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`, which records the merge-queue outage that a floating `@stable` caused.
 
 | Language | Location | Package Manager | Lint | Format | Test | Build |
 |----------|----------|----------------|------|--------|------|-------|
@@ -192,7 +193,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 | **Python** | `bindings/python/` | pip + maturin | `python3.12 -m ruff check .` | `python3.12 -m ruff format .` | `python3.12 -m pytest tests/ -v` | `maturin develop --release` |
 | **TypeScript** | `bindings/typescript/` | **bun** (not npm) | `bun run lint` (biome) | `bun run format` (biome) | `bun test` | `bun run build` (tsup) |
 | **Kotlin** | `bindings/kotlin/` | Gradle 8.x | `./gradlew detekt` | — | `./gradlew test` | `./gradlew assembleRelease` |
-| **Fuzzing** | `fuzz/` (standalone, not workspace) | cargo-fuzz (**nightly only**) | — | — | `cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz` | `cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml` |
+| **Fuzzing** | `fuzz/` (standalone, not workspace) | cargo-fuzz (**nightly only**) | — | — | `cd fuzz && cargo fuzz run <target>` | `cd fuzz && cargo check` |
 
 **Language-specific gotchas:**
 
@@ -200,7 +201,7 @@ All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm 
 - **Kotlin:** JDK 17 (zulu), Gradle 8.x, Kotlin 2.x — all via mise. Run `eval "$(mise env)"` first.
 - **TypeScript:** `bun run check` runs `tsc --noEmit` for type checking. Biome handles both lint and format.
 - **PRD validation:** `python3.12 scripts/validate-prd.py` — run before committing PRD changes.
-- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. All commands name `+nightly-2026-05-03`, the nightly that `fuzz/rust-toolchain.toml` pins. List targets: `cargo +nightly-2026-05-03 fuzz list --fuzz-dir fuzz`. See ADR-045, the fuzzing infrastructure decision, and `fuzz/README.md`.
+- **Fuzzing:** `fuzz/` is a standalone crate — never add it to root `Cargo.toml` members. Run every fuzz command from inside `fuzz/`: rustup applies the toolchain file of the directory a command runs in, and `fuzz/rust-toolchain.toml` names the nightly cargo-fuzz needs, so no command names a version. A command run from the repository root resolves the stable pin instead, and cargo-fuzz refuses to run on it. List targets: `cd fuzz && cargo fuzz list`. See ADR-045, the fuzzing infrastructure decision, and `fuzz/README.md`.
 
 ### Git
 

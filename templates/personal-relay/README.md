@@ -23,8 +23,8 @@ imports `scp_node::ApplicationNodeBuilder`, which the ADR-052 node-construction 
 deleted in favour of `Node::start(NodeConfig { .. })`, so `cargo build` stops at that import
 with `error[E0432]`. Issue #2384, the non-workspace crates that no longer compile, tracks the
 port. Every recipe below — the quick start, the systemd unit, and the Docker block — is
-correct once that lands, and the Docker recipe's Rust version is already governed by
-`scripts/check-toolchain-pin.sh`.
+correct once that lands, and the Docker recipe compiles on the version
+`rust-toolchain.toml` names, because it copies that file into the image.
 
 ## Quick start
 
@@ -181,18 +181,36 @@ The root context is not optional. `scp-personal-relay` declares its own `[worksp
 six `crates/*` path dependencies, which a context rooted at this directory cannot reach.
 Building the manifest by path from a root context satisfies both.
 
-Keep the Rust version equal to `channel` in `rust-toolchain.toml`, and keep the builder stage
-and the runtime stage on the same Debian release: glibc is backward compatible only, so a
-binary linked against a newer release's glibc cannot exec on an older one.
+The builder tag names a Debian release and no Rust version. `COPY . .` brings the
+repository's `rust-toolchain.toml` into the image, and rustup — which the official `rust`
+image ships — reads that file for the `cargo build` below, so the container compiles on the
+version that file names and on no other. Keep the builder stage and the runtime stage on the
+same Debian release: glibc is backward compatible only, so a binary linked against a newer
+release's glibc cannot exec on an older one.
 
 ```dockerfile
-FROM rust:1.98.0-bookworm AS builder
+FROM rust:bookworm AS builder
 WORKDIR /build
+# `aws-lc-sys` runs cmake from its build script, `ring` runs perl, and `libsqlite3-sys`
+# compiles SQLCipher against OpenSSL — the same build-script dependencies the root
+# `Dockerfile` installs, because this template depends on the same crates.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake perl pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 COPY . .
+# ASSERT-PINNED-RUSTC — every container build of this workspace carries these three lines
+# verbatim, and `scripts/check-toolchain-wiring.sh` fails on one that does not. They make
+# the image prove which compiler it resolved, so no reading of COPY lines has to.
+RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"; \
+    got="$(rustc --version | cut -d' ' -f2)"; \
+    [ -n "$pin" ] && [ "$got" = "$pin" ] || { echo "image resolved rustc '$got'; rust-toolchain.toml names '$pin'" >&2; exit 1; }
 RUN cargo build --release --manifest-path templates/personal-relay/Cargo.toml
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+# `libssl3` because the binary links `libcrypto.so.3` that SQLCipher pulls in.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/templates/personal-relay/target/release/scp-personal-relay /usr/local/bin/
 EXPOSE 443
 VOLUME /data

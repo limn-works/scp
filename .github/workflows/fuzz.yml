@@ -17,25 +17,44 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # The one nightly the fuzz crate builds on. Nightlies after this date
-  # tightened the `pub(crate)` re-export rules (E0365) and reject openmls
-  # 0.8.1's `pub use crate::ciphersuite::signature::*` at prelude.rs:16.
-  # `fuzz/rust-toolchain.toml` records the same date and the unpin condition, and
-  # `scripts/check-toolchain-pin.sh` fails when the two disagree.
-  #
-  # Every job below reaches this value through `dtolnay/rust-toolchain@master` plus a
-  # `toolchain:` input. The action publishes `master`, `stable`, `beta`, `nightly`, and a
-  # branch per released version, but no dated-nightly branch, so the `@nightly-<date>` ref
-  # these jobs used before never resolved and every scheduled run failed at job setup.
-  FUZZ_TOOLCHAIN: nightly-2026-05-03
 
 jobs:
+  # ── The nightly every job below compiles on ────────────────────────────────
+  # `fuzz/rust-toolchain.toml` names it, records why it is a dated nightly, and records
+  # what unpins it. This job reads the channel out of that file and no other step in this
+  # workflow repeats it, so the file and the workflow cannot disagree.
+  #
+  # Every job reaches the value through `dtolnay/rust-toolchain@master` plus a
+  # `toolchain:` input, rather than through the directory override `fuzz/README.md`
+  # documents, because these jobs run `cargo fuzz --fuzz-dir fuzz` from the repository
+  # root so that their corpus-cache paths and their command paths agree. The action
+  # publishes `master`, `stable`, `beta`, `nightly`, and a branch per released version,
+  # but no dated-nightly branch, so the `@nightly-<date>` ref these jobs used before
+  # never resolved and every scheduled run failed at setup.
+  toolchain:
+    name: Fuzz / read the pinned nightly
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.read.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: read
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+            fuzz/rust-toolchain.toml | head -n 1)
+          if [ -z "$channel" ]; then
+            echo "fuzz/rust-toolchain.toml names no [toolchain] channel" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
   # ── Nightly: regression + corpus growth ────────────────────────────────────
   # Runs every night at 03:00 UTC. Tier 1 targets get 15 min each; Tier 2 get
   # 5 min each. All targets run in parallel. Corpus is cached per-target and
   # minimized after each run with cargo fuzz cmin.
   fuzz-nightly:
     name: Fuzz / ${{ matrix.target }}
+    needs: toolchain
     runs-on: ubuntu-latest
     if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
     strategy:
@@ -94,21 +113,14 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      # TEMPORARY: pinned nightly. Recent nightlies (post-2026-05-03) tightened
-      # E0365 enforcement on glob re-exports, which fires on openmls 0.8.1's
-      # prelude — its trailing `pub use crate::ciphersuite::*` picks up the
-      # earlier `pub(crate) use signature::*` shadow and re-exports
-      # `Signature` / `SignContent` / `SignaturePublicKey` /
-      # `OpenMlsSignaturePublicKey` at insufficient visibility.
-      #
-      # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
-      # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
+      # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
+      # nightly and what unpins it.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+          toolchain: ${{ needs.toolchain.outputs.channel }}
 
       - name: Install cargo-fuzz
-        run: cargo +${{ env.FUZZ_TOOLCHAIN }} install cargo-fuzz --locked
+        run: cargo +${{ needs.toolchain.outputs.channel }} install cargo-fuzz --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -123,14 +135,14 @@ jobs:
           restore-keys: corpus-${{ matrix.target }}-
 
       # Every `cargo fuzz` command below names its toolchain explicitly. These
-      # steps run from the repository root, where `rust-toolchain.toml` pins
-      # stable 1.98.0, and cargo-fuzz only runs on nightly. An explicit
+      # steps run from the repository root, where `rust-toolchain.toml` names a
+      # stable channel, and cargo-fuzz only runs on nightly. An explicit
       # `+toolchain` sets RUSTUP_TOOLCHAIN for the command and everything it
       # spawns, which overrides that file. The same convention already governs
       # the fuzz-crate check in ci.yml.
       - name: Run fuzzer
         run: |
-          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz run ${{ matrix.target }} \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz run ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             -- \
@@ -144,7 +156,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz cmin ${{ matrix.target }} \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz cmin ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             || true
@@ -176,6 +188,7 @@ jobs:
   # self-generates a valid frame to tamper.
   fuzz-mls-decrypt:
     name: Fuzz / fuzz_mls_decrypt (release, debug-assertions off)
+    needs: toolchain
     runs-on: ubuntu-latest
     if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
     steps:
@@ -184,14 +197,14 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      # TEMPORARY: pinned nightly (see the note in fuzz-nightly). Unpin once
-      # openmls publishes a fixed prelude and scp-runtime updates its dependency.
+      # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
+      # nightly and what unpins it.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+          toolchain: ${{ needs.toolchain.outputs.channel }}
 
       - name: Install cargo-fuzz
-        run: cargo +${{ env.FUZZ_TOOLCHAIN }} install cargo-fuzz --locked
+        run: cargo +${{ needs.toolchain.outputs.channel }} install cargo-fuzz --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -211,7 +224,7 @@ jobs:
         # openmls's decrypt `debug_assert!` and turn every tampered input into a
         # false crash.
         run: |
-          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz run fuzz_mls_decrypt -O \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz run fuzz_mls_decrypt -O \
             --fuzz-dir fuzz \
             fuzz/corpus/fuzz_mls_decrypt \
             -- \
@@ -224,7 +237,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz cmin fuzz_mls_decrypt -O \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz cmin fuzz_mls_decrypt -O \
             --fuzz-dir fuzz \
             fuzz/corpus/fuzz_mls_decrypt \
             || true
@@ -251,6 +264,7 @@ jobs:
   # via RUSTFLAGS to catch undefined behavior in dependency C code.
   fuzz-weekly:
     name: Deep Fuzz / ${{ matrix.target }}
+    needs: toolchain
     runs-on: ubuntu-latest
     if: github.event.schedule == '0 0 * * 6' || github.event_name == 'workflow_dispatch'
     strategy:
@@ -281,21 +295,14 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      # TEMPORARY: pinned nightly. Recent nightlies (post-2026-05-03) tightened
-      # E0365 enforcement on glob re-exports, which fires on openmls 0.8.1's
-      # prelude — its trailing `pub use crate::ciphersuite::*` picks up the
-      # earlier `pub(crate) use signature::*` shadow and re-exports
-      # `Signature` / `SignContent` / `SignaturePublicKey` /
-      # `OpenMlsSignaturePublicKey` at insufficient visibility.
-      #
-      # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
-      # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
+      # `fuzz/rust-toolchain.toml` names this channel and records why it is a dated
+      # nightly and what unpins it.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+          toolchain: ${{ needs.toolchain.outputs.channel }}
 
       - name: Install cargo-fuzz
-        run: cargo +${{ env.FUZZ_TOOLCHAIN }} install cargo-fuzz --locked
+        run: cargo +${{ needs.toolchain.outputs.channel }} install cargo-fuzz --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -318,7 +325,7 @@ jobs:
         env:
           RUSTFLAGS: "-Zsanitizer=address,undefined"
         run: |
-          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz run ${{ matrix.target }} \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz run ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             -- \
@@ -332,7 +339,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz cmin ${{ matrix.target }} \
+          cargo +${{ needs.toolchain.outputs.channel }} fuzz cmin ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             || true

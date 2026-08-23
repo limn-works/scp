@@ -16,7 +16,7 @@ cargo-fuzz = true
 # ("Ciphertext decryption failed") fire on EVERY tampered ciphertext and report
 # a false crash. `fuzz_mls_decrypt` must validate the SHIPPED release path
 # (debug_assert compiled out → typed `Err`), so it MUST be run with
-# `cargo +nightly-2026-05-03 fuzz run fuzz_mls_decrypt -O ...` (release, debug-assertions
+# `cd fuzz && cargo fuzz run fuzz_mls_decrypt -O ...` (release, debug-assertions
 # off). This explicit profile line keeps debug-assertions off in the profile
 # itself (the release default) so the two agree; the `-O` flag is the operative
 # switch that stops cargo-fuzz re-enabling them. See the dedicated

@@ -27,10 +27,19 @@ is **regression detection** as the protocol evolves — catching new parsing bug
 
 ### Install prerequisites
 
+Run every command below from inside `fuzz/`. rustup applies the toolchain file of the
+directory a command runs in, so `fuzz/rust-toolchain.toml` supplies the nightly cargo-fuzz
+needs and no command here names a version. A command run from the repository root resolves
+the stable pin in the root `rust-toolchain.toml` instead, and cargo-fuzz refuses to run on
+stable.
+
 ```sh
-# Nightly Rust (required by cargo-fuzz). `rust-toolchain.toml` in this
-# directory pins the date; nightlies after it fail to build openmls 0.8.1.
-rustup toolchain install nightly-2026-05-03
+cd fuzz
+
+# Nightly Rust, which cargo-fuzz requires. rustup reads the channel out of
+# `rust-toolchain.toml` in this directory and installs it. Nightlies after the date that
+# file names fail to build openmls 0.8.1, which is why it names a date.
+rustup toolchain install
 
 # cargo-fuzz
 cargo install cargo-fuzz --locked
@@ -45,8 +54,8 @@ mise install
 ### Run a single target for 60 seconds
 
 ```sh
-cargo +nightly-2026-05-03 fuzz run fuzz_outer_envelope --fuzz-dir fuzz \
-  -- -dict=fuzz/dicts/msgpack_outer_envelope.dict \
+cargo fuzz run fuzz_outer_envelope \
+  -- -dict=dicts/msgpack_outer_envelope.dict \
      -max_total_time=60 -max_len=1048576
 ```
 
@@ -76,7 +85,7 @@ See [Crash Workflow](#crash-workflow) below.
 ### List all targets
 
 ```sh
-cargo +nightly-2026-05-03 fuzz list --fuzz-dir fuzz
+cargo fuzz list
 ```
 
 ## Target Inventory
@@ -145,17 +154,17 @@ Require structured generation to reach code paths that raw bytes cannot.
 ### Single target, short run
 
 ```sh
-cargo +nightly-2026-05-03 fuzz run fuzz_outer_envelope --fuzz-dir fuzz \
-  -- -dict=fuzz/dicts/msgpack_outer_envelope.dict \
+cargo fuzz run fuzz_outer_envelope \
+  -- -dict=dicts/msgpack_outer_envelope.dict \
      -max_total_time=300 -max_len=1048576 -rss_limit_mb=2048 -timeout=30
 ```
 
 ### Overnight campaign (8+ hours for Tier 1)
 
 ```sh
-cargo +nightly-2026-05-03 fuzz run fuzz_outer_envelope --fuzz-dir fuzz \
-  fuzz/corpus/fuzz_outer_envelope \
-  -- -dict=fuzz/dicts/msgpack_outer_envelope.dict \
+cargo fuzz run fuzz_outer_envelope \
+  corpus/fuzz_outer_envelope \
+  -- -dict=dicts/msgpack_outer_envelope.dict \
      -max_total_time=28800 -max_len=1048576 -rss_limit_mb=2048 -timeout=30 -detect_leaks=0
 ```
 
@@ -164,7 +173,7 @@ Always pass the corpus directory so the fuzzer can both read seeds and save newl
 ### Minimize corpus after a campaign
 
 ```sh
-cargo +nightly-2026-05-03 fuzz cmin fuzz_outer_envelope --fuzz-dir fuzz fuzz/corpus/fuzz_outer_envelope
+cargo fuzz cmin fuzz_outer_envelope corpus/fuzz_outer_envelope
 ```
 
 Run this periodically — corpus grows unbounded otherwise, slowing future runs.
@@ -173,7 +182,7 @@ Run this periodically — corpus grows unbounded otherwise, slowing future runs.
 
 ```sh
 # Build with coverage instrumentation
-cargo +nightly-2026-05-03 fuzz coverage fuzz_outer_envelope --fuzz-dir fuzz fuzz/corpus/fuzz_outer_envelope
+cargo fuzz coverage fuzz_outer_envelope corpus/fuzz_outer_envelope
 
 # Show coverage (requires llvm-tools)
 # The coverage data is in fuzz/coverage/fuzz_outer_envelope/
@@ -215,7 +224,7 @@ in the libFuzzer logs plateaus at a low number, check that:
 
 6. **Verify locally**:
    ```sh
-   cargo +nightly-2026-05-03 fuzz run fuzz_my_target --fuzz-dir fuzz -- -max_total_time=60
+   cargo fuzz run fuzz_my_target -- -max_total_time=60
    ```
 
 See `fuzz/.claude/CLAUDE.md` for the full agent-facing checklist.
@@ -227,7 +236,7 @@ When the fuzzer finds a crash:
 ### 1. Reproduce
 
 ```sh
-cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz fuzz/artifacts/<target>/crash-<hash>
+cargo fuzz run <target> artifacts/<target>/crash-<hash>
 ```
 
 You should see the same panic/abort. If not, the crash may be non-deterministic (unlikely with libFuzzer).
@@ -235,7 +244,7 @@ You should see the same panic/abort. If not, the crash may be non-deterministic 
 ### 2. Minimize
 
 ```sh
-cargo +nightly-2026-05-03 fuzz tmin <target> --fuzz-dir fuzz fuzz/artifacts/<target>/crash-<hash>
+cargo fuzz tmin <target> artifacts/<target>/crash-<hash>
 ```
 
 `tmin` produces a smaller input that still triggers the crash. Copy the minimized file to
@@ -257,7 +266,7 @@ This prevents regression without requiring the fuzzer to rediscover it:
 ```rust
 #[test]
 fn regression_fuzz_outer_envelope_crash_abc123() {
-    // Minimized crash input from fuzz/corpus/fuzz_outer_envelope/crash-abc123
+    // Minimized crash input from corpus/fuzz_outer_envelope/crash-abc123
     let input = &[0x85, 0x01, ...];
     let _ = OuterEnvelope::from_bytes(input);
 }
@@ -336,7 +345,7 @@ Runs at 00:00 UTC every Saturday (or on `workflow_dispatch`):
 `.github/workflows/ci.yml` includes a `fuzz-build` job on every PR:
 
 ```sh
-cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml
+cargo check
 ```
 
 This catches compilation breakage without running the fuzzer. If a production type's public API changes
@@ -365,8 +374,8 @@ To run with UBSan locally (nightly only):
 
 ```sh
 RUSTFLAGS="-Zsanitizer=undefined" \
-  cargo +nightly-2026-05-03 fuzz run fuzz_outer_envelope --fuzz-dir fuzz \
-  -- -dict=fuzz/dicts/msgpack_outer_envelope.dict -max_total_time=300 -max_len=1048576
+  cargo fuzz run fuzz_outer_envelope \
+  -- -dict=dicts/msgpack_outer_envelope.dict -max_total_time=300 -max_len=1048576
 ```
 
 Note: combining `address` and `undefined` sanitizers (`-Zsanitizer=address,undefined`) may not work

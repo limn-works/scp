@@ -3585,7 +3585,7 @@ For parser and deserializer targets (T1/T2), the fuzzer receives a raw `&[u8]` s
 **CI cadence:**
 - **Nightly** (`.github/workflows/fuzz.yml`, 03:00 UTC): T1 targets 15 min each, T2 targets 5 min each. All targets parallel. Corpus cached per-target with `actions/cache`; `cargo fuzz cmin` runs after each campaign.
 - **Weekly deep-fuzz** (Saturday 00:00 UTC or `workflow_dispatch`): T1 targets only, 2 hours each, AddressSanitizer enabled (cargo-fuzz default) + UBSan on Saturdays.
-- **Per-PR compilation check** (`cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml`): catches API breakage without running the fuzzer. Runs in `.github/workflows/ci.yml` as `fuzz-build`. `fuzz/rust-toolchain.toml` pins that nightly and records the condition for unpinning it.
+- **Per-PR compilation check** (`cargo check` on the fuzz crate): catches API breakage without running the fuzzer. Runs in `.github/workflows/ci.yml` as `fuzz-build`. `fuzz/rust-toolchain.toml` names the nightly the crate compiles on and records the condition for unpinning it; no command and no workflow repeats that channel.
 
 ### Rationale
 
@@ -3681,11 +3681,11 @@ fuzz/                        # Standalone cargo-fuzz crate (not workspace member
 
 ### Acceptance Criteria
 
-1. `cargo +nightly-2026-05-03 fuzz list --fuzz-dir fuzz` lists all 27 targets.
-2. `cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml` succeeds on a stable CI runner, because the explicit `+toolchain` flag selects the pinned nightly for that command.
+1. `cd fuzz && cargo fuzz list` lists all 27 targets.
+2. `cd fuzz && cargo check` succeeds on a CI runner whose default toolchain is stable, because rustup applies the toolchain file of the directory a command runs in and `fuzz/rust-toolchain.toml` names the nightly.
 3. Fuzz crate is NOT listed in root `Cargo.toml` `[workspace] members`.
 4. `.github/workflows/fuzz.yml` runs T1 targets (15 min) and T2 targets (5 min) nightly; T1 targets with UBSan weekly.
-5. `.github/workflows/ci.yml` includes a `fuzz-build` job that runs `cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml`.
+5. `.github/workflows/ci.yml` includes a `fuzz-build` job that compiles the fuzz crate on the channel `fuzz/rust-toolchain.toml` names, and the job repeats that channel nowhere.
 6. Security invariants I1–I10 are documented in `fuzz/README.md` with current coverage status.
 7. `fuzz/.claude/CLAUDE.md` exists with agent-facing conventions: standalone crate caution, nightly requirement, raw-bytes-vs-Arbitrary guidance, dictionary format, invariant catalog.
 8. All T1/T2 targets use raw bytes (`|data: &[u8]|`). All T3/T4 targets that require semantic structure use `Arbitrary`.
