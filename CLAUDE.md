@@ -146,10 +146,10 @@ check-toolchain-wiring.sh (every container build asserts which compiler it resol
 the changes job of every paths-filtered workflow routes a pin change to every lane that
 compiles on it, and ci.yml routes every root-level file and every cargo configuration
 file to a lane or declares it unread; .mise.toml names no Rust version source),
-check-examples-build-shipped.sh (every published `examples/*.rs` must be a cargo
-example target that builds lint-clean on default features; the `cargo package
---list` sourcing and the per-package loop are both the assertion — see the script
-header),
+check-examples-build-shipped.sh (every example target compiles, and every published
+`examples/*.rs` is some target's source, joined on PATH not on target name; the
+path join, the per-package loop, and the target-driven compile loop are all the
+assertion — see the script header, which also states what the check cannot prove),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:

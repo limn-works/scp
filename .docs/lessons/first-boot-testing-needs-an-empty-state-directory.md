@@ -33,7 +33,3 @@ returns exactly one implementation, the test-harness
 nullifier-backed identity — the no-stand-ins tenet working as designed, and a fact
 the example's own "Run this, then open the printed URL" instruction did not carry
 until this branch added it.
-
-When a run is supposed to exercise first-boot behaviour, point every state
-directory the program reads at an empty one. A first run that finds a persisted identity takes the load branch, so it never
-reaches the branch that creates one.
