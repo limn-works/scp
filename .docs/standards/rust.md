@@ -19,9 +19,10 @@ Rust coding standards, safety rules, linting, formatting, testing, and CI for th
 the table above, and it is the only list — a second list in prose goes stale, which is how
 this pin's own first draft came to name four locations while the gate read seven. The gate
 fails when those locations disagree, when the compiler a command in the repository resolves
-to is not the pinned one, when a container build's builder stage names a different Debian
-release than its runtime stage, and when a file carrying a `FROM rust:` line is missing from
-its list.
+to is not the pinned one, when a container build's `FROM` lines are not the exact set it
+permits, and when a file carrying a `FROM rust` line is missing from its list. Changing a
+container's compiler or Debian release means editing that permitted set in the gate in the
+same commit.
 
 `.mise.toml` has to match because mise sets `RUSTUP_TOOLCHAIN` for the commands it runs, and
 that variable overrides `rust-toolchain.toml` entirely — channel, components, and targets.

@@ -161,21 +161,34 @@ WantedBy=multi-user.target
 
 ### Docker
 
+Build from the repository root, not from this directory. `scp-personal-relay` declares its
+own `[workspace]`, so `cargo build -p scp-personal-relay` finds no such package at the root;
+and its manifest names six `crates/*` path dependencies, which a build context rooted here
+cannot reach. Naming the manifest by path from a root context satisfies both:
+
+```sh
+docker build -f templates/personal-relay/Dockerfile -t scp-personal-relay .
+```
+
 ```dockerfile
 FROM rust:1.98.0-bookworm AS builder
 WORKDIR /build
 COPY . .
-RUN cargo build --release -p scp-personal-relay
+RUN cargo build --release --manifest-path templates/personal-relay/Cargo.toml
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /build/target/release/scp-personal-relay /usr/local/bin/
+COPY --from=builder /build/templates/personal-relay/target/release/scp-personal-relay /usr/local/bin/
 EXPOSE 443
 VOLUME /data
 ENV SCP_RELAY_STORAGE_PATH=/data
 HEALTHCHECK CMD ["/usr/local/bin/scp-personal-relay", "--health"]
 ENTRYPOINT ["/usr/local/bin/scp-personal-relay"]
 ```
+
+Keep the Rust version equal to the pin in `rust-toolchain.toml` at the repository root, and
+keep this builder stage and the runtime stage on the same Debian release;
+`scripts/check-toolchain-pin.sh` enforces both.
 
 ```bash
 docker run -d \

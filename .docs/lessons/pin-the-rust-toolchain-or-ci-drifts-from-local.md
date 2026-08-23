@@ -60,10 +60,20 @@ Three more name the nightly that the standalone fuzz crate needs:
 Keep no second list: counting the locations in prose produced three artifacts that disagreed
 with the gate and with each other, and one whole commit repairing them. The gate also checks
 three properties that version agreement leaves open: that `rustc --version` in the repository
-equals the pin, that each container build's builder stage and runtime stage name the same
-Debian release, and that no file carrying a `FROM rust:` line is missing from its list — the
-last one because four review rounds each found one more such file, and a list that checks
-only the files it already names cannot find the next. The second one exists because the first draft of this fix broke it —
+equals the pin, that each container build's `FROM` lines equal a set the gate permits, and
+that no file carrying a `FROM rust` line is missing from its list.
+
+The container check is a whitelist rather than a parser, and arriving there took three
+rounds of the wrong shape. Each round validated Docker's `FROM` syntax by pattern, and each
+round a reviewer found one more legal spelling the pattern mishandled: an indented keyword,
+a lowercase one, an untagged `FROM rust`, a registry-qualified image, a second stage whose
+tag named no Debian release. Docker's grammar admits many spellings of one image, so
+enumerating them does not terminate. Enumerating the permitted lines does: each container
+file declares the exact `FROM` lines it may contain, every other spelling differs from them
+and fails, and a legitimate change to a container's compiler or Debian release means editing
+that declaration in the same commit. CLAUDE.md asks for this shape directly — a positive
+whitelist closed by construction, never a denylist chasing one more spelling — and the
+review-pass count was the signal that the earlier shape was wrong. The second one exists because the first draft of this fix broke it —
 `rust:1.85-slim` is a Debian 12 image and `rust:1.98.0-slim` is a Debian 13 one, so bumping
 the version alone moved the builder to glibc 2.41 while the runtime stayed on 2.36, and
 glibc is backward compatible only. The gate reads a fixed list of locations and extracts one version string

@@ -16,10 +16,10 @@
 # Stable version — every one of these compiles the workspace:
 #   1. `rust-toolchain.toml`      channel                   — what plain `cargo` resolves to
 #   2. `.mise.toml`               rust version              — what a mise shell resolves to
-#   3. every `FROM rust:` tag in `Dockerfile` and in
-#      `templates/personal-relay/README.md` — the two container builds of this
-#      workspace's crates — together with each file's `FROM debian:` stage, whose
-#      Debian release must equal its builder's
+#   3. the `FROM` lines of `Dockerfile` and of `templates/personal-relay/README.md` —
+#      the two container builds of this workspace's crates — each of which must equal
+#      a permitted set written in this gate, so the compiler and the Debian release
+#      both change deliberately
 #   4. `.docs/standards/rust.md`  rustc/cargo/clippy/rustfmt rows — the governing standard
 #
 # Nightly version — the standalone fuzz crate needs one, and cargo-fuzz does not run
@@ -108,12 +108,21 @@ done
 # lands rather than the morning the pin moves.
 # `--untracked` matters: a container build added but not yet committed is exactly the case
 # a pre-commit or pre-push run has to catch, and plain `git grep` searches only the index.
-discovered=$(git grep -l --untracked -E '^[Ff][Rr][Oo][Mm][[:space:]]+(--[a-z-]+=[^[:space:]]+[[:space:]]+)*rust:' -- . 2>/dev/null | sort || true)
-listed=$(printf '%s\n' "${DOCKERFILES[@]}" | sort)
-if [[ $discovered != "$listed" ]]; then
-    unlisted=$(comm -23 <(printf '%s\n' "$discovered") <(printf '%s\n' "$listed") | tr '\n' ' ')
-    [[ -z ${unlisted// /} ]] ||
-        report "these files carry a 'FROM rust:' line and DOCKERFILES does not name them: $unlisted"
+# Match `rust` with or without a tag, indented or not, in either case, so a file the
+# whitelist above would reject cannot escape by not being looked at.
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    report "not inside a git working tree, so the gate cannot search for unlisted container builds"
+else
+    # This file is excluded because `expected_from_lines` above necessarily contains the
+    # permitted `FROM rust:` lines verbatim; it declares them rather than building on them.
+    discovered=$(git grep -l --untracked -iE '^[[:space:]]*FROM[[:space:]]+([^[:space:]]+[[:space:]]+)*rust[:[:space:]]' \
+        -- . ':!scripts/check-toolchain-pin.sh' | sort)
+    listed=$(printf '%s\n' "${DOCKERFILES[@]}" | sort)
+    if [[ $discovered != "$listed" ]]; then
+        unlisted=$(comm -23 <(printf '%s\n' "$discovered") <(printf '%s\n' "$listed") | tr '\n' ' ')
+        [[ -z ${unlisted// /} ]] ||
+            report "these files carry a 'FROM rust' line and DOCKERFILES does not name them: $unlisted"
+    fi
 fi
 
 # The toolchain table names four tools. Checking only `rustc` would let the clippy row
@@ -130,11 +139,21 @@ require fuzz_version "fuzz/rust-toolchain.toml [toolchain] channel" \
 
 require fuzz_workflow_version ".github/workflows/fuzz.yml env FUZZ_TOOLCHAIN" \
     ".github/workflows/fuzz.yml" \
-    's/^[[:space:]]*FUZZ_TOOLCHAIN:[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p'
+    's/^[[:space:]]*FUZZ_TOOLCHAIN:[[:space:]]*"?([^"[:space:]]+)"?[[:space:]]*$/\1/p'
 
 require ci_workflow_version ".github/workflows/ci.yml env FUZZ_TOOLCHAIN" \
     ".github/workflows/ci.yml" \
-    's/^[[:space:]]*FUZZ_TOOLCHAIN:[[:space:]]*([^[:space:]]+)[[:space:]]*$/\1/p'
+    's/^[[:space:]]*FUZZ_TOOLCHAIN:[[:space:]]*"?([^"[:space:]]+)"?[[:space:]]*$/\1/p'
+
+# A job-level `env:` block overrides the workflow-level one for that job's steps, and the
+# extraction above reads the first definition in the file. Requiring exactly one definition
+# per workflow keeps the value the gate compares equal to the value every job resolves.
+for wf in .github/workflows/fuzz.yml .github/workflows/ci.yml; do
+    [[ -f $wf ]] || continue
+    count=$(grep -cE '^[[:space:]]*FUZZ_TOOLCHAIN:' "$wf" || true)
+    [[ $count -eq 1 ]] ||
+        report "$wf defines FUZZ_TOOLCHAIN $count times; a job-level env block overrides the workflow-level one, and the gate reads only the first"
+done
 
 # Any location that produced no value already set `fail`. Stop here rather than
 # compare, because two empty values would otherwise agree with each other.
@@ -151,73 +170,75 @@ fi
 # the patch component, because a floating tag such as `rust:1.98-slim` resolves to the
 # newest 1.98.x, so the day 1.98.1 ships the container would compile on a compiler the pin
 # does not name — the drift this gate exists to stop, admitted by the gate itself.
-# Reduce every `FROM` line to `<image>:<tag>`, so each check below matches one shape
-# instead of carrying its own spelling of the optional parts. Docker allows flags such as
-# `--platform=` before the image and a `@sha256:` digest after the tag, a stage name is
-# optional, and the keyword itself is case-insensitive; none of those change which image
-# the line selects.
-from_images() {
-    sed -nE 's|^[Ff][Rr][Oo][Mm][[:space:]]+(--[a-z-]+=[^[:space:]]+[[:space:]]+)*([^[:space:]@]+).*|\2|p' "$1"
-}
-
-# Debian names each release twice — `debian:12-slim` and `debian:bookworm-slim` are the
-# same image — so map the number onto the name before comparing.
-debian_suite() {
+# CONTAINER BUILDS — a positive whitelist, not a parser.
+#
+# Three review rounds each found one more legal Dockerfile spelling this check mishandled:
+# an indented `FROM`, a lowercase one, an untagged `FROM rust`, a registry-qualified image,
+# and a second stage whose tag named no Debian release. Docker's `FROM` grammar admits many
+# spellings of one image, so validating them by pattern is an open-ended denylist, and
+# CLAUDE.md's guard against non-convergent enforcement asks for the opposite shape: a
+# positive whitelist of permitted forms, closed by construction.
+#
+# So each container file declares the exact set of `FROM` lines it may contain, with the
+# pinned version substituted for @PIN@. The gate compares that set against the file, in
+# both directions. Every spelling above fails, because none of them is a listed line, and
+# the fix for a legitimate change is to update the expected set here — which is what makes
+# changing a container's compiler or Debian release a deliberate act rather than a silent
+# one.
+#
+# The two files are on the list for the same reason: each documents a container build of
+# this workspace's crates. `templates/personal-relay/README.md` depends on `crates/*` by
+# path, so its tag selects a compiler for this workspace exactly as the root Dockerfile's
+# does, and it shipped naming Rust 1.85 — which predates the `as_chunks` this workspace
+# calls.
+#
+# Every builder stage and every runtime stage names the same Debian release on purpose.
+# glibc is backward compatible only, so a binary the builder links against a newer
+# release's glibc cannot exec on an older one, and the runtime container dies at startup
+# with "version `GLIBC_2.xx' not found". `rust:1.85-slim` was a Debian 12 image and
+# `rust:1.98.0-slim` is a Debian 13 one, so a tag naming no release changes distribution
+# under the build without the tag changing; naming the release in every line closes that.
+expected_from_lines() {
     case $1 in
-        11 | bullseye) printf 'bullseye' ;;
-        12 | bookworm) printf 'bookworm' ;;
-        13 | trixie) printf 'trixie' ;;
-        *) printf '%s' "$1" ;;
+        Dockerfile)
+            cat <<EOF
+FROM rust:@PIN@-slim-bookworm AS chef
+FROM chef AS planner
+FROM chef AS builder
+FROM debian:bookworm-slim AS runtime
+EOF
+            ;;
+        templates/personal-relay/README.md)
+            cat <<EOF
+FROM rust:@PIN@-bookworm AS builder
+FROM debian:bookworm-slim
+EOF
+            ;;
+        *)
+            return 1
+            ;;
     esac
 }
 
 for f in "${DOCKERFILES[@]}"; do
     [[ -f $f ]] || continue
-    images=$(from_images "$f")
-
-    tags=$(sed -nE 's|^rust:(.+)$|\1|p' <<< "$images")
-    if [[ -z $tags ]]; then
-        report "$f: no 'FROM rust:<version>' line found"
+    if ! expected=$(expected_from_lines "$f"); then
+        report "$f is listed in DOCKERFILES but expected_from_lines does not describe it"
         continue
     fi
-    while IFS= read -r tag; do
-        [[ -n $tag ]] || continue
-        [[ ${tag%%-*} == "$pin_version" ]] ||
-            report "$f builds on rust:$tag; rust-toolchain.toml names $pin_version"
-    done <<< "$tags"
-
-    # The `FROM rust:` tag selects a Debian release as well as a compiler version, and the
-    # runtime stage selects one too. glibc is backward compatible only, so a binary the
-    # builder links against a newer release's glibc cannot exec on an older one, and the
-    # runtime container dies at startup with "version `GLIBC_2.xx' not found". Comparing
-    # versions leaves that unchecked, because the version is the part of the tag before the
-    # first hyphen. Accept `rust:<version>-<release>` and `rust:<version>-slim-<release>`,
-    # both of which name a release; a tag ending at `-slim`, or carrying no suffix, names
-    # none, and follows whichever Debian the rust image currently defaults to — which is
-    # how `rust:1.85-slim` (Debian 12) became `rust:1.98.0-slim` (Debian 13) during this
-    # pin's own first draft.
-    builder_raw=$(sed -nE 's|^rust:[^-]+(-slim)?-([a-z0-9]+)$|\2|p' <<< "$images" | grep -vx slim || true)
-    runtime_raw=$(sed -nE 's|^debian:([a-z0-9]+)-slim$|\1|p' <<< "$images" || true)
-    if [[ -z $builder_raw ]]; then
-        report "$f: no 'FROM rust:<version>[-slim]-<debian-release>' line found; a tag naming no release follows whichever Debian the rust image defaults to"
-        continue
-    fi
-    if [[ -z $runtime_raw ]]; then
-        report "$f: no 'FROM debian:<debian-release>-slim' line found"
-        continue
-    fi
-    # Take the set of releases the whole file names, across both stage kinds, and require
-    # it to hold exactly one. Comparing each builder against the set of runtimes would ask
-    # only for membership, and a file with two runtime stages satisfies membership while
-    # one of them still runs an older glibc than the builder linked against.
-    suites=""
-    while IFS= read -r raw; do
-        [[ -n $raw ]] || continue
-        suites+="$(debian_suite "$raw")"$'\n'
-    done <<< "$builder_raw"$'\n'"$runtime_raw"
-    distinct=$(printf '%s' "$suites" | sed '/^$/d' | sort -u)
-    if [[ $(grep -c . <<< "$distinct") -ne 1 ]]; then
-        report "$f names more than one Debian release across its stages: $(tr '\n' ' ' <<< "$distinct")"
+    expected=${expected//@PIN@/$pin_version}
+    # Case-insensitive and whitespace-tolerant on the way IN, so a lowercase or indented
+    # `from` line still lands in the comparison; the expected set is written one way, so
+    # any other spelling differs from it and fails.
+    actual=$(grep -iE '^[[:space:]]*FROM[[:space:]]' "$f" || true)
+    if [[ $actual != "$expected" ]]; then
+        report "$f: its 'FROM' lines are not the permitted set for pin $pin_version.
+  expected:
+$(sed 's/^/    /' <<< "$expected")
+  found:
+$(sed 's/^/    /' <<< "${actual:-<none>}")
+  Change a container's compiler or Debian release by editing expected_from_lines in this
+  gate at the same time, so the change is deliberate."
     fi
 done
 
@@ -232,8 +253,17 @@ done
 if ! command -v rustc >/dev/null 2>&1; then
     report "rustc is not on PATH, so the gate cannot confirm which compiler this directory resolves to"
 else
-    active_version=$(rustc --version 2>/dev/null | sed -nE 's/^rustc ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')
-    if [[ -z $active_version ]]; then
+    # Capture the status rather than letting `set -e` abort the assignment: a rustc that
+    # exits non-zero — rustup failing to fetch the pinned toolchain, most likely — would
+    # otherwise kill the gate with rustc's own status and print nothing at all.
+    if ! raw_rustc=$(rustc --version 2>&1); then
+        report "'rustc --version' failed, so the active compiler is unknown: $raw_rustc"
+        raw_rustc=""
+    fi
+    active_version=$(sed -nE 's/^rustc ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' <<< "$raw_rustc")
+    if [[ -z $raw_rustc ]]; then
+        : # already reported
+    elif [[ -z $active_version ]]; then
         report "could not parse 'rustc --version' output, so the active compiler is unknown"
     elif [[ $active_version != "$pin_version" ]]; then
         report "rustc in this directory is $active_version; rust-toolchain.toml names $pin_version.\
@@ -252,7 +282,8 @@ fi
 pin_targets=$(sed 's/#.*//' rust-toolchain.toml | tr '\n' ' ' |
     sed -nE 's/.*targets[[:space:]]*=[[:space:]]*\[([^]]*)\].*/\1/p' |
     tr ',' '\n' | sed -nE 's/[^"]*"([^"]+)".*/\1/p')
-mise_targets=$(sed -nE 's/^[[:space:]]*rust[[:space:]]*=.*targets[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' .mise.toml | tr ',' '\n')
+mise_targets=$(sed -nE 's/^[[:space:]]*rust[[:space:]]*=.*targets[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' .mise.toml |
+    tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
 if [[ -z $pin_targets ]]; then
     report "rust-toolchain.toml: no 'targets = [ .. ]' array found, so the gate cannot check that .mise.toml covers it"
 elif [[ -z $mise_targets ]]; then
