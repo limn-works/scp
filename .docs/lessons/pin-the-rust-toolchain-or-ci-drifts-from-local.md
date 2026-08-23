@@ -445,6 +445,30 @@ file's contents happen to carry.** A keyword search answers "does this text ment
 container build", and a document that explains one mentions it exactly as loudly as a
 Dockerfile does.
 
+## An Advisory Ignore Records the Day Somebody Wrote It
+
+`deny.toml` suppressed RUSTSEC-2026-0098, RUSTSEC-2026-0099, and RUSTSEC-2026-0104 with the
+justification "Awaiting upstream rustls-webpki patch". rustls-webpki published the patch for
+the first two on 2026-04-14 and for the third on 2026-04-22, four months before anyone read
+the file again, and every requirement on the crate in this workspace is semver-compatible
+with it: rustls 0.23.37 requires `^0.103.5` and rustls-platform-verifier 0.6.2 requires
+`^0.103`, so `cargo update -p rustls-webpki --precise 0.103.13` moved one lockfile entry and
+nothing else. Until then the relay kept linking 0.103.10, which accepts a URI name
+constraint it should reject, accepts a wildcard-asserting certificate under a permitted
+DNS-name constraint, and panics on a syntactically valid empty `BIT STRING` in a CRL's
+`onlySomeReasons` extension before that CRL's signature is verified.
+
+An operator reading `deny.toml` to learn which advisories this repository still carries
+would have read "no fix exists" and left all three suppressed. The three ignore entries are
+deleted, and `cargo deny check advisories` — which the `rust-deny` job runs, guarded by a
+filter that lists `deny.toml` and `Cargo.lock` — now fails if the lock ever resolves a
+vulnerable rustls-webpki again.
+
+The generalisation: **"awaiting upstream" is a claim about a date, and the file it lives in
+does not age with it.** An ignore entry whose justification is the absence of a fix is a
+claim to re-check against the advisory database's `patched` range, not a decision to record
+once.
+
 ## Raising the Pin
 
 1. Edit `channel` in `rust-toolchain.toml`. Nothing else names the version.
