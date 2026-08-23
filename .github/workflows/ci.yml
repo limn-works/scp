@@ -501,6 +501,25 @@ jobs:
       - run: pip install tree-sitter tree-sitter-rust
       - run: python3.12 scripts/check-bridge-instance-lifecycle.py
 
+  release-pipeline:
+    needs: check-draft
+    name: enforcement / release pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned so a breaking upstream release cannot change the verdict.
+      - run: pip install 'pytest>=8,<10' 'PyYAML>=6,<7'
+      # The self-tests replay the two shapes the workflows carried before this
+      # gate existed and assert it rejects both, so a green gate means the gate
+      # detects the defect rather than agreeing with whatever the files say.
+      - name: Gate self-tests
+        run: python3.12 -m pytest scripts/test_check_release_pipeline.py -v
+      - name: Real check (Swift mirror license, Kotlin build gate)
+        run: python3.12 scripts/check-release-pipeline.py
+
   wasm-protocol:
     needs: check-draft
     name: WASM / protocol
@@ -1442,6 +1461,7 @@ jobs:
       - no-mutable-globals-python
       - no-mutable-globals-ts
       - no-mutable-globals-kotlin
+      - release-pipeline
       - wasm-protocol
       - wasm-test
       - rust-fmt
@@ -1495,6 +1515,7 @@ jobs:
             "${{ needs.no-mutable-globals-python.result }}" \
             "${{ needs.no-mutable-globals-ts.result }}" \
             "${{ needs.no-mutable-globals-kotlin.result }}" \
+            "${{ needs.release-pipeline.result }}" \
             "${{ needs.wasm-protocol.result }}" \
             "${{ needs.wasm-test.result }}" \
             "${{ needs.rust-fmt.result }}" \

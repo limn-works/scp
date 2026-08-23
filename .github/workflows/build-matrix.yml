@@ -370,6 +370,26 @@ jobs:
         working-directory: bindings/kotlin
         run: ./gradlew :scp-kt:generateUniffiBindings
 
+      # Compile both published Kotlin modules here, in the credential-free build
+      # gate. release.yml's publish-maven runs these same two tasks, but it runs
+      # them with the GPG signing key and the Central Portal token in its
+      # environment and alongside publish-crates, publish-pypi, and publish-npm,
+      # which all depend on the same two signing jobs and therefore start
+      # together. crates.io, PyPI, and npm reject a re-upload of a version, so a
+      # Kotlin compile error that first surfaced in publish-maven would force a
+      # version bump across every SDK. Compiling here fails the release before
+      # any registry has taken an upload, and it fails a dry run too, because
+      # publish-maven is skipped when dry-run is true.
+      #
+      # `-x generateUniffiBindings` reuses the bindings the previous step wrote
+      # instead of running cargo a second time, which is the same exclusion
+      # publish-maven passes.
+      - name: Compile Kotlin modules
+        working-directory: bindings/kotlin
+        run: |
+          ./gradlew :scp-kt:assemble :scp-kt-android:assembleRelease \
+            -x generateUniffiBindings
+
       # The cross-compiled UniFFI jniLibs (one .so per Android ABI). publish-maven
       # downloads + re-stages these so Gradle assembles the published AAR with
       # native libraries present — without a second NDK cross-compile in the

@@ -866,7 +866,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout monorepo
-        # Provides bindings/swift/Package.dist.swift (manifest template) + LICENSE.
+        # Provides bindings/swift/Package.dist.swift (the manifest template) and
+        # LICENSE-APACHE (the grant the mirror publishes as its LICENSE).
         uses: actions/checkout@v5
 
       - name: Checkout scp-swift mirror
@@ -926,15 +927,23 @@ jobs:
               -e "s|__SCP_XCFRAMEWORK_CHECKSUM__|${CHECKSUM}|" \
               ../bindings/swift/Package.dist.swift > Package.swift
 
-          # License (fail closed — a published package must carry one) + a
-          # generated do-not-edit README.
-          cp ../LICENSE LICENSE
+          # LICENSING.md assigns the Swift binding the Apache License 2.0, so
+          # the mirror carries that grant in full. The repository root's LICENSE
+          # is a pointer: it names LICENSING.md, LICENSE-APACHE, and
+          # LICENSE-AGPL, and the mirror carries none of the three, so copying
+          # it would publish three dangling references and no grant.
+          cp ../LICENSE-APACHE LICENSE
           printf '%s\n' \
             "# SCP — Swift SDK" \
             "" \
             "Auto-generated SwiftPM distribution of the Shared Context Protocol Swift SDK." \
             "Source of truth: https://github.com/limn-works/scp (bindings/swift)." \
             "Do not edit; every release regenerates and publishes this repository." \
+            "" \
+            "## License" \
+            "" \
+            "Copyright Limn Works LLC. Licensed under the Apache License," \
+            "Version 2.0, whose full text is in LICENSE." \
             "" \
             "## Installation" \
             "" \
