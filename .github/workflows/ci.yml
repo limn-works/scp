@@ -50,6 +50,10 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              # The rust-clippy job runs scripts/check-examples-build-shipped.sh,
+              # so a change to that gate or its baseline must trigger the job.
+              - 'scripts/check-examples-build-shipped.sh'
+              - 'scripts/examples-shipped-baseline.txt'
             python:
               - 'bindings/python/**'
               - 'crates/scp-ffi/src/**'
@@ -514,8 +518,8 @@ jobs:
           # invocation covers all four.
           cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
           # Examples ship inside the published crate, so they must build on the
-          # feature set that ships. Package scope is load-bearing — the script
-          # header says why a workspace-wide form is inert.
+          # feature set that ships. Per-target scope and the baseline ratchet are
+          # both load-bearing — the script header says why.
           bash scripts/check-examples-build-shipped.sh
 
   # Matrix jobs must always expand so each OS variant reports a status
