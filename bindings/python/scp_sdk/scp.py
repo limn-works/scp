@@ -3120,7 +3120,8 @@ class SCP:
         ``<data_dir>/identity.key`` and requires ``passphrase``. CREATING one on a
         first run needs a pre-rotation custody backend that only a ``testing``
         build has, so a shipped build raises ``RuntimeError`` carrying
-        ``SCP-IDENT-1059`` rather than mint a nullifier-backed identity.
+        the message "node startup failed" rather than mint a nullifier-backed
+        identity. No error code reaches the caller on this path.
         Pass an explicit ``identity_did``, or point ``data_dir`` at a
         directory that already holds an identity.
         """

@@ -171,7 +171,8 @@ public struct Node: Sendable {
     /// and the `passphrase` parameter is required. CREATING one on a first run
     /// needs a pre-rotation custody backend that only a `testing` build has, so
     /// a shipped build throws rather than mint a nullifier-backed identity
-    /// (`SCP-IDENT-1059`). Pass an identity, or point
+    /// The failure arrives as `ScpError.Identity` with code `SCP-TRANS-5051` and
+    /// the message "node identity operation failed". Pass an identity, or point
     /// `dataDir` at a directory that already holds one.
     ///
     /// No passphrase is required when `identity` is provided.

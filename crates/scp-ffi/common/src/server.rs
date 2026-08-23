@@ -409,7 +409,7 @@ pub async fn start_node_in_memory(
 /// the FIRST run needs a [`PreRotationCustody`] backend (spec §9.7.4.1 §3), and
 /// the only implementation is the test-harness `InMemoryPreRotationCustody`, so
 /// a shipped build fails closed with
-/// [`IdentityError::NoPreRotationBackend`] (`SCP-IDENT-1059`) rather than mint a
+/// [`IdentityError::NoPreRotationBackend`] rather than mint a
 /// nullifier-backed identity. Pass an explicit `identity` on a shipped build, or
 /// point `data_dir` at a directory that already holds one.
 ///
@@ -424,7 +424,7 @@ pub async fn start_node_in_memory(
 /// - No passphrase provided when `identity` is `None` ([`ServerError::MissingPassphrase`])
 /// - `identity` is `None` on a first run of a shipped build, because creating an
 ///   identity needs a `PreRotationCustody` backend that only a `testing` build
-///   has ([`ServerError::Node`] wrapping `SCP-IDENT-1059`)
+///   has ([`ServerError::Node`], whose `user_message` is "node startup failed")
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local(
     data_dir: &Path,

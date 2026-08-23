@@ -647,7 +647,8 @@ pub(crate) async fn node_start_in_memory_on(
 /// With `identity_did = None` this reloads a persistent identity and requires a
 /// passphrase. Creating one on a first run needs a pre-rotation custody backend
 /// that only a `testing` build has, so a shipped build fails closed with
-/// `SCP-IDENT-1059` rather than mint a nullifier-backed identity.
+/// a plain error whose message is "node startup failed" rather than mint a
+/// nullifier-backed identity. No error code reaches the caller on this path.
 pub(crate) async fn node_start_local_on(
     bi: &Arc<NapiBridgeInstance>,
     data_dir: String,

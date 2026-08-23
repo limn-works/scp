@@ -119,7 +119,8 @@ Additional `RelayConfig` fields with fixed defaults (not configurable via env va
 | `rate_limit_subscribes_per_minute` | `20` | SUBSCRIBE operations per minute per connection |
 | `delivery_jitter_ms` | `50` | Random delivery delay for metadata privacy |
 | `bridge_secret` | `None` | Shared secret for internal bridge auth |
-| `supports_bridge` | `false` | Whether BRIDGE operations are accepted |
+| `bridge` | `BridgeRole::Disabled` | Whether BRIDGE operations are accepted, and in which role |
+| `did_record_validation` | see `crates/scp-transport/src/native/server.rs` | Whether the relay validates stored DID records |
 
 ### Node-specific configuration
 
@@ -250,14 +251,16 @@ SCP_STORAGE_PATH=/var/lib/scp/node \
 scp-node
 ```
 
-**A shipped `scp-node` binary cannot complete a first run.** `main.rs` builds every
-node mode through `IdentitySource::Generate`, and creating an identity requires a
-`PreRotationCustody` backend whose only implementation is the test harness. On a
-build without the `testing` feature the node logs `application node failed to
-build` and exits 1 with `SCP-IDENT-1059`. The test
-`pre_rotation_severance_generate_fails_closed` in `crates/scp-node/src/lib.rs`
-pins that behaviour. The real backend is not implemented yet, and the node fails
-closed rather than mint a nullifier-backed identity.
+**On a shipped build, the full-node and `--self-host` modes cannot complete a first
+run.** Both need to create an identity, which requires a `PreRotationCustody`
+backend whose only implementation is the test harness, so the node logs
+`application node failed to build` and exits 1. The test
+`pre_rotation_severance_generate_fails_closed` in `crates/scp-node/src/lib.rs` pins
+that behaviour. The real backend is not implemented yet, and the node fails closed
+rather than mint a nullifier-backed identity.
+
+`--relay-only` is unaffected: `run_relay_only` builds a `RelayServer` and no
+identity at all, so it starts on a shipped build.
 
 The steps below therefore describe what the binary does once that backend lands,
 and what a `testing` build does today:
@@ -268,13 +271,14 @@ and what a `testing` build does today:
 4. Provisions a TLS certificate via ACME (unless `SCP_NODE_TLS_SELF_SIGNED=1`).
 5. Starts the HTTP server with `.well-known/scp` endpoint.
 
-A shipped `scp-node` fails on **every** run, not only the first. `main.rs` passes
-`IdentitySource::Generate`, `NodeConfig` maps every arm but `Persisted` to
-`persist = false`, and the resolver returns before it reads storage. So the binary
+The full-node mode fails on **every** run, not only the first. `main.rs` passes
+`IdentitySource::Generate`, `Node::start` maps every arm but `Persisted` to
+`persist = false`, and the resolver returns before it reads storage. So that mode
 never writes an identity either, and the "subsequent runs reload it" case cannot
-arise from `scp-node` at all. The reload path is real and ungated, but only the
-`--self-host` flow and the FFI `start_node_local` surface reach it, because those
-pass `IdentitySource::Persisted`.
+arise from it. The reload path is real and ungated, but only the `--self-host`
+flow and the FFI `start_node_local` surface reach it, because those pass
+`IdentitySource::Persisted` — and both still fail closed on a first run, when
+there is nothing stored to reload.
 
 ### Development deployment
 
@@ -308,17 +312,16 @@ use scp_transport::native::storage::BlobStorageBackend;
 // `open_encrypted_storage` are yours to write; this shows the config shape and the
 // type annotations it needs, not a runnable program.
 //
-// Three of the imports sit behind features that are OFF by default in their own
-// crates, so your Cargo.toml needs them explicitly:
-//   scp-dht      = { version = "…", features = ["production-dht"] }  # PkarrDhtClient
-//   scp-platform = { version = "…", features = ["sqlite"] }          # SqliteKeyCustody, SqliteStorage
-//   scp-transport = { version = "…", features = ["sqlite-blob"] }    # BlobStorageBackend::sqlite
-// This snippet compiles inside the SCP workspace without them only because
-// crates/scp-node enables all three on its own dependency edges.
+// `PkarrDhtClient`, `scp_platform::sqlite`, and `BlobStorageBackend::sqlite` each
+// sit behind a feature that is off by default in its own crate, and you do not
+// need to enable any of them: depending on `scp-node` is enough. Cargo unifies the
+// features `scp-node` requests on its own edges into the single build of each
+// dependency, for an external consumer exactly as inside this workspace. Drop
+// `scp-node` from your dependencies and all three imports stop resolving.
 //
 // A shipped build cannot CREATE an identity: that needs a `PreRotationCustody`
 // backend which only a `testing` build has, so `IdentitySource::Generate` and
-// `::Persisted` both fail closed with SCP-IDENT-1059 on a first run. Load the
+// `::Persisted` both fail closed on a first run. Load the
 // identity you already hold and pass it explicitly.
 let identity: ScpIdentity = load_node_identity()?;
 let document: DidDocument = load_node_did_document()?;
@@ -350,24 +353,29 @@ println!("Relay addr: {}", node.relay().bound_addr());
 node.serve(axum::Router::new(), shutdown_signal()).await?;
 ```
 
-### ApplicationNodeBuilder methods
+### `NodeConfig` fields
 
-| Method | Description |
-|--------|-------------|
-| `storage(s)` | Set the platform storage backend |
-| `domain(d)` | Set the domain for TLS and DID document |
-| `no_domain()` | Zero-config mode (spec SS10.12.8) |
-| `generate_identity_with(custody, did_method)` | Generate a new identity on build |
-| `explicit_identity(identity, document, did_method)` | Use a pre-existing identity |
-| `identity_with_storage(custody, did_method)` | Persist/reload identity via storage |
-| `bind_addr(addr)` | Internal relay bind address |
-| `http_bind_addr(addr)` | Public HTTP server bind address |
-| `tls_provider(provider)` | Custom TLS certificate provider |
-| `relay_config(config)` | Override RelayConfig |
-| `local_api()` | Enable the dev API with a generated bearer token |
-| `projection_rate_limit(n)` | Per-IP rate limit for projection endpoints |
-| `nat_strategy(strategy)` | Override NAT traversal strategy |
-| `build()` | Build and start the node (async) |
+ADR-052 replaced `ApplicationNodeBuilder` with one flat config struct plus
+`Node::start`. There is no builder and no `.build()`; set the fields you need and
+take the rest from `NodeConfig::defaults`.
+
+| Field | Description |
+|-------|-------------|
+| `reach: Reach` | How the node is reached: `Domain`, `NatTraversal`, `Tunnel`, or `Local` |
+| `identity: IdentitySource<K, D>` | `Generate`, `Persisted`, or `Explicit` |
+| `storage: S` | Platform storage backend; `Node::start` requires `EncryptedStorage` |
+| `blob_storage: BlobStorageBackend` | Relay blob backend (required, no default) |
+| `tls: TlsMode` | `Acme`, `SelfSigned`, `Plaintext`, `Terminated`, or `Custom` |
+| `dht: DhtMode` | `Disabled` (default, no publish) or `Production` |
+| `bind_addr: Option<SocketAddr>` | Internal relay bind address |
+| `http_bind_addr: Option<SocketAddr>` | Public HTTP server bind address |
+| `local_api: Option<SocketAddr>` | Dev API bind address; `None` disables it |
+| `cors_origins: Option<Vec<String>>` | Allowed CORS origins |
+| `dht_gateways: Vec<String>` | DHT HTTP gateway URLs |
+| `projection_rate_limit: Option<u32>` | Per-IP rate limit for projection endpoints |
+| `dns_provider: Option<DnsProviderConfig>` | DNS provider for ACME DNS-01 |
+| `nat: NatSlot` | NAT traversal strategy selection |
+| `network_detector: Option<Arc<dyn NetworkChangeDetector>>` | Network change source |
 
 ---
 
@@ -473,7 +481,7 @@ SCP_RELAY_LOG_LEVEL=warn scp-relay
 
 ### Dev API (scp-node only)
 
-When enabled via `ApplicationNodeBuilder::local_api()`, the dev API provides endpoints for inspection and testing:
+When enabled by setting `local_api: Some(addr)` on `NodeConfig`, the dev API provides endpoints for inspection and testing:
 
 ```bash
 # The dev token is printed at startup
