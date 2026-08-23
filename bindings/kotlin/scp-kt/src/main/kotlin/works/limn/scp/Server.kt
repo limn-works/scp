@@ -477,9 +477,10 @@ class Node internal constructor(
          * "node identity operation failed".
          * With no identity in [dataDir] this build fails on every run, not only
          * the first: none of this SDK's create calls mints one, so nothing it
-         * offers seeds that directory. The reload branch fires only against a
-         * directory a `testing` build already seeded. Passing [identityDid]
-         * does not help either, for the reason below.
+         * offers seeds that directory. The reload branch needs a directory that
+         * already holds an identity record, and a custody holding that record's
+         * key handles. Passing [identityDid] does not help either, for the
+         * reason below.
          *
          * On a shipped build, supplying [identityDid] does not work:
          * UniFFI's `build_node_identity_from_uniffi` is replaced under

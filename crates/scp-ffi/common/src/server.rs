@@ -52,9 +52,12 @@ pub type ConcreteDidMethod = DidDht<FfiDhtClient, SystemClock>;
 /// [`start_node_local`], the node uses this identity instead of generating
 /// a fresh one. On a `testing` build that enables identity portability — the
 /// same DID persists across node restarts and can be shared across FFI bridge
-/// instances. On a shipped build a caller has no way to obtain one: `PyO3` and
-/// napi resolve it from an identity registry that never fills, and `UniFFI`
-/// rejects any supplied identity with `SCP-IDENT-1013`.
+/// instances. No bridge hands a shipped-build caller one: `PyO3` and napi
+/// resolve it from an identity registry that never fills, and `UniFFI` rejects
+/// any supplied identity with `SCP-IDENT-1013`. Every field is `pub` and the
+/// struct carries no `#[non_exhaustive]`, so a Rust consumer depending on this
+/// crate by path constructs one directly — `publish = false` does not stop a
+/// path dependency.
 pub struct NodeIdentity {
     /// The SCP identity containing key handles and DID string.
     pub identity: ScpIdentity,
@@ -425,8 +428,8 @@ pub async fn start_node_in_memory(
 /// `InMemoryPreRotationCustody`, so `IdentityError::NoPreRotationBackend` comes
 /// back instead. This crate's own create surface fails closed the same way, so
 /// nothing an FFI caller can invoke puts an identity into `data_dir` and the
-/// reload branch fires only against a slot a `testing` build already seeded, with
-/// a custody holding the matching handles. (A Rust consumer of `scp-identity` can still mint
+/// reload branch needs a slot that already holds an identity record and a custody
+/// that holds that record's key handles. (A Rust consumer of `scp-identity` can still mint
 /// one: `DidMethod::create` takes a caller-supplied `PreRotationCustody`, and that
 /// trait is not sealed — see issue 2392.) `identity` is a different matter — every field of `ScpIdentity` and
 /// `DidDocument` is public, so a caller CAN assemble one by hand, and such an
@@ -445,8 +448,10 @@ pub async fn start_node_in_memory(
 /// - `identity` is `None` on a shipped build AND `data_dir` holds no identity,
 ///   because creating one needs a `PreRotationCustody` backend that only a
 ///   `testing` build has ([`ServerError::Node`], whose `user_message` is "node
-///   startup failed"). Against a directory a `testing` build seeded, the reload
-///   branch succeeds.
+///   startup failed"). The reload branch succeeds only when the directory holds
+///   an identity record AND the custody holds that record's key handles; with the
+///   record present and the handles absent it returns [`ServerError::Storage`],
+///   because `validate_persisted_custody` runs on every reload.
 /// - Relay binding, identity generation, or TLS fails ([`ServerError::Node`])
 pub async fn start_node_local(
     data_dir: &Path,

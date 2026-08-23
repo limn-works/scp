@@ -2261,7 +2261,8 @@ async fn build_host_site_node<D: scp_identity::DidMethod + 'static>(
     // restarts: it reloads the identity from the root `node_storage`, and creates
     // and persists one on first boot only under `testing`. On a build without that
     // feature the create half returns `IdentityError::NoPreRotationBackend`, so a
-    // self-host node starts only against storage a `testing` build already seeded. `tls` defaults to
+    // self-host node starts only against storage that already holds an identity
+    // record whose key handles the custody also holds. `tls` defaults to
     // `TlsMode::SelfSigned`, a no-op on a no-domain reach.
     let config = NodeConfig {
         dht,
