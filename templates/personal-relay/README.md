@@ -18,6 +18,14 @@ This template builds a single-binary relay that:
 - Port 443 reachable from the internet (for ACME challenges and client connections)
 - Port 80 temporarily reachable during initial certificate provisioning (ACME HTTP-01)
 
+**This template does not currently compile against the workspace.** `src/main.rs:25`
+imports `scp_node::ApplicationNodeBuilder`, which the ADR-052 node-construction refactor
+deleted in favour of `Node::start(NodeConfig { .. })`, so `cargo build` stops at that import
+with `error[E0432]`. Issue #2384, the non-workspace crates that no longer compile, tracks the
+port. Every recipe below — the quick start, the systemd unit, and the Docker block — is
+correct once that lands, and the Docker recipe's Rust version is already governed by
+`scripts/check-toolchain-pin.sh`.
+
 ## Quick start
 
 ```bash
@@ -161,14 +169,8 @@ WantedBy=multi-user.target
 
 ### Docker
 
-**This template does not currently compile against the workspace.**
-`src/main.rs` imports `scp_node::ApplicationNodeBuilder`, which the ADR-052 node-construction
-refactor deleted in favour of `Node::start(NodeConfig { .. })`, so `cargo build` stops at that
-import. Issue #2384, the non-workspace crates that no longer compile, tracks the port. The
-Docker recipe below is correct once that lands, and its Rust version is already governed by
-`scripts/check-toolchain-pin.sh`.
-
-Save the block as `templates/personal-relay/Dockerfile`, then build from the repository root:
+Save the block below as `templates/personal-relay/Dockerfile`, then build from the repository
+root:
 
 ```sh
 docker build -f templates/personal-relay/Dockerfile -t scp-personal-relay .
