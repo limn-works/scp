@@ -19,9 +19,12 @@
 # `scp-runtime` declares no `default` key at all. Cargo unifies a crate's
 # dev-dependency features into its dev targets and no invocation switches that
 # off, so per-package scope narrows the closure without emptying it. Cargo also
-# strips path-only dev-dependencies from a published manifest, so an example
-# importing one compiles here and cannot compile for a consumer —
-# `crates/scp-transport/examples/relay-chat.rs` imports `scp_core` that way.
+# strips path-only DEV-dependencies from a published manifest, and with them the
+# feature activations they carried, so an example relying on one compiles here and
+# not for a consumer. `crates/scp-runtime/examples/identity.rs` is the live case:
+# `scp-dht` and `scp-platform` survive publication as normal dependencies, but the
+# `testing` feature that produces `InMemoryDhtClient` and `scp_platform::testing`
+# comes only from scp-runtime's stripped dev-dependency edges.
 #
 # Therefore this check CANNOT prove that an example compiles for someone who
 # installs the crate, and CANNOT prove that an example avoids a test-only
@@ -49,10 +52,14 @@
 # TWO RESIDUAL LIMITS, both structural, neither worth another mechanism:
 #   - A target whose body sits behind `#[cfg(...)]` is counted and compiles to
 #     nothing. `checked` counts targets, not lines, so coverage is an upper bound.
-#   - Every remaining bypass models an author editing the manifest of the crate
-#     under test. Defending a gate against edits to its own subject is unbounded;
-#     review is what covers that, and the enforcement-file hook deliberately
-#     protects this script and not `crates/*/Cargo.toml`.
+#   - Every remaining bypass needs write access to the crate under test. That is
+#     the criterion, and it is wider than "edits the manifest": `crates/NAME/build.rs`
+#     needs no manifest key at all, and a build script that prints
+#     `cargo::rustc-cfg=feature="testing"` makes `DhtMode::Memory` exist for every
+#     target of the package. Measured: gate exit 0 on an example naming the
+#     nullifier. `.cargo/config.toml` rustflags is the same class. Defending a gate
+#     against a writer of its own subject is unbounded, so review covers it; the
+#     enforcement-file hook deliberately protects this script and not the crates.
 #
 # See .docs/lessons/shipped-targets-need-a-default-feature-build.md.
 set -euo pipefail
