@@ -26,6 +26,30 @@ the file still ships. `scripts/check-examples-build-shipped.sh` reads the publis
 set, fails when a published `examples/NAME.rs` has no matching target, and loops per
 package. Do not collapse the loop back into `--workspace`.
 
+## Six rounds, nine bypasses, and what finally closed them
+
+Nine distinct ways past this gate were found across six review rounds. The first
+eight all shared one root: the check compared **names** or **shapes** rather than
+the thing being asserted. What closed them was joining published file path to
+target `src_path`, and iterating targets rather than files.
+
+| Round | Bypass | Root |
+|---|---|---|
+| 1 | `cargo clippy --workspace --examples` | dev-dep unification turned `scp-node/testing` ON |
+| 2 | (scope overclaimed, not a bypass) | comment promised more than the check delivers |
+| 3 | `required-features = ["testing"]` | cargo skips the target and exits 0 |
+| 4a | `autoexamples = false` | file ships, target absent, target-sourced list blind |
+| 4b | any nullifier but `DhtMode::Memory` | dev-dependencies, unclosable |
+| 4c | `required-features` as standing exemption | bought nothing, hid four examples |
+| 5 | `cargo package --list` exit 101 swallowed | manifest error dropped a crate in silence |
+| 6a | `[[example]] path = "examples/decoy/website.rs"` | name join saw `website` on both sides |
+| 6b | `exclude = ["examples/*"]` | file-driven loop skipped the package |
+| 6c | filename containing a space | unquoted `for` word-split past both checks |
+
+6a is the instructive one: it kept the reported count at eight and printed
+`── scp-node::website` for a file it never opened. A check that reports success by
+name will report success for the wrong file.
+
 ## Four rounds, six bypasses, and the reframe that ended it
 
 Each review round produced a different way past this gate. `CLAUDE.md` names the
@@ -95,6 +119,12 @@ Reintroducing `DhtMode::Memory` settled it:
 | `cargo clippy --workspace --examples -- -D warnings` | **exit 0** | exit 0 | exit 0 |
 | `cargo clippy -p scp-node --examples -- -D warnings` | exit 101, `E0599` | **exit 0** | exit 0 |
 | `bash scripts/check-examples-build-shipped.sh` | exit 1, `E0599` | exit 1, names the target | exit 0 |
+
+A fourth defect belongs in the same table and was found later: renaming
+`crates/scp-node/README.md` makes `cargo package --list` exit 101, and an earlier
+version of the check discarded that exit code, so scp-node dropped out in silence —
+7 examples checked instead of 8, with `website.rs` never linted. The check now
+surfaces it and exits 1.
 
 Run a gate against the defect before committing it, and record both exit codes.
 
