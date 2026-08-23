@@ -644,9 +644,9 @@ fn parse_dht_mode_or_exit() -> scp_node::DhtMode {
 /// describes the cleartext exposure instead.
 ///
 /// `publishes_dht` reflects whether `SCP_NODE_DHT_MODE` resolves to `production`
-/// (publish) vs `memory` (no publish). Under `memory` the host's address is NOT
-/// published to the DHT, so the IP<->DID disclosure line is replaced with a line
-/// stating the node is reachable but not DHT-discoverable.
+/// (publish) vs `disabled` (no publish). Under `disabled` the host's address is
+/// NOT published to the DHT, so the IP<->DID disclosure line is replaced with a
+/// line stating the node is reachable but not DHT-discoverable.
 fn self_host_banner(port: u16, plaintext: bool, publishes_dht: bool) -> String {
     let transport_line = if plaintext {
         "  * Transport is PLAINTEXT HTTP (SCP_NODE_SELF_HOST_PLAINTEXT=1): traffic is\n\
@@ -730,18 +730,20 @@ fn env_flag_is_truthy(value: Option<&str>) -> bool {
 /// Opens an inbound TCP port to the public internet (via NAT-PMP/UPnP when the
 /// `upnp` feature is built). Whether the host's address is published to the
 /// Mainline DHT is governed independently by `SCP_NODE_DHT_MODE`:
-/// `production` (the default) publishes; `memory` does NOT publish — the node is
-/// still reachable on the opened port, the address is just not DHT-discoverable
-/// (share it out-of-band). `memory` is valid with NAT probing on or off. See the
+/// `production` (the default) publishes; `disabled` does NOT publish — the node
+/// is still reachable on the opened port, the address is just not
+/// DHT-discoverable (share it out-of-band). `disabled` is valid with NAT probing
+/// on or off. (`memory` compiles only under the `testing` feature, so a shipped
+/// build exits 1 on it.) See the
 /// startup banner.
 async fn run_self_host(storage_path: Option<&PathBuf>, site_dir: Option<&PathBuf>) {
     let port: u16 = startup::env_or("SCP_NODE_SELF_HOST_PORT", 8443u16);
     let plaintext = self_host_plaintext();
     let skip_nat = self_host_skip_nat();
 
-    // -- DHT mode: production pkarr by default; memory for "reachable but not
+    // -- DHT mode: production pkarr by default; `disabled` for "reachable but not
     //    DHT-discoverable" hosting. Parsed BEFORE the banner so the banner can
-    //    state the actual disclosure posture (memory = address NOT published). --
+    //    state the actual disclosure posture (disabled = address NOT published). --
     let dht_mode = parse_dht_mode_or_exit();
     let publishes_dht = matches!(dht_mode, scp_node::DhtMode::Production);
 

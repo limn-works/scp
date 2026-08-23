@@ -3814,6 +3814,16 @@ export class SCP {
     }
   }
 
+  /**
+   * Starts an application node with in-memory storage.
+   *
+   * Omitting `identityDid` requests auto-generation, which a shipped build
+   * refuses: the in-memory key custody, storage, and DHT client it needs compile
+   * only under the `testing` feature (ADR-062 Decision 1/6). The refusal arrives
+   * as a mapped bridge error carrying "auto-generated in-memory node identity is
+   * unavailable in this build". Pass an explicit `identityDid` on a production
+   * path.
+   */
   async nodeStartInMemory(identityDid?: string | null): Promise<Node> {
     try {
       const raw = await (this.#native.nodeStartInMemory as (d: string | null) => Promise<unknown>)(

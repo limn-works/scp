@@ -385,8 +385,9 @@ pub async fn start_node_in_memory(
 ///   `<data_dir>/storage/` — persistent key-value storage for protocol state
 /// - [`BlobStorageBackend::redb`] at `<data_dir>/blobs.redb` — persistent
 ///   relay blob storage
-/// - [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient) (no real DHT
-///   network — suitable for local-only use)
+/// - The production Mainline DHT client, built from `ClientDhtConfig::default()`.
+///   A `testing` build substitutes the [`InMemoryDhtClient`](scp_dht::InMemoryDhtClient)
+///   nullifier so tests stay offline; a shipped build never reaches it.
 /// - Self-signed TLS (for the localhost domain)
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)
 ///
