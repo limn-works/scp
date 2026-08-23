@@ -268,9 +268,13 @@ and what a `testing` build does today:
 4. Provisions a TLS certificate via ACME (unless `SCP_NODE_TLS_SELF_SIGNED=1`).
 5. Starts the HTTP server with `.well-known/scp` endpoint.
 
-On subsequent runs, the node loads the existing identity from SQLite and reuses
-the DID. That reload path carries no `testing` gate, so a node whose storage
-already holds an identity starts on a shipped build.
+A shipped `scp-node` fails on **every** run, not only the first. `main.rs` passes
+`IdentitySource::Generate`, `NodeConfig` maps every arm but `Persisted` to
+`persist = false`, and the resolver returns before it reads storage. So the binary
+never writes an identity either, and the "subsequent runs reload it" case cannot
+arise from `scp-node` at all. The reload path is real and ungated, but only the
+`--self-host` flow and the FFI `start_node_local` surface reach it, because those
+pass `IdentitySource::Persisted`.
 
 ### Development deployment
 
@@ -303,6 +307,14 @@ use scp_transport::native::storage::BlobStorageBackend;
 // `load_node_identity`, `load_node_did_document`, `build_did_method`, and
 // `open_encrypted_storage` are yours to write; this shows the config shape and the
 // type annotations it needs, not a runnable program.
+//
+// Three of the imports sit behind features that are OFF by default in their own
+// crates, so your Cargo.toml needs them explicitly:
+//   scp-dht      = { version = "…", features = ["production-dht"] }  # PkarrDhtClient
+//   scp-platform = { version = "…", features = ["sqlite"] }          # SqliteKeyCustody, SqliteStorage
+//   scp-transport = { version = "…", features = ["sqlite-blob"] }    # BlobStorageBackend::sqlite
+// This snippet compiles inside the SCP workspace without them only because
+// crates/scp-node enables all three on its own dependency edges.
 //
 // A shipped build cannot CREATE an identity: that needs a `PreRotationCustody`
 // backend which only a `testing` build has, so `IdentitySource::Generate` and
