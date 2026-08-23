@@ -242,6 +242,7 @@ RUST_ONLY_RUNS = {
     "bridge-parity": True,
     "bridge-parity-kotlin": True,
     "bridge-parity-swift": True,
+    "docker-image": True,
     "fuzz-build": False,
     "kotlin-lint": False,
     "kotlin-test": True,

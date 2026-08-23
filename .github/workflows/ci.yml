@@ -408,6 +408,7 @@ jobs:
     needs: check-draft
     name: enforcement / toolchain wiring
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       # The mise check parses `.mise.toml` with `tomllib`, which the Python standard
@@ -899,6 +900,7 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     name: Docker / relay and node image
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       # The builder stage measures about 6 GB — 2 GB of it the pin's cross-compilation
       # targets — before the buildx cache blobs. `rust-clippy` here and all three jobs in
