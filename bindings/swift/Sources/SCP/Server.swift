@@ -139,10 +139,13 @@ public struct Node: Sendable {
 
     /// Starts a full application node with in-memory storage.
     ///
-    /// When `identity` is provided, the node uses the pre-existing identity
-    /// (on a `testing` build only — see below)
-    /// instead of generating a fresh one. This enables identity portability --
-    /// the same DID persists across node restarts.
+    /// When `identity` is provided, a shipped build REJECTS it: UniFFI's
+    /// `build_node_identity_from_uniffi` is replaced under
+    /// `cfg(not(feature = "testing"))` by a stub that always returns
+    /// ``ScpError/Identity`` with code `SCP-IDENT-1013`, because node identity
+    /// portability needs custody access the mobile bridge does not have. On a
+    /// `testing` build the node uses the pre-existing identity, so the same DID
+    /// persists across restarts.
     ///
     /// Passing `nil` for `identity` requests auto-generation, which is available
     /// ONLY in a `testing` build (in-memory key custody, in-memory storage, and
@@ -181,9 +184,10 @@ public struct Node: Sendable {
     /// The failure arrives as `ScpError.Identity` with code `SCP-TRANS-5051` and
     /// the message "node identity operation failed".
     ///
-    /// This build fails on EVERY run, not only the first: none of this SDK's create
-    /// calls mints an identity, so nothing it offers puts one in `dataDir` and the
-    /// reload branch never fires. Passing `identity` does not help either, for a
+    /// With no identity in `dataDir` this build fails on every run, not only the
+    /// first: none of this SDK's create calls mints one, so nothing it offers seeds
+    /// that directory. The reload branch fires only against a directory a `testing`
+    /// build already seeded. Passing `identity` does not help either, for a
     /// reason specific to this bridge: see the `SCP-IDENT-1013` note below.
     ///
     /// On a shipped build, supplying `identity` does not work either: UniFFI's

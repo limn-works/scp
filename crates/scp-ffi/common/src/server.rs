@@ -413,13 +413,15 @@ pub async fn start_node_in_memory(
 /// key `scp/identity` in `<data_dir>/storage/`). The `passphrase` parameter is
 /// required in this mode — there is no environment variable fallback.
 ///
-/// A shipped build fails here on EVERY run, not only the first. Reloading a DID
-/// from storage carries no gate, but creating one needs a `PreRotationCustody`
+/// With no identity in storage, a shipped build fails here on every run, not only
+/// the first. Reloading a DID from storage carries no gate and does work; creating
+/// one needs a `PreRotationCustody`
 /// backend (spec §9.7.4.1 §3) whose only implementation is the test-harness
 /// `InMemoryPreRotationCustody`, so `IdentityError::NoPreRotationBackend` comes
 /// back instead. This crate's own create surface fails closed the same way, so
 /// nothing an FFI caller can invoke puts an identity into `data_dir` and the
-/// reload branch never fires. (A Rust consumer of `scp-identity` can still mint
+/// reload branch fires only against a slot a `testing` build already seeded, with
+/// a custody holding the matching handles. (A Rust consumer of `scp-identity` can still mint
 /// one: `DidMethod::create` takes a caller-supplied `PreRotationCustody`, and that
 /// trait is not sealed — see issue 2392.) `identity` is a different matter — every field of `ScpIdentity` and
 /// `DidDocument` is public, so a caller CAN assemble one by hand, and such an

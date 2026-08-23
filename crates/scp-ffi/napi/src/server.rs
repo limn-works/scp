@@ -501,8 +501,8 @@ impl Drop for NapiNodeHandle {
 
 /// Builds a [`NodeIdentity`] from the NAPI identity registry for a given DID.
 ///
-/// Looks up the DID in the global identity registry (populated by
-/// `identity_create`) and constructs a `NodeIdentity` with a properly
+/// Looks up the DID in the global identity registry (populated by the
+/// `identity_create*`, migrate, rotate, and agent-key paths) and constructs a `NodeIdentity` with a properly
 /// configured `DidDht` instance that has signing capability.
 ///
 /// # Errors
@@ -650,7 +650,8 @@ pub(crate) async fn node_start_in_memory_on(
 /// Per-bridge-instance implementation of `node_start_local`.
 ///
 /// With `identity_did = None` this reloads a persistent identity and requires a
-/// passphrase. On a shipped build this fails on every run: creating an identity
+/// passphrase. On a shipped build with no identity in storage this fails on every
+/// run: creating an identity
 /// needs a pre-rotation custody backend
 /// that only a `testing` build has, so a shipped build fails closed with
 /// a plain error whose message is "node startup failed" rather than mint a

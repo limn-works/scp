@@ -77,11 +77,14 @@ pub struct Node;
 /// implementation is the test harness (ADR-062 §Decision 6). So `Generate` fails
 /// on every start, and `Persisted` fails whenever its storage holds no identity.
 ///
-/// `Persisted`'s reload branch carries no gate and does work on a shipped build:
-/// given a storage slot that already holds an identity, the node starts and serves.
-/// Nothing the node itself does puts one there, so in practice that slot was
-/// written by a `testing` build. `Explicit` is the variant a shipped node starts
-/// from without any such precondition.
+/// `Persisted`'s reload branch carries no gate and does work on a shipped build,
+/// given two things together: a storage slot that already holds an identity, AND a
+/// `custody` that holds the `#0`, `#active`, and `#agent` handles that identity
+/// names. `validate_persisted_custody` checks both presence and public-key
+/// agreement, so a seeded storage slot paired with a different custody fails with
+/// `NodeError::Storage`, not a serving node. Nothing the node itself writes to that
+/// slot, so in practice a `testing` build produced the pair. `Explicit` is the
+/// variant a shipped node starts from without any such precondition.
 pub enum IdentitySource<K: KeyCustody, D: DidMethod> {
     /// Generate a new identity using the provided key custody and DID method.
     ///

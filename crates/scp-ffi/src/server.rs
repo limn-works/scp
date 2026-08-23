@@ -577,7 +577,7 @@ impl Drop for PyNodeHandle {
 /// registry.
 ///
 /// Looks up the given DID in the `PyO3` bridge identity registry (populated by
-/// `PyScp::identity_create`) and builds a `NodeIdentity` with a configured DID
+/// the `identity_create*` and migrate paths, never by `identity_load`) and builds a `NodeIdentity` with a configured DID
 /// method instance that can sign on behalf of the identity's custody provider.
 ///
 /// # Errors
@@ -673,8 +673,10 @@ impl crate::scp::PyScp {
     ///
     /// When ``identity_did`` is provided, the node uses the pre-existing identity
     /// from the `PyO3` identity registry (populated by the ``identity_create*``
-    /// and migrate paths, never by ``identity_load``). This enables identity
-    /// portability — the same DID persists across node restarts.
+    /// and migrate paths, never by ``identity_load``). On a `testing` build that
+    /// enables identity portability — the same DID persists across node restarts.
+    /// On a shipped build the registry is empty, for the reason above, so the
+    /// lookup finds nothing.
     #[pyo3(name = "node_start_in_memory", signature = (identity_did=None))]
     pub fn node_start_in_memory(
         &self,

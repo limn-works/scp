@@ -3852,9 +3852,10 @@ export class SCP {
    * `SCP-UNKNOWN-0000`; match on the message, not the code. It fails closed
    * rather than mint a nullifier-backed identity.
    *
-   * This build fails on EVERY run, not only the first: none of this SDK's create
-   * calls mints an identity, so nothing it offers puts one in `dataDir` and the
-   * reload branch never fires. Passing `identityDid` does not help either. Every
+   * With no identity in `dataDir` this build fails on every run, not only the
+   * first: none of this SDK's create calls mints one, so nothing it offers seeds
+   * that directory. The reload branch fires only against a directory a `testing`
+   * build already seeded. Passing `identityDid` does not help either. Every
    * writer to the identity registry — create, migrate, rotate-key, add-agent,
    * rotate-agent, remove-agent — either fails closed on a shipped build before it
    * writes, or needs an entry already present, so the registry never fills.
