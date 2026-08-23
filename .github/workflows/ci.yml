@@ -855,12 +855,21 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       # The template is a separate cargo workspace, so it needs its own cache entry;
-      # `Swatinem/rust-cache` keys on the manifest and lockfile under this directory.
+      # `Swatinem/rust-cache` keys on `templates/personal-relay/Cargo.toml` and
+      # `templates/personal-relay/Cargo.lock`, both of which this repository tracks.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: templates/personal-relay
+      # `--locked` compiles the versions `templates/personal-relay/Cargo.lock` names and
+      # fails when the manifest and that lockfile disagree. Without it the resolver picks
+      # the newest compatible release of each of the seven third-party dependencies and
+      # their transitive graph on every run, so an upstream release could turn this
+      # required check red on every open branch with no commit in this repository having
+      # caused it. That lockfile pins the same version of every crate the root
+      # `Cargo.lock` also names, so this job compiles the workspace's crates against the
+      # dependency versions the rest of CI tests them against.
       - name: Type-check the template
-        run: cargo check --manifest-path templates/personal-relay/Cargo.toml --all-targets
+        run: cargo check --locked --manifest-path templates/personal-relay/Cargo.toml --all-targets
 
   # ── Python ──────────────────────────────────────────────────────────
   python-lint:

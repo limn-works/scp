@@ -20,9 +20,15 @@ This template builds a single-binary relay that:
 
 This crate declares its own `[workspace]` table, so `cargo clippy --workspace` at the
 repository root never reaches it. The `Rust / personal-relay template` job in
-`.github/workflows/ci.yml` runs `cargo check` against this manifest on every pull request
-that touches a `crates/*` path or this directory, so a constructor change that breaks the
-recipes below fails there rather than in your build.
+`.github/workflows/ci.yml` runs `cargo check --locked` against this manifest on every pull
+request that touches a `crates/*` path or this directory, so a constructor change that
+breaks the recipes below fails there rather than in your build.
+
+`Cargo.lock` in this directory is tracked, and it pins the same version of every crate the
+repository's root `Cargo.lock` also names. Every build below passes `--locked`, so it
+compiles the dependency versions the rest of CI tests this workspace against, and an
+upstream release cannot change what your build resolves. To take newer versions, run
+`cargo update` here and commit the result.
 
 ## Quick start
 
@@ -32,7 +38,7 @@ git clone https://github.com/limn-works/scp.git
 cd scp/templates/personal-relay
 
 # Build in release mode
-cargo build --release
+cargo build --locked --release
 
 # Run with a domain (automatic Let's Encrypt TLS)
 SCP_RELAY_DOMAIN=relay.example.com \
@@ -202,7 +208,7 @@ COPY . .
 RUN pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"; \
     got="$(rustc --version | cut -d' ' -f2)"; \
     [ -n "$pin" ] && [ "$got" = "$pin" ] || { echo "image resolved rustc '$got'; rust-toolchain.toml names '$pin'" >&2; exit 1; }
-RUN cargo build --release --manifest-path templates/personal-relay/Cargo.toml
+RUN cargo build --locked --release --manifest-path templates/personal-relay/Cargo.toml
 
 FROM debian:bookworm-slim
 # `libssl3` because the binary links `libcrypto.so.3` that SQLCipher pulls in.
