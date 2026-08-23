@@ -464,7 +464,9 @@ class Node internal constructor(
          * `FileKeyCustody`, and [passphrase] is required. CREATING one on a
          * first run needs a pre-rotation custody backend that only a `testing`
          * build has, so a shipped build fails closed rather than mint a
-         * nullifier-backed identity (`SCP-IDENT-1059`).
+         * nullifier-backed identity. The failure arrives as
+         * `ScpException.Identity` with code `SCP-TRANS-5051` and the message
+         * "node identity operation failed".
          * Pass an identity, or point [dataDir] at a directory that already
          * holds one.
          *

@@ -725,7 +725,8 @@ impl crate::scp::PyScp {
     /// persistent identity from ``<data_dir>/identity.key``. The ``passphrase``
     /// parameter is required in this mode. CREATING one on a first run needs a
     /// pre-rotation custody backend that only a ``testing`` build has, so a
-    /// shipped build raises ``RuntimeError`` carrying ``SCP-IDENT-1059`` instead
+    /// shipped build raises ``RuntimeError`` with the message "node startup
+    /// failed" instead
     /// of minting a nullifier-backed identity. Pass an
     /// explicit ``identity_did``, or point ``data_dir`` at a directory that
     /// already holds an identity.
