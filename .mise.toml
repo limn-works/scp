@@ -4,11 +4,20 @@ bun = "1.3.9"
 python = "3.12.12"
 kotlin = "2.3.10"
 gradle = "8.14.4"
-# Keep this version equal to `channel` in `rust-toolchain.toml`. mise exports
-# RUSTUP_TOOLCHAIN, which takes precedence over that file, so naming "stable"
-# here would let a local shell resolve a different compiler than CI resolves and
-# hide exactly the class of failure the pin exists to prevent.
-rust = { version = "1.98.0", targets = "wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android,x86_64-apple-darwin,aarch64-apple-darwin" }
+# Keep `version` equal to `channel` in `rust-toolchain.toml`, and keep `targets` a
+# superset of that file's `targets`.
+#
+# mise sets RUSTUP_TOOLCHAIN for the commands it runs, and that variable overrides
+# `rust-toolchain.toml` entirely — channel, components, and targets alike. Check it
+# with `mise x -- printenv RUSTUP_TOOLCHAIN`; note that plain `mise env` does not
+# print the variable, so that command is the one that answers the question. Naming
+# "stable" here would therefore let a local shell resolve a different compiler than
+# CI resolves and hide the exact failure the pin exists to prevent, and omitting a
+# target here makes a cross-build that CI performs fail locally.
+#
+# `mise ls rust` reports the requested version as `(missing)` until `mise install`
+# runs, and mise falls back to the previously installed toolchain until then.
+rust = { version = "1.98.0", targets = "wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-pc-windows-msvc" }
 "cargo:cargo-nextest" = "latest"
 "cargo:maturin" = "latest"
 "cargo:cargo-deny" = "latest"

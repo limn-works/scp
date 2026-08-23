@@ -142,6 +142,8 @@ bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 check-shipped-feature-graph.sh (ADR-062 §Decision 6 G1 — the shipped-artifact
 feature-graph ⊆-allowlist prove-absence gate; the allowlist permits durability-only
 features only, ZERO nullifier exceptions),
+check-toolchain-pin.sh (every location that selects a Rust version names the same
+version; the fuzz crate's pin stays on a nightly),
 pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 When a check fails, fix the code that the check rejected. You may modify an enforcement file for exactly two reasons:
@@ -182,7 +184,7 @@ Caulfield asked a model to characterize the director Chris Columbus and got "war
 
 All tools via [mise](https://mise.jdx.dev/) (see `.mise.toml`). **Never use npm or npx** — bun only for JS/TS. System `python3` is Xcode 3.9 — **do not use it**; use `python3.12`.
 
-**Rust is pinned, and raising the pin is a deliberate change.** `rust-toolchain.toml` pins the compiler, its components, and every cross-compilation target CI builds for; `.mise.toml` names the same version because mise exports `RUSTUP_TOOLCHAIN`, which takes precedence over that file; `fuzz/rust-toolchain.toml` pins the nightly that `fuzz/` needs. To raise the version: change `channel` in `rust-toolchain.toml` and `rust` in `.mise.toml` together, run the CI clippy command from the Orchestrator verification protocol below, and fix everything the new release reports in that same pull request. Never lower the pin to make a new lint disappear. See `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`, which records the merge-queue outage that a floating `@stable` caused.
+**Rust is pinned, and raising the pin is a deliberate change.** Four locations name the stable version — `rust-toolchain.toml` (which also pins the components and every cross-compilation target CI builds for), `.mise.toml`, `Dockerfile`, and `.docs/standards/rust.md` — and two name the nightly `fuzz/` needs: `fuzz/rust-toolchain.toml` and `FUZZ_TOOLCHAIN` in `.github/workflows/fuzz.yml`. `scripts/check-toolchain-pin.sh` fails when any of them disagree. mise sets `RUSTUP_TOOLCHAIN` for the commands it runs, and that variable overrides `rust-toolchain.toml` entirely, which is why `.mise.toml` must match — check it with `mise x -- printenv RUSTUP_TOOLCHAIN`, since plain `mise env` does not print it. To raise the version: change all four together, run `bash scripts/check-toolchain-pin.sh`, run the CI clippy command from the Orchestrator verification protocol below, and fix everything the new release reports in that same pull request. Never lower the pin to make a new lint disappear. See `.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`, which records the merge-queue outage that a floating `@stable` caused.
 
 | Language | Location | Package Manager | Lint | Format | Test | Build |
 |----------|----------|----------------|------|--------|------|-------|

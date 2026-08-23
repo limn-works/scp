@@ -1,17 +1,23 @@
 # `fuzz/` is a standalone cargo-fuzz crate, outside the workspace, and cargo-fuzz
 # only runs on nightly (see the Fuzzing row of CLAUDE.md's toolchain table).
-# The repository root pins stable 1.98.0, so this file pins nightly for anyone
-# whose shell is inside this directory.
 #
-# The pinned date is the last nightly the fuzz crate compiles on. Nightlies
-# after 2026-05-03 tightened the `pub(crate)` re-export rules (E0365) and reject
-# openmls 0.8.1's `pub use crate::ciphersuite::signature::*` at prelude.rs:16.
-# Unpin once openmls publishes a fix or `crates/scp-runtime` moves to a version
-# that re-exports under the new rules. `.github/workflows/fuzz.yml` and the fuzz
-# check in `.github/workflows/ci.yml` name the same nightly.
+# The pinned date is the last nightly the fuzz crate compiles on. Nightlies after
+# 2026-05-03 tightened the `pub(crate)` re-export rules (E0365) and reject openmls
+# 0.8.1's `pub use crate::ciphersuite::signature::*` at prelude.rs:16. Unpin once
+# openmls publishes a fix or `crates/scp-runtime` moves to a version that re-exports
+# under the new rules. `.github/workflows/fuzz.yml` names the same date in its
+# `FUZZ_TOOLCHAIN` environment variable, and `scripts/check-toolchain-pin.sh` fails
+# when the two disagree or when this channel stops being a nightly.
 #
-# Running from the repository root instead of this directory picks up the root
-# pin, so those commands pass the toolchain explicitly:
-# `cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz`.
+# WHAT THIS FILE DOES NOT COVER. A directory-override file loses to the
+# `RUSTUP_TOOLCHAIN` environment variable, and mise sets that variable for every
+# command it runs — check with `mise x -- printenv RUSTUP_TOOLCHAIN`. CLAUDE.md
+# mandates mise, so on the setup this repository asks for, a bare `cargo fuzz` picks
+# up the stable version `.mise.toml` names even from inside this directory. Every
+# documented invocation therefore passes the toolchain on the command line:
+# `cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz`. An explicit
+# `+toolchain` sets `RUSTUP_TOOLCHAIN` for the command and everything it spawns, so
+# it wins over both this file and mise. This file covers the remaining case: a shell
+# inside `fuzz/` that mise does not manage.
 [toolchain]
 channel = "nightly-2026-05-03"

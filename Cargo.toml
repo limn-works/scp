@@ -115,24 +115,37 @@ cargo_common_metadata = "allow"
 # clippy cannot point to the source location so a crate-level allow is needed.
 large_stack_arrays = "allow"
 # `clippy::unused_async_trait_impl` (added in clippy 1.98.0) reports an `async fn`
-# whose body contains no `.await`, inside an impl block. It reaches two kinds of
-# site, and neither one gives the author an edit worth making:
+# whose body contains no `.await`, inside an impl block.
 #
-#  - An inherent impl. `clippy::unused_async` already reports the same function,
-#    and that lint stays on below, so this workspace still forces a written
-#    justification at every such site (84 of them carry one today). Allowing the
-#    second name drops no detection.
-#  - A trait impl. `clippy::unused_async` skips these deliberately, because the
-#    trait declares the method as future-returning and the impl cannot delete the
-#    future. The impl can only re-spell `async fn f(..) -> T` as
-#    `fn f(..) -> impl Future<Output = T> + Send { async move { .. } }`, which
-#    desugars to the identical future. Clippy's own suggested form is not that
-#    re-spelling: it wraps the body's values in `std::future::ready`, which runs
-#    the body at call time instead of at poll time and so moves when a side
-#    effect such as a map insert happens.
+# THE CRITERION for allowing it: this lint decides nothing that `clippy::unused_async`
+# does not already decide, except on a trait impl, and on a trait impl the author of
+# the impl does not control whether the future exists. `clippy::unused_async` stays
+# enabled below, so the question "should this function be async at all" still has to
+# be answered wherever the author of the function can answer it.
 #
-# `clippy::unused_async` is NOT allowed here — an async function with no await
-# still has to justify itself at every inherent-impl and free-function site.
+# The evidence behind that criterion, per kind of site the lint reaches:
+#
+#  - An inherent impl. `clippy::unused_async` reports the same function, so allowing
+#    the second name drops no detection. It does not follow that every such function
+#    carries an individual justification: of the 84 `clippy::unused_async` allows in
+#    the tree, at least four are module-scoped inner attributes covering every
+#    function in their module.
+#  - A trait impl. `clippy::unused_async` skips these deliberately. The trait declares
+#    the method as future-returning, so the impl can only re-spell
+#    `async fn f(..) -> T` as `fn f(..) -> impl Future<Output = T> + Send
+#    { async move { .. } }`, which desugars to the identical future. Clippy's own
+#    suggested form is not that re-spelling: it wraps the body's values in
+#    `std::future::ready`, which runs the body at call time instead of at poll time
+#    and so moves when a side effect such as a map insert happens.
+#
+# WHAT THIS ALLOW DOES NOT DECIDE: whether a trait this workspace owns should declare
+# the method async in the first place. When no impl of a trait ever awaits, the edit
+# worth making is on the trait, and it is a design change this allow neither makes nor
+# forecloses. `HandleQuerier` and `ContextQuerier` are the two traits in that position
+# today.
+#
+# `clippy::unused_async` is NOT allowed here — an async function with no await still
+# has to justify itself at every inherent-impl and free-function site.
 unused_async_trait_impl = "allow"
 unwrap_used = "deny"
 expect_used = "deny"

@@ -17,6 +17,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The one nightly the fuzz crate builds on. Nightlies after this date
+  # tightened the `pub(crate)` re-export rules (E0365) and reject openmls
+  # 0.8.1's `pub use crate::ciphersuite::signature::*` at prelude.rs:16.
+  # `fuzz/rust-toolchain.toml` records the same date and the unpin condition.
+  FUZZ_TOOLCHAIN: nightly-2026-05-03
 
 jobs:
   # ── Nightly: regression + corpus growth ────────────────────────────────────
@@ -92,10 +97,15 @@ jobs:
       #
       # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
       # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
-      - uses: dtolnay/rust-toolchain@nightly-2026-05-03
+      # The action publishes only `master`, `nightly`, and `stable` branches, so a
+      # dated ref never resolved and every scheduled run failed at job setup.
+      # Naming the date through the `toolchain` input is what ci.yml already does.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +${{ env.FUZZ_TOOLCHAIN }} install cargo-fuzz --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -117,7 +127,7 @@ jobs:
       # the fuzz-crate check in ci.yml.
       - name: Run fuzzer
         run: |
-          cargo +nightly-2026-05-03 fuzz run ${{ matrix.target }} \
+          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz run ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             -- \
@@ -131,7 +141,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo +nightly-2026-05-03 fuzz cmin ${{ matrix.target }} \
+          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz cmin ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             || true
@@ -173,10 +183,15 @@ jobs:
 
       # TEMPORARY: pinned nightly (see the note in fuzz-nightly). Unpin once
       # openmls publishes a fixed prelude and scp-runtime updates its dependency.
-      - uses: dtolnay/rust-toolchain@nightly-2026-05-03
+      # The action publishes only `master`, `nightly`, and `stable` branches, so a
+      # dated ref never resolved and every scheduled run failed at job setup.
+      # Naming the date through the `toolchain` input is what ci.yml already does.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +${{ env.FUZZ_TOOLCHAIN }} install cargo-fuzz --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -196,7 +211,7 @@ jobs:
         # openmls's decrypt `debug_assert!` and turn every tampered input into a
         # false crash.
         run: |
-          cargo +nightly-2026-05-03 fuzz run fuzz_mls_decrypt -O \
+          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz run fuzz_mls_decrypt -O \
             --fuzz-dir fuzz \
             fuzz/corpus/fuzz_mls_decrypt \
             -- \
@@ -209,7 +224,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo +nightly-2026-05-03 fuzz cmin fuzz_mls_decrypt -O \
+          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz cmin fuzz_mls_decrypt -O \
             --fuzz-dir fuzz \
             fuzz/corpus/fuzz_mls_decrypt \
             || true
@@ -275,10 +290,15 @@ jobs:
       #
       # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
       # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
-      - uses: dtolnay/rust-toolchain@nightly-2026-05-03
+      # The action publishes only `master`, `nightly`, and `stable` branches, so a
+      # dated ref never resolved and every scheduled run failed at job setup.
+      # Naming the date through the `toolchain` input is what ci.yml already does.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +${{ env.FUZZ_TOOLCHAIN }} install cargo-fuzz --locked
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -301,7 +321,7 @@ jobs:
         env:
           RUSTFLAGS: "-Zsanitizer=address,undefined"
         run: |
-          cargo +nightly-2026-05-03 fuzz run ${{ matrix.target }} \
+          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz run ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             -- \
@@ -315,7 +335,7 @@ jobs:
       - name: Minimize corpus
         if: always()
         run: |
-          cargo +nightly-2026-05-03 fuzz cmin ${{ matrix.target }} \
+          cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz cmin ${{ matrix.target }} \
             --fuzz-dir fuzz \
             fuzz/corpus/${{ matrix.target }} \
             || true

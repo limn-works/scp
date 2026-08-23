@@ -7,12 +7,28 @@ Rust coding standards, safety rules, linting, formatting, testing, and CI for th
 | Tool | Version | Purpose |
 |------|---------|---------|
 | Rust edition | 2024 | Language edition (all crates) |
-| rustc | stable (latest) | Compiler |
-| cargo | stable (latest) | Build system, package manager |
-| clippy | stable (latest) | Linter |
-| rustfmt | stable (latest) | Formatter |
+| rustc | 1.98.0 | Compiler |
+| cargo | 1.98.0 | Build system, package manager |
+| clippy | 1.98.0 | Linter |
+| rustfmt | 1.98.0 | Formatter |
 | cargo-deny | latest | Dependency license/advisory audit |
 | cargo-nextest | latest | Test runner (parallel, better output) |
+
+**The compiler version is pinned, and raising it is a deliberate change.**
+`rust-toolchain.toml` at the repository root names the version above, the `clippy` and
+`rustfmt` components, and every cross-compilation target CI builds for. `.mise.toml` names
+the same version, because mise sets `RUSTUP_TOOLCHAIN` for the commands it runs and that
+variable overrides the file — verify with `mise x -- printenv RUSTUP_TOOLCHAIN`. `fuzz/`
+carries its own pin for the nightly cargo-fuzz needs.
+
+Before this pin existed, every CI workflow installed `dtolnay/rust-toolchain@stable`, which
+resolves to whichever stable release exists on the morning a job runs. Rust 1.98.0 shipped
+on 2026-08-20 with two new `pedantic` lints, and the `Rust / clippy` required check failed
+on every branch overnight while local runs on 1.97.1 reported a clean pass. To raise the
+version: change `channel` in `rust-toolchain.toml` and `rust` in `.mise.toml` together, run
+the CI clippy command, and fix everything the new release reports in that same pull request.
+Never lower the pin to make a new lint disappear. See
+`.docs/lessons/pin-the-rust-toolchain-or-ci-drifts-from-local.md`.
 
 ## Safety Rules
 
@@ -118,13 +134,14 @@ proptest! {
 
 SCP uses cargo-fuzz (libFuzzer) for parser safety and security invariant testing at trust
 boundaries. The fuzz crate lives at `fuzz/` (repo root) — a **standalone crate, not a
-workspace member**. All `cargo fuzz` commands require nightly:
+workspace member**. All `cargo fuzz` commands require the one nightly `fuzz/rust-toolchain.toml` pins —
+nightlies after that date reject openmls 0.8.1's prelude re-export (E0365):
 
 ```sh
-cargo +nightly fuzz list --fuzz-dir fuzz          # list all 19 targets
-cargo +nightly fuzz run <target> --fuzz-dir fuzz \
+cargo +nightly-2026-05-03 fuzz list --fuzz-dir fuzz          # list all 19 targets
+cargo +nightly-2026-05-03 fuzz run <target> --fuzz-dir fuzz \
   -- -dict=fuzz/dicts/<dict> -max_total_time=60    # run one target locally
-cargo +nightly check --manifest-path fuzz/Cargo.toml  # compile-check (no fuzzing)
+cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml  # compile-check (no fuzzing)
 ```
 
 **Tier strategy** (ADR-045):

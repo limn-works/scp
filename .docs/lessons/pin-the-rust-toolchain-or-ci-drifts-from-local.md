@@ -27,33 +27,58 @@ while the two runs resolve to different compilers.
 
 ## The Fix
 
-Three files select a Rust version, and all three now name `1.98.0`:
+Counting the places that select a Rust version is the part a reviewer has to check, and
+the first count was wrong. Four locations name the stable version and now all name
+`1.98.0`:
 
 - `rust-toolchain.toml` at the repository root pins `channel`, the `clippy` and `rustfmt`
   components, and every cross-compilation target some CI job builds for. Listing the
-  targets matters: the workflow steps add their targets to whatever `@stable` resolves to,
-  so once stable moves past the pin, a target installed into the newer toolchain would be
-  missing from the one cargo actually uses.
-- `.mise.toml` names the same version, because mise exports `RUSTUP_TOOLCHAIN`, and that
-  environment variable takes precedence over `rust-toolchain.toml`. Leaving it at
-  `"stable"` would reintroduce the drift on every developer machine.
-- `fuzz/rust-toolchain.toml` pins the nightly that `fuzz/` needs, because a root pin
-  otherwise reaches that standalone crate too.
+  targets matters, and not only for a future stable release: rustup names toolchains, and
+  `stable-<host>` and `1.98.0-<host>` are already different names, so a target a workflow
+  step installs into `stable` is invisible to the toolchain cargo uses.
+- `.mise.toml` names the same version, because mise sets `RUSTUP_TOOLCHAIN` for the
+  commands it runs and that variable overrides `rust-toolchain.toml` entirely. Verify with
+  `mise x -- printenv RUSTUP_TOOLCHAIN`; plain `mise env` does not print the variable, so
+  checking that command instead reports the wrong answer.
+- `Dockerfile` selects a base image. `.dockerignore` does not exclude the pin, so `COPY . .`
+  carries it into the build and rustup honours it over the image's own compiler.
+- `.docs/standards/rust.md` states the toolchain policy, and CLAUDE.md places
+  `.docs/standards/` upstream of code. A standard reading "stable (latest)" while a file
+  pins a version makes the pin contradict its own governing artifact.
 
-`.github/workflows/fuzz.yml` now writes `cargo +nightly-2026-05-03 fuzz run …`. Those
-steps run with the repository root as the working directory, where the root pin applies,
-and an explicit `+toolchain` sets `RUSTUP_TOOLCHAIN` for the command and everything it
-spawns. The fuzz-crate check in `.github/workflows/ci.yml` already wrote its toolchain
-that way.
+Two more locations name the nightly the standalone fuzz crate needs:
+`fuzz/rust-toolchain.toml` and the `FUZZ_TOOLCHAIN` environment variable in
+`.github/workflows/fuzz.yml`.
+
+`scripts/check-toolchain-pin.sh` reads all six and requires exact equality. The gate is
+closed by construction — a fixed list of locations, one version string extracted from
+each — rather than a scan for version-shaped strings, so it admits nothing it was not told
+to check. A comment asking several files to agree is not enforcement, and the repository's
+own tenet is to enforce mechanically.
+
+`.github/workflows/fuzz.yml` now names the nightly on every `cargo` command. Those steps
+run with the repository root as the working directory, where the root pin applies, and an
+explicit `+toolchain` sets `RUSTUP_TOOLCHAIN` for the command and everything it spawns.
+The fuzz-crate check in `.github/workflows/ci.yml` already wrote its toolchain that way.
+
+Auditing those steps turned up a second defect that had nothing to do with the pin: all
+three fuzz jobs referenced the action as `dtolnay/rust-toolchain@nightly-2026-05-03`, and
+that repository publishes only `master`, `nightly`, and `stable` branches. The ref never
+resolved, so every scheduled Fuzz run failed at job setup with "unable to find version"
+and the fuzzer had not executed since the ref was introduced. A green pull request tells
+you nothing about a workflow that runs on a schedule. Naming the date through the
+`toolchain` input of `@master` — the form `ci.yml` already used — is the working shape.
 
 ## Raising the Pin
 
 Bumping Rust is a change someone makes on purpose:
 
-1. Raise `channel` in `rust-toolchain.toml` and `rust` in `.mise.toml` to the same version.
-2. Run the CI clippy command from the "Orchestrator verification protocol" section of
+1. Raise the version in `rust-toolchain.toml`, `.mise.toml`, `Dockerfile`, and
+   `.docs/standards/rust.md`.
+2. Run `bash scripts/check-toolchain-pin.sh`, which fails until all four agree.
+3. Run the CI clippy command from the "Orchestrator verification protocol" section of
    CLAUDE.md.
-3. Fix everything the new release reports, in that same pull request.
+4. Fix everything the new release reports, in that same pull request.
 
 A new stable release reporting new lints is then a scheduled piece of work, not an
 overnight outage of the merge queue.

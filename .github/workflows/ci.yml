@@ -311,6 +311,18 @@ jobs:
   # module-level `static` / `let` / `var` / `static var` declaration.
   #
   # One job per language to keep failure attribution obvious.
+  # The repository names a Rust version in several places, and a disagreement puts a
+  # developer and CI on different compilers — the drift that let Rust 1.98.0's new
+  # clippy lints break the merge queue overnight while local runs reported a clean
+  # pass. The gate reads a fixed list of locations and requires exact equality.
+  toolchain-pin:
+    needs: check-draft
+    name: enforcement / toolchain pin agreement
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash scripts/check-toolchain-pin.sh
+
   no-mutable-globals-rust:
     needs: check-draft
     name: enforcement / no-mutable-globals (rust workspace)

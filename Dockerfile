@@ -1,5 +1,12 @@
 # Stage 1: Chef — install cargo-chef
-FROM rust:1.85-slim AS chef
+#
+# Keep this tag equal to `channel` in `rust-toolchain.toml`. `COPY . .` carries
+# that file into the build, and rustup honours it over the base image's own
+# compiler, so a mismatched tag makes every cargo step download a second
+# toolchain — and makes `cargo chef cook` compile dependencies with a different
+# compiler than `cargo build` uses, which discards the layer cache the chef
+# stages exist to build.
+FROM rust:1.98-slim AS chef
 RUN cargo install cargo-chef
 WORKDIR /app
 

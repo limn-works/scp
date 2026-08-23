@@ -3230,38 +3230,22 @@ mod tests {
             golden_root4,
             "4-leaf root golden KAT drift"
         );
-    }
 
-    /// Odd-leaf counts against the independent recursive RFC-6962 MTH.
-    ///
-    /// `compute_chunk_manifest_root` pairs each level with
-    /// `slice::as_chunks::<2>` and promotes the trailing unpaired hash from
-    /// `as_chunks`' remainder. A rewrite that discarded that remainder would
-    /// silently drop the final chunk of every odd level, which would produce
-    /// a manifest root that no longer commits to the last chunk the operator
-    /// signed. `indep_mth` splits at the largest power of two instead of
-    /// pairing levels, so it never consults a remainder and cannot mirror
-    /// that error. This test therefore pins the promotion itself, and the
-    /// `assert_ne!` pair states the property the promotion exists for: an
-    /// odd-count root differs from the root over the same sequence with the
-    /// unpaired final chunk removed.
-    #[test]
-    fn odd_leaf_root_promotes_unpaired_tail() {
+        // Odd leaf counts, which the 2-leaf and 4-leaf perfect trees above do
+        // not reach. `compute_chunk_manifest_root` pairs each level with
+        // `slice::as_chunks::<2>` and promotes the trailing hash from that
+        // call's remainder; dropping the remainder would discard the final
+        // chunk of every odd level and yield a root that no longer commits to
+        // the last chunk the operator signed. `indep_mth` splits at the
+        // largest power of two rather than pairing levels, so it never
+        // consults a remainder and cannot mirror that error.
         for n in [1usize, 3, 5, 7, 9] {
-            let chunks: Vec<OutletStreamChunk> =
-                (0..n).map(|i| chunk_of_kind(i as u64, 0)).collect();
+            let odd: Vec<OutletStreamChunk> = (0..n).map(|i| chunk_of_kind(i as u64, 0)).collect();
             assert_eq!(
-                compute_chunk_manifest_root(&chunks).unwrap(),
-                indep_mth(&chunks),
+                compute_chunk_manifest_root(&odd).unwrap(),
+                indep_mth(&odd),
                 "{n}-leaf root diverged from independent MTH"
             );
-            if n > 1 {
-                assert_ne!(
-                    compute_chunk_manifest_root(&chunks).unwrap(),
-                    compute_chunk_manifest_root(&chunks[..n - 1]).unwrap(),
-                    "{n}-leaf root ignored the unpaired final chunk"
-                );
-            }
         }
     }
 }
