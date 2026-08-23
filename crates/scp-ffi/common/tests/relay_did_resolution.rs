@@ -181,9 +181,20 @@ fn production_resolver(
     Arc<scp_ffi_common::ProductionDidResolver<InMemoryDhtClient>>,
     Arc<TransportRelayQuerier>,
 ) {
+    production_resolver_with_cache(dht, Arc::new(DidCache::new()))
+}
+
+/// Composes the production resolver over `dht` and a caller-supplied cache, so a
+/// test can seed the cache the resolver reads on step 1 and step 3a.
+fn production_resolver_with_cache(
+    dht: Arc<InMemoryDhtClient>,
+    cache: Arc<DidCache>,
+) -> (
+    Arc<scp_ffi_common::ProductionDidResolver<InMemoryDhtClient>>,
+    Arc<TransportRelayQuerier>,
+) {
     let relay_querier = Arc::new(TransportRelayQuerier::new());
-    let resolver =
-        build_production_did_resolver(Arc::clone(&relay_querier), dht, Arc::new(DidCache::new()));
+    let resolver = build_production_did_resolver(Arc::clone(&relay_querier), dht, cache);
     (resolver, relay_querier)
 }
 

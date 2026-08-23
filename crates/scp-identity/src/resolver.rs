@@ -970,7 +970,25 @@ fn pick_winner_and_detect_divergence(
                     raw_signature: dht_rec.raw_signature,
                     fresher_seq: dht_rec.resolved.seq,
                 }),
-                Ordering::Equal => None,
+                Ordering::Equal => {
+                    // §3.10.4: "Both layers succeed, same sequence number. The
+                    // documents MUST be byte-identical (same key signs both,
+                    // same content). If they differ despite identical sequence
+                    // numbers, this indicates a bug in the publishing
+                    // implementation. The resolver MUST log a warning and accept
+                    // either document." Compare the signed BEP44 bytes, because
+                    // those are what the owner's key actually covers.
+                    if relay_rec.raw_value != dht_rec.raw_value {
+                        warn!(
+                            did = %relay_rec.resolved.document.id,
+                            seq = relay_rec.resolved.seq,
+                            "the relay and the Mainline DHT hold different documents at the same \
+                             sequence number, which means the publisher signed two documents at \
+                             one seq — accepting the relay's copy (§3.10.4)"
+                        );
+                    }
+                    None
+                }
             };
 
             // Highest seq wins; on tie, relay preferred.
@@ -1299,6 +1317,210 @@ mod tests {
             cache,
             Arc::new(vec!["wss://bootstrap.example.com/scp/v1".to_owned()]),
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // Relay query order (§3.10.4 step 3a)
+    // -----------------------------------------------------------------------
+
+    /// A relay layer that records the URL list the resolver handed it, and
+    /// answers only for the URLs the test names as holding the record.
+    struct UrlRecordingRelayQuerier {
+        /// The URL list from the most recent `query`, in the order received.
+        seen_urls: Mutex<Vec<String>>,
+        /// URL -> the record that relay serves.
+        records: Mutex<std::collections::HashMap<String, RelayRecord>>,
+    }
+
+    impl UrlRecordingRelayQuerier {
+        fn new() -> Self {
+            Self {
+                seen_urls: Mutex::new(Vec::new()),
+                records: Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        async fn serve(&self, relay_url: &str, record: RelayRecord) {
+            self.records
+                .lock()
+                .await
+                .insert(relay_url.to_owned(), record);
+        }
+
+        async fn seen(&self) -> Vec<String> {
+            self.seen_urls.lock().await.clone()
+        }
+    }
+
+    impl MultiRelayQuerier for UrlRecordingRelayQuerier {
+        fn query(
+            &self,
+            _did: &str,
+            relay_urls: &[String],
+        ) -> impl Future<Output = Result<Option<RelayRecord>, IdentityError>> + Send {
+            let urls = relay_urls.to_vec();
+            async move {
+                *self.seen_urls.lock().await = urls.clone();
+                let records = self.records.lock().await;
+                // Mirror the production composer: a URL nothing serves is a
+                // relay that could not be reached.
+                let mut any_reached = false;
+                let mut best: Option<RelayRecord> = None;
+                for url in &urls {
+                    if let Some(record) = records.get(url) {
+                        any_reached = true;
+                        if best.as_ref().is_none_or(|b| record.seq > b.seq) {
+                            best = Some(record.clone());
+                        }
+                    }
+                }
+                if any_reached {
+                    Ok(best)
+                } else {
+                    Err(IdentityError::RelayQueryFailed(
+                        "no relay in the list was reachable (test)".to_owned(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// `relay_query_order` puts the identity's own relays first and the
+    /// bootstrap relays after, and lists each URL once.
+    #[test]
+    fn relay_query_order_puts_identity_relays_first_and_keeps_bootstrap() {
+        let ordered = relay_query_order(
+            vec![
+                "wss://alice/scp/v1".to_owned(),
+                "wss://both/scp/v1".to_owned(),
+            ],
+            vec![
+                "wss://both/scp/v1".to_owned(),
+                "wss://bound/scp/v1".to_owned(),
+            ],
+        );
+
+        assert_eq!(
+            ordered,
+            vec![
+                "wss://alice/scp/v1".to_owned(),
+                "wss://both/scp/v1".to_owned(),
+                "wss://bound/scp/v1".to_owned(),
+            ],
+            "§3.10.4 step 3a orders the identity's own relays before the bootstrap relays, \
+             and a URL in both lists is queried once"
+        );
+    }
+
+    /// A DID whose cached document advertises relays this instance never
+    /// connected must not lose the relays it DID connect.
+    ///
+    /// The production querier answers only for a relay with a live transport
+    /// and never dials, so replacing the bootstrap set with the cached list
+    /// would make the relay layer unavailable forever for exactly the
+    /// identities whose relays the cache knows.
+    #[tokio::test]
+    async fn a_dids_own_advertised_relays_do_not_displace_the_bootstrap_relays() {
+        let (signing_key, did, mut doc) = make_test_identity();
+
+        // The cached document advertises a relay nothing connected.
+        doc.set_relay_services(&["wss://alice-relay.example.com/scp/v1"])
+            .unwrap();
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        cache.insert(&did, doc.clone(), 1).await;
+        // Age past the inactive refresh TTL so step 1 does not short-circuit,
+        // while `cached_relay_urls` still reads the advertised relay.
+        clock.advance(8 * 24 * 60 * 60);
+
+        // The BOOTSTRAP relay — the one this instance connected — holds seq 4.
+        let (value, signature) = sign_document(&signing_key, &doc, 4);
+        let relay = Arc::new(UrlRecordingRelayQuerier::new());
+        relay
+            .serve(
+                "wss://bootstrap.example.com/scp/v1",
+                RelayRecord {
+                    value,
+                    signature,
+                    seq: 4,
+                    relay_url: "wss://bootstrap.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        let dht = Arc::new(InMemoryDhtClient::new());
+        let resolver = make_resolver(Arc::clone(&relay), dht, cache);
+
+        let outcome = resolver
+            .resolve(&did)
+            .await
+            .expect("resolution must succeed");
+
+        assert_eq!(
+            relay.seen().await,
+            vec![
+                "wss://alice-relay.example.com/scp/v1".to_owned(),
+                "wss://bootstrap.example.com/scp/v1".to_owned(),
+            ],
+            "the DID's own relay is queried first, and the bound bootstrap relay still follows"
+        );
+        let found = outcome
+            .found()
+            .expect("the bootstrap relay served the record");
+        assert_eq!(found.seq, 4);
+        assert_eq!(
+            found.source,
+            ResolutionSource::ScpRelay {
+                relay_url: "wss://bootstrap.example.com/scp/v1".to_owned()
+            }
+        );
+    }
+
+    /// The other half of the order: a record held ONLY by the relay the DID's
+    /// own document advertises resolves, once that relay is reachable.
+    #[tokio::test]
+    async fn a_did_resolves_from_the_relay_only_its_own_document_names() {
+        let (signing_key, did, mut doc) = make_test_identity();
+
+        doc.set_relay_services(&["wss://alice-relay.example.com/scp/v1"])
+            .unwrap();
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(Arc::clone(&clock)));
+        cache.insert(&did, doc.clone(), 1).await;
+        clock.advance(8 * 24 * 60 * 60);
+
+        let (value, signature) = sign_document(&signing_key, &doc, 6);
+        let relay = Arc::new(UrlRecordingRelayQuerier::new());
+        relay
+            .serve(
+                "wss://alice-relay.example.com/scp/v1",
+                RelayRecord {
+                    value,
+                    signature,
+                    seq: 6,
+                    relay_url: "wss://alice-relay.example.com/scp/v1".to_owned(),
+                },
+            )
+            .await;
+
+        let resolver = make_resolver(relay, Arc::new(InMemoryDhtClient::new()), cache);
+
+        let outcome = resolver
+            .resolve(&did)
+            .await
+            .expect("resolution must succeed");
+        let found = outcome
+            .found()
+            .expect("the DID's own relay served the record");
+
+        assert_eq!(found.seq, 6);
+        assert_eq!(
+            found.source,
+            ResolutionSource::ScpRelay {
+                relay_url: "wss://alice-relay.example.com/scp/v1".to_owned()
+            },
+            "a relay URL that appears only inside the DID's own document is queried"
+        );
     }
 
     // -----------------------------------------------------------------------

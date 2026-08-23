@@ -149,6 +149,13 @@ const NAPI_IDENTITY_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/sr
 const PYO3_TRANSPORT_SRC: &str = include_str!("../../../../crates/scp-ffi/src/transport.rs");
 const NAPI_TRANSPORT_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/transport.rs");
 
+// Node auto-wire sources: `auto_wire_context_manager` connects a second relay socket
+// for the bridge instance, so it is one of the paths that must bind that
+// connection into the relay layer of DID resolution (§3.10.4 step 3a). Pinned by
+// `every_path_that_installs_a_relay_adapter_binds_it_into_did_resolution`.
+const PYO3_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/src/server.rs");
+const NAPI_SERVER_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/server.rs");
+
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
@@ -3801,6 +3808,67 @@ fn every_bridge_binds_its_relay_into_did_resolution() {
             fn_body_contains(src, disconnect_fn, "unbind_relay_transport"),
             "{bridge}: {disconnect_fn} must unbind the relay so the resolver stops \
              querying a relay the caller walked away from"
+        );
+    }
+}
+
+/// EVERY path that installs a relay adapter on a bridge instance binds it into
+/// the relay layer of DID resolution — not only `transport_connect`.
+///
+/// The criterion this gate applies: a function that hands a connected relay
+/// adapter to the instance's `TransportManager` must also hand it to the
+/// instance's relay querier, because `set_transport` and `clear_transport`
+/// release the querier's bindings along with the manager. A path that installs
+/// without binding leaves the resolver with no relay at all, so every resolve
+/// reports the relay layer unavailable while the bridge holds a live connection.
+///
+/// The three cases below are the three ways an adapter reaches an instance
+/// besides `transport_connect`: adding a second relay, re-dialling after a
+/// suspend, and auto-wiring an embedded node's relay.
+#[test]
+fn every_path_that_installs_a_relay_adapter_binds_it_into_did_resolution() {
+    for (bridge, src, install_fn) in [
+        ("PyO3", PYO3_TRANSPORT_SRC, "transport_add_relay"),
+        ("napi-rs", NAPI_TRANSPORT_SRC, "transport_add_relay_on"),
+        ("UniFFI", UNIFFI_BRIDGE_SRC, "add_relay"),
+        (
+            "scp-ffi-common",
+            BRIDGE_INSTANCE_SRC,
+            "reconnect_transport_if_pending",
+        ),
+        ("PyO3 server", PYO3_SERVER_SRC, "auto_wire_context_manager"),
+        (
+            "napi-rs server",
+            NAPI_SERVER_SRC,
+            "auto_wire_context_manager",
+        ),
+    ] {
+        assert!(
+            fn_body_contains(src, install_fn, "bind_relay_transport"),
+            "{bridge}: {install_fn} installs a relay adapter, so it must bind that adapter \
+             into the instance's relay querier. Without the bind the resolver holds no relay \
+             and reports the relay layer unavailable while the connection is live \
+             (spec §3.10.4 step 3a)"
+        );
+    }
+}
+
+/// Tearing down the transport releases the relay bindings with it.
+///
+/// A binding is a strong `Arc` on an adapter the transport manager owns, so a
+/// binding that outlives its manager keeps the adapter alive past teardown.
+/// `NativeRelayAdapter::drop` is the only thing that cancels the cover-traffic
+/// and heartbeat tasks and closes the socket, so a leaked binding leaves a
+/// suspended or shut-down instance still transmitting.
+#[test]
+fn transport_teardown_releases_the_relay_bindings() {
+    for teardown_fn in ["clear_transport", "set_transport"] {
+        assert!(
+            fn_body_contains(BRIDGE_INSTANCE_SRC, teardown_fn, "relay_querier.clear()"),
+            "CoreFields::{teardown_fn} replaces or drops the transport manager, so it must \
+             release the relay querier's bindings on that manager's adapters — otherwise \
+             NativeRelayAdapter::drop never runs and the socket, cover traffic, and heartbeat \
+             survive the teardown"
         );
     }
 }

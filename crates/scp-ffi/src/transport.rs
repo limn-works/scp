@@ -469,10 +469,17 @@ impl crate::scp::PyScp {
             .map_err(ScpPyError::from)?;
         let scoring_url = relay_url.to_owned();
 
+        // Share ONE connected adapter between the `TransportManager` that sends
+        // over it and the DID relay querier that runs QUERY over it, exactly as
+        // `transport_connect` does. Without the bind, DID resolution never
+        // queries this relay, and the cross-relay fan-out §3.10.8 relies on for
+        // suppression resistance collapses back to the connect-time relay.
+        let shared: Arc<dyn scp_transport::TransportAdapter> = Arc::from(adapter);
         let count = crate::runtime::with_transport_manager_mut(bi, |manager| {
-            let _eviction = manager.add_adapter(adapter);
+            let _eviction = manager.add_adapter(Box::new(Arc::clone(&shared)));
             Ok(manager.adapter_count())
         })?;
+        bi.core.bind_relay_transport(relay_url.to_owned(), shared);
 
         // Spawn suppression → scoring bridge task.
         //

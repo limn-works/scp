@@ -3697,11 +3697,18 @@ impl TransportManager {
             })
             .map_err(ScpError::from)?;
 
+        // Share ONE connected adapter between the `TransportManager` that sends
+        // over it and the DID relay querier that runs QUERY over it, exactly as
+        // `transport_connect` does. Without the bind, DID resolution never
+        // queries this relay, and the cross-relay fan-out §3.10.8 relies on for
+        // suppression resistance collapses back to the connect-time relay.
+        let shared: Arc<dyn scp_transport::TransportAdapter> = Arc::from(adapter);
+        let shared_for_manager = Arc::clone(&shared);
         let count = self
             .bi
             .core
-            .with_transport_mut(|mgr| {
-                let _eviction = mgr.add_adapter(adapter);
+            .with_transport_mut(move |mgr| {
+                let _eviction = mgr.add_adapter(Box::new(shared_for_manager));
                 #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
                 let count = mgr.adapter_count() as u32;
                 count
@@ -3710,6 +3717,7 @@ impl TransportManager {
                 msg: e.to_string(),
                 code: codes::TRANS_5003.to_owned(),
             })?;
+        self.bi.core.bind_relay_transport(relay_url.clone(), shared);
 
         // Spawn suppression → scoring bridge task against this handle's
         // owning `UniffiBridgeInstance`.

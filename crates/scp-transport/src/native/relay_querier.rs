@@ -117,24 +117,48 @@ impl TransportRelayQuerier {
         }
     }
 
+    /// Removes every binding, releasing this querier's `Arc` on each adapter.
+    ///
+    /// A caller that tears down the transport calls this, because each binding
+    /// is a strong reference to an adapter the transport owns. Leaving a binding
+    /// behind keeps the adapter alive past the teardown, so
+    /// `NativeRelayAdapter::drop` — which cancels the cover-traffic and
+    /// heartbeat tasks and closes the socket — never runs, and the resolver goes
+    /// on querying a connection nothing else holds.
+    pub fn clear(&self) {
+        if let Ok(mut relays) = self.relays.write() {
+            relays.clear();
+        }
+    }
+
     /// Returns the adapter bound for `relay_url`, cloned out under a short
     /// synchronous lock so the guard never crosses an `.await`.
     fn adapter_for(&self, relay_url: &str) -> Option<Arc<dyn TransportAdapter>> {
         self.relays.read().ok()?.get(relay_url).cloned()
     }
 
-    /// Returns every relay URL that currently has a bound transport.
+    /// Returns every relay URL that currently has a bound transport, sorted.
     ///
     /// This is the resolver's bootstrap relay set (spec §18.5.1 priority 1 —
     /// the relays the caller explicitly configured and this instance connected).
     /// A poisoned lock yields an empty list, which the composer reports as a
     /// relay layer that could not answer.
+    ///
+    /// `BootstrapRelays::bootstrap_relay_urls` documents its result as being in
+    /// priority order, and a `HashMap`'s iteration order is arbitrary and
+    /// reseeded per process. Sorting gives every consumer one order that does
+    /// not change between runs. The relays in this set are peers of one another
+    /// — the caller configured all of them and this instance connected all of
+    /// them — so no ranking among them exists to preserve.
     #[must_use]
     pub fn bound_relay_urls(&self) -> Vec<String> {
-        self.relays
+        let mut urls: Vec<String> = self
+            .relays
             .read()
             .map(|relays| relays.keys().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        urls.sort_unstable();
+        urls
     }
 }
 
@@ -568,10 +592,17 @@ mod tests {
         querier.bind(RELAY, Arc::new(MockRawAdapter::new(vec![frame])));
 
         let composer = RealMultiRelayQuerier::new(querier);
-        let result = composer.query(&did_a, &[RELAY.to_owned()]).await.unwrap();
+        let error = composer
+            .query(&did_a, &[RELAY.to_owned()])
+            .await
+            .expect_err("the only relay served a frame the resolver discarded");
         assert!(
-            result.is_none(),
-            "a frame that verifies only against its embedded key must be rejected"
+            matches!(error, IdentityError::RelayQueryFailed(_)),
+            "a frame that verifies only against its embedded key is rejected, and §3.10.4 \
+             discards it as if the relay had failed — reporting `Ok(None)` would tell the \
+             resolver that the relay answered and holds no record for {did_a}, which turns \
+             the attacker's substitution into a claim that nobody published the DID; got \
+             {error:?}"
         );
     }
 

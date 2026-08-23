@@ -236,7 +236,6 @@ mod tests {
     #[cfg(feature = "testing")]
     use scp_dht::InMemoryDhtClient;
     #[cfg(feature = "testing")]
-    #[cfg(feature = "testing")]
     use scp_identity::DidCache;
     #[cfg(feature = "testing")]
     use std::sync::Arc;

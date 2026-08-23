@@ -563,11 +563,18 @@ pub(crate) async fn transport_add_relay_on(
             code: codes::TRANS_5001.to_owned(),
         })?;
 
+    // Share ONE connected adapter between the `TransportManager` that sends over
+    // it and the DID relay querier that runs QUERY over it, exactly as
+    // `transport_connect` does. Without the bind, DID resolution never queries
+    // this relay, and the cross-relay fan-out §3.10.8 relies on for suppression
+    // resistance collapses back to the connect-time relay.
+    let shared: Arc<dyn scp_transport::TransportAdapter> = Arc::from(adapter);
     let count = with_transport_manager_mut_on(bi, |manager| {
-        let _eviction = manager.add_adapter(adapter);
+        let _eviction = manager.add_adapter(Box::new(Arc::clone(&shared)));
         #[allow(clippy::cast_possible_truncation)]
         Ok(manager.adapter_count() as u32)
     })?;
+    bi.core.bind_relay_transport(relay_url.clone(), shared);
 
     // Spawn suppression → scoring bridge task.
     if let Some(rx) = suppression_rx {
