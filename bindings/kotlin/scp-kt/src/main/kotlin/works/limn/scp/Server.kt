@@ -259,8 +259,10 @@ class Relay internal constructor(
  * Opaque handle to a running SCP application node.
  *
  * Created via [Node.Companion.startInMemory] or [Node.Companion.startLocal].
- * The node includes a running relay server, a generated DID identity, and
- * (optionally) persistent storage.
+ * The node includes a running relay server, a DID identity, and (optionally)
+ * persistent storage. The identity is generated only when the caller omits one
+ * AND the build enables `testing`; a shipped build requires an explicit
+ * identity and fails closed otherwise.
  *
  * Implements [AutoCloseable] so it can be used with Kotlin's `use` extension:
  * ```kotlin
@@ -458,9 +460,13 @@ class Node internal constructor(
          * Starts a full application node with file-backed storage.
          *
          * When [identityDid] is provided, the node uses the pre-existing
-         * identity. When `null`, the node creates or reloads a persistent
-         * identity via `FileKeyCustody`. The [passphrase] parameter is
-         * required in this mode.
+         * identity. When `null`, the node reloads a persistent identity via
+         * `FileKeyCustody`, and [passphrase] is required. CREATING one on a
+         * first run needs a pre-rotation custody backend that only a `testing`
+         * build has, so a shipped build fails closed rather than mint a
+         * nullifier-backed identity (`SCP-IDENT-1059`; RFC #2130, issue #1729).
+         * Pass an identity, or point [dataDir] at a directory that already
+         * holds one.
          *
          * No passphrase is required when [identityDid] is provided.
          *
