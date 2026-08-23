@@ -362,8 +362,8 @@ library across every cross-compiled target adds build risk and no security. The 
 produced this rule: rustls-webpki 0.103.14 raised its `aws-lc-rs` floor from 1.14 to 1.18
 to expose ML-DSA, which would have moved `aws-lc-sys` 0.39.0 to 0.44.0 and its vendored
 AWS-LC 1.71.0 to 5.5.0 under twelve of the thirteen targets CI compiles for — every
-one but `wasm32-unknown-unknown`, which CI type-checks rather than builds and whose
-crate graph contains no `aws-lc-sys` — for an algorithm this
+one but `wasm32-unknown-unknown`, whose crate graph contains no `aws-lc-sys` — for an
+algorithm this
 workspace never asserts; 0.103.13 cleared the same three advisories and moved nothing.
 Establish that by evidence: `diff` the candidate's `Cargo.toml` against the current one,
 and read the upstream release notes for every version in between.
@@ -377,9 +377,12 @@ and revert every change the advisory did not require. Prove the result resolves 
 whatever `cargo install` left on the machine. An older cargo-deny misses whole advisory
 classes — 0.19.0 reports nothing for the `unsound` class that 0.20.2 raises as an error —
 so a green run from the wrong binary proves nothing, and an `advisory-not-detected`
-warning from the wrong binary marks a live entry as unnecessary. cargo-deny also reports an advisory
-against only the highest version of a duplicated crate, so count every copy of the crate
-in `Cargo.lock` before calling an advisory cleared.
+warning from the wrong binary marks a live entry as unnecessary. Count every copy of the crate in
+`Cargo.lock` before calling an advisory cleared: a bump that adds a patched version on top
+of unpatched duplicates leaves the unpatched ones compiling into the shipped artifact.
+Measured on 0.20.2, cargo-deny does emit one diagnostic per affected copy — both
+`libcrux-sha3 0.0.6` and `0.0.7` are reported — so the count is a check on the fix, not a
+compensation for the tool.
 
 ## CI Matrix
 

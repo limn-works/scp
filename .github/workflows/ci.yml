@@ -163,7 +163,7 @@ jobs:
 
   # ── Fail-closed pre-rotation (ADR-062 §Decision 6 / SCP-CAPINJECT-006) ──
   # Runs the production (no-`testing`) identity-creation paths and asserts they
-  # FAIL CLOSED with the typed IdentityError::NoPreRotationBackend (SCP-IDENT-1059)
+  # FAIL CLOSED with the typed IdentityError::NoPreRotationBackend
   # rather than minting the severed in-memory pre-rotation nullifier. These tests
   # are `#[cfg(not(feature = "testing"))]`, so they compile/run ONLY in the bare
   # build where the nullifier is severed (the workspace test lane runs WITH
@@ -172,7 +172,7 @@ jobs:
   # silent nullifier fallback, `Ok(_)` trips the assertion.
   fail-closed-pre-rotation:
     needs: check-draft
-    name: Fail-closed pre-rotation (SCP-IDENT-1059)
+    name: Fail-closed pre-rotation (NoPreRotationBackend)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

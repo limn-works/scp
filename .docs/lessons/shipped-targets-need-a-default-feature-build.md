@@ -41,17 +41,21 @@ after Caulfield.
 
 ## Eight rounds, twelve bypasses, and which ones the gate closes
 
-Eight review rounds produced twelve bypasses, from seven of those rounds — the round-2
-row records an overclaim rather than a bypass. They do not share one root, and no single
-change closed them. Nine are closed by the five mechanisms listed above plus the shell
-quoting that answers row 6c. Two are not closed at all and are not meant to be: row 4b
-(any nullifier other than `DhtMode::Memory`) and row 8 (a `build.rs` injecting a cfg),
-both of which need write access to the crate under test.
+The table below has thirteen rows. Row 2 records an overclaim rather than a bypass, so
+twelve are bypasses, found across seven of the eight rounds. They do not share one root,
+and no single change closed them.
 
-Counting these was itself a source of error. Four earlier drafts of this paragraph
+Ten are closed: rows 1, 3, 4a, 4c, 5, 6a, 6b, 7a, and 7b by the five mechanisms listed
+above, and row 6c by reading with `while IFS= read -r` instead of word-splitting.
+
+Two are not closed, and are not meant to be: row 4b (any nullifier other than
+`DhtMode::Memory`) and row 8 (a `build.rs` injecting a cfg). Both need write access to
+the crate under test, which is the stated residual limit.
+
+Counting these was itself a source of error. Five earlier drafts of this paragraph
 asserted a total, described a table column, or claimed a coverage that the table three
-lines below already contradicted. Every one was caught by a reviewer rather than by its
-author, which is the argument for keeping the table adjacent to the prose that counts it.
+lines below already contradicted, and a reviewer caught every one. That is why the counts
+above name their rows: a bare total drifts from the table, and an enumeration does not.
 
 | Round | Bypass | Root |
 |---|---|---|

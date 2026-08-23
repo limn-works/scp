@@ -4543,6 +4543,10 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `node_start_in_memory`.
+    ///
+    /// Omitting `identity_did` requests auto-generation, which a shipped build
+    /// refuses: the in-memory custody, storage, and DHT client it needs compile
+    /// only under the `testing` feature. The refusal carries no error code.
     #[napi(js_name = "nodeStartInMemory")]
     pub async fn node_start_in_memory(
         &self,
@@ -4552,6 +4556,11 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `node_start_local`.
+    ///
+    /// Omitting `identity_did` reloads the identity the storage already holds and
+    /// requires `passphrase`. Creating one on a first run needs a pre-rotation
+    /// custody backend that only a `testing` build has, so a shipped build fails
+    /// closed with the message "node startup failed" and no error code.
     #[napi(js_name = "nodeStartLocal")]
     pub async fn node_start_local(
         &self,
